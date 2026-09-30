@@ -48,6 +48,13 @@ impl BundleLintFinding {
             message: message.into(),
         }
     }
+
+    fn warning(entity: impl Into<String>, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            severity: LintSeverity::Warning,
+            ..Self::error(entity, code, message)
+        }
+    }
 }
 
 impl LintFinding {
@@ -183,11 +190,19 @@ fn lint_spawn_effect(
     let Effect::Spawn {
         entity_type,
         initial_action,
+        copy,
         ..
     } = effect
     else {
         return;
     };
+    lint_spawn_copy(
+        automata.get(entity_name),
+        entity_name,
+        action,
+        copy,
+        findings,
+    );
 
     let Some(target_automaton) = automata.get(entity_type) else {
         findings.push(BundleLintFinding::error(
@@ -224,7 +239,8 @@ fn lint_spawn_effect(
         target_action,
         findings,
     );
-    let available_params = available_spawn_params(action, parent_snake);
+    let mut available_params = available_spawn_params(action, parent_snake);
+    available_params.extend(copy.iter().cloned());
     lint_spawn_param_mapping(
         entity_name,
         &action.name,
@@ -234,6 +250,37 @@ fn lint_spawn_effect(
         target_action,
         findings,
     );
+}
+
+/// A `copy(...)` name nothing on the parent can hold (no declared variable and
+/// no action parameter) would silently hand the child nothing.
+fn lint_spawn_copy(
+    parent: Option<&Automaton>,
+    entity_name: &str,
+    action: &super::Action,
+    copy: &[String],
+    findings: &mut Vec<BundleLintFinding>,
+) {
+    let Some(parent) = parent else {
+        return;
+    };
+    for name in copy {
+        let declared = parent.state.iter().any(|var| &var.name == name);
+        let a_param = parent
+            .actions
+            .iter()
+            .any(|a| a.params.iter().any(|p| p.name() == name));
+        if !declared && !a_param {
+            findings.push(BundleLintFinding::warning(
+                entity_name.to_string(),
+                "spawn_copy_field_unknown",
+                format!(
+                    "action '{}' copies '{name}' into its spawned child, but no variable or action parameter of '{entity_name}' holds it",
+                    action.name
+                ),
+            ));
+        }
+    }
 }
 
 fn target_action<'a>(automaton: &'a Automaton, action_name: &str) -> Option<&'a super::Action> {

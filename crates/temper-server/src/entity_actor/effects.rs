@@ -93,6 +93,9 @@ pub struct SpawnRequest {
     pub initial_action: Option<String>,
     /// Optional field on the parent to store the child's ID.
     pub store_id_in: Option<String>,
+    /// The parent's fields named by the spawn's `copy(...)`, as they were when
+    /// the effect ran; handed to the child's initial action.
+    pub copied_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A deferred schedule-at request — resolved after `sync_fields`.
@@ -739,6 +742,7 @@ pub fn apply_effects(
                 initial_action,
                 store_id_in,
                 id,
+                copy,
             } => {
                 let child_id = id
                     .as_ref()
@@ -755,11 +759,21 @@ pub fn apply_effects(
                     );
                 }
 
+                let copied_fields = state
+                    .fields
+                    .as_object()
+                    .map(|parent| {
+                        copy.iter()
+                            .filter_map(|name| Some((name.clone(), parent.get(name)?.clone())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 spawn_requests.push(SpawnRequest {
                     entity_type: entity_type.clone(),
                     entity_id: child_id.clone(),
                     initial_action: Some(initial_action.clone()),
                     store_id_in: store_id_in.clone(),
+                    copied_fields,
                 });
 
                 tracing::info!(

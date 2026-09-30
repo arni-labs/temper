@@ -254,6 +254,8 @@ pub enum Effect {
         initial_action: String,
         store_id_in: Option<String>,
         id: Option<Arg>,
+        /// Parent fields handed to the child's initial action.
+        copy: Vec<String>,
     },
 }
 

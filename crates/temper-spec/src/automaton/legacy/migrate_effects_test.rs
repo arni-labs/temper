@@ -114,6 +114,24 @@ effect = [{ type = "spawn", entity_type = "Child", entity_id_source = "child_key
 }
 
 #[test]
+fn copy_fields_become_a_spawn_copy_list() {
+    // TemperPaw's CronJob and Computer hand parent fields to the spawned
+    // child; the conversion keeps that instead of refusing the spec.
+    let (source, _) = migrate(
+        r#"
+[[action]]
+name = "Start"
+from = ["A"]
+effect = [{ type = "spawn", entity_type = "Session", entity_id_source = "{uuid}", initial_action = "Configure", store_id_in = "session_id", copy_fields = "system_prompt,model" }]
+"#,
+    );
+    assert_eq!(
+        effects(&source, "Start"),
+        ["spawn('Session', 'Configure', session_id, copy(system_prompt, model))"]
+    );
+}
+
+#[test]
 fn integrations_become_triggers_on_the_actions_that_fired_them() {
     let (source, notes) = migrate(
         r#"

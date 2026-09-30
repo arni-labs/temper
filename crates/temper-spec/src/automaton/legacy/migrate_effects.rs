@@ -191,20 +191,21 @@ fn statement(
             store_id_in,
             copy_fields,
         } => {
-            if copy_fields.is_some() {
-                return Err(fail(format!(
-                    "spawn of '{entity_type}' uses copy_fields, which is gone; convert by hand"
-                )));
-            }
+            let copy = match copy_fields {
+                Some(names) if !names.is_empty() => format!(", copy({})", names.join(", ")),
+                _ => String::new(),
+            };
             let initial = initial_action
                 .ok_or_else(|| fail(format!("spawn of '{entity_type}' has no initial_action")))?;
             let id = (entity_id_source != "{uuid}").then(|| format!("params.{entity_id_source}"));
             match (store_id_in, id) {
                 (Some(field), Some(id)) => {
-                    format!("spawn('{entity_type}', '{initial}', {field}, {id})")
+                    format!("spawn('{entity_type}', '{initial}', {field}, {id}{copy})")
                 }
-                (Some(field), None) => format!("spawn('{entity_type}', '{initial}', {field})"),
-                (None, None) => format!("spawn('{entity_type}', '{initial}')"),
+                (Some(field), None) => {
+                    format!("spawn('{entity_type}', '{initial}', {field}{copy})")
+                }
+                (None, None) => format!("spawn('{entity_type}', '{initial}'{copy})"),
                 (None, Some(_)) => {
                     return Err(fail(format!(
                         "spawn of '{entity_type}' takes its id from '{entity_id_source}' but stores it nowhere; add a store field by hand"

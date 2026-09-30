@@ -280,3 +280,59 @@ params = ["title", "description", "plan_id"]
         "expected no bundle lint findings, got: {findings:?}"
     );
 }
+
+#[test]
+fn bundle_lint_maps_copied_fields_and_warns_on_unknown_copy_names() {
+    let parent = parse(
+        r#"
+[automaton]
+name = "Plan"
+states = ["Draft"]
+initial = "Draft"
+
+[[action]]
+name = "Describe"
+from = ["Draft"]
+params = ["description"]
+
+[[action]]
+name = "AddTask"
+from = ["Draft"]
+params = ["title"]
+effect = ["spawn('Task', 'Create', task_id, copy(description, descripton))"]
+"#,
+    );
+    let child = parse(
+        r#"
+[automaton]
+name = "Task"
+states = ["Open"]
+initial = "Open"
+
+[[action]]
+name = "Create"
+from = ["Open"]
+params = ["title", "description", "plan_id"]
+"#,
+    );
+
+    let bundle = BTreeMap::from([("Plan".to_string(), parent), ("Task".to_string(), child)]);
+    let findings = lint_automata_bundle(&bundle);
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.code == "spawn_initial_action_params_unmapped"),
+        "a copied field supplies the child's param: {findings:?}"
+    );
+    assert!(findings.iter().any(|finding| {
+        finding.code == "spawn_copy_field_unknown"
+            && finding.severity == LintSeverity::Warning
+            && finding.message.contains("'descripton'")
+    }));
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.message.contains("'description' into")),
+        "a name another action sets is not flagged"
+    );
+}

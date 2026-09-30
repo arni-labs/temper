@@ -366,6 +366,9 @@ mod effects {
             "spawn('Task', 'Create', last_task_id)",
             "spawn('Task', 'Create')",
             "spawn('Task', 'Create', last_task_id, params.task_id)",
+            "spawn('Session', 'Configure', last_session_id, copy(system_prompt, model))",
+            "spawn('Task', 'Create', copy(title))",
+            "spawn('Task', 'Create', last_task_id, params.task_id, copy(title))",
         ] {
             let effect = parse_effect(source).unwrap_or_else(|e| panic!("{source}: {e}"));
             assert_eq!(effect.to_string(), source);
@@ -398,6 +401,11 @@ mod effects {
         for (source, message) in [
             ("items", "expected '=', '+=', '-=' or '('"),
             ("emit('Shipped')", "unknown effect 'emit'"),
+            ("spawn('T', 'A', copy(a, a))", "copy names 'a' twice"),
+            (
+                "spawn('T', 'A', f, params.id, other)",
+                "spawn takes a field, an id and copy(...) at most",
+            ),
             ("trigger('notify')", "unknown effect 'trigger'"),
             ("schedule('A')", "expected ','"),
             ("schedule('A', -1)", "expected a delay"),
