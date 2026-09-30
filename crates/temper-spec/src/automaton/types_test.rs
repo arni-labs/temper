@@ -102,8 +102,8 @@ effect = [
     );
     assert!(matches!(
         &automaton.actions[0].effect[7],
-        Effect::Spawn { entity_type, initial_action, store_id_in: Some(field), id: None }
-            if entity_type == "Child" && initial_action == "Init" && field == "child_id"
+        Effect::Spawn { entity_type, initial_action, store_id_in: Some(field), id: None, copy }
+            if entity_type == "Child" && initial_action == "Init" && field == "child_id" && copy.is_empty()
     ));
 }
 

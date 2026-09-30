@@ -7,7 +7,8 @@
 //!         | "remove_at" "(" ident "," arg ")"
 //!         | "schedule" "(" 'action' "," int ")"
 //!         | "schedule_at" "(" 'action' "," ident ")"
-//!         | "spawn" "(" 'type' "," 'action' [ "," ident [ "," arg ] ] ")" ;
+//!         | "spawn" "(" 'type' "," 'action' [ "," ident [ "," arg ] ] [ "," copy ] ")" ;
+//! copy    = "copy" "(" ident { "," ident } ")" ;
 //! arg     = int | 'string' | "true" | "false" | ident | "params" "." ident ;
 //! ```
 //!
@@ -96,9 +97,11 @@ pub enum Effect {
         /// The entity field holding the timestamp.
         field: String,
     },
-    /// `spawn('Type', 'Action', field, id)`: create a child entity, dispatch
-    /// `Action` on it, and store its id in `field`. The id is `id` (a
-    /// `'string'` or `params.p`) when given and present, otherwise fresh.
+    /// `spawn('Type', 'Action', field, id, copy(a, b))`: create a child
+    /// entity, dispatch `Action` on it, and store its id in `field`. The id is
+    /// `id` (a `'string'` or `params.p`) when given and present, otherwise
+    /// fresh. `Action` receives this action's params, the parent ids and, for
+    /// each name in `copy`, this entity's field of that name.
     Spawn {
         /// The child entity type.
         entity_type: String,
@@ -108,6 +111,8 @@ pub enum Effect {
         store_id_in: Option<String>,
         /// The child's id, when the caller chooses it.
         id: Option<Arg>,
+        /// Fields of this entity handed to the child's initial action.
+        copy: Vec<String>,
     },
 }
 
@@ -180,21 +185,28 @@ impl Parser<'_> {
                 let entity_type = self.string()?;
                 self.expect(&Tok::Comma, "','")?;
                 let initial_action = self.string()?;
-                let store_id_in = if self.eat(&Tok::Comma) {
-                    Some(self.ident()?)
-                } else {
-                    None
-                };
-                let id = if store_id_in.is_some() && self.eat(&Tok::Comma) {
-                    Some(self.arg()?)
-                } else {
-                    None
-                };
+                let mut store_id_in = None;
+                let mut id = None;
+                let mut copy = Vec::new();
+                while self.eat(&Tok::Comma) {
+                    if self.peek_call("copy") {
+                        copy = self.copy_list()?;
+                        break;
+                    }
+                    if store_id_in.is_none() {
+                        store_id_in = Some(self.ident()?);
+                    } else if id.is_none() {
+                        id = Some(self.arg()?);
+                    } else {
+                        return Err(self.error("spawn takes a field, an id and copy(...) at most"));
+                    }
+                }
                 Effect::Spawn {
                     entity_type,
                     initial_action,
                     store_id_in,
                     id,
+                    copy,
                 }
             }
             "emit" | "trigger" => {
@@ -210,6 +222,22 @@ impl Parser<'_> {
         };
         self.expect(&Tok::RParen, "')'")?;
         Ok(effect)
+    }
+
+    /// `copy(a, b, ...)`: one or more distinct field names.
+    fn copy_list(&mut self) -> Result<Vec<String>, ParseError> {
+        self.ident()?; // `copy`
+        self.expect(&Tok::LParen, "'('")?;
+        let mut names = vec![self.ident()?];
+        while self.eat(&Tok::Comma) {
+            let name = self.ident()?;
+            if names.contains(&name) {
+                return Err(self.error(&format!("copy names '{name}' twice")));
+            }
+            names.push(name);
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        Ok(names)
     }
 
     fn string(&mut self) -> Result<String, ParseError> {
@@ -269,6 +297,7 @@ impl fmt::Display for Effect {
                 initial_action,
                 store_id_in,
                 id,
+                copy,
             } => {
                 write!(f, "spawn('{entity_type}', '{initial_action}'")?;
                 if let Some(field) = store_id_in {
@@ -276,6 +305,9 @@ impl fmt::Display for Effect {
                 }
                 if let Some(id) = id {
                     write!(f, ", {id}")?;
+                }
+                if !copy.is_empty() {
+                    write!(f, ", copy({})", copy.join(", "))?;
                 }
                 f.write_str(")")
             }

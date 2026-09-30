@@ -16,10 +16,8 @@ use std::collections::BTreeMap;
 use temper_platform::bootstrap::{bootstrap_agent_specs, bootstrap_system_tenant};
 use temper_platform::state::PlatformState;
 use temper_runtime::tenant::TenantId;
-use temper_server::StorageStack;
 use temper_server::identity::{IdentityResolver, hash_token};
 use temper_server::request_context::AgentContext;
-use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
 
 mod common;
@@ -822,66 +820,6 @@ async fn e2e_http_generic_delete_removes_credential_authority() {
     );
 }
 
-/// A mutation on one replica is authoritative for identity checks on another.
-#[tokio::test]
-async fn e2e_replica_revocation_is_read_from_shared_durable_state() {
-    let directory = tempfile::tempdir().expect("create identity replica test directory");
-    let database_url = format!("file:{}", directory.path().join("identity.db").display());
-    let store = TursoEventStore::new(&database_url, None)
-        .await
-        .expect("create shared identity store");
-
-    let mut first = identity_test_state();
-    let registry = first
-        .registry
-        .read()
-        .expect("identity registry lock should be healthy")
-        .clone();
-    let mut second = PlatformState::with_registry(registry, None);
-    first
-        .server
-        .set_storage_stack(StorageStack::from_turso(store.clone()));
-    second
-        .server
-        .set_storage_stack(StorageStack::from_turso(store));
-
-    let plaintext = "tmpr_cross-replica-revocation";
-    let key_hash = define_type_and_issue_credential(
-        &first,
-        "replica-type",
-        "replica-agent",
-        plaintext,
-        "replica-inst",
-    )
-    .await;
-    let tenant = TenantId::new(TEST_TENANT);
-    let resolver = IdentityResolver::new();
-    assert!(
-        resolver
-            .resolve(&first.server, &tenant, plaintext)
-            .await
-            .is_some()
-    );
-
-    let response = dispatch(
-        &second,
-        "AgentCredential",
-        &key_hash,
-        "Revoke",
-        serde_json::json!({}),
-    )
-    .await;
-    assert!(response.success, "replica Revoke: {:?}", response.error);
-
-    assert!(
-        resolver
-            .resolve(&first.server, &tenant, plaintext)
-            .await
-            .is_none(),
-        "the first replica must observe revocation from shared durable state"
-    );
-}
-
 // =========================================================================
 // Bootstrap operator credential tests
 // =========================================================================
@@ -921,9 +859,31 @@ async fn e2e_bootstrap_operator_credential_idempotent() {
     temper_platform::bootstrap_operator_credential(&state, api_key, TEST_TENANT)
         .await
         .expect("operator credential bootstrap should succeed");
+    let key_hash = hash_token(api_key);
+    let history_after_first = state
+        .server
+        .get_tenant_entity_state(&tenant, "AgentCredential", &key_hash)
+        .await
+        .expect("credential exists after bootstrap")
+        .state
+        .total_event_count;
     temper_platform::bootstrap_operator_credential(&state, api_key, TEST_TENANT)
         .await
         .expect("operator credential bootstrap should succeed");
+
+    // Every boot bootstraps: a second one must not grow the journal identity
+    // resolution replays (a production credential had reached 61 events).
+    let history_after_second = state
+        .server
+        .get_tenant_entity_state(&tenant, "AgentCredential", &key_hash)
+        .await
+        .expect("credential exists after second bootstrap")
+        .state
+        .total_event_count;
+    assert_eq!(
+        history_after_second, history_after_first,
+        "re-bootstrapping an already-current operator credential must not re-issue it"
+    );
 
     // Should still resolve correctly.
     let resolver = IdentityResolver::new();

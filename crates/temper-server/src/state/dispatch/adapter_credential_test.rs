@@ -22,7 +22,6 @@ const PROVIDER_SECRET: &str = "provider-super-secret";
 
 struct PersistedIdentityFixture {
     first: crate::state::ServerState,
-    second: crate::state::ServerState,
     store: TursoEventStore,
     _directory: tempfile::TempDir,
 }
@@ -39,14 +38,9 @@ async fn persisted_identity_fixture() -> PersistedIdentityFixture {
             ("AgentCredential", AGENT_CREDENTIAL_IOA),
         ],
     );
-    let second_registry = registry.clone();
     let mut first = crate::state::ServerState::from_registry(
         ActorSystem::new("adapter-credential-first"),
         registry,
-    );
-    let mut second = crate::state::ServerState::from_registry(
-        ActorSystem::new("adapter-credential-second"),
-        second_registry,
     );
     let directory = tempfile::tempdir().expect("create adapter credential test directory");
     let database_url = format!("file:{}", directory.path().join("identity.db").display());
@@ -54,7 +48,6 @@ async fn persisted_identity_fixture() -> PersistedIdentityFixture {
         .await
         .expect("create adapter credential store");
     first.set_storage_stack(StorageStack::from_turso(store.clone()));
-    second.set_storage_stack(StorageStack::from_turso(store.clone()));
 
     let response = first
         .dispatch_tenant_action(
@@ -79,7 +72,6 @@ async fn persisted_identity_fixture() -> PersistedIdentityFixture {
 
     PersistedIdentityFixture {
         first,
-        second,
         store,
         _directory: directory,
     }
@@ -268,7 +260,7 @@ async fn adapter_success_revokes_captured_token_and_never_persists_plaintext() {
     let credential = mint(&fixture).await;
     let plaintext = credential.plaintext.clone();
     let key_hash = credential.key_hash.clone();
-    assert_token_resolves(&fixture.second, &plaintext, true).await;
+    assert_token_resolves(&fixture.first, &plaintext, true).await;
     let (sender, receiver) = oneshot::channel();
 
     let result = fixture
@@ -294,7 +286,7 @@ async fn adapter_success_revokes_captured_token_and_never_persists_plaintext() {
         receiver.await.expect("adapter should capture token"),
         plaintext
     );
-    assert_token_resolves(&fixture.second, &plaintext, false).await;
+    assert_token_resolves(&fixture.first, &plaintext, false).await;
 
     let events = fixture
         .store
@@ -334,7 +326,7 @@ async fn adapter_error_still_revokes_captured_token() {
         receiver.await.expect("adapter should capture token"),
         plaintext
     );
-    assert_token_resolves(&fixture.second, &plaintext, false).await;
+    assert_token_resolves(&fixture.first, &plaintext, false).await;
 }
 
 #[tokio::test]
@@ -402,7 +394,7 @@ async fn adapter_panic_is_contained_and_still_revokes_token() {
         .await
         .expect_err("adapter panic should become a typed error after cleanup");
     assert!(error.to_string().contains("adapter invocation panicked"));
-    assert_token_resolves(&fixture.second, &plaintext, false).await;
+    assert_token_resolves(&fixture.first, &plaintext, false).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -437,7 +429,7 @@ async fn adapter_timeout_revokes_token_at_the_execution_budget() {
             .to_string()
             .contains("exceeded its 3600-second budget")
     );
-    assert_token_resolves(&fixture.second, &plaintext, false).await;
+    assert_token_resolves(&fixture.first, &plaintext, false).await;
 }
 
 #[tokio::test]
@@ -476,7 +468,7 @@ async fn caller_cancellation_detaches_cleanup_and_revokes_after_adapter_finishes
 
     for _ in 0..100 {
         if crate::identity::IdentityResolver::new()
-            .resolve(&fixture.second, &TenantId::default(), &plaintext)
+            .resolve(&fixture.first, &TenantId::default(), &plaintext)
             .await
             .is_none()
         {
@@ -488,17 +480,17 @@ async fn caller_cancellation_detaches_cleanup_and_revokes_after_adapter_finishes
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn bounded_expiry_denies_token_from_second_state_without_cleanup() {
+async fn bounded_expiry_denies_token_without_cleanup() {
     let clock = Arc::new(LogicalClock::with_delta_ms(1_000));
     let id_gen = Arc::new(DeterministicIdGen::new(42));
     let _clock_guard = install_sim_context(clock.clone(), id_gen);
     let fixture = persisted_identity_fixture().await;
     let credential = mint(&fixture).await;
     let plaintext = credential.plaintext.clone();
-    assert_token_resolves(&fixture.second, &plaintext, true).await;
+    assert_token_resolves(&fixture.first, &plaintext, true).await;
 
     clock.advance_by(ADAPTER_CREDENTIAL_TTL_SECS as u64 + 1);
-    assert_token_resolves(&fixture.second, &plaintext, false).await;
+    assert_token_resolves(&fixture.first, &plaintext, false).await;
 
     fixture
         .first

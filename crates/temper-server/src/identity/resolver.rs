@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
-use crate::entity_actor::{EntityState, recover_authoritative_entity_state_from_store};
+use crate::entity_actor::EntityState;
 use crate::identity::jwt;
 use crate::state::ServerState;
 
@@ -47,12 +47,12 @@ pub struct ResolvedIdentity {
 
 /// Resolves bearer tokens to platform-assigned agent identities.
 ///
-/// Each protected request resolves both the credential and its linked agent
-/// type from authoritative state. Persistent deployments replay the complete
-/// durable journal with strict validation; in-memory deployments read their
-/// sole local actor state. Successful identities are deliberately not cached,
-/// so revocation and type deprecation take effect on the next request even
-/// when another server replica performed the mutation.
+/// Each protected request reads the credential and its linked agent type as
+/// the entities they are, through their actors, the same way sign-out
+/// generations and trusted issuers are read. Successful identities are not
+/// cached, so a revocation or type deprecation takes effect on the next
+/// request to this server. Freshness across several servers is a property of
+/// all entities, not of this one type (ADR-0157 amendment).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IdentityResolver;
 
@@ -91,8 +91,7 @@ impl IdentityResolver {
         // Look up AgentCredential entity. We use the key_hash as entity ID
         // for O(1) lookup — the Issue action must use the key_hash as the
         // entity ID when creating credentials.
-        let credential =
-            authoritative_entity_state(state, tenant, "AgentCredential", &key_hash).await?;
+        let credential = entity_state(state, tenant, "AgentCredential", &key_hash).await?;
 
         // Verify credential is Active.
         if credential.status != "Active" {
@@ -119,8 +118,7 @@ impl IdentityResolver {
         }
 
         // Look up linked AgentType entity.
-        let agent_type =
-            authoritative_entity_state(state, tenant, "AgentType", agent_type_id).await?;
+        let agent_type = entity_state(state, tenant, "AgentType", agent_type_id).await?;
 
         // Verify AgentType is Active.
         if agent_type.status != "Active" {
@@ -140,8 +138,7 @@ impl IdentityResolver {
         // read at which both were active; without it, a revocation or link
         // change between the two reads could assemble a mixed-time identity
         // that never existed.
-        let credential_recheck =
-            authoritative_entity_state(state, tenant, "AgentCredential", &key_hash).await?;
+        let credential_recheck = entity_state(state, tenant, "AgentCredential", &key_hash).await?;
         if !same_credential_authority(&credential, &credential_recheck) {
             tracing::warn!(
                 tenant = %tenant,
@@ -173,7 +170,7 @@ impl IdentityResolver {
 
     /// JWT path: verify an ES256 token against its registered `TrustedIssuer`,
     /// then map verified claims to an identity. No caching — every call
-    /// re-reads authoritative state, matching the credential path.
+    /// re-reads current entity state, matching the credential path.
     async fn resolve_jwt(
         &self,
         state: &ServerState,
@@ -321,43 +318,30 @@ fn same_credential_authority(first: &EntityState, second: &EntityState) -> bool 
         && first.fields == second.fields
 }
 
-async fn authoritative_entity_state(
+/// An identity entity's current state, read like any other entity, or None
+/// when it does not exist. The existence check comes first because reading
+/// spawns an actor on demand, and the id here comes from a caller's token.
+async fn entity_state(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
     entity_id: &str,
 ) -> Option<EntityState> {
-    let Some((store, backend)) = state.event_journal() else {
-        return state
-            .get_tenant_entity_state(tenant, entity_type, entity_id)
-            .await
-            .ok()
-            .map(|response| response.state);
-    };
-
-    let table = state.registry.read().ok()?.get_table(tenant, entity_type)?;
-    let initial_fields = serde_json::json!({});
-    match recover_authoritative_entity_state_from_store(
-        tenant.as_str(),
-        entity_type,
-        entity_id,
-        table.as_ref(),
-        &store,
-        backend,
-        &initial_fields,
-        None,
-    )
-    .await
+    if !state.entity_exists(tenant, entity_type, entity_id) {
+        return None;
+    }
+    match state
+        .get_tenant_entity_state(tenant, entity_type, entity_id)
+        .await
     {
-        Ok(entity) if entity.total_event_count > 0 => Some(entity),
-        Ok(_) => None,
+        Ok(response) => Some(response.state),
         Err(error) => {
             tracing::warn!(
                 tenant = %tenant,
                 entity_type,
                 entity_id,
                 %error,
-                "authoritative identity state replay failed closed"
+                "identity state read failed closed"
             );
             None
         }

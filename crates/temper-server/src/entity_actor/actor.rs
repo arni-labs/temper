@@ -968,12 +968,12 @@ pub(crate) async fn recover_entity_state_from_store(
     Ok(state)
 }
 
-/// Rebuild security-sensitive state from the complete durable journal.
-///
-/// This intentionally ignores snapshots and fails closed on read errors,
-/// sequence gaps, incompatible events, or history after a terminal tombstone.
-/// Identity resolution uses this path so a stale or corrupt snapshot cannot
-/// preserve revoked authority.
+/// Rebuild state from the complete durable journal, ignoring snapshots and
+/// failing closed on read errors, sequence gaps, incompatible events, or
+/// history after a terminal tombstone. Tests use it as the strict reference
+/// a live actor's state must agree with. (Identity resolution used it on
+/// every request until credentials were read as ordinary entities.)
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover_authoritative_entity_state_from_store(
     tenant: &str,

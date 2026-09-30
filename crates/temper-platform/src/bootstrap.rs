@@ -601,6 +601,21 @@ pub async fn bootstrap_operator_credential(
     let key_hash = hash_token(api_key);
     let key_prefix = api_key.chars().take(8).collect::<String>();
 
+    // Issue is a self-transition on an Active credential, so re-issuing at
+    // every boot appended one more event to the journal identity resolution
+    // replays (61 on a production credential). A credential that is already
+    // active and linked to this operator is left as it is.
+    if operator_credential_is_current(state, &tenant_id, &key_hash, agent_type_id, instance_id)
+        .await
+    {
+        crate::operator_manage_policies::seed_operator_manage_policies(state, tenant).await;
+        tracing::info!(
+            "Operator credential already current for tenant '{tenant}' (key_hash={}...)",
+            &key_hash[..8]
+        );
+        return Ok(());
+    }
+
     state
         .server
         .dispatch_tenant_action(
@@ -631,6 +646,38 @@ pub async fn bootstrap_operator_credential(
         &key_hash[..8]
     );
     Ok(())
+}
+
+/// Whether the operator credential for `key_hash` exists, is Active and is
+/// bound to this key and operator identity, so issuing it again would change
+/// nothing but the length of its journal.
+async fn operator_credential_is_current(
+    state: &PlatformState,
+    tenant_id: &temper_runtime::tenant::TenantId,
+    key_hash: &str,
+    agent_type_id: &str,
+    instance_id: &str,
+) -> bool {
+    if !state
+        .server
+        .entity_exists(tenant_id, "AgentCredential", key_hash)
+    {
+        return false;
+    }
+    let Ok(response) = state
+        .server
+        .get_tenant_entity_state(tenant_id, "AgentCredential", key_hash)
+        .await
+    else {
+        return false;
+    };
+    let fields = &response.state.fields;
+    let field = |name: &str| fields.get(name).and_then(serde_json::Value::as_str);
+    response.state.status == "Active"
+        && field("key_hash") == Some(key_hash)
+        && field("agent_type_id") == Some(agent_type_id)
+        && field("agent_instance_id") == Some(instance_id)
+        && field("expires_at").is_none_or(str::is_empty)
 }
 
 /// Outcome of [`bootstrap_trusted_issuer_from_env`].

@@ -50,6 +50,7 @@ pub enum ResolvedEffect {
         initial_action: String,
         store_id_in: Option<String>,
         id: Option<Arg>,
+        copy: Vec<String>,
     },
 }
 
@@ -154,11 +155,13 @@ fn resolve_effect(effect: &Effect, kinds: &BTreeMap<&str, VarKind>) -> ResolvedE
             initial_action,
             store_id_in,
             id,
+            copy,
         } => ResolvedEffect::Spawn {
             entity_type,
             initial_action,
             store_id_in,
             id,
+            copy,
         },
     }
 }

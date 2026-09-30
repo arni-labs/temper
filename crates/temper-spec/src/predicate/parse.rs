@@ -177,6 +177,11 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos).map(|(tok, _)| tok)
     }
 
+    /// Whether the next tokens are `name(`.
+    pub(super) fn peek_call(&self, name: &str) -> bool {
+        self.peek_keyword(name) && matches!(self.tokens.get(self.pos + 1), Some((Tok::LParen, _)))
+    }
+
     fn peek_keyword(&self, keyword: &str) -> bool {
         matches!(self.peek(), Some(Tok::Ident(name)) if name == keyword)
     }

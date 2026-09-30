@@ -198,11 +198,13 @@ fn convert_effect(effect: ResolvedEffect) -> Effect {
             initial_action,
             store_id_in,
             id,
+            copy,
         } => Effect::SpawnEntity {
             entity_type,
             initial_action,
             store_id_in,
             id,
+            copy,
         },
     }
 }
@@ -386,6 +388,7 @@ effect = ["spawn('SubTask', 'Begin', subtask_id)"]
                 initial_action: "Begin".into(),
                 store_id_in: Some("subtask_id".into()),
                 id: None,
+                copy: Vec::new(),
             }),
             "expected SpawnEntity effect, got: {:?}",
             rule.effects
