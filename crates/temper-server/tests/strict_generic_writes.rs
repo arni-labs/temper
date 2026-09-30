@@ -437,7 +437,7 @@ params = ["system_prompt", "model"]
 name = "Fire"
 from = ["Configured"]
 to = "Fired"
-params = ["run"]
+params = ["run", "model"]
 effect = ["spawn('Session', 'Start', session_id, params.run, copy(system_prompt, model))"]
 "#;
     let child = r#"
@@ -471,7 +471,8 @@ params = ["system_prompt", "model"]
             "Configure",
             json!({"system_prompt":"be brief","model":"m-1"}),
         ),
-        ("Fire", json!({"run":"session-1"})),
+        // Fire sets a new model; the child must get it, not the old field.
+        ("Fire", json!({"run":"session-1","model":"m-2"})),
     ] {
         state
             .dispatch_tenant_action(&tenant, "Job", "job", action, params, &Default::default())
@@ -493,7 +494,10 @@ params = ["system_prompt", "model"]
     .await
     .expect("spawned session did not start");
     assert_eq!(session.state.fields["system_prompt"], "be brief");
-    assert_eq!(session.state.fields["model"], "m-1");
+    assert_eq!(
+        session.state.fields["model"], "m-2",
+        "a value the spawning action sets wins over the copied field"
+    );
     let job = state
         .get_tenant_entity_state(&tenant, "Job", "job")
         .await

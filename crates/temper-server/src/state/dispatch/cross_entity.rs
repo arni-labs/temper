@@ -179,9 +179,13 @@ impl crate::state::ServerState {
                         return;
                     }
                     let initializer = if let Some(action) = initial_action {
-                        let mut params = parent_params.as_object().cloned().unwrap_or_default();
+                        // Copied parent fields fill in what this action's own
+                        // params do not carry; a param wins, so a value the
+                        // spawning action just set is never overwritten by the
+                        // field as it stood before the action.
+                        let mut params = copied_fields;
+                        params.extend(parent_params.as_object().cloned().unwrap_or_default());
                         params.extend(parent_fields.clone());
-                        params.extend(copied_fields);
                         match state.prepare_generated_action_params(
                             &t,
                             &child_type,
