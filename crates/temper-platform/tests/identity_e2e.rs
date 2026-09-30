@@ -928,10 +928,14 @@ async fn e2e_bootstrap_operator_credential_idempotent_across_restart() {
         "first boot must persist the credential"
     );
 
+    // The restarted server opens the database afresh, as a new process would.
+    let reopened_store = temper_store_turso::TursoEventStore::new(&database_url, None)
+        .await
+        .expect("reopen identity store");
     let mut restarted = identity_test_state();
     restarted
         .server
-        .set_storage_stack(temper_server::StorageStack::from_turso(store.clone()));
+        .set_storage_stack(temper_server::StorageStack::from_turso(reopened_store));
     temper_platform::bootstrap_operator_credential(&restarted, api_key, TEST_TENANT)
         .await
         .expect("restarted boot bootstraps the operator credential");
