@@ -129,8 +129,10 @@ positive cache is not compatible with this boundary.
 
 **Amendment: identity reads (2026-09-29).** The credential and its agent type
 are now read the way every other entity is, through their actors, after an
-existence check so a caller's token cannot spawn one. The full journal replay
-per read is removed. In production it replayed one operator credential's 61
+existence check so a caller's token cannot spawn one. A credential this server
+has not loaded since it started (after a restart, or one another server wrote)
+is found in the durable store once and then served from its actor. The full
+journal replay per read is removed. In production it replayed one operator credential's 61
 events three times per request, about two million replayed events an hour, and
 contributed to database connection waits on the shared store; the credential's
 journal also grew by one `Issue` event per boot, which bootstrap no longer

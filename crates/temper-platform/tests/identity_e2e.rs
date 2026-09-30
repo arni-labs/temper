@@ -896,6 +896,62 @@ async fn e2e_bootstrap_operator_credential_idempotent() {
     assert!(identity.verified);
 }
 
+/// A restarted server finds the operator credential in the store: it does not
+/// issue it again, and the operator key still resolves.
+#[tokio::test]
+async fn e2e_bootstrap_operator_credential_idempotent_across_restart() {
+    use temper_runtime::persistence::EventStore;
+
+    let directory = tempfile::tempdir().expect("create identity store directory");
+    let database_url = format!("file:{}", directory.path().join("identity.db").display());
+    let store = temper_store_turso::TursoEventStore::new(&database_url, None)
+        .await
+        .expect("create identity store");
+    let api_key = "tmpr_restart-bootstrap-test";
+    let tenant = TenantId::new(TEST_TENANT);
+    let persistence_id = format!("{TEST_TENANT}:AgentCredential:{}", hash_token(api_key));
+
+    let mut first = identity_test_state();
+    first
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_turso(store.clone()));
+    temper_platform::bootstrap_operator_credential(&first, api_key, TEST_TENANT)
+        .await
+        .expect("first boot bootstraps the operator credential");
+    let journal_after_first = store
+        .read_events(&persistence_id, 0)
+        .await
+        .expect("read credential journal")
+        .len();
+    assert!(
+        journal_after_first > 0,
+        "first boot must persist the credential"
+    );
+
+    let mut restarted = identity_test_state();
+    restarted
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_turso(store.clone()));
+    temper_platform::bootstrap_operator_credential(&restarted, api_key, TEST_TENANT)
+        .await
+        .expect("restarted boot bootstraps the operator credential");
+    let journal_after_restart = store
+        .read_events(&persistence_id, 0)
+        .await
+        .expect("read credential journal")
+        .len();
+    assert_eq!(
+        journal_after_restart, journal_after_first,
+        "a restart must not re-issue a current operator credential"
+    );
+
+    let identity = IdentityResolver::new()
+        .resolve(&restarted.server, &tenant, api_key)
+        .await
+        .expect("operator credential should resolve after a restart");
+    assert_eq!(identity.agent_instance_id, "operator");
+}
+
 /// Identity resolution is tenant-scoped.
 #[tokio::test]
 async fn e2e_identity_resolution_is_tenant_scoped() {

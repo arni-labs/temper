@@ -22,6 +22,9 @@ const PROVIDER_SECRET: &str = "provider-super-secret";
 
 struct PersistedIdentityFixture {
     first: crate::state::ServerState,
+    /// A second server on the same store that has loaded nothing yet, as after
+    /// a restart.
+    second: crate::state::ServerState,
     store: TursoEventStore,
     _directory: tempfile::TempDir,
 }
@@ -38,9 +41,14 @@ async fn persisted_identity_fixture() -> PersistedIdentityFixture {
             ("AgentCredential", AGENT_CREDENTIAL_IOA),
         ],
     );
+    let second_registry = registry.clone();
     let mut first = crate::state::ServerState::from_registry(
         ActorSystem::new("adapter-credential-first"),
         registry,
+    );
+    let mut second = crate::state::ServerState::from_registry(
+        ActorSystem::new("adapter-credential-second"),
+        second_registry,
     );
     let directory = tempfile::tempdir().expect("create adapter credential test directory");
     let database_url = format!("file:{}", directory.path().join("identity.db").display());
@@ -48,6 +56,7 @@ async fn persisted_identity_fixture() -> PersistedIdentityFixture {
         .await
         .expect("create adapter credential store");
     first.set_storage_stack(StorageStack::from_turso(store.clone()));
+    second.set_storage_stack(StorageStack::from_turso(store.clone()));
 
     let response = first
         .dispatch_tenant_action(
@@ -72,6 +81,7 @@ async fn persisted_identity_fixture() -> PersistedIdentityFixture {
 
     PersistedIdentityFixture {
         first,
+        second,
         store,
         _directory: directory,
     }
@@ -254,6 +264,34 @@ impl AgentAdapter for BlockingAdapter {
     }
 }
 
+/// A credential this server has not loaded since it started (after a restart,
+/// or one written by another server on the same store) still resolves, and an
+/// unknown token does not.
+#[tokio::test]
+async fn credential_resolves_on_a_server_that_has_not_loaded_it() {
+    let fixture = persisted_identity_fixture().await;
+    let credential = mint(&fixture).await;
+
+    assert!(
+        !fixture.second.entity_exists(
+            &TenantId::default(),
+            "AgentCredential",
+            &credential.key_hash
+        ),
+        "the second server must start without the credential in memory"
+    );
+    assert_token_resolves(&fixture.second, &credential.plaintext, true).await;
+    assert_token_resolves(&fixture.second, "tmpr_not-a-real-token", false).await;
+    assert!(
+        !fixture.second.entity_exists(
+            &TenantId::default(),
+            "AgentCredential",
+            &crate::identity::hash_token("tmpr_not-a-real-token")
+        ),
+        "an unknown token must not create a credential entity"
+    );
+}
+
 #[tokio::test]
 async fn adapter_success_revokes_captured_token_and_never_persists_plaintext() {
     let fixture = persisted_identity_fixture().await;
@@ -287,6 +325,7 @@ async fn adapter_success_revokes_captured_token_and_never_persists_plaintext() {
         plaintext
     );
     assert_token_resolves(&fixture.first, &plaintext, false).await;
+    assert_token_resolves(&fixture.second, &plaintext, false).await;
 
     let events = fixture
         .store
@@ -480,17 +519,17 @@ async fn caller_cancellation_detaches_cleanup_and_revokes_after_adapter_finishes
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn bounded_expiry_denies_token_without_cleanup() {
+async fn bounded_expiry_denies_token_from_second_state_without_cleanup() {
     let clock = Arc::new(LogicalClock::with_delta_ms(1_000));
     let id_gen = Arc::new(DeterministicIdGen::new(42));
     let _clock_guard = install_sim_context(clock.clone(), id_gen);
     let fixture = persisted_identity_fixture().await;
     let credential = mint(&fixture).await;
     let plaintext = credential.plaintext.clone();
-    assert_token_resolves(&fixture.first, &plaintext, true).await;
+    assert_token_resolves(&fixture.second, &plaintext, true).await;
 
     clock.advance_by(ADAPTER_CREDENTIAL_TTL_SECS as u64 + 1);
-    assert_token_resolves(&fixture.first, &plaintext, false).await;
+    assert_token_resolves(&fixture.second, &plaintext, false).await;
 
     fixture
         .first
