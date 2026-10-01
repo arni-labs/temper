@@ -618,6 +618,9 @@ impl crate::state::ServerState {
             tracing::error!(tenant = %ctx.tenant, entity_type = ctx.entity_type,
                 entity_id = ctx.entity_id, action = ctx.action, %error,
                 "Committed transition projection failed; dependents not started");
+            // The journal is committed: hand the projection to the retrying
+            // queue so reads catch up once the store recovers.
+            self.apply_query_projection_update(ctx, &response).await;
             let mut response = response;
             response.success = false;
             response.error = Some(format!(
