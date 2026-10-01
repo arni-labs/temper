@@ -61,6 +61,16 @@ pub(crate) fn parse_effect_value(
     effects: &mut Vec<Effect>,
 ) -> Result<(), AutomatonParseError> {
     match value {
+        // Some specs quoted the whole effect array as one string.
+        Value::String(text) if text.trim_start().starts_with('[') => {
+            let quoted: toml::Table = format!("v = {text}").parse().map_err(|e| {
+                AutomatonParseError::Validation(format!("invalid effect '{text}': {e}"))
+            })?;
+            match quoted.get("v") {
+                Some(inner @ Value::Array(_)) => parse_effect_value(inner, effects)?,
+                _ => return Err(invalid_effect_value(value)),
+            }
+        }
         Value::String(text) => effects.push(parse_string_effect(text)?),
         Value::Array(entries) => {
             for entry in entries {
