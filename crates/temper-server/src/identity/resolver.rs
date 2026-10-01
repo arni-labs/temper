@@ -321,13 +321,20 @@ fn same_credential_authority(first: &EntityState, second: &EntityState) -> bool 
 /// An identity entity's current state, read like any other entity, or None
 /// when it does not exist. The existence check comes first because reading
 /// spawns an actor on demand, and the id here comes from a caller's token.
+/// An entity this server has not loaded since it started (after a restart,
+/// or one written by another server) is found in the durable store once and
+/// then served from its actor.
 async fn entity_state(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
     entity_id: &str,
 ) -> Option<EntityState> {
-    if !state.entity_exists(tenant, entity_type, entity_id) {
+    if !state.entity_exists(tenant, entity_type, entity_id)
+        && !state
+            .ensure_entity_loaded(tenant, entity_type, entity_id)
+            .await
+    {
         return None;
     }
     match state

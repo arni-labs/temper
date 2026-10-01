@@ -658,9 +658,12 @@ async fn operator_credential_is_current(
     agent_type_id: &str,
     instance_id: &str,
 ) -> bool {
+    // Bootstrap runs before this server has loaded any credential, so the
+    // store decides whether one exists.
     if !state
         .server
-        .entity_exists(tenant_id, "AgentCredential", key_hash)
+        .ensure_entity_loaded(tenant_id, "AgentCredential", key_hash)
+        .await
     {
         return false;
     }
