@@ -129,11 +129,8 @@ fn populate_registry_merges_csdl_fragments_from_all_restored_rows() {
     );
 }
 
-#[test]
-fn populate_registry_skips_a_stored_spec_that_no_longer_parses() {
-    let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml").to_string();
-    // A spec stored before the predicate grammar: an old-syntax guard table.
-    let legacy_ioa = r#"
+/// A spec stored before the predicate grammar: an old-syntax guard table.
+const LEGACY_TASK_IOA: &str = r#"
 [automaton]
 name = "Task"
 states = ["Open", "Done"]
@@ -149,8 +146,12 @@ name = "Finish"
 from = ["Open"]
 to = "Done"
 guard = [{ type = "is_true", var = "ready" }]
-"#
-    .to_string();
+"#;
+
+#[test]
+fn populate_registry_converts_a_stored_spec_in_the_old_syntax() {
+    let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml").to_string();
+    let legacy_ioa = LEGACY_TASK_IOA.to_string();
     let rows = vec![
         MockSpecRow {
             entity_type: "Order".to_string(),
@@ -181,12 +182,129 @@ guard = [{ type = "is_true", var = "ready" }]
     .expect("one bad stored spec must not fail the restore");
 
     let tenant = TenantId::new("default");
-    assert_eq!(restored, 1);
+    assert_eq!(restored, 2);
     assert!(registry.get_table(&tenant, "Order").is_some());
     assert!(
-        registry.get_table(&tenant, "Task").is_none(),
-        "the unparseable spec is skipped"
+        registry.get_table(&tenant, "Task").is_some(),
+        "a stored spec in the old syntax is converted, not dropped"
     );
+}
+
+/// A stored spec that neither parses nor converts.
+const UNREADABLE_IOA: &str = "[automaton]\nname = \"Broken\"\nstates = [\n";
+
+#[test]
+fn populate_registry_skips_a_stored_spec_that_cannot_be_read() {
+    let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml").to_string();
+    let rows = vec![
+        MockSpecRow {
+            entity_type: "Order".to_string(),
+            ioa_source: order_ioa,
+            csdl_xml: csdl_xml_for("Order", "Orders"),
+            status: "passed".to_string(),
+            verified: true,
+        },
+        MockSpecRow {
+            entity_type: "Broken".to_string(),
+            ioa_source: UNREADABLE_IOA.to_string(),
+            csdl_xml: csdl_xml_for("Broken", "Brokens"),
+            status: "passed".to_string(),
+            verified: true,
+        },
+    ];
+    let mut grouped = BTreeMap::new();
+    grouped.insert("default".to_string(), rows);
+    let mut registry = SpecRegistry::new();
+
+    let restored = populate_registry(
+        &mut registry,
+        grouped,
+        &mut BTreeMap::new(),
+        |row| Some(row.csdl_xml.clone()),
+        |row| (row.entity_type.clone(), row.ioa_source.clone()),
+    )
+    .expect("one unreadable stored spec must not fail the restore");
+
+    let tenant = TenantId::new("default");
+    assert_eq!(restored, 1);
+    assert!(registry.get_table(&tenant, "Order").is_some());
+    assert!(registry.get_table(&tenant, "Broken").is_none());
+}
+
+/// The platform-store restore TemperPaw runs at boot: an old-syntax spec is
+/// converted, registered and written back committed, so the next boot reads
+/// it as stored; an unreadable spec stays in the store and only its own type
+/// is unavailable; the rest of the tenant restores.
+#[tokio::test]
+async fn platform_store_restore_converts_old_syntax_and_keeps_unreadable_specs() {
+    use crate::platform_store::{PlatformStore, SimPlatformStore};
+
+    let store = SimPlatformStore::no_faults(7);
+    let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml");
+    let rows = [
+        (
+            "Order",
+            order_ioa.to_string(),
+            csdl_xml_for("Order", "Orders"),
+        ),
+        (
+            "Task",
+            LEGACY_TASK_IOA.to_string(),
+            csdl_xml_for("Task", "Tasks"),
+        ),
+        (
+            "Broken",
+            UNREADABLE_IOA.to_string(),
+            csdl_xml_for("Broken", "Brokens"),
+        ),
+    ];
+    for (entity_type, ioa, csdl) in &rows {
+        let hash = temper_store_turso::spec_content_hash(ioa);
+        store
+            .upsert_spec("default", entity_type, ioa, csdl, &hash)
+            .await
+            .expect("seed spec");
+    }
+    store
+        .commit_specs("default")
+        .await
+        .expect("commit seed specs");
+
+    let mut registry = SpecRegistry::new();
+    let restored = restore_registry_from_platform_store(&mut registry, &store)
+        .await
+        .expect("restore");
+
+    let tenant = TenantId::new("default");
+    assert_eq!(restored, 2);
+    assert!(registry.get_table(&tenant, "Order").is_some());
+    assert!(registry.get_table(&tenant, "Task").is_some());
+    assert!(registry.get_table(&tenant, "Broken").is_none());
+
+    let stored: BTreeMap<String, crate::platform_store::SpecRow> = store
+        .load_specs()
+        .await
+        .expect("load specs")
+        .into_iter()
+        .map(|row| (row.entity_type.clone(), row))
+        .collect();
+    let task = stored
+        .get("Task")
+        .expect("converted spec is still stored and committed");
+    assert!(
+        temper_spec::automaton::parse_automaton(&task.ioa_source).is_ok(),
+        "the stored Task spec is now in the current syntax"
+    );
+    assert_eq!(
+        task.content_hash,
+        temper_store_turso::spec_content_hash(&task.ioa_source)
+    );
+    assert_eq!(
+        stored.get("Broken").map(|row| row.ioa_source.as_str()),
+        Some(UNREADABLE_IOA),
+        "an unreadable spec is kept as stored, not deleted"
+    );
+    assert!(stored.contains_key("Order"));
 }
 
 #[test]

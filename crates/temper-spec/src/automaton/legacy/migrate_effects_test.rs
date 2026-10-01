@@ -294,3 +294,99 @@ to = "B"
     assert!(effects(&source, "Submit").is_empty());
     assert_eq!(notes.len(), 2, "{notes:?}");
 }
+
+#[test]
+fn a_string_variable_that_is_appended_to_becomes_a_list() {
+    let source = r#"
+[automaton]
+name = "Q"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "job_ids"
+type = "string"
+initial = "[]"
+
+[[state]]
+name = "label"
+type = "string"
+initial = ""
+
+[[action]]
+name = "RecordJob"
+from = ["Open"]
+params = ["job_ids"]
+effect = [{ type = "list_append", var = "job_ids" }]
+"#;
+    let migration = migrate_source(source).unwrap_or_else(|e| panic!("{e}"));
+    let automaton = parse_automaton(&migration.source).expect("converted spec parses");
+    let job_ids = automaton
+        .state
+        .iter()
+        .find(|var| var.name == "job_ids")
+        .expect("job_ids declared");
+    assert_eq!(job_ids.var_type, crate::automaton::VarType::List);
+    let label = automaton
+        .state
+        .iter()
+        .find(|var| var.name == "label")
+        .expect("label declared");
+    assert_eq!(
+        label.var_type,
+        crate::automaton::VarType::String,
+        "a string nothing appends to stays a string"
+    );
+    assert_eq!(
+        effects(&migration.source, "RecordJob"),
+        ["append(job_ids, params.job_ids)"]
+    );
+}
+
+#[test]
+fn a_nested_not_trigger_guard_converts() {
+    let (source, _) = migrate(
+        r#"
+[[action]]
+name = "Go"
+from = ["A"]
+to = "B"
+
+[[action.triggers]]
+name = "tell_parent"
+kind = "entity"
+target_entity = "Parent"
+target_action = "Done"
+
+[action.triggers.guard]
+type = "not"
+
+[action.triggers.guard.guard]
+type = "field_equals"
+field = "parent_id"
+value = ""
+
+[action.triggers.resolve_target]
+type = "field"
+field = "parent_id"
+"#,
+    );
+    assert!(
+        source.contains(r#"guard = "parent_id != ''""#),
+        "the inner guard must survive conversion:\n{source}"
+    );
+}
+
+#[test]
+fn an_effect_array_quoted_as_one_string_converts() {
+    let (source, _) = migrate(
+        r#"
+[[action]]
+name = "Go"
+from = ["A"]
+to = "B"
+effect = '[{ type = "increment", var = "items" }, { type = "set_bool", var = "ready", value = true }]'
+"#,
+    );
+    assert_eq!(effects(&source, "Go"), ["items += 1", "ready = true"]);
+}

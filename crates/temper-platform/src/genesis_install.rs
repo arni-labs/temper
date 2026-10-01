@@ -20,6 +20,7 @@ mod blob_materialization;
 mod bundle_transport;
 mod bundles;
 mod cache_paths;
+mod legacy_specs;
 mod object_lookup;
 use blob_materialization::{
     MAX_GENESIS_TREE_CANONICAL_BYTES, blob_content_len, canonical_field_len, git_object_body,
@@ -199,6 +200,7 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
             };
             match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
                 Ok(_) => {
+                    legacy_specs::convert_legacy_bundle_specs(&cache_root);
                     add_os_apps_dir_preferred(cache_root);
                     restored += 1;
                 }
@@ -314,6 +316,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         };
         match materialized {
             Ok(_) => {
+                legacy_specs::convert_legacy_bundle_specs(&cache_root);
                 add_os_apps_dir_preferred(cache_root);
                 restored += 1;
             }
