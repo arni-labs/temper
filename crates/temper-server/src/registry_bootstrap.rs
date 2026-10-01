@@ -474,6 +474,11 @@ fn read_stored_spec(tenant: &str, entity_type: &str, ioa_source: &str) -> Stored
 
 /// Write converted specs back so the conversion happens once. A failed write
 /// only means the next boot converts the stored source again.
+///
+/// Writing a new source resets the row's verification, and nothing re-verifies
+/// a restored spec, so its entity type would refuse writes (423). The
+/// conversion keeps the spec's meaning, so a spec that was verified as stored
+/// stays verified as converted, as the kernel already trusts prebuilt bundles.
 async fn persist_converted_specs(
     store: &dyn crate::platform_store::PlatformStore,
     tenant: &str,
@@ -482,6 +487,14 @@ async fn persist_converted_specs(
     if converted.is_empty() {
         return;
     }
+    let verified_before = store
+        .load_verification_cache(tenant)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(tenant, %error, "failed to read verification before converting specs");
+            BTreeMap::new()
+        });
+    let mut carry_verification = Vec::new();
     for (row, source) in converted {
         let hash = temper_store_turso::spec_content_hash(source);
         let csdl_xml = row.csdl_xml.as_deref().unwrap_or_default();
@@ -490,6 +503,31 @@ async fn persist_converted_specs(
             .await
         {
             tracing::warn!(tenant, entity_type = %row.entity_type, %error, "failed to store converted spec");
+            continue;
+        }
+        if verified_before
+            .get(&row.entity_type)
+            .is_some_and(|(cached_hash, verified)| *verified && *cached_hash == row.content_hash)
+        {
+            carry_verification.push(row.entity_type.as_str());
+        }
+    }
+    for entity_type in carry_verification {
+        if let Err(error) = store
+            .persist_spec_verification(
+                tenant,
+                entity_type,
+                crate::platform_store::SpecVerificationUpdate {
+                    status: "completed",
+                    verified: true,
+                    levels_passed: None,
+                    levels_total: None,
+                    verification_result_json: None,
+                },
+            )
+            .await
+        {
+            tracing::warn!(tenant, entity_type, %error, "failed to carry verification to converted spec");
         }
     }
     // upsert_spec marks a changed row uncommitted, and uncommitted rows are

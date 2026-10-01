@@ -369,3 +369,79 @@ fn row_to_registry_status_failed() {
         other => panic!("Expected Restored, got {other:?}"),
     }
 }
+
+/// Converting a stored spec rewrites its row, which resets verification; a spec
+/// that was verified as stored must stay verified as converted, or its entity
+/// type refuses writes after the upgrade. One that was not verified stays so.
+#[tokio::test]
+async fn converted_specs_keep_their_verification() {
+    use crate::platform_store::{PlatformStore, SpecVerificationUpdate};
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let url = format!("file:{}", directory.path().join("specs.db").display());
+    let store = temper_store_turso::TursoEventStore::new(&url, None)
+        .await
+        .expect("turso store");
+    let unverified_ioa = LEGACY_TASK_IOA.replace("name = \"Task\"", "name = \"Draft\"");
+    for (entity_type, ioa, set) in [
+        ("Task", LEGACY_TASK_IOA, "Tasks"),
+        ("Draft", unverified_ioa.as_str(), "Drafts"),
+    ] {
+        let hash = temper_store_turso::spec_content_hash(ioa);
+        PlatformStore::upsert_spec(
+            &store,
+            "default",
+            entity_type,
+            ioa,
+            &csdl_xml_for(entity_type, set),
+            &hash,
+        )
+        .await
+        .expect("seed spec");
+    }
+    PlatformStore::commit_specs(&store, "default")
+        .await
+        .expect("commit");
+    PlatformStore::persist_spec_verification(
+        &store,
+        "default",
+        "Task",
+        SpecVerificationUpdate {
+            status: "completed",
+            verified: true,
+            levels_passed: None,
+            levels_total: None,
+            verification_result_json: None,
+        },
+    )
+    .await
+    .expect("verify Task");
+
+    let mut registry = SpecRegistry::new();
+    let restored = restore_registry_from_platform_store(&mut registry, &store)
+        .await
+        .expect("restore");
+    assert_eq!(restored, 2);
+
+    let rows: BTreeMap<String, crate::platform_store::SpecRow> = PlatformStore::load_specs(&store)
+        .await
+        .expect("load specs")
+        .into_iter()
+        .map(|row| (row.entity_type.clone(), row))
+        .collect();
+    let cache = PlatformStore::load_verification_cache(&store, "default")
+        .await
+        .expect("verification cache");
+    let task = rows.get("Task").expect("Task stored");
+    assert!(temper_spec::automaton::parse_automaton(&task.ioa_source).is_ok());
+    assert_eq!(
+        cache.get("Task"),
+        Some(&(task.content_hash.clone(), true)),
+        "a verified spec stays verified under its converted source"
+    );
+    assert_eq!(
+        cache.get("Draft").map(|(_, verified)| *verified),
+        Some(false),
+        "an unverified spec is not marked verified by the conversion"
+    );
+}
