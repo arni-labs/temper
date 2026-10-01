@@ -177,24 +177,19 @@ fn populate_registry<R: SpecRowLike>(
             continue;
         };
 
-        // A stored spec that no longer parses (for example, one still in the
-        // old predicate syntax) disables only its own entity type, not the
-        // tenant or the server.
+        // A stored spec in the old predicate syntax is converted in memory; one
+        // that still cannot be read disables only its own entity type, not
+        // the tenant or the server.
         let ioa_owned: Vec<(String, String)> = tenant_rows
             .iter()
             .map(&get_ioa)
-            .filter(|(entity_type, ioa)| match temper_spec::automaton::parse_automaton(ioa) {
-                Ok(_) => true,
-                Err(error) => {
-                    tracing::error!(
-                        tenant = %tenant,
-                        entity_type = %entity_type,
-                        %error,
-                        "skipping stored spec that does not parse; convert it with `temper migrate-predicates` and redeploy"
-                    );
-                    false
-                }
-            })
+            .filter_map(
+                |(entity_type, ioa)| match read_stored_spec(&tenant, &entity_type, &ioa) {
+                    StoredSpec::Current => Some((entity_type, ioa)),
+                    StoredSpec::Converted(source) => Some((entity_type, source)),
+                    StoredSpec::Unreadable => None,
+                },
+            )
             .collect();
         let ioa_pairs: Vec<(&str, &str)> = ioa_owned
             .iter()
@@ -382,9 +377,26 @@ pub async fn restore_registry_from_platform_store(
             }
         };
 
-        let ioa_pairs: Vec<(&str, &str)> = tenant_rows
+        // Specs stored by an earlier kernel in the old predicate syntax are
+        // converted here, once, and written back. One that still cannot be
+        // read disables only its own entity type and stays in the store.
+        let mut readable: Vec<(String, String)> = Vec::with_capacity(tenant_rows.len());
+        let mut converted: Vec<(&crate::platform_store::SpecRow, String)> = Vec::new();
+        for row in tenant_rows {
+            match read_stored_spec(tenant, &row.entity_type, &row.ioa_source) {
+                StoredSpec::Current => {
+                    readable.push((row.entity_type.clone(), row.ioa_source.clone()));
+                }
+                StoredSpec::Converted(source) => {
+                    readable.push((row.entity_type.clone(), source.clone()));
+                    converted.push((row, source));
+                }
+                StoredSpec::Unreadable => {}
+            }
+        }
+        let ioa_pairs: Vec<(&str, &str)> = readable
             .iter()
-            .map(|r| (r.entity_type.as_str(), r.ioa_source.as_str()))
+            .map(|(entity_type, ioa)| (entity_type.as_str(), ioa.as_str()))
             .collect();
 
         match registry.try_register_tenant_with_constraints(
@@ -396,12 +408,13 @@ pub async fn restore_registry_from_platform_store(
             false,
         ) {
             Ok(()) => {
-                restored_specs += tenant_rows.len();
+                restored_specs += readable.len();
+                persist_converted_specs(store, tenant, &converted).await;
             }
             Err(e) => {
                 tracing::warn!(tenant = %tenant, "reconciling orphaned specs for tenant that failed registration: {e}");
-                for row in tenant_rows {
-                    orphaned_specs.push((row.tenant.clone(), row.entity_type.clone()));
+                for (entity_type, _) in &readable {
+                    orphaned_specs.push((tenant.clone(), entity_type.clone()));
                 }
             }
         }
@@ -420,6 +433,70 @@ pub async fn restore_registry_from_platform_store(
     }
 
     Ok(restored_specs)
+}
+
+/// How a persisted spec reads under this kernel.
+enum StoredSpec {
+    /// Parses as stored.
+    Current,
+    /// Was in the old predicate syntax; this is the converted source.
+    Converted(String),
+    /// Neither parses nor converts.
+    Unreadable,
+}
+
+fn read_stored_spec(tenant: &str, entity_type: &str, ioa_source: &str) -> StoredSpec {
+    let Err(parse_error) = temper_spec::automaton::parse_automaton(ioa_source) else {
+        return StoredSpec::Current;
+    };
+    match temper_spec::automaton::legacy::migrate_source(ioa_source) {
+        Ok(migration) => {
+            tracing::info!(
+                tenant,
+                entity_type,
+                notes = migration.notes.len(),
+                "converted stored spec to the current syntax"
+            );
+            StoredSpec::Converted(migration.source)
+        }
+        Err(convert_error) => {
+            tracing::error!(
+                tenant,
+                entity_type,
+                %parse_error,
+                %convert_error,
+                "stored spec does not parse and cannot be converted; its entity type stays unavailable until the spec is fixed"
+            );
+            StoredSpec::Unreadable
+        }
+    }
+}
+
+/// Write converted specs back so the conversion happens once. A failed write
+/// only means the next boot converts the stored source again.
+async fn persist_converted_specs(
+    store: &dyn crate::platform_store::PlatformStore,
+    tenant: &str,
+    converted: &[(&crate::platform_store::SpecRow, String)],
+) {
+    if converted.is_empty() {
+        return;
+    }
+    for (row, source) in converted {
+        let hash = temper_store_turso::spec_content_hash(source);
+        let csdl_xml = row.csdl_xml.as_deref().unwrap_or_default();
+        if let Err(error) = store
+            .upsert_spec(tenant, &row.entity_type, source, csdl_xml, &hash)
+            .await
+        {
+            tracing::warn!(tenant, entity_type = %row.entity_type, %error, "failed to store converted spec");
+        }
+    }
+    // upsert_spec marks a changed row uncommitted, and uncommitted rows are
+    // deleted at the next startup.
+    if let Err(error) = store.commit_specs(tenant).await {
+        tracing::warn!(tenant, %error, "failed to commit converted specs");
+    }
 }
 
 #[cfg(test)]
