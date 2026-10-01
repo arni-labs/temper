@@ -39,7 +39,7 @@ const DST_SEEDS: u64 = 64;
 /// projection lagging behind the journal — the exact condition that makes the
 /// real planner fall back to the authoritative scan (and 413 at scale).
 #[derive(Default)]
-struct SimQueryPlane {
+pub(super) struct SimQueryPlane {
     // (entity_type, entity_id) -> catalog row
     catalog: Mutex<BTreeMap<(String, String), EntityCatalogRow>>,
 }
@@ -184,7 +184,10 @@ fn eq_filter(ws: &str, path: &str) -> FilterExpr {
 }
 
 /// Build a sim-backed ServerState with the keyed Order table installed.
-fn sim_state(seed: u64, qp: std::sync::Arc<SimQueryPlane>) -> (ServerState, BoxedEventStore) {
+pub(super) fn sim_state(
+    seed: u64,
+    qp: std::sync::Arc<SimQueryPlane>,
+) -> (ServerState, BoxedEventStore) {
     let events = BoxedEventStore::new(SimEventStore::no_faults(seed));
     let mut state = build_order_state("dst-projection-lag");
     state.set_storage_stack(StorageStack::new(

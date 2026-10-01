@@ -212,8 +212,9 @@ pub(super) async fn missing_catalog_entity_ids(
 /// Returns `Some(json)` when the catalog has a row for `(tenant, entity_type,
 /// key)` and catalog materialization is preferred or the catalog fast-read
 /// feature flag is enabled. Returns `None` when catalog reads are disabled,
-/// the catalog has no row, or the read fails — caller is expected to fall
-/// back to actor hydration in that case.
+/// the catalog has no row, the row is behind a commit this server's actor
+/// already holds, or the read fails — caller is expected to fall back to
+/// actor hydration in that case.
 ///
 /// The returned JSON has the same shape as the actor's serialized
 /// `EntityState` so downstream code (`enrich_entity_response`, OData
@@ -232,6 +233,16 @@ pub(super) async fn try_load_entity_body_from_catalog(
     let ids = [key.to_string()];
     let rows = try_load_catalog_rows(state, tenant, entity_type, &ids).await;
     let row = rows.into_iter().next().map(|(_, r)| r)?;
+    // ADR-0148: projection writes are queued, so a point read right after a
+    // write can find the row one write behind. When this server's actor holds
+    // a newer commit, the caller reads the actor instead.
+    if state
+        .resident_entity_sequence(tenant, entity_type, key)
+        .await
+        .is_some_and(|committed| committed > row.sequence_nr)
+    {
+        return None;
+    }
     maybe_spawn_catalog_shadow_check(state, tenant, entity_type, &row);
     Some(catalog_row_to_entity_body(
         entity_type,

@@ -1840,6 +1840,35 @@ impl ServerState {
         }
     }
 
+    /// The committed sequence of an entity whose actor is live in memory, or
+    /// None when no live actor holds it. Never spawns an actor.
+    pub async fn resident_entity_sequence(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<u64> {
+        let key = format!("{tenant}:{entity_type}:{entity_id}");
+        let actor_ref = {
+            let registry = self.actor_registry.read().ok()?;
+            registry
+                .get(&key)
+                .filter(|actor| !actor.is_closed())
+                .cloned()?
+        };
+        let policy = self.dispatch_retry_policy();
+        let outcome = retry::ask_with_backoff::<_, EntityResponse, _>(
+            &actor_ref,
+            || EntityMsg::GetState,
+            &policy,
+        )
+        .await;
+        outcome
+            .result
+            .ok()
+            .map(|response| response.state.sequence_nr)
+    }
+
     /// List entity IDs for a type, guaranteeing completeness against the
     /// durable event store.
     ///

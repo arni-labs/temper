@@ -20,6 +20,7 @@ use temper_store_turso::TursoEventStore;
 mod dst_projection_lag;
 mod keyed_existence;
 mod paging;
+mod point_read_freshness;
 mod proof;
 
 const CSDL_XML: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
