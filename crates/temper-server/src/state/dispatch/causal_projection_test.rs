@@ -183,9 +183,12 @@ async fn causal_projection_failure_preserves_commit_without_starting_dependents(
     );
 }
 
+/// ADR-0148 amendment: an ordinary edit is projected before its response, so a
+/// caller that writes and then queries sees the write without waiting for the
+/// queue.
 #[tokio::test]
-async fn causal_barrier_does_not_make_ordinary_edits_synchronous() {
-    let (state, query, queue, _temp) = fixture().await;
+async fn ordinary_edits_are_projected_before_the_response() {
+    let (state, query, _queue, _temp) = fixture().await;
     let response = state
         .dispatch_tenant_action(
             &TenantId::default(),
@@ -204,16 +207,9 @@ async fn causal_barrier_does_not_make_ordinary_edits_synchronous() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        rows[0].fields["prompt_template"], "old",
-        "ordinary projection stays queued"
+        rows[0].fields["prompt_template"], "edited",
+        "the edit is visible to queries when dispatch returns"
     );
-    queue.drain_once_for_test().await;
-    let rows = query
-        .load_entity_catalog_rows("default", "Source", &["source".into()])
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(rows[0].fields["prompt_template"], "edited");
 }
 
 #[tokio::test]
