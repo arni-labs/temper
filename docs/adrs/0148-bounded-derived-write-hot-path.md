@@ -2,6 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-06-18
+- Amended: 2026-10-01, every committed transition is projected before the response (see "Amendment: projection before response")
 - Deciders: Temper core maintainers
 - Supersedes: ADR-0142
 - Related:
@@ -94,6 +95,21 @@ another source transition. Delayed older projection writes remain subject to
 the store's sequence guard. Superseded state timers are invalidated before
 waiting, so a committed reset cannot leave its old deadline active during a
 slow write. Successor timers start only after visibility is established.
+
+**Amendment: projection before response (2026-10-01).** Every committed
+single-action transition now awaits its query projection before the response
+returns, not only transitions with declared dependents. Until ADR-0181 every
+action carried an emit effect, which counted as a dependent, so in practice
+every transition was already projected before its response; removing those
+emits made ordinary transitions queued for the first time. On Postgres that
+made a collection read filtered on a just-changed field return the previous
+answer for about 10 ms (an OAuth grant still matched its old refresh-token
+hash 7 times in 80), where the previous kernel returned 0 in 80. Callers that
+write and then query (Katagami's token route and curation pipeline) depend on
+that. The cost is one awaited projection write per transition, which is what
+deployments paid before ADR-0181. A projection failure is reported in the
+response as before. The queued path remains for composite dispatch, deletes
+and backfill.
 
 ### Sub-Decision 3: Session Collection Reads Must Push Down Bounds
 

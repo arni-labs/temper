@@ -91,3 +91,47 @@ async fn a_point_read_of_an_entity_not_in_memory_uses_the_projection() {
         "checking freshness must not spawn an actor"
     );
 }
+
+/// A transition with no reactions, integrations or timers is projected before
+/// dispatch returns, so collection reads (`$filter`) see it at once too.
+#[tokio::test]
+async fn an_ordinary_transition_is_projected_before_dispatch_returns() {
+    let qp = Arc::new(SimQueryPlane::default());
+    let (state, _events) = sim_state(13, qp.clone());
+    let tenant = TenantId::default();
+    let agent_ctx = AgentContext::for_service("projection-before-response");
+    state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o2",
+            "Create",
+            serde_json::json!({}),
+            &agent_ctx,
+        )
+        .await
+        .expect("create");
+    let added = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o2",
+            "AddItem",
+            serde_json::json!({ "ProductId": "p1", "Quantity": 1 }),
+            &agent_ctx,
+        )
+        .await
+        .expect("add item");
+    assert!(added.success, "{:?}", added.error);
+
+    let rows = qp
+        .load_entity_catalog_rows(tenant.as_str(), "Order", &["o2".to_string()])
+        .await
+        .expect("read catalog")
+        .expect("catalog rows");
+    assert_eq!(
+        rows.first().map(|row| row.sequence_nr),
+        Some(added.state.sequence_nr),
+        "the projection must hold the committed sequence when dispatch returns"
+    );
+}
