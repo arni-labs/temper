@@ -3,7 +3,9 @@
 
 use super::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use temper_server::storage::{PolicyStore, PolicyStoreRow};
 use temper_store_turso::TursoEventStore;
 
 const PERMIT_THINGS: &str = "permit(principal, action, resource is Thing);";
@@ -12,6 +14,8 @@ const FORBID_WITHDRAW: &str =
 const FORBID_DELETE: &str = "forbid(principal, action == Action::\"Delete\", resource is Thing);";
 const APPROVED_PING: &str = "permit(principal, action == Action::\"Ping\", resource is Gadget);";
 const HAND_ADDED_POKE: &str = "permit(principal, action == Action::\"Poke\", resource is Gadget);";
+/// `FORBID_WITHDRAW` as someone might have saved it by hand.
+const FORBID_WITHDRAW_REFORMATTED: &str = "// frozen items\r\nforbid(\r\n    principal,\r\n    action == Action::\"Withdraw\",\r\n    resource is Thing\r\n);";
 
 struct Fixture {
     state: PlatformState,
@@ -22,14 +26,22 @@ struct Fixture {
 
 impl Fixture {
     async fn new(label: &str) -> Self {
+        Self::with_policy_store(label, |store| store).await
+    }
+
+    /// A fixture whose policy rows go through `wrap(real store)`.
+    async fn with_policy_store(
+        label: &str,
+        wrap: impl FnOnce(Arc<dyn PolicyStore>) -> Arc<dyn PolicyStore>,
+    ) -> Self {
         let id = uuid::Uuid::new_v4();
         let db_url = format!("file:/tmp/temper-policy-reinstall-{label}-{id}.db");
         let apps_root = std::env::temp_dir().join(format!("temper-policy-reinstall-{label}-{id}"));
         let turso = TursoEventStore::new(&db_url, None).await.unwrap();
+        let mut stack = temper_server::StorageStack::from_turso(turso);
+        stack.policies = stack.policies.map(wrap);
         let mut state = PlatformState::new(None);
-        state
-            .server
-            .set_storage_stack(temper_server::StorageStack::from_turso(turso));
+        state.server.set_storage_stack(stack);
         Self {
             state,
             db_url,
@@ -60,11 +72,15 @@ impl Fixture {
     }
 
     async fn install(&self, app: &str) {
-        // Other tests reload the global catalog; register right before use.
-        add_os_apps_dir(self.apps_root.clone());
-        install_os_app(&self.state, &self.tenant, app)
+        self.try_install(app)
             .await
             .unwrap_or_else(|error| panic!("install {app}: {error}"));
+    }
+
+    async fn try_install(&self, app: &str) -> Result<InstallResult, String> {
+        // Other tests reload the global catalog; register right before use.
+        add_os_apps_dir(self.apps_root.clone());
+        install_os_app(&self.state, &self.tenant, app).await
     }
 
     fn allowed(&self, state: &PlatformState, action: &str, resource_type: &str) -> bool {
@@ -298,5 +314,183 @@ async fn reinstall_drops_a_removed_policy_file() {
             fx.allowed(state, "Withdraw", "Thing"),
             "removed file's forbid kept"
         );
+    }
+}
+
+// SECTION: statement-level ownership, layout and write order
+
+/// Forwards to the real store but refuses to rewrite the `primary` row.
+struct PrimaryRewriteFails(Arc<dyn PolicyStore>);
+
+#[async_trait::async_trait]
+impl PolicyStore for PrimaryRewriteFails {
+    async fn save_policy(
+        &self,
+        tenant: &str,
+        policy_id: &str,
+        cedar_text: &str,
+        created_by: &str,
+    ) -> Result<bool, String> {
+        self.0
+            .save_policy(tenant, policy_id, cedar_text, created_by)
+            .await
+    }
+
+    async fn load_policies_for_tenant(&self, tenant: &str) -> Result<Vec<PolicyStoreRow>, String> {
+        self.0.load_policies_for_tenant(tenant).await
+    }
+
+    async fn load_all_policies(&self) -> Result<Vec<PolicyStoreRow>, String> {
+        self.0.load_all_policies().await
+    }
+
+    async fn toggle_policy_enabled(
+        &self,
+        tenant: &str,
+        policy_id: &str,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        self.0
+            .toggle_policy_enabled(tenant, policy_id, enabled)
+            .await
+    }
+
+    async fn update_policy_text(
+        &self,
+        tenant: &str,
+        policy_id: &str,
+        cedar_text: &str,
+        created_by: &str,
+    ) -> Result<bool, String> {
+        if policy_id == "primary" {
+            return Err("injected failure rewriting primary".to_string());
+        }
+        self.0
+            .update_policy_text(tenant, policy_id, cedar_text, created_by)
+            .await
+    }
+
+    async fn replace_policy_if_hash(
+        &self,
+        tenant: &str,
+        policy_id: &str,
+        expected_hash: &str,
+        cedar_text: &str,
+        created_by: &str,
+    ) -> Result<bool, String> {
+        self.0
+            .replace_policy_if_hash(tenant, policy_id, expected_hash, cedar_text, created_by)
+            .await
+    }
+
+    async fn delete_policy(&self, tenant: &str, policy_id: &str) -> Result<(), String> {
+        self.0.delete_policy(tenant, policy_id).await
+    }
+}
+
+#[tokio::test]
+async fn another_owners_multi_statement_row_keeps_its_forbid() {
+    let fx = Fixture::new("shared-statement").await;
+    let app = format!("reinstall-shared-{}", uuid::Uuid::new_v4().simple());
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_WITHDRAW))]);
+    fx.install(&app).await;
+    // A hand-added row that carries the app's old file, including its forbid,
+    // among other statements of its own.
+    let guard_row = format!(
+        "{APPROVED_PING}\n{}",
+        thing_policies(FORBID_WITHDRAW).trim()
+    );
+    let live = format!("{}\n{guard_row}", fx.live_text());
+    fx.add_active_row("manual-withdraw-guard", &guard_row, &live)
+        .await;
+
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_DELETE))]);
+    fx.install(&app).await;
+
+    for state in [&fx.state, &fx.restart().await] {
+        assert!(
+            !fx.allowed(state, "Withdraw", "Thing"),
+            "another owner's forbid was dropped"
+        );
+        assert!(fx.allowed(state, "Ping", "Gadget"));
+        assert!(!fx.allowed(state, "Delete", "Thing"));
+    }
+}
+
+#[tokio::test]
+async fn reformatted_primary_copy_is_removed() {
+    let fx = Fixture::new("reformatted-primary").await;
+    let app = format!("reinstall-reformatted-{}", uuid::Uuid::new_v4().simple());
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_WITHDRAW))]);
+    fx.install(&app).await;
+    let snapshot =
+        format!("{PERMIT_THINGS}\r\n{FORBID_WITHDRAW_REFORMATTED}\r\n{HAND_ADDED_POKE}\r\n");
+    fx.add_active_row("primary", &snapshot, &snapshot).await;
+    assert!(!fx.allowed(&fx.state, "Withdraw", "Thing"));
+
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_DELETE))]);
+    fx.install(&app).await;
+
+    for state in [&fx.state, &fx.restart().await] {
+        assert!(
+            fx.allowed(state, "Withdraw", "Thing"),
+            "reformatted old forbid survived"
+        );
+        assert!(!fx.allowed(state, "Delete", "Thing"));
+        assert!(
+            fx.allowed(state, "Poke", "Gadget"),
+            "hand-added policy lost"
+        );
+    }
+    let rows = fx.rows().await;
+    let primary = rows.iter().find(|row| row.policy_id == "primary").unwrap();
+    assert!(
+        primary.cedar_text.contains("// frozen items"),
+        "layout around it kept"
+    );
+    assert!(primary.cedar_text.contains(HAND_ADDED_POKE));
+}
+
+#[tokio::test]
+async fn failed_primary_rewrite_leaves_the_previous_install() {
+    let fx = Fixture::with_policy_store("primary-fails", |store| {
+        Arc::new(PrimaryRewriteFails(store))
+    })
+    .await;
+    let app = format!("reinstall-primary-fails-{}", uuid::Uuid::new_v4().simple());
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_WITHDRAW))]);
+    fx.install(&app).await;
+    let snapshot = format!("{}\n{HAND_ADDED_POKE}", fx.live_text());
+    fx.add_active_row("primary", &snapshot, &snapshot).await;
+    let rows_before: Vec<_> = fx
+        .rows()
+        .await
+        .into_iter()
+        .map(|row| (row.policy_id, row.policy_hash))
+        .collect();
+    let legacy_before = fx.legacy_text().await;
+
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_DELETE))]);
+    let error = fx
+        .try_install(&app)
+        .await
+        .expect_err("primary rewrite must fail");
+    assert!(error.contains("primary"), "{error}");
+
+    let rows_after: Vec<_> = fx
+        .rows()
+        .await
+        .into_iter()
+        .map(|row| (row.policy_id, row.policy_hash))
+        .collect();
+    assert_eq!(rows_after, rows_before, "rows changed by a failed install");
+    assert_eq!(fx.legacy_text().await, legacy_before);
+    assert_eq!(fx.live_text(), snapshot);
+    for state in [&fx.state, &fx.restart().await] {
+        assert!(
+            !fx.allowed(state, "Withdraw", "Thing"),
+            "previous install not intact"
+        );
+        assert!(fx.allowed(state, "Delete", "Thing"));
     }
 }

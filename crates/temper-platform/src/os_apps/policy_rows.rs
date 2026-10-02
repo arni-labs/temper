@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use temper_authz::statements::{StatementKey, remove_statements, statement_keys};
 use temper_server::storage::PolicyStoreRow;
 
 use super::{AppBundle, merge_bundle_policies};
@@ -74,13 +75,14 @@ pub(super) async fn persist_bundle_policy_rows(
 /// The Cedar a reinstall of one app replaces.
 ///
 /// An earlier install of the app recorded each of its policy files as a row.
-/// Text in those rows that the new bundle no longer carries is superseded: it
-/// must leave the live set, the legacy aggregate and any `primary` snapshot,
-/// or an old forbid outlives its replacement (forbid beats every permit).
+/// Statements in those rows that the new bundle no longer carries are
+/// superseded: they must leave the live set, the legacy aggregate and any
+/// `primary` snapshot, or an old forbid outlives its replacement (forbid beats
+/// every permit). Statements are compared parsed, so layout does not matter.
 #[derive(Debug, Default)]
 pub(super) struct SupersededAppPolicies {
-    /// Superseded policy texts, trimmed, each recorded once.
-    texts: Vec<String>,
+    /// Superseded statements that no other owner holds.
+    statements: BTreeSet<StatementKey>,
     /// This app's rows whose source file is gone from the new bundle.
     removed_row_ids: Vec<String>,
     /// The tenant's `primary` snapshot row, when one exists.
@@ -88,28 +90,27 @@ pub(super) struct SupersededAppPolicies {
 }
 
 impl SupersededAppPolicies {
-    pub(super) fn has_texts(&self) -> bool {
-        !self.texts.is_empty()
+    pub(super) fn has_statements(&self) -> bool {
+        !self.statements.is_empty()
     }
 
     /// The tenant's Cedar after installing `bundle`: `live_text` without the
-    /// superseded texts, plus the bundle's policies.
+    /// superseded statements, plus the bundle's policies.
     ///
     /// # Errors
     ///
-    /// Returns an error when removing the superseded texts leaves Cedar that
-    /// does not parse; the install then stops before persisting anything.
+    /// Returns an error when the live text does not parse or the result is
+    /// not valid Cedar; the install then stops before persisting anything.
     pub(super) fn replace_in(
         &self,
         state: &PlatformState,
         live_text: &str,
         bundle: &AppBundle,
     ) -> Result<String, String> {
-        let combined = merge_bundle_policies(
-            &strip_policy_texts(live_text, &self.texts),
-            &bundle.cedar_policies,
-        );
-        if self.has_texts() {
+        let kept = remove_statements(live_text, &self.statements)
+            .map_err(|error| format!("Failed to read the tenant's live Cedar: {error}"))?;
+        let combined = merge_bundle_policies(&kept, &bundle.cedar_policies);
+        if self.has_statements() {
             state
                 .server
                 .authz
@@ -122,15 +123,15 @@ impl SupersededAppPolicies {
     }
 }
 
-/// Read which of `app_name`'s previously installed Cedar `bundle` replaces.
+/// Read which of `app_name`'s previously installed statements `bundle` replaces.
 ///
-/// Text another owner (an approval, a hand-added row or another app) holds
-/// verbatim is kept. Without a durable policy store nothing is recorded per
-/// app, so nothing is superseded.
+/// A statement another enabled row holds (an approval, a hand-added row or
+/// another app, but not the `primary` snapshot) is kept. Without a durable
+/// policy store nothing is recorded per app, so nothing is superseded.
 ///
 /// # Errors
 ///
-/// Returns an error when the tenant's policy rows cannot be read.
+/// Returns an error when the tenant's policy rows cannot be read or parsed.
 pub(super) async fn superseded_app_policies(
     state: &PlatformState,
     tenant: &str,
@@ -146,60 +147,88 @@ pub(super) async fn superseded_app_policies(
         .map_err(|error| format!("Failed to read Cedar policy rows for '{tenant}': {error}"))?;
 
     let owner = os_app_policy_owner(app_name);
-    let bundle_texts: BTreeSet<&str> = bundle
-        .cedar_policy_sources
-        .iter()
-        .map(|source| source.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect();
-    let bundle_row_ids: BTreeSet<String> = bundle
-        .cedar_policy_sources
-        .iter()
-        .filter(|source| !source.text.trim().is_empty())
-        .map(|source| os_app_policy_row_id(app_name, &source.relative_path))
-        .collect();
-    let held_by_others: BTreeSet<&str> = rows
-        .iter()
-        .filter(|row| row.enabled && row.created_by != owner && row.policy_id != PRIMARY_POLICY_ID)
-        .map(|row| row.cedar_text.trim())
-        .collect();
-
-    let mut superseded = SupersededAppPolicies {
-        primary: rows
-            .iter()
-            .find(|row| row.policy_id == PRIMARY_POLICY_ID)
-            .cloned(),
-        ..SupersededAppPolicies::default()
-    };
-    for row in rows.iter().filter(|row| row.created_by == owner) {
-        if !bundle_row_ids.contains(&row.policy_id) {
-            superseded.removed_row_ids.push(row.policy_id.clone());
-        }
-        let text = row.cedar_text.trim();
-        if text.is_empty() || bundle_texts.contains(text) || held_by_others.contains(text) {
+    let mut bundle_statements = BTreeSet::new();
+    let mut bundle_row_ids = BTreeSet::new();
+    for source in &bundle.cedar_policy_sources {
+        if source.text.trim().is_empty() {
             continue;
         }
-        if !superseded.texts.iter().any(|known| known == text) {
-            superseded.texts.push(text.to_string());
+        bundle_statements.extend(parsed_statements(&source.relative_path, &source.text)?);
+        bundle_row_ids.insert(os_app_policy_row_id(app_name, &source.relative_path));
+    }
+    let mut previous = BTreeSet::new();
+    let mut held_by_others = BTreeSet::new();
+    let mut superseded = SupersededAppPolicies::default();
+    for row in &rows {
+        if row.created_by == owner {
+            previous.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
+            if !bundle_row_ids.contains(&row.policy_id) {
+                superseded.removed_row_ids.push(row.policy_id.clone());
+            }
+        } else if row.policy_id == PRIMARY_POLICY_ID {
+            superseded.primary = Some(row.clone());
+        } else if row.enabled {
+            held_by_others.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
         }
     }
-    debug_assert!(
-        superseded
-            .texts
-            .iter()
-            .all(|text| !bundle_texts.contains(text.as_str()))
-    );
+    superseded.statements = previous
+        .difference(&bundle_statements)
+        .filter(|statement| !held_by_others.contains(*statement))
+        .cloned()
+        .collect();
+    debug_assert!(superseded.statements.is_disjoint(&bundle_statements));
+    debug_assert!(superseded.statements.is_disjoint(&held_by_others));
     Ok(superseded)
 }
 
-/// Drop the rows of source files the bundle no longer has, and strip the
-/// superseded texts from the `primary` snapshot, which boot loads instead of
-/// the legacy aggregate.
+fn parsed_statements(source: &str, cedar_text: &str) -> Result<BTreeSet<StatementKey>, String> {
+    statement_keys(cedar_text)
+        .map_err(|error| format!("Failed to parse Cedar in '{source}': {error}"))
+}
+
+/// Remove the superseded statements from the `primary` snapshot, which boot
+/// loads in place of the legacy aggregate.
+///
+/// Runs before anything else is written, so a failure leaves the previous
+/// install fully in place.
 ///
 /// # Errors
 ///
-/// Returns an error when a row cannot be deleted or rewritten.
-pub(super) async fn retire_superseded_rows(
+/// Returns an error when the snapshot cannot be parsed or rewritten.
+pub(super) async fn rewrite_primary_snapshot(
+    state: &PlatformState,
+    tenant: &str,
+    superseded: &SupersededAppPolicies,
+) -> Result<(), String> {
+    let (Some(policy_store), Some(primary)) = (state.server.policy_store(), &superseded.primary)
+    else {
+        return Ok(());
+    };
+    let stripped =
+        remove_statements(&primary.cedar_text, &superseded.statements).map_err(|error| {
+            format!("Failed to parse the '{PRIMARY_POLICY_ID}' policy row: {error}")
+        })?;
+    if stripped == primary.cedar_text {
+        return Ok(());
+    }
+    policy_store
+        .update_policy_text(tenant, PRIMARY_POLICY_ID, &stripped, &primary.created_by)
+        .await
+        .map_err(|error| {
+            format!("Failed to rewrite the '{PRIMARY_POLICY_ID}' policy row: {error}")
+        })?;
+    Ok(())
+}
+
+/// Delete the rows of source files the bundle no longer has.
+///
+/// Runs after the bundle's rows are written, so the app is never left with
+/// fewer policies than either version.
+///
+/// # Errors
+///
+/// Returns an error when a row cannot be deleted.
+pub(super) async fn delete_dropped_rows(
     state: &PlatformState,
     tenant: &str,
     superseded: &SupersededAppPolicies,
@@ -213,89 +242,5 @@ pub(super) async fn retire_superseded_rows(
             .await
             .map_err(|error| format!("Failed to delete Cedar policy row '{policy_id}': {error}"))?;
     }
-    let Some(primary) = superseded.primary.as_ref() else {
-        return Ok(());
-    };
-    let stripped = strip_policy_texts(&primary.cedar_text, &superseded.texts);
-    if stripped == primary.cedar_text {
-        return Ok(());
-    }
-    policy_store
-        .update_policy_text(tenant, PRIMARY_POLICY_ID, &stripped, &primary.created_by)
-        .await
-        .map_err(|error| {
-            format!("Failed to rewrite the '{PRIMARY_POLICY_ID}' policy row: {error}")
-        })?;
     Ok(())
-}
-
-/// Remove every occurrence of each text that spans whole lines.
-///
-/// Installs join policy files with newlines, so a file's text always starts
-/// and ends on a line boundary; a match inside a line belongs to something
-/// else and stays.
-fn strip_policy_texts(policy_text: &str, texts: &[String]) -> String {
-    let mut stripped = policy_text.to_string();
-    for text in texts {
-        stripped = strip_line_bounded(&stripped, text.trim());
-    }
-    stripped
-}
-
-fn strip_line_bounded(haystack: &str, needle: &str) -> String {
-    if needle.is_empty() {
-        return haystack.to_string();
-    }
-    let mut kept = String::with_capacity(haystack.len());
-    let mut rest = haystack;
-    let mut removed = false;
-    while let Some(position) = rest.find(needle) {
-        let end = position + needle.len();
-        let starts_line = if position == 0 {
-            kept.is_empty() || kept.ends_with('\n')
-        } else {
-            rest.as_bytes()[position - 1] == b'\n'
-        };
-        let ends_line = end == rest.len() || rest.as_bytes()[end] == b'\n';
-        if starts_line && ends_line {
-            kept.push_str(&rest[..position]);
-            rest = rest[end..].strip_prefix('\n').unwrap_or(&rest[end..]);
-            removed = true;
-        } else {
-            kept.push_str(&rest[..end]);
-            rest = &rest[end..];
-        }
-    }
-    if !removed {
-        return haystack.to_string();
-    }
-    kept.push_str(rest);
-    // A text removed from the end leaves the newline that joined it.
-    let trimmed_len = kept.trim_end_matches('\n').len();
-    kept.truncate(trimmed_len);
-    debug_assert!(kept.len() < haystack.len());
-    kept
-}
-
-#[cfg(test)]
-mod tests {
-    use super::strip_line_bounded;
-
-    #[test]
-    fn strips_whole_line_occurrences_only() {
-        let old = "forbid(principal, action == Action::\"Withdraw\", resource);";
-        let text = format!("permit(principal, action, resource);\n{old}\n// note {old}\n{old}");
-        let stripped = strip_line_bounded(&text, old);
-        assert_eq!(
-            stripped,
-            format!("permit(principal, action, resource);\n// note {old}")
-        );
-    }
-
-    #[test]
-    fn leaves_text_without_the_needle_unchanged() {
-        let text = "permit(principal, action, resource);";
-        assert_eq!(strip_line_bounded(text, "forbid(x);"), text);
-        assert_eq!(strip_line_bounded(text, ""), text);
-    }
 }

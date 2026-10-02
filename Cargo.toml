@@ -87,6 +87,8 @@ fred = { version = "10", features = ["subscriber-client", "i-scripts", "sha-1"] 
 
 # Auth
 cedar-policy = "4"
+# Source spans of parsed statements; cedar-policy does not expose them.
+cedar-policy-core = "4"
 
 # Verification
 stateright = "0.31"

@@ -1194,12 +1194,15 @@ pub(super) async fn install_os_app_with_plan(
         policy_rows::SupersededAppPolicies::default()
     };
     let combined_policy =
-        if plan.policies && (!bundle.cedar_policies.is_empty() || superseded.has_texts()) {
+        if plan.policies && (!bundle.cedar_policies.is_empty() || superseded.has_statements()) {
             let existing = cached_or_active_tenant_policy_text(state, tenant);
             Some(superseded.replace_in(state, &existing, &bundle)?)
         } else {
             None
         };
+    if plan.policies {
+        policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
+    }
 
     // ── Step 1: Persist to Turso FIRST (if available). ──────────────
     // If any write fails, bail before touching in-memory state.
@@ -1291,7 +1294,7 @@ pub(super) async fn install_os_app_with_plan(
 
     if plan.policies {
         policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle).await?;
-        policy_rows::retire_superseded_rows(state, tenant, &superseded).await?;
+        policy_rows::delete_dropped_rows(state, tenant, &superseded).await?;
     }
 
     // ── Step 2: Bootstrap into memory (verification + registry). ────
