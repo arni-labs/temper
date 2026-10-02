@@ -166,7 +166,8 @@ pub(super) async fn superseded_app_policies(
                 superseded.removed_row_ids.push(row.policy_id.clone());
             }
         } else if row.policy_id == PRIMARY_POLICY_ID {
-            superseded.primary = Some(row.clone());
+            // Boot ignores a disabled snapshot, so only an enabled one matters.
+            superseded.primary = row.enabled.then(|| row.clone());
         } else if row.enabled {
             held_by_others.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
         }
@@ -190,11 +191,13 @@ fn parsed_statements(source: &str, cedar_text: &str) -> Result<BTreeSet<Statemen
 /// loads in place of the legacy aggregate.
 ///
 /// Runs before anything else is written, so a failure leaves the previous
-/// install fully in place.
+/// install fully in place. The write is conditional on the snapshot read
+/// earlier: a `PUT` that replaced it meanwhile wins, and the install stops.
 ///
 /// # Errors
 ///
-/// Returns an error when the snapshot cannot be parsed or rewritten.
+/// Returns an error when the snapshot cannot be parsed or written, or a
+/// conflict when it changed since it was read.
 pub(super) async fn rewrite_primary_snapshot(
     state: &PlatformState,
     tenant: &str,
@@ -211,12 +214,24 @@ pub(super) async fn rewrite_primary_snapshot(
     if stripped == primary.cedar_text {
         return Ok(());
     }
-    policy_store
-        .update_policy_text(tenant, PRIMARY_POLICY_ID, &stripped, &primary.created_by)
+    let replaced = policy_store
+        .replace_policy_if_hash(
+            tenant,
+            PRIMARY_POLICY_ID,
+            &primary.policy_hash,
+            &stripped,
+            &primary.created_by,
+        )
         .await
         .map_err(|error| {
             format!("Failed to rewrite the '{PRIMARY_POLICY_ID}' policy row: {error}")
         })?;
+    if !replaced {
+        return Err(format!(
+            "Conflict: the '{PRIMARY_POLICY_ID}' policy row changed during the install; \
+             nothing was written, install again against the current policies"
+        ));
+    }
     Ok(())
 }
 
