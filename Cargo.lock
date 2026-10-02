@@ -7050,6 +7050,7 @@ name = "temper-authz"
 version = "0.1.0"
 dependencies = [
  "cedar-policy",
+ "cedar-policy-core",
  "opentelemetry",
  "serde",
  "serde_json",

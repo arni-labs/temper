@@ -896,6 +896,7 @@ fn test_intent_discovery_specs_verify() {
 }
 
 mod directed_evolution;
+mod policy_reinstall;
 #[test]
 fn test_get_app_project_management() {
     let bundle = get_os_app("project-management");

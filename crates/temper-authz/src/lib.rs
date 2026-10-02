@@ -9,6 +9,7 @@ mod engine;
 mod error;
 mod metrics;
 mod policy_gen;
+pub mod statements;
 
 pub use context::{
     AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
