@@ -18,6 +18,7 @@ pub(super) fn parse_schema(
     let namespace = required_attr(start, "Namespace")?;
     let mut schema = Schema {
         namespace,
+        alias: attr_str(start, "Alias"),
         entity_types: Vec::new(),
         enum_types: Vec::new(),
         actions: Vec::new(),

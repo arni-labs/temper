@@ -1,6 +1,6 @@
 #!/bin/bash
 # Item 12: Full Cascade Runner
-# Runs temper verify on all spec directories, captures JSON results with timestamps.
+# Checks repository source collections before packaging; records JSON results.
 # Results stored in .cascade-results/ for regression tracking.
 set -euo pipefail
 
@@ -41,7 +41,7 @@ for DIR in $SPEC_DIRS; do
     # Run verification and capture output
     VERIFY_OUTPUT=""
     VERIFY_EXIT=0
-    VERIFY_OUTPUT="$(cd "$WORKSPACE_ROOT" && cargo run -p temper-cli --quiet -- verify --specs-dir "$DIR" 2>&1)" || VERIFY_EXIT=$?
+    VERIFY_OUTPUT="$(cd "$WORKSPACE_ROOT" && "$WORKSPACE_ROOT/scripts/verify-source-collection.sh" "$DIR" 2>&1)" || VERIFY_EXIT=$?
 
     STATUS="pass"
     if [ "$VERIFY_EXIT" -ne 0 ]; then

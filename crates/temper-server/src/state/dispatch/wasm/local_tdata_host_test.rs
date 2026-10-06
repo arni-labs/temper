@@ -279,6 +279,7 @@ async fn local_tdata_calls_use_odata_handlers() {
         state,
         temper_runtime::tenant::TenantId::default(),
         Some(&agent),
+        "test-module",
         Arc::new(FailingHost),
     );
     let headers = vec![
@@ -346,7 +347,12 @@ async fn direct_invocation_loopback_dispatches_in_process_with_caller_authority(
         )
         .expect("agent-only policy should parse");
     let caller = SecurityContext::from_resolved_identity("agent-1", "operator", None);
-    let host = state.local_tdata_direct_host(&TenantId::default(), Arc::new(FailingHost), &caller);
+    let host = state.local_tdata_direct_host(
+        &TenantId::default(),
+        Arc::new(FailingHost),
+        &caller,
+        "test-module",
+    );
     let headers = vec![
         ("x-tenant-id".to_string(), "default".to_string()),
         ("accept".to_string(), "application/json".to_string()),
@@ -367,7 +373,12 @@ async fn direct_invocation_loopback_dispatches_in_process_with_caller_authority(
 async fn direct_invocation_loopback_does_not_run_as_system() {
     let state = test_state();
     let caller = customer_security_context("customer-1");
-    let host = state.local_tdata_direct_host(&TenantId::default(), Arc::new(FailingHost), &caller);
+    let host = state.local_tdata_direct_host(
+        &TenantId::default(),
+        Arc::new(FailingHost),
+        &caller,
+        "test-module",
+    );
     let headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "application/json".to_string()),
@@ -405,6 +416,7 @@ async fn local_tdata_forged_admin_headers_cannot_upgrade_customer() {
         state,
         TenantId::default(),
         Some(&customer),
+        "test-module",
         Arc::new(FailingHost),
     );
     let headers = vec![
@@ -444,6 +456,7 @@ async fn local_tdata_uses_exact_agent_and_ignores_guest_tenant() {
         state.clone(),
         TenantId::default(),
         Some(&agent),
+        "test-module",
         Arc::new(FailingHost),
     );
     let headers = vec![
@@ -478,6 +491,7 @@ async fn local_tdata_uses_invocation_tenant_without_a_tenant_header() {
         state,
         temper_runtime::tenant::TenantId::default(),
         Some(&agent),
+        "test-module",
         Arc::new(FailingHost),
     );
     let headers = vec![
@@ -520,6 +534,7 @@ async fn allowlisted_public_tdata_calls_use_odata_handlers() {
         state,
         temper_runtime::tenant::TenantId::default(),
         Some(&agent),
+        "test-module",
         Arc::new(FailingHost),
     );
     let headers = vec![
@@ -582,6 +597,7 @@ async fn production_host_stack_forwards_the_llm_content_export_decision() {
             state,
             temper_runtime::tenant::TenantId::default(),
             Some(&agent),
+            "test-module",
             inner,
         ));
         assert_eq!(

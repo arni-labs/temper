@@ -1,7 +1,7 @@
 //! Persistence methods for ServerState (Postgres, Turso, Redis backends).
 
-use sqlx::PgPool;
 use temper_runtime::tenant::TenantId;
+use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::{TursoEventStore, TursoWasmInvocationInsert};
 
 use super::ServerState;
@@ -13,7 +13,7 @@ use crate::storage::BackendLabel;
 /// `turso_for_tenant()` returns an owned `TursoEventStore` (Arc-based,
 /// clone is cheap), so tenant-scoped operations use this owned variant.
 pub(crate) enum TenantMetadataBackend {
-    Postgres(PgPool),
+    Postgres(PostgresEventStore),
     Turso(TursoEventStore),
     Redis,
 }
@@ -45,14 +45,19 @@ impl ServerState {
     ///
     /// In TenantRouted mode, routes to the per-tenant database.
     /// In single-DB Turso mode, returns the shared store.
-    /// In Postgres mode, returns the shared pool (RLS handles isolation).
+    /// In Postgres mode, returns the configured store, preserving schema selection.
     pub(crate) async fn tenant_metadata_backend(
         &self,
         tenant: &str,
     ) -> Option<TenantMetadataBackend> {
         let stack = self.storage_stack.as_ref()?;
         if let Some(pool) = stack.postgres_pool.as_ref() {
-            return Some(TenantMetadataBackend::Postgres(pool.clone()));
+            let store = stack
+                .metadata
+                .as_ref()
+                .and_then(|provider| provider.postgres_store())
+                .unwrap_or_else(|| PostgresEventStore::new(pool.clone()));
+            return Some(TenantMetadataBackend::Postgres(store));
         }
         if let Some(provider) = stack.turso.as_ref()
             && let Some(turso) = provider.store_for_tenant(tenant).await
@@ -107,9 +112,9 @@ impl ServerState {
             })?;
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 sqlx::query(
-                    "INSERT INTO wasm_modules \
+                    &store.schema().qualify_sql("INSERT INTO {schema}wasm_modules \
                      (tenant, module_name, wasm_bytes, sha256_hash, version, size_bytes, updated_at, source) \
                      VALUES ($1, $2, $3, $4, 1, $5, now(), $6) \
                      ON CONFLICT (tenant, module_name) DO UPDATE SET \
@@ -120,7 +125,7 @@ impl ServerState {
                          updated_at = now(), \
                          source = EXCLUDED.source \
                      WHERE wasm_modules.sha256_hash IS DISTINCT FROM EXCLUDED.sha256_hash \
-                        AND ($7 OR EXCLUDED.source = 'upload' OR wasm_modules.source = 'bundled')",
+                        AND ($7 OR EXCLUDED.source = 'upload' OR wasm_modules.source = 'bundled')"),
                 )
                 .bind(tenant)
                 .bind(module_name)
@@ -129,7 +134,7 @@ impl ServerState {
                 .bind(wasm_bytes.len() as i32)
                 .bind(persisted_source)
                 .bind(replace_uploaded_wasm)
-                .execute(&pool)
+                .execute(store.pool())
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("failed to upsert WASM module {tenant}/{module_name}: {e}"))
@@ -177,16 +182,18 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
-                let rows =
-                    sqlx::query_as::<_, (String, String, String, chrono::DateTime<chrono::Utc>)>(
-                        "SELECT module_name, sha256_hash, source, updated_at \
-                         FROM wasm_modules WHERE tenant = $1",
-                    )
-                    .bind(tenant)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| format!("failed to load WASM module sources for {tenant}: {e}"))?;
+            TenantMetadataBackend::Postgres(store) => {
+                let rows = sqlx::query_as::<
+                    _,
+                    (String, String, String, chrono::DateTime<chrono::Utc>),
+                >(&store.schema().qualify_sql(
+                    "SELECT module_name, sha256_hash, source, updated_at \
+                         FROM {schema}wasm_modules WHERE tenant = $1",
+                ))
+                .bind(tenant)
+                .fetch_all(store.pool())
+                .await
+                .map_err(|e| format!("failed to load WASM module sources for {tenant}: {e}"))?;
                 Ok(rows
                     .into_iter()
                     .map(|(name, hash, source, updated_at)| {
@@ -235,16 +242,15 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
-                let result =
-                    sqlx::query("DELETE FROM wasm_modules WHERE tenant = $1 AND module_name = $2")
-                        .bind(tenant)
-                        .bind(module_name)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| {
-                            format!("failed to delete WASM module {tenant}/{module_name}: {e}")
-                        })?;
+            TenantMetadataBackend::Postgres(store) => {
+                let result = sqlx::query(&store.schema().qualify_sql(
+                    "DELETE FROM {schema}wasm_modules WHERE tenant = $1 AND module_name = $2",
+                ))
+                .bind(tenant)
+                .bind(module_name)
+                .execute(store.pool())
+                .await
+                .map_err(|e| format!("failed to delete WASM module {tenant}/{module_name}: {e}"))?;
                 Ok(result.rows_affected() > 0)
             }
             TenantMetadataBackend::Turso(turso) => turso
@@ -281,13 +287,13 @@ impl ServerState {
         };
 
         let (wasm_bytes, stored_hash) = match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 let row: Option<(Vec<u8>, String)> = sqlx::query_as(
-                    "SELECT wasm_bytes, sha256_hash FROM wasm_modules WHERE tenant = $1 AND module_name = $2",
+                    &store.schema().qualify_sql("SELECT wasm_bytes, sha256_hash FROM {schema}wasm_modules WHERE tenant = $1 AND module_name = $2"),
                 )
                 .bind(&tenant_name)
                 .bind(module_name)
-                .fetch_optional(&pool)
+                .fetch_optional(store.pool())
                 .await
                 .map_err(|e| {
                     format!(

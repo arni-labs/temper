@@ -46,6 +46,8 @@ struct PreparedCompositeSubWrite {
     entity_id: String,
     action: String,
     params: Value,
+    // Fallback re-enters core dispatch, which must resolve original input itself.
+    unresolved_params: Value,
     idempotency_key: String,
     preflight_target: Option<PreflightCompositeTarget>,
     uses_parent_gate: bool,
@@ -189,7 +191,7 @@ impl crate::state::ServerState {
                     &prepared.entity_type,
                     &prepared.entity_id,
                     &prepared.action,
-                    prepared.params,
+                    prepared.unresolved_params,
                     &sub_agent_ctx,
                     false,
                     None,
@@ -591,7 +593,15 @@ impl crate::state::ServerState {
             let sub_entity_id = sub_write.entity_id.clone();
             let sub_action = sub_write.action.clone();
             let table = self.transition_table_for_dispatch(tenant, &sub_entity_type)?;
-            let sub_params = normalize_sub_write_params(sub_write, table.strict_action_params);
+            let unresolved_params =
+                normalize_sub_write_params(sub_write, table.strict_action_params);
+            let sub_params = self.resolve_authenticated_params(
+                tenant,
+                &sub_entity_type,
+                &sub_action,
+                unresolved_params.clone(),
+                composite_agent_ctx,
+            )?;
 
             let governed = match governed_cache.get(&sub_entity_type) {
                 Some(governed) => *governed,
@@ -616,6 +626,7 @@ impl crate::state::ServerState {
                 entity_id: sub_entity_id,
                 action: sub_action,
                 params: sub_params,
+                unresolved_params,
                 idempotency_key: format!(
                     "composite:{tenant}:{entity_type}:{entity_id}:{action}:{parent_idempotency}:subwrite:{idx}"
                 ),

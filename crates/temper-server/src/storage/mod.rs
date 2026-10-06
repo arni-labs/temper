@@ -1209,6 +1209,12 @@ impl<T> MetadataStore for T where
 /// Provider for platform, tenant-scoped, and fan-out metadata stores.
 #[async_trait::async_trait]
 pub trait MetadataStoreProvider: Send + Sync {
+    /// Concrete PostgreSQL store for legacy metadata helpers. Providers without
+    /// PostgreSQL retain the default; configured stores keep their schema choice.
+    fn postgres_store(&self) -> Option<PostgresEventStore> {
+        None
+    }
+
     fn platform_store(&self) -> Option<Arc<dyn MetadataStore>>;
 
     async fn store_for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataStore>>;
@@ -1314,7 +1320,7 @@ impl StorageStack {
             Some(store.clone() as Arc<dyn QueryPlaneStore>),
             Some(store.clone() as Arc<dyn DataOnlyCreateStore>),
             Some(store.clone() as Arc<dyn TrajectorySink>),
-            Some(Arc::new(SingleMetadataStoreProvider::new(store))),
+            Some(Arc::new(SingleMetadataStoreProvider::new_postgres(store))),
         )
     }
 
@@ -1395,6 +1401,7 @@ impl StorageStack {
 
 struct SingleMetadataStoreProvider {
     store: Arc<dyn MetadataStore>,
+    postgres: Option<PostgresEventStore>,
 }
 
 impl SingleMetadataStoreProvider {
@@ -1402,12 +1409,26 @@ impl SingleMetadataStoreProvider {
     where
         T: MetadataStore + 'static,
     {
-        Self { store }
+        Self {
+            store,
+            postgres: None,
+        }
+    }
+
+    fn new_postgres(store: Arc<PostgresEventStore>) -> Self {
+        Self {
+            postgres: Some((*store).clone()),
+            store,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl MetadataStoreProvider for SingleMetadataStoreProvider {
+    fn postgres_store(&self) -> Option<PostgresEventStore> {
+        self.postgres.clone()
+    }
+
     fn platform_store(&self) -> Option<Arc<dyn MetadataStore>> {
         Some(self.store.clone())
     }

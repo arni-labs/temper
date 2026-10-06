@@ -59,11 +59,13 @@ struct QueryProjectionCatalogUpdate<'a> {
 }
 
 async fn update_query_projection_catalog_row(
+    schema: &crate::PostgresSchema,
     tx: &mut Transaction<'_, Postgres>,
     update: QueryProjectionCatalogUpdate<'_>,
 ) -> Result<(), PersistenceError> {
     crate::dbm::postgres_query!(
-        "UPDATE entity_catalog \
+        schema,
+        "UPDATE {schema}entity_catalog \
          SET status = $4, \
              fields = CASE WHEN projection_hash IS DISTINCT FROM $7 THEN $5 ELSE fields END, \
              sequence_nr = $6, \
@@ -88,6 +90,7 @@ async fn update_query_projection_catalog_row(
 }
 
 async fn reconcile_query_projection_field_index(
+    schema: &crate::PostgresSchema,
     tx: &mut Transaction<'_, Postgres>,
     tenant: &str,
     entity_type: &str,
@@ -103,7 +106,8 @@ async fn reconcile_query_projection_field_index(
     }
 
     crate::dbm::postgres_query!(
-        "DELETE FROM entity_field_index e \
+        schema,
+        "DELETE FROM {schema}entity_field_index e \
          WHERE e.tenant = $1 \
            AND e.entity_type = $2 \
            AND e.entity_id = $3 \
@@ -127,7 +131,8 @@ async fn reconcile_query_projection_field_index(
 
     if !field_names.is_empty() {
         crate::dbm::postgres_query!(
-            "INSERT INTO entity_field_index \
+            schema,
+            "INSERT INTO {schema}entity_field_index \
              (tenant, entity_type, entity_id, field_name, field_value, status) \
              SELECT $1, $2, $3, incoming.field_name, incoming.field_value, $6 \
              FROM unnest($4::text[], $5::text[]) AS incoming(field_name, field_value) \
@@ -513,8 +518,8 @@ impl PostgresEventStore {
         let created_at = parse_rfc3339(entry.created_at)?;
         let request_body = parse_optional_json(entry.request_body)?;
         let matched_policy_ids = parse_optional_json(entry.matched_policy_ids)?;
-        crate::dbm::postgres_query!(
-            "INSERT INTO trajectories \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}trajectories \
              (tenant, entity_type, entity_id, action, success, from_status, to_status, error, \
               agent_id, session_id, authz_denied, denied_resource, denied_module, source, \
               spec_governed, created_at, request_body, intent, matched_policy_ids, capture_seq) \
@@ -637,8 +642,9 @@ impl PostgresEventStore {
 
         let previous_catalog: Option<CatalogProjectionFingerprint> =
             crate::dbm::postgres_query_as!(
+                &self.schema,
                 "SELECT status, projection_hash, sequence_nr \
-                 FROM entity_catalog \
+                 FROM {schema}entity_catalog \
                  WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
                  FOR UPDATE",
             )
@@ -682,6 +688,7 @@ impl PostgresEventStore {
             return Ok(());
         } else if previous_catalog.is_some() {
             update_query_projection_catalog_row(
+                &self.schema,
                 &mut tx,
                 QueryProjectionCatalogUpdate {
                     tenant,
@@ -697,8 +704,8 @@ impl PostgresEventStore {
             .await?;
             previous_catalog
         } else {
-            let inserted: Option<i32> = crate::dbm::postgres_query_scalar!(
-                "INSERT INTO entity_catalog \
+            let inserted: Option<i32> = crate::dbm::postgres_query_scalar!(&self.schema,
+                "INSERT INTO {schema}entity_catalog \
                  (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 2, $8, now()) \
                  ON CONFLICT (tenant, entity_type, entity_id) DO NOTHING \
@@ -721,8 +728,9 @@ impl PostgresEventStore {
             } else {
                 let raced_catalog: Option<CatalogProjectionFingerprint> =
                     crate::dbm::postgres_query_as!(
+                        &self.schema,
                         "SELECT status, projection_hash, sequence_nr \
-                         FROM entity_catalog \
+                         FROM {schema}entity_catalog \
                          WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
                          FOR UPDATE",
                     )
@@ -764,6 +772,7 @@ impl PostgresEventStore {
                     return Ok(());
                 }
                 update_query_projection_catalog_row(
+                    &self.schema,
                     &mut tx,
                     QueryProjectionCatalogUpdate {
                         tenant,
@@ -799,6 +808,7 @@ impl PostgresEventStore {
 
         if should_reconcile_index {
             reconcile_query_projection_field_index(
+                &self.schema,
                 &mut tx,
                 tenant,
                 entity_type,
@@ -883,8 +893,8 @@ impl PostgresEventStore {
                 return Err(storage_error(e));
             }
         };
-        crate::dbm::postgres_query!(
-            "DELETE FROM entity_catalog WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+        crate::dbm::postgres_query!(&self.schema,
+            "DELETE FROM {schema}entity_catalog WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
         )
         .bind(tenant)
         .bind(entity_type)
@@ -892,7 +902,7 @@ impl PostgresEventStore {
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
-        crate::dbm::postgres_query!("DELETE FROM entity_field_index WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3")
+        crate::dbm::postgres_query!(&self.schema,"DELETE FROM {schema}entity_field_index WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3")
             .bind(tenant)
             .bind(entity_type)
             .bind(entity_id)
@@ -925,8 +935,10 @@ impl PostgresEventStore {
         params: Vec<String>,
     ) -> Result<Vec<String>, PersistenceError> {
         let clause = postgres_placeholders(where_clause, params.len() + 2);
+        let schema = self.schema.prefix();
+        let index_cte = crate::query_page::field_index_cte(schema);
         let sql = format!(
-            "SELECT entity_id FROM entity_catalog \
+            "{index_cte}SELECT entity_id FROM {schema}entity_catalog \
              WHERE tenant = $1 AND entity_type = $2 AND ({clause}) \
              ORDER BY entity_id"
         );
@@ -957,9 +969,10 @@ impl PostgresEventStore {
             .collect();
         let field_names = requested_fields.iter().cloned().collect::<Vec<_>>();
         let rows = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT c.entity_id, c.status, f.field_name, f.field_value \
-             FROM entity_catalog c \
-             LEFT JOIN entity_field_index f \
+             FROM {schema}entity_catalog c \
+             LEFT JOIN {schema}entity_field_index f \
                ON c.tenant = f.tenant \
               AND c.entity_type = f.entity_type \
               AND c.entity_id = f.entity_id \
@@ -1009,8 +1022,8 @@ impl PostgresEventStore {
     pub async fn projected_entity_counts_by_tenant(
         &self,
     ) -> Result<Vec<(String, u64)>, PersistenceError> {
-        let rows: Vec<(String, i64)> = crate::dbm::postgres_query_as!(
-            "SELECT tenant, COUNT(*)::bigint FROM entity_catalog GROUP BY tenant ORDER BY tenant",
+        let rows: Vec<(String, i64)> = crate::dbm::postgres_query_as!(&self.schema,
+            "SELECT tenant, COUNT(*)::bigint FROM {schema}entity_catalog GROUP BY tenant ORDER BY tenant",
         )
         .fetch_all(self.pool())
         .await
@@ -1042,8 +1055,9 @@ impl PostgresEventStore {
             Option<serde_json::Value>,
             i64,
         )> = crate::dbm::postgres_query_as!(
+            &self.schema,
             "SELECT entity_id, status, fields, state, sequence_nr \
-             FROM entity_catalog \
+             FROM {schema}entity_catalog \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = ANY($3) \
              ORDER BY entity_id",
         )
@@ -1075,8 +1089,8 @@ impl PostgresEventStore {
         csdl_xml: &str,
         content_hash: &str,
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            "INSERT INTO specs \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}specs \
              (tenant, entity_type, ioa_source, csdl_xml, content_hash, committed, version, verified, verification_status, updated_at) \
              VALUES ($1, $2, $3, $4, $5, false, 1, false, 'pending', now()) \
              ON CONFLICT (tenant, entity_type) DO UPDATE SET \
@@ -1104,10 +1118,10 @@ impl PostgresEventStore {
     }
 
     pub async fn load_specs(&self) -> Result<Vec<PostgresSpecRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
                     levels_passed, levels_total, verification_result, content_hash, updated_at, committed \
-             FROM specs WHERE committed = true ORDER BY tenant, entity_type",
+             FROM {schema}specs WHERE committed = true ORDER BY tenant, entity_type",
         )
         .fetch_all(self.pool())
         .await
@@ -1120,18 +1134,22 @@ impl PostgresEventStore {
         tenant: &str,
         entity_type: &str,
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!("DELETE FROM specs WHERE tenant = $1 AND entity_type = $2")
-            .bind(tenant)
-            .bind(entity_type)
-            .execute(self.pool())
-            .await
-            .map_err(storage_error)?;
+        crate::dbm::postgres_query!(
+            &self.schema,
+            "DELETE FROM {schema}specs WHERE tenant = $1 AND entity_type = $2"
+        )
+        .bind(tenant)
+        .bind(entity_type)
+        .execute(self.pool())
+        .await
+        .map_err(storage_error)?;
         Ok(())
     }
 
     pub async fn commit_specs(&self, tenant: &str) -> Result<(), PersistenceError> {
         crate::dbm::postgres_query!(
-            "UPDATE specs SET committed = true, updated_at = now() WHERE tenant = $1"
+            &self.schema,
+            "UPDATE {schema}specs SET committed = true, updated_at = now() WHERE tenant = $1"
         )
         .bind(tenant)
         .execute(self.pool())
@@ -1141,10 +1159,13 @@ impl PostgresEventStore {
     }
 
     pub async fn delete_uncommitted_specs(&self) -> Result<usize, PersistenceError> {
-        let result = crate::dbm::postgres_query!("DELETE FROM specs WHERE committed = false")
-            .execute(self.pool())
-            .await
-            .map_err(storage_error)?;
+        let result = crate::dbm::postgres_query!(
+            &self.schema,
+            "DELETE FROM {schema}specs WHERE committed = false"
+        )
+        .execute(self.pool())
+        .await
+        .map_err(storage_error)?;
         Ok(result.rows_affected() as usize)
     }
 
@@ -1153,7 +1174,8 @@ impl PostgresEventStore {
         tenant: &str,
     ) -> Result<BTreeMap<String, (String, bool)>, PersistenceError> {
         let rows: Vec<(String, String, bool)> = crate::dbm::postgres_query_as!(
-            "SELECT entity_type, content_hash, verified FROM specs WHERE tenant = $1",
+            &self.schema,
+            "SELECT entity_type, content_hash, verified FROM {schema}specs WHERE tenant = $1",
         )
         .bind(tenant)
         .fetch_all(self.pool())
@@ -1173,7 +1195,8 @@ impl PostgresEventStore {
     ) -> Result<(), PersistenceError> {
         let verification_result = parse_optional_json(update.verification_result_json)?;
         crate::dbm::postgres_query!(
-            "UPDATE specs SET verification_status = $3, verified = $4, levels_passed = $5, \
+            &self.schema,
+            "UPDATE {schema}specs SET verification_status = $3, verified = $4, levels_passed = $5, \
              levels_total = $6, verification_result = $7, updated_at = now() \
              WHERE tenant = $1 AND entity_type = $2",
         )
@@ -1195,8 +1218,8 @@ impl PostgresEventStore {
         tenant: &str,
         policy_text: &str,
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            "INSERT INTO tenant_policies (tenant, policy_text, updated_at) VALUES ($1, $2, now()) \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}tenant_policies (tenant, policy_text, updated_at) VALUES ($1, $2, now()) \
              ON CONFLICT (tenant) DO UPDATE SET policy_text = EXCLUDED.policy_text, updated_at = now()",
         )
         .bind(tenant)
@@ -1209,7 +1232,8 @@ impl PostgresEventStore {
 
     pub async fn load_tenant_policies(&self) -> Result<Vec<(String, String)>, PersistenceError> {
         crate::dbm::postgres_query_as!(
-            "SELECT tenant, policy_text FROM tenant_policies ORDER BY tenant"
+            &self.schema,
+            "SELECT tenant, policy_text FROM {schema}tenant_policies ORDER BY tenant"
         )
         .fetch_all(self.pool())
         .await
@@ -1225,7 +1249,8 @@ impl PostgresEventStore {
     ) -> Result<bool, PersistenceError> {
         let policy_hash = compute_policy_hash(cedar_text);
         let existing_hash: Option<String> = crate::dbm::postgres_query_scalar!(
-            "SELECT policy_hash FROM policies WHERE tenant = $1 AND policy_id = $2",
+            &self.schema,
+            "SELECT policy_hash FROM {schema}policies WHERE tenant = $1 AND policy_id = $2",
         )
         .bind(tenant)
         .bind(policy_id)
@@ -1239,7 +1264,8 @@ impl PostgresEventStore {
 
         if existing_hash.is_none() {
             let duplicate: Option<i32> = crate::dbm::postgres_query_scalar!(
-                "SELECT 1 FROM policies \
+                &self.schema,
+                "SELECT 1 FROM {schema}policies \
                  WHERE tenant = $1 AND enabled = true AND policy_hash = $2 \
                  LIMIT 1",
             )
@@ -1254,7 +1280,8 @@ impl PostgresEventStore {
         }
 
         crate::dbm::postgres_query!(
-            "INSERT INTO policies \
+            &self.schema,
+            "INSERT INTO {schema}policies \
              (tenant, policy_id, cedar_text, policy_hash, created_at, created_by, enabled) \
              VALUES ($1, $2, $3, $4, now(), $5, true) \
              ON CONFLICT (tenant, policy_id) DO UPDATE SET \
@@ -1280,8 +1307,9 @@ impl PostgresEventStore {
         tenant: &str,
     ) -> Result<Vec<PostgresPolicyRow>, PersistenceError> {
         crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT tenant, policy_id, cedar_text, policy_hash, created_at, created_by, enabled \
-             FROM policies \
+             FROM {schema}policies \
              WHERE tenant = $1 \
              ORDER BY created_at ASC",
         )
@@ -1294,8 +1322,9 @@ impl PostgresEventStore {
 
     pub async fn load_all_policies(&self) -> Result<Vec<PostgresPolicyRow>, PersistenceError> {
         crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT tenant, policy_id, cedar_text, policy_hash, created_at, created_by, enabled \
-             FROM policies \
+             FROM {schema}policies \
              ORDER BY tenant ASC, created_at ASC",
         )
         .fetch_all(self.pool())
@@ -1311,7 +1340,8 @@ impl PostgresEventStore {
         enabled: bool,
     ) -> Result<bool, PersistenceError> {
         let result = crate::dbm::postgres_query!(
-            "UPDATE policies SET enabled = $3 \
+            &self.schema,
+            "UPDATE {schema}policies SET enabled = $3 \
              WHERE tenant = $1 AND policy_id = $2",
         )
         .bind(tenant)
@@ -1332,7 +1362,8 @@ impl PostgresEventStore {
     ) -> Result<bool, PersistenceError> {
         let policy_hash = compute_policy_hash(cedar_text);
         let result = crate::dbm::postgres_query!(
-            "UPDATE policies \
+            &self.schema,
+            "UPDATE {schema}policies \
              SET cedar_text = $3, policy_hash = $4, created_by = $5, created_at = now() \
              WHERE tenant = $1 AND policy_id = $2",
         )
@@ -1360,8 +1391,8 @@ impl PostgresEventStore {
         created_by: &str,
     ) -> Result<bool, PersistenceError> {
         let policy_hash = compute_policy_hash(cedar_text);
-        let result = crate::dbm::postgres_query!(
-            "UPDATE policies SET cedar_text = $3, policy_hash = $4, created_by = $5, created_at = now() \
+        let result = crate::dbm::postgres_query!(&self.schema,
+            "UPDATE {schema}policies SET cedar_text = $3, policy_hash = $4, created_by = $5, created_at = now() \
              WHERE tenant = $1 AND policy_id = $2 AND policy_hash = $6 AND enabled = TRUE",
         ).bind(tenant).bind(policy_id).bind(cedar_text).bind(&policy_hash)
             .bind(created_by).bind(expected_hash).execute(self.pool()).await.map_err(storage_error)?;
@@ -1373,12 +1404,15 @@ impl PostgresEventStore {
         tenant: &str,
         policy_id: &str,
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!("DELETE FROM policies WHERE tenant = $1 AND policy_id = $2")
-            .bind(tenant)
-            .bind(policy_id)
-            .execute(self.pool())
-            .await
-            .map_err(storage_error)?;
+        crate::dbm::postgres_query!(
+            &self.schema,
+            "DELETE FROM {schema}policies WHERE tenant = $1 AND policy_id = $2"
+        )
+        .bind(tenant)
+        .bind(policy_id)
+        .execute(self.pool())
+        .await
+        .map_err(storage_error)?;
         Ok(())
     }
 
@@ -1387,8 +1421,8 @@ impl PostgresEventStore {
         tenant: &str,
         cross_invariants_toml: &str,
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            "INSERT INTO tenant_constraints (tenant, cross_invariants_toml, version, updated_at) \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}tenant_constraints (tenant, cross_invariants_toml, version, updated_at) \
              VALUES ($1, $2, 1, now()) \
              ON CONFLICT (tenant) DO UPDATE SET cross_invariants_toml = EXCLUDED.cross_invariants_toml, \
                  version = tenant_constraints.version + 1, updated_at = now()",
@@ -1406,8 +1440,8 @@ impl PostgresEventStore {
         tenant: &str,
         app_name: &str,
     ) -> Result<bool, PersistenceError> {
-        crate::dbm::postgres_query_scalar!(
-            "SELECT EXISTS(SELECT 1 FROM tenant_installed_apps WHERE tenant = $1 AND app_name = $2)",
+        crate::dbm::postgres_query_scalar!(&self.schema,
+            "SELECT EXISTS(SELECT 1 FROM {schema}tenant_installed_apps WHERE tenant = $1 AND app_name = $2)",
         )
         .bind(tenant)
         .bind(app_name)
@@ -1452,8 +1486,8 @@ impl PostgresEventStore {
         record: &PostgresInstalledAppRow,
     ) -> Result<(), PersistenceError> {
         let last_reconciled_at = parse_optional_rfc3339(record.last_reconciled_at.as_deref())?;
-        crate::dbm::postgres_query!(
-            "INSERT INTO tenant_installed_apps \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}tenant_installed_apps \
              (tenant, app_name, source_kind, app_ref, version_hash, pinned_version_hash, current_version_hash, follow_policy, closure_id, registry_url, registry_tenant, \
               app_version, bundle_digest, spec_digest, policy_digest, wasm_digest, \
               content_digest, seed_digest, installed_at, last_reconciled_at, status) \
@@ -1500,11 +1534,11 @@ impl PostgresEventStore {
         tenant: &str,
         app_name: &str,
     ) -> Result<Option<PostgresInstalledAppRow>, PersistenceError> {
-        let row = crate::dbm::postgres_query!(
+        let row = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, app_name, source_kind, app_ref, version_hash, pinned_version_hash, current_version_hash, follow_policy, closure_id, registry_url, registry_tenant, \
                     app_version, bundle_digest, spec_digest, policy_digest, \
                     wasm_digest, content_digest, seed_digest, installed_at, last_reconciled_at, status \
-             FROM tenant_installed_apps WHERE tenant = $1 AND app_name = $2",
+             FROM {schema}tenant_installed_apps WHERE tenant = $1 AND app_name = $2",
         )
         .bind(tenant)
         .bind(app_name)
@@ -1516,7 +1550,8 @@ impl PostgresEventStore {
 
     pub async fn list_all_installed_apps(&self) -> Result<Vec<(String, String)>, PersistenceError> {
         crate::dbm::postgres_query_as!(
-            "SELECT tenant, app_name FROM tenant_installed_apps ORDER BY tenant, app_name",
+            &self.schema,
+            "SELECT tenant, app_name FROM {schema}tenant_installed_apps ORDER BY tenant, app_name",
         )
         .fetch_all(self.pool())
         .await
@@ -1531,8 +1566,8 @@ impl PostgresEventStore {
         data: &str,
     ) -> Result<(), PersistenceError> {
         let data = parse_json(data)?;
-        let result = crate::dbm::postgres_query!(
-            "INSERT INTO pending_decisions (id, tenant, status, data, created_at, updated_at) \
+        let result = crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}pending_decisions (id, tenant, status, data, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, now(), now()) \
              ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, \
                  data = EXCLUDED.data, updated_at = now() \
@@ -1558,7 +1593,8 @@ impl PostgresEventStore {
         limit: i64,
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<serde_json::Value> = crate::dbm::postgres_query_scalar!(
-            "SELECT data FROM pending_decisions ORDER BY updated_at DESC LIMIT $1",
+            &self.schema,
+            "SELECT data FROM {schema}pending_decisions ORDER BY updated_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(self.pool())
@@ -1578,7 +1614,8 @@ impl PostgresEventStore {
         session_id: &str,
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<serde_json::Value> = crate::dbm::postgres_query_scalar!(
-            "SELECT data FROM pending_decisions \
+            &self.schema,
+            "SELECT data FROM {schema}pending_decisions \
              WHERE tenant = $1 \
                AND status = 'approved' \
                AND data->'approved_scope'->>'session_id' = $2",
@@ -1596,8 +1633,9 @@ impl PostgresEventStore {
         tenant: &str,
     ) -> Result<Vec<PostgresWasmModuleRow>, PersistenceError> {
         let rows = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT tenant, module_name, wasm_bytes, sha256_hash, source \
-             FROM wasm_modules WHERE tenant = $1 ORDER BY module_name",
+             FROM {schema}wasm_modules WHERE tenant = $1 ORDER BY module_name",
         )
         .bind(tenant)
         .fetch_all(self.pool())
@@ -1610,8 +1648,9 @@ impl PostgresEventStore {
         &self,
     ) -> Result<Vec<PostgresWasmModuleRow>, PersistenceError> {
         let rows = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT tenant, module_name, wasm_bytes, sha256_hash, source \
-             FROM wasm_modules ORDER BY tenant, module_name",
+             FROM {schema}wasm_modules ORDER BY tenant, module_name",
         )
         .fetch_all(self.pool())
         .await
@@ -1642,8 +1681,8 @@ impl PostgresEventStore {
         } else {
             source
         };
-        crate::dbm::postgres_query!(
-            "INSERT INTO wasm_modules \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}wasm_modules \
              (tenant, module_name, wasm_bytes, sha256_hash, version, size_bytes, updated_at, source) \
              VALUES ($1, $2, $3, $4, 1, $5, now(), $6) \
              ON CONFLICT (tenant, module_name) DO UPDATE SET \
@@ -1676,11 +1715,11 @@ impl PostgresEventStore {
         tenant: &str,
         limit: i64,
     ) -> Result<Vec<PostgresTrajectoryRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, entity_id, action, success, from_status, to_status, error, \
                     agent_id, session_id, authz_denied, denied_resource, denied_module, source, spec_governed, \
                     created_at, request_body, intent, matched_policy_ids, capture_seq \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE tenant = $1 \
              ORDER BY created_at DESC \
              LIMIT $2",
@@ -1698,9 +1737,10 @@ impl PostgresEventStore {
         tenant: &str,
     ) -> Result<Vec<PostgresUnmetIntentAggRow>, PersistenceError> {
         let rows = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT entity_type, MAX(action) AS action, error, COUNT(*)::bigint AS cnt, \
                     MIN(created_at) AS first_seen, MAX(created_at) AS last_seen \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE tenant = $1 \
                AND success = false AND (authz_denied IS NULL OR authz_denied = false) \
              GROUP BY entity_type, error \
@@ -1719,8 +1759,9 @@ impl PostgresEventStore {
         tenant: &str,
     ) -> Result<BTreeMap<String, String>, PersistenceError> {
         let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = crate::dbm::postgres_query_as!(
+            &self.schema,
             "SELECT entity_type, MAX(created_at) AS latest_at \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE tenant = $1 AND success = true AND action = 'SubmitSpec' \
              GROUP BY entity_type",
         )
@@ -1738,7 +1779,8 @@ impl PostgresEventStore {
         &self,
     ) -> Result<BTreeMap<String, u64>, PersistenceError> {
         let rows: Vec<(String, i64)> = crate::dbm::postgres_query_as!(
-            "SELECT tenant, COUNT(*)::bigint FROM trajectories GROUP BY tenant"
+            &self.schema,
+            "SELECT tenant, COUNT(*)::bigint FROM {schema}trajectories GROUP BY tenant"
         )
         .fetch_all(self.pool())
         .await
@@ -1762,10 +1804,10 @@ impl PostgresEventStore {
         success_filter: Option<bool>,
         failed_limit: i64,
     ) -> Result<PostgresTrajectoryStats, PersistenceError> {
-        let row: (i64, i64) = crate::dbm::postgres_query_as!(
+        let row: (i64, i64) = crate::dbm::postgres_query_as!(&self.schema,
             "SELECT COUNT(*)::bigint AS total, \
                     COALESCE(SUM(CASE WHEN success = true THEN 1 ELSE 0 END), 0)::bigint AS success_count \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE tenant = $1 \
                AND ($2::text IS NULL OR entity_type = $2) \
                AND ($3::text IS NULL OR action = $3) \
@@ -1781,11 +1823,11 @@ impl PostgresEventStore {
         let total = row.0 as u64;
         let success_count = row.1 as u64;
 
-        let action_rows: Vec<(String, i64, i64, i64)> = crate::dbm::postgres_query_as!(
+        let action_rows: Vec<(String, i64, i64, i64)> = crate::dbm::postgres_query_as!(&self.schema,
             "SELECT action, COUNT(*)::bigint AS total, \
                     COALESCE(SUM(CASE WHEN success = true THEN 1 ELSE 0 END), 0)::bigint AS success, \
                     COALESCE(SUM(CASE WHEN success = false THEN 1 ELSE 0 END), 0)::bigint AS error \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE tenant = $1 \
              GROUP BY action",
         )
@@ -1807,11 +1849,11 @@ impl PostgresEventStore {
             })
             .collect();
 
-        let failed_rows = crate::dbm::postgres_query!(
+        let failed_rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, entity_id, action, success, from_status, to_status, error, \
                     agent_id, session_id, authz_denied, denied_resource, denied_module, source, spec_governed, \
                     created_at, request_body, intent, matched_policy_ids, capture_seq \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE tenant = $1 \
                AND success = false \
              ORDER BY created_at DESC \
@@ -1845,11 +1887,11 @@ impl PostgresEventStore {
         entity_type: Option<&str>,
         limit: i64,
     ) -> Result<Vec<PostgresTrajectoryRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, entity_id, action, success, from_status, to_status, error, \
                     agent_id, session_id, authz_denied, denied_resource, denied_module, source, spec_governed, \
                     created_at, request_body, intent, matched_policy_ids, capture_seq \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE agent_id = $1 \
                AND ($2::text IS NULL OR tenant = $2) \
                AND ($3::text IS NULL OR entity_type = $3) \
@@ -1887,11 +1929,11 @@ impl PostgresEventStore {
         entity_type: Option<&str>,
         limit: i64,
     ) -> Result<Vec<PostgresTrajectoryRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, entity_id, action, success, from_status, to_status, error, \
                     agent_id, session_id, authz_denied, denied_resource, denied_module, source, spec_governed, \
                     created_at, request_body, intent, matched_policy_ids, capture_seq \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE session_id = $1 \
                AND ($2::text IS NULL OR tenant = $2) \
                AND ($3::text IS NULL OR entity_type = $3) \
@@ -1912,13 +1954,13 @@ impl PostgresEventStore {
         &self,
         tenant: Option<&str>,
     ) -> Result<Vec<PostgresAgentSummary>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT agent_id, COUNT(*)::bigint AS total_actions, \
                     COALESCE(SUM(CASE WHEN success = true THEN 1 ELSE 0 END), 0)::bigint AS success_count, \
                     COALESCE(SUM(CASE WHEN success = false THEN 1 ELSE 0 END), 0)::bigint AS error_count, \
                     COALESCE(SUM(CASE WHEN authz_denied = true THEN 1 ELSE 0 END), 0)::bigint AS denial_count, \
                     MAX(created_at) AS last_active_at \
-             FROM trajectories \
+             FROM {schema}trajectories \
              WHERE agent_id IS NOT NULL AND ($1::text IS NULL OR tenant = $1) \
              GROUP BY agent_id \
              ORDER BY last_active_at DESC",
@@ -1943,7 +1985,8 @@ impl PostgresEventStore {
         total_steps: Option<i64>,
     ) -> Result<(), PersistenceError> {
         crate::dbm::postgres_query!(
-            "INSERT INTO design_time_events \
+            &self.schema,
+            "INSERT INTO {schema}design_time_events \
              (kind, entity_type, tenant, summary, level, passed, step_number, total_steps) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
@@ -1966,9 +2009,9 @@ impl PostgresEventStore {
         tenant: Option<&str>,
         limit: i64,
     ) -> Result<Vec<PostgresDesignTimeEventRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT id, kind, entity_type, tenant, summary, level, passed, step_number, total_steps, created_at \
-             FROM design_time_events \
+             FROM {schema}design_time_events \
              WHERE ($1::text IS NULL OR tenant = $1) \
              ORDER BY created_at DESC \
              LIMIT $2",
@@ -1992,8 +2035,8 @@ impl PostgresEventStore {
         p: &PostgresOtsTrajectoryParams<'_>,
     ) -> Result<(), PersistenceError> {
         let data = parse_json(p.data)?;
-        crate::dbm::postgres_query!(
-            "INSERT INTO ots_trajectories \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}ots_trajectories \
              (trajectory_id, tenant, agent_id, session_id, outcome, turn_count, data, persistence_status, persist_attempts, last_error, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'persisted', 0, NULL, now(), now()) \
              ON CONFLICT (tenant, trajectory_id) DO UPDATE SET \
@@ -2019,8 +2062,8 @@ impl PostgresEventStore {
         p: &PostgresOtsTrajectoryParams<'_>,
     ) -> Result<(), PersistenceError> {
         let data = parse_json(p.data)?;
-        crate::dbm::postgres_query!(
-            "INSERT INTO ots_trajectories \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}ots_trajectories \
              (trajectory_id, tenant, agent_id, session_id, outcome, turn_count, data, persistence_status, persist_attempts, last_error, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 0, NULL, now(), now()) \
              ON CONFLICT (tenant, trajectory_id) DO UPDATE SET \
@@ -2052,7 +2095,8 @@ impl PostgresEventStore {
         trajectory_id: &str,
     ) -> Result<(), PersistenceError> {
         crate::dbm::postgres_query!(
-            "UPDATE ots_trajectories \
+            &self.schema,
+            "UPDATE {schema}ots_trajectories \
              SET persistence_status = 'persisted', last_error = NULL, updated_at = now() \
              WHERE tenant = $1 AND trajectory_id = $2",
         )
@@ -2071,8 +2115,8 @@ impl PostgresEventStore {
         trajectory_id: &str,
         error: &str,
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            "UPDATE ots_trajectories \
+        crate::dbm::postgres_query!(&self.schema,
+            "UPDATE {schema}ots_trajectories \
              SET persistence_status = 'failed', persist_attempts = persist_attempts + 1, last_error = $3, updated_at = now() \
              WHERE tenant = $1 AND trajectory_id = $2",
         )
@@ -2089,9 +2133,9 @@ impl PostgresEventStore {
         &self,
         limit: i64,
     ) -> Result<Vec<PostgresQueuedOtsTrajectoryRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT trajectory_id, tenant, agent_id, COALESCE(session_id, '') AS session_id, outcome, turn_count, data, persist_attempts \
-             FROM ots_trajectories \
+             FROM {schema}ots_trajectories \
              WHERE persistence_status = 'queued' \
              ORDER BY updated_at ASC, created_at ASC \
              LIMIT $1",
@@ -2110,9 +2154,9 @@ impl PostgresEventStore {
         outcome: Option<&str>,
         limit: i64,
     ) -> Result<Vec<PostgresOtsTrajectoryRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT trajectory_id, tenant, agent_id, COALESCE(session_id, '') AS session_id, outcome, turn_count, persistence_status, persist_attempts, last_error, created_at, updated_at \
-             FROM ots_trajectories \
+             FROM {schema}ots_trajectories \
              WHERE tenant = $1 \
                AND ($2::text IS NULL OR agent_id = $2) \
                AND ($3::text IS NULL OR outcome = $3) \
@@ -2140,8 +2184,9 @@ impl PostgresEventStore {
         trajectory_id: &str,
     ) -> Result<Option<PostgresOtsTrajectoryDocument>, PersistenceError> {
         let row = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT agent_id, COALESCE(session_id, '') AS session_id, outcome, data \
-             FROM ots_trajectories WHERE tenant = $1 AND trajectory_id = $2"
+             FROM {schema}ots_trajectories WHERE tenant = $1 AND trajectory_id = $2"
         )
         .bind(tenant)
         .bind(trajectory_id)
@@ -2162,8 +2207,8 @@ impl PostgresEventStore {
         ttl: Option<Duration>,
     ) -> Result<(), String> {
         let ttl_seconds = ttl.map(|duration| duration.as_secs() as i64);
-        crate::dbm::postgres_query!(
-            "INSERT INTO blobs (blob_key, data, size_bytes, expires_at) \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}blobs (blob_key, data, size_bytes, expires_at) \
              VALUES ($1, $2, $3, CASE WHEN $4::bigint IS NULL THEN NULL ELSE now() + ($4::bigint * interval '1 second') END) \
              ON CONFLICT (blob_key) DO NOTHING",
         )
@@ -2179,12 +2224,13 @@ impl PostgresEventStore {
 
     pub async fn sweep_expired_blobs(&self, max_rows: u64) -> Result<u64, String> {
         let result = crate::dbm::postgres_query!(
+            &self.schema,
             "WITH doomed AS ( \
-                 SELECT blob_key FROM blobs \
+                 SELECT blob_key FROM {schema}blobs \
                  WHERE expires_at IS NOT NULL AND expires_at < now() \
                  LIMIT $1 \
              ) \
-             DELETE FROM blobs USING doomed WHERE blobs.blob_key = doomed.blob_key",
+             DELETE FROM {schema}blobs USING doomed WHERE blobs.blob_key = doomed.blob_key",
         )
         .bind(max_rows as i64)
         .execute(self.pool())
@@ -2194,11 +2240,14 @@ impl PostgresEventStore {
     }
 
     pub async fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        crate::dbm::postgres_query_scalar!("SELECT data FROM blobs WHERE blob_key = $1")
-            .bind(key)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(|e| format!("blob get failed: {e}"))
+        crate::dbm::postgres_query_scalar!(
+            &self.schema,
+            "SELECT data FROM {schema}blobs WHERE blob_key = $1"
+        )
+        .bind(key)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| format!("blob get failed: {e}"))
     }
 
     /// Retrieve a blob only when its durable size metadata is within the
@@ -2211,7 +2260,8 @@ impl PostgresEventStore {
         let max_bytes = i64::try_from(max_bytes)
             .map_err(|_| "legacy blob read budget exceeds i64".to_string())?;
         crate::dbm::postgres_query_scalar!(
-            "SELECT data FROM blobs WHERE blob_key = $1 AND octet_length(data) <= $2"
+            &self.schema,
+            "SELECT data FROM {schema}blobs WHERE blob_key = $1 AND octet_length(data) <= $2"
         )
         .bind(key)
         .bind(max_bytes)
@@ -2232,7 +2282,8 @@ impl PostgresEventStore {
         artifact: &PostgresPublishedArtifactUpsert<'_>,
     ) -> Result<PostgresPublishedArtifactRow, PersistenceError> {
         crate::dbm::postgres_query!(
-            "INSERT INTO published_artifacts (
+            &self.schema,
+            "INSERT INTO {schema}published_artifacts (
                 id, tenant, source_file_id, source_file_version_id, content_hash,
                 label, mime_type, byte_length, public_storage_key, public_url,
                 owner_ref_type, owner_ref_id, status, updated_at
@@ -2290,10 +2341,11 @@ impl PostgresEventStore {
         artifact_id: &str,
     ) -> Result<Option<PostgresPublishedArtifactRow>, PersistenceError> {
         let row = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT id, tenant, source_file_id, source_file_version_id, content_hash,
                     label, mime_type, byte_length, public_storage_key, public_url,
                     owner_ref_type, owner_ref_id, status
-               FROM published_artifacts
+               FROM {schema}published_artifacts
               WHERE tenant = $1 AND id = $2",
         )
         .bind(tenant)
@@ -2311,8 +2363,8 @@ impl PostgresEventStore {
         ciphertext: &[u8],
         nonce: &[u8],
     ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            "INSERT INTO tenant_secrets (tenant, key_name, ciphertext, nonce, created_at, updated_at) \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}tenant_secrets (tenant, key_name, ciphertext, nonce, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, now(), now()) \
              ON CONFLICT (tenant, key_name) DO UPDATE SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, updated_at = now()",
         )
@@ -2332,7 +2384,8 @@ impl PostgresEventStore {
         key_name: &str,
     ) -> Result<bool, PersistenceError> {
         let result = crate::dbm::postgres_query!(
-            "DELETE FROM tenant_secrets WHERE tenant = $1 AND key_name = $2"
+            &self.schema,
+            "DELETE FROM {schema}tenant_secrets WHERE tenant = $1 AND key_name = $2"
         )
         .bind(tenant)
         .bind(key_name)
@@ -2347,7 +2400,8 @@ impl PostgresEventStore {
         tenant: &str,
     ) -> Result<Vec<PostgresSecretRow>, PersistenceError> {
         crate::dbm::postgres_query_as!(
-            "SELECT key_name, ciphertext, nonce FROM tenant_secrets WHERE tenant = $1"
+            &self.schema,
+            "SELECT key_name, ciphertext, nonce FROM {schema}tenant_secrets WHERE tenant = $1"
         )
         .bind(tenant)
         .fetch_all(self.pool())
@@ -2367,8 +2421,9 @@ impl PostgresEventStore {
         let agent_type_key = agent_type.unwrap_or("");
         let timestamp = parse_rfc3339(timestamp)?;
         let existing = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT count, first_seen, last_seen, distinct_resource_ids_json \
-             FROM policy_denial_patterns \
+             FROM {schema}policy_denial_patterns \
              WHERE tenant = $1 AND agent_type = $2 AND action = $3 AND resource_type = $4",
         )
         .bind(tenant)
@@ -2404,8 +2459,8 @@ impl PostgresEventStore {
         let ids_json = serde_json::to_value(distinct_resource_ids.into_iter().collect::<Vec<_>>())
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
 
-        crate::dbm::postgres_query!(
-            "INSERT INTO policy_denial_patterns \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}policy_denial_patterns \
              (tenant, agent_type, action, resource_type, count, first_seen, last_seen, distinct_resource_ids_json) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (tenant, agent_type, action, resource_type) DO UPDATE SET \
@@ -2430,9 +2485,9 @@ impl PostgresEventStore {
         &self,
         tenant: &str,
     ) -> Result<Vec<PostgresPolicyDenialPatternRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, agent_type, action, resource_type, count, first_seen, last_seen, distinct_resource_ids_json \
-             FROM policy_denial_patterns \
+             FROM {schema}policy_denial_patterns \
              WHERE tenant = $1 \
              ORDER BY last_seen DESC, count DESC",
         )
@@ -2449,7 +2504,8 @@ impl PostgresEventStore {
         status: Option<&str>,
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<serde_json::Value> = crate::dbm::postgres_query_scalar!(
-            "SELECT data FROM pending_decisions \
+            &self.schema,
+            "SELECT data FROM {schema}pending_decisions \
              WHERE tenant = $1 AND ($2::text IS NULL OR status = $2) \
              ORDER BY created_at DESC",
         )
@@ -2466,7 +2522,8 @@ impl PostgresEventStore {
         status: Option<&str>,
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<serde_json::Value> = crate::dbm::postgres_query_scalar!(
-            "SELECT data FROM pending_decisions \
+            &self.schema,
+            "SELECT data FROM {schema}pending_decisions \
              WHERE ($1::text IS NULL OR status = $1) \
              ORDER BY created_at DESC",
         )
@@ -2483,7 +2540,8 @@ impl PostgresEventStore {
         id: &str,
     ) -> Result<Option<String>, PersistenceError> {
         let row: Option<serde_json::Value> = crate::dbm::postgres_query_scalar!(
-            "SELECT data FROM pending_decisions WHERE tenant = $1 AND id = $2"
+            &self.schema,
+            "SELECT data FROM {schema}pending_decisions WHERE tenant = $1 AND id = $2"
         )
         .bind(tenant)
         .bind(id)
@@ -2499,8 +2557,9 @@ impl PostgresEventStore {
         module_name: &str,
     ) -> Result<Option<PostgresWasmModuleRow>, PersistenceError> {
         let row = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT tenant, module_name, wasm_bytes, sha256_hash, source \
-             FROM wasm_modules WHERE tenant = $1 AND module_name = $2",
+             FROM {schema}wasm_modules WHERE tenant = $1 AND module_name = $2",
         )
         .bind(tenant)
         .bind(module_name)
@@ -2514,8 +2573,9 @@ impl PostgresEventStore {
         &self,
     ) -> Result<Vec<PostgresWasmModuleMetadataRow>, PersistenceError> {
         let rows = crate::dbm::postgres_query!(
+            &self.schema,
             "SELECT tenant, module_name, sha256_hash, size_bytes, updated_at \
-             FROM wasm_modules ORDER BY tenant, module_name",
+             FROM {schema}wasm_modules ORDER BY tenant, module_name",
         )
         .fetch_all(self.pool())
         .await
@@ -2528,8 +2588,8 @@ impl PostgresEventStore {
         entry: &PostgresWasmInvocationInsert<'_>,
     ) -> Result<(), PersistenceError> {
         let created_at = parse_rfc3339(entry.created_at)?;
-        crate::dbm::postgres_query!(
-            "INSERT INTO wasm_invocation_logs \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}wasm_invocation_logs \
              (tenant, entity_type, entity_id, module_name, trigger_action, callback_action, success, error, duration_ms, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
@@ -2553,9 +2613,9 @@ impl PostgresEventStore {
         &self,
         limit: i64,
     ) -> Result<Vec<PostgresWasmInvocationRow>, PersistenceError> {
-        let rows = crate::dbm::postgres_query!(
+        let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, entity_id, module_name, trigger_action, callback_action, success, error, duration_ms, created_at \
-             FROM wasm_invocation_logs \
+             FROM {schema}wasm_invocation_logs \
              ORDER BY created_at DESC \
              LIMIT $1",
         )
@@ -2572,7 +2632,8 @@ impl PostgresEventStore {
         module_name: &str,
     ) -> Result<bool, PersistenceError> {
         let result = crate::dbm::postgres_query!(
-            "DELETE FROM wasm_modules WHERE tenant = $1 AND module_name = $2"
+            &self.schema,
+            "DELETE FROM {schema}wasm_modules WHERE tenant = $1 AND module_name = $2"
         )
         .bind(tenant)
         .bind(module_name)

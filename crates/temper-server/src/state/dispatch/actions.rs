@@ -386,6 +386,9 @@ impl crate::state::ServerState {
         await_integration: bool,
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
+        let params =
+            self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
+
         let explicit_workflow_context = agent_ctx.workflow_run_id.is_some()
             || agent_ctx.workflow_root_entity_type.is_some()
             || agent_ctx.workflow_root_entity_id.is_some();

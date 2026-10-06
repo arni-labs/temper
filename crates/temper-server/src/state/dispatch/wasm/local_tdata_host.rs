@@ -35,13 +35,18 @@ impl LocalTDataWasmHost {
         state: ServerState,
         tenant: TenantId,
         security_ctx: Option<&SecurityContext>,
+        module_name: &str,
         delegate: Arc<dyn WasmHost>,
     ) -> Self {
         Self {
             state,
-            authenticated: security_ctx
-                .cloned()
-                .map(|security_ctx| AuthenticatedRequestContext::new(tenant, security_ctx)),
+            authenticated: security_ctx.cloned().map(|mut security_ctx| {
+                security_ctx.context_attrs.insert(
+                    "module".into(),
+                    serde_json::Value::String(module_name.into()),
+                );
+                AuthenticatedRequestContext::new(tenant, security_ctx)
+            }),
             delegate,
         }
     }

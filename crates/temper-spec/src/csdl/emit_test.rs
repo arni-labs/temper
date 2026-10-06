@@ -305,3 +305,30 @@ fn targeted_annotation_blocks_round_trip() {
         matches!(&again[0].annotations[0].value, AnnotationValue::String(s) if s == "Service,Project")
     );
 }
+
+#[test]
+fn schema_alias_survives_parse_emit_and_serialization() {
+    let xml = r#"<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+      <edmx:DataServices><Schema Namespace="Example.Types" Alias="ET" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+        <EntityType Name="Widget"><Key><PropertyRef Name="Id"/></Key><Property Name="Id" Type="Edm.String"/></EntityType>
+        <EntityContainer Name="Service"><EntitySet Name="Widgets" EntityType="ET.Widget"/></EntityContainer>
+      </Schema></edmx:DataServices></edmx:Edmx>"#;
+    let parsed = parse_csdl(xml).unwrap();
+    assert_eq!(parsed.schemas[0].alias.as_deref(), Some("ET"));
+    let round_trip = parse_csdl(&emit_csdl_xml(&parsed)).unwrap();
+    assert_eq!(round_trip.schemas[0].alias.as_deref(), Some("ET"));
+    assert_eq!(
+        round_trip.schemas[0].entity_containers[0].entity_sets[0].entity_type,
+        "ET.Widget"
+    );
+    let serialized = serde_json::to_string(&parsed).unwrap();
+    let restored: CsdlDocument = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(restored.schemas[0].alias.as_deref(), Some("ET"));
+    let mut legacy = serde_json::to_value(&parsed).unwrap();
+    legacy["schemas"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("alias");
+    let restored: CsdlDocument = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.schemas[0].alias, None);
+}

@@ -223,6 +223,11 @@ pub async fn run(
             };
             let _ = vault.cache_platform_secret("sandbox_url", sandbox_url);
         }
+
+        // TEMPER_SECRET_<NAME> — any other secret the operator supplies. Runs
+        // last, so every name seeded above keeps its value.
+        // determinism-ok: environment read once at startup
+        temper_server::secrets::seed_platform_secrets_from_environment(vault, std::env::vars_os());
     }
 
     // Startup banner

@@ -228,13 +228,22 @@ pub async fn restore_registry_from_postgres(
     registry: &mut SpecRegistry,
     pool: &sqlx::PgPool,
 ) -> Result<usize, String> {
-    let rows: Vec<PersistedSpecRow> = sqlx::query_as(
+    let store = temper_store_postgres::PostgresEventStore::new(pool.clone());
+    restore_registry_from_postgres_store(registry, &store).await
+}
+
+/// Restore a registry using the schema selected by the PostgreSQL store.
+pub async fn restore_registry_from_postgres_store(
+    registry: &mut SpecRegistry,
+    store: &temper_store_postgres::PostgresEventStore,
+) -> Result<usize, String> {
+    let rows: Vec<PersistedSpecRow> = sqlx::query_as(&store.schema().qualify_sql(
         "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
                 levels_passed, levels_total, verification_result, updated_at \
-         FROM specs \
+         FROM {schema}specs \
          ORDER BY tenant, entity_type",
-    )
-    .fetch_all(pool)
+    ))
+    .fetch_all(store.pool())
     .await
     .map_err(|e| format!("Failed to read specs from Postgres: {e}"))?;
 
@@ -244,12 +253,12 @@ pub async fn restore_registry_from_postgres(
         cross_invariants_toml: String,
     }
 
-    let constraints_rows: Vec<ConstraintRow> = sqlx::query_as(
+    let constraints_rows: Vec<ConstraintRow> = sqlx::query_as(&store.schema().qualify_sql(
         "SELECT tenant, cross_invariants_toml \
-         FROM tenant_constraints \
+         FROM {schema}tenant_constraints \
          ORDER BY tenant",
-    )
-    .fetch_all(pool)
+    ))
+    .fetch_all(store.pool())
     .await
     .map_err(|e| format!("Failed to read tenant constraints from Postgres: {e}"))?;
 

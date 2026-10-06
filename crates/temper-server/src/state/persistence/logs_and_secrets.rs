@@ -7,12 +7,12 @@ impl ServerState {
     pub async fn emit_design_time_event(&self, event: DesignTimeEvent) -> Result<(), String> {
         if let Some(backend) = self.tenant_metadata_backend(&event.tenant).await {
             match backend {
-                TenantMetadataBackend::Postgres(pool) => {
+                TenantMetadataBackend::Postgres(store) => {
                     let created_at = temper_runtime::scheduler::sim_now();
                     sqlx::query(
-                        "INSERT INTO design_time_events \
+                        &store.schema().qualify_sql("INSERT INTO {schema}design_time_events \
                          (kind, entity_type, tenant, summary, level, passed, step_number, total_steps, created_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"),
                     )
                     .bind(&event.kind)
                     .bind(&event.entity_type)
@@ -23,7 +23,7 @@ impl ServerState {
                     .bind(event.step_number.map(i16::from))
                     .bind(event.total_steps.map(i16::from))
                     .bind(created_at)
-                    .execute(&pool)
+                    .execute(store.pool())
                     .await
                     .map_err(|e| {
                         format!(
@@ -96,8 +96,8 @@ impl ServerState {
         let data_json = serde_json::to_string(decision)
             .map_err(|e| format!("failed to serialize decision {}: {e}", decision.id))?;
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
-                temper_store_postgres::PostgresEventStore::new(pool)
+            TenantMetadataBackend::Postgres(store) => {
+                store
                     .upsert_pending_decision(&decision.id, &decision.tenant, status_str, &data_json)
                     .await
                     .map_err(|e| {
@@ -145,12 +145,10 @@ impl ServerState {
             return false;
         };
         let blobs = match backend {
-            TenantMetadataBackend::Postgres(pool) => {
-                temper_store_postgres::PostgresEventStore::new(pool)
-                    .load_approved_session_decisions(tenant, session_id)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
+            TenantMetadataBackend::Postgres(store) => store
+                .load_approved_session_decisions(tenant, session_id)
+                .await
+                .map_err(|e| e.to_string()),
             TenantMetadataBackend::Turso(turso) => turso
                 .load_approved_session_decisions(tenant, session_id)
                 .await
@@ -193,20 +191,20 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 sqlx::query(
-                    "INSERT INTO tenant_secrets (tenant, key_name, ciphertext, nonce, created_at, updated_at) \
+                    &store.schema().qualify_sql("INSERT INTO {schema}tenant_secrets (tenant, key_name, ciphertext, nonce, created_at, updated_at) \
                      VALUES ($1, $2, $3, $4, now(), now()) \
                      ON CONFLICT (tenant, key_name) DO UPDATE SET \
                          ciphertext = EXCLUDED.ciphertext, \
                          nonce = EXCLUDED.nonce, \
-                         updated_at = now()",
+                         updated_at = now()"),
                 )
                 .bind(tenant)
                 .bind(key_name)
                 .bind(ciphertext)
                 .bind(nonce)
-                .execute(&pool)
+                .execute(store.pool())
                 .await
                 .map_err(|e| format!("failed to upsert secret {tenant}/{key_name}: {e}"))?;
                 Ok(())
@@ -226,14 +224,15 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
-                let result =
-                    sqlx::query("DELETE FROM tenant_secrets WHERE tenant = $1 AND key_name = $2")
-                        .bind(tenant)
-                        .bind(key_name)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| format!("failed to delete secret {tenant}/{key_name}: {e}"))?;
+            TenantMetadataBackend::Postgres(store) => {
+                let result = sqlx::query(&store.schema().qualify_sql(
+                    "DELETE FROM {schema}tenant_secrets WHERE tenant = $1 AND key_name = $2",
+                ))
+                .bind(tenant)
+                .bind(key_name)
+                .execute(store.pool())
+                .await
+                .map_err(|e| format!("failed to delete secret {tenant}/{key_name}: {e}"))?;
                 Ok(result.rows_affected() > 0)
             }
             TenantMetadataBackend::Turso(turso) => turso
@@ -254,12 +253,12 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 let rows: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-                    "SELECT key_name, ciphertext, nonce FROM tenant_secrets WHERE tenant = $1",
+                    &store.schema().qualify_sql("SELECT key_name, ciphertext, nonce FROM {schema}tenant_secrets WHERE tenant = $1"),
                 )
                 .bind(tenant)
-                .fetch_all(&pool)
+                .fetch_all(store.pool())
                 .await
                 .map_err(|e| format!("failed to load secrets for tenant {tenant}: {e}"))?;
 

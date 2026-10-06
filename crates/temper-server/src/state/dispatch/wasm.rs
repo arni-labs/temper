@@ -215,6 +215,7 @@ pub(crate) fn authorized_http_endpoint_host(
         state.clone(),
         tenant.clone(),
         Some(&module_identity),
+        module_name,
         production_host,
     ));
     Ok(Arc::new(AuthorizedWasmHost::new(
@@ -885,6 +886,7 @@ impl crate::state::ServerState {
                     self.clone(),
                     ctx.entity_ref.tenant.clone(),
                     ctx.agent_ctx.security_ctx.as_ref(),
+                    &module_name,
                     production_host,
                 ));
                 let host: Arc<dyn WasmHost> =
@@ -1525,6 +1527,7 @@ impl crate::state::ServerState {
         tenant: &TenantId,
         production_host: Arc<dyn WasmHost>,
         security_ctx: &SecurityContext,
+        module_name: &str,
     ) -> Arc<dyn WasmHost> {
         let loopback_ctx =
             (security_ctx.principal.kind != PrincipalKind::System).then_some(security_ctx);
@@ -1532,6 +1535,7 @@ impl crate::state::ServerState {
             self.clone(),
             tenant.clone(),
             loopback_ctx,
+            module_name,
             production_host,
         ))
     }
@@ -1609,7 +1613,8 @@ impl crate::state::ServerState {
             base_host = base_host.with_binary_http_interceptor(interceptor);
         }
         let production_host: Arc<dyn WasmHost> = Arc::new(base_host);
-        let inner = self.local_tdata_direct_host(tenant, production_host, security_ctx);
+        let inner =
+            self.local_tdata_direct_host(tenant, production_host, security_ctx, module_name);
         let host: Arc<dyn WasmHost> =
             Arc::new(AuthorizedWasmHost::new(inner, base_gate, authz_ctx));
         let limits = WasmResourceLimits::default();

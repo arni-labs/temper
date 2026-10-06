@@ -25,7 +25,8 @@ impl PostgresEventStore {
         let mut transaction = self.pool().begin().await.map_err(storage_error)?;
 
         let policy_result = crate::dbm::postgres_query!(
-            "INSERT INTO policies \
+            &self.schema,
+            "INSERT INTO {schema}policies \
              (tenant, policy_id, cedar_text, policy_hash, created_at, created_by, enabled) \
              VALUES ($1, $2, $3, $4, now(), $5, true) \
              ON CONFLICT (tenant, policy_id) DO NOTHING",
@@ -45,7 +46,8 @@ impl PostgresEventStore {
         }
 
         let decision_result = crate::dbm::postgres_query!(
-            "UPDATE pending_decisions \
+            &self.schema,
+            "UPDATE {schema}pending_decisions \
              SET status = 'approved', data = $3, updated_at = now() \
              WHERE tenant = $1 AND id = $2 AND status = 'pending'",
         )
@@ -76,15 +78,19 @@ impl PostgresEventStore {
             .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
         let mut transaction = self.pool().begin().await.map_err(storage_error)?;
 
-        crate::dbm::postgres_query!("DELETE FROM policies WHERE tenant = $1 AND policy_id = $2",)
-            .bind(tenant)
-            .bind(policy_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
+        crate::dbm::postgres_query!(
+            &self.schema,
+            "DELETE FROM {schema}policies WHERE tenant = $1 AND policy_id = $2",
+        )
+        .bind(tenant)
+        .bind(policy_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
 
         let decision_result = crate::dbm::postgres_query!(
-            "UPDATE pending_decisions \
+            &self.schema,
+            "UPDATE {schema}pending_decisions \
              SET status = 'pending', data = $3, updated_at = now() \
              WHERE tenant = $1 AND id = $2 AND status = 'approved'",
         )

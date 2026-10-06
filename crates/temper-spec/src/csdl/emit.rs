@@ -25,9 +25,13 @@ pub fn emit_csdl_xml(doc: &CsdlDocument) -> String {
 
 fn emit_schema(out: &mut String, schema: &Schema) {
     out.push_str(&format!(
-        "    <Schema Namespace=\"{}\" xmlns=\"http://docs.oasis-open.org/odata/ns/edm\">\n",
-        schema.namespace
+        "    <Schema Namespace=\"{}\"",
+        xml_escape(&schema.namespace)
     ));
+    if let Some(alias) = &schema.alias {
+        out.push_str(&format!(" Alias=\"{}\"", xml_escape(alias)));
+    }
+    out.push_str(" xmlns=\"http://docs.oasis-open.org/odata/ns/edm\">\n");
 
     for term in &schema.terms {
         emit_term(out, term);

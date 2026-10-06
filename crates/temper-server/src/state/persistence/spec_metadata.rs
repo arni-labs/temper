@@ -19,9 +19,9 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 sqlx::query(
-                    "INSERT INTO specs \
+                    &store.schema().qualify_sql("INSERT INTO {schema}specs \
                      (tenant, entity_type, ioa_source, csdl_xml, version, verified, verification_status, updated_at) \
                      VALUES ($1, $2, $3, $4, 1, false, 'pending', now()) \
                      ON CONFLICT (tenant, entity_type) DO UPDATE SET \
@@ -33,13 +33,13 @@ impl ServerState {
                          levels_passed = NULL, \
                          levels_total = NULL, \
                          verification_result = NULL, \
-                         updated_at = now()",
+                         updated_at = now()"),
                 )
                 .bind(tenant)
                 .bind(entity_type)
                 .bind(ioa_source)
                 .bind(csdl_xml)
-                .execute(&pool)
+                .execute(store.pool())
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("failed to upsert spec {tenant}/{entity_type} in postgres: {e}"))
@@ -66,29 +66,31 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 if let Some(source) = cross_invariants_toml {
                     sqlx::query(
-                        "INSERT INTO tenant_constraints (tenant, cross_invariants_toml, version, updated_at) \
+                        &store.schema().qualify_sql("INSERT INTO {schema}tenant_constraints (tenant, cross_invariants_toml, version, updated_at) \
                          VALUES ($1, $2, 1, now()) \
                          ON CONFLICT (tenant) DO UPDATE SET \
                             cross_invariants_toml = EXCLUDED.cross_invariants_toml, \
                             version = tenant_constraints.version + 1, \
-                            updated_at = now()",
+                            updated_at = now()"),
                     )
                     .bind(tenant)
                     .bind(source)
-                    .execute(&pool)
+                    .execute(store.pool())
                     .await
                     .map_err(|e| format!("failed to upsert tenant constraints for {tenant}: {e}"))?;
                 } else {
-                    sqlx::query("DELETE FROM tenant_constraints WHERE tenant = $1")
-                        .bind(tenant)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| {
-                            format!("failed to clear tenant constraints for {tenant}: {e}")
-                        })?;
+                    sqlx::query(
+                        &store.schema().qualify_sql(
+                            "DELETE FROM {schema}tenant_constraints WHERE tenant = $1",
+                        ),
+                    )
+                    .bind(tenant)
+                    .execute(store.pool())
+                    .await
+                    .map_err(|e| format!("failed to clear tenant constraints for {tenant}: {e}"))?;
                 }
                 Ok(())
             }
@@ -138,16 +140,16 @@ impl ServerState {
         };
 
         match backend {
-            TenantMetadataBackend::Postgres(pool) => {
+            TenantMetadataBackend::Postgres(store) => {
                 sqlx::query(
-                    "UPDATE specs SET \
+                    &store.schema().qualify_sql("UPDATE {schema}specs SET \
                          verified = $3, \
                          verification_status = $4, \
                          levels_passed = $5, \
                          levels_total = $6, \
                          verification_result = $7, \
                          updated_at = now() \
-                     WHERE tenant = $1 AND entity_type = $2",
+                     WHERE tenant = $1 AND entity_type = $2"),
                 )
                 .bind(tenant)
                 .bind(entity_type)
@@ -156,7 +158,7 @@ impl ServerState {
                 .bind(levels_passed)
                 .bind(levels_total)
                 .bind(verification_result.map(Json))
-                .execute(&pool)
+                .execute(store.pool())
                 .await
                 .map(|_| ())
                 .map_err(|e| {

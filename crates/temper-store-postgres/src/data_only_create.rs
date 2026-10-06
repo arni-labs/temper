@@ -123,7 +123,8 @@ impl PostgresEventStore {
         let metadata_json = serde_json::to_value(&event.metadata)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
         if let Err(e) = crate::dbm::postgres_query!(
-            "INSERT INTO events \
+            &self.schema,
+            "INSERT INTO {schema}events \
              (tenant, entity_type, entity_id, sequence_nr, event_type, payload, metadata) \
              VALUES ($1, $2, $3, 1, $4, $5, $6)",
         )
@@ -147,8 +148,8 @@ impl PostgresEventStore {
             return Err(storage_error(e));
         }
 
-        if let Err(e) = crate::dbm::postgres_query!(
-            "INSERT INTO entity_catalog \
+        if let Err(e) = crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}entity_catalog \
              (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, 1, 2, $7, now())",
         )
@@ -175,7 +176,8 @@ impl PostgresEventStore {
 
         if !field_names.is_empty() {
             crate::dbm::postgres_query!(
-                "INSERT INTO entity_field_index \
+                &self.schema,
+                "INSERT INTO {schema}entity_field_index \
                  (tenant, entity_type, entity_id, field_name, field_value, status) \
                  SELECT $1, $2, $3, incoming.field_name, incoming.field_value, $6 \
                  FROM unnest($4::text[], $5::text[]) AS incoming(field_name, field_value)",

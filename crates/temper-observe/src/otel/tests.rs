@@ -3,7 +3,7 @@ use super::sampler::{DISPATCH_BACKGROUND_PREFIXES, WASM_AUXILIARY_PREFIXES};
 use super::*;
 
 use opentelemetry::trace::{SamplingDecision, SpanKind, TraceId};
-use opentelemetry_sdk::trace::ShouldSample;
+use opentelemetry_sdk::trace::{Sampler, ShouldSample};
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

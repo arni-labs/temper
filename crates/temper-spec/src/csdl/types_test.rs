@@ -3,6 +3,7 @@ use super::*;
 fn sample_schema() -> Schema {
     Schema {
         namespace: "TestNs".into(),
+        alias: None,
         entity_types: sample_entity_types(),
         enum_types: sample_enum_types(),
         actions: sample_actions(),
@@ -202,6 +203,7 @@ fn csdl_document_schemas_by_namespace() {
             sample_schema(),
             Schema {
                 namespace: "OtherNs".into(),
+                alias: None,
                 entity_types: vec![],
                 enum_types: vec![],
                 actions: vec![],

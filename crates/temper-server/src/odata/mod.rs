@@ -20,6 +20,7 @@ mod stream_fast_path;
 mod stream_put;
 mod write;
 
+pub(crate) use common::resolve_entity_type;
 pub use content_addressed::handle_blob_ingest_raw;
 pub use read::handle_hints;
 pub use read::handle_metadata;

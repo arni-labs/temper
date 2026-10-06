@@ -31,6 +31,16 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     }
     for action in &automaton.actions {
         for param in &action.params {
+            if param.source().is_some()
+                && (!automaton.automaton.strict_action_params
+                    || param.param_type() != VarType::String)
+            {
+                return Err(AutomatonParseError::Validation(format!(
+                    "action '{}' bound parameter '{}' requires strict_action_params and string type",
+                    action.name,
+                    param.name(),
+                )));
+            }
             if super::types::is_server_derived_field_name(param.name()) {
                 return Err(AutomatonParseError::Validation(format!(
                     "action '{}' parameter '{}' uses a runtime-owned field name",

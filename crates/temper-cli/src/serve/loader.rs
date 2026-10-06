@@ -109,8 +109,9 @@ pub(super) fn lint_tenant_specs(
 
 /// Load specs from a directory into an existing SpecRegistry WITHOUT running verification.
 ///
-/// All entities start with `VerificationStatus::Pending`. The observe UI
-/// can display state machines immediately while verification runs in background.
+/// New or changed entities start with `VerificationStatus::Pending`. Identical
+/// specs retain passed verification evidence restored from storage; background
+/// verification skips these same hashes, so resetting them would leave them pending.
 pub(super) fn load_into_registry(
     registry: &mut SpecRegistry,
     specs_dir: &str,
@@ -195,6 +196,17 @@ pub(super) fn load_into_registry(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
+    let tenant_id = TenantId::new(tenant);
+    let unchanged_passed: Vec<_> = ioa_sources
+        .iter()
+        .filter_map(|(entity, source)| {
+            let old = registry.get_spec(&tenant_id, entity)?;
+            let status = registry.get_verification_status(&tenant_id, entity)?;
+            (old.ioa_source == *source && status.is_passed())
+                .then(|| (entity.clone(), status.clone()))
+        })
+        .collect();
+
     registry
         .try_register_tenant_with_constraints(
             tenant,
@@ -205,6 +217,10 @@ pub(super) fn load_into_registry(
             false,
         )
         .with_context(|| format!("Failed to register tenant '{tenant}'"))?;
+
+    for (entity, status) in unchanged_passed {
+        registry.set_verification_status(&tenant_id, &entity, status);
+    }
 
     Ok(LoadedTenantSpecs {
         csdl_xml: registry
@@ -470,3 +486,7 @@ assert = "true"
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "loader_reload_tests.rs"]
+mod reload_tests;

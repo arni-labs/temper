@@ -42,6 +42,7 @@ params = [
   "action_bridge_entity_id",
   "action_bridge_action",
   "action_bridge_response",
+  "admission_actions",
 ]
 hint = "Initialize endpoint fields. Self-loop on initial state; from_states follow IOA convention."
 

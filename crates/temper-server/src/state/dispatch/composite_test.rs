@@ -1,4 +1,7 @@
 #[cfg(feature = "sim")]
+#[path = "composite/authenticated_params_test.rs"]
+mod authenticated_params_test;
+#[cfg(feature = "sim")]
 #[path = "composite/defaults_test.rs"]
 mod defaults_test;
 use std::collections::BTreeMap;

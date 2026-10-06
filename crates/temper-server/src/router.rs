@@ -172,7 +172,7 @@ pub fn build_router(state: ServerState) -> Router {
 /// otherwise. Slice 3 of K-1 Phase 2 replaces the 501 with a real
 /// streaming dispatch into the bound WASM integration.
 #[tracing::instrument(skip_all, fields(http.method = %method, http.route = %uri.path()))]
-async fn http_endpoint_fallback(
+pub async fn http_endpoint_fallback(
     State(state): State<ServerState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
     admitted: Option<Extension<crate::http_endpoint::AdmittedHttpEndpoint>>,
@@ -225,6 +225,21 @@ async fn dispatch_matched_route(
     body: Body,
     route: crate::http_endpoint::MatchedRoute,
 ) -> Response {
+    if let Some(config) = route.route.native.clone() {
+        return crate::http_endpoint::native::dispatch(
+            &state,
+            crate::http_endpoint::native::NativeRequest {
+                authenticated,
+                method,
+                uri,
+                headers,
+                body,
+                matched: route,
+            },
+            config,
+        )
+        .await;
+    }
     use temper_wasm::http_stream::HttpResponseHead;
     use temper_wasm::types::{HttpDispatchContext, WasmInvocationContext};
     let tenant_id = authenticated.tenant().clone();
@@ -249,6 +264,34 @@ async fn dispatch_matched_route(
                 route.route.integration_module
             )))
             .expect("response builder");
+    };
+
+    let deadline = crate::http_endpoint::budget::ExchangeDeadline::new(
+        std::time::Duration::from_secs(u64::from(route.route.timeout_secs)),
+    );
+
+    // Run checks through OData/Cedar/IOA with the original authenticated caller.
+    // The module cannot select or forge this identity, and receives only the
+    // successful action responses, never a reusable caller credential.
+    let admitted = match deadline
+        .wait(crate::http_endpoint::admission::admit(
+            &state,
+            &authenticated,
+            &route.params,
+            route.route.admission_actions.clone(),
+        ))
+        .await
+    {
+        Ok(Ok(admitted)) => admitted,
+        Ok(Err(response)) => return response,
+        Err(_) => {
+            return crate::response::odata_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "AdmissionTimeout",
+                "Endpoint action checks timed out",
+            )
+            .into_response();
+        }
     };
 
     // Open an inbound exchange on the shared registry.
@@ -310,7 +353,7 @@ async fn dispatch_matched_route(
         trigger_action: "HandleHttp".to_string(),
         wasm_module: Some(route.route.integration_module.clone()),
         trigger_params: serde_json::Value::Null,
-        entity_state: serde_json::Value::Null,
+        entity_state: serde_json::json!(admitted),
         agent_id: Some(authenticated.security_context().principal.id.clone()),
         session_id: None,
         integration_config: std::collections::BTreeMap::new(),
@@ -353,7 +396,7 @@ async fn dispatch_matched_route(
     // Spawn task B: invoke the WASM module. Runs to completion
     // (guest writes head + body via FFI; we drain on the axum side).
     let mut limits = temper_wasm::types::WasmResourceLimits {
-        max_duration: std::time::Duration::from_secs(route.route.timeout_secs as u64),
+        max_duration: deadline.remaining(),
         ..Default::default()
     };
     if let Some(max_fuel) = route.route.max_fuel {
@@ -453,12 +496,9 @@ async fn dispatch_matched_route(
 
     // Await the guest's response head — bounded by the route's
     // configured timeout so a bad guest doesn't wedge the request.
-    let head_timeout = std::time::Duration::from_secs(route.route.timeout_secs as u64);
-    let head_result = tokio::time::timeout(
-        head_timeout,
-        streams.await_inbound_response_head(guest_response_body),
-    )
-    .await;
+    let head_result = deadline
+        .wait(streams.await_inbound_response_head(guest_response_body))
+        .await;
     let head: HttpResponseHead = match head_result {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
@@ -909,9 +949,9 @@ fn http_404_response(path: &str) -> Response {
 }
 
 mod guest_headers;
-pub(crate) use guest_headers::guest_visible_headers;
 #[cfg(test)]
-pub(crate) use guest_headers::{GUEST_FORBIDDEN_CREDENTIAL_HEADERS, is_credential_header};
+pub(crate) use guest_headers::GUEST_FORBIDDEN_CREDENTIAL_HEADERS;
+pub(crate) use guest_headers::{guest_visible_headers, is_credential_header};
 
 #[cfg(test)]
 #[path = "router_test.rs"]

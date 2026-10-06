@@ -122,8 +122,20 @@ fn split_path_segments(path: &str) -> Result<Vec<String>, ODataError> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut paren_depth: u32 = 0;
+    let mut quoted = false;
 
     for ch in path.chars() {
+        // In OData string literals, parentheses and slashes are data. A
+        // doubled quote toggles twice, preserving the surrounding literal.
+        if ch == '\'' {
+            quoted = !quoted;
+            current.push(ch);
+            continue;
+        }
+        if quoted {
+            current.push(ch);
+            continue;
+        }
         match ch {
             '(' => {
                 paren_depth += 1;
@@ -149,6 +161,11 @@ fn split_path_segments(path: &str) -> Result<Vec<String>, ODataError> {
         }
     }
 
+    if quoted {
+        return Err(ODataError::InvalidPath {
+            message: "unterminated string literal".into(),
+        });
+    }
     if paren_depth != 0 {
         return Err(ODataError::InvalidPath {
             message: "unmatched opening parenthesis".into(),
@@ -460,6 +477,24 @@ fn validate_identifier(s: &str) -> Result<(), ODataError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_key_delimiters_are_not_path_syntax() {
+        for id in ["a)b", "a(b", "a')/b", "a/(b)", "'"] {
+            let path = format!("Targets('{}')/Example.Serve", id.replace('\'', "''"));
+            assert_eq!(
+                parse_path(&path).unwrap(),
+                ODataPath::BoundAction {
+                    parent: Box::new(ODataPath::Entity(
+                        "Targets".into(),
+                        KeyValue::Single(id.into())
+                    )),
+                    action: "Serve".into(),
+                }
+            );
+        }
+        assert!(parse_path("Targets('unterminated)/Example.Serve").is_err());
+    }
 
     #[test]
     fn parse_service_document_root() {

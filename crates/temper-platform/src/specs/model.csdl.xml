@@ -289,6 +289,7 @@
         <Property Name="ActionBridgeEntityId" Type="Edm.String" />
         <Property Name="ActionBridgeAction" Type="Edm.String" />
         <Property Name="ActionBridgeResponse" Type="Edm.String" />
+        <Property Name="AdmissionActions" Type="Edm.String" />
       </EntityType>
       <Action Name="PauseHttpEndpoint" IsBound="true">
         <Parameter Name="bindingParameter" Type="Temper.System.HttpEndpoint" />

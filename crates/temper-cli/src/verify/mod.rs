@@ -1,9 +1,7 @@
 //! Verification cascade command for `temper verify`.
 //!
-//! Loads specifications and runs validation checks. Full model checking
-//! integration with temper-verify will be added in a future release.
+//! Validates application files and requires a complete verification result.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -12,16 +10,16 @@ use temper_spec::automaton::{LintSeverity, lint_automata_bundle, lint_automaton}
 use temper_spec::csdl::parse_csdl;
 use temper_spec::model::build_spec_model;
 
-use crate::util::to_pascal_case;
+mod input;
+mod package;
+use input::read_ioa_sources;
 
 /// Run the `temper verify` command.
 ///
-/// Loads specs from the given directory, builds the spec model, and reports
-/// validation results. Full Stateright model checking will be integrated
-/// once temper-verify exposes its public API.
+/// Loads CSDL and IOA, validates policies and compiled module references, and
+/// runs the verification cascade. Missing files and incomplete proofs fail.
 pub fn run(specs_dir: &str) -> Result<()> {
     let specs_path = Path::new(specs_dir);
-
     println!("Running verification cascade...");
     println!("  Specs directory: {}", specs_path.display());
 
@@ -36,20 +34,88 @@ pub fn run(specs_dir: &str) -> Result<()> {
 
     let csdl_xml = fs::read_to_string(&csdl_path)
         .with_context(|| format!("Failed to read {}", csdl_path.display()))?;
+    input::validate_xml_document(&csdl_xml)?;
     let csdl = parse_csdl(&csdl_xml)
         .with_context(|| format!("Failed to parse CSDL from {}", csdl_path.display()))?;
+
+    anyhow::ensure!(!csdl.schemas.is_empty(), "CSDL must contain a Schema");
 
     // Read IOA TOML specs (preferred) and TLA+ specs (legacy)
     let ioa_sources = read_ioa_sources(specs_path)?;
     let tla_sources = read_tla_sources(specs_path)?;
+    input::validate_ioa_entities(&csdl, &ioa_sources)?;
+    package::validate(specs_path)?;
 
+    verify_ioa_sources(&ioa_sources)?;
+
+    // Build spec model (which includes cross-validation)
+    let spec = build_spec_model(csdl, tla_sources);
+
+    // Report results
+    println!("\nVerification Report");
+    println!("{}", "=".repeat(50));
+
+    // Schema summary
+    let entity_count: usize = spec.csdl.schemas.iter().map(|s| s.entity_types.len()).sum();
+    let action_count: usize = spec.csdl.schemas.iter().map(|s| s.actions.len()).sum();
+    let function_count: usize = spec.csdl.schemas.iter().map(|s| s.functions.len()).sum();
+
+    println!("\nSpecification Summary:");
+    println!("  Entity types:    {entity_count}");
+    println!("  Actions:         {action_count}");
+    println!("  Functions:       {function_count}");
+    println!("  State machines:  {}", spec.state_machines.len());
+
+    // State machine details
+    for (name, sm) in &spec.state_machines {
+        println!("\n  State Machine: {name}");
+        println!("    States:       {}", sm.states.len());
+        println!("    Transitions:  {}", sm.transitions.len());
+        println!("    Invariants:   {}", sm.invariants.len());
+        println!("    Liveness:     {}", sm.liveness_properties.len());
+    }
+
+    // Validation errors
+    if !spec.validation.errors.is_empty() {
+        println!("\nErrors ({}):", spec.validation.errors.len());
+        for err in &spec.validation.errors {
+            println!("  FAIL: {err}");
+        }
+    }
+
+    // Validation warnings
+    if !spec.validation.warnings.is_empty() {
+        println!("\nWarnings ({}):", spec.validation.warnings.len());
+        for warn in &spec.validation.warnings {
+            println!("  WARN: {warn}");
+        }
+    }
+
+    // Summary
+    println!("\n{}", "=".repeat(50));
+    if spec.validation.is_valid() {
+        println!("Result: PASS -- all cross-validation checks passed.");
+    } else {
+        println!(
+            "Result: FAIL -- {} error(s) found.",
+            spec.validation.errors.len()
+        );
+        anyhow::bail!("Verification failed.");
+    }
+
+    Ok(())
+}
+
+/// Verify IOA behavior independently of artifact packaging. Unit tests also use
+/// this to check source collections whose modules and policies are supplied later.
+fn verify_ioa_sources(ioa_sources: &std::collections::BTreeMap<String, String>) -> Result<()> {
     // Run IOA verification cascade if IOA files found
     if !ioa_sources.is_empty() {
         let mut parsed_automata = std::collections::BTreeMap::new();
         let mut lint_error_count = 0usize;
         let mut lint_error_lines = Vec::new();
 
-        for (entity_name, ioa_source) in &ioa_sources {
+        for (entity_name, ioa_source) in ioa_sources {
             let automaton = temper_spec::automaton::parse_automaton(ioa_source)
                 .with_context(|| format!("Failed to parse IOA spec for '{entity_name}'"))?;
 
@@ -108,7 +174,7 @@ pub fn run(specs_dir: &str) -> Result<()> {
         }
 
         println!("\nRunning IOA verification cascade...");
-        for (entity_name, ioa_source) in &ioa_sources {
+        for (entity_name, ioa_source) in ioa_sources {
             println!("\n  Verifying {entity_name}...");
             let cascade = temper_verify::cascade::VerificationCascade::from_ioa(ioa_source)
                 .with_sim_seeds(5)
@@ -135,63 +201,6 @@ pub fn run(specs_dir: &str) -> Result<()> {
         }
     }
 
-    // Build spec model (which includes cross-validation)
-    let spec = build_spec_model(csdl, tla_sources);
-
-    // Report results
-    println!("\nVerification Report");
-    println!("{}", "=".repeat(50));
-
-    // Schema summary
-    let entity_count: usize = spec.csdl.schemas.iter().map(|s| s.entity_types.len()).sum();
-    let action_count: usize = spec.csdl.schemas.iter().map(|s| s.actions.len()).sum();
-    let function_count: usize = spec.csdl.schemas.iter().map(|s| s.functions.len()).sum();
-
-    println!("\nSpecification Summary:");
-    println!("  Entity types:    {entity_count}");
-    println!("  Actions:         {action_count}");
-    println!("  Functions:       {function_count}");
-    println!("  State machines:  {}", spec.state_machines.len());
-
-    // State machine details
-    for (name, sm) in &spec.state_machines {
-        println!("\n  State Machine: {name}");
-        println!("    States:       {}", sm.states.len());
-        println!("    Transitions:  {}", sm.transitions.len());
-        println!("    Invariants:   {}", sm.invariants.len());
-        println!("    Liveness:     {}", sm.liveness_properties.len());
-    }
-
-    // Validation errors
-    if !spec.validation.errors.is_empty() {
-        println!("\nErrors ({}):", spec.validation.errors.len());
-        for err in &spec.validation.errors {
-            println!("  FAIL: {err}");
-        }
-    }
-
-    // Validation warnings
-    if !spec.validation.warnings.is_empty() {
-        println!("\nWarnings ({}):", spec.validation.warnings.len());
-        for warn in &spec.validation.warnings {
-            println!("  WARN: {warn}");
-        }
-    }
-
-    // Summary
-    println!("\n{}", "=".repeat(50));
-    if spec.validation.is_valid() {
-        println!("Result: PASS -- all cross-validation checks passed.");
-        println!("\nNote: Full model checking (Stateright) is not yet integrated.");
-        println!("      Run TLC separately for exhaustive state space exploration.");
-    } else {
-        println!(
-            "Result: FAIL -- {} error(s) found.",
-            spec.validation.errors.len()
-        );
-        anyhow::bail!("Verification failed.");
-    }
-
     Ok(())
 }
 
@@ -202,24 +211,30 @@ pub fn run(specs_dir: &str) -> Result<()> {
 /// of the entity trigger graph (so every entity is covered), checks the
 /// `no_dropped_reaction` property, and reports every dropped reaction with
 /// enough detail to name it. A dropped reaction GATES — it fails the command.
-/// An INCOMPLETE run (budget exhausted) is surfaced as a warning and does not
-/// claim a pass.
+/// An INCOMPLETE run (budget exhausted) fails complete-application verification.
 fn run_composite_verification(
     parsed_automata: &std::collections::BTreeMap<String, temper_spec::automaton::Automaton>,
 ) -> Result<()> {
-    use temper_verify::composite::{CompositeOutcome, verify_all};
+    use temper_verify::composite::verify_all;
 
     let automaton_refs: Vec<&temper_spec::automaton::Automaton> =
         parsed_automata.values().collect();
 
     println!("\nRunning composite cross-entity verification (ADR-0150)...");
     let results = verify_all(&automaton_refs);
+    report_composite_results(&results)
+}
+
+fn report_composite_results(
+    results: &[temper_verify::composite::CompositeVerifyResult],
+) -> Result<()> {
+    use temper_verify::composite::CompositeOutcome;
 
     let mut any_violation = false;
     let mut any_incomplete = false;
     let mut dropped_lines: Vec<String> = Vec::new();
 
-    for result in &results {
+    for result in results {
         let scope = result.scope.join(", ");
         match result.outcome {
             CompositeOutcome::Verified => {
@@ -273,220 +288,21 @@ fn run_composite_verification(
         );
     }
     if any_incomplete {
-        println!(
-            "\nWARNING: composite verification was INCOMPLETE for one or more seeds (budget exhausted). The cross-entity proof is partial — narrow the spec or raise the budget to fully verify."
-        );
-    } else {
-        println!("\nComposite cross-entity verification: ALL PASSED");
+        anyhow::bail!("composite verification incomplete: state exploration budget exhausted");
     }
+    println!("\nComposite cross-entity verification: ALL PASSED");
 
     Ok(())
-}
-
-/// Read all `.ioa.toml` files from the specs directory.
-fn read_ioa_sources(specs_dir: &Path) -> Result<HashMap<String, String>> {
-    let mut sources = HashMap::new();
-
-    if !specs_dir.is_dir() {
-        return Ok(sources);
-    }
-
-    for entry in fs::read_dir(specs_dir)
-        .with_context(|| format!("Failed to read specs directory: {}", specs_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-
-        if file_name.ends_with(".ioa.toml") {
-            let entity_name = file_name.strip_suffix(".ioa.toml").unwrap_or_default();
-            let entity_name = to_pascal_case(entity_name);
-
-            let source = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read IOA file: {}", path.display()))?;
-
-            sources.insert(entity_name, source);
-        }
-    }
-
-    Ok(sources)
 }
 
 // read_tla_sources is shared via crate::util::read_tla_sources
 use crate::util::read_tla_sources;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn test_verify_reference_specs() {
-        let specs_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/specs");
+#[cfg(test)]
+mod migration_tests;
 
-        if !Path::new(specs_dir).join("model.csdl.xml").exists() {
-            eprintln!("Skipping verify test: reference specs not found");
-            return;
-        }
-
-        let result = run(specs_dir);
-        result.expect("verify should pass on reference specs");
-    }
-
-    #[test]
-    fn test_verify_fails_on_broken_spawn_contract_with_exact_lint_code() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let specs_dir = tmp.path();
-
-        let csdl = r#"<?xml version="1.0" encoding="utf-8"?>
-<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
-  <edmx:DataServices>
-    <Schema Namespace="Temper.Broken" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-      <EntityType Name="Plan">
-        <Key><PropertyRef Name="Id" /></Key>
-        <Property Name="Id" Type="Edm.Guid" Nullable="false" />
-        <Property Name="status" Type="Edm.String" />
-      </EntityType>
-      <EntityType Name="Task">
-        <Key><PropertyRef Name="Id" /></Key>
-        <Property Name="Id" Type="Edm.Guid" Nullable="false" />
-        <Property Name="status" Type="Edm.String" />
-      </EntityType>
-      <EntityContainer Name="Service">
-        <EntitySet Name="Plans" EntityType="Temper.Broken.Plan" />
-        <EntitySet Name="Tasks" EntityType="Temper.Broken.Task" />
-      </EntityContainer>
-    </Schema>
-  </edmx:DataServices>
-</edmx:Edmx>"#;
-        let plan = r#"
-[automaton]
-name = "Plan"
-states = ["Active"]
-initial = "Active"
-
-[[action]]
-name = "AddTask"
-kind = "input"
-from = ["Active"]
-params = ["title"]
-effect = ["spawn('Task', 'Create')"]
-"#;
-        let task = r#"
-[automaton]
-name = "Task"
-states = ["Open"]
-initial = "Open"
-
-[[action]]
-name = "Create"
-kind = "input"
-from = ["Open"]
-params = ["title", "description", "plan_id"]
-"#;
-
-        fs::write(specs_dir.join("model.csdl.xml"), csdl).expect("write csdl");
-        fs::write(specs_dir.join("plan.ioa.toml"), plan).expect("write plan");
-        fs::write(specs_dir.join("task.ioa.toml"), task).expect("write task");
-
-        let result = run(specs_dir.to_str().expect("tmp path utf-8"));
-        let err = result.expect_err("verify should fail on broken spawn contract");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("spawn_initial_action_params_unmapped"),
-            "expected exact lint code in error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_multi_entity_dir_runs_composite_as_gating_step() {
-        // A two-entity directory whose cross-entity reaction can be dropped:
-        // Workspace.Freeze moves Workspace out of Active before File.Touch
-        // fires Workspace.IncrementUsage (enabled only from Active). The
-        // dropped reaction must FAIL the command (composite is gating).
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let specs_dir = tmp.path();
-
-        let csdl = r#"<?xml version="1.0" encoding="utf-8"?>
-<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
-  <edmx:DataServices>
-    <Schema Namespace="Temper.Fs" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-      <EntityType Name="File">
-        <Key><PropertyRef Name="Id" /></Key>
-        <Property Name="Id" Type="Edm.Guid" Nullable="false" />
-        <Property Name="status" Type="Edm.String" />
-        <Property Name="workspace_id" Type="Edm.String" />
-      </EntityType>
-      <EntityType Name="Workspace">
-        <Key><PropertyRef Name="Id" /></Key>
-        <Property Name="Id" Type="Edm.Guid" Nullable="false" />
-        <Property Name="status" Type="Edm.String" />
-      </EntityType>
-      <EntityContainer Name="Service">
-        <EntitySet Name="Files" EntityType="Temper.Fs.File" />
-        <EntitySet Name="Workspaces" EntityType="Temper.Fs.Workspace" />
-      </EntityContainer>
-    </Schema>
-  </edmx:DataServices>
-</edmx:Edmx>"#;
-        let file = r#"
-[automaton]
-name = "File"
-states = ["New", "Updated"]
-initial = "New"
-
-[[action]]
-name = "Touch"
-kind = "input"
-from = ["New"]
-to = "Updated"
-
-[[action.triggers]]
-name = "touch_increments_usage"
-kind = "entity"
-target_entity = "Workspace"
-target_action = "IncrementUsage"
-
-[action.triggers.resolve_target]
-kind = "field"
-id_field = "workspace_id"
-"#;
-        let workspace = r#"
-[automaton]
-name = "Workspace"
-states = ["Active", "Frozen"]
-initial = "Active"
-
-[[action]]
-name = "IncrementUsage"
-kind = "input"
-from = ["Active"]
-to = "Active"
-
-[[action]]
-name = "Freeze"
-kind = "internal"
-from = ["Active"]
-to = "Frozen"
-"#;
-
-        fs::write(specs_dir.join("model.csdl.xml"), csdl).expect("write csdl");
-        fs::write(specs_dir.join("file.ioa.toml"), file).expect("write file");
-        fs::write(specs_dir.join("workspace.ioa.toml"), workspace).expect("write workspace");
-
-        let result = run(specs_dir.to_str().expect("tmp path utf-8"));
-        let err = result.expect_err("composite gating step must fail on a dropped reaction");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("composite cross-entity verification failed"),
-            "expected composite gating failure, got: {msg}"
-        );
-        assert!(
-            msg.contains("IncrementUsage") && msg.contains("Frozen"),
-            "failure should name the dropped reaction + wrong state, got: {msg}"
-        );
-    }
-}
+#[cfg(test)]
+mod repository_tests;

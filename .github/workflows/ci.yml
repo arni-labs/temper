@@ -357,27 +357,14 @@ jobs:
       - name: Build temper-cli
         run: cargo build -p temper-cli
 
-      - name: Verify all spec directories
+      # Source collections include partial fixtures and examples whose Rust
+      # hosts/build scripts supply policies and modules. Keep checking every
+      # collection's CSDL and IOA behavior; test the strict CLI on assembled
+      # application fixtures, including missing-policy/module failure cases.
+      - name: Verify repository sources and complete application fixtures
         run: |
-          # Find all directories containing .ioa.toml files
-          SPEC_DIRS=$(find . -name '*.ioa.toml' -exec dirname {} \; | sort -u)
-          if [ -z "$SPEC_DIRS" ]; then
-            echo "No spec directories found — skipping verification"
-            exit 0
-          fi
-          ALL_PASSED=true
-          for dir in $SPEC_DIRS; do
-            # Only verify dirs that also have a CSDL model
-            if [ -f "$dir/model.csdl.xml" ]; then
-              echo "Verifying specs in $dir..."
-              if ! cargo run -p temper-cli -- verify --specs-dir "$dir"; then
-                echo "FAIL: Spec verification failed for $dir"
-                ALL_PASSED=false
-              fi
-            fi
-          done
-          if [ "$ALL_PASSED" = false ]; then exit 1; fi
-          echo "All specs verified: OK"
+          cargo test --locked -p temper-cli verify::
+
 
 
   # ─────────────────────────────────────────────────────
