@@ -30,6 +30,7 @@ impl PostgresEventStore {
         let limit_param = params.len() + 3;
         let offset_param = params.len() + 4;
         let sql = postgres_query_field_page_sql(
+            self.schema.prefix(),
             &clause,
             &order_sql,
             limit_param,
@@ -89,9 +90,11 @@ impl PostgresEventStore {
         clause: &str,
         params: Vec<String>,
     ) -> Result<usize, PersistenceError> {
+        let schema = self.schema.prefix();
+        let index_cte = field_index_cte(schema);
         let sql = format!(
-            "SELECT COUNT(*) \
-             FROM entity_catalog \
+            "{index_cte}SELECT COUNT(*) \
+             FROM {schema}entity_catalog \
              WHERE tenant = $1 AND entity_type = $2 AND ({clause})"
         );
         let tagged_sql = crate::dbm::tag_sql(&sql);
@@ -107,6 +110,7 @@ impl PostgresEventStore {
 }
 
 fn postgres_query_field_page_sql(
+    schema: &str,
     clause: &str,
     order_sql: &str,
     limit_param: usize,
@@ -118,12 +122,25 @@ fn postgres_query_field_page_sql(
     } else {
         "entity_id"
     };
+    let index_cte = field_index_cte(schema);
     format!(
-        "SELECT {select} \
-         FROM entity_catalog \
+        "{index_cte}SELECT {select} \
+         FROM {schema}entity_catalog \
          WHERE tenant = $1 AND entity_type = $2 AND ({clause}) \
          ORDER BY {order_sql} \
          LIMIT ${limit_param} OFFSET ${offset_param}"
+    )
+}
+
+// Generated filter fragments refer to entity_field_index. Bind that relation
+// locally to the selected physical table, without rewriting the fragment or its
+// literals. With no schema selected, retain the original SQL and query plan.
+pub(crate) fn field_index_cte(schema: &str) -> String {
+    if schema.is_empty() {
+        return String::new();
+    }
+    format!(
+        "WITH entity_field_index AS (SELECT * FROM {schema}entity_field_index WHERE tenant = $1 AND entity_type = $2) "
     )
 }
 
@@ -166,16 +183,31 @@ mod tests {
 
     #[test]
     fn no_count_page_sql_does_not_compute_window_count() {
-        let sql = postgres_query_field_page_sql("entity_id = $3", "entity_id ASC", 4, 5, false);
+        let sql = postgres_query_field_page_sql("", "entity_id = $3", "entity_id ASC", 4, 5, false);
 
         assert!(sql.starts_with("SELECT entity_id FROM entity_catalog"));
+        assert!(!sql.contains("{schema}"));
         assert!(!sql.contains("COUNT(*) OVER()"));
     }
 
     #[test]
     fn count_page_sql_computes_count_only_when_requested() {
-        let sql = postgres_query_field_page_sql("entity_id = $3", "entity_id ASC", 4, 5, true);
+        let sql = postgres_query_field_page_sql("", "entity_id = $3", "entity_id ASC", 4, 5, true);
 
         assert!(sql.contains("COUNT(*) OVER() AS total_count"));
+    }
+    #[test]
+    fn qualified_page_keeps_caller_fragments_unchanged() {
+        let sql = postgres_query_field_page_sql(
+            "\"chosen\".",
+            "status = '{schema}'",
+            "entity_id ASC",
+            3,
+            4,
+            false,
+        );
+        assert!(sql.contains("FROM \"chosen\".entity_catalog"));
+        assert!(sql.contains("FROM \"chosen\".entity_field_index"));
+        assert!(sql.contains("status = '{schema}'"));
     }
 }

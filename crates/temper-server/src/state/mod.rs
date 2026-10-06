@@ -582,6 +582,8 @@ pub struct ServerState {
     /// Consulted by the router fallback to dispatch to WASM
     /// integrations registered via the HttpEndpoint entity.
     pub http_endpoint_tables: Arc<crate::http_endpoint::HttpEndpointTables>,
+    /// Host-installed transports available to declared native HTTP endpoints.
+    pub http_transports: Arc<crate::http_endpoint::native::TransportRegistry>,
     /// Shared HTTP stream registry for ADR-0057 streaming exchanges.
     /// Held by ServerState so the dispatcher can mint inbound
     /// exchanges before handing the guest-facing handles to the
@@ -807,6 +809,7 @@ impl ServerState {
             custom_effect_handler: None,
             bound_action_hook: None,
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
+            http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
             workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
@@ -1064,6 +1067,7 @@ impl ServerState {
             custom_effect_handler: None,
             bound_action_hook: None,
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
+            http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
             workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),

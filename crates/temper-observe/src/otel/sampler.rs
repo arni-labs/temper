@@ -196,11 +196,14 @@ fn trace_id_sample_at(trace_id: TraceId, rate_pct: u8) -> bool {
 
 /// Sampler that drops specific span names outright, reduced-samples specific
 /// prefixes, and delegates every other span decision to the wrapped inner
-/// sampler (default: parent-based AlwaysOn).
+/// sampler (default: parent-based AlwaysOn; `OTEL_TRACES_SAMPLER` chooses
+/// another).
 ///
-/// Implemented here rather than configured via `OTEL_TRACES_SAMPLER_ARG` so
-/// the drop rules live in source (grep-able) and survive env-var rewrites by
-/// tenant/deploy tooling.
+/// The drop rules are implemented here rather than configured through the
+/// environment so they live in source (grep-able) and survive env-var
+/// rewrites by tenant/deploy tooling. `OTEL_TRACES_SAMPLER` and
+/// `OTEL_TRACES_SAMPLER_ARG` choose only the inner sampler; the rules apply
+/// around whichever one is chosen.
 #[derive(Debug, Clone)]
 pub(super) struct NameBasedSampler {
     pub(super) inner: Sampler,

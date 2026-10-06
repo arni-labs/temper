@@ -26,6 +26,10 @@
 //!     comma-separated Methods column.
 //!   * `Paused` / `Deleted` endpoints never match.
 
+pub mod admission;
+pub(crate) mod budget;
+pub mod native;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -73,6 +77,10 @@ pub struct HttpEndpointRoute {
     /// spec-defined action. The WASM module supplies parameters only;
     /// the endpoint row supplies the target action and entity template.
     pub action_bridge: Option<HttpActionBridge>,
+    /// Optional native transport with spec-declared OData admission actions.
+    pub native: Option<native::NativeEndpoint>,
+    /// Ordered caller-authorized OData actions before a WASM endpoint executes.
+    pub admission_actions: Vec<admission::AdmissionAction>,
 }
 
 /// Kernel-owned bridge from an HttpEndpoint adapter result to a
@@ -438,7 +446,21 @@ pub fn route_from_entity_fields(id: &str, fields: &serde_json::Value) -> Option<
         .and_then(|v| usize::try_from(v).ok())
         .or_else(|| git_pack_defaults.then_some(128 * 1024 * 1024));
     let action_bridge = optional_action_bridge(obj)?;
+    let admission_actions = match obj.get("AdmissionActions") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => Vec::new(),
+        Some(serde_json::Value::String(value)) => {
+            serde_json::from_str::<Vec<admission::AdmissionAction>>(value).ok()?
+        }
+        _ => return None,
+    };
+    // Do not silently ignore a second admission list on the native dispatch path.
+    if !admission_actions.is_empty() && optional_string(obj, "NativeConfig").is_some() {
+        return None;
+    }
     Some(HttpEndpointRoute {
+        admission_actions,
+
         id: id.to_string(),
         path_prefix,
         methods,
@@ -450,6 +472,10 @@ pub fn route_from_entity_fields(id: &str, fields: &serde_json::Value) -> Option<
         max_memory,
         max_response_bytes,
         action_bridge,
+        native: match optional_string(obj, "NativeConfig") {
+            Some(json) => Some(serde_json::from_str(&json).ok()?),
+            None => None,
+        },
     })
 }
 
@@ -583,6 +609,8 @@ mod tests {
             max_memory: None,
             max_response_bytes: None,
             action_bridge: None,
+            native: None,
+            admission_actions: Vec::new(),
         }
     }
 

@@ -54,6 +54,6 @@ pub(crate) mod workflow_tracing;
 
 pub use entity_actor::{EntityActor, EntityActorHandler, EntityMsg, EntityResponse, EntityState};
 pub use registry::SpecRegistry;
-pub use router::build_router;
+pub use router::{build_router, http_endpoint_fallback};
 pub use state::ServerState;
 pub use storage::StorageStack;

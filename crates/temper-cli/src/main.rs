@@ -62,7 +62,8 @@ enum Commands {
     },
     /// Run the verification cascade
     Verify {
-        /// Path to the specs directory
+        /// Directory with model.csdl.xml, IOA files, policies/, and compiled modules/.
+        /// Missing artifacts and incomplete verification cause failure.
         #[arg(short, long, default_value = "specs")]
         specs_dir: String,
     },

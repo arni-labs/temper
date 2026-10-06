@@ -32,6 +32,7 @@ impl PostgresEventStore {
             .into_iter()
             .collect::<Vec<_>>();
         let rows: Vec<(String, String, serde_json::Value, i64)> = crate::dbm::postgres_query_as!(
+            &self.schema,
             "SELECT c.entity_id, \
                     c.status, \
                     COALESCE( \
@@ -50,7 +51,7 @@ impl PostgresEventStore {
                         '{}'::jsonb \
                     ) AS fields, \
                     c.sequence_nr \
-             FROM entity_catalog c \
+             FROM {schema}entity_catalog c \
              WHERE c.tenant = $1 AND c.entity_type = $2 AND c.entity_id = ANY($3) \
              ORDER BY c.entity_id",
         )

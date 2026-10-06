@@ -1,0 +1,101 @@
+== stderr ==
+OTEL export configured: endpoint=http://127.0.0.1:<port> source=OTLP_ENDPOINT logfire_auth=false
+== log lines ==
+{"fields":{"endpoint":"http://127.0.0.1:<port>","log_batch":512,"log_queue":2048,"message":"OTEL initialised (traces + metrics + logs)","service_name":"temper-platform","trace_batch":512,"trace_dispatch_background_sample_pct":25,"trace_queue":2048,"trace_wasm_auxiliary_sample_pct":5},"level":"INFO","target":"temper_observe::otel"}
+{"fields":{"endpoint":"http://127.0.0.1:<port>","endpoint_source":"OTLP_ENDPOINT","logfire_auth":false,"message":"OTEL export pipeline active","service_name":"temper-platform"},"level":"INFO","target":"temper_observe::otel"}
+{"fields":{"detail":"inside","message":"test log inside a span"},"level":"INFO","span":{"name":"test.request"},"target":"otel_export::child"}
+{"fields":{"message":"test log outside a span"},"level":"WARN","target":"otel_export::child"}
+== requests ==
+/v1/logs application/x-protobuf
+/v1/metrics application/x-protobuf
+/v1/traces application/x-protobuf
+== traces ==
+span "test.child" scope=temper trace=trace#1 id=span#1 parent=span#2 kind=1 flags=1 status=0 events=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute busy_ns = "<masked>"
+  attribute code.filepath = "crates/temper-observe/tests/otel_export/child.rs"
+  attribute code.lineno = "<masked>"
+  attribute code.namespace = "otel_export::child"
+  attribute idle_ns = "<masked>"
+  attribute thread.id = "<masked>"
+  attribute thread.name = "<masked>"
+span "test.request" scope=temper trace=trace#1 id=span#2 parent=[] kind=1 flags=1 status=0 events=["test log inside a span"]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute busy_ns = "<masked>"
+  attribute code.filepath = "crates/temper-observe/tests/otel_export/child.rs"
+  attribute code.lineno = "<masked>"
+  attribute code.namespace = "otel_export::child"
+  attribute idle_ns = "<masked>"
+  attribute thread.id = "<masked>"
+  attribute thread.name = "<masked>"
+span "test.sampled_caller" scope=temper trace=[4bf92f3577b34da6a3ce929d0e0e4736] id=span#3 parent=span#4 kind=1 flags=1 status=0 events=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute busy_ns = "<masked>"
+  attribute code.filepath = "crates/temper-observe/tests/otel_export/child.rs"
+  attribute code.lineno = "<masked>"
+  attribute code.namespace = "otel_export::child"
+  attribute idle_ns = "<masked>"
+  attribute thread.id = "<masked>"
+  attribute thread.name = "<masked>"
+span "wasm:workspace_fs.read" scope=temper trace=[00000000000000000000000000000064] id=span#5 parent=span#4 kind=1 flags=1 status=0 events=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute busy_ns = "<masked>"
+  attribute code.filepath = "crates/temper-observe/tests/otel_export/child.rs"
+  attribute code.lineno = "<masked>"
+  attribute code.namespace = "otel_export::child"
+  attribute idle_ns = "<masked>"
+  attribute thread.id = "<masked>"
+  attribute thread.name = "<masked>"
+== logs ==
+log "test log inside a span" scope=otel_export::child severity=INFO(9) time=<observed time> observed=<set> trace=[] span=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute detail = "inside"
+log "test log outside a span" scope=otel_export::child severity=WARN(13) time=<observed time> observed=<set> trace=[] span=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+log "OTEL initialised (traces + metrics + logs)" scope=temper_observe::otel severity=INFO(9) time=<observed time> observed=<set> trace=[] span=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute endpoint = "http://127.0.0.1:<port>"
+  attribute log_batch = "512"
+  attribute log_queue = "2048"
+  attribute service_name = "temper-platform"
+  attribute trace_batch = "512"
+  attribute trace_dispatch_background_sample_pct = "25"
+  attribute trace_queue = "2048"
+  attribute trace_wasm_auxiliary_sample_pct = "5"
+log "OTEL export pipeline active" scope=temper_observe::otel severity=INFO(9) time=<observed time> observed=<set> trace=[] span=[]
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  attribute endpoint = "http://127.0.0.1:<port>"
+  attribute endpoint_source = "OTLP_ENDPOINT"
+  attribute logfire_auth = "false"
+  attribute service_name = "temper-platform"
+== metrics ==
+metric "otel_export_test_counter" scope=otel_export_test kind=sum unit="" description=""
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  point {} = 1
+metric "temper_trace_sampler_configured_rules" scope=temper.observe kind=gauge unit="" description="Configured trace sampler rules by rule kind. Values are counts, not rates."
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  point {"rule_kind": "drop_exact"} = 2
+  point {"rule_kind": "reduced_prefix"} = 3
+metric "temper_trace_sampler_decisions_total" scope=temper.observe kind=sum unit="" description="Trace sampler decisions by bounded rule name and final sampling decision."
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  point {"decision": "drop", "rule": "delegate"} = 1
+  point {"decision": "drop", "rule": "drop_exact"} = 2
+  point {"decision": "record_and_sample", "rule": "delegate"} = 3
+  point {"decision": "record_and_sample", "rule": "wasm_auxiliary"} = 1
+  point {"decision": "reduced_drop", "rule": "wasm_auxiliary"} = 1
+metric "temper_trace_sampler_reduced_sample_rate_pct" scope=temper.observe kind=gauge unit="%" description="Effective trace sampler keep rate for reduced-prefix rules."
+  resource runtime-id = "<masked>"
+  resource service.name = "temper-platform"
+  point {"rule": "dispatch_background"} = 25
+  point {"rule": "wasm_auxiliary"} = 5

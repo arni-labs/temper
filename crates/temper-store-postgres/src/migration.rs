@@ -22,6 +22,55 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), PersistenceError> {
         .map_err(|e| PersistenceError::Storage(format!("failed to run Postgres migrations: {e}")))
 }
 
+/// Run migrations in an explicitly selected schema, creating it if necessary.
+///
+/// All migration statements, including SQLx's migration history, execute in one
+/// transaction. `SET LOCAL` therefore stays on the same backend even through a
+/// transaction pooler and is undone on commit or rollback. Runtime store queries
+/// use explicit schema names and need no session settings. Existing migration SQL
+/// and checksums remain unchanged. The default schema preserves `run_migrations`.
+/// This path supports transactional migrations only.
+pub async fn run_migrations_in_schema(
+    pool: &PgPool,
+    schema: &crate::PostgresSchema,
+) -> Result<(), PersistenceError> {
+    let Some(name) = schema.name() else {
+        return run_migrations(pool).await;
+    };
+    let mut migrator = sqlx::migrate!("./migrations");
+    if migrator.iter().any(|migration| migration.no_tx) {
+        return Err(PersistenceError::Storage(
+            "schema-selected migrations must support transactions".into(),
+        ));
+    }
+    // Session advisory locks can leak through transaction poolers. Use a lock
+    // scoped to this migration transaction and selected database/schema instead.
+    migrator.set_locking(false);
+    let mut tx = pool.begin().await.map_err(migration_error)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':temper-migrations:' || $1, 0))")
+        .bind(name).execute(&mut *tx).await.map_err(migration_error)?;
+    let identifier = schema
+        .prefix()
+        .strip_suffix('.')
+        .expect("explicit schema prefix");
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {identifier}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(migration_error)?;
+    sqlx::query(&format!(
+        "SET LOCAL search_path TO {identifier}, pg_catalog"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(migration_error)?;
+    migrator.run(&mut *tx).await.map_err(migration_error)?;
+    tx.commit().await.map_err(migration_error)
+}
+
+fn migration_error(error: impl std::fmt::Display) -> PersistenceError {
+    PersistenceError::Storage(format!("failed to run Postgres migrations: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::schema;

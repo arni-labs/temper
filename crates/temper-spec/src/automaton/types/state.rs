@@ -202,7 +202,18 @@ pub enum ActionParam {
         /// Parameter type.
         #[serde(rename = "type")]
         param_type: VarType,
+        /// Trusted runtime source. A caller cannot supply this parameter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ParameterSource>,
     },
+}
+
+/// Authenticated runtime values available to declared action parameters.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterSource {
+    /// Verified delegated subject when present, otherwise the principal ID.
+    AuthenticatedSubject,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +222,8 @@ struct TypedParam {
     name: String,
     #[serde(rename = "type", default)]
     param_type: VarType,
+    #[serde(default)]
+    source: Option<ParameterSource>,
 }
 
 impl<'de> Deserialize<'de> for ActionParam {
@@ -219,9 +232,16 @@ impl<'de> Deserialize<'de> for ActionParam {
         match serde_json::Value::deserialize(deserializer)? {
             serde_json::Value::String(name) => Ok(ActionParam::Named(name)),
             table @ serde_json::Value::Object(_) => {
-                let TypedParam { name, param_type } =
-                    serde_json::from_value(table).map_err(D::Error::custom)?;
-                Ok(ActionParam::Typed { name, param_type })
+                let TypedParam {
+                    name,
+                    param_type,
+                    source,
+                } = serde_json::from_value(table).map_err(D::Error::custom)?;
+                Ok(ActionParam::Typed {
+                    name,
+                    param_type,
+                    source,
+                })
             }
             other => Err(D::Error::custom(format!(
                 "a parameter is a name or {{ name = ..., type = ... }}, found {other}"
@@ -236,6 +256,14 @@ impl ActionParam {
         match self {
             Self::Named(n) => n,
             Self::Typed { name, .. } => name,
+        }
+    }
+
+    /// Runtime source for this parameter, if it is not client supplied.
+    pub fn source(&self) -> Option<ParameterSource> {
+        match self {
+            Self::Named(_) => None,
+            Self::Typed { source, .. } => *source,
         }
     }
 

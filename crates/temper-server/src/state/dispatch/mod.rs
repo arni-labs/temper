@@ -11,6 +11,7 @@ use tracing::Instrument;
 
 mod actions;
 mod adapter;
+mod authenticated_params;
 mod compensation;
 mod composite;
 mod cross_entity;

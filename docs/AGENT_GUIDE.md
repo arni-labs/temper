@@ -1286,7 +1286,42 @@ temper serve [--port PORT] [--specs-dir DIR] [--tenant NAME]
 | `OTLP_ENDPOINT` | For telemetry export | OTLP collector base URL (e.g., `http://localhost:4318`) |
 | `CLICKHOUSE_URL` | For analysis queries | ClickHouse HTTP endpoint (read path for trajectory analysis) |
 | `ANTHROPIC_API_KEY` | For agent mode | Claude API key |
+| `TEMPER_SECRET_<NAME>` | No | Supplies the secret `<name>` to every tenant from the moment the server is up. See [Secrets from the environment](#secrets-from-the-environment). |
 | `RUST_LOG` | No | Log level (default: `info,temper=debug`) |
+
+### Secrets from the environment
+
+`temper serve` seeds its secrets cache at start from every variable named `TEMPER_SECRET_<NAME>` that has a non-empty value. The secret is `<name>` in lower case: `TEMPER_SECRET_BUILD_TOKEN=abc` supplies the secret `build_token`, which a module reads with `get_secret("build_token")` and an integration config references as `{secret:build_token}`. With no such variable set, nothing changes.
+
+- **Naming rule.** `<NAME>` is one or more of `A` to `Z`, `0` to `9` and `_`, and starts with a letter. A variable that does not fit (`TEMPER_SECRET_` alone, a lower-case letter, a dash) is skipped and logged once at startup as a warning that gives the variable's name. The server still starts. An empty value is the same as an unset variable.
+- **Reach.** A seeded secret is a platform secret: every tenant reads it, including tenants created later. It is held in memory only and is not written to storage, so it has to be in the environment at every start. `GET /api/tenants/{tenant}/secrets` lists it by name.
+- **Who can read it.** Whoever can read any other secret of the tenant, by the same two routes. A module's `get_secret("<name>")` call needs a policy in its tenant that permits `access_secret` on `Secret::"<name>"`, and is refused without one. A `{secret:<name>}` template in an integration config is resolved when the integration runs, without that check, as it is for every secret. Because a seeded secret reaches every tenant, supply this way only what every tenant's specs may use.
+- **Precedence**, highest first:
+  1. A secret a tenant stored through the secrets API, for that tenant only, whether it was stored before or after the server started. Deleting it uncovers the seeded value again.
+  2. What the server sets itself at start: `anthropic_api_key` when `ANTHROPIC_API_KEY` is set, `exa_api_key` when `EXA_API_KEY` is set, and the addresses the server gives its own modules (such as `temper_api_url`). The prefixed variable of the same name is skipped and logged by name.
+  3. The prefixed variable.
+- **What is logged.** One line with the number of secrets seeded, and one warning for each skipped variable with its name. Values are never logged. With no `TEMPER_SECRET_` variable set, startup logs nothing about them.
+- **Budgets.** A value larger than 8192 bytes, the limit of the secrets API, is skipped and logged by name. The platform layer holds at most 100 secrets, the server's own included. Variables are taken in name order, and any beyond that are skipped and logged by name.
+
+### Telemetry export settings
+
+When an OTLP endpoint is configured, these standard OpenTelemetry variables adjust what `temper serve` exports. All are optional. With none of them set, the export is unchanged.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `OTEL_SERVICE_NAME` | `temper-platform` | Service name on traces, metrics and logs. |
+| `OTEL_RESOURCE_ATTRIBUTES` | none | Extra resource attributes as `key=value,key=value`, added to traces, metrics and logs. |
+| `OTEL_TRACES_EXPORTER` | `otlp` | `none` switches the export of traces off. |
+| `OTEL_METRICS_EXPORTER` | `otlp` | `none` switches the export of metrics off. |
+| `OTEL_LOGS_EXPORTER` | `otlp` | `none` switches the export of logs off. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | Which spans are recorded: `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off` or `parentbased_traceidratio`. |
+| `OTEL_TRACES_SAMPLER_ARG` | `1` | Ratio from 0 to 1 for `traceidratio` and `parentbased_traceidratio`. |
+
+- **Resource attributes the server computes itself win** over `OTEL_RESOURCE_ATTRIBUTES`: `runtime-id` always, `deployment.environment.name` when `DD_ENV` or `LOGFIRE_ENVIRONMENT` is set, and `service.version` when `DD_VERSION` is set. A `service.name` in `OTEL_RESOURCE_ATTRIBUTES` does not replace the service name; use `OTEL_SERVICE_NAME`. Keys and values are trimmed and otherwise taken as written.
+- **A signal that is switched off** keeps running inside the process and is not exported. Spans still carry trace context and log lines are still printed.
+- **Sampling.** The `parentbased_` samplers follow the caller's decision when a span has a remote parent. `always_on` and `traceidratio` do not, so they record spans for requests the caller marked "not sampled". The name-based filter (span names dropped outright, and prefixes kept at a reduced rate through `TEMPER_TRACE_WASM_AUX_SAMPLE_PCT` and `TEMPER_TRACE_DISPATCH_BACKGROUND_SAMPLE_PCT`) applies around whichever sampler is chosen.
+- **Bad values never stop the server.** A value that is not supported is logged once at startup as a warning (`OTEL export setting: ...`) and the default applies. An empty value is the same as an unset variable.
+- **Log records carry an event time.** Every exported log record has its event time set (to the time it was observed when it has none), so backends that date records by event time accept them.
 
 **OTEL env var precedence:** The OTEL SDK reads signal-specific env vars (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`) *before* the generic `OTEL_EXPORTER_OTLP_ENDPOINT`. If any signal-specific var is set — even by an unrelated tool — it silently overrides Temper's configured endpoint for that signal. `init_tracing()` clears these vars automatically. See Appendix D for details.
 

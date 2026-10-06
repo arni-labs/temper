@@ -152,6 +152,9 @@ pub struct ActionContract {
     /// Explicit types only; bare parameter names retain constraint-inferred semantics.
     #[serde(default)]
     pub param_types: BTreeMap<String, temper_spec::automaton::VarType>,
+    /// Values resolved by authenticated dispatch, never accepted from the caller.
+    #[serde(default)]
+    pub param_sources: BTreeMap<String, temper_spec::automaton::ParameterSource>,
     /// Preconditions checked before effects and field synchronization.
     pub constraints: Vec<ActionConstraint>,
 }

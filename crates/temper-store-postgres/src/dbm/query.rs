@@ -26,9 +26,9 @@ pub(crate) struct PostgresQuery {
 }
 
 impl PostgresQuery {
-    pub(crate) fn new(sql: &'static str) -> Self {
+    pub(crate) fn new(sql: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            sql: super::tag_static_sql(sql),
+            sql: super::tag_query_sql(sql.into()),
             args: Ok(PgArguments::default()),
         }
     }
@@ -112,7 +112,7 @@ impl<O> PostgresQueryAs<O>
 where
     O: for<'r> FromRow<'r, PgRow> + Send + Unpin,
 {
-    pub(crate) fn new(sql: &'static str) -> Self {
+    pub(crate) fn new(sql: impl Into<Cow<'static, str>>) -> Self {
         Self {
             inner: PostgresQuery::new(sql),
             output: PhantomData,
@@ -186,7 +186,7 @@ where
     (O,): for<'r> FromRow<'r, PgRow>,
     O: Send + Unpin,
 {
-    pub(crate) fn new(sql: &'static str) -> Self {
+    pub(crate) fn new(sql: impl Into<Cow<'static, str>>) -> Self {
         Self {
             inner: PostgresQuery::new(sql),
             output: PhantomData,

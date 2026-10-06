@@ -167,12 +167,32 @@ pub(super) async fn dispatch_bound_action(
         return super::common::verification_gate_response(error);
     }
 
+    // Resolve a validation copy before materializing anything. Dispatch resolves
+    // the original caller input independently at its own trusted boundary.
+    let resolved_body = match state.resolve_authenticated_params(
+        tenant,
+        entity_type,
+        action,
+        body_json.clone(),
+        &dispatch_agent_ctx,
+    ) {
+        Ok(params) => params,
+        Err(error) => {
+            return odata_error(
+                StatusCode::BAD_REQUEST,
+                "AuthenticatedParameter",
+                &error.to_string(),
+            )
+            .into_response();
+        }
+    };
+
     if let Err(resp) = enforce_commons_account_verified_for_action(
         state,
         tenant,
         entity_type,
         &current_state.state.fields,
-        &body_json,
+        &resolved_body,
     )
     .await
     {
@@ -187,7 +207,7 @@ pub(super) async fn dispatch_bound_action(
         state,
         tenant,
         entity_type,
-        owner_id_from_action(&current_state.state.fields, &body_json),
+        owner_id_from_action(&current_state.state.fields, &resolved_body),
         security_ctx,
     )
     .await
@@ -225,7 +245,7 @@ pub(super) async fn dispatch_bound_action(
             .and_then(|table| {
                 table.validate_action_params(
                     action.rsplit('.').next().unwrap_or(action),
-                    &body_json,
+                    &resolved_body,
                     &current_state.state.fields,
                     &current_state.state.counters,
                     &current_state.state.booleans,
@@ -327,7 +347,7 @@ pub(super) async fn dispatch_bound_action(
                             entity_type,
                             entity_id: key_str,
                             action,
-                            params: &body_json,
+                            params: &resolved_body,
                             state_json: &state_json,
                         })
                         .await

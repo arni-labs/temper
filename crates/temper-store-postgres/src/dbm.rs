@@ -6,18 +6,27 @@ pub(crate) use query::query_span_metadata;
 pub(crate) use query::{PostgresQuery, PostgresQueryAs, PostgresQueryScalar};
 
 macro_rules! postgres_query {
+    ($schema:expr, $sql:expr $(,)?) => {
+        $crate::dbm::PostgresQuery::new($schema.qualify_sql($sql))
+    };
     ($sql:expr $(,)?) => {
         $crate::dbm::PostgresQuery::new($sql)
     };
 }
 
 macro_rules! postgres_query_as {
+    ($schema:expr, $sql:expr $(,)?) => {
+        $crate::dbm::PostgresQueryAs::new($schema.qualify_sql($sql))
+    };
     ($sql:expr $(,)?) => {
         $crate::dbm::PostgresQueryAs::new($sql)
     };
 }
 
 macro_rules! postgres_query_scalar {
+    ($schema:expr, $sql:expr $(,)?) => {
+        $crate::dbm::PostgresQueryScalar::new($schema.qualify_sql($sql))
+    };
     ($sql:expr $(,)?) => {
         $crate::dbm::PostgresQueryScalar::new($sql)
     };
@@ -127,18 +136,18 @@ pub(crate) fn tag_sql(sql: &str) -> Cow<'_, str> {
     ))
 }
 
-fn tag_static_sql(sql: &'static str) -> query::TaggedSql {
+fn tag_query_sql(sql: Cow<'static, str>) -> query::TaggedSql {
     let config = DbmSqlCommentConfig::from_env();
     if !config.enabled() {
         return query::TaggedSql {
-            text: Cow::Borrowed(sql),
+            text: sql,
             persistent: true,
         };
     }
 
     query::TaggedSql {
         text: Cow::Owned(tag_sql_with_config_and_traceparent(
-            sql,
+            &sql,
             &config,
             current_traceparent_header().as_deref(),
         )),

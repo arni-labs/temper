@@ -62,16 +62,16 @@ if [ -n "$STAGED_RS" ]; then
     fi
 fi
 
-# --- Item 8: Spec Syntax Validation ---
+# --- Item 8: Source Collection Verification ---
 STAGED_SPECS="$(git diff --cached --name-only --diff-filter=ACM -- '*.ioa.toml' || true)"
 
 if [ -n "$STAGED_SPECS" ]; then
-    echo "Pre-commit: validating spec syntax..." >&2
+    echo "Pre-commit: verifying source collections..." >&2
 
     for SPEC in $STAGED_SPECS; do
-        # Try parsing the spec (syntax check only, not full cascade)
-        if ! cargo run -p temper-cli --quiet -- verify --specs-dir "$(dirname "$SPEC")" 2>/dev/null; then
-            echo "BLOCKED: Spec syntax error in $SPEC" >&2
+        # Check source behavior and CSDL bindings before policies/modules are packaged.
+        if ! "$WORKSPACE_ROOT/scripts/verify-source-collection.sh" "$(dirname "$SPEC")"; then
+            echo "BLOCKED: Source verification failed for $SPEC" >&2
             echo "Fix the spec before committing." >&2
             exit 1
         fi

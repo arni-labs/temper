@@ -29,12 +29,27 @@ const EVENT_APPEND_OPERATION: &str = "event_append";
 #[derive(Clone, Debug)]
 pub struct PostgresEventStore {
     pool: PgPool,
+    pub(crate) schema: crate::PostgresSchema,
 }
 
 impl PostgresEventStore {
     /// Create a new store backed by the given connection pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            schema: crate::PostgresSchema::default(),
+        }
+    }
+
+    /// Create a store that explicitly addresses tables in `schema`.
+    /// This never changes connection settings or creates database objects.
+    pub fn with_schema(pool: PgPool, schema: crate::PostgresSchema) -> Self {
+        Self { pool, schema }
+    }
+
+    /// Schema selected for this store; the default follows the connection's search path.
+    pub fn schema(&self) -> &crate::PostgresSchema {
+        &self.schema
     }
 
     /// Return a reference to the inner pool (useful for migrations).
@@ -120,7 +135,8 @@ impl EventStore for PostgresEventStore {
         };
 
         let row: Option<(i64,)> = crate::dbm::postgres_query_as!(
-            "SELECT COALESCE(MAX(sequence_nr), 0) FROM events \
+            &self.schema,
+            "SELECT COALESCE(MAX(sequence_nr), 0) FROM {schema}events \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
         )
         .bind(tenant)
@@ -144,7 +160,8 @@ impl EventStore for PostgresEventStore {
         // already holding the key is the violation (reject + surface).
         for key in key_rows {
             let holder: Option<(String,)> = crate::dbm::postgres_query_as!(
-                "SELECT entity_id FROM entity_key_index \
+                &self.schema,
+                "SELECT entity_id FROM {schema}entity_key_index \
                  WHERE tenant = $1 AND entity_type = $2 AND key_name = $3 AND key_hash = $4",
             )
             .bind(tenant)
@@ -164,9 +181,15 @@ impl EventStore for PostgresEventStore {
             }
         }
 
-        let segment_index =
-            segments::open_segment_for_append(&mut tx, tenant, entity_type, entity_id, current_seq)
-                .await?;
+        let segment_index = segments::open_segment_for_append(
+            &self.schema,
+            &mut tx,
+            tenant,
+            entity_type,
+            entity_id,
+            current_seq,
+        )
+        .await?;
 
         let mut new_seq = expected_sequence;
         for event in events {
@@ -174,8 +197,8 @@ impl EventStore for PostgresEventStore {
             let metadata_json = serde_json::to_value(&event.metadata)
                 .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
 
-            if let Err(e) = crate::dbm::postgres_query!(
-                "INSERT INTO events (tenant, entity_type, entity_id, sequence_nr, segment_index, event_type, payload, metadata) \
+            if let Err(e) = crate::dbm::postgres_query!(&self.schema,
+                "INSERT INTO {schema}events (tenant, entity_type, entity_id, sequence_nr, segment_index, event_type, payload, metadata) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(tenant)
@@ -204,6 +227,7 @@ impl EventStore for PostgresEventStore {
 
         if new_seq > expected_sequence {
             segments::update_segment_after_append(
+                &self.schema,
                 &mut tx,
                 tenant,
                 entity_type,
@@ -219,7 +243,8 @@ impl EventStore for PostgresEventStore {
         // key_name (the value may have changed), then claim the new key_hash.
         for key in key_rows {
             crate::dbm::postgres_query!(
-                "DELETE FROM entity_key_index \
+                &self.schema,
+                "DELETE FROM {schema}entity_key_index \
                  WHERE tenant = $1 AND entity_type = $2 AND key_name = $3 AND entity_id = $4",
             )
             .bind(tenant)
@@ -230,7 +255,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
             crate::dbm::postgres_query!(
-                "INSERT INTO entity_key_index \
+                &self.schema,
+                "INSERT INTO {schema}entity_key_index \
                  (tenant, entity_type, key_name, key_hash, entity_id, sequence_nr) \
                  VALUES ($1, $2, $3, $4, $5, $6)",
             )
@@ -253,7 +279,8 @@ impl EventStore for PostgresEventStore {
         // constraint; vectors are derived ranking state.
         if reconcile_vectors {
             crate::dbm::postgres_query!(
-                "DELETE FROM entity_vector_index \
+                &self.schema,
+                "DELETE FROM {schema}entity_vector_index \
                  WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
             )
             .bind(tenant)
@@ -264,7 +291,8 @@ impl EventStore for PostgresEventStore {
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
             for row in vector_rows {
                 crate::dbm::postgres_query!(
-                    "INSERT INTO entity_vector_index \
+                    &self.schema,
+                    "INSERT INTO {schema}entity_vector_index \
                      (tenant, entity_type, decl_name, model_tag, entity_id, vector, sequence_nr) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
@@ -321,7 +349,8 @@ impl EventStore for PostgresEventStore {
             // the conflict surfaces via the metric and a keyed read still resolves
             // to whoever currently holds it).
             let holder: Option<(String,)> = crate::dbm::postgres_query_as!(
-                "SELECT entity_id FROM entity_key_index \
+                &self.schema,
+                "SELECT entity_id FROM {schema}entity_key_index \
                  WHERE tenant = $1 AND entity_type = $2 AND key_name = $3 AND key_hash = $4",
             )
             .bind(tenant)
@@ -342,7 +371,8 @@ impl EventStore for PostgresEventStore {
                 continue;
             }
             crate::dbm::postgres_query!(
-                "DELETE FROM entity_key_index \
+                &self.schema,
+                "DELETE FROM {schema}entity_key_index \
                  WHERE tenant = $1 AND entity_type = $2 AND key_name = $3 AND entity_id = $4",
             )
             .bind(tenant)
@@ -353,7 +383,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
             crate::dbm::postgres_query!(
-                "INSERT INTO entity_key_index \
+                &self.schema,
+                "INSERT INTO {schema}entity_key_index \
                  (tenant, entity_type, key_name, key_hash, entity_id, sequence_nr) \
                  VALUES ($1, $2, $3, $4, $5, 0) \
                  ON CONFLICT (tenant, entity_type, key_name, key_hash) DO NOTHING",
@@ -387,7 +418,8 @@ impl EventStore for PostgresEventStore {
         // Upsert the covered key-set: a re-key after a key-set change must OVERWRITE the
         // stale set (not DO NOTHING) so `complete` reflects the keys actually assigned.
         crate::dbm::postgres_query!(
-            "INSERT INTO key_index_backfill_watermark (tenant, entity_type, key_set) \
+            &self.schema,
+            "INSERT INTO {schema}key_index_backfill_watermark (tenant, entity_type, key_set) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (tenant, entity_type) \
              DO UPDATE SET key_set = EXCLUDED.key_set, completed_at = now()",
@@ -410,8 +442,8 @@ impl EventStore for PostgresEventStore {
             .acquire()
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(
-            "SELECT entity_type, key_set FROM key_index_backfill_watermark WHERE tenant = $1",
+        let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(&self.schema,
+            "SELECT entity_type, key_set FROM {schema}key_index_backfill_watermark WHERE tenant = $1",
         )
         .bind(tenant)
         .fetch_all(&mut *conn)
@@ -431,7 +463,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         let rows: Vec<(String,)> = crate::dbm::postgres_query_as!(
-            "SELECT DISTINCT entity_id FROM entity_key_index \
+            &self.schema,
+            "SELECT DISTINCT entity_id FROM {schema}entity_key_index \
              WHERE tenant = $1 AND entity_type = $2",
         )
         .bind(tenant)
@@ -455,7 +488,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         let row: Option<(String,)> = crate::dbm::postgres_query_as!(
-            "SELECT entity_id FROM entity_key_index \
+            &self.schema,
+            "SELECT entity_id FROM {schema}entity_key_index \
              WHERE tenant = $1 AND entity_type = $2 AND key_name = $3 AND key_hash = $4",
         )
         .bind(tenant)
@@ -484,7 +518,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         crate::dbm::postgres_query!(
-            "DELETE FROM entity_vector_index \
+            &self.schema,
+            "DELETE FROM {schema}entity_vector_index \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
         )
         .bind(tenant)
@@ -495,7 +530,8 @@ impl EventStore for PostgresEventStore {
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         for row in vector_rows {
             crate::dbm::postgres_query!(
-                "INSERT INTO entity_vector_index \
+                &self.schema,
+                "INSERT INTO {schema}entity_vector_index \
                  (tenant, entity_type, decl_name, model_tag, entity_id, vector, sequence_nr) \
                  VALUES ($1, $2, $3, $4, $5, $6, 0)",
             )
@@ -529,7 +565,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         let rows: Vec<(String, Vec<u8>)> = crate::dbm::postgres_query_as!(
-            "SELECT entity_id, vector FROM entity_vector_index \
+            &self.schema,
+            "SELECT entity_id, vector FROM {schema}entity_vector_index \
              WHERE tenant = $1 AND entity_type = $2 AND decl_name = $3 AND model_tag = $4 \
              ORDER BY entity_id LIMIT $5",
         )
@@ -561,7 +598,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         crate::dbm::postgres_query!(
-            "INSERT INTO vector_index_backfill_watermark (tenant, entity_type, vector_set) \
+            &self.schema,
+            "INSERT INTO {schema}vector_index_backfill_watermark (tenant, entity_type, vector_set) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (tenant, entity_type) \
              DO UPDATE SET vector_set = EXCLUDED.vector_set, completed_at = now()",
@@ -584,8 +622,8 @@ impl EventStore for PostgresEventStore {
             .acquire()
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-        let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(
-            "SELECT entity_type, vector_set FROM vector_index_backfill_watermark WHERE tenant = $1",
+        let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(&self.schema,
+            "SELECT entity_type, vector_set FROM {schema}vector_index_backfill_watermark WHERE tenant = $1",
         )
         .bind(tenant)
         .fetch_all(&mut *conn)
@@ -605,7 +643,8 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
         let rows: Vec<(String,)> = crate::dbm::postgres_query_as!(
-            "SELECT DISTINCT entity_id FROM entity_vector_index \
+            &self.schema,
+            "SELECT DISTINCT entity_id FROM {schema}entity_vector_index \
              WHERE tenant = $1 AND entity_type = $2",
         )
         .bind(tenant)
@@ -684,7 +723,8 @@ impl EventStore for PostgresEventStore {
                 parse_persistence_id_parts(&append.persistence_id)
                     .map_err(PersistenceError::Storage)?;
             let row: Option<(i64,)> = crate::dbm::postgres_query_as!(
-                "SELECT COALESCE(MAX(sequence_nr), 0) FROM events \
+                &self.schema,
+                "SELECT COALESCE(MAX(sequence_nr), 0) FROM {schema}events \
                  WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
             )
             .bind(tenant)
@@ -703,6 +743,7 @@ impl EventStore for PostgresEventStore {
                 });
             }
             let segment_index = segments::open_segment_for_append(
+                &self.schema,
                 &mut tx,
                 tenant,
                 entity_type,
@@ -728,8 +769,8 @@ impl EventStore for PostgresEventStore {
                 let metadata_json = serde_json::to_value(&event.metadata)
                     .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
 
-                if let Err(e) = crate::dbm::postgres_query!(
-                    "INSERT INTO events (tenant, entity_type, entity_id, sequence_nr, segment_index, event_type, payload, metadata) \
+                if let Err(e) = crate::dbm::postgres_query!(&self.schema,
+                    "INSERT INTO {schema}events (tenant, entity_type, entity_id, sequence_nr, segment_index, event_type, payload, metadata) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 )
                 .bind(tenant)
@@ -756,6 +797,7 @@ impl EventStore for PostgresEventStore {
             }
             if new_seq > append.expected_sequence {
                 segments::update_segment_after_append(
+                    &self.schema,
                     &mut tx,
                     tenant,
                     entity_type,
@@ -803,8 +845,9 @@ impl EventStore for PostgresEventStore {
 
         let rows: Vec<(i64, String, serde_json::Value, serde_json::Value)> =
             crate::dbm::postgres_query_as!(
+                &self.schema,
                 "SELECT sequence_nr, event_type, payload, metadata \
-             FROM events \
+             FROM {schema}events \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND sequence_nr > $4 \
              ORDER BY sequence_nr ASC",
             )
@@ -850,7 +893,8 @@ impl EventStore for PostgresEventStore {
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
         crate::dbm::postgres_query!(
-            "INSERT INTO snapshots (tenant, entity_type, entity_id, sequence_nr, state) \
+            &self.schema,
+            "INSERT INTO {schema}snapshots (tenant, entity_type, entity_id, sequence_nr, state) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (tenant, entity_type, entity_id) \
              DO UPDATE SET sequence_nr = $4, state = $5, created_at = now()",
@@ -864,8 +908,8 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        crate::dbm::postgres_query!(
-            "INSERT INTO snapshot_history (tenant, entity_type, entity_id, sequence_nr, state) \
+        crate::dbm::postgres_query!(&self.schema,
+            "INSERT INTO {schema}snapshot_history (tenant, entity_type, entity_id, sequence_nr, state) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (tenant, entity_type, entity_id, sequence_nr) \
              DO UPDATE SET state = $5, created_at = now()",
@@ -879,8 +923,15 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        segments::rotate_after_snapshot(&mut tx, tenant, entity_type, entity_id, sequence_nr)
-            .await?;
+        segments::rotate_after_snapshot(
+            &self.schema,
+            &mut tx,
+            tenant,
+            entity_type,
+            entity_id,
+            sequence_nr,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -900,7 +951,8 @@ impl EventStore for PostgresEventStore {
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
 
         let row: Option<(i64, Vec<u8>)> = crate::dbm::postgres_query_as!(
-            "SELECT sequence_nr, state FROM snapshots \
+            &self.schema,
+            "SELECT sequence_nr, state FROM {schema}snapshots \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
         )
         .bind(tenant)
@@ -920,8 +972,9 @@ impl EventStore for PostgresEventStore {
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
         let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(
+            &self.schema,
             "SELECT DISTINCT entity_type, entity_id \
-             FROM events \
+             FROM {schema}events \
              WHERE tenant = $1",
         )
         .bind(tenant)
@@ -939,15 +992,16 @@ impl EventStore for PostgresEventStore {
         entity_type: &str,
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<String> = crate::dbm::postgres_query_scalar!(
+            &self.schema,
             "SELECT entity_id \
              FROM ( \
                SELECT c.entity_id \
-               FROM entity_catalog c \
+               FROM {schema}entity_catalog c \
                WHERE c.tenant = $1 \
                  AND c.entity_type = $2 \
                  AND NOT EXISTS ( \
                    SELECT 1 \
-                   FROM events d \
+                   FROM {schema}events d \
                    WHERE d.tenant = c.tenant \
                      AND d.entity_type = c.entity_type \
                      AND d.entity_id = c.entity_id \
@@ -955,12 +1009,12 @@ impl EventStore for PostgresEventStore {
                  ) \
                UNION \
                SELECT f.entity_id \
-               FROM entity_field_index f \
+               FROM {schema}entity_field_index f \
                WHERE f.tenant = $1 \
                  AND f.entity_type = $2 \
                  AND NOT EXISTS ( \
                    SELECT 1 \
-                   FROM events d \
+                   FROM {schema}events d \
                    WHERE d.tenant = f.tenant \
                      AND d.entity_type = f.entity_type \
                      AND d.entity_id = f.entity_id \
@@ -968,12 +1022,12 @@ impl EventStore for PostgresEventStore {
                  ) \
                UNION \
                SELECT DISTINCT e.entity_id \
-               FROM events e \
+               FROM {schema}events e \
                WHERE e.tenant = $1 \
                  AND e.entity_type = $2 \
                  AND NOT EXISTS ( \
                    SELECT 1 \
-                   FROM events d \
+                   FROM {schema}events d \
                    WHERE d.tenant = e.tenant \
                      AND d.entity_type = e.entity_type \
                      AND d.entity_id = e.entity_id \
@@ -1003,8 +1057,9 @@ impl EventStore for PostgresEventStore {
         let limit = limit.min(i64::MAX as usize) as i64;
         if let Some(entity_type) = entity_type {
             let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(
+                &self.schema,
                 "SELECT DISTINCT entity_type, entity_id \
-                 FROM events \
+                 FROM {schema}events \
                  WHERE tenant = $1 AND entity_type = $2 \
                  ORDER BY entity_type, entity_id \
                  LIMIT $3",
@@ -1019,8 +1074,9 @@ impl EventStore for PostgresEventStore {
         }
 
         let rows: Vec<(String, String)> = crate::dbm::postgres_query_as!(
+            &self.schema,
             "SELECT DISTINCT entity_type, entity_id \
-             FROM events \
+             FROM {schema}events \
              WHERE tenant = $1 \
              ORDER BY entity_type, entity_id \
              LIMIT $2",

@@ -841,6 +841,23 @@ pub async fn handle_odata_post(
                     )
                     .into_response();
                 };
+                let body_json = match state.resolve_authenticated_params(
+                    &tenant,
+                    &entity_type,
+                    &action,
+                    body_json,
+                    &agent_ctx,
+                ) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return odata_error(
+                            StatusCode::BAD_REQUEST,
+                            "AuthenticatedParameter",
+                            &error.to_string(),
+                        )
+                        .into_response();
+                    }
+                };
                 let namespace = format!("{tenant}/{key_str}");
                 let handle =
                     temper_actor_runtime::ActorHandle::new(namespace.clone(), entity_type.clone());

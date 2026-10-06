@@ -438,3 +438,26 @@ fn webhooks_name_the_entity_id_source() {
         "query.",
     );
 }
+
+#[test]
+fn authenticated_parameter_source_is_preserved_by_the_strict_reader() {
+    let source = r#"
+[automaton]
+name="Owned"
+states=["Requested","Active"]
+initial="Requested"
+strict_action_params=true
+[[state]]
+name="owner"
+type="string"
+initial=""
+[[action]]
+name="Create"
+from=["Requested"]
+to="Active"
+params=[{name="owner",type="string",source="authenticated_subject"}]
+"#;
+    let auto = super::parse_automaton(source).expect("trusted parameter source must parse");
+    let json = serde_json::to_value(&auto.actions[0].params[0]).unwrap();
+    assert_eq!(json["source"], "authenticated_subject");
+}

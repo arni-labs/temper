@@ -2,7 +2,7 @@
 # verify-specs.sh -- Claude Code PostToolUse hook for spec verification.
 #
 # Reads the PostToolUse JSON payload from stdin, extracts the file path,
-# and runs `temper verify` if the file is a spec file (*.ioa.toml,
+# and checks repository source behavior if the file is a spec file (*.ioa.toml,
 # *.csdl.xml, or *.cedar).
 #
 # Exit codes:
@@ -13,7 +13,7 @@
 #   Input: {"tool_name":"Write","tool_input":{"file_path":"/path/to/order.ioa.toml",...}}
 #   -> extracts /path/to/order.ioa.toml
 #   -> determines parent directory as specs dir
-#   -> runs: cargo run -p temper-cli -- verify --specs-dir /path/to
+#   -> runs: scripts/verify-source-collection.sh /path/to
 #   -> exit 0 on pass, exit 2 on fail
 #
 #   Input: {"tool_name":"Edit","tool_input":{"file_path":"/path/to/main.rs",...}}
@@ -88,7 +88,7 @@ fi
 echo "Verifying specs in $SPECS_DIR ..." >&2
 
 # Run the verification cascade.
-if OUTPUT="$(cd "$WORKSPACE_ROOT" && cargo run -p temper-cli -- verify --specs-dir "$SPECS_DIR" 2>&1)"; then
+if OUTPUT="$(cd "$WORKSPACE_ROOT" && "$WORKSPACE_ROOT/scripts/verify-source-collection.sh" "$SPECS_DIR" 2>&1)"; then
     echo "$OUTPUT" >&2
     echo "Spec verification passed." >&2
     exit 0

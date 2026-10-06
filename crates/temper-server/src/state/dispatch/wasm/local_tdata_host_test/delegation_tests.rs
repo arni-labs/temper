@@ -7,6 +7,7 @@ async fn boundary_paths_delegate_to_production_host() {
         test_state(),
         temper_runtime::tenant::TenantId::default(),
         Some(&SecurityContext::system()),
+        "test-module",
         Arc::new(CountingHost {
             calls: calls.clone(),
             stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -45,6 +46,7 @@ async fn local_tdata_without_invocation_authority_delegates() {
         test_state(),
         TenantId::default(),
         None,
+        "test-module",
         Arc::new(CountingHost {
             calls: calls.clone(),
             stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -68,6 +70,7 @@ async fn outbound_streaming_delegates_to_production_host() {
         test_state(),
         temper_runtime::tenant::TenantId::default(),
         Some(&SecurityContext::system()),
+        "test-module",
         Arc::new(CountingHost {
             calls: Arc::new(AtomicUsize::new(0)),
             stream_calls: stream_calls.clone(),

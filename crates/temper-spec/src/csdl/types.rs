@@ -12,6 +12,9 @@ pub struct CsdlDocument {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
     pub namespace: String,
+    /// Optional short name used to qualify references to this schema's types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub entity_types: Vec<EntityType>,
     pub enum_types: Vec<EnumType>,
     pub actions: Vec<Action>,

@@ -7076,6 +7076,7 @@ dependencies = [
  "dotenvy",
  "indicatif",
  "open",
+ "quick-xml",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "serde",
@@ -7187,6 +7188,7 @@ name = "temper-observe"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "log",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -7353,6 +7355,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "p256",
+ "percent-encoding",
  "pprof",
  "reqwest 0.12.28",
  "serde",

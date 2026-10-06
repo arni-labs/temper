@@ -26,3 +26,5 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The export tests ask the `log` bridge whether logging is enabled.
+log = "0.4"
