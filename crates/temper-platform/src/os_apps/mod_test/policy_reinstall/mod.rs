@@ -37,7 +37,9 @@ impl Fixture {
         let id = uuid::Uuid::new_v4();
         let db_url = format!("file:/tmp/temper-policy-reinstall-{label}-{id}.db");
         let apps_root = std::env::temp_dir().join(format!("temper-policy-reinstall-{label}-{id}"));
-        let turso = TursoEventStore::new(&db_url, None).await.unwrap();
+        let turso = TursoEventStore::new(&db_url, None)
+            .await
+            .expect("open test Turso store");
         let mut stack = temper_server::StorageStack::from_turso(turso);
         stack.policies = stack.policies.map(wrap);
         let mut state = PlatformState::new(None);
@@ -55,19 +57,19 @@ impl Fixture {
         let app_dir = self.apps_root.join(app);
         let policy_dir = app_dir.join("policies");
         let _ = fs::remove_dir_all(&policy_dir);
-        fs::create_dir_all(&policy_dir).unwrap();
+        fs::create_dir_all(&policy_dir).expect("create policy dir");
         fs::write(
             app_dir.join("app.toml"),
             format!("name = \"{app}\"\ndescription = \"Policy reinstall test app\"\nversion = \"0.1.0\"\n"),
         )
-        .unwrap();
+        .expect("write app.toml");
         fs::write(
             app_dir.join("APP.md"),
             format!("# {app}\n\nPolicy reinstall test app.\n"),
         )
-        .unwrap();
+        .expect("write APP.md");
         for (file, text) in policies {
-            fs::write(policy_dir.join(file), text).unwrap();
+            fs::write(policy_dir.join(file), text).expect("write policy file");
         }
     }
 
@@ -118,11 +120,15 @@ impl Fixture {
     }
 
     async fn legacy_text(&self) -> String {
-        let store = self.state.server.platform_turso_store().unwrap();
+        let store = self
+            .state
+            .server
+            .platform_turso_store()
+            .expect("platform Turso store");
         store
             .load_tenant_policies()
             .await
-            .unwrap()
+            .expect("load tenant policies")
             .into_iter()
             .find(|(tenant, _)| tenant == &self.tenant)
             .map(|(_, text)| text)
@@ -147,13 +153,15 @@ impl Fixture {
             .server
             .tenant_policies
             .write()
-            .unwrap()
+            .expect("tenant policy lock poisoned")
             .insert(self.tenant.clone(), live_text.to_string());
     }
 
     /// A fresh process on the same database, booted the way TemperPaw boots.
     async fn restart(&self) -> PlatformState {
-        let store = TursoEventStore::new(&self.db_url, None).await.unwrap();
+        let store = TursoEventStore::new(&self.db_url, None)
+            .await
+            .expect("reopen test Turso store");
         let state = PlatformState::new(None);
         crate::recovery::recover_cedar_policies(&state, &store).await;
         state
@@ -227,7 +235,10 @@ async fn approvals_and_primary_survive_reinstall_and_restart() {
         );
     }
     let rows = fx.rows().await;
-    let primary = rows.iter().find(|row| row.policy_id == "primary").unwrap();
+    let primary = rows
+        .iter()
+        .find(|row| row.policy_id == "primary")
+        .expect("primary policy row");
     assert!(!primary.cedar_text.contains(FORBID_WITHDRAW));
     assert!(primary.cedar_text.contains(HAND_ADDED_POKE));
     assert!(primary.cedar_text.contains(APPROVED_PING));
