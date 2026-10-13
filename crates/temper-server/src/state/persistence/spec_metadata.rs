@@ -45,17 +45,20 @@ impl ServerState {
         }
     }
 
-    /// Commit spec sources whose install passed verification, so restart
-    /// recovery restores them. Upserts leave a changed row uncommitted, and
-    /// startup deletes uncommitted rows, so a failed or interrupted install
-    /// never comes back half-installed.
+    /// Commit an install whose specs all passed verification: exactly these
+    /// sources with this CSDL, plus the removal of `removed` types (a
+    /// replace-mode load dropped them), in one transaction. Returns whether
+    /// the install is now committed (false: another install replaced a row
+    /// first), or `None` when no durable backend is configured.
     pub async fn commit_spec_sources(
         &self,
         tenant: &str,
         ioa_sources: &BTreeMap<String, String>,
-    ) -> Result<usize, String> {
+        csdl_xml: &str,
+        removed: &[String],
+    ) -> Result<Option<bool>, String> {
         let Some(backend) = self.tenant_metadata_backend(tenant).await else {
-            return Ok(0);
+            return Ok(None);
         };
         let hashes: Vec<(&str, String)> = ioa_sources
             .iter()
@@ -66,19 +69,22 @@ impl ServerState {
                 )
             })
             .collect();
-        let versions: Vec<(&str, &str)> = hashes
+        let versions: Vec<(&str, &str, &str)> = hashes
             .iter()
-            .map(|(entity_type, hash)| (*entity_type, hash.as_str()))
+            .map(|(entity_type, hash)| (*entity_type, hash.as_str(), csdl_xml))
             .collect();
+        let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
 
         match backend {
             TenantMetadataBackend::Postgres(store) => store
-                .commit_spec_versions(tenant, &versions)
+                .commit_spec_versions(tenant, &versions, &removed)
                 .await
+                .map(Some)
                 .map_err(|e| format!("failed to commit specs for {tenant} in postgres: {e}")),
             TenantMetadataBackend::Turso(turso) => turso
-                .commit_spec_versions(tenant, &versions)
+                .commit_spec_versions(tenant, &versions, &removed)
                 .await
+                .map(Some)
                 .map_err(|e| format!("failed to commit specs for {tenant} in turso: {e}")),
             TenantMetadataBackend::Redis => Err(Self::redis_ephemeral_error("Spec commit")),
         }

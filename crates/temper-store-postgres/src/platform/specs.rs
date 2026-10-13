@@ -2,8 +2,9 @@
 //!
 //! A changed spec is written uncommitted and committed once its install
 //! verifies. While a committed version is being replaced it is kept in
-//! `spec_committed_versions`, so startup recovery puts it back instead of
-//! losing the type when the replacement never commits.
+//! `spec_committed_versions`, and restore loads that committed version: a
+//! failed, interrupted or still-running install never costs a type its
+//! working version.
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
 
@@ -109,53 +110,78 @@ impl PostgresEventStore {
         transaction.commit().await.map_err(storage_error)
     }
 
-    /// Commit exactly these spec versions, `(entity_type, content_hash)`, in
-    /// one transaction, and return how many rows became committed.
+    /// Commit one install in one transaction: exactly these spec versions,
+    /// `(entity_type, content_hash, csdl_xml)`, and the deletion of `removed`
+    /// types (a replace-mode load that dropped them).
     ///
-    /// A row whose content changed after it was verified stays as it is, so
-    /// another install of the same type is committed only by its own success.
+    /// Returns true when every version is committed afterwards. When a row no
+    /// longer holds its version (another install replaced it), the transaction
+    /// rolls back and returns false, so an install commits whole or not at all.
     pub async fn commit_spec_versions(
         &self,
         tenant: &str,
-        versions: &[(&str, &str)],
-    ) -> Result<usize, PersistenceError> {
-        if versions.is_empty() {
-            return Ok(0);
+        versions: &[(&str, &str, &str)],
+        removed: &[&str],
+    ) -> Result<bool, PersistenceError> {
+        if versions.is_empty() && removed.is_empty() {
+            return Ok(true);
         }
         let mut transaction = self.pool().begin().await.map_err(storage_error)?;
-        let mut committed = 0usize;
-        for (entity_type, content_hash) in versions {
-            let result = crate::dbm::postgres_query!(
+        for (entity_type, content_hash, csdl_xml) in versions {
+            let committed: bool = crate::dbm::postgres_query_scalar!(
                 &self.schema,
-                "UPDATE {schema}specs SET committed = true, updated_at = now() \
-                 WHERE tenant = $1 AND entity_type = $2 AND content_hash = $3 AND committed = false",
+                "WITH promoted AS ( \
+                     UPDATE {schema}specs SET committed = true, updated_at = now() \
+                     WHERE tenant = $1 AND entity_type = $2 AND content_hash = $3 \
+                       AND csdl_xml IS NOT DISTINCT FROM $4 AND committed = false \
+                     RETURNING 1) \
+                 SELECT EXISTS (SELECT 1 FROM promoted) OR EXISTS ( \
+                     SELECT 1 FROM {schema}specs WHERE tenant = $1 AND entity_type = $2 \
+                       AND content_hash = $3 AND csdl_xml IS NOT DISTINCT FROM $4 AND committed = true)",
             )
             .bind(tenant)
             .bind(*entity_type)
             .bind(*content_hash)
+            .bind(*csdl_xml)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if !committed {
+                transaction.rollback().await.map_err(storage_error)?;
+                return Ok(false);
+            }
+            crate::dbm::postgres_query!(
+                &self.schema,
+                "DELETE FROM {schema}spec_committed_versions WHERE tenant = $1 AND entity_type = $2",
+            )
+            .bind(tenant)
+            .bind(*entity_type)
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-            if result.rows_affected() > 0 {
-                crate::dbm::postgres_query!(
-                    &self.schema,
-                    "DELETE FROM {schema}spec_committed_versions WHERE tenant = $1 AND entity_type = $2",
-                )
-                .bind(tenant)
-                .bind(*entity_type)
-                .execute(&mut *transaction)
-                .await
-                .map_err(storage_error)?;
+        }
+        for entity_type in removed {
+            for sql in [
+                "DELETE FROM {schema}specs WHERE tenant = $1 AND entity_type = $2",
+                "DELETE FROM {schema}spec_committed_versions WHERE tenant = $1 AND entity_type = $2",
+            ] {
+                crate::dbm::postgres_query!(&self.schema, sql)
+                    .bind(tenant)
+                    .bind(*entity_type)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
             }
-            committed += result.rows_affected() as usize;
         }
         transaction.commit().await.map_err(storage_error)?;
-        Ok(committed)
+        Ok(true)
     }
 
-    /// Discard every uncommitted spec version (startup recovery), and return
-    /// how many were discarded. A type that had a committed version gets it
-    /// back; a type that never committed is removed.
+    /// Discard abandoned installs (startup recovery) and return how many
+    /// uncommitted versions were discarded. An uncommitted row older than an
+    /// hour returns to its saved committed version, or is removed when its
+    /// type never committed. Younger rows may be another replica's install in
+    /// flight and are left alone; restore already loads the committed version.
     pub async fn delete_uncommitted_specs(&self) -> Result<usize, PersistenceError> {
         let mut transaction = self.pool().begin().await.map_err(storage_error)?;
         let restored = crate::dbm::postgres_query!(&self.schema,
@@ -165,22 +191,27 @@ impl PostgresEventStore {
                  levels_passed = b.levels_passed, levels_total = b.levels_total, \
                  verification_result = b.verification_result, updated_at = b.updated_at, committed = true \
              FROM {schema}spec_committed_versions AS b \
-             WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type AND s.committed = false",
+             WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type \
+               AND s.committed = false AND s.updated_at < now() - interval '1 hour'",
         )
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
         let deleted = crate::dbm::postgres_query!(
             &self.schema,
-            "DELETE FROM {schema}specs WHERE committed = false"
+            "DELETE FROM {schema}specs WHERE committed = false AND updated_at < now() - interval '1 hour'"
         )
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        crate::dbm::postgres_query!(&self.schema, "DELETE FROM {schema}spec_committed_versions")
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
+        crate::dbm::postgres_query!(&self.schema,
+            "DELETE FROM {schema}spec_committed_versions AS b WHERE NOT EXISTS ( \
+                 SELECT 1 FROM {schema}specs AS s \
+                 WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type AND s.committed = false)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
         Ok((restored.rows_affected() + deleted.rows_affected()) as usize)
     }

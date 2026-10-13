@@ -237,7 +237,7 @@ pub async fn restore_registry_from_postgres_store(
     registry: &mut SpecRegistry,
     store: &temper_store_postgres::PostgresEventStore,
 ) -> Result<usize, String> {
-    // Same rule as Turso: a spec is restored only once its install committed.
+    // Same rule as Turso: restore loads each type's committed version.
     match store.delete_uncommitted_specs().await {
         Ok(0) => {}
         Ok(n) => tracing::info!(
@@ -248,8 +248,13 @@ pub async fn restore_registry_from_postgres_store(
     let rows: Vec<PersistedSpecRow> = sqlx::query_as(&store.schema().qualify_sql(
         "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
                 levels_passed, levels_total, verification_result, updated_at \
-         FROM {schema}specs \
-         WHERE committed = true \
+         FROM {schema}specs WHERE committed = true \
+         UNION ALL \
+         SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
+                levels_passed, levels_total, verification_result, updated_at \
+         FROM {schema}spec_committed_versions AS b WHERE NOT EXISTS ( \
+             SELECT 1 FROM {schema}specs AS s \
+             WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type AND s.committed = true) \
          ORDER BY tenant, entity_type",
     ))
     .fetch_all(store.pool())
@@ -517,6 +522,7 @@ async fn persist_converted_specs(
             BTreeMap::new()
         });
     let mut carry_verification = Vec::new();
+    let mut written: Vec<(&str, String, &str)> = Vec::new();
     for (row, source) in converted {
         let hash = temper_store_turso::spec_content_hash(source);
         let csdl_xml = row.csdl_xml.as_deref().unwrap_or_default();
@@ -527,6 +533,7 @@ async fn persist_converted_specs(
             tracing::warn!(tenant, entity_type = %row.entity_type, %error, "failed to store converted spec");
             continue;
         }
+        written.push((row.entity_type.as_str(), hash, csdl_xml));
         if verified_before
             .get(&row.entity_type)
             .is_some_and(|(cached_hash, verified)| *verified && *cached_hash == row.content_hash)
@@ -552,10 +559,16 @@ async fn persist_converted_specs(
             tracing::warn!(tenant, entity_type, %error, "failed to carry verification to converted spec");
         }
     }
-    // upsert_spec marks a changed row uncommitted, and uncommitted rows are
-    // deleted at the next startup.
-    if let Err(error) = store.commit_specs(tenant).await {
-        tracing::warn!(tenant, %error, "failed to commit converted specs");
+    // upsert_spec marks a changed row uncommitted; commit exactly the
+    // converted rows, or restore keeps loading the stored version.
+    let versions: Vec<(&str, &str, &str)> = written
+        .iter()
+        .map(|(entity_type, hash, csdl_xml)| (*entity_type, hash.as_str(), *csdl_xml))
+        .collect();
+    match store.commit_spec_versions(tenant, &versions, &[]).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(tenant, "converted specs changed before commit"),
+        Err(error) => tracing::warn!(tenant, %error, "failed to commit converted specs"),
     }
 }
 

@@ -130,7 +130,21 @@ pub trait PlatformStore: Send + Sync {
 
     /// Mark all uncommitted specs for a tenant as committed.
     async fn commit_specs(&self, tenant: &str) -> Result<(), String>;
-    /// Delete all uncommitted specs across all tenants.
+
+    /// Commit one install: exactly these `(entity_type, content_hash,
+    /// csdl_xml)` versions, and delete the `removed` types, in one
+    /// transaction. Returns false (and changes nothing) when a row no longer
+    /// holds its version.
+    async fn commit_spec_versions(
+        &self,
+        tenant: &str,
+        versions: &[(&str, &str, &str)],
+        removed: &[&str],
+    ) -> Result<bool, String>;
+
+    /// Discard abandoned uncommitted spec versions (startup recovery). A type
+    /// returns to its last committed version, or is removed if it never
+    /// committed.
     async fn delete_uncommitted_specs(&self) -> Result<usize, String>;
 
     /// Load verification cache: (entity_type -> (content_hash, verified)) for a tenant.
@@ -285,6 +299,17 @@ impl PlatformStore for TursoEventStore {
 
     async fn commit_specs(&self, tenant: &str) -> Result<(), String> {
         self.commit_specs(tenant).await.map_err(|e| e.to_string())
+    }
+
+    async fn commit_spec_versions(
+        &self,
+        tenant: &str,
+        versions: &[(&str, &str, &str)],
+        removed: &[&str],
+    ) -> Result<bool, String> {
+        self.commit_spec_versions(tenant, versions, removed)
+            .await
+            .map_err(|e| e.to_string())
     }
     async fn delete_uncommitted_specs(&self) -> Result<usize, String> {
         self.delete_uncommitted_specs()
@@ -551,6 +576,17 @@ impl PlatformStore for PostgresEventStore {
 
     async fn commit_specs(&self, tenant: &str) -> Result<(), String> {
         self.commit_specs(tenant).await.map_err(|e| e.to_string())
+    }
+
+    async fn commit_spec_versions(
+        &self,
+        tenant: &str,
+        versions: &[(&str, &str, &str)],
+        removed: &[&str],
+    ) -> Result<bool, String> {
+        self.commit_spec_versions(tenant, versions, removed)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn delete_uncommitted_specs(&self) -> Result<usize, String> {
@@ -1029,11 +1065,17 @@ mod sim_platform_store {
                 return Err("SimPlatformStore: injected spec read failure".into());
             }
 
+            // An uncommitted row is restored at its saved committed version.
             Ok(inner
                 .specs
-                .values()
-                .filter(|s| s.committed)
-                .cloned()
+                .iter()
+                .filter_map(|(key, row)| {
+                    if row.committed {
+                        Some(row.clone())
+                    } else {
+                        inner.committed_versions.get(key).cloned()
+                    }
+                })
                 .collect())
         }
 
@@ -1060,9 +1102,39 @@ mod sim_platform_store {
             Ok(())
         }
 
+        async fn commit_spec_versions(
+            &self,
+            tenant: &str,
+            versions: &[(&str, &str, &str)],
+            removed: &[&str],
+        ) -> Result<bool, String> {
+            let mut inner = self.inner.lock().expect("SimPlatformStore lock poisoned"); // ci-ok: infallible lock
+            let key = |entity_type: &str| (tenant.to_string(), entity_type.to_string());
+            let all_held = versions.iter().all(|(entity_type, hash, csdl)| {
+                inner.specs.get(&key(entity_type)).is_some_and(|row| {
+                    row.content_hash == *hash && row.csdl_xml.as_deref() == Some(*csdl)
+                })
+            });
+            if !all_held {
+                return Ok(false);
+            }
+            for (entity_type, _, _) in versions {
+                if let Some(row) = inner.specs.get_mut(&key(entity_type)) {
+                    row.committed = true;
+                }
+                inner.committed_versions.remove(&key(entity_type));
+            }
+            for entity_type in removed {
+                inner.specs.remove(&key(entity_type));
+                inner.committed_versions.remove(&key(entity_type));
+            }
+            Ok(true)
+        }
+
         async fn delete_uncommitted_specs(&self) -> Result<usize, String> {
             let mut inner = self.inner.lock().expect("SimPlatformStore lock poisoned"); // ci-ok: infallible lock
-            // An uncommitted row returns to its last committed version, if any.
+            // One process and no clock: every uncommitted row is abandoned. It
+            // returns to its last committed version, if any.
             let saved = std::mem::take(&mut inner.committed_versions);
             let mut discarded = 0;
             for (key, version) in saved {

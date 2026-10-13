@@ -60,3 +60,64 @@ fn background_verification_skips_cached_verified_hashes() {
     assert_eq!(pending.len(), 1);
     assert!(pending.contains_key("Task"));
 }
+
+#[tokio::test]
+async fn app_specs_are_committed_once_background_verification_passes() {
+    use temper_platform::state::PlatformState;
+    use temper_server::storage::StorageStack;
+    use temper_store_turso::TursoEventStore;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let specs = dir.path().join("specs");
+    std::fs::create_dir_all(&specs).expect("specs dir"); // determinism-ok: test fixture
+    std::fs::write(
+        specs.join("model.csdl.xml"),
+        include_str!("../../../../test-fixtures/specs/model.csdl.xml"),
+    )
+    .expect("write csdl"); // determinism-ok: test fixture
+    std::fs::write(
+        specs.join("order.ioa.toml"),
+        include_str!("../../../../test-fixtures/specs/order.ioa.toml"),
+    )
+    .expect("write ioa"); // determinism-ok: test fixture
+    let specs_dir = specs.to_str().expect("utf-8 path");
+
+    // What `temper serve --app app=DIR` does at boot: register, persist, verify.
+    let store = TursoEventStore::new(
+        &format!("file:{}", dir.path().join("temper.db").display()),
+        None,
+    )
+    .await
+    .expect("turso store");
+    let mut state = PlatformState::new(None);
+    let loaded = {
+        let mut registry = state.registry.write().unwrap();
+        super::loader::load_into_registry(&mut registry, specs_dir, "app").expect("load app")
+    };
+    super::storage::upsert_loaded_specs_to_turso(&store, "app", &loaded)
+        .await
+        .expect("persist app specs");
+    state
+        .server
+        .set_storage_stack(StorageStack::from_turso(store.clone()));
+
+    super::spawn_background_verification(&state, specs_dir, "app")
+        .await
+        .expect("verification spawned")
+        .await
+        .expect("commit task");
+
+    let restorable: Vec<String> = store
+        .load_specs()
+        .await
+        .expect("load specs")
+        .into_iter()
+        .filter(|row| row.tenant == "app")
+        .map(|row| row.entity_type)
+        .collect();
+    assert_eq!(
+        restorable,
+        vec!["Order".to_string()],
+        "a verified --app install must be committed so it comes back without --app"
+    );
+}

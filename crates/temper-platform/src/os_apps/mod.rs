@@ -1284,11 +1284,26 @@ pub(super) async fn install_os_app_with_plan(
         ps.record_installed_app(tenant, app_name)
             .await
             .map_err(|e| format!("Failed to record os-app installation: {e}"))?;
-        if plan.specs {
-            // Commit only when this path used individual spec writes.
-            ps.commit_specs(tenant)
+        if plan.specs
+            && let Some(ref merged) = merged_csdl
+        {
+            // Commit exactly this app's rows, not another install's.
+            let hashes: Vec<(&str, String)> = bundle
+                .specs
+                .iter()
+                .map(|(et, ioa)| (et.as_str(), temper_store_turso::spec_content_hash(ioa)))
+                .collect();
+            let versions: Vec<(&str, &str, &str)> = hashes
+                .iter()
+                .map(|(et, hash)| (*et, hash.as_str(), merged.as_str()))
+                .collect();
+            if !ps
+                .commit_spec_versions(tenant, &versions, &[])
                 .await
-                .map_err(|e| format!("Failed to commit specs: {e}"))?;
+                .map_err(|e| format!("Failed to commit specs: {e}"))?
+            {
+                return Err("Failed to commit specs: another install replaced them".to_string());
+            }
         }
     }
 

@@ -1,9 +1,13 @@
+//! Installed specs across restarts.
+//!
 //! A failed reinstall never costs a type its last working version.
 //!
 //! Install v1 of a type (verified, committed), create a record, then install a
 //! v2 that fails verification. After a restart, v1's spec and record answer;
-//! the failed v2 is discarded. Run against Turso always, and against
-//! PostgreSQL when `TEMPER_TEST_POSTGRES_URL` names a disposable database.
+//! the failed v2 is discarded, and a type that never committed stays out. Run
+//! against Turso always, and against PostgreSQL when `TEMPER_TEST_POSTGRES_URL`
+//! names a disposable database. A replace-mode load-dir that drops a type
+//! removes it durably.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use temper_runtime::{ActorSystem, tenant::TenantId};
@@ -46,6 +50,9 @@ to = "Done"
 name = "DoneHasItems"
 assert = "status in ['Done'] => items > 0"
 "#;
+
+const GHOST_IOA: &str =
+    "[automaton]\nname = \"Ghost\"\nstates = [\"Draft\"]\ninitial = \"Draft\"\n";
 
 /// Test-only blanket permit: this file checks persistence, not authorization.
 const PERMIT_ALL: &str = "permit(principal, action, resource);";
@@ -123,6 +130,12 @@ async fn install_v1_then_failing_v2(state: &ServerState) {
     assert_eq!(status, StatusCode::CREATED, "{text}");
     let v2 = install_order(state, ORDER_V2_FAILING).await;
     assert_eq!(v2["all_passed"], false, "{v2}");
+    assert_eq!(v2["committed"], false, "{v2}");
+    // A type whose install never committed (here: written, never verified).
+    state
+        .upsert_spec_source("default", "Ghost", GHOST_IOA, CSDL_XML)
+        .await
+        .unwrap();
 }
 
 /// Run 2 (after restart): v1 is the registered spec and its record answers.
@@ -150,6 +163,15 @@ async fn assert_v1_answers(state: &ServerState) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        state
+            .registry
+            .read()
+            .unwrap()
+            .get_spec(&TenantId::default(), "Ghost")
+            .is_none(),
+        "a type that never committed must not be restored"
+    );
 }
 
 #[tokio::test]
@@ -214,4 +236,69 @@ async fn failed_reinstall_keeps_last_committed_version_on_postgres() {
     .await
     .unwrap();
     pool.close().await;
+}
+
+/// Write a specs directory with the fixture CSDL and the given IOA files.
+fn specs_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("model.csdl.xml"), CSDL_XML).unwrap(); // determinism-ok: test fixture
+    for (name, source) in files {
+        std::fs::write(dir.path().join(name), source).unwrap(); // determinism-ok: test fixture
+    }
+    dir
+}
+
+/// Load-dir in replace mode (the default) and return the summary line.
+async fn load_dir(state: &ServerState, dir: &std::path::Path) -> serde_json::Value {
+    let body = serde_json::json!({ "tenant": "default", "specs_dir": dir.to_str().unwrap() });
+    let (status, text) = send(
+        state,
+        Request::post("/api/specs/load-dir")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["type"] == "summary")
+        .expect("load-dir stream ends with a summary")
+}
+
+#[tokio::test]
+async fn replace_mode_load_dir_removes_dropped_types_durably() {
+    const DIRECTORY_IOA: &str = include_str!("../../../test-fixtures/specs/directory.ioa.toml");
+    let db = tempfile::tempdir().unwrap();
+    let db_url = format!("file:{}", db.path().join("temper.db").display());
+    let both = specs_dir(&[
+        ("order.ioa.toml", ORDER_V1),
+        ("directory.ioa.toml", DIRECTORY_IOA),
+    ]);
+    let order_only = specs_dir(&[("order.ioa.toml", ORDER_V1)]);
+
+    let store = TursoEventStore::new(&db_url, None).await.unwrap();
+    let state = server(
+        StorageStack::from_turso(store),
+        SpecRegistry::new(),
+        "run-1",
+    );
+    let first = load_dir(&state, both.path()).await;
+    assert_eq!(first["committed"], true, "{first}");
+    let second = load_dir(&state, order_only.path()).await;
+    assert_eq!(second["committed"], true, "{second}");
+    drop(state);
+
+    let store = TursoEventStore::new(&db_url, None).await.unwrap();
+    let mut registry = SpecRegistry::new();
+    restore_registry_from_turso(&mut registry, &store)
+        .await
+        .unwrap();
+    let mut restored: Vec<&str> = registry.entity_types(&TenantId::default());
+    restored.sort_unstable();
+    assert_eq!(
+        restored,
+        vec!["Order"],
+        "a type a replace-mode load dropped must stay dropped after restart"
+    );
 }

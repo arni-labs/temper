@@ -59,6 +59,10 @@ async fn test_load_dir_registers_specs() {
     let summary = lines.last().unwrap();
     assert_eq!(summary["type"], "summary");
     assert_eq!(summary["tenant"], "test-tenant");
+    assert_eq!(
+        summary["committed"], false,
+        "no durable store, so nothing was committed: {summary}"
+    );
 
     // Verify specs are in the registry
     let registry = state.registry.read().unwrap();

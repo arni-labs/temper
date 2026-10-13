@@ -606,13 +606,26 @@ fn emit_ephemeral_info(message: &str) {
 ///
 /// For each entity, runs the verification cascade in a blocking task and
 /// updates the registry while persisting workflow history/status to Postgres.
-async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, tenant: &str) {
+/// The returned task commits the app's specs once every verification passes.
+async fn spawn_background_verification(
+    state: &PlatformState,
+    specs_dir: &str,
+    tenant: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
     let specs_path = Path::new(specs_dir);
     let mut ioa_sources = match read_ioa_sources(specs_path) {
         Ok(sources) => sources,
         Err(e) => {
             eprintln!("Warning: failed to read IOA sources for background verification: {e}");
-            return;
+            return None;
+        }
+    };
+    // The CSDL the app's rows were stored with, committed with them.
+    let csdl_xml = match std::fs::read_to_string(specs_path.join("model.csdl.xml")) {
+        Ok(csdl_xml) => csdl_xml,
+        Err(e) => {
+            eprintln!("Warning: failed to read the CSDL for background verification: {e}");
+            return None;
         }
     };
 
@@ -918,19 +931,23 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
         }));
     }
 
-    // Without a commit, restart recovery drops the app's changed specs.
-    tokio::spawn(async move {
+    // Without a commit, restart recovery keeps the app's last committed specs.
+    Some(tokio::spawn(async move {
         for verification in verifications {
             if !verification.await.unwrap_or(false) {
                 return;
             }
         }
-        if let Err(e) = server.commit_spec_sources(&tenant_str, &app_sources).await
-            && !is_ephemeral_metadata_error(&e)
+        match server
+            .commit_spec_sources(&tenant_str, &app_sources, &csdl_xml, &[])
+            .await
         {
-            eprintln!("Warning: failed to commit verified specs for {tenant_str}: {e}");
+            Ok(Some(true) | None) => {}
+            Ok(Some(false)) => eprintln!("Warning: specs for {tenant_str} changed before commit"),
+            Err(e) if is_ephemeral_metadata_error(&e) => {}
+            Err(e) => eprintln!("Warning: failed to commit verified specs for {tenant_str}: {e}"),
         }
-    });
+    }))
 }
 
 fn ioa_sources_requiring_background_verification(

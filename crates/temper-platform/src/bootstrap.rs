@@ -443,7 +443,7 @@ pub(crate) async fn persist_bootstrap_verification(
     verified_cache: &BTreeMap<String, (String, bool)>,
 ) {
     let hashes_to_persist = hashes_requiring_persistence(hashes, verified_cache);
-    let mut wrote_specs = false;
+    let mut written: Vec<(&str, &str, &str)> = Vec::new();
 
     for (entity_type, content_hash) in &hashes_to_persist {
         // Find the IOA source for this entity type.
@@ -461,7 +461,7 @@ pub(crate) async fn persist_bootstrap_verification(
             tracing::warn!("Failed to persist bootstrap spec {tenant}/{entity_type}: {e}");
             continue;
         }
-        wrote_specs = true;
+        written.push((entity_type.as_str(), content_hash.as_str(), csdl_source));
 
         // Mark as verified (bootstrap panics on failure, so all specs here passed).
         if let Err(e) = store
@@ -483,10 +483,12 @@ pub(crate) async fn persist_bootstrap_verification(
     }
 
     // `upsert_spec` marks rows as uncommitted while content is rewritten. Once
-    // bootstrap verification succeeds, promote the tenant's spec set back to a
-    // durable committed state so restart recovery can actually see the rows.
-    if wrote_specs && let Err(e) = store.commit_specs(tenant).await {
-        tracing::warn!("Failed to commit bootstrap specs for tenant '{tenant}': {e}");
+    // bootstrap verification succeeds, commit exactly the rows written here, so
+    // another install still verifying in this tenant is not committed with them.
+    match store.commit_spec_versions(tenant, &written, &[]).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!("Bootstrap specs for tenant '{tenant}' changed before commit"),
+        Err(e) => tracing::warn!("Failed to commit bootstrap specs for tenant '{tenant}': {e}"),
     }
 }
 

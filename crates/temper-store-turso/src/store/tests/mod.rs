@@ -2027,8 +2027,30 @@ async fn load_verification_cache_ignores_uncommitted_specs() {
     );
 }
 
+/// `(entity_type, content_hash, committed)` of a tenant's restorable specs.
+async fn restorable(store: &TursoEventStore, tenant: &str) -> Vec<(String, String, bool)> {
+    store
+        .load_specs()
+        .await
+        .expect("load specs")
+        .into_iter()
+        .filter(|row| row.tenant == tenant)
+        .map(|row| {
+            (
+                row.entity_type,
+                row.content_hash.unwrap_or_default(),
+                row.committed,
+            )
+        })
+        .collect()
+}
+
+fn spec(entity_type: &str, hash: &str) -> (String, String, bool) {
+    (entity_type.to_string(), hash.to_string(), true)
+}
+
 #[tokio::test]
-async fn commit_spec_versions_commits_only_the_verified_version() {
+async fn commit_spec_versions_commits_an_install_whole_or_not_at_all() {
     let store = make_store("spec-commit-versions").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
@@ -2039,45 +2061,70 @@ async fn commit_spec_versions_commits_only_the_verified_version() {
             .expect("upsert uncommitted spec");
     }
 
-    // Issue was replaced by v2 after v1 verified; Note is the verified version.
-    let committed = store
-        .commit_spec_versions(
-            &tenant,
-            &[("Issue", "sha256:issue-v0"), ("Note", "sha256:note-v1")],
-        )
-        .await
-        .expect("commit versions");
-    assert_eq!(committed, 1);
+    // Issue's row no longer holds the verified version: nothing commits.
+    let stale = [
+        ("Issue", "sha256:issue-v0", csdl_xml),
+        ("Note", "sha256:note-v1", csdl_xml),
+    ];
+    assert!(
+        !store
+            .commit_spec_versions(&tenant, &stale, &[])
+            .await
+            .unwrap()
+    );
+    // The IOA matches but the CSDL does not: nothing commits.
+    let other_csdl = [("Issue", "sha256:issue-v1", "<Schema Namespace=\"Other\" />")];
+    assert!(
+        !store
+            .commit_spec_versions(&tenant, &other_csdl, &[])
+            .await
+            .unwrap()
+    );
+    assert_eq!(restorable(&store, &tenant).await, vec![]);
 
-    let removed = store
-        .delete_uncommitted_specs()
-        .await
-        .expect("startup recovery");
-    assert_eq!(removed, 1, "only the unverified Issue row is dropped");
-    let restored: Vec<String> = store
-        .load_specs()
-        .await
-        .expect("load specs")
-        .into_iter()
-        .filter(|row| row.tenant == tenant)
-        .map(|row| row.entity_type)
-        .collect();
-    assert_eq!(restored, vec!["Note".to_string()]);
+    let install = [
+        ("Issue", "sha256:issue-v1", csdl_xml),
+        ("Note", "sha256:note-v1", csdl_xml),
+    ];
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &install, &[])
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &install, &[])
+            .await
+            .unwrap(),
+        "an install that is already committed reports committed"
+    );
+    assert_eq!(
+        restorable(&store, &tenant).await,
+        vec![
+            spec("Issue", "sha256:issue-v1"),
+            spec("Note", "sha256:note-v1")
+        ]
+    );
+
+    // A replace-mode install that drops Note removes its row with the commit.
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &[], &["Note"])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        restorable(&store, &tenant).await,
+        vec![spec("Issue", "sha256:issue-v1")]
+    );
 }
 
 #[tokio::test]
-async fn startup_recovery_returns_a_failed_reinstall_to_its_committed_version() {
+async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
     let store = make_store("spec-committed-version-recovery").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
-    let hashes = |rows: Vec<crate::TursoSpecRow>| -> Vec<(String, Option<String>)> {
-        rows.into_iter()
-            .filter(|row| row.tenant == tenant)
-            .map(|row| (row.entity_type, row.content_hash))
-            .collect()
-    };
-
-    // Issue v1 and Note v1 are installed and committed.
     for (entity_type, hash) in [("Issue", "sha256:issue-v1"), ("Note", "sha256:note-v1")] {
         store
             .upsert_spec(&tenant, entity_type, "v1", csdl_xml, hash)
@@ -2086,45 +2133,63 @@ async fn startup_recovery_returns_a_failed_reinstall_to_its_committed_version() 
     }
     store.commit_specs(&tenant).await.expect("commit v1");
 
-    // Issue v2 never commits (failed verification); Note v2 commits; Task
-    // is new and never commits.
+    // Issue v2 is pending (failed, interrupted, or verifying elsewhere); Task
+    // is a new type that has not committed.
     store
         .upsert_spec(&tenant, "Issue", "v2", csdl_xml, "sha256:issue-v2")
         .await
         .expect("upsert Issue v2");
     store
-        .upsert_spec(&tenant, "Note", "v2", csdl_xml, "sha256:note-v2")
-        .await
-        .expect("upsert Note v2");
-    store
-        .commit_spec_versions(&tenant, &[("Note", "sha256:note-v2")])
-        .await
-        .expect("commit Note v2");
-    store
         .upsert_spec(&tenant, "Task", "v1", csdl_xml, "sha256:task-v1")
         .await
         .expect("upsert Task");
+    let committed_view = vec![
+        spec("Issue", "sha256:issue-v1"),
+        spec("Note", "sha256:note-v1"),
+    ];
+    assert_eq!(restorable(&store, &tenant).await, committed_view);
 
-    let discarded = store
-        .delete_uncommitted_specs()
+    // A boot while the installs are young leaves them alone; one may still
+    // commit afterwards.
+    assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 0);
+    assert_eq!(restorable(&store, &tenant).await, committed_view);
+
+    // Once abandoned, recovery returns Issue to v1 and removes Task.
+    let conn = store.connection().expect("connection");
+    conn.execute(
+        "UPDATE specs SET updated_at = '2000-01-01 00:00:00' WHERE tenant = ?1 AND committed = 0",
+        params![tenant.as_str()],
+    )
+    .await
+    .expect("age the pending rows");
+    assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 2);
+    assert_eq!(restorable(&store, &tenant).await, committed_view);
+    assert!(
+        !store
+            .commit_spec_versions(&tenant, &[("Issue", "sha256:issue-v2", csdl_xml)], &[])
+            .await
+            .unwrap(),
+        "an install discarded as abandoned can no longer commit"
+    );
+    assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 0);
+
+    // A later install that verifies replaces v1 for good.
+    store
+        .upsert_spec(&tenant, "Issue", "v3", csdl_xml, "sha256:issue-v3")
         .await
-        .expect("startup recovery");
-    assert_eq!(discarded, 2, "Issue v2 and Task are discarded");
-    assert_eq!(
-        hashes(store.load_specs().await.expect("load specs")),
-        vec![
-            ("Issue".to_string(), Some("sha256:issue-v1".to_string())),
-            ("Note".to_string(), Some("sha256:note-v2".to_string())),
-        ],
-        "a failed reinstall returns to its committed version; a new type that never committed is gone"
+        .expect("upsert Issue v3");
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &[("Issue", "sha256:issue-v3", csdl_xml)], &[])
+            .await
+            .unwrap()
     );
     assert_eq!(
-        store
-            .delete_uncommitted_specs()
-            .await
-            .expect("second recovery"),
-        0,
-        "recovery leaves nothing to redo"
+        restorable(&store, &tenant).await,
+        vec![
+            spec("Issue", "sha256:issue-v3"),
+            spec("Note", "sha256:note-v1")
+        ]
     );
 }
 

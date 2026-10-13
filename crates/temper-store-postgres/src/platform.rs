@@ -1086,7 +1086,14 @@ impl PostgresEventStore {
         let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
                     levels_passed, levels_total, verification_result, content_hash, updated_at, committed \
-             FROM {schema}specs WHERE committed = true ORDER BY tenant, entity_type",
+             FROM {schema}specs WHERE committed = true \
+             UNION ALL \
+             SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
+                    levels_passed, levels_total, verification_result, content_hash, updated_at, true \
+             FROM {schema}spec_committed_versions AS b WHERE NOT EXISTS ( \
+                 SELECT 1 FROM {schema}specs AS s \
+                 WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type AND s.committed = true) \
+             ORDER BY tenant, entity_type",
         )
         .fetch_all(self.pool())
         .await
