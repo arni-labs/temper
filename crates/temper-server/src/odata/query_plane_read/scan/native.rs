@@ -3,8 +3,9 @@ use temper_odata::query::types::OrderDirection;
 use super::super::super::filter_sql;
 use super::super::types::{QueryPlaneCoverageReport, QueryPlaneReadError};
 use super::{
-    CandidateScanResult, NativeCandidatePagePlan, ScanCounters, TelemetryInput, apply_select_only,
-    base_telemetry, budget_rejection, materialize_filter_and_authorize_ids,
+    CandidateScanResult, NativeCandidatePagePlan, RowAuthz, ScanCounters, TelemetryInput,
+    apply_select_only, base_telemetry, budget_rejection, decide_row_authz,
+    materialize_filter_and_authorize_ids,
 };
 use crate::odata::query_plane_read::types::{
     QueryPlaneFallbackReason, QueryPlaneReadRequest, QueryPlaneReadStrategy,
@@ -137,6 +138,89 @@ async fn try_query_native_page(
         })
 }
 
+/// One SQL page when every row is allowed and the filter, if any, is already
+/// in the query. `$count` then comes from the window count instead of a
+/// second pass over every document.
+async fn try_uniform_native_page(
+    request: &QueryPlaneReadRequest<'_>,
+    plan: &NativeCandidatePagePlan,
+    coverage: QueryPlaneCoverageReport,
+    authz: &RowAuthz,
+    requested_top: usize,
+    skip: usize,
+    include_count: bool,
+) -> Option<Result<CandidateScanResult, QueryPlaneReadError>> {
+    if matches!(authz, RowAuthz::DenyAll) {
+        let counters = ScanCounters::empty();
+        let telemetry = base_telemetry(
+            request,
+            TelemetryInput {
+                strategy: QueryPlaneReadStrategy::NativePagePushdown,
+                fallback_reason: QueryPlaneFallbackReason::None,
+                filter_pushdown: plan.filter_pushdown,
+                catalog_materialization: true,
+                coverage,
+                counters,
+                returned_count: 0,
+            },
+        );
+        return Some(Ok(CandidateScanResult {
+            entities: Vec::new(),
+            count: include_count.then_some(0),
+            telemetry,
+        }));
+    }
+    if !matches!(authz, RowAuthz::AllowAll) {
+        return None;
+    }
+    if request.query_options.filter.is_some() && !plan.filter_pushdown {
+        return None;
+    }
+    if requested_top == 0 {
+        return None;
+    }
+
+    let page = match try_query_native_page(request, plan, skip, requested_top, include_count).await
+    {
+        Ok(Some(page)) => page,
+        _ => return None,
+    };
+    if include_count && page.total_count.is_none() {
+        return None;
+    }
+
+    let mut counters = ScanCounters::empty();
+    counters.pushdown_sparse_probe_count = 1;
+    counters.pushdown_page_count = page.entity_ids.len();
+    let authorized =
+        materialize_filter_and_authorize_ids(request, &page.entity_ids, true, authz, &mut counters)
+            .await;
+    if authorized.len() != page.entity_ids.len() {
+        return None;
+    }
+
+    let count = include_count.then_some(page.total_count.unwrap_or(authorized.len()));
+    let entities = apply_select_only(authorized, request.query_options);
+    let returned_count = entities.len();
+    let telemetry = base_telemetry(
+        request,
+        TelemetryInput {
+            strategy: QueryPlaneReadStrategy::NativePagePushdown,
+            fallback_reason: QueryPlaneFallbackReason::None,
+            filter_pushdown: plan.filter_pushdown,
+            catalog_materialization: true,
+            coverage,
+            counters,
+            returned_count,
+        },
+    );
+    Some(Ok(CandidateScanResult {
+        entities,
+        count,
+        telemetry,
+    }))
+}
+
 pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     request: &QueryPlaneReadRequest<'_>,
     plan: NativeCandidatePagePlan,
@@ -164,6 +248,21 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
             count: None,
             telemetry,
         }));
+    }
+
+    let authz = decide_row_authz(request);
+    if let Some(result) = try_uniform_native_page(
+        request,
+        &plan,
+        coverage,
+        &authz,
+        requested_top,
+        skip,
+        include_count,
+    )
+    .await
+    {
+        return Some(result);
     }
 
     let scan_budget = request.budget.scan_candidate_budget();
@@ -202,9 +301,14 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
         }
 
         let page_len = page.entity_ids.len();
-        let authorized =
-            materialize_filter_and_authorize_ids(request, &page.entity_ids, true, &mut counters)
-                .await;
+        let authorized = materialize_filter_and_authorize_ids(
+            request,
+            &page.entity_ids,
+            true,
+            &authz,
+            &mut counters,
+        )
+        .await;
         for entity in authorized {
             let index = authorized_seen;
             authorized_seen += 1;

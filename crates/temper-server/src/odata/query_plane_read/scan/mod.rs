@@ -4,10 +4,15 @@ mod read_source;
 pub(super) use native::{native_candidate_page_plan, try_native_page_read};
 pub(super) use read_source::read_from_source_cursor;
 
+use std::collections::{BTreeSet, HashMap};
+
+use temper_authz::ListReadUniformity;
 use temper_odata::query::types::QueryOptions;
 
-use super::super::authz::{READ_ACTION, authorize_read, entity_id_from_body};
-use super::super::read_support::materialize_entity_set_entities;
+use super::super::authz::{READ_ACTION, entity_id_from_body, resource_attrs_from_body};
+use super::super::read_support::{
+    catalog_select_projection_fields, materialize_entity_set_entities,
+};
 use super::types::{
     QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadBudget, QueryPlaneReadError,
     QueryPlaneReadRequest, QueryPlaneReadStrategy, QueryPlaneReadTelemetry,
@@ -37,6 +42,7 @@ pub(super) struct ScanCounters {
     pub(super) catalog_shadow_check_scheduled: usize,
     pub(super) pushdown_sparse_probe_count: usize,
     pub(super) pushdown_page_count: usize,
+    pub(super) catalog_select_projection: bool,
 }
 
 impl ScanCounters {
@@ -48,7 +54,48 @@ impl ScanCounters {
             catalog_shadow_check_scheduled: 0,
             pushdown_sparse_probe_count: 0,
             pushdown_page_count: 0,
+            catalog_select_projection: false,
         }
+    }
+}
+
+/// How row `read` decisions apply to one list.
+#[derive(Clone, Debug)]
+pub(super) enum RowAuthz {
+    /// One Cedar decision allowed every row of this entity type.
+    AllowAll,
+    /// One Cedar decision denied every row of this entity type.
+    DenyAll,
+    /// At least one policy can tell rows apart.
+    ///
+    /// `attribute_keys` is `Some` when those policies only read the listed
+    /// resource attributes (plus the entity id and `has_spec`).
+    PerRow {
+        attribute_keys: Option<BTreeSet<String>>,
+    },
+}
+
+/// Classify this list once. A uniform policy evaluates Cedar a single time.
+pub(super) fn decide_row_authz(request: &QueryPlaneReadRequest<'_>) -> RowAuthz {
+    match request.state.authz.list_read_uniformity(
+        request.tenant.as_str(),
+        request.security_ctx,
+        READ_ACTION,
+        request.entity_type,
+    ) {
+        ListReadUniformity::Uniform => {
+            let probe = serde_json::json!({
+                "entity_id": "_list",
+                "status": "",
+                "fields": {}
+            });
+            if row_permitted(request, "_list", &probe) {
+                RowAuthz::AllowAll
+            } else {
+                RowAuthz::DenyAll
+            }
+        }
+        ListReadUniformity::PerEntity { attribute_keys } => RowAuthz::PerRow { attribute_keys },
     }
 }
 
@@ -116,7 +163,7 @@ pub(super) fn base_telemetry(
         catalog_shadow_check_scheduled: input.counters.catalog_shadow_check_scheduled,
         coverage: input.coverage,
         select_requested: select_requested(request.query_options),
-        catalog_select_projection: false,
+        catalog_select_projection: input.counters.catalog_select_projection,
         select_count: select_count(request.query_options),
         pushdown_sparse_page: input.strategy == QueryPlaneReadStrategy::NativePagePushdown,
         pushdown_sparse_probe_count: input.counters.pushdown_sparse_probe_count,
@@ -148,19 +195,74 @@ pub(super) fn budget_rejection(
     }
 }
 
-fn is_authorized_entity(request: &QueryPlaneReadRequest<'_>, entity: &serde_json::Value) -> bool {
-    entity_id_from_body(entity).is_some_and(|entity_id| {
-        authorize_read(
-            request.state,
-            request.tenant,
+fn row_permitted(
+    request: &QueryPlaneReadRequest<'_>,
+    entity_id: &str,
+    entity: &serde_json::Value,
+) -> bool {
+    let attrs = resource_attrs_from_body(
+        request.state,
+        request.tenant,
+        request.entity_type,
+        entity_id,
+        entity,
+    );
+    let attrs: HashMap<String, serde_json::Value> = attrs.into_iter().collect(); // determinism-ok: Cedar API requires HashMap
+    request
+        .state
+        .authz
+        .authorize_for_tenant_or_bypass(
+            request.tenant.as_str(),
             request.security_ctx,
             READ_ACTION,
             request.entity_type,
-            entity_id,
-            entity,
+            &attrs,
         )
-        .is_ok()
-    })
+        .is_allowed()
+}
+
+pub(super) fn entity_read_allowed(
+    request: &QueryPlaneReadRequest<'_>,
+    entity: &serde_json::Value,
+) -> bool {
+    entity_id_from_body(entity).is_some_and(|entity_id| row_permitted(request, entity_id, entity))
+}
+
+fn retain_authorized(
+    request: &QueryPlaneReadRequest<'_>,
+    entities: Vec<serde_json::Value>,
+    authz: &RowAuthz,
+) -> Vec<serde_json::Value> {
+    match authz {
+        RowAuthz::AllowAll => entities,
+        RowAuthz::DenyAll => Vec::new(),
+        RowAuthz::PerRow { .. } => entities
+            .into_iter()
+            .filter(|entity| entity_read_allowed(request, entity))
+            .collect(),
+    }
+}
+
+fn projection_fields<'a>(
+    request: &'a QueryPlaneReadRequest<'_>,
+    authz: &RowAuthz,
+) -> Option<&'a [String]> {
+    let select = catalog_select_projection_fields(request.query_options)?;
+    match authz {
+        RowAuthz::AllowAll | RowAuthz::DenyAll => Some(select),
+        RowAuthz::PerRow {
+            attribute_keys: Some(keys),
+        } => keys
+            .iter()
+            .all(|key| {
+                matches!(key.as_str(), "has_spec" | "id" | "Id" | "entity_id")
+                    || select.iter().any(|field| field == key)
+            })
+            .then_some(select),
+        RowAuthz::PerRow {
+            attribute_keys: None,
+        } => None,
+    }
 }
 
 pub(super) fn apply_select_only(
@@ -169,15 +271,38 @@ pub(super) fn apply_select_only(
 ) -> Vec<serde_json::Value> {
     let (entities, _) = apply_query_options(entities, &select_only_query_options(query_options));
     entities
+        .into_iter()
+        .map(|mut entity| {
+            if entity.get("entity_id").is_none()
+                && let Some(entity_id) = entity_id_from_odata_id(&entity)
+                && let Some(object) = entity.as_object_mut()
+            {
+                object.insert("entity_id".to_string(), serde_json::json!(entity_id));
+            }
+            entity
+        })
+        .collect()
+}
+
+fn entity_id_from_odata_id(entity: &serde_json::Value) -> Option<String> {
+    let odata_id = entity.get("@odata.id")?.as_str()?;
+    let (_, rest) = odata_id.split_once('(')?;
+    let inner = rest.strip_suffix(')')?;
+    Some(inner.trim_matches('\'').to_string())
 }
 
 pub(super) async fn materialize_and_authorize_ids(
     request: &QueryPlaneReadRequest<'_>,
     entity_ids: &[String],
     prefer_catalog: bool,
+    authz: &RowAuthz,
     counters: &mut ScanCounters,
 ) -> Vec<serde_json::Value> {
     counters.candidate_count += entity_ids.len();
+    if matches!(authz, RowAuthz::DenyAll) || entity_ids.is_empty() {
+        return Vec::new();
+    }
+    let projection = projection_fields(request, authz);
     let materialized = materialize_entity_set_entities(
         request.state,
         request.tenant,
@@ -185,26 +310,28 @@ pub(super) async fn materialize_and_authorize_ids(
         request.entity_set_name,
         entity_ids,
         prefer_catalog,
-        None,
+        projection,
     )
     .await;
     counters.materialized_count += materialized.entities.len();
     counters.catalog_shadow_check_budget += materialized.catalog_shadow_check_budget;
     counters.catalog_shadow_check_scheduled += materialized.catalog_shadow_check_scheduled;
-    materialized
-        .entities
-        .into_iter()
-        .filter(|entity| is_authorized_entity(request, entity))
-        .collect()
+    counters.catalog_select_projection |= materialized.catalog_select_projection;
+    retain_authorized(request, materialized.entities, authz)
 }
 
 pub(super) async fn materialize_filter_and_authorize_ids(
     request: &QueryPlaneReadRequest<'_>,
     entity_ids: &[String],
     prefer_catalog: bool,
+    authz: &RowAuthz,
     counters: &mut ScanCounters,
 ) -> Vec<serde_json::Value> {
     counters.candidate_count += entity_ids.len();
+    if matches!(authz, RowAuthz::DenyAll) || entity_ids.is_empty() {
+        return Vec::new();
+    }
+    let projection = projection_fields(request, authz);
     let materialized = materialize_entity_set_entities(
         request.state,
         request.tenant,
@@ -212,12 +339,13 @@ pub(super) async fn materialize_filter_and_authorize_ids(
         request.entity_set_name,
         entity_ids,
         prefer_catalog,
-        None,
+        projection,
     )
     .await;
     counters.materialized_count += materialized.entities.len();
     counters.catalog_shadow_check_budget += materialized.catalog_shadow_check_budget;
     counters.catalog_shadow_check_scheduled += materialized.catalog_shadow_check_scheduled;
+    counters.catalog_select_projection |= materialized.catalog_select_projection;
 
     let entities = if request.query_options.filter.is_some() {
         let (entities, _) = apply_query_options(
@@ -229,8 +357,5 @@ pub(super) async fn materialize_filter_and_authorize_ids(
         materialized.entities
     };
 
-    entities
-        .into_iter()
-        .filter(|entity| is_authorized_entity(request, entity))
-        .collect()
+    retain_authorized(request, entities, authz)
 }

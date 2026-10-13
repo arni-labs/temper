@@ -15,7 +15,7 @@ pub use context::{
     AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
     is_cedar_authority_context_key,
 };
-pub use engine::{AuthzDecision, AuthzEngine, VERIFIED_OPERATOR_WHEN};
+pub use engine::{AuthzDecision, AuthzEngine, ListReadUniformity, VERIFIED_OPERATOR_WHEN};
 pub use error::{AuthzDenial, AuthzError};
 pub use metrics::init_metrics;
 pub use policy_gen::{

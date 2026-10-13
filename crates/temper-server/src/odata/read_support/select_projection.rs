@@ -1,6 +1,5 @@
 use crate::storage::EntityCatalogRow;
 
-#[cfg(test)]
 pub(in crate::odata) fn catalog_select_projection_fields(
     query_options: &temper_odata::query::types::QueryOptions,
 ) -> Option<&[String]> {
@@ -54,7 +53,7 @@ fn selected_catalog_property(
     }
 }
 
-pub(super) fn catalog_row_to_selected_entity_body(
+pub(in crate::odata) fn catalog_row_to_selected_entity_body(
     entity_type: &str,
     entity_set_name: &str,
     row: EntityCatalogRow,

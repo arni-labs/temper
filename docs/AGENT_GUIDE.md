@@ -1282,6 +1282,8 @@ temper serve [--port PORT] [--specs-dir DIR] [--tenant NAME]
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DATABASE_URL` | For persistence | Postgres connection string. **Without this, events are lost on restart.** |
+| `TEMPER_PG_MAX_CONNECTIONS` | No | Postgres pool size for `temper serve`. `DATABASE_MAX_CONNECTIONS` is the fallback name. Default 32. |
+| `TEMPER_PG_STATEMENT_TIMEOUT_SECS` | No | Postgres `statement_timeout` in seconds. `DATABASE_STATEMENT_TIMEOUT_SECS` is the fallback name. Default 15. Pool checkout waits at most 5 seconds. |
 | `REDIS_URL` | Not used | Reserved for future distributed deployment. Server does not read this. |
 | `OTLP_ENDPOINT` | For telemetry export | OTLP collector base URL (e.g., `http://localhost:4318`) |
 | `CLICKHOUSE_URL` | For analysis queries | ClickHouse HTTP endpoint (read path for trajectory analysis) |

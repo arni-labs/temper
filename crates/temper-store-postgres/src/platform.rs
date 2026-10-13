@@ -1034,53 +1034,6 @@ impl PostgresEventStore {
             .collect())
     }
 
-    /// Batch-load full entity catalog rows for a list of entity IDs.
-    ///
-    /// Returns only rows that exist in the catalog. IDs without a row in the
-    /// projection are silently omitted from the result, leaving the caller
-    /// free to fall back to the actor path on a per-id basis.
-    pub async fn load_entity_catalog_rows_pg(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_ids: &[String],
-    ) -> Result<Vec<crate::platform::PostgresEntityCatalogRow>, PersistenceError> {
-        if entity_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<(
-            String,
-            String,
-            serde_json::Value,
-            Option<serde_json::Value>,
-            i64,
-        )> = crate::dbm::postgres_query_as!(
-            &self.schema,
-            "SELECT entity_id, status, fields, state, sequence_nr \
-             FROM {schema}entity_catalog \
-             WHERE tenant = $1 AND entity_type = $2 AND entity_id = ANY($3) \
-             ORDER BY entity_id",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(entity_ids)
-        .fetch_all(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(rows
-            .into_iter()
-            .map(|(entity_id, status, fields, state, seq)| {
-                crate::platform::PostgresEntityCatalogRow {
-                    entity_id,
-                    status,
-                    fields,
-                    state,
-                    sequence_nr: seq.max(0) as u64,
-                }
-            })
-            .collect())
-    }
-
     pub async fn upsert_spec(
         &self,
         tenant: &str,
