@@ -29,7 +29,7 @@ use super::read_support::{
     record_entity_set_not_found, resolve_entity_set_name, try_load_entity_body_from_catalog,
 };
 use super::response::annotate_entity;
-use super::stream_fast_path::try_file_stream_fast_path;
+use super::stream_fast_path::{FileValueRequest, try_file_stream_fast_path};
 use crate::blobs::{BlobHydrationBudget, hydrate_blob_refs_for_tenant_with_budget};
 use crate::query_eval::{expand_entity, select_fields};
 use crate::response::{ODataResponse, ODataStreamResponse, ODataXmlResponse, odata_error};
@@ -606,6 +606,7 @@ pub(super) async fn handle_odata_get_for_tenant(
     security_ctx: SecurityContext,
     path: String,
     query_params: std::collections::BTreeMap<String, String>,
+    file_value: FileValueRequest,
 ) -> axum::response::Response {
     let odata_path = match parse_path(&format!("/{path}")) {
         Ok(p) => p,
@@ -731,7 +732,15 @@ pub(super) async fn handle_odata_get_for_tenant(
         }
 
         ODataPath::Value { ref parent } => {
-            handle_stream_get(&state, &tenant, &security_ctx, parent, &hydration_budget).await
+            handle_stream_get(
+                &state,
+                &tenant,
+                &security_ctx,
+                parent,
+                &hydration_budget,
+                &file_value,
+            )
+            .await
         }
 
         _ => odata_error(
@@ -1231,8 +1240,24 @@ pub async fn handle_odata_get(
     };
     let tenant = authenticated.tenant().clone();
     let security_ctx = authenticated.security_context().clone();
-    let response =
-        handle_odata_get_for_tenant(state.clone(), tenant, security_ctx, path, query_params).await;
+    let file_value = FileValueRequest {
+        if_none_match: _headers
+            .get(axum::http::header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        redirect: query_params
+            .get("redirect")
+            .is_some_and(|value| value == "1"),
+    };
+    let response = handle_odata_get_for_tenant(
+        state.clone(),
+        tenant,
+        security_ctx,
+        path,
+        query_params,
+        file_value,
+    )
+    .await;
     crate::authz::resolve_requested_denial(&state, &authenticated, response).await
 }
 
@@ -1306,6 +1331,7 @@ async fn handle_stream_get(
     security_ctx: &SecurityContext,
     parent: &ODataPath,
     hydration_budget: &BlobHydrationBudget,
+    file_value: &FileValueRequest,
 ) -> axum::response::Response {
     if let Some((set_name, key, property)) = resolve_blob_primitive_value_parent(parent) {
         return handle_blob_primitive_stream(
@@ -1351,7 +1377,7 @@ async fn handle_stream_get(
     };
 
     if let Some(response) =
-        try_file_stream_fast_path(state, tenant, &set_name, &entity_type, &key).await
+        try_file_stream_fast_path(state, tenant, &set_name, &entity_type, &key, file_value).await
     {
         return response;
     }
@@ -1455,12 +1481,14 @@ async fn handle_stream_get(
         .get("content_hash")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let cache_immutable = etag.is_some();
 
     ODataStreamResponse {
         status: StatusCode::OK,
-        body: body_bytes,
+        body: crate::response::ODataStreamBody::Bytes(body_bytes),
         content_type,
         etag,
+        cache_immutable,
     }
     .into_response()
 }

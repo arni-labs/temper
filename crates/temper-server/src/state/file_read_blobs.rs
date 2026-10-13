@@ -33,6 +33,73 @@ impl ServerState {
         }
         Ok(None)
     }
+
+    /// Open the object for `content_hash` as a bounded stream.
+    ///
+    /// Tries the native key, then the legacy external key. `None` means every
+    /// candidate was missing.
+    pub(crate) async fn open_blob_stream_for_hash(
+        &self,
+        tenant: &TenantId,
+        content_hash: &str,
+    ) -> Result<Option<crate::blob_store::BlobObjectStream>, String> {
+        let blob_endpoint = self
+            .secrets_vault
+            .as_ref()
+            .and_then(|vault| vault.get_secret(tenant.as_str(), "blob_endpoint"));
+        let max_bytes = u64::try_from(crate::blob_store::MAX_RAW_BLOB_BYTES).unwrap_or(u64::MAX);
+        for blob_key in file_blob_read_keys(blob_endpoint.as_deref(), content_hash) {
+            match self
+                .stream_blob_object(tenant, &blob_key, max_bytes)
+                .await
+                .map_err(|error| format!("failed to stream blob '{content_hash}': {error}"))?
+            {
+                crate::blob_store::BlobStreamRead::Found(stream) => return Ok(Some(stream)),
+                crate::blob_store::BlobStreamRead::Missing => {}
+                crate::blob_store::BlobStreamRead::TooLarge { actual_bytes } => {
+                    return Err(format!(
+                        "blob '{content_hash}' is {} bytes, over the read budget",
+                        actual_bytes.unwrap_or(max_bytes)
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Presign a GET for the first existing key of `content_hash`.
+    ///
+    /// `Ok(None)` means there is nothing to redirect to (local store, missing
+    /// object, or the existence check failed). Callers must already have
+    /// authorized the read.
+    pub(crate) async fn presign_file_blob(
+        &self,
+        tenant: &TenantId,
+        content_hash: &str,
+    ) -> Result<Option<String>, String> {
+        let Ok(store) = self.blob_store_for_tenant(tenant) else {
+            return Ok(None);
+        };
+        let blob_endpoint = self
+            .secrets_vault
+            .as_ref()
+            .and_then(|vault| vault.get_secret(tenant.as_str(), "blob_endpoint"));
+        for blob_key in file_blob_read_keys(blob_endpoint.as_deref(), content_hash) {
+            match store.object_exists(&blob_key).await {
+                Ok(true) => return Ok(store.presign_get(&blob_key)),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %blob_key,
+                        %error,
+                        "blob HEAD failed while preparing a download redirect; streaming instead"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn file_blob_read_keys(blob_endpoint: Option<&str>, content_hash: &str) -> Vec<String> {

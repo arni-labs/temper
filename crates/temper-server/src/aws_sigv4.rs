@@ -170,6 +170,72 @@ pub(crate) fn parse_url_host_path(url: &str) -> (&str, &str) {
     }
 }
 
+/// Inputs for a short-lived presigned `GET` URL.
+pub(crate) struct PresignedGetRequest<'a> {
+    /// Full object URL, without a query string.
+    pub url: &'a str,
+    /// Region component of the credential scope.
+    pub region: &'a str,
+    /// Service component of the credential scope. Blob storage uses `s3`.
+    pub service: &'a str,
+    /// Access key id for the `X-Amz-Credential` clause.
+    pub access_key: &'a str,
+    /// Secret key the signing key derives from.
+    pub secret_key: &'a str,
+    /// Request timestamp in `%Y%m%dT%H%M%SZ` form.
+    pub amz_date: &'a str,
+    /// How many seconds the URL remains valid.
+    pub expires_secs: u64,
+}
+
+/// Build a query-authenticated GET URL.
+///
+/// The signature covers `UNSIGNED-PAYLOAD` and the `host` header only, which
+/// is the form a browser can follow without sending an `Authorization` header.
+pub(crate) fn presign_get_url(request: &PresignedGetRequest<'_>) -> Result<String, String> {
+    if request.expires_secs == 0 {
+        return Err("presigned GET expiry must be at least one second".to_string());
+    }
+    let date = &request.amz_date[..8];
+    let (host, path) = parse_url_host_path(request.url);
+    let canonical_uri = uri_encode_path(path);
+    let scope = format!("{date}/{}/{}/aws4_request", request.region, request.service);
+    let credential = format!("{}/{scope}", request.access_key);
+    let query_pairs = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", credential),
+        ("X-Amz-Date", request.amz_date.to_string()),
+        ("X-Amz-Expires", request.expires_secs.to_string()),
+        ("X-Amz-SignedHeaders", "host".to_string()),
+    ];
+    let canonical_query = query_pairs
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{}={}",
+                uri_encode_component(name),
+                uri_encode_component(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_headers = format!("host:{host}\n");
+    let canonical_request = format!(
+        "GET\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
+    );
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{scope}\n{canonical_request_hash}",
+        request.amz_date
+    );
+    let signing_key = derive_signing_key(request.secret_key, date, request.region, request.service);
+    let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    Ok(format!(
+        "{}?{canonical_query}&X-Amz-Signature={signature}",
+        request.url
+    ))
+}
+
 /// Percent-encode a URL path per the SigV4 canonical URI rules
 /// (`/` is preserved; unreserved characters pass through).
 pub(crate) fn uri_encode_path(path: &str) -> String {
@@ -178,6 +244,24 @@ pub(crate) fn uri_encode_path(path: &str) -> String {
         match byte {
             b'/' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(b"0123456789ABCDEF"[(byte >> 4) as usize] as char);
+                out.push(b"0123456789ABCDEF"[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Percent-encode a query component. `/` is encoded, unlike [`uri_encode_path`].
+fn uri_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'-' | b'_' | b'.' | b'~' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => {
+                out.push(byte as char);
+            }
             _ => {
                 out.push('%');
                 out.push(b"0123456789ABCDEF"[(byte >> 4) as usize] as char);
@@ -256,5 +340,46 @@ mod tests {
             signature,
             "c0fcfd599eca87021d40732416afb30d604bfac09c6698dcbfb7629655bff2f5"
         );
+    }
+
+    #[test]
+    fn presign_get_url_matches_an_independent_canonical_request() {
+        let url = presign_get_url(&PresignedGetRequest {
+            url: "https://example.r2.cloudflarestorage.com/temper-blobs/temper-fs/sha256:abc",
+            region: "auto",
+            service: "s3",
+            access_key: "AKIDEXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            amz_date: "20150830T123600Z",
+            expires_secs: 120,
+        })
+        .expect("presign");
+
+        let canonical_uri = "/temper-blobs/temper-fs/sha256%3Aabc";
+        let canonical_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=120&X-Amz-SignedHeaders=host";
+        let canonical_request = format!(
+            "GET\n{canonical_uri}\n{canonical_query}\nhost:example.r2.cloudflarestorage.com\n\nhost\nUNSIGNED-PAYLOAD"
+        );
+        let scope = "20150830/auto/s3/aws4_request";
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n20150830T123600Z\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signing_key = derive_signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "auto",
+            "s3",
+        );
+        let expected = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+        let signature = url
+            .split("X-Amz-Signature=")
+            .nth(1)
+            .expect("signature query param");
+        assert_eq!(signature, expected);
+        assert!(url.contains("X-Amz-Expires=120"));
+        assert!(url.starts_with(
+            "https://example.r2.cloudflarestorage.com/temper-blobs/temper-fs/sha256:abc?"
+        ));
     }
 }

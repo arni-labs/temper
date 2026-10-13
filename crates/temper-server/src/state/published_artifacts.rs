@@ -150,8 +150,12 @@ impl ServerState {
             IndexedFileStreamRead::Content {
                 content_hash,
                 mime_type,
-                bytes,
-            } => (content_hash, mime_type, bytes),
+                body,
+            } => (
+                content_hash,
+                mime_type,
+                super::file_reads::materialize_indexed_body(body).await?,
+            ),
             IndexedFileStreamRead::NoContent { .. } => {
                 return Err(format!("{source_display} has no content to publish"));
             }

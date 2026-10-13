@@ -19,6 +19,7 @@ mod keys;
 mod limits;
 mod local;
 mod raw_ingest;
+mod s3_get;
 mod state;
 mod streaming;
 pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endpoint};
@@ -31,6 +32,7 @@ pub(crate) use raw_ingest::BlobIngestProgressPolicy;
 pub(crate) use raw_ingest::{
     BlobIngestAdmissionError, BlobIngestBudget, BlobStageError, MAX_RAW_BLOB_BYTES,
 };
+use s3_get::blob_http_client;
 pub(crate) use streaming::BlobReadBounded;
 pub use streaming::{BlobObjectStream, BlobStreamRead, decode_json_base64_stream};
 
@@ -81,10 +83,7 @@ impl BlobStore {
                 key_prefix,
                 access_key,
                 secret_key,
-                client: reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .expect("static blob HTTP client configuration must be valid"), // ci-ok: static reqwest builder options
+                client: blob_http_client(),
             }),
         }
     }
@@ -192,6 +191,36 @@ impl BlobStore {
         .await
         .map_err(|_| format!("blob get timed out for '{key}'"))?
     }
+
+    /// Whether the object exists. Used to choose a presigned download target
+    /// after authorization, before any redirect is returned.
+    pub(crate) async fn object_exists(&self, key: &str) -> Result<bool, String> {
+        let _permit =
+            tokio::time::timeout(BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore().acquire_owned())
+                .await
+                .map_err(|_| format!("blob existence check queue deadline exceeded for '{key}'"))?
+                .expect("blob semaphore closed"); // ci-ok: process-global and never closed
+        match &self.backend {
+            BlobStoreBackend::LocalFs { root } => {
+                let path = local_blob_path(root, key)?;
+                tokio::fs::try_exists(&path).await.map_err(|error| {
+                    format!("failed to stat local blob '{}': {error}", path.display())
+                })
+            }
+            BlobStoreBackend::S3(store) => store.exists(key).await,
+        }
+    }
+
+    /// Short-lived presigned GET, when this store can sign one.
+    ///
+    /// Local files have no public URL, so they return `None` and the caller
+    /// streams the bytes itself.
+    pub(crate) fn presign_get(&self, key: &str) -> Option<String> {
+        match &self.backend {
+            BlobStoreBackend::LocalFs { .. } => None,
+            BlobStoreBackend::S3(store) => store.presign_get(key),
+        }
+    }
 }
 
 impl S3BlobStore {
@@ -248,6 +277,7 @@ impl S3BlobStore {
                     status: Some(status),
                     request_bytes,
                     response_bytes: 0,
+                    ttfb: None,
                 });
                 Ok(())
             }
@@ -261,6 +291,7 @@ impl S3BlobStore {
                     status: error.status,
                     request_bytes,
                     response_bytes: 0,
+                    ttfb: None,
                 });
                 Err(error.message)
             }
@@ -319,6 +350,7 @@ impl S3BlobStore {
                     status: Some(status),
                     request_bytes: content_len,
                     response_bytes: 0,
+                    ttfb: None,
                 });
                 Ok(())
             }
@@ -332,73 +364,7 @@ impl S3BlobStore {
                     status: error.status,
                     request_bytes: content_len,
                     response_bytes: 0,
-                });
-                Err(error.message)
-            }
-        }
-    }
-
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let started_at = Instant::now(); // determinism-ok: production blob transport metric only
-        let span = blob_transport_span("get", "s3", 0);
-        let result = async {
-            let url = self.object_url(key);
-            let mut request = self.client.get(&url);
-            let headers = self
-                .signed_headers(Method::GET, &url)
-                .map_err(BlobTransportError::message)?;
-            for (header_name, header_value) in &headers {
-                request = request.header(header_name, header_value);
-            }
-
-            let response = request.send().await.map_err(|e| {
-                BlobTransportError::message(format!("blob GET request failed for '{key}': {e}"))
-            })?;
-            let status = response.status();
-            if status == StatusCode::NOT_FOUND {
-                return Ok((status, None));
-            }
-            if !status.is_success() {
-                return Err(BlobTransportError::status(
-                    format!("blob GET failed for '{key}' with HTTP {status}"),
-                    status,
-                ));
-            }
-
-            let bytes = response.bytes().await.map_err(|e| {
-                BlobTransportError::message(format!("blob GET body read failed for '{key}': {e}"))
-            })?;
-            Ok((status, Some(bytes.to_vec())))
-        }
-        .instrument(span.clone())
-        .await;
-
-        match result {
-            Ok((status, bytes)) => {
-                let response_bytes = bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
-                let outcome = if bytes.is_some() { "ok" } else { "not_found" };
-                finish_blob_transport(BlobTransportFinish {
-                    started_at,
-                    span: &span,
-                    operation: "get",
-                    backend: "s3",
-                    outcome,
-                    status: Some(status),
-                    request_bytes: 0,
-                    response_bytes,
-                });
-                Ok(bytes)
-            }
-            Err(error) => {
-                finish_blob_transport(BlobTransportFinish {
-                    started_at,
-                    span: &span,
-                    operation: "get",
-                    backend: "s3",
-                    outcome: "error",
-                    status: error.status,
-                    request_bytes: 0,
-                    response_bytes: 0,
+                    ttfb: None,
                 });
                 Err(error.message)
             }
@@ -447,6 +413,7 @@ impl S3BlobStore {
                     status: Some(status),
                     request_bytes: 0,
                     response_bytes: 0,
+                    ttfb: None,
                 });
                 Ok(exists)
             }
@@ -460,6 +427,7 @@ impl S3BlobStore {
                     status: error.status,
                     request_bytes: 0,
                     response_bytes: 0,
+                    ttfb: None,
                 });
                 Err(error.message)
             }

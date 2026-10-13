@@ -48,6 +48,7 @@ async fn put_local_blob_mode_observed(
         status: None,
         request_bytes,
         response_bytes: 0,
+        ttfb: None,
     });
     result
 }
@@ -73,6 +74,7 @@ pub(super) async fn get_local_blob_observed(
         status: None,
         request_bytes: 0,
         response_bytes,
+        ttfb: None,
     });
     result
 }
@@ -102,6 +104,7 @@ pub(super) async fn get_local_blob_bounded_observed(
         status: None,
         request_bytes: 0,
         response_bytes,
+        ttfb: None,
     });
     result
 }
