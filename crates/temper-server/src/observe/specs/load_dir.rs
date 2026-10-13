@@ -18,7 +18,7 @@ use super::super::specs_helpers::{
     to_pascal_case, unchanged_passed_verification,
 };
 use super::types::LoadDirRequest;
-use super::verification_stream::build_verification_stream_response;
+use super::verification_stream::{PendingInstall, build_verification_stream_response};
 use crate::authz::{
     GovernedMutationAuth, require_authenticated_context, require_governed_mutation_auth,
     require_tenant_match,
@@ -408,9 +408,24 @@ pub(super) async fn load_specs_from_directory(
         .collect();
 
     // Snapshot before register: merge/replace resets verification to Pending.
-    let cached_verification = {
+    // A replace-mode load drops the tenant's other types; their rows are
+    // removed when this install commits.
+    let (cached_verification, removed_types) = {
         let registry = state.registry.read().unwrap(); // ci-ok: infallible lock
-        unchanged_passed_verification(&registry, &body.tenant, &ioa_sources)
+        let removed: Vec<String> = if body.merge {
+            Vec::new()
+        } else {
+            registry
+                .entity_types(&body.tenant.as_str().into())
+                .into_iter()
+                .map(str::to_string)
+                .filter(|entity_type| !ioa_sources.contains_key(entity_type))
+                .collect()
+        };
+        (
+            unchanged_passed_verification(&registry, &body.tenant, &ioa_sources),
+            removed,
+        )
     };
 
     {
@@ -475,7 +490,11 @@ pub(super) async fn load_specs_from_directory(
         state,
         body.tenant,
         entity_names,
-        ioa_sources,
+        PendingInstall {
+            ioa_sources,
+            csdl_xml: csdl_xml_for_db,
+            removed_types,
+        },
         cached_verification,
         lint_warning_lines,
         cross_lint_warning_lines,

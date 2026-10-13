@@ -54,6 +54,14 @@ pub const CREATE_ENTITY_LISTING_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_events_tenant_entity
     ON events (tenant, entity_type, entity_id);";
 
+/// CREATE INDEX statement for the tombstone probe of every entity listing.
+///
+/// Listings keep an entity unless its journal has a `Deleted` event; the
+/// partial index lets that probe read only tombstones (migration 0017).
+pub const CREATE_EVENTS_DELETED_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_events_deleted
+    ON events (tenant, entity_type, entity_id) WHERE event_type = 'Deleted';";
+
 /// CREATE TABLE statement for persisted specs and verification status.
 pub const CREATE_SPECS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS specs (

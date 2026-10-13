@@ -4,6 +4,7 @@ use super::*;
 fn schemas_are_idempotent() {
     assert!(CREATE_EVENTS_TABLE.contains("IF NOT EXISTS"));
     assert!(CREATE_EVENTS_ENTITY_INDEX.contains("IF NOT EXISTS"));
+    assert!(CREATE_EVENTS_DELETED_INDEX.contains("IF NOT EXISTS"));
     assert!(CREATE_EVENT_SEGMENTS_TABLE.contains("IF NOT EXISTS"));
     assert!(CREATE_EVENT_SEGMENTS_OPEN_INDEX.contains("IF NOT EXISTS"));
     assert!(CREATE_SNAPSHOTS_TABLE.contains("IF NOT EXISTS"));

@@ -34,6 +34,13 @@ pub const CREATE_EVENTS_ENTITY_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_events_entity
     ON events(tenant, entity_type, entity_id, sequence_nr);";
 
+/// Tombstones only. Entity listings keep an entity unless it has a `Deleted`
+/// event; without this index that check reads the entity's whole journal once
+/// per journal row, so a 30,000-event entity took 15 minutes to list.
+pub const CREATE_EVENTS_DELETED_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_events_deleted
+    ON events(tenant, entity_type, entity_id) WHERE event_type = 'Deleted';";
+
 pub const CREATE_SNAPSHOTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS snapshots (
     tenant TEXT NOT NULL,
@@ -276,6 +283,26 @@ pub const ALTER_SPECS_ADD_CONTENT_HASH: &str = "ALTER TABLE specs ADD COLUMN con
 /// ALTER TABLE migration: add committed flag to specs table (WAL-style commit pattern).
 pub const ALTER_SPECS_ADD_COMMITTED: &str =
     "ALTER TABLE specs ADD COLUMN committed INTEGER NOT NULL DEFAULT 1";
+
+/// The last committed version of a spec whose row now holds an uncommitted
+/// one. Startup recovery puts it back, so a failed or interrupted reinstall
+/// never costs a type its working version. Cleared when the row commits.
+pub const CREATE_SPEC_COMMITTED_VERSIONS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS spec_committed_versions (
+    tenant TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    ioa_source TEXT NOT NULL,
+    csdl_xml TEXT,
+    content_hash TEXT,
+    version INTEGER NOT NULL,
+    verified INTEGER NOT NULL,
+    verification_status TEXT NOT NULL,
+    levels_passed INTEGER,
+    levels_total INTEGER,
+    verification_result TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(tenant, entity_type)
+);";
 
 /// ALTER TABLE migrations for the `trajectories` table.
 ///

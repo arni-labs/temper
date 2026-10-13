@@ -443,7 +443,7 @@ pub(crate) async fn persist_bootstrap_verification(
     verified_cache: &BTreeMap<String, (String, bool)>,
 ) {
     let hashes_to_persist = hashes_requiring_persistence(hashes, verified_cache);
-    let mut wrote_specs = false;
+    let mut written: Vec<(&str, &str, &str)> = Vec::new();
 
     for (entity_type, content_hash) in &hashes_to_persist {
         // Find the IOA source for this entity type.
@@ -461,7 +461,7 @@ pub(crate) async fn persist_bootstrap_verification(
             tracing::warn!("Failed to persist bootstrap spec {tenant}/{entity_type}: {e}");
             continue;
         }
-        wrote_specs = true;
+        written.push((entity_type.as_str(), content_hash.as_str(), csdl_source));
 
         // Mark as verified (bootstrap panics on failure, so all specs here passed).
         if let Err(e) = store
@@ -483,10 +483,12 @@ pub(crate) async fn persist_bootstrap_verification(
     }
 
     // `upsert_spec` marks rows as uncommitted while content is rewritten. Once
-    // bootstrap verification succeeds, promote the tenant's spec set back to a
-    // durable committed state so restart recovery can actually see the rows.
-    if wrote_specs && let Err(e) = store.commit_specs(tenant).await {
-        tracing::warn!("Failed to commit bootstrap specs for tenant '{tenant}': {e}");
+    // bootstrap verification succeeds, commit exactly the rows written here, so
+    // another install still verifying in this tenant is not committed with them.
+    match store.commit_spec_versions(tenant, &written, &[]).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!("Bootstrap specs for tenant '{tenant}' changed before commit"),
+        Err(e) => tracing::warn!("Failed to commit bootstrap specs for tenant '{tenant}': {e}"),
     }
 }
 
@@ -1198,6 +1200,45 @@ initial = "Created"
         // The derived slice must round-trip through the XML emitter/parser.
         let xml = emit_csdl_xml(&doc);
         parse_csdl(&xml).expect("emitted identity slice must re-parse");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_persistence_commits_only_its_own_specs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = temper_store_turso::TursoEventStore::new(
+            &format!("file:{}", dir.path().join("specs.db").display()),
+            None,
+        )
+        .await
+        .expect("turso store");
+        // Another install in this tenant, still verifying.
+        PlatformStore::upsert_spec(&store, "t", "Note", "note v1", "<csdl/>", "sha256:note")
+            .await
+            .expect("seed a pending install");
+
+        let hashes = vec![("Agent".to_string(), "sha256:agent".to_string())];
+        persist_bootstrap_verification(
+            &store,
+            "t",
+            &[("Agent", "agent source")],
+            "<csdl/>",
+            &hashes,
+            &BTreeMap::new(),
+        )
+        .await;
+
+        let restorable: Vec<String> = PlatformStore::load_specs(&store)
+            .await
+            .expect("load specs")
+            .into_iter()
+            .filter(|row| row.tenant == "t")
+            .map(|row| row.entity_type)
+            .collect();
+        assert_eq!(
+            restorable,
+            vec!["Agent".to_string()],
+            "bootstrap must not commit another install's pending row"
+        );
     }
 
     #[tokio::test]

@@ -2027,6 +2027,172 @@ async fn load_verification_cache_ignores_uncommitted_specs() {
     );
 }
 
+/// `(entity_type, content_hash, committed)` of a tenant's restorable specs.
+async fn restorable(store: &TursoEventStore, tenant: &str) -> Vec<(String, String, bool)> {
+    store
+        .load_specs()
+        .await
+        .expect("load specs")
+        .into_iter()
+        .filter(|row| row.tenant == tenant)
+        .map(|row| {
+            (
+                row.entity_type,
+                row.content_hash.unwrap_or_default(),
+                row.committed,
+            )
+        })
+        .collect()
+}
+
+fn spec(entity_type: &str, hash: &str) -> (String, String, bool) {
+    (entity_type.to_string(), hash.to_string(), true)
+}
+
+#[tokio::test]
+async fn commit_spec_versions_commits_an_install_whole_or_not_at_all() {
+    let store = make_store("spec-commit-versions").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
+    for (entity_type, hash) in [("Issue", "sha256:issue-v1"), ("Note", "sha256:note-v1")] {
+        store
+            .upsert_spec(&tenant, entity_type, "[automaton]\n", csdl_xml, hash)
+            .await
+            .expect("upsert uncommitted spec");
+    }
+
+    // Issue's row no longer holds the verified version: nothing commits.
+    let stale = [
+        ("Issue", "sha256:issue-v0", csdl_xml),
+        ("Note", "sha256:note-v1", csdl_xml),
+    ];
+    assert!(
+        !store
+            .commit_spec_versions(&tenant, &stale, &[])
+            .await
+            .unwrap()
+    );
+    // The IOA matches but the CSDL does not: nothing commits.
+    let other_csdl = [("Issue", "sha256:issue-v1", "<Schema Namespace=\"Other\" />")];
+    assert!(
+        !store
+            .commit_spec_versions(&tenant, &other_csdl, &[])
+            .await
+            .unwrap()
+    );
+    assert_eq!(restorable(&store, &tenant).await, vec![]);
+
+    let install = [
+        ("Issue", "sha256:issue-v1", csdl_xml),
+        ("Note", "sha256:note-v1", csdl_xml),
+    ];
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &install, &[])
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &install, &[])
+            .await
+            .unwrap(),
+        "an install that is already committed reports committed"
+    );
+    assert_eq!(
+        restorable(&store, &tenant).await,
+        vec![
+            spec("Issue", "sha256:issue-v1"),
+            spec("Note", "sha256:note-v1")
+        ]
+    );
+
+    // A replace-mode install that drops Note removes its row with the commit.
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &[], &["Note"])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        restorable(&store, &tenant).await,
+        vec![spec("Issue", "sha256:issue-v1")]
+    );
+}
+
+#[tokio::test]
+async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
+    let store = make_store("spec-committed-version-recovery").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
+    for (entity_type, hash) in [("Issue", "sha256:issue-v1"), ("Note", "sha256:note-v1")] {
+        store
+            .upsert_spec(&tenant, entity_type, "v1", csdl_xml, hash)
+            .await
+            .expect("upsert v1");
+    }
+    store.commit_specs(&tenant).await.expect("commit v1");
+
+    // Issue v2 is pending (failed, interrupted, or verifying elsewhere); Task
+    // is a new type that has not committed.
+    store
+        .upsert_spec(&tenant, "Issue", "v2", csdl_xml, "sha256:issue-v2")
+        .await
+        .expect("upsert Issue v2");
+    store
+        .upsert_spec(&tenant, "Task", "v1", csdl_xml, "sha256:task-v1")
+        .await
+        .expect("upsert Task");
+    let committed_view = vec![
+        spec("Issue", "sha256:issue-v1"),
+        spec("Note", "sha256:note-v1"),
+    ];
+    assert_eq!(restorable(&store, &tenant).await, committed_view);
+
+    // A boot while the installs are young leaves them alone; one may still
+    // commit afterwards.
+    assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 0);
+    assert_eq!(restorable(&store, &tenant).await, committed_view);
+
+    // Once abandoned, recovery returns Issue to v1 and removes Task.
+    let conn = store.connection().expect("connection");
+    conn.execute(
+        "UPDATE specs SET updated_at = '2000-01-01 00:00:00' WHERE tenant = ?1 AND committed = 0",
+        params![tenant.as_str()],
+    )
+    .await
+    .expect("age the pending rows");
+    assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 2);
+    assert_eq!(restorable(&store, &tenant).await, committed_view);
+    assert!(
+        !store
+            .commit_spec_versions(&tenant, &[("Issue", "sha256:issue-v2", csdl_xml)], &[])
+            .await
+            .unwrap(),
+        "an install discarded as abandoned can no longer commit"
+    );
+    assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 0);
+
+    // A later install that verifies replaces v1 for good.
+    store
+        .upsert_spec(&tenant, "Issue", "v3", csdl_xml, "sha256:issue-v3")
+        .await
+        .expect("upsert Issue v3");
+    assert!(
+        store
+            .commit_spec_versions(&tenant, &[("Issue", "sha256:issue-v3", csdl_xml)], &[])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        restorable(&store, &tenant).await,
+        vec![
+            spec("Issue", "sha256:issue-v3"),
+            spec("Note", "sha256:note-v1")
+        ]
+    );
+}
+
 #[tokio::test]
 async fn upsert_wasm_module_preserves_version_for_identical_hash() {
     let store = make_store("wasm-idempotent").await;
@@ -2105,4 +2271,60 @@ async fn upsert_wasm_module_stores_metadata_only_without_db_blob() {
         loaded.wasm_bytes.is_empty(),
         "Turso store should return metadata-only rows for new WASM artifacts"
     );
+}
+
+#[tokio::test]
+async fn deleted_probes_use_the_tombstone_index() {
+    // Every listing keeps an entity unless its journal has a `Deleted` event.
+    // Probed through the sequence index, that check reads the entity's whole
+    // journal once per journal row: one 30,000-event entity held the first
+    // list after a restart for 15 minutes. Each probe must be a tombstone seek.
+    let store = make_store("deleted-probes").await;
+    use crate::driver::{Value, params_from_iter};
+
+    let conn = store.connection().expect("connection");
+    for (name, sql, params) in [
+        (
+            "list_entity_ids",
+            super::event_store::LIST_ENTITY_IDS_SQL,
+            vec![Value::from("t")],
+        ),
+        (
+            "list_entity_ids_limited (type)",
+            super::event_store::LIST_ENTITY_IDS_OF_TYPE_LIMITED_SQL,
+            vec![Value::from("t"), Value::from("Order"), Value::from(10_i64)],
+        ),
+        (
+            "list_entity_ids_limited",
+            super::event_store::LIST_ENTITY_IDS_LIMITED_SQL,
+            vec![Value::from("t"), Value::from(10_i64)],
+        ),
+        (
+            "list_entity_ids_by_type",
+            super::entity_listing::LIST_ENTITY_IDS_BY_TYPE_SQL,
+            vec![Value::from("t"), Value::from("Order")],
+        ),
+    ] {
+        let mut rows = conn
+            .query(
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params_from_iter(params),
+            )
+            .await
+            .expect("query plan");
+        let mut probes = Vec::new();
+        while let Some(row) = rows.next().await.expect("plan row") {
+            let detail = row.get::<String>(3).expect("plan detail");
+            if detail.contains(" d ") {
+                probes.push(detail);
+            }
+        }
+        assert!(!probes.is_empty(), "{name}: no tombstone probe in the plan");
+        for probe in probes {
+            assert!(
+                probe.contains("idx_events_deleted"),
+                "{name}: tombstone probe does not use idx_events_deleted: {probe}"
+            );
+        }
+    }
 }

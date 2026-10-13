@@ -48,19 +48,25 @@ async fn standard_server_keeps_schema_for_secrets_wasm_and_spec_restoration() {
         state.load_wasm_module_sources("tenant").await.unwrap()["module"].source,
         "upload"
     );
+    let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml");
+    let csdl_xml = include_str!("../../../test-fixtures/specs/model.csdl.xml");
     state
-        .upsert_spec_source(
-            "tenant",
-            "Order",
-            include_str!("../../../test-fixtures/specs/order.ioa.toml"),
-            include_str!("../../../test-fixtures/specs/model.csdl.xml"),
-        )
+        .upsert_spec_source("tenant", "Order", order_ioa, csdl_xml)
         .await
         .unwrap();
     state
         .upsert_tenant_constraints("tenant", None)
         .await
         .unwrap();
+    // A spec is restored only after its install committed.
+    let order = std::collections::BTreeMap::from([("Order".to_string(), order_ioa.to_string())]);
+    assert_eq!(
+        state
+            .commit_spec_sources("tenant", &order, csdl_xml, &[])
+            .await
+            .unwrap(),
+        Some(true)
+    );
     let mut restored = SpecRegistry::new();
     assert_eq!(
         restore_registry_from_postgres_store(&mut restored, &store)

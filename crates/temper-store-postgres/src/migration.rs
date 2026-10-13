@@ -249,6 +249,10 @@ mod tests {
             "entity listing index DDL must be idempotent"
         );
         assert!(
+            schema::CREATE_EVENTS_DELETED_INDEX.contains("IF NOT EXISTS"),
+            "tombstone index DDL must be idempotent"
+        );
+        assert!(
             schema::CREATE_WASM_MODULES_TABLE.contains("IF NOT EXISTS"),
             "wasm_modules DDL must be idempotent"
         );

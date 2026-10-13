@@ -1221,3 +1221,31 @@ fn session_read_follows_capture_order_not_insert_order() {
             .unwrap();
     });
 }
+
+/// Every listing's tombstone probe reads `idx_events_deleted` (migration 0017)
+/// instead of scanning the whole journal. Gated on DATABASE_URL.
+#[test]
+fn migrations_create_the_tombstone_index() {
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+
+    sqlx::test_block_on(async {
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let definition: Option<String> = crate::dbm::postgres_query_scalar!(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE tablename = 'events' AND indexname = 'idx_events_deleted'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let definition = definition.expect("idx_events_deleted exists after migrations");
+        assert!(
+            definition.contains("(tenant, entity_type, entity_id)")
+                && definition.contains("WHERE (event_type = 'Deleted'::text)"),
+            "unexpected tombstone index: {definition}"
+        );
+    });
+}
