@@ -1,6 +1,20 @@
 //! Storage backend connection and persistence functions (Postgres, Turso).
+//!
+//! Postgres pool settings (read once at process start):
+//!
+//! - `TEMPER_PG_MAX_CONNECTIONS`, or `DATABASE_MAX_CONNECTIONS` — pool size.
+//!   Default 32. A non-positive or non-numeric value keeps the default.
+//! - `TEMPER_PG_STATEMENT_TIMEOUT_SECS`, or `DATABASE_STATEMENT_TIMEOUT_SECS` —
+//!   per-statement timeout in seconds. Default 15. Applied as Postgres
+//!   `statement_timeout` on the connection startup options and again with
+//!   `set_config` when the pool opens each connection.
+//! - Acquire timeout is 5 seconds. A checkout that waits longer fails the
+//!   request instead of holding the caller until the pool is exhausted.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use temper_evolution::PostgresRecordStore;
 use temper_server::storage::StorageStack;
@@ -9,11 +23,94 @@ use temper_store_turso::TursoEventStore;
 
 use super::LoadedTenantSpecs;
 
+const DEFAULT_MAX_CONNECTIONS: u32 = 32;
+const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 15;
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolved Postgres pool limits for `temper serve`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PostgresPoolConfig {
+    /// Maximum checked-out connections.
+    pub max_connections: u32,
+    /// `statement_timeout` in milliseconds.
+    pub statement_timeout_ms: u64,
+}
+
+impl PostgresPoolConfig {
+    /// Read pool limits from the process environment.
+    pub(super) fn from_env() -> Self {
+        Self::from_values(&[
+            (
+                "TEMPER_PG_MAX_CONNECTIONS",
+                std::env::var("TEMPER_PG_MAX_CONNECTIONS").ok(),
+            ),
+            (
+                "DATABASE_MAX_CONNECTIONS",
+                std::env::var("DATABASE_MAX_CONNECTIONS").ok(),
+            ),
+            (
+                "TEMPER_PG_STATEMENT_TIMEOUT_SECS",
+                std::env::var("TEMPER_PG_STATEMENT_TIMEOUT_SECS").ok(),
+            ),
+            (
+                "DATABASE_STATEMENT_TIMEOUT_SECS",
+                std::env::var("DATABASE_STATEMENT_TIMEOUT_SECS").ok(),
+            ),
+        ])
+    }
+
+    fn from_values(values: &[(&str, Option<String>)]) -> Self {
+        let max_connections = positive_u64(
+            values,
+            &["TEMPER_PG_MAX_CONNECTIONS", "DATABASE_MAX_CONNECTIONS"],
+            u64::from(DEFAULT_MAX_CONNECTIONS),
+        )
+        .min(u64::from(u32::MAX)) as u32;
+        let statement_timeout_secs = positive_u64(
+            values,
+            &[
+                "TEMPER_PG_STATEMENT_TIMEOUT_SECS",
+                "DATABASE_STATEMENT_TIMEOUT_SECS",
+            ],
+            DEFAULT_STATEMENT_TIMEOUT_SECS,
+        );
+        Self {
+            max_connections,
+            statement_timeout_ms: statement_timeout_secs.saturating_mul(1000),
+        }
+    }
+}
+
+fn positive_u64(values: &[(&str, Option<String>)], names: &[&str], default: u64) -> u64 {
+    for name in names {
+        let Some((_, Some(value))) = values.iter().find(|(key, _)| *key == *name) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return trimmed
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(default);
+    }
+    default
+}
+
 pub(super) async fn connect_postgres_store(
     database_url: &str,
 ) -> Result<(StorageStack, sqlx::PgPool)> {
     eprintln!("  Connecting to Postgres...");
-    let pool = sqlx::PgPool::connect(database_url)
+    let config = PostgresPoolConfig::from_env();
+    eprintln!(
+        "  Postgres pool: max_connections={}, acquire_timeout={}s, statement_timeout={}ms",
+        config.max_connections,
+        ACQUIRE_TIMEOUT.as_secs(),
+        config.statement_timeout_ms
+    );
+    let pool = connect_postgres_pool(database_url, config)
         .await
         .context("Failed to connect to Postgres")?;
     temper_store_postgres::migration::run_migrations(&pool)
@@ -29,6 +126,34 @@ pub(super) async fn connect_postgres_store(
         StorageStack::from_postgres(PostgresEventStore::new(pool.clone())),
         pool,
     ))
+}
+
+async fn connect_postgres_pool(
+    database_url: &str,
+    config: PostgresPoolConfig,
+) -> Result<sqlx::PgPool> {
+    let mut options: PgConnectOptions = database_url
+        .parse()
+        .context("invalid Postgres connection URL")?;
+    let timeout_setting = config.statement_timeout_ms.to_string();
+    options = options.options([("statement_timeout", timeout_setting.as_str())]);
+    let statement_timeout_ms = config.statement_timeout_ms;
+    PgPoolOptions::new()
+        .max_connections(config.max_connections)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .after_connect(move |conn, _meta| {
+            let timeout = statement_timeout_ms.to_string();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                    .bind(timeout)
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await
+        .context("failed to open the Postgres pool")
 }
 
 pub(super) fn redact_connection_url(url: &str) -> String {
@@ -166,4 +291,54 @@ mod tests {
     }
 
     // row_to_registry_status tests moved to temper_server::registry_bootstrap::tests
+
+    fn values<'a>(pairs: &'a [(&'a str, &'a str)]) -> Vec<(&'a str, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (*key, Some((*value).to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn pool_config_defaults_when_unset() {
+        assert_eq!(
+            PostgresPoolConfig::from_values(&[]),
+            PostgresPoolConfig {
+                max_connections: 32,
+                statement_timeout_ms: 15_000,
+            }
+        );
+    }
+
+    #[test]
+    fn pool_config_prefers_temper_names_and_rejects_non_positive() {
+        let config = PostgresPoolConfig::from_values(&values(&[
+            ("TEMPER_PG_MAX_CONNECTIONS", "8"),
+            ("DATABASE_MAX_CONNECTIONS", "99"),
+            ("TEMPER_PG_STATEMENT_TIMEOUT_SECS", "0"),
+            ("DATABASE_STATEMENT_TIMEOUT_SECS", "4"),
+        ]));
+        assert_eq!(
+            config,
+            PostgresPoolConfig {
+                max_connections: 8,
+                statement_timeout_ms: 15_000,
+            }
+        );
+    }
+
+    #[test]
+    fn pool_config_falls_back_to_database_names() {
+        let config = PostgresPoolConfig::from_values(&values(&[
+            ("DATABASE_MAX_CONNECTIONS", "4"),
+            ("DATABASE_STATEMENT_TIMEOUT_SECS", "9"),
+        ]));
+        assert_eq!(
+            config,
+            PostgresPoolConfig {
+                max_connections: 4,
+                statement_timeout_ms: 9_000,
+            }
+        );
+    }
 }

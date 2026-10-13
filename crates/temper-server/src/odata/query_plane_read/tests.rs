@@ -254,6 +254,169 @@ async fn row_authorized_count_over_budget_returns_413() {
 }
 
 #[tokio::test]
+async fn list_read_drops_rows_a_per_entity_forbid_names() {
+    let state = build_order_state("query-plane-row-forbid");
+    create_orders(&state, 3).await;
+    let tenant = TenantId::default();
+    state
+        .authz
+        .reload_tenant_policies(
+            tenant.as_str(),
+            r#"
+            permit(principal, action == Action::"list", resource is Order);
+            permit(principal, action == Action::"read", resource is Order);
+            forbid(principal, action == Action::"read", resource == Order::"ord-01");
+            "#,
+        )
+        .expect("install row forbid");
+    let security_ctx = SecurityContext {
+        principal: temper_authz::Principal {
+            id: "reader".to_string(),
+            kind: temper_authz::PrincipalKind::Customer,
+            role: None,
+            acting_for: None,
+            agent_type: None,
+            attributes: Default::default(),
+        },
+        context_attrs: Default::default(),
+        correlation_id: "row-forbid".to_string(),
+    };
+    let query_options = QueryOptions {
+        top: Some(10),
+        count: Some(true),
+        ..QueryOptions::default()
+    };
+
+    let result = match read_entity_set_page(QueryPlaneReadRequest {
+        state: &state,
+        tenant: &tenant,
+        security_ctx: &security_ctx,
+        entity_type: "Order",
+        entity_set_name: "Orders",
+        query_options: &query_options,
+        budget: QueryPlaneReadBudget {
+            default_page_size: 10,
+            max_entities: 10,
+        },
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => panic!("per-entity forbid should filter rows, not reject the list"),
+    };
+    assert_eq!(result.count, Some(2));
+
+    let ids = result
+        .entities
+        .iter()
+        .map(listed_entity_id)
+        .collect::<Vec<_>>();
+    assert!(
+        ids.iter().any(|id| id == "ord-00"),
+        "allowed row must remain: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id == "ord-02"),
+        "allowed row must remain: {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|id| id == "ord-01"),
+        "forbidden row must be filtered: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn uniform_type_permit_returns_every_row() {
+    let state = build_order_state("query-plane-uniform-permit");
+    create_orders(&state, 3).await;
+    let tenant = TenantId::default();
+    state
+        .authz
+        .reload_tenant_policies(
+            tenant.as_str(),
+            r#"
+            permit(principal, action == Action::"list", resource is Order);
+            permit(principal, action == Action::"read", resource is Order);
+            "#,
+        )
+        .expect("install uniform permit");
+    let security_ctx = SecurityContext {
+        principal: temper_authz::Principal {
+            id: "reader".to_string(),
+            kind: temper_authz::PrincipalKind::Customer,
+            role: None,
+            acting_for: None,
+            agent_type: None,
+            attributes: Default::default(),
+        },
+        context_attrs: Default::default(),
+        correlation_id: "uniform-permit".to_string(),
+    };
+    let query_options = QueryOptions {
+        top: Some(10),
+        count: Some(true),
+        ..QueryOptions::default()
+    };
+
+    let result = match read_entity_set_page(QueryPlaneReadRequest {
+        state: &state,
+        tenant: &tenant,
+        security_ctx: &security_ctx,
+        entity_type: "Order",
+        entity_set_name: "Orders",
+        query_options: &query_options,
+        budget: QueryPlaneReadBudget {
+            default_page_size: 10,
+            max_entities: 10,
+        },
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => panic!("uniform permit should allow the list"),
+    };
+    assert_eq!(result.count, Some(3));
+
+    let ids = result
+        .entities
+        .iter()
+        .map(listed_entity_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ids,
+        ["ord-00", "ord-01", "ord-02"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+}
+
+fn listed_entity_id(entity: &serde_json::Value) -> String {
+    if let Some(id) = entity.get("entity_id").and_then(|value| value.as_str()) {
+        return id.to_string();
+    }
+    if let Some(id) = entity.get("Id").and_then(|value| value.as_str()) {
+        return id.to_string();
+    }
+    if let Some(id) = entity
+        .get("fields")
+        .and_then(|fields| fields.get("Id"))
+        .and_then(|value| value.as_str())
+    {
+        return id.to_string();
+    }
+    let odata_id = entity
+        .get("@odata.id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    odata_id
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .map(|inner| inner.trim_matches('\'').to_string())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
 async fn row_authorized_first_page_can_stop_after_proof() {
     let state = build_order_state("query-plane-budget-first-page");
     create_orders(&state, 11).await;

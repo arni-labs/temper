@@ -19,6 +19,9 @@ use crate::error::{AuthzDenial, AuthzError};
 use crate::metrics::{CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
+mod list_uniformity;
+
+pub use list_uniformity::ListReadUniformity;
 
 #[cfg(test)]
 mod tests;
@@ -670,6 +673,49 @@ impl AuthzEngine {
                 }
             }
         }
+    }
+
+    /// Whether a list's `read` decision is the same for every row of `resource_type`.
+    ///
+    /// Callers that get [`ListReadUniformity::Uniform`] evaluate Cedar once and
+    /// apply that decision to the page. A per-entity result still filters each
+    /// row; `attribute_keys` is the set of resource fields that can change the
+    /// answer, so the caller does not have to load the rest of the document.
+    pub fn list_read_uniformity(
+        &self,
+        tenant: &str,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+    ) -> ListReadUniformity {
+        let tenants = match self.tenant_policies.read() {
+            Ok(tenants) => tenants,
+            Err(_) => {
+                return ListReadUniformity::PerEntity {
+                    attribute_keys: None,
+                };
+            }
+        };
+        if let Some(tenant_policies) = tenants.get(tenant) {
+            return list_uniformity::classify(
+                &tenant_policies.policies.policy_set,
+                security_ctx,
+                action,
+                resource_type,
+            );
+        }
+        drop(tenants);
+        if Self::is_system(security_ctx) {
+            return list_uniformity::classify(
+                &self.platform_policy_set.policy_set,
+                security_ctx,
+                action,
+                resource_type,
+            );
+        }
+        // No tenant policy and not a system principal: Cedar default-deny.
+        // That denial does not depend on which row is being read.
+        ListReadUniformity::Uniform
     }
 
     /// Quick check: is this a system principal?

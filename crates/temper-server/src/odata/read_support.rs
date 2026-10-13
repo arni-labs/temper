@@ -16,9 +16,8 @@ mod shadow;
 
 use config::{catalog_fast_read_enabled, entity_set_materialization_concurrency};
 pub(super) use config::{odata_default_page_size, odata_max_entities};
-use select_projection::catalog_row_to_selected_entity_body;
-#[cfg(test)]
-pub(super) use select_projection::catalog_select_projection_fields;
+pub(in crate::odata) use select_projection::catalog_row_to_selected_entity_body;
+pub(in crate::odata) use select_projection::catalog_select_projection_fields;
 use shadow::{
     CatalogShadowReadBudget, maybe_spawn_catalog_shadow_check,
     maybe_spawn_catalog_shadow_check_with_budget,
@@ -115,9 +114,9 @@ async fn try_load_selected_catalog_rows(
     entity_type: &str,
     entity_ids: &[String],
     selected_fields: &[String],
-) -> BTreeMap<String, EntityCatalogRow> {
+) -> (BTreeMap<String, EntityCatalogRow>, bool) {
     let Some(query_plane) = state.query_plane_store() else {
-        return BTreeMap::new();
+        return (BTreeMap::new(), false);
     };
     match load_selected_catalog_rows_by_id(
         &query_plane,
@@ -128,10 +127,11 @@ async fn try_load_selected_catalog_rows(
     )
     .await
     {
-        Ok(CatalogRowsLoad::Available(rows)) => rows,
-        Ok(CatalogRowsLoad::Unsupported) => {
-            try_load_catalog_rows(state, tenant, entity_type, entity_ids).await
-        }
+        Ok(CatalogRowsLoad::Available(rows)) => (rows, true),
+        Ok(CatalogRowsLoad::Unsupported) => (
+            try_load_catalog_rows(state, tenant, entity_type, entity_ids).await,
+            false,
+        ),
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -139,7 +139,10 @@ async fn try_load_selected_catalog_rows(
                 entity_type = %entity_type,
                 "selected catalog fast-read failed; falling back to full catalog materialization"
             );
-            try_load_catalog_rows(state, tenant, entity_type, entity_ids).await
+            (
+                try_load_catalog_rows(state, tenant, entity_type, entity_ids).await,
+                false,
+            )
         }
     }
 }
@@ -261,12 +264,21 @@ pub(super) async fn materialize_entity_set_entities(
     selected_catalog_fields: Option<&[String]>,
 ) -> MaterializedEntitySet {
     let selected_catalog_fields_owned = selected_catalog_fields.map(Vec::from);
+    let mut catalog_select_projection = false;
     let mut catalog_hits: BTreeMap<String, EntityCatalogRow> =
         if should_read_catalog_for_materialization(prefer_catalog) {
             match selected_catalog_fields {
                 Some(select) => {
-                    try_load_selected_catalog_rows(state, tenant, entity_type, entity_ids, select)
-                        .await
+                    let (rows, sparse) = try_load_selected_catalog_rows(
+                        state,
+                        tenant,
+                        entity_type,
+                        entity_ids,
+                        select,
+                    )
+                    .await;
+                    catalog_select_projection = sparse;
+                    rows
                 }
                 None => try_load_catalog_rows(state, tenant, entity_type, entity_ids).await,
             }
@@ -376,6 +388,7 @@ pub(super) async fn materialize_entity_set_entities(
         entities,
         catalog_shadow_check_budget: shadow_budget.configured(),
         catalog_shadow_check_scheduled: shadow_budget.scheduled(),
+        catalog_select_projection,
     }
 }
 
@@ -383,6 +396,9 @@ pub(super) struct MaterializedEntitySet {
     pub(super) entities: Vec<serde_json::Value>,
     pub(super) catalog_shadow_check_budget: usize,
     pub(super) catalog_shadow_check_scheduled: usize,
+    /// The catalog read projected `$select` fields and did not transfer
+    /// `state` or the full `fields` document.
+    pub(super) catalog_select_projection: bool,
 }
 
 #[cfg(test)]

@@ -1,4 +1,8 @@
-//! Sparse selected catalog reads for OData list projections.
+//! Catalog reads for OData list projections.
+//!
+//! Full-document reads and `$select` projections share one batch size so a
+//! list of a whole entity type cannot pin a pool connection on a single
+//! multi-megabyte JSON transfer.
 
 use std::collections::BTreeSet;
 
@@ -6,6 +10,77 @@ use temper_runtime::persistence::PersistenceError;
 
 use crate::PostgresEventStore;
 use crate::platform::{PostgresEntityCatalogRow, storage_error};
+
+/// Ids per catalog `ANY($n)` read.
+const CATALOG_READ_BATCH: usize = 128;
+
+impl PostgresEventStore {
+    /// Batch-load full entity catalog rows for a list of entity IDs.
+    ///
+    /// Returns only rows that exist in the catalog. IDs without a row in the
+    /// projection are silently omitted from the result, leaving the caller
+    /// free to fall back to the actor path on a per-id basis.
+    ///
+    /// Large id lists are read in batches of [`CATALOG_READ_BATCH`].
+    pub async fn load_entity_catalog_rows_pg(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+    ) -> Result<Vec<PostgresEntityCatalogRow>, PersistenceError> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::new();
+        for chunk in entity_ids.chunks(CATALOG_READ_BATCH) {
+            rows.extend(
+                self.load_entity_catalog_rows_pg_chunk(tenant, entity_type, chunk)
+                    .await?,
+            );
+        }
+        rows.sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
+        Ok(rows)
+    }
+
+    async fn load_entity_catalog_rows_pg_chunk(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+    ) -> Result<Vec<PostgresEntityCatalogRow>, PersistenceError> {
+        let rows: Vec<(
+            String,
+            String,
+            serde_json::Value,
+            Option<serde_json::Value>,
+            i64,
+        )> = crate::dbm::postgres_query_as!(
+            &self.schema,
+            "SELECT entity_id, status, fields, state, sequence_nr \
+             FROM {schema}entity_catalog \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = ANY($3) \
+             ORDER BY entity_id",
+        )
+        .bind(tenant)
+        .bind(entity_type)
+        .bind(entity_ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(storage_error)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(entity_id, status, fields, state, seq)| PostgresEntityCatalogRow {
+                    entity_id,
+                    status,
+                    fields,
+                    state,
+                    sequence_nr: seq.max(0) as u64,
+                },
+            )
+            .collect())
+    }
+}
 
 impl PostgresEventStore {
     /// Batch-load catalog rows while projecting only the requested JSON fields.
@@ -31,6 +106,29 @@ impl PostgresEventStore {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for chunk in entity_ids.chunks(CATALOG_READ_BATCH) {
+            rows.extend(
+                self.load_selected_entity_catalog_chunk(
+                    tenant,
+                    entity_type,
+                    chunk,
+                    &selected_fields,
+                )
+                .await?,
+            );
+        }
+        rows.sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
+        Ok(rows)
+    }
+
+    async fn load_selected_entity_catalog_chunk(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+        selected_fields: &[String],
+    ) -> Result<Vec<PostgresEntityCatalogRow>, PersistenceError> {
         let rows: Vec<(String, String, serde_json::Value, i64)> = crate::dbm::postgres_query_as!(
             &self.schema,
             "SELECT c.entity_id, \
@@ -58,7 +156,7 @@ impl PostgresEventStore {
         .bind(tenant)
         .bind(entity_type)
         .bind(entity_ids)
-        .bind(&selected_fields)
+        .bind(selected_fields)
         .fetch_all(self.pool())
         .await
         .map_err(storage_error)?;
