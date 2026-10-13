@@ -10,11 +10,21 @@ use crate::state::ServerState;
 
 use super::verification_cached::{cached_verification_line, restore_unchanged_verification};
 
+/// An install that is committed once every spec in it verifies.
+pub(super) struct PendingInstall {
+    /// Entity type to IOA source.
+    pub(super) ioa_sources: BTreeMap<String, String>,
+    /// The CSDL persisted with each spec row.
+    pub(super) csdl_xml: String,
+    /// Types a replace-mode load dropped; their rows go when it commits.
+    pub(super) removed_types: Vec<String>,
+}
+
 pub(super) fn build_verification_stream_response(
     state: ServerState,
     tenant: String,
     entity_names: Vec<String>,
-    ioa_sources: BTreeMap<String, String>,
+    install: PendingInstall,
     cached_verification: BTreeMap<String, crate::registry::EntityVerificationResult>,
     lint_warning_lines: Vec<serde_json::Value>,
     cross_lint_warning_lines: Vec<serde_json::Value>,
@@ -154,7 +164,7 @@ pub(super) fn build_verification_stream_response(
                 .await;
 
             // Run verification: in subprocess (if configured) or in-process.
-            let ioa_source = ioa_sources[entity_name].clone();
+            let ioa_source = install.ioa_sources[entity_name].clone();
             let result: Result<temper_verify::CascadeResult, String> =
                 if let Some(bin) = state_for_task.verify_subprocess_bin.as_deref() {
                     tracing::debug!(entity = %entity_name, "running verification in subprocess");
@@ -466,13 +476,37 @@ pub(super) fn build_verification_stream_response(
             }
         }
 
-        // Stream final summary
+        // Only an install whose every spec passed is committed, so restart
+        // recovery brings it back; anything else is dropped at the next boot.
         let all_passed = entity_results.values().all(|&p| p);
+        let (committed, commit_error) = if all_passed {
+            match state_for_task
+                .commit_spec_sources(
+                    &tenant,
+                    &install.ioa_sources,
+                    &install.csdl_xml,
+                    &install.removed_types,
+                )
+                .await
+            {
+                Ok(committed) => (committed == Some(true), None),
+                Err(e) => {
+                    tracing::error!(tenant = %tenant, error = %e, "failed to commit verified specs");
+                    (false, Some(e))
+                }
+            }
+        } else {
+            (false, None)
+        };
+
+        // Stream final summary
         let _ = tx
             .send(Ok(serde_json::to_string(&serde_json::json!({
                     "type": "summary",
                     "tenant": &tenant,
                     "all_passed": all_passed,
+                    "committed": committed,
+                    "commit_error": commit_error,
                     "entities": entity_results,
                 }))
                 .unwrap() // ci-ok: infallible serialization

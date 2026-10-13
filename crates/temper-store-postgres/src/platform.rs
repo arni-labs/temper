@@ -18,6 +18,7 @@ mod evolution;
 mod inputs;
 mod policy_approval;
 mod rows;
+mod specs;
 pub use inputs::{PostgresEvolutionRecordInsert, PostgresPolicyApprovalCommit};
 use rows::*;
 
@@ -1081,92 +1082,23 @@ impl PostgresEventStore {
             .collect())
     }
 
-    pub async fn upsert_spec(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        ioa_source: &str,
-        csdl_xml: &str,
-        content_hash: &str,
-    ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(&self.schema,
-            "INSERT INTO {schema}specs \
-             (tenant, entity_type, ioa_source, csdl_xml, content_hash, committed, version, verified, verification_status, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, false, 1, false, 'pending', now()) \
-             ON CONFLICT (tenant, entity_type) DO UPDATE SET \
-                 ioa_source = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN EXCLUDED.ioa_source ELSE specs.ioa_source END, \
-                 csdl_xml = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN EXCLUDED.csdl_xml ELSE specs.csdl_xml END, \
-                 content_hash = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN EXCLUDED.content_hash ELSE specs.content_hash END, \
-                 committed = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN false ELSE specs.committed END, \
-                 version = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN specs.version + 1 ELSE specs.version END, \
-                 verified = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN false ELSE specs.verified END, \
-                 verification_status = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN 'pending' ELSE specs.verification_status END, \
-                 levels_passed = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN NULL ELSE specs.levels_passed END, \
-                 levels_total = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN NULL ELSE specs.levels_total END, \
-                 verification_result = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN NULL ELSE specs.verification_result END, \
-                 updated_at = CASE WHEN specs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR specs.csdl_xml IS DISTINCT FROM EXCLUDED.csdl_xml THEN now() ELSE specs.updated_at END",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(ioa_source)
-        .bind(csdl_xml)
-        .bind(content_hash)
-        .execute(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(())
-    }
-
     pub async fn load_specs(&self) -> Result<Vec<PostgresSpecRow>, PersistenceError> {
         let rows = crate::dbm::postgres_query!(&self.schema,
             "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
                     levels_passed, levels_total, verification_result, content_hash, updated_at, committed \
-             FROM {schema}specs WHERE committed = true ORDER BY tenant, entity_type",
+             FROM {schema}specs WHERE committed = true \
+             UNION ALL \
+             SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
+                    levels_passed, levels_total, verification_result, content_hash, updated_at, true \
+             FROM {schema}spec_committed_versions AS b WHERE NOT EXISTS ( \
+                 SELECT 1 FROM {schema}specs AS s \
+                 WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type AND s.committed = true) \
+             ORDER BY tenant, entity_type",
         )
         .fetch_all(self.pool())
         .await
         .map_err(storage_error)?;
         Ok(rows.into_iter().map(row_to_spec).collect())
-    }
-
-    pub async fn delete_spec(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            &self.schema,
-            "DELETE FROM {schema}specs WHERE tenant = $1 AND entity_type = $2"
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .execute(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(())
-    }
-
-    pub async fn commit_specs(&self, tenant: &str) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(
-            &self.schema,
-            "UPDATE {schema}specs SET committed = true, updated_at = now() WHERE tenant = $1"
-        )
-        .bind(tenant)
-        .execute(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(())
-    }
-
-    pub async fn delete_uncommitted_specs(&self) -> Result<usize, PersistenceError> {
-        let result = crate::dbm::postgres_query!(
-            &self.schema,
-            "DELETE FROM {schema}specs WHERE committed = false"
-        )
-        .execute(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(result.rows_affected() as usize)
     }
 
     pub async fn load_verification_cache(
