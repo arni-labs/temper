@@ -131,6 +131,9 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_EVENTS_ENTITY_INDEX, ())
             .await
             .map_err(storage_error)?;
+        conn.execute(schema::CREATE_EVENTS_DELETED_INDEX, ())
+            .await
+            .map_err(storage_error)?;
         conn.execute(schema::CREATE_EVENT_SEGMENTS_TABLE, ())
             .await
             .map_err(storage_error)?;
