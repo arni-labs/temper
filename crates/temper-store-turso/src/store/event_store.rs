@@ -19,6 +19,54 @@ use crate::retry::{is_transient_write_error, retry_delay_ms};
 
 const APPEND_BATCH_INSERT_CHUNK_ROWS: usize = 400;
 
+/// Every live `(entity_type, entity_id)` of a tenant. The `NOT EXISTS` probe is
+/// served by `idx_events_deleted`; see `schema::CREATE_EVENTS_DELETED_INDEX`.
+pub(super) const LIST_ENTITY_IDS_SQL: &str = "\
+SELECT DISTINCT e.entity_type, e.entity_id
+    FROM events e
+    WHERE e.tenant = ?1
+      AND NOT EXISTS (
+        SELECT 1
+        FROM events d
+        WHERE d.tenant = e.tenant
+          AND d.entity_type = e.entity_type
+          AND d.entity_id = e.entity_id
+          AND d.event_type = 'Deleted'
+      )";
+
+/// At most `?3` live ids of one entity type, in id order.
+pub(super) const LIST_ENTITY_IDS_OF_TYPE_LIMITED_SQL: &str = "\
+SELECT DISTINCT e.entity_type, e.entity_id
+    FROM events e
+    WHERE e.tenant = ?1
+      AND e.entity_type = ?2
+      AND NOT EXISTS (
+        SELECT 1
+        FROM events d
+        WHERE d.tenant = e.tenant
+          AND d.entity_type = e.entity_type
+          AND d.entity_id = e.entity_id
+          AND d.event_type = 'Deleted'
+      )
+    ORDER BY e.entity_type, e.entity_id
+    LIMIT ?3";
+
+/// At most `?2` live `(entity_type, entity_id)` pairs of a tenant, in order.
+pub(super) const LIST_ENTITY_IDS_LIMITED_SQL: &str = "\
+SELECT DISTINCT e.entity_type, e.entity_id
+    FROM events e
+    WHERE e.tenant = ?1
+      AND NOT EXISTS (
+        SELECT 1
+        FROM events d
+        WHERE d.tenant = e.tenant
+          AND d.entity_type = e.entity_type
+          AND d.entity_id = e.entity_id
+          AND d.event_type = 'Deleted'
+      )
+    ORDER BY e.entity_type, e.entity_id
+    LIMIT ?2";
+
 struct PreparedEventInsert {
     tenant: String,
     entity_type: String,
@@ -624,20 +672,7 @@ impl EventStore for TursoEventStore {
     ) -> Result<Vec<(String, String)>, PersistenceError> {
         let conn = self.configured_connection().await?;
         let mut rows = conn
-            .query(
-                "SELECT DISTINCT e.entity_type, e.entity_id
-                 FROM events e
-                 WHERE e.tenant = ?1
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM events d
-                     WHERE d.tenant = e.tenant
-                       AND d.entity_type = e.entity_type
-                       AND d.entity_id = e.entity_id
-                       AND d.event_type = 'Deleted'
-                   )",
-                params![tenant],
-            )
+            .query(LIST_ENTITY_IDS_SQL, params![tenant])
             .await
             .map_err(storage_error)?;
 
@@ -675,20 +710,7 @@ impl EventStore for TursoEventStore {
         if let Some(entity_type) = entity_type {
             let mut rows = conn
                 .query(
-                    "SELECT DISTINCT e.entity_type, e.entity_id
-                     FROM events e
-                     WHERE e.tenant = ?1
-                       AND e.entity_type = ?2
-                       AND NOT EXISTS (
-                         SELECT 1
-                         FROM events d
-                         WHERE d.tenant = e.tenant
-                           AND d.entity_type = e.entity_type
-                           AND d.entity_id = e.entity_id
-                           AND d.event_type = 'Deleted'
-                       )
-                     ORDER BY e.entity_type, e.entity_id
-                     LIMIT ?3",
+                    LIST_ENTITY_IDS_OF_TYPE_LIMITED_SQL,
                     params![tenant, entity_type, limit],
                 )
                 .await
@@ -704,22 +726,7 @@ impl EventStore for TursoEventStore {
         }
 
         let mut rows = conn
-            .query(
-                "SELECT DISTINCT e.entity_type, e.entity_id
-                 FROM events e
-                 WHERE e.tenant = ?1
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM events d
-                     WHERE d.tenant = e.tenant
-                       AND d.entity_type = e.entity_type
-                       AND d.entity_id = e.entity_id
-                       AND d.event_type = 'Deleted'
-                   )
-                 ORDER BY e.entity_type, e.entity_id
-                 LIMIT ?2",
-                params![tenant, limit],
-            )
+            .query(LIST_ENTITY_IDS_LIMITED_SQL, params![tenant, limit])
             .await
             .map_err(storage_error)?;
 

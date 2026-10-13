@@ -2106,3 +2106,59 @@ async fn upsert_wasm_module_stores_metadata_only_without_db_blob() {
         "Turso store should return metadata-only rows for new WASM artifacts"
     );
 }
+
+#[tokio::test]
+async fn deleted_probes_use_the_tombstone_index() {
+    // Every listing keeps an entity unless its journal has a `Deleted` event.
+    // Probed through the sequence index, that check reads the entity's whole
+    // journal once per journal row: one 30,000-event entity held the first
+    // list after a restart for 15 minutes. Each probe must be a tombstone seek.
+    let store = make_store("deleted-probes").await;
+    use crate::driver::{Value, params_from_iter};
+
+    let conn = store.connection().expect("connection");
+    for (name, sql, params) in [
+        (
+            "list_entity_ids",
+            super::event_store::LIST_ENTITY_IDS_SQL,
+            vec![Value::from("t")],
+        ),
+        (
+            "list_entity_ids_limited (type)",
+            super::event_store::LIST_ENTITY_IDS_OF_TYPE_LIMITED_SQL,
+            vec![Value::from("t"), Value::from("Order"), Value::from(10_i64)],
+        ),
+        (
+            "list_entity_ids_limited",
+            super::event_store::LIST_ENTITY_IDS_LIMITED_SQL,
+            vec![Value::from("t"), Value::from(10_i64)],
+        ),
+        (
+            "list_entity_ids_by_type",
+            super::entity_listing::LIST_ENTITY_IDS_BY_TYPE_SQL,
+            vec![Value::from("t"), Value::from("Order")],
+        ),
+    ] {
+        let mut rows = conn
+            .query(
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                params_from_iter(params),
+            )
+            .await
+            .expect("query plan");
+        let mut probes = Vec::new();
+        while let Some(row) = rows.next().await.expect("plan row") {
+            let detail = row.get::<String>(3).expect("plan detail");
+            if detail.contains(" d ") {
+                probes.push(detail);
+            }
+        }
+        assert!(!probes.is_empty(), "{name}: no tombstone probe in the plan");
+        for probe in probes {
+            assert!(
+                probe.contains("idx_events_deleted"),
+                "{name}: tombstone probe does not use idx_events_deleted: {probe}"
+            );
+        }
+    }
+}
