@@ -466,13 +466,29 @@ pub(super) fn build_verification_stream_response(
             }
         }
 
-        // Stream final summary
+        // Only an install whose every spec passed is committed, so restart
+        // recovery brings it back; anything else is dropped at the next boot.
         let all_passed = entity_results.values().all(|&p| p);
+        let commit_error = if all_passed {
+            state_for_task
+                .commit_spec_sources(&tenant, &ioa_sources)
+                .await
+                .err()
+        } else {
+            None
+        };
+        if let Some(e) = &commit_error {
+            tracing::error!(tenant = %tenant, error = %e, "failed to commit verified specs");
+        }
+
+        // Stream final summary
         let _ = tx
             .send(Ok(serde_json::to_string(&serde_json::json!({
                     "type": "summary",
                     "tenant": &tenant,
                     "all_passed": all_passed,
+                    "committed": all_passed && commit_error.is_none(),
+                    "commit_error": commit_error,
                     "entities": entity_results,
                 }))
                 .unwrap() // ci-ok: infallible serialization

@@ -18,6 +18,7 @@ mod evolution;
 mod inputs;
 mod policy_approval;
 mod rows;
+mod spec_commit;
 pub use inputs::{PostgresEvolutionRecordInsert, PostgresPolicyApprovalCommit};
 use rows::*;
 

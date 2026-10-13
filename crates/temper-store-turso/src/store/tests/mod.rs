@@ -2028,6 +2028,44 @@ async fn load_verification_cache_ignores_uncommitted_specs() {
 }
 
 #[tokio::test]
+async fn commit_spec_versions_commits_only_the_verified_version() {
+    let store = make_store("spec-commit-versions").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
+    for (entity_type, hash) in [("Issue", "sha256:issue-v1"), ("Note", "sha256:note-v1")] {
+        store
+            .upsert_spec(&tenant, entity_type, "[automaton]\n", csdl_xml, hash)
+            .await
+            .expect("upsert uncommitted spec");
+    }
+
+    // Issue was replaced by v2 after v1 verified; Note is the verified version.
+    let committed = store
+        .commit_spec_versions(
+            &tenant,
+            &[("Issue", "sha256:issue-v0"), ("Note", "sha256:note-v1")],
+        )
+        .await
+        .expect("commit versions");
+    assert_eq!(committed, 1);
+
+    let removed = store
+        .delete_uncommitted_specs()
+        .await
+        .expect("startup recovery");
+    assert_eq!(removed, 1, "only the unverified Issue row is dropped");
+    let restored: Vec<String> = store
+        .load_specs()
+        .await
+        .expect("load specs")
+        .into_iter()
+        .filter(|row| row.tenant == tenant)
+        .map(|row| row.entity_type)
+        .collect();
+    assert_eq!(restored, vec!["Note".to_string()]);
+}
+
+#[tokio::test]
 async fn upsert_wasm_module_preserves_version_for_identical_hash() {
     let store = make_store("wasm-idempotent").await;
 

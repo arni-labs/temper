@@ -650,6 +650,41 @@ impl TursoEventStore {
         Ok(())
     }
 
+    /// Commit exactly these spec versions, `(entity_type, content_hash)`, in
+    /// one transaction, and return how many rows became committed.
+    ///
+    /// A row whose content changed after it was verified stays as it is, so
+    /// another install of the same type is committed only by its own success.
+    #[instrument(skip_all, fields(tenant, otel.name = "turso.commit_spec_versions"))]
+    pub async fn commit_spec_versions(
+        &self,
+        tenant: &str,
+        versions: &[(&str, &str)],
+    ) -> Result<usize, PersistenceError> {
+        let _query_timer = TursoQueryTimer::start("turso.commit_spec_versions");
+        if versions.is_empty() {
+            return Ok(0);
+        }
+        let _write_permit = self
+            .acquire_write_permit("turso.commit_spec_versions", WritePriority::High)
+            .await?;
+        let conn = self.configured_connection().await?;
+        let tx = conn.begin_immediate().await.map_err(storage_error)?;
+        let mut committed = 0usize;
+        for (entity_type, content_hash) in versions {
+            committed += tx
+                .execute(
+                    "UPDATE specs SET committed = 1, updated_at = datetime('now') \
+                     WHERE tenant = ?1 AND entity_type = ?2 AND content_hash = ?3 AND committed != 1",
+                    params![tenant, *entity_type, *content_hash],
+                )
+                .await
+                .map_err(storage_error)? as usize;
+        }
+        tx.commit().await.map_err(storage_error)?;
+        Ok(committed)
+    }
+
     /// Delete all uncommitted specs across all tenants.
     #[instrument(skip_all, fields(otel.name = "turso.delete_uncommitted_specs"))]
     pub async fn delete_uncommitted_specs(&self) -> Result<usize, PersistenceError> {

@@ -654,6 +654,11 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
         }
     }
 
+    // The app's whole spec set, committed once every changed spec verifies.
+    let app_sources: BTreeMap<String, String> = ioa_sources
+        .iter()
+        .map(|(entity, source)| (entity.clone(), source.clone()))
+        .collect();
     let source_count = ioa_sources.len();
     ioa_sources = ioa_sources_requiring_background_verification(ioa_sources, &verification_cache);
     let skipped_count = source_count.saturating_sub(ioa_sources.len());
@@ -663,13 +668,14 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
         );
     }
 
+    let mut verifications = Vec::with_capacity(ioa_sources.len());
     for (entity_name, ioa_source) in ioa_sources {
         let registry = registry.clone();
         let server = server.clone();
         let tenant = tenant_str.clone();
         let entity = entity_name.clone();
 
-        tokio::spawn(async move {
+        verifications.push(tokio::spawn(async move {
             // Persist running status first, then update in-memory registry.
             if let Err(e) = server
                 .persist_spec_verification(&tenant, &entity, "running", None)
@@ -683,7 +689,7 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
                     eprintln!(
                         "Warning: failed to persist running verification status for {tenant}/{entity}: {e}"
                     );
-                    return;
+                    return false;
                 }
             }
             {
@@ -709,7 +715,7 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
                 eprintln!(
                     "Warning: failed to persist/emit verify_started for {tenant}/{entity}: {e}"
                 );
-                return;
+                return false;
             }
 
             println!("  [verify] Starting verification for {entity}...");
@@ -807,7 +813,7 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
                             eprintln!(
                                 "Warning: failed to persist final verification status for {tenant}/{entity}: {e}"
                             );
-                            return;
+                            return false;
                         }
                     }
                     {
@@ -843,6 +849,7 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
                     {
                         eprintln!("Warning: failed to persist/emit verify_done for {tenant}: {e}");
                     }
+                    all_passed
                 }
                 Err(e) => {
                     eprintln!("  [verify] {entity_clone}: verification failed: {e}");
@@ -875,7 +882,7 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
                             eprintln!(
                                 "Warning: failed to persist failed verification status for {tenant}/{entity_clone}: {persist_err}"
                             );
-                            return;
+                            return false;
                         }
                     }
                     {
@@ -905,10 +912,25 @@ async fn spawn_background_verification(state: &PlatformState, specs_dir: &str, t
                             "Warning: failed to persist/emit verify_done panic event for {tenant}: {event_err}"
                         );
                     }
+                    false
                 }
             }
-        });
+        }));
     }
+
+    // Without a commit, restart recovery drops the app's changed specs.
+    tokio::spawn(async move {
+        for verification in verifications {
+            if !verification.await.unwrap_or(false) {
+                return;
+            }
+        }
+        if let Err(e) = server.commit_spec_sources(&tenant_str, &app_sources).await
+            && !is_ephemeral_metadata_error(&e)
+        {
+            eprintln!("Warning: failed to commit verified specs for {tenant_str}: {e}");
+        }
+    });
 }
 
 fn ioa_sources_requiring_background_verification(
@@ -928,70 +950,5 @@ fn ioa_sources_requiring_background_verification(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{cache_platform_secret_if_present, ioa_sources_requiring_background_verification};
-    use std::collections::{BTreeMap, HashMap};
-    use temper_server::secrets::vault::SecretsVault;
-
-    fn test_vault() -> SecretsVault {
-        SecretsVault::new(&[0x42; 32])
-    }
-
-    #[test]
-    fn cache_platform_secret_if_present_stores_present_value() {
-        let vault = test_vault();
-
-        cache_platform_secret_if_present(&vault, "exa_api_key", Some("exa-live".to_string()));
-
-        assert_eq!(
-            vault.get_platform_secret("exa_api_key"),
-            Some("exa-live".to_string())
-        );
-    }
-
-    #[test]
-    fn cache_platform_secret_if_present_skips_missing_value() {
-        let vault = test_vault();
-
-        cache_platform_secret_if_present(&vault, "exa_api_key", None);
-
-        assert_eq!(vault.get_platform_secret("exa_api_key"), None);
-    }
-
-    #[test]
-    fn background_verification_skips_cached_verified_hashes() {
-        let mut ioa_sources = HashMap::new();
-        ioa_sources.insert(
-            "Issue".to_string(),
-            "[automaton]\nname = \"Issue\"\n".to_string(),
-        );
-        ioa_sources.insert(
-            "Task".to_string(),
-            "[automaton]\nname = \"Task\"\n".to_string(),
-        );
-
-        let mut verification_cache = BTreeMap::new();
-        verification_cache.insert(
-            "Issue".to_string(),
-            (
-                temper_store_turso::spec_content_hash(
-                    ioa_sources.get("Issue").expect("Issue source"),
-                ),
-                true,
-            ),
-        );
-        verification_cache.insert(
-            "Task".to_string(),
-            (
-                temper_store_turso::spec_content_hash("different source"),
-                true,
-            ),
-        );
-
-        let pending =
-            ioa_sources_requiring_background_verification(ioa_sources, &verification_cache);
-
-        assert_eq!(pending.len(), 1);
-        assert!(pending.contains_key("Task"));
-    }
-}
+#[path = "mod_test.rs"]
+mod tests;

@@ -237,10 +237,17 @@ pub async fn restore_registry_from_postgres_store(
     registry: &mut SpecRegistry,
     store: &temper_store_postgres::PostgresEventStore,
 ) -> Result<usize, String> {
+    // Same rule as Turso: a spec is restored only once its install committed.
+    match store.delete_uncommitted_specs().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("deleted {n} uncommitted specs during startup recovery"),
+        Err(e) => tracing::warn!("failed to delete uncommitted specs: {e}"),
+    }
     let rows: Vec<PersistedSpecRow> = sqlx::query_as(&store.schema().qualify_sql(
         "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
                 levels_passed, levels_total, verification_result, updated_at \
          FROM {schema}specs \
+         WHERE committed = true \
          ORDER BY tenant, entity_type",
     ))
     .fetch_all(store.pool())

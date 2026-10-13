@@ -52,29 +52,14 @@ pub(super) async fn upsert_loaded_specs_to_postgres(
     tenant: &str,
     loaded: &LoadedTenantSpecs,
 ) -> Result<()> {
+    // Same write as Turso: a changed spec stays uncommitted until it verifies.
+    let store = PostgresEventStore::new(pool.clone());
     for (entity_type, ioa_source) in &loaded.ioa_sources {
-        sqlx::query(
-            "INSERT INTO specs \
-             (tenant, entity_type, ioa_source, csdl_xml, version, verified, verification_status, updated_at) \
-             VALUES ($1, $2, $3, $4, 1, false, 'pending', now()) \
-             ON CONFLICT (tenant, entity_type) DO UPDATE SET \
-                 ioa_source = EXCLUDED.ioa_source, \
-                 csdl_xml = EXCLUDED.csdl_xml, \
-                 version = specs.version + 1, \
-                 verified = false, \
-                 verification_status = 'pending', \
-                 levels_passed = NULL, \
-                 levels_total = NULL, \
-                 verification_result = NULL, \
-                 updated_at = now()",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(ioa_source)
-        .bind(&loaded.csdl_xml)
-        .execute(pool)
-        .await
-        .with_context(|| format!("Failed to persist spec {tenant}/{entity_type}"))?;
+        let hash = temper_store_turso::spec_content_hash(ioa_source);
+        store
+            .upsert_spec(tenant, entity_type, ioa_source, &loaded.csdl_xml, &hash)
+            .await
+            .with_context(|| format!("Failed to persist spec {tenant}/{entity_type}"))?;
     }
     if let Some(source) = loaded.cross_invariants_toml.as_deref() {
         sqlx::query(

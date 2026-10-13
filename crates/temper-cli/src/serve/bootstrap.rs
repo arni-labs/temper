@@ -79,6 +79,7 @@ pub(super) async fn init_storage(
                     router = router.with_cloud_config(api_token, org, group);
                     println!("  Cloud provisioning: enabled");
                 }
+                ensure_default_tenant(&router).await?;
 
                 let tenant_count = router.connected_tenants().await.len();
                 println!(
@@ -123,6 +124,22 @@ pub(super) async fn init_storage(
         }
     };
     Ok((pg_pool, storage_stack))
+}
+
+/// Register tenant `default` in a routed platform DB. The operator credential
+/// and the built-in specs live there, and a fresh platform DB has no tenants,
+/// so without this every request to `default` fails with "not found in
+/// registry". `temper-system` needs no row: it is served by the platform DB.
+async fn ensure_default_tenant(router: &TenantStoreRouter) -> Result<()> {
+    let tenant = TenantId::default();
+    let existed = router
+        .ensure_tenant(tenant.as_str())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to register tenant '{tenant}': {e}"))?;
+    if !existed {
+        println!("  Registered tenant '{tenant}' in the platform DB");
+    }
+    Ok(())
 }
 
 /// Phase 2: Build the spec registry from persistent storage and disk apps.
@@ -447,8 +464,10 @@ pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, St
     agent_spec_tenants.insert("default".to_string());
 
     let default_cache = load_verified_cache(state, "default").await;
+    // Merge like every other tenant: `default` may already hold specs restored
+    // in Phase 2, and replacing its entity sets would hide them until reinstall.
     let default_hashes =
-        temper_platform::bootstrap_agent_specs(state, "default", false, &default_cache);
+        temper_platform::bootstrap_agent_specs(state, "default", true, &default_cache);
     if let Some(turso) = state.server.turso_store_for_tenant("default").await {
         temper_platform::persist_agent_verification(
             &turso,
@@ -647,9 +666,91 @@ mod tests {
     use temper_runtime::tenant::TenantId;
     use temper_server::storage::StorageStack;
     use temper_spec::csdl::parse_csdl;
-    use temper_store_turso::TursoEventStore;
+    use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
-    use super::bootstrap_installed_apps;
+    use super::{bootstrap_installed_apps, bootstrap_tenants, ensure_default_tenant};
+
+    #[tokio::test]
+    async fn agent_bootstrap_keeps_specs_restored_into_default() {
+        const NOTE_CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Temper" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Note">
+        <Key><PropertyRef Name="id"/></Key>
+        <Property Name="id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="Service">
+        <EntitySet Name="Notes" EntityType="Temper.Note"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"#;
+        const NOTE_IOA: &str =
+            "[automaton]\nname = \"Note\"\nstates = [\"Draft\"]\ninitial = \"Draft\"\n";
+
+        // Phase 2 restored a user spec into `default`.
+        let state = PlatformState::new(None);
+        state.registry.write().unwrap().register_tenant(
+            "default",
+            parse_csdl(NOTE_CSDL).expect("csdl"),
+            NOTE_CSDL.to_string(),
+            &[("Note", NOTE_IOA)],
+        );
+
+        bootstrap_tenants(&state, &[]).await;
+
+        let registry = state.registry.read().unwrap();
+        let config = registry
+            .get_tenant(&TenantId::new("default"))
+            .expect("tenant default");
+        assert_eq!(
+            config.entity_set_map.get("Notes").map(String::as_str),
+            Some("Note"),
+            "agent bootstrap must not hide restored entity sets in default"
+        );
+        assert!(config.entity_set_map.contains_key("AgentTypes"));
+    }
+
+    #[tokio::test]
+    async fn routed_boot_registers_default_tenant_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform_url = format!("file:{}", dir.path().join("platform.db").display());
+        let tenants_dir = dir.path().join("tenants").display().to_string();
+
+        // First boot on an empty platform DB.
+        let router = TenantStoreRouter::new(&platform_url, None, Some(tenants_dir.clone()))
+            .await
+            .expect("router");
+        ensure_default_tenant(&router).await.expect("first boot");
+        let store = router
+            .store_for_tenant("default")
+            .await
+            .expect("tenant default must resolve after a fresh routed boot");
+        store
+            .record_installed_app("default", "probe-app")
+            .await
+            .expect("write to tenant default");
+        drop(router);
+
+        // Restart: the same row and database come back, nothing is re-provisioned.
+        let router = TenantStoreRouter::new(&platform_url, None, Some(tenants_dir))
+            .await
+            .expect("router after restart");
+        ensure_default_tenant(&router).await.expect("second boot");
+        assert_eq!(
+            router.list_tenants().await.expect("tenants"),
+            vec!["default".to_string()]
+        );
+        let apps = router
+            .store_for_tenant("default")
+            .await
+            .expect("tenant default after restart")
+            .list_all_installed_apps()
+            .await
+            .expect("installed apps");
+        assert_eq!(apps, vec![("default".to_string(), "probe-app".to_string())]);
+    }
 
     #[tokio::test]
     async fn bootstrap_installed_apps_replays_persisted_app_when_registry_specs_are_stale() {
