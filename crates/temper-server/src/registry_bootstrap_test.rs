@@ -445,3 +445,58 @@ async fn converted_specs_keep_their_verification() {
         "an unverified spec is not marked verified by the conversion"
     );
 }
+
+/// Converting stored specs commits only the converted rows: another install
+/// in the tenant that is still pending stays uncommitted.
+#[tokio::test]
+async fn converted_specs_commit_only_their_own_rows() {
+    use crate::platform_store::PlatformStore;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let url = format!("file:{}", directory.path().join("specs.db").display());
+    let store = temper_store_turso::TursoEventStore::new(&url, None)
+        .await
+        .expect("turso store");
+    let task_csdl = csdl_xml_for("Task", "Tasks");
+    PlatformStore::upsert_spec(
+        &store,
+        "default",
+        "Task",
+        LEGACY_TASK_IOA,
+        &task_csdl,
+        &temper_store_turso::spec_content_hash(LEGACY_TASK_IOA),
+    )
+    .await
+    .expect("seed Task");
+    PlatformStore::commit_specs(&store, "default")
+        .await
+        .expect("commit Task");
+    let pending_ioa = "[automaton]\nname = \"Note\"\nstates = [\"Draft\"]\ninitial = \"Draft\"\n";
+    PlatformStore::upsert_spec(
+        &store,
+        "default",
+        "Note",
+        pending_ioa,
+        &csdl_xml_for("Note", "Notes"),
+        &temper_store_turso::spec_content_hash(pending_ioa),
+    )
+    .await
+    .expect("seed a pending install");
+
+    let mut registry = SpecRegistry::new();
+    restore_registry_from_platform_store(&mut registry, &store)
+        .await
+        .expect("restore");
+
+    let restorable: Vec<String> = PlatformStore::load_specs(&store)
+        .await
+        .expect("load specs")
+        .into_iter()
+        .map(|row| row.entity_type)
+        .collect();
+    assert_eq!(
+        restorable,
+        vec!["Task".to_string()],
+        "the pending Note install must not be committed by the conversion"
+    );
+}

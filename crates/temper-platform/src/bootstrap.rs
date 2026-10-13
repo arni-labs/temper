@@ -1203,6 +1203,45 @@ initial = "Created"
     }
 
     #[tokio::test]
+    async fn bootstrap_persistence_commits_only_its_own_specs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = temper_store_turso::TursoEventStore::new(
+            &format!("file:{}", dir.path().join("specs.db").display()),
+            None,
+        )
+        .await
+        .expect("turso store");
+        // Another install in this tenant, still verifying.
+        PlatformStore::upsert_spec(&store, "t", "Note", "note v1", "<csdl/>", "sha256:note")
+            .await
+            .expect("seed a pending install");
+
+        let hashes = vec![("Agent".to_string(), "sha256:agent".to_string())];
+        persist_bootstrap_verification(
+            &store,
+            "t",
+            &[("Agent", "agent source")],
+            "<csdl/>",
+            &hashes,
+            &BTreeMap::new(),
+        )
+        .await;
+
+        let restorable: Vec<String> = PlatformStore::load_specs(&store)
+            .await
+            .expect("load specs")
+            .into_iter()
+            .filter(|row| row.tenant == "t")
+            .map(|row| row.entity_type)
+            .collect();
+        assert_eq!(
+            restorable,
+            vec!["Agent".to_string()],
+            "bootstrap must not commit another install's pending row"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_identity_specs_registers_both_entity_sets() {
         let state = PlatformState::new(None);
         bootstrap_identity_specs(&state, "app-tenant")

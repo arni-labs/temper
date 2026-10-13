@@ -10,7 +10,38 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 
 use crate::PostgresEventStore;
 
+/// An uncommitted row younger than this may belong to an install still
+/// verifying in another replica, so startup cleanup leaves it alone. Restore
+/// already loads the committed version, so waiting costs only the cleanup.
+const ABANDONED_INSTALL_AGE: &str = "1 hour";
+
 impl PostgresEventStore {
+    /// Lock a spec row until the transaction ends.
+    ///
+    /// At READ COMMITTED each statement takes its own snapshot. Without the
+    /// lock, an upsert could read the row while another transaction is
+    /// committing a new version (and dropping the saved copy), save nothing,
+    /// then overwrite that version once its lock frees: no committed version
+    /// would remain. Taking the lock first makes every later statement of the
+    /// transaction see the row as last committed.
+    async fn lock_spec_row(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<(), PersistenceError> {
+        crate::dbm::postgres_query!(
+            &self.schema,
+            "SELECT 1 FROM {schema}specs WHERE tenant = $1 AND entity_type = $2 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(entity_type)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        Ok(())
+    }
+
     /// Upsert a spec source with content-hash gating: an unchanged spec keeps
     /// its row as it is; a changed one is written uncommitted and pending.
     pub async fn upsert_spec(
@@ -22,6 +53,8 @@ impl PostgresEventStore {
         content_hash: &str,
     ) -> Result<(), PersistenceError> {
         let mut transaction = self.pool().begin().await.map_err(storage_error)?;
+        self.lock_spec_row(&mut transaction, tenant, entity_type)
+            .await?;
         crate::dbm::postgres_query!(&self.schema,
             "INSERT INTO {schema}spec_committed_versions \
              (tenant, entity_type, ioa_source, csdl_xml, content_hash, version, verified, \
@@ -128,6 +161,8 @@ impl PostgresEventStore {
         }
         let mut transaction = self.pool().begin().await.map_err(storage_error)?;
         for (entity_type, content_hash, csdl_xml) in versions {
+            self.lock_spec_row(&mut transaction, tenant, entity_type)
+                .await?;
             let committed: bool = crate::dbm::postgres_query_scalar!(
                 &self.schema,
                 "WITH promoted AS ( \
@@ -178,8 +213,8 @@ impl PostgresEventStore {
     }
 
     /// Discard abandoned installs (startup recovery) and return how many
-    /// uncommitted versions were discarded. An uncommitted row older than an
-    /// hour returns to its saved committed version, or is removed when its
+    /// uncommitted versions were discarded. An uncommitted row older than
+    /// [`ABANDONED_INSTALL_AGE`] returns to its saved committed version, or is removed when its
     /// type never committed. Younger rows may be another replica's install in
     /// flight and are left alone; restore already loads the committed version.
     pub async fn delete_uncommitted_specs(&self) -> Result<usize, PersistenceError> {
@@ -192,15 +227,17 @@ impl PostgresEventStore {
                  verification_result = b.verification_result, updated_at = b.updated_at, committed = true \
              FROM {schema}spec_committed_versions AS b \
              WHERE s.tenant = b.tenant AND s.entity_type = b.entity_type \
-               AND s.committed = false AND s.updated_at < now() - interval '1 hour'",
+               AND s.committed = false AND s.updated_at < now() - $1::interval",
         )
+        .bind(ABANDONED_INSTALL_AGE)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
         let deleted = crate::dbm::postgres_query!(
             &self.schema,
-            "DELETE FROM {schema}specs WHERE committed = false AND updated_at < now() - interval '1 hour'"
+            "DELETE FROM {schema}specs WHERE committed = false AND updated_at < now() - $1::interval"
         )
+        .bind(ABANDONED_INSTALL_AGE)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

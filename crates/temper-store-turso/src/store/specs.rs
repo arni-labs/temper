@@ -332,15 +332,16 @@ impl TursoEventStore {
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_spec");
         let conn = self.configured_connection().await?;
+        let tx = conn.begin_immediate().await.map_err(storage_error)?;
         for sql in [
             "DELETE FROM specs WHERE tenant = ?1 AND entity_type = ?2",
             "DELETE FROM spec_committed_versions WHERE tenant = ?1 AND entity_type = ?2",
         ] {
-            conn.execute(sql, params![tenant, entity_type])
+            tx.execute(sql, params![tenant, entity_type])
                 .await
                 .map_err(storage_error)?;
         }
-        Ok(())
+        tx.commit().await.map_err(storage_error)
     }
 
     /// Persist verification result for a spec.
@@ -677,18 +678,19 @@ impl TursoEventStore {
     pub async fn commit_specs(&self, tenant: &str) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.commit_specs");
         let conn = self.configured_connection().await?;
-        conn.execute(
+        let tx = conn.begin_immediate().await.map_err(storage_error)?;
+        tx.execute(
             "UPDATE specs SET committed = 1, updated_at = datetime('now') WHERE tenant = ?1 AND committed != 1",
             params![tenant],
         )
         .await
         .map_err(storage_error)?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM spec_committed_versions WHERE tenant = ?1",
             params![tenant],
         )
         .await
         .map_err(storage_error)?;
-        Ok(())
+        tx.commit().await.map_err(storage_error)
     }
 }
