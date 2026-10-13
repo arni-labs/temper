@@ -884,6 +884,8 @@ mod sim_platform_store {
         faults: SimPlatformFaultConfig,
         /// Specs keyed by (tenant, entity_type).
         specs: BTreeMap<(String, String), SpecRow>,
+        /// Last committed version of a spec whose row is uncommitted.
+        committed_versions: BTreeMap<(String, String), SpecRow>,
         /// Verification cache: (tenant, entity_type) -> (content_hash, verified).
         verification_cache: BTreeMap<(String, String), (String, bool)>,
         /// Cedar policies keyed by tenant.
@@ -910,6 +912,7 @@ mod sim_platform_store {
                     rng: DeterministicRng::new(seed),
                     faults,
                     specs: BTreeMap::new(),
+                    committed_versions: BTreeMap::new(),
                     verification_cache: BTreeMap::new(),
                     policies: BTreeMap::new(),
                     policy_entries: BTreeMap::new(),
@@ -996,6 +999,14 @@ mod sim_platform_store {
             }
 
             let key = (tenant.to_string(), entity_type.to_string());
+            if let Some(existing) = inner.specs.get(&key).filter(|row| {
+                row.committed
+                    && (row.content_hash != content_hash
+                        || row.csdl_xml.as_deref() != Some(csdl_xml))
+            }) {
+                let saved = existing.clone();
+                inner.committed_versions.insert(key.clone(), saved);
+            }
             inner.specs.insert(
                 key,
                 SpecRow {
@@ -1032,9 +1043,9 @@ mod sim_platform_store {
             if inner.rng.chance(prob) {
                 return Err("SimPlatformStore: injected cleanup failure".into());
             }
-            inner
-                .specs
-                .remove(&(tenant.to_string(), entity_type.to_string()));
+            let key = (tenant.to_string(), entity_type.to_string());
+            inner.specs.remove(&key);
+            inner.committed_versions.remove(&key);
             Ok(())
         }
 
@@ -1045,14 +1056,24 @@ mod sim_platform_store {
                     spec.committed = true;
                 }
             }
+            inner.committed_versions.retain(|(t, _), _| t != tenant);
             Ok(())
         }
 
         async fn delete_uncommitted_specs(&self) -> Result<usize, String> {
             let mut inner = self.inner.lock().expect("SimPlatformStore lock poisoned"); // ci-ok: infallible lock
+            // An uncommitted row returns to its last committed version, if any.
+            let saved = std::mem::take(&mut inner.committed_versions);
+            let mut discarded = 0;
+            for (key, version) in saved {
+                if let Some(row) = inner.specs.get_mut(&key).filter(|row| !row.committed) {
+                    *row = version;
+                    discarded += 1;
+                }
+            }
             let before = inner.specs.len();
             inner.specs.retain(|_, s| s.committed);
-            Ok(before - inner.specs.len())
+            Ok(discarded + before - inner.specs.len())
         }
 
         async fn load_verification_cache(

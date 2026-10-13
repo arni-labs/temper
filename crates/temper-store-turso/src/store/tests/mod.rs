@@ -2066,6 +2066,69 @@ async fn commit_spec_versions_commits_only_the_verified_version() {
 }
 
 #[tokio::test]
+async fn startup_recovery_returns_a_failed_reinstall_to_its_committed_version() {
+    let store = make_store("spec-committed-version-recovery").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
+    let hashes = |rows: Vec<crate::TursoSpecRow>| -> Vec<(String, Option<String>)> {
+        rows.into_iter()
+            .filter(|row| row.tenant == tenant)
+            .map(|row| (row.entity_type, row.content_hash))
+            .collect()
+    };
+
+    // Issue v1 and Note v1 are installed and committed.
+    for (entity_type, hash) in [("Issue", "sha256:issue-v1"), ("Note", "sha256:note-v1")] {
+        store
+            .upsert_spec(&tenant, entity_type, "v1", csdl_xml, hash)
+            .await
+            .expect("upsert v1");
+    }
+    store.commit_specs(&tenant).await.expect("commit v1");
+
+    // Issue v2 never commits (failed verification); Note v2 commits; Task
+    // is new and never commits.
+    store
+        .upsert_spec(&tenant, "Issue", "v2", csdl_xml, "sha256:issue-v2")
+        .await
+        .expect("upsert Issue v2");
+    store
+        .upsert_spec(&tenant, "Note", "v2", csdl_xml, "sha256:note-v2")
+        .await
+        .expect("upsert Note v2");
+    store
+        .commit_spec_versions(&tenant, &[("Note", "sha256:note-v2")])
+        .await
+        .expect("commit Note v2");
+    store
+        .upsert_spec(&tenant, "Task", "v1", csdl_xml, "sha256:task-v1")
+        .await
+        .expect("upsert Task");
+
+    let discarded = store
+        .delete_uncommitted_specs()
+        .await
+        .expect("startup recovery");
+    assert_eq!(discarded, 2, "Issue v2 and Task are discarded");
+    assert_eq!(
+        hashes(store.load_specs().await.expect("load specs")),
+        vec![
+            ("Issue".to_string(), Some("sha256:issue-v1".to_string())),
+            ("Note".to_string(), Some("sha256:note-v2".to_string())),
+        ],
+        "a failed reinstall returns to its committed version; a new type that never committed is gone"
+    );
+    assert_eq!(
+        store
+            .delete_uncommitted_specs()
+            .await
+            .expect("second recovery"),
+        0,
+        "recovery leaves nothing to redo"
+    );
+}
+
+#[tokio::test]
 async fn upsert_wasm_module_preserves_version_for_identical_hash() {
     let store = make_store("wasm-idempotent").await;
 

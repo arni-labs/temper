@@ -10,6 +10,27 @@ use super::{TursoEventStore, TursoInstalledAppRow, TursoSpecRow, write_gate::Wri
 use crate::TursoSpecVerificationUpdate;
 use crate::metrics::TursoQueryTimer;
 
+/// Columns a saved committed version carries, in `spec_committed_versions` order.
+const SPEC_VERSION_COLUMNS: &str = "tenant, entity_type, ioa_source, csdl_xml, content_hash, \
+     version, verified, verification_status, levels_passed, levels_total, \
+     verification_result, updated_at";
+
+/// A committed spec version saved while its row holds an uncommitted one.
+struct SavedSpecVersion {
+    tenant: String,
+    entity_type: String,
+    ioa_source: String,
+    csdl_xml: Option<String>,
+    content_hash: Option<String>,
+    version: i64,
+    verified: i64,
+    verification_status: String,
+    levels_passed: Option<i64>,
+    levels_total: Option<i64>,
+    verification_result: Option<String>,
+    updated_at: String,
+}
+
 #[derive(Debug)]
 struct ExistingSpecFingerprint {
     content_hash: Option<String>,
@@ -37,9 +58,23 @@ impl TursoEventStore {
             .acquire_write_permit("turso.upsert_spec", WritePriority::High)
             .await?;
         let conn = self.configured_connection().await?;
+        let tx = conn.begin_immediate().await.map_err(storage_error)?;
+        // A committed version about to be replaced is kept until the new one
+        // commits, so startup recovery can put it back.
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO spec_committed_versions ({SPEC_VERSION_COLUMNS}) \
+                 SELECT {SPEC_VERSION_COLUMNS} FROM specs \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND committed = 1 \
+                   AND (content_hash IS NOT ?3 OR csdl_xml IS NOT ?4)"
+            ),
+            params![tenant, entity_type, content_hash, csdl_xml],
+        )
+        .await
+        .map_err(storage_error)?;
         // When content_hash matches the existing row, keep verification intact.
         // Otherwise reset to pending so the cascade re-runs.
-        conn.execute(
+        tx.execute(
             "INSERT INTO specs (tenant, entity_type, ioa_source, csdl_xml, content_hash, committed, version, verified, verification_status, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, 1, 0, 'pending', datetime('now'))
              ON CONFLICT (tenant, entity_type) DO UPDATE SET
@@ -80,6 +115,7 @@ impl TursoEventStore {
         )
         .await
         .map_err(storage_error)?;
+        tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
 
@@ -152,6 +188,12 @@ impl TursoEventStore {
                          WHEN specs.content_hash IS NOT excluded.content_hash OR specs.csdl_xml IS NOT excluded.csdl_xml OR specs.committed != 1
                          THEN datetime('now') ELSE specs.updated_at END",
                 params![tenant, entity_type, ioa_source, csdl_xml, content_hash],
+            )
+            .await
+            .map_err(storage_error)?;
+            tx.execute(
+                "DELETE FROM spec_committed_versions WHERE tenant = ?1 AND entity_type = ?2",
+                params![tenant, entity_type],
             )
             .await
             .map_err(storage_error)?;
@@ -310,12 +352,14 @@ impl TursoEventStore {
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_spec");
         let conn = self.configured_connection().await?;
-        conn.execute(
+        for sql in [
             "DELETE FROM specs WHERE tenant = ?1 AND entity_type = ?2",
-            params![tenant, entity_type],
-        )
-        .await
-        .map_err(storage_error)?;
+            "DELETE FROM spec_committed_versions WHERE tenant = ?1 AND entity_type = ?2",
+        ] {
+            conn.execute(sql, params![tenant, entity_type])
+                .await
+                .map_err(storage_error)?;
+        }
         Ok(())
     }
 
@@ -647,6 +691,12 @@ impl TursoEventStore {
         )
         .await
         .map_err(storage_error)?;
+        conn.execute(
+            "DELETE FROM spec_committed_versions WHERE tenant = ?1",
+            params![tenant],
+        )
+        .await
+        .map_err(storage_error)?;
         Ok(())
     }
 
@@ -672,28 +722,99 @@ impl TursoEventStore {
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         let mut committed = 0usize;
         for (entity_type, content_hash) in versions {
-            committed += tx
+            let affected = tx
                 .execute(
                     "UPDATE specs SET committed = 1, updated_at = datetime('now') \
                      WHERE tenant = ?1 AND entity_type = ?2 AND content_hash = ?3 AND committed != 1",
                     params![tenant, *entity_type, *content_hash],
                 )
                 .await
-                .map_err(storage_error)? as usize;
+                .map_err(storage_error)?;
+            if affected > 0 {
+                tx.execute(
+                    "DELETE FROM spec_committed_versions WHERE tenant = ?1 AND entity_type = ?2",
+                    params![tenant, *entity_type],
+                )
+                .await
+                .map_err(storage_error)?;
+            }
+            committed += affected as usize;
         }
         tx.commit().await.map_err(storage_error)?;
         Ok(committed)
     }
 
-    /// Delete all uncommitted specs across all tenants.
+    /// Discard every uncommitted spec version (startup recovery), and return
+    /// how many were discarded. A type that had a committed version gets it
+    /// back; a type that never committed is removed.
     #[instrument(skip_all, fields(otel.name = "turso.delete_uncommitted_specs"))]
     pub async fn delete_uncommitted_specs(&self) -> Result<usize, PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_uncommitted_specs");
+        let _write_permit = self
+            .acquire_write_permit("turso.delete_uncommitted_specs", WritePriority::High)
+            .await?;
         let conn = self.configured_connection().await?;
-        let affected = conn
-            .execute("DELETE FROM specs WHERE committed = 0", ())
+        let tx = conn.begin_immediate().await.map_err(storage_error)?;
+        let mut rows = tx
+            .query(
+                &format!("SELECT {SPEC_VERSION_COLUMNS} FROM spec_committed_versions"),
+                (),
+            )
             .await
             .map_err(storage_error)?;
-        Ok(affected as usize)
+        let mut saved = Vec::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            saved.push(SavedSpecVersion {
+                tenant: row.get(0).map_err(storage_error)?,
+                entity_type: row.get(1).map_err(storage_error)?,
+                ioa_source: row.get(2).map_err(storage_error)?,
+                csdl_xml: row.get(3).map_err(storage_error)?,
+                content_hash: row.get(4).map_err(storage_error)?,
+                version: row.get(5).map_err(storage_error)?,
+                verified: row.get(6).map_err(storage_error)?,
+                verification_status: row.get(7).map_err(storage_error)?,
+                levels_passed: row.get(8).map_err(storage_error)?,
+                levels_total: row.get(9).map_err(storage_error)?,
+                verification_result: row.get(10).map_err(storage_error)?,
+                updated_at: row.get(11).map_err(storage_error)?,
+            });
+        }
+        drop(rows);
+        let mut discarded = 0usize;
+        for v in &saved {
+            discarded += tx
+                .execute(
+                    "UPDATE specs SET ioa_source = ?3, csdl_xml = ?4, content_hash = ?5, \
+                         version = ?6, verified = ?7, verification_status = ?8, \
+                         levels_passed = ?9, levels_total = ?10, verification_result = ?11, \
+                         updated_at = ?12, committed = 1 \
+                     WHERE tenant = ?1 AND entity_type = ?2 AND committed = 0",
+                    params![
+                        v.tenant.as_str(),
+                        v.entity_type.as_str(),
+                        v.ioa_source.as_str(),
+                        v.csdl_xml.clone(),
+                        v.content_hash.clone(),
+                        v.version,
+                        v.verified,
+                        v.verification_status.as_str(),
+                        v.levels_passed,
+                        v.levels_total,
+                        v.verification_result.clone(),
+                        v.updated_at.as_str()
+                    ],
+                )
+                .await
+                .map_err(storage_error)? as usize;
+        }
+        discarded += tx
+            .execute("DELETE FROM specs WHERE committed = 0", ())
+            .await
+            .map_err(storage_error)? as usize;
+        tx.execute("DELETE FROM spec_committed_versions", ())
+            .await
+            .map_err(storage_error)?;
+        tx.commit().await.map_err(storage_error)?;
+        Ok(discarded)
     }
 }

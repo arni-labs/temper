@@ -240,8 +240,10 @@ pub async fn restore_registry_from_postgres_store(
     // Same rule as Turso: a spec is restored only once its install committed.
     match store.delete_uncommitted_specs().await {
         Ok(0) => {}
-        Ok(n) => tracing::info!("deleted {n} uncommitted specs during startup recovery"),
-        Err(e) => tracing::warn!("failed to delete uncommitted specs: {e}"),
+        Ok(n) => tracing::info!(
+            "discarded {n} uncommitted spec versions during startup recovery; types with a committed version keep it"
+        ),
+        Err(e) => tracing::warn!("failed to discard uncommitted spec versions: {e}"),
     }
     let rows: Vec<PersistedSpecRow> = sqlx::query_as(&store.schema().qualify_sql(
         "SELECT tenant, entity_type, ioa_source, csdl_xml, verification_status, verified, \
@@ -297,11 +299,13 @@ pub async fn restore_registry_from_turso(
     registry: &mut SpecRegistry,
     turso: &TursoEventStore,
 ) -> Result<usize, String> {
-    // GC uncommitted specs left behind by interrupted install_os_app writes.
+    // Discard uncommitted spec versions left by failed or interrupted installs.
     match turso.delete_uncommitted_specs().await {
         Ok(0) => {}
-        Ok(n) => tracing::info!("deleted {n} uncommitted specs during startup recovery"),
-        Err(e) => tracing::warn!("failed to delete uncommitted specs: {e}"),
+        Ok(n) => tracing::info!(
+            "discarded {n} uncommitted spec versions during startup recovery; types with a committed version keep it"
+        ),
+        Err(e) => tracing::warn!("failed to discard uncommitted spec versions: {e}"),
     }
     let rows = turso
         .load_specs()
@@ -350,8 +354,10 @@ pub async fn restore_registry_from_platform_store(
 ) -> Result<usize, String> {
     match store.delete_uncommitted_specs().await {
         Ok(0) => {}
-        Ok(n) => tracing::info!("deleted {n} uncommitted specs during startup recovery"),
-        Err(e) => tracing::warn!("failed to delete uncommitted specs: {e}"),
+        Ok(n) => tracing::info!(
+            "discarded {n} uncommitted spec versions during startup recovery; types with a committed version keep it"
+        ),
+        Err(e) => tracing::warn!("failed to discard uncommitted spec versions: {e}"),
     }
     let rows = store
         .load_specs()
