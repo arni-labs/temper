@@ -7281,6 +7281,7 @@ dependencies = [
  "tokio-test",
  "toml",
  "tower",
+ "tower-http",
  "tracing",
  "uuid",
  "wiremock",

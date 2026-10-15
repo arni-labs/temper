@@ -71,6 +71,16 @@ pub fn is_public_kernel_request(method: &Method, path: &str) -> bool {
         || (method == Method::GET && path.starts_with("/genesis/"))
 }
 
+/// A browser's CORS preflight: `OPTIONS` with an `Origin` and the method it asks to send. It carries no credential by
+/// the fetch standard, so it is admitted without one; the router's CORS layer answers it and no route runs.
+pub fn is_cors_preflight(request: &Request) -> bool {
+    request.method() == Method::OPTIONS
+        && request.headers().contains_key(axum::http::header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
 /// Routes that serve an anonymous caller, but must still resolve a credential
 /// when one is presented.
 ///
@@ -116,6 +126,7 @@ pub async fn require_authenticated_request_context(request: Request, next: Next)
     // public kernel request instead would have discarded that credential before
     // resolution ever ran.
     if is_public_kernel_request(request.method(), request.uri().path())
+        || is_cors_preflight(&request)
         || allows_anonymous_fallback(request.method(), request.uri().path())
         || request
             .extensions()

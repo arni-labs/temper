@@ -287,6 +287,9 @@ fn request_credential(req: &Request) -> Option<String> {
 
 fn is_public_request(req: &Request) -> bool {
     temper_server::authz::is_public_kernel_request(req.method(), req.uri().path())
+        // A browser asking whether it may send a request (a page putting a file straight into an app's Temper) sends
+        // no credential; the kernel router's CORS layer answers it and no route runs.
+        || temper_server::authz::is_cors_preflight(req)
         || matches!(
             (req.method(), req.uri().path()),
             (&Method::GET, "/healthz")
