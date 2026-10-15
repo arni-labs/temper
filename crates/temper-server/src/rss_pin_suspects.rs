@@ -12,10 +12,16 @@ use axum::body::{Body, to_bytes};
 use temper_authz::{AuthzEngine, ListReadUniformity, Principal, PrincipalKind, SecurityContext};
 
 fn rss_bytes() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").expect("status");
+    let status = std::fs::read_to_string("/proc/self/status") // determinism-ok: test RSS probe reads /proc
+        .expect("status");
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: u64 = rest.split_whitespace().next().unwrap().parse().unwrap();
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .expect("VmRSS kilobytes")
+                .parse()
+                .expect("VmRSS is a number");
             return kb * 1024;
         }
     }
