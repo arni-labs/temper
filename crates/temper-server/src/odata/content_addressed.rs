@@ -43,7 +43,7 @@ use crate::state::ServerState;
 
 const EXPECTED_OBJECT_ID_HEADER: &str = "x-expected-object-id";
 
-mod responses;
+pub(in crate::odata) mod responses;
 use responses::{
     blob_store_error_response, remove_binary_fields_from_create_response, stage_error_response,
 };

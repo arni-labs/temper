@@ -19,6 +19,7 @@ mod http_client;
 mod keys;
 mod limits;
 mod local;
+mod presign;
 mod raw_ingest;
 mod s3_buffered_get;
 mod state;
@@ -27,6 +28,7 @@ pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endp
 pub(crate) use keys::{DEFAULT_BLOB_BUCKET, hex_lower, wasm_artifact_key};
 use limits::{BLOB_BUFFERED_OPERATION_TIMEOUT, BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore};
 use local::{get_local_blob_observed, local_blob_path, put_local_blob_observed};
+pub(crate) use presign::PresignedResponse;
 pub use raw_ingest::BlobByteStream;
 #[cfg(test)]
 pub(crate) use raw_ingest::BlobIngestProgressPolicy;
@@ -55,6 +57,8 @@ struct S3BlobStore {
     key_prefix: Option<String>,
     access_key: Option<String>,
     secret_key: Option<String>,
+    /// The session token of temporary credentials (`x-amz-security-token`), signed with every request.
+    session_token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -83,9 +87,24 @@ impl BlobStore {
                 key_prefix,
                 access_key,
                 secret_key,
+                session_token: None,
                 client: http_client::shared_client(),
             }),
         }
+    }
+
+    /// Sign every object-store request with the session token of temporary credentials (R2 and S3 issue them with
+    /// their own access key and secret). No effect on a local store.
+    pub(crate) fn with_session_token(mut self, token: Option<String>) -> Self {
+        if let BlobStoreBackend::S3(store) = &mut self.backend {
+            store.session_token = token.filter(|token| !token.trim().is_empty());
+        }
+        self
+    }
+
+    /// Whether the bytes live in a remote object store (R2/S3) rather than on this server's disk.
+    pub(crate) fn is_object_store(&self) -> bool {
+        matches!(self.backend, BlobStoreBackend::S3(_))
     }
 
     pub(crate) async fn put_if_absent(
@@ -416,7 +435,12 @@ impl S3BlobStore {
         };
 
         let amz_date = aws_sigv4::amz_date_now();
-        aws_sigv4::build_signed_headers(&aws_sigv4::SignedHeaderRequest {
+        let token = self.session_token.as_deref();
+        let extra: Vec<(&str, &str)> = token
+            .map(|token| ("x-amz-security-token", token))
+            .into_iter()
+            .collect();
+        let mut headers = aws_sigv4::build_signed_headers(&aws_sigv4::SignedHeaderRequest {
             method: method.as_str(),
             url,
             payload_hash: "UNSIGNED-PAYLOAD",
@@ -425,8 +449,16 @@ impl S3BlobStore {
             access_key,
             secret_key,
             amz_date: &amz_date,
-            extra_signed_headers: &[],
+            extra_signed_headers: &extra,
             error_context: "blob",
-        })
+        })?;
+        if let Some(token) = token {
+            headers.insert(
+                "x-amz-security-token",
+                reqwest::header::HeaderValue::from_str(token)
+                    .map_err(|e| format!("invalid blob session token header: {e}"))?,
+            );
+        }
+        Ok(headers)
     }
 }

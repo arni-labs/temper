@@ -7,7 +7,7 @@ use crate::entity_actor::{EntityEvent, EntityResponse, EntityState, process_acti
 use crate::events::EntityStateChange;
 
 use super::file_writes::content_hash_and_native_blob_key;
-use super::{FileStreamContentError, ServerState};
+use super::{FileStreamContentError, ServerState, StoredFileContent};
 
 impl ServerState {
     /// Create a brand-new TemperFS `File` and persist its first stream bytes as
@@ -52,38 +52,77 @@ impl ServerState {
         mime_type: &str,
         agent_ctx: &crate::request_context::AgentContext,
     ) -> Result<crate::entity_actor::EntityResponse, FileStreamContentError> {
-        if self.ensure_entity_loaded(tenant, "File", file_id).await {
-            return Err(FileStreamContentError::ActionRejected(format!(
-                "File('{file_id}') already exists; use File $value update for existing content"
-            )));
-        }
-
-        let Some((store, _backend)) = self.event_journal() else {
-            return Err(FileStreamContentError::State(
-                "File initial content create requires an event journal".to_string(),
-            ));
-        };
-        let table = self.file_transition_table(tenant)?;
-
-        // Reject a brand-new File whose target Workspace is not Active BEFORE
-        // persisting any bytes. `workspace_id` arrives in the create params on
-        // this path (the File has no persisted state yet).
         let workspace_id = create_params
             .get("workspace_id")
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
-        self.reject_write_if_workspace_not_active(tenant, &workspace_id)
+        self.check_new_file_writable(tenant, file_id, &workspace_id)
             .await?;
 
         let (content_hash, blob_key) = content_hash_and_native_blob_key(body);
-        self.put_content_addressed_blob(tenant, &blob_key, body, None)
+        self.put_file_content_blob(tenant, &blob_key, body)
             .await
             .map_err(|e| {
                 FileStreamContentError::BlobStore(format!(
                     "failed to persist blob '{blob_key}': {e}"
                 ))
             })?;
+        let content = StoredFileContent {
+            content_hash,
+            size_bytes: body.len() as u64,
+        };
+        self.commit_new_file_content(
+            tenant,
+            file_id,
+            create_params,
+            &content,
+            mime_type,
+            agent_ctx,
+        )
+        .await
+    }
+
+    /// Refuse a brand-new File BEFORE any of its bytes are stored: one that
+    /// exists already, or whose target Workspace is not Active (`workspace_id`
+    /// arrives in the create params: the File has no persisted state yet).
+    pub(crate) async fn check_new_file_writable(
+        &self,
+        tenant: &temper_runtime::tenant::TenantId,
+        file_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), FileStreamContentError> {
+        if self.ensure_entity_loaded(tenant, "File", file_id).await {
+            return Err(FileStreamContentError::ActionRejected(format!(
+                "File('{file_id}') already exists; use File $value update for existing content"
+            )));
+        }
+        self.reject_write_if_workspace_not_active(tenant, workspace_id)
+            .await
+    }
+
+    /// Commit a brand-new File whose bytes are already stored under their
+    /// content hash, as ONE atomic create-with-content append.
+    pub(crate) async fn commit_new_file_content(
+        &self,
+        tenant: &temper_runtime::tenant::TenantId,
+        file_id: &str,
+        create_params: serde_json::Value,
+        content: &StoredFileContent,
+        mime_type: &str,
+        agent_ctx: &crate::request_context::AgentContext,
+    ) -> Result<crate::entity_actor::EntityResponse, FileStreamContentError> {
+        let Some((store, _backend)) = self.event_journal() else {
+            return Err(FileStreamContentError::State(
+                "File initial content create requires an event journal".to_string(),
+            ));
+        };
+        let table = self.file_transition_table(tenant)?;
+        let workspace_id = create_params
+            .get("workspace_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
 
         let persistence_id = format!("{tenant}:File:{file_id}");
         let mut state = initial_file_state(file_id, &table, serde_json::json!({}));
@@ -119,8 +158,8 @@ impl ServerState {
             .to_string();
         let created_by = agent_ctx.agent_id.clone().unwrap_or_default();
         let stream_params = serde_json::json!({
-            "content_hash": content_hash,
-            "size_bytes": body.len() as i64,
+            "content_hash": content.content_hash,
+            "size_bytes": content.size_bytes as i64,
             "mime_type": mime_type,
             "version_number": version_number,
             "previous_version_id": previous_version_id,
@@ -214,7 +253,7 @@ impl ServerState {
         Ok(response)
     }
 
-    fn file_transition_table(
+    pub(super) fn file_transition_table(
         &self,
         tenant: &temper_runtime::tenant::TenantId,
     ) -> Result<temper_jit::table::TransitionTable, FileStreamContentError> {

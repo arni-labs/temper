@@ -11,6 +11,8 @@ const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const DEFAULT_BUDGET_UNIT_BYTES: usize = 1024 * 1024;
 const DEFAULT_GLOBAL_CONCURRENCY: usize = 8;
 const DEFAULT_PER_TENANT_CONCURRENCY: usize = 1;
+/// A page uploads a few files at once (a picture per card), so File uploads admit more per tenant than git Blobs.
+const FILE_PER_TENANT_CONCURRENCY: usize = 4;
 const MAX_TENANT_ENTRIES: usize = 4096;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -156,6 +158,17 @@ impl BlobIngestProgressPolicy {
 impl BlobIngestBudget {
     pub(crate) fn runtime() -> Self {
         Self::new(DEFAULT_BUDGET_BYTES, DEFAULT_BUDGET_UNIT_BYTES)
+    }
+
+    /// The budget for File `$value` uploads: as for raw Blobs, with a few uploads per tenant at once.
+    pub(crate) fn files() -> Self {
+        Self::with_limits(
+            DEFAULT_BUDGET_BYTES,
+            DEFAULT_BUDGET_UNIT_BYTES,
+            DEFAULT_GLOBAL_CONCURRENCY,
+            FILE_PER_TENANT_CONCURRENCY,
+            BlobIngestProgressPolicy::runtime(),
+        )
     }
 
     pub(crate) fn new(capacity_bytes: usize, unit_bytes: usize) -> Self {

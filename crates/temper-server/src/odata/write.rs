@@ -28,7 +28,7 @@ use super::constraints::pre_delete_relation_checks;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
 use super::response::annotate_entity;
 use super::storage_guardrails::enforce_commons_storage_cap;
-use super::stream_put::handle_stream_put;
+use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_target};
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context, remote_parent_context};
 use crate::response::{ODataResponse, odata_error};
@@ -1180,7 +1180,7 @@ pub async fn handle_odata_put(
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
     headers: HeaderMap,
     axum::extract::Path(path): axum::extract::Path<String>,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> impl IntoResponse {
     let authenticated = match require_authenticated_context(authenticated) {
         Ok(context) => context,
@@ -1194,6 +1194,28 @@ pub async fn handle_odata_put(
     };
     let mut agent_ctx = extract_agent_context(&headers);
     apply_authenticated_context(&mut agent_ctx, &security_ctx);
+
+    // A File's bytes stream to the blob store; every other body is buffered within the router's body limit.
+    if let Some(file_id) = streamed_file_target(&state, &tenant, &odata_path, &headers) {
+        return handle_file_value_put(
+            &state,
+            &tenant,
+            &file_id,
+            &headers,
+            request.into_body(),
+            &agent_ctx,
+            &security_ctx,
+        )
+        .await;
+    }
+    let body = match <axum::body::Bytes as axum::extract::FromRequest<ServerState>>::from_request(
+        request, &state,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
 
     match odata_path {
         ODataPath::Entity(set_name, key) => {
