@@ -141,9 +141,8 @@ async fn pin_suspects_plateau_under_repeated_list_and_admission_load() {
     let third = rss_bytes();
 
     let grew = third.saturating_sub(first);
-    eprintln!("rss pin suspects: first={first} second={second} third={third} grew={grew}");
     assert!(
         grew < 32 * 1024 * 1024,
-        "repeated list/admission load grew RSS by {grew} bytes ({first} -> {third})"
+        "repeated list/admission load grew RSS by {grew} bytes (first={first} second={second} third={third})"
     );
 }
