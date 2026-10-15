@@ -100,8 +100,13 @@ async fn authenticate(
 }
 
 /// A Temper whose default tenant keeps File bytes in `mock`'s bucket under [`PREFIX`], with temporary credentials,
-/// and whose Cedar lets `member` write and read Files and `reader` only read them.
+/// and read-only link credentials, and whose Cedar lets `member` write and read Files and `reader` only read them.
 async fn state_with_object_store(test: &str, mock: &MockServer) -> ServerState {
+    state_with(test, mock, true).await
+}
+
+/// The same, with the read-only link credentials (`link`) or without them.
+async fn state_with(test: &str, mock: &MockServer, link: bool) -> ServerState {
     let db = std::env::temp_dir().join(format!(
         "temper-file-object-store-{test}-{}.db",
         uuid::Uuid::new_v4()
@@ -145,6 +150,17 @@ async fn state_with_object_store(test: &str, mock: &MockServer) -> ServerState {
         vault
             .cache_secret("default", key, value)
             .expect("cache secret");
+    }
+    if link {
+        for (key, value) in [
+            ("blob_link_access_key", "LINKID"),
+            ("blob_link_secret_key", "link-secret"),
+            ("blob_link_session_token", "bGluaw=="),
+        ] {
+            vault
+                .cache_secret("default", key, value.to_string())
+                .expect("cache secret");
+        }
     }
     state.secrets_vault = Some(std::sync::Arc::new(vault));
     state
@@ -370,7 +386,9 @@ async fn a_reader_gets_a_short_link_to_the_bytes_and_a_stranger_gets_nothing() {
         "{location}"
     );
     assert!(
-        location.contains("X-Amz-Security-Token=dGVtcG9yYXJ5&"),
+        location.contains("X-Amz-Security-Token=bGluaw%3D%3D&")
+            && location.contains("X-Amz-Credential=LINKID%2F")
+            && !location.contains("dGVtcG9yYXJ5"),
         "{location}"
     );
     assert!(
@@ -387,6 +405,26 @@ async fn a_reader_gets_a_short_link_to_the_bytes_and_a_stranger_gets_nothing() {
             .get("cache-control")
             .and_then(|v| v.to_str().ok()),
         Some("no-store")
+    );
+
+    let film = router(&state)
+        .oneshot(
+            Request::get("/tdata/Files('fl-film')/$value?redirect=3600")
+                .header("x-test-principal", "reader")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("respond");
+    let long = film
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        long.contains("X-Amz-Expires=3600&"),
+        "a film's link may last an hour: {long}"
     );
 
     let refused = router(&state)
@@ -411,4 +449,37 @@ async fn a_reader_gets_a_short_link_to_the_bytes_and_a_stranger_gets_nothing() {
         .await
         .expect("body");
     assert_eq!(&bytes[..], b"film");
+}
+
+#[tokio::test]
+async fn without_read_only_link_credentials_no_link_carries_the_temporary_ones() {
+    let mock = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex("^/bucket/.*"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/bucket/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"film".to_vec()))
+        .mount(&mock)
+        .await;
+    let state = state_with("no-link", &mock, false).await;
+    let put = router(&state)
+        .oneshot(put_file("fl-film", b"film".to_vec(), "member"))
+        .await
+        .expect("put");
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+    let read = router(&state)
+        .oneshot(
+            Request::get("/tdata/Files('fl-film')/$value?redirect=1")
+                .header("x-test-principal", "reader")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("respond");
+    // A link would carry the session token, and temporary credentials are rebuilt from it: the bytes come instead.
+    assert_eq!(read.status(), StatusCode::OK);
+    assert!(read.headers().get("location").is_none());
 }

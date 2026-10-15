@@ -109,13 +109,13 @@ mod tests {
     fn several_files_of_one_tenant_may_come_in_at_once() {
         let budget = BlobIngestBudget::files();
         let tenant = TenantId::default();
-        let held: Vec<_> = (0..4)
+        let held: Vec<_> = (0..8)
             .map(|_| budget.try_reserve(&tenant, 1024).expect("admitted"))
             .collect();
-        assert_eq!(held.len(), 4);
+        assert_eq!(held.len(), 8);
         assert!(
             budget.try_reserve(&tenant, 1024).is_err(),
-            "a fifth waits its turn"
+            "a ninth waits its turn"
         );
     }
 }

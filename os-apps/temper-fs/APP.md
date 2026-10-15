@@ -69,14 +69,20 @@ when the vault has `blob_endpoint` (with `blob_bucket`, `blob_access_key`, `blob
 own disk. The vault may also hold:
 
 - `blob_session_token`: the session token of temporary credentials, signed with every request;
-- `blob_prefix`: a folder of the bucket every key goes under (one deployment's own place in a shared bucket).
+- `blob_prefix`: a folder of the bucket every key goes under (one deployment's own place in a shared bucket);
+- `blob_link_access_key`, `blob_link_secret_key`, `blob_link_session_token`: read-only credentials that sign links. A
+  link carries the session token of whatever signs it, and temporary credentials can be rebuilt from their token, so
+  with temporary store credentials and no link credentials there are no links at all.
 
 With a remote store a File's bytes are never copied into the database.
 
 - **Upload**: `PUT Files('<id>')/$value` with a `Content-Length` streams: Cedar decides from the headers, the body is
   staged on disk while it is hashed, sent to the store, and only then committed. It is not bound by the router's
-  buffered body limit (at most 2 GiB). A body without `Content-Length` is buffered as before. A File that takes no
-  content in its current state is refused before its body is read.
+  buffered body limit (at most 2 GiB; eight uploads per tenant at once; no throughput floor, only two minutes without
+  progress or two hours in all). A body without `Content-Length`, or any body for a local store (which keeps the
+  database copy), is buffered as before. A File that takes no content in its current state is refused before its body
+  is read.
 - **Read**: `GET Files('<id>')/$value?redirect=1` answers, once Cedar lets the reader read the File, `302` to a
-  five-minute link to its bytes in the store, labelled with its type (pictures, films and sounds open in place;
-  anything else is a download). Without `redirect=1`, or with a local store, the bytes come through the server.
+  five-minute link to its bytes in the store (`redirect=<seconds>`, 60 to 3600, for a film), labelled with its type
+  (pictures, films and sounds open in place; anything else is a download). Without `redirect`, with a local store, or
+  with no credentials safe to put in a link, the bytes come through the server.

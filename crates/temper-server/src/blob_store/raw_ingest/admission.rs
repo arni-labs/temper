@@ -11,8 +11,12 @@ const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const DEFAULT_BUDGET_UNIT_BYTES: usize = 1024 * 1024;
 const DEFAULT_GLOBAL_CONCURRENCY: usize = 8;
 const DEFAULT_PER_TENANT_CONCURRENCY: usize = 1;
-/// A page uploads a few files at once (a picture per card), so File uploads admit more per tenant than git Blobs.
-const FILE_PER_TENANT_CONCURRENCY: usize = 4;
+/// A page uploads several files at once (a picture per card), so File uploads admit more than git Blobs.
+const FILE_PER_TENANT_CONCURRENCY: usize = 8;
+const FILE_GLOBAL_CONCURRENCY: usize = 32;
+/// A person's upload may be slow (a phone on a weak line): it only has to keep moving, and to end within two hours.
+const FILE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const FILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_TENANT_ENTRIES: usize = 4096;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -160,14 +164,21 @@ impl BlobIngestBudget {
         Self::new(DEFAULT_BUDGET_BYTES, DEFAULT_BUDGET_UNIT_BYTES)
     }
 
-    /// The budget for File `$value` uploads: as for raw Blobs, with a few uploads per tenant at once.
+    /// The budget for File `$value` uploads: more at once than raw Blobs, and no floor on throughput, which a git
+    /// push between servers can meet and a person on a phone cannot.
     pub(crate) fn files() -> Self {
         Self::with_limits(
             DEFAULT_BUDGET_BYTES,
             DEFAULT_BUDGET_UNIT_BYTES,
-            DEFAULT_GLOBAL_CONCURRENCY,
+            FILE_GLOBAL_CONCURRENCY,
             FILE_PER_TENANT_CONCURRENCY,
-            BlobIngestProgressPolicy::runtime(),
+            BlobIngestProgressPolicy {
+                idle_timeout: FILE_IDLE_TIMEOUT,
+                total_timeout: FILE_TOTAL_TIMEOUT,
+                throughput_grace: FILE_TOTAL_TIMEOUT,
+                throughput_check_interval: FILE_TOTAL_TIMEOUT,
+                min_bytes_per_second: 1,
+            },
         )
     }
 

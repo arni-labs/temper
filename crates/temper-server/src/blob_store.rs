@@ -28,7 +28,7 @@ pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endp
 pub(crate) use keys::{DEFAULT_BLOB_BUCKET, hex_lower, wasm_artifact_key};
 use limits::{BLOB_BUFFERED_OPERATION_TIMEOUT, BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore};
 use local::{get_local_blob_observed, local_blob_path, put_local_blob_observed};
-pub(crate) use presign::PresignedResponse;
+pub(crate) use presign::{MAX_PRESIGN_SECS, PresignedResponse};
 pub use raw_ingest::BlobByteStream;
 #[cfg(test)]
 pub(crate) use raw_ingest::BlobIngestProgressPolicy;
@@ -59,7 +59,18 @@ struct S3BlobStore {
     secret_key: Option<String>,
     /// The session token of temporary credentials (`x-amz-security-token`), signed with every request.
     session_token: Option<String>,
+    /// Read-only credentials that sign links (presign.rs), when the store's own are temporary ones.
+    link: Option<LinkCredentials>,
     client: reqwest::Client,
+}
+
+/// Credentials that only read objects, used to sign links handed to readers: a link carries its session token, from
+/// which temporary credentials can be rebuilt, so the store's own (which write) never go into one.
+#[derive(Clone, Debug)]
+pub(crate) struct LinkCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
 }
 
 impl BlobStore {
@@ -88,6 +99,7 @@ impl BlobStore {
                 access_key,
                 secret_key,
                 session_token: None,
+                link: None,
                 client: http_client::shared_client(),
             }),
         }
@@ -98,6 +110,14 @@ impl BlobStore {
     pub(crate) fn with_session_token(mut self, token: Option<String>) -> Self {
         if let BlobStoreBackend::S3(store) = &mut self.backend {
             store.session_token = token.filter(|token| !token.trim().is_empty());
+        }
+        self
+    }
+
+    /// Sign links with these read-only credentials rather than the store's own (presign.rs).
+    pub(crate) fn with_link_credentials(mut self, link: Option<LinkCredentials>) -> Self {
+        if let BlobStoreBackend::S3(store) = &mut self.backend {
+            store.link = link.filter(|l| !l.access_key.is_empty() && !l.secret_key.is_empty());
         }
         self
     }

@@ -43,8 +43,22 @@ impl S3BlobStore {
         response: &PresignedResponse<'_>,
         amz_date: &str,
     ) -> Option<String> {
-        let access_key = self.access_key.as_deref()?;
-        let secret_key = self.secret_key.as_deref()?;
+        // A link carries the session token of the credentials that sign it, and temporary credentials can be rebuilt
+        // from their token: a link is signed with read-only link credentials, or with the store's own only when they
+        // are permanent (a link then gives away nothing but itself). Otherwise there is no link.
+        let (access_key, secret_key, session_token) = match (&self.link, &self.session_token) {
+            (Some(link), _) => (
+                link.access_key.as_str(),
+                link.secret_key.as_str(),
+                link.session_token.as_deref(),
+            ),
+            (None, None) => (
+                self.access_key.as_deref()?,
+                self.secret_key.as_deref()?,
+                None,
+            ),
+            (None, Some(_)) => return None,
+        };
         assert!(amz_date.len() >= 8, "amz_date is %Y%m%dT%H%M%SZ");
         let expires = expires_secs.clamp(1, MAX_PRESIGN_SECS).to_string();
         let url = self.object_url(key);
@@ -59,7 +73,7 @@ impl S3BlobStore {
             ("X-Amz-Expires", &expires),
             ("X-Amz-SignedHeaders", "host"),
         ];
-        if let Some(token) = self.session_token.as_deref() {
+        if let Some(token) = session_token {
             query.push(("X-Amz-Security-Token", token));
         }
         if let Some(content_type) = response.content_type.filter(|v| !v.is_empty()) {
@@ -129,6 +143,14 @@ mod tests {
         .with_session_token(token.map(str::to_string))
     }
 
+    fn link(token: &str) -> Option<super::super::LinkCredentials> {
+        Some(super::super::LinkCredentials {
+            access_key: "LINKID".to_string(),
+            secret_key: "link-secret".to_string(),
+            session_token: Some(token.to_string()),
+        })
+    }
+
     fn signed(store: &BlobStore, response: &PresignedResponse<'_>) -> String {
         let BlobStoreBackend::S3(s3) = &store.backend else {
             panic!("an S3 store");
@@ -138,9 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn a_link_names_the_prefixed_key_its_lifetime_and_the_session_token() {
+    fn a_link_names_the_prefixed_key_its_lifetime_and_the_link_credentials_session_token() {
         let url = signed(
-            &store(Some("tok/en=")),
+            &store(Some("write-token")).with_link_credentials(link("tok/en=")),
             &PresignedResponse {
                 content_type: Some("image/png"),
                 content_disposition: None,
@@ -151,6 +173,14 @@ mod tests {
         ));
         assert!(url.contains("X-Amz-Expires=120&"));
         assert!(url.contains("X-Amz-Security-Token=tok%2Fen%3D&"));
+        assert!(
+            url.contains("X-Amz-Credential=LINKID%2F"),
+            "signed with the link credentials"
+        );
+        assert!(
+            !url.contains("write-token") && !url.contains("AKID"),
+            "the store's own never go into a link"
+        );
         assert!(url.contains("response-content-type=image%2Fpng"));
         assert!(url.contains("&X-Amz-Signature="));
         // The query is in canonical (sorted) order, so what was signed is what is sent.
@@ -175,6 +205,18 @@ mod tests {
             BlobStore::local_fs("/tmp/x")
                 .presigned_get_url("k", 60, &PresignedResponse::default())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn temporary_store_credentials_without_link_credentials_sign_no_link() {
+        let BlobStoreBackend::S3(s3) = &store(Some("write-token")).backend else {
+            panic!("an S3 store");
+        };
+        assert!(
+            s3.presigned_get_url("k", 60, &PresignedResponse::default(), "20261015T120000Z")
+                .is_none(),
+            "a link would carry the token, and the token rebuilds the credentials that write"
         );
     }
 

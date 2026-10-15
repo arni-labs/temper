@@ -23,6 +23,17 @@ impl ServerState {
                 .get_secret(tenant.as_str(), "blob_bucket")
                 .unwrap_or_else(|| DEFAULT_BLOB_BUCKET.to_string());
             let prefix = vault.get_secret(tenant.as_str(), "blob_prefix");
+            let link = match (
+                vault.get_secret(tenant.as_str(), "blob_link_access_key"),
+                vault.get_secret(tenant.as_str(), "blob_link_secret_key"),
+            ) {
+                (Some(access_key), Some(secret_key)) => Some(super::LinkCredentials {
+                    access_key,
+                    secret_key,
+                    session_token: vault.get_secret(tenant.as_str(), "blob_link_session_token"),
+                }),
+                _ => None,
+            };
             return Ok(BlobStore::s3(
                 endpoint,
                 bucket,
@@ -31,7 +42,8 @@ impl ServerState {
                 self.blob_staging_root(tenant),
                 object_key_prefix(prefix.as_deref(), tenant),
             )
-            .with_session_token(vault.get_secret(tenant.as_str(), "blob_session_token")));
+            .with_session_token(vault.get_secret(tenant.as_str(), "blob_session_token"))
+            .with_link_credentials(link));
         }
         self.local_blob_store(tenant).ok_or_else(|| {
             "blob object store is not configured; set BLOB_ENDPOINT/BLOB_BUCKET/BLOB_ACCESS_KEY/BLOB_SECRET_KEY or TEMPER_LOCAL_BLOB_DIR"

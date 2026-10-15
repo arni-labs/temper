@@ -733,7 +733,7 @@ pub(super) async fn handle_odata_get_for_tenant(
         ODataPath::Value { ref parent } => {
             let link = query_params
                 .get("redirect")
-                .is_some_and(|v| v == "1" || v == "true");
+                .and_then(|v| super::stream_fast_path::file_link_secs(v));
             handle_stream_get(
                 &state,
                 &tenant,
@@ -1317,7 +1317,7 @@ async fn handle_stream_get(
     security_ctx: &SecurityContext,
     parent: &ODataPath,
     hydration_budget: &BlobHydrationBudget,
-    link: bool,
+    link: Option<u64>,
 ) -> axum::response::Response {
     if let Some((set_name, key, property)) = resolve_blob_primitive_value_parent(parent) {
         return handle_blob_primitive_stream(
@@ -1364,9 +1364,9 @@ async fn handle_stream_get(
 
     // `?redirect=1`: once Cedar has let the reader read the File, send them to a short-lived link to its bytes in
     // the object store, rather than carrying the bytes through this server.
-    if link
+    if let Some(secs) = link
         && entity_type == "File"
-        && let Some(response) = file_link_response(state, tenant, &entity_state)
+        && let Some(response) = file_link_response(state, tenant, &entity_state, secs)
     {
         return response;
     }

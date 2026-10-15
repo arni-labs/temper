@@ -35,8 +35,15 @@ pub(in crate::odata) fn streamed_file_target(
     headers.get("content-length")?;
     let (set_name, key) = resolve_value_parent(parent).ok()?;
     let entity_type = resolve_entity_type(state, tenant, &set_name)?;
-    (entity_type == "File" && check_has_stream_or_400(state, tenant, &entity_type).is_ok())
-        .then_some(key)
+    // A local store keeps a copy of the bytes in the database, which the buffered path writes; stream only to a
+    // remote object store, which keeps them alone.
+    let remote = state
+        .blob_store_for_tenant(tenant)
+        .is_ok_and(|store| store.is_object_store());
+    (remote
+        && entity_type == "File"
+        && check_has_stream_or_400(state, tenant, &entity_type).is_ok())
+    .then_some(key)
 }
 
 /// Upload a File's bytes from the request body as it arrives.
