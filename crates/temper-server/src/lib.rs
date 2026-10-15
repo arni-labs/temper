@@ -55,7 +55,8 @@ pub mod wasm_registry;
 pub mod webhooks;
 pub(crate) mod workflow_tracing;
 
-#[cfg(test)]
+// Reads RSS from procfs, which only Linux has.
+#[cfg(all(test, target_os = "linux"))]
 mod rss_pin_suspects;
 
 pub use entity_actor::{EntityActor, EntityActorHandler, EntityMsg, EntityResponse, EntityState};
