@@ -1801,22 +1801,43 @@ impl ServerState {
             return true;
         }
 
-        let Some((store, _backend)) = journal.as_ref() else {
-            return false;
+        self.load_entity_from_store(tenant, entity_type, entity_id)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Load an entity that is not in the index from the durable store and
+    /// spawn its actor. `Ok(false)` means it does not exist (no journal, no
+    /// events, deleted, or no transition table for its type); `Err` means the
+    /// store read or the actor ask failed, so existence is unknown. Callers
+    /// that must not mistake an outage for absence, such as identity
+    /// resolution, use this instead of [`Self::ensure_entity_loaded`].
+    pub async fn load_entity_from_store(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool, String> {
+        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
+        let Some((store, _backend)) = self.event_journal() else {
+            return Ok(false);
         };
 
-        let events = match store.read_events(&persistence_id, 0).await {
-            Ok(events) if !events.is_empty() => events,
-            _ => return false,
-        };
+        let events = store
+            .read_events(&persistence_id, 0)
+            .await
+            .map_err(|error| format!("event store read failed for {persistence_id}: {error}"))?;
+        if events.is_empty() {
+            return Ok(false);
+        }
 
         if events.last().is_some_and(is_deleted_envelope) {
             self.remove_entity(tenant, entity_type, entity_id);
-            return false;
+            return Ok(false);
         }
 
         let Some(actor_ref) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
-            return false;
+            return Ok(false);
         };
 
         let policy = self.dispatch_retry_policy();
@@ -1830,12 +1851,12 @@ impl ServerState {
             Ok(response) if response.state.status == "Deleted" => {
                 let _ = actor_ref.stop();
                 self.remove_entity(tenant, entity_type, entity_id);
-                false
+                Ok(false)
             }
-            Ok(_) => true,
-            Err(_) => {
+            Ok(_) => Ok(true),
+            Err(error) => {
                 self.remove_entity(tenant, entity_type, entity_id);
-                false
+                Err(format!("actor load failed for {persistence_id}: {error}"))
             }
         }
     }
