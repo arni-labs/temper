@@ -142,7 +142,7 @@ pub(super) async fn commit_field_update(
             }
             Err(e) => {
                 state.fields = previous_fields;
-                return Err(format!("persistence failed: {e}"));
+                return Err(super::actor::persistence_failure(&e));
             }
         }
     }

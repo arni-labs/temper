@@ -10,6 +10,14 @@
 //!   `set_config` when the pool opens each connection.
 //! - Acquire timeout is 5 seconds. A checkout that waits longer fails the
 //!   request instead of holding the caller until the pool is exhausted.
+//!
+//! Event size (any backend), the bytes of one event (one recorded change) as
+//! JSON. Unset, empty or 0 sets no limit; anything but a whole number stops
+//! the server.
+//!
+//! - `TEMPER_WARN_EVENT_BYTES` — a larger event is written and logged as a
+//!   warning.
+//! - `TEMPER_MAX_EVENT_BYTES` — a larger event is refused before it is written.
 
 use std::time::Duration;
 
@@ -17,7 +25,7 @@ use anyhow::{Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use temper_evolution::PostgresRecordStore;
-use temper_server::storage::StorageStack;
+use temper_server::storage::{EventSizeLimits, StorageStack};
 use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::TursoEventStore;
 
@@ -79,6 +87,25 @@ impl PostgresPoolConfig {
             statement_timeout_ms: statement_timeout_secs.saturating_mul(1000),
         }
     }
+}
+
+/// Read the event size limits from their variables' values, if set.
+pub(super) fn event_size_limits(warn: Option<&str>, max: Option<&str>) -> Result<EventSizeLimits> {
+    Ok(EventSizeLimits {
+        warn_bytes: event_bytes("TEMPER_WARN_EVENT_BYTES", warn)?,
+        max_bytes: event_bytes("TEMPER_MAX_EVENT_BYTES", max)?,
+    })
+}
+
+/// One size variable's value: `None` is no limit.
+fn event_bytes(name: &str, value: Option<&str>) -> Result<Option<usize>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let limit: usize = value
+        .parse()
+        .with_context(|| format!("{name} must be a whole number of bytes, not {value:?}"))?;
+    Ok((limit > 0).then_some(limit))
 }
 
 fn positive_u64(values: &[(&str, Option<String>)], names: &[&str], default: u64) -> u64 {
@@ -297,6 +324,31 @@ mod tests {
             .iter()
             .map(|(key, value)| (*key, Some((*value).to_string())))
             .collect()
+    }
+
+    #[test]
+    fn event_size_limits_are_off_unless_a_positive_number_is_set() {
+        assert_eq!(
+            event_size_limits(None, None).unwrap(),
+            EventSizeLimits::default()
+        );
+        assert_eq!(
+            event_size_limits(Some(" "), Some("0")).unwrap(),
+            EventSizeLimits::default()
+        );
+        assert_eq!(
+            event_size_limits(Some("16384"), Some("131072")).unwrap(),
+            EventSizeLimits {
+                warn_bytes: Some(16_384),
+                max_bytes: Some(131_072),
+            }
+        );
+        let refused = event_size_limits(None, Some("128k")).unwrap_err();
+        assert!(
+            refused.to_string().contains("TEMPER_MAX_EVENT_BYTES"),
+            "{refused}"
+        );
+        assert!(event_size_limits(Some("-1"), None).is_err());
     }
 
     #[test]

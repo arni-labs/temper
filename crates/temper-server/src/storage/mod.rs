@@ -461,26 +461,122 @@ where
 }
 
 /// Cloneable boxed event store handle.
+///
+/// Every event the server journals is appended through this handle, so it is
+/// where the per-event size limits hold (`with_event_size_limits`).
 #[derive(Clone)]
-pub struct BoxedEventStore(Arc<dyn DynEventStore>);
+pub struct BoxedEventStore {
+    store: Arc<dyn DynEventStore>,
+    limits: EventSizeLimits,
+}
+
+/// How large one event (one recorded change, its payload as JSON) may be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventSizeLimits {
+    /// Above this many bytes an event is written and a warning is logged.
+    pub warn_bytes: Option<usize>,
+    /// Above this many bytes an append is refused and nothing is written.
+    pub max_bytes: Option<usize>,
+}
 
 impl BoxedEventStore {
     pub fn new<T>(store: T) -> Self
     where
         T: EventStore,
     {
-        Self(Arc::new(store))
+        Self::from_arc(Arc::new(store))
     }
 
     pub fn from_arc<T>(store: Arc<T>) -> Self
     where
         T: EventStore,
     {
-        Self(store)
+        Self {
+            store,
+            limits: EventSizeLimits::default(),
+        }
+    }
+
+    /// Warn about, or refuse, any append carrying an event whose payload, as
+    /// JSON, is larger than the limits. The default warns and refuses nothing.
+    pub fn with_event_size_limits(mut self, limits: EventSizeLimits) -> Self {
+        debug_assert!(
+            limits.warn_bytes != Some(0) && limits.max_bytes != Some(0),
+            "a zero limit would catch every event"
+        );
+        self.limits = limits;
+        self
     }
 
     pub fn inner(&self) -> Arc<dyn DynEventStore> {
-        self.0.clone()
+        self.store.clone()
+    }
+
+    /// The size limits every append is held to.
+    pub(crate) fn event_size_limits(&self) -> EventSizeLimits {
+        self.limits
+    }
+
+    /// Warn about, or refuse, `events` by the limits; every append checks.
+    pub(crate) fn check_event_sizes(
+        &self,
+        persistence_id: &str,
+        events: &[PersistenceEnvelope],
+    ) -> Result<(), PersistenceError> {
+        for event in events {
+            self.check_event_size(persistence_id, &event.event_type, &event.payload, true)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse one event's payload over the limit, logging the refusal once, and,
+    /// when `warn`, log one over the warning size.
+    pub(crate) fn check_event_size(
+        &self,
+        persistence_id: &str,
+        event_type: &str,
+        payload: &serde_json::Value,
+        warn: bool,
+    ) -> Result<(), PersistenceError> {
+        let EventSizeLimits {
+            warn_bytes,
+            max_bytes,
+        } = self.limits;
+        if max_bytes.is_none() && (!warn || warn_bytes.is_none()) {
+            return Ok(());
+        }
+        let bytes = json_len(payload)?;
+        if let Some(limit) = max_bytes
+            && bytes > limit
+        {
+            tracing::warn!(
+                persistence_id,
+                event_type,
+                bytes,
+                max_bytes = limit,
+                "event refused for its size: one change was larger than this server's limit; keep long lists as their own records and pictures as files"
+            );
+            return Err(PersistenceError::EventTooLarge {
+                event_type: event_type.to_string(),
+                persistence_id: persistence_id.to_string(),
+                bytes,
+                limit,
+            });
+        }
+        if warn
+            && let Some(warn_at) = warn_bytes
+            && bytes > warn_at
+        {
+            tracing::warn!(
+                persistence_id,
+                event_type,
+                bytes,
+                warn_bytes = warn_at,
+                max_bytes,
+                "large event: one change recorded more than the warning size; keep long lists as their own records and pictures as files"
+            );
+        }
+        Ok(())
     }
 
     pub async fn append(
@@ -489,7 +585,8 @@ impl BoxedEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        self.0
+        self.check_event_sizes(persistence_id, events)?;
+        self.store
             .append(persistence_id, expected_sequence, events)
             .await
     }
@@ -498,7 +595,10 @@ impl BoxedEventStore {
         &self,
         appends: &[PersistenceAppend],
     ) -> Result<Vec<PersistenceAppendResult>, PersistenceError> {
-        self.0.append_batch(appends).await
+        for append in appends {
+            self.check_event_sizes(&append.persistence_id, &append.events)?;
+        }
+        self.store.append_batch(appends).await
     }
 
     pub async fn read_events(
@@ -506,7 +606,7 @@ impl BoxedEventStore {
         persistence_id: &str,
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
-        self.0.read_events(persistence_id, from_sequence).await
+        self.store.read_events(persistence_id, from_sequence).await
     }
 
     pub async fn append_with_keys(
@@ -516,7 +616,8 @@ impl BoxedEventStore {
         events: &[PersistenceEnvelope],
         key_rows: &[temper_runtime::persistence::EntityKeyRow],
     ) -> Result<u64, PersistenceError> {
-        self.0
+        self.check_event_sizes(persistence_id, events)?;
+        self.store
             .append_with_keys(persistence_id, expected_sequence, events, key_rows)
             .await
     }
@@ -530,7 +631,8 @@ impl BoxedEventStore {
         vector_rows: &[temper_runtime::persistence::EntityVectorRow],
         reconcile_vectors: bool,
     ) -> Result<u64, PersistenceError> {
-        self.0
+        self.check_event_sizes(persistence_id, events)?;
+        self.store
             .append_with_index_rows(
                 persistence_id,
                 expected_sequence,
@@ -549,7 +651,7 @@ impl BoxedEventStore {
         entity_id: &str,
         vector_rows: &[temper_runtime::persistence::EntityVectorRow],
     ) -> Result<(), PersistenceError> {
-        self.0
+        self.store
             .backfill_entity_vectors(tenant, entity_type, entity_id, vector_rows)
             .await
     }
@@ -562,7 +664,7 @@ impl BoxedEventStore {
         model_tag: &str,
         limit: usize,
     ) -> Result<Vec<temper_runtime::persistence::EntityVectorCandidate>, PersistenceError> {
-        self.0
+        self.store
             .vector_candidates(tenant, entity_type, decl_name, model_tag, limit)
             .await
     }
@@ -573,7 +675,7 @@ impl BoxedEventStore {
         entity_type: &str,
         vector_set: &str,
     ) -> Result<(), PersistenceError> {
-        self.0
+        self.store
             .mark_vector_index_backfilled(tenant, entity_type, vector_set)
             .await
     }
@@ -582,7 +684,7 @@ impl BoxedEventStore {
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
-        self.0.vector_index_backfilled_types(tenant).await
+        self.store.vector_index_backfilled_types(tenant).await
     }
 
     pub async fn vectored_entity_ids_for_type(
@@ -590,7 +692,7 @@ impl BoxedEventStore {
         tenant: &str,
         entity_type: &str,
     ) -> Result<Vec<String>, PersistenceError> {
-        self.0
+        self.store
             .vectored_entity_ids_for_type(tenant, entity_type)
             .await
     }
@@ -602,7 +704,7 @@ impl BoxedEventStore {
         key_name: &str,
         key_hash: &str,
     ) -> Result<Option<String>, PersistenceError> {
-        self.0
+        self.store
             .lookup_by_key(tenant, entity_type, key_name, key_hash)
             .await
     }
@@ -614,7 +716,7 @@ impl BoxedEventStore {
         entity_id: &str,
         key_rows: &[temper_runtime::persistence::EntityKeyRow],
     ) -> Result<(), PersistenceError> {
-        self.0
+        self.store
             .backfill_entity_keys(tenant, entity_type, entity_id, key_rows)
             .await
     }
@@ -625,7 +727,7 @@ impl BoxedEventStore {
         entity_type: &str,
         key_set: &str,
     ) -> Result<(), PersistenceError> {
-        self.0
+        self.store
             .mark_key_index_backfilled(tenant, entity_type, key_set)
             .await
     }
@@ -634,7 +736,7 @@ impl BoxedEventStore {
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
-        self.0.key_index_backfilled_types(tenant).await
+        self.store.key_index_backfilled_types(tenant).await
     }
 
     pub async fn keyed_entity_ids_for_type(
@@ -642,7 +744,9 @@ impl BoxedEventStore {
         tenant: &str,
         entity_type: &str,
     ) -> Result<Vec<String>, PersistenceError> {
-        self.0.keyed_entity_ids_for_type(tenant, entity_type).await
+        self.store
+            .keyed_entity_ids_for_type(tenant, entity_type)
+            .await
     }
 
     pub async fn save_snapshot(
@@ -651,7 +755,7 @@ impl BoxedEventStore {
         sequence_nr: u64,
         snapshot: &[u8],
     ) -> Result<(), PersistenceError> {
-        self.0
+        self.store
             .save_snapshot(persistence_id, sequence_nr, snapshot)
             .await
     }
@@ -660,14 +764,14 @@ impl BoxedEventStore {
         &self,
         persistence_id: &str,
     ) -> Result<Option<(u64, Vec<u8>)>, PersistenceError> {
-        self.0.load_snapshot(persistence_id).await
+        self.store.load_snapshot(persistence_id).await
     }
 
     pub async fn list_entity_ids(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
-        self.0.list_entity_ids(tenant).await
+        self.store.list_entity_ids(tenant).await
     }
 
     pub async fn list_entity_ids_by_type(
@@ -675,7 +779,9 @@ impl BoxedEventStore {
         tenant: &str,
         entity_type: &str,
     ) -> Result<Vec<String>, PersistenceError> {
-        self.0.list_entity_ids_by_type(tenant, entity_type).await
+        self.store
+            .list_entity_ids_by_type(tenant, entity_type)
+            .await
     }
 
     pub async fn list_entity_ids_limited(
@@ -684,10 +790,28 @@ impl BoxedEventStore {
         entity_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, String)>, PersistenceError> {
-        self.0
+        self.store
             .list_entity_ids_limited(tenant, entity_type, limit)
             .await
     }
+}
+
+/// The length of `value` serialized as JSON, counted without building the text.
+fn json_len(value: &serde_json::Value) -> Result<usize, PersistenceError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value)
+        .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+    Ok(count.0)
 }
 
 /// Backend label used for metrics and operator-facing diagnostics only.
@@ -1306,6 +1430,20 @@ impl StorageStack {
             trajectory,
             metadata,
         }
+    }
+
+    /// Warn about, or refuse, events over these sizes on every append
+    /// (`BoxedEventStore::with_event_size_limits`).
+    pub fn with_event_size_limits(mut self, limits: EventSizeLimits) -> Self {
+        if limits != EventSizeLimits::default() {
+            tracing::info!(
+                warn_bytes = limits.warn_bytes,
+                max_bytes = limits.max_bytes,
+                "event size limits for one change"
+            );
+        }
+        self.events = self.events.with_event_size_limits(limits);
+        self
     }
 
     pub fn from_postgres(store: PostgresEventStore) -> Self {

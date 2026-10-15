@@ -65,6 +65,15 @@ impl ReplayPolicy {
     }
 }
 
+/// What the caller of a refused write is told. An oversized change is refused
+/// with its own words (what to keep elsewhere); anything else failed to persist.
+pub(super) fn persistence_failure(error: &PersistenceError) -> String {
+    match error {
+        PersistenceError::EventTooLarge { .. } => error.to_string(),
+        _ => format!("persistence failed: {error}"),
+    }
+}
+
 pub(super) fn event_budget_workspace_id(state: &EntityState) -> String {
     if state.entity_type == "Workspace" {
         return state.entity_id.clone();
@@ -470,6 +479,8 @@ impl EntityActor {
                 tracing::debug!(entity = %state.entity_id, seq = new_seq, "event persisted");
                 Ok(new_seq)
             }
+            // Refused for its size: the event store logged it once, with its words.
+            Err(e @ PersistenceError::EventTooLarge { .. }) => Err(e),
             Err(e) => {
                 tracing::error!(
                     entity = %state.entity_id, error = %e,
@@ -1491,11 +1502,17 @@ impl Actor for EntityActor {
                                             break;
                                         }
                                         Err(e) => {
+                                            let said = match &e {
+                                                PersistenceError::EventTooLarge { .. } => {
+                                                    e.to_string()
+                                                }
+                                                _ => {
+                                                    format!("persistence failed during retry: {e}")
+                                                }
+                                            };
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                                Some(format!(
-                                                    "persistence failed during retry: {e}"
-                                                )),
+                                                Some(said),
                                             ));
                                             break;
                                         }
@@ -1538,7 +1555,7 @@ impl Actor for EntityActor {
                                 ctx.reply(EntityResponse {
                                     success: false,
                                     state: state.clone(),
-                                    error: Some(format!("persistence failed: {e}")),
+                                    error: Some(persistence_failure(&e)),
                                     custom_effects: vec![],
                                     scheduled_actions: vec![],
                                     spawn_requests: vec![],
@@ -1841,6 +1858,10 @@ mod tests;
 #[cfg(test)]
 #[path = "authoritative_replay_test.rs"]
 mod authoritative_replay_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "event_size_test.rs"]
+mod event_size_tests;
 
 #[cfg(test)]
 #[path = "contract_state_test.rs"]

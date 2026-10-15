@@ -111,7 +111,13 @@ pub async fn run(
         if let Some(pool) = stack.postgres_pool.clone() {
             state.server.pg_record_store = Some(Arc::new(PostgresRecordStore::new(pool)));
         }
-        state.server.set_storage_stack(stack);
+        let limits = storage::event_size_limits(
+            std::env::var("TEMPER_WARN_EVENT_BYTES").ok().as_deref(),
+            std::env::var("TEMPER_MAX_EVENT_BYTES").ok().as_deref(),
+        )?;
+        state
+            .server
+            .set_storage_stack(stack.with_event_size_limits(limits));
     }
 
     // Phase 5b: Secrets vault
