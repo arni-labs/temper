@@ -3,6 +3,9 @@
 //! HTTP / OData / Cedar / registry live here with EntityActor and
 //! `entity_actor/effects.rs` (the default `apply_effects`). Not a plug.
 
+// The wasm host's async blocks exceed rustc's default query depth.
+#![recursion_limit = "256"]
+
 pub mod adapters;
 mod admin;
 #[cfg(feature = "observe")]
@@ -51,6 +54,9 @@ pub mod vector_index;
 pub mod wasm_registry;
 pub mod webhooks;
 pub(crate) mod workflow_tracing;
+
+#[cfg(test)]
+mod rss_pin_suspects;
 
 pub use entity_actor::{EntityActor, EntityActorHandler, EntityMsg, EntityResponse, EntityState};
 pub use registry::SpecRegistry;

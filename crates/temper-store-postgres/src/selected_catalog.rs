@@ -12,7 +12,14 @@ use crate::PostgresEventStore;
 use crate::platform::{PostgresEntityCatalogRow, storage_error};
 
 /// Ids per catalog `ANY($n)` read.
-const CATALOG_READ_BATCH: usize = 128;
+///
+/// `temper serve` checks out up to 32 Postgres connections. Each checkout
+/// holds this many JSON documents until the query returns, and glibc keeps
+/// that high-water mark after the rows are dropped. A 128-row batch of 32KiB
+/// documents on 32 connections peaked near 320MiB and still occupied about
+/// 150MiB more than the same load on 10 connections once the rows were
+/// freed. 32 rows is a quarter of that concurrent payload.
+const CATALOG_READ_BATCH: usize = 32;
 
 impl PostgresEventStore {
     /// Batch-load full entity catalog rows for a list of entity IDs.

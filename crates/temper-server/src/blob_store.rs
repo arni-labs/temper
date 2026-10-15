@@ -15,10 +15,12 @@ use crate::blob_transport_observability::{
     BlobTransportError, BlobTransportFinish, blob_transport_span, finish_blob_transport,
 };
 mod endpoint;
+mod http_client;
 mod keys;
 mod limits;
 mod local;
 mod raw_ingest;
+mod s3_buffered_get;
 mod state;
 mod streaming;
 pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endpoint};
@@ -81,10 +83,7 @@ impl BlobStore {
                 key_prefix,
                 access_key,
                 secret_key,
-                client: reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .expect("static blob HTTP client configuration must be valid"), // ci-ok: static reqwest builder options
+                client: http_client::shared_client(),
             }),
         }
     }
@@ -331,73 +330,6 @@ impl S3BlobStore {
                     outcome: "error",
                     status: error.status,
                     request_bytes: content_len,
-                    response_bytes: 0,
-                });
-                Err(error.message)
-            }
-        }
-    }
-
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let started_at = Instant::now(); // determinism-ok: production blob transport metric only
-        let span = blob_transport_span("get", "s3", 0);
-        let result = async {
-            let url = self.object_url(key);
-            let mut request = self.client.get(&url);
-            let headers = self
-                .signed_headers(Method::GET, &url)
-                .map_err(BlobTransportError::message)?;
-            for (header_name, header_value) in &headers {
-                request = request.header(header_name, header_value);
-            }
-
-            let response = request.send().await.map_err(|e| {
-                BlobTransportError::message(format!("blob GET request failed for '{key}': {e}"))
-            })?;
-            let status = response.status();
-            if status == StatusCode::NOT_FOUND {
-                return Ok((status, None));
-            }
-            if !status.is_success() {
-                return Err(BlobTransportError::status(
-                    format!("blob GET failed for '{key}' with HTTP {status}"),
-                    status,
-                ));
-            }
-
-            let bytes = response.bytes().await.map_err(|e| {
-                BlobTransportError::message(format!("blob GET body read failed for '{key}': {e}"))
-            })?;
-            Ok((status, Some(bytes.to_vec())))
-        }
-        .instrument(span.clone())
-        .await;
-
-        match result {
-            Ok((status, bytes)) => {
-                let response_bytes = bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
-                let outcome = if bytes.is_some() { "ok" } else { "not_found" };
-                finish_blob_transport(BlobTransportFinish {
-                    started_at,
-                    span: &span,
-                    operation: "get",
-                    backend: "s3",
-                    outcome,
-                    status: Some(status),
-                    request_bytes: 0,
-                    response_bytes,
-                });
-                Ok(bytes)
-            }
-            Err(error) => {
-                finish_blob_transport(BlobTransportFinish {
-                    started_at,
-                    span: &span,
-                    operation: "get",
-                    backend: "s3",
-                    outcome: "error",
-                    status: error.status,
-                    request_bytes: 0,
                     response_bytes: 0,
                 });
                 Err(error.message)
