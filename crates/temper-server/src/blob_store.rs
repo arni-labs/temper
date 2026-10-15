@@ -59,6 +59,11 @@ struct S3BlobStore {
 }
 
 impl BlobStore {
+    /// Whether the bytes live in an S3-compatible object store (R2, S3), off this machine.
+    pub(crate) fn is_object_store(&self) -> bool {
+        matches!(self.backend, BlobStoreBackend::S3(_))
+    }
+
     pub(crate) fn local_fs(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {

@@ -46,6 +46,9 @@ impl ServerState {
     ) -> Result<(), String> {
         let store = self.blob_store_for_tenant(tenant)?;
         store.put_if_absent(key, body, ttl).await?;
+        if !copies_to_metadata(&store, key) {
+            return Ok(());
+        }
         self.put_metadata_blob_shadow(tenant, key, body, ttl).await
     }
 
@@ -59,6 +62,9 @@ impl ServerState {
     ) -> Result<(), String> {
         let store = self.blob_store_for_tenant(tenant)?;
         store.put_content_addressed(key, body, ttl).await?;
+        if !copies_to_metadata(&store, key) {
+            return Ok(());
+        }
         self.put_metadata_blob_shadow(tenant, key, body, ttl).await
     }
 
@@ -261,6 +267,18 @@ impl ServerState {
     }
 }
 
+/// TemperFS file content (`temper-fs/` keys) kept in an object store is not copied into the metadata
+/// database as well. On a Temper whose metadata store is one app's own database file, that copy put every
+/// file's bytes back into the database the object store was meant to keep them out of. Everything else is
+/// copied as before (Genesis install recovery reads those copies), and so is file content on a local
+/// store, where the database copy is the one that outlives the machine.
+fn copies_to_metadata(store: &BlobStore, key: &str) -> bool {
+    !(store.is_object_store() && key.starts_with(FILE_CONTENT_PREFIX))
+}
+
+/// Where TemperFS keeps a file's content, by its hash (`state/file_writes.rs`).
+const FILE_CONTENT_PREFIX: &str = "temper-fs/";
+
 fn tenant_object_namespace(tenant: &TenantId) -> Option<String> {
     (tenant != &TenantId::default())
         .then(|| super::hex_lower(&Sha256::digest(tenant.as_str().as_bytes())))
@@ -279,6 +297,22 @@ mod tests {
     use temper_spec::csdl::CsdlDocument;
 
     use super::*;
+
+    #[test]
+    fn file_content_in_an_object_store_is_not_copied_into_the_metadata_database() {
+        let staging = std::env::temp_dir();
+        let r2 = BlobStore::s3("https://r2.example", "files", None, None, staging, None);
+        let local = BlobStore::local_fs(std::env::temp_dir().join("blobs"));
+        assert!(!copies_to_metadata(&r2, "temper-fs/sha256:abc"));
+        assert!(
+            copies_to_metadata(&r2, "wasm-modules/abc"),
+            "other objects keep their copy"
+        );
+        assert!(
+            copies_to_metadata(&local, "temper-fs/sha256:abc"),
+            "a local store keeps the copy that outlives the machine"
+        );
+    }
 
     #[test]
     fn tenant_object_namespaces_are_stable_and_default_compatible() {
