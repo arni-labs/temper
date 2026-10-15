@@ -12,6 +12,13 @@ use super::{
 };
 use crate::query_eval::apply_query_options;
 
+/// Selected documents held at once while a per-entity list is filtered.
+///
+/// Same size as the catalog SQL batch (`CATALOG_READ_BATCH` in
+/// `temper-store-postgres`). One chunk is one read, then the documents are
+/// dropped; only the allowed ids are kept.
+const SPARSE_DECISION_BATCH: usize = 32;
+
 async fn read_source_cursor_without_filter_or_count(
     request: &QueryPlaneReadRequest<'_>,
     all_entity_ids: &[String],
@@ -264,32 +271,37 @@ async fn sparse_allowed_ids<'a>(
         fields.push("status".to_string());
     }
     fields.push("entity_id".to_string());
-    let loaded = crate::storage::load_selected_catalog_rows_by_id(
-        &query_plane,
-        request.tenant.as_str(),
-        request.entity_type,
-        all_entity_ids,
-        &fields,
-    )
-    .await
-    .ok()?;
-    let crate::storage::CatalogRowsLoad::Available(rows) = loaded else {
-        return None;
-    };
-
+    // Decide a batch and drop it. Holding every selected document for the
+    // whole id list (up to the scan budget) is what made a per-entity list
+    // the size of the catalog. One batch matches the SQL read size, and the
+    // allowed result is only ids, in the same order as `all_entity_ids`.
     let mut allowed = Vec::new();
-    for entity_id in all_entity_ids {
-        let Some(row) = rows.get(entity_id) else {
-            continue;
-        };
-        let body = super::super::super::read_support::catalog_row_to_selected_entity_body(
+    for chunk in all_entity_ids.chunks(SPARSE_DECISION_BATCH) {
+        let loaded = crate::storage::load_selected_catalog_rows_by_id(
+            &query_plane,
+            request.tenant.as_str(),
             request.entity_type,
-            request.entity_set_name,
-            row.clone(),
+            chunk,
             &fields,
-        );
-        if super::entity_read_allowed(request, &body) {
-            allowed.push(entity_id);
+        )
+        .await
+        .ok()?;
+        let crate::storage::CatalogRowsLoad::Available(rows) = loaded else {
+            return None;
+        };
+        for entity_id in chunk {
+            let Some(row) = rows.get(entity_id) else {
+                continue;
+            };
+            let body = super::super::super::read_support::catalog_row_to_selected_entity_body(
+                request.entity_type,
+                request.entity_set_name,
+                row.clone(),
+                &fields,
+            );
+            if super::entity_read_allowed(request, &body) {
+                allowed.push(entity_id);
+            }
         }
     }
     Some(allowed)
