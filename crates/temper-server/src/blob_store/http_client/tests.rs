@@ -8,6 +8,8 @@ use tokio::net::TcpListener;
 use super::super::BlobStore;
 use super::*;
 
+// RSS comes from procfs, which only Linux has.
+#[cfg(target_os = "linux")]
 fn rss_bytes() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").expect("status");
     for line in status.lines() {
@@ -205,6 +207,7 @@ async fn a_reset_connection_is_retried_once() {
     assert!(accepts.load(Ordering::SeqCst) >= 2);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_cache_budget_bounds_retained_rss_across_repeated_fills() {
     let before = rss_bytes();
