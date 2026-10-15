@@ -236,7 +236,10 @@ async fn reformatted_primary_copy_is_removed() {
         );
     }
     let rows = fx.rows().await;
-    let primary = rows.iter().find(|row| row.policy_id == "primary").unwrap();
+    let primary = rows
+        .iter()
+        .find(|row| row.policy_id == "primary")
+        .expect("primary policy row");
     assert!(
         primary.cedar_text.contains("// frozen items"),
         "layout around it kept"
@@ -345,7 +348,7 @@ async fn failed_app_row_write_after_primary_rewrite_restarts_to_the_same_stateme
         .await
         .into_iter()
         .find(|row| row.policy_id == "primary")
-        .unwrap();
+        .expect("primary policy row");
     assert!(
         !primary.cedar_text.contains(FORBID_WITHDRAW),
         "the primary rewrite ran before the failure"
