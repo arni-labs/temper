@@ -5,6 +5,19 @@ pub(super) struct FileProjectionMeta {
     pub(super) content_hash: String,
     pub(super) mime_type: String,
     pub(super) has_content: bool,
+    pub(super) size_bytes: Option<u64>,
+}
+
+fn size_from_text(value: Option<&str>) -> Option<u64> {
+    let parsed = value?.parse::<i64>().ok()?;
+    u64::try_from(parsed).ok()
+}
+
+fn size_from_json(fields: &serde_json::Value) -> Option<u64> {
+    let value = fields.get("size_bytes")?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|size| u64::try_from(size).ok()))
 }
 
 pub(super) fn file_projection_from_row(row: QueryProjectionFieldsRow) -> FileProjectionMeta {
@@ -26,6 +39,11 @@ pub(super) fn file_projection_from_row(row: QueryProjectionFieldsRow) -> FilePro
             .get("has_content")
             .and_then(|value| value.as_deref())
             .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        size_bytes: size_from_text(
+            row.fields
+                .get("size_bytes")
+                .and_then(|value| value.as_deref()),
+        ),
     }
 }
 
@@ -45,6 +63,7 @@ pub(super) fn file_projection_from_state(fields: &serde_json::Value) -> FileProj
             .get("has_content")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        size_bytes: size_from_json(fields),
     }
 }
 
@@ -66,6 +85,11 @@ pub(super) fn file_version_projection_from_row(
             .cloned()
             .flatten()
             .unwrap_or_default(),
+        size_bytes: size_from_text(
+            row.fields
+                .get("size_bytes")
+                .and_then(|value| value.as_deref()),
+        ),
     }
 }
 
@@ -83,5 +107,6 @@ pub(super) fn file_version_projection_from_state(fields: &serde_json::Value) -> 
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string(),
+        size_bytes: size_from_json(fields),
     }
 }

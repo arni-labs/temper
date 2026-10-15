@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+
 use temper_runtime::tenant::TenantId;
 use tracing::instrument;
 
@@ -10,9 +11,13 @@ use super::file_read_projection::{
 
 #[cfg(feature = "observe")]
 mod batch_text;
+mod body;
+mod open;
 
 #[cfg(feature = "observe")]
 pub(crate) use batch_text::{BatchTextReadError, validate_batch_text_ids};
+pub use body::IndexedFileBody;
+pub(crate) use body::{IndexedFileDescriptor, materialize_indexed_body};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TextFileReadResult {
@@ -32,7 +37,7 @@ pub struct TextFileVersionReadResult {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum IndexedFileStreamRead {
     MissingIndex,
     StaleIndex {
@@ -46,13 +51,20 @@ pub enum IndexedFileStreamRead {
     Content {
         content_hash: String,
         mime_type: String,
-        bytes: Vec<u8>,
+        body: IndexedFileBody,
     },
+}
+
+/// Whether an indexed read materializes the object or leaves it as a stream.
+#[derive(Clone, Copy)]
+pub(super) enum BlobBodyLoad {
+    Buffered,
+    Stream,
 }
 
 /// Which indexed stream entity a read targets, used to dispatch the
 /// authoritative actor-state fallback.
-enum StreamKind {
+pub(super) enum StreamKind {
     File,
     Version,
 }
@@ -73,12 +85,20 @@ impl ServerState {
             .await?;
         let Some(meta) = meta_by_id.get(file_id).cloned() else {
             return self
-                .read_file_stream_from_state_fallback(tenant, file_id)
+                .read_file_stream_from_state_fallback(tenant, file_id, BlobBodyLoad::Buffered)
                 .await;
         };
-        let read = self.read_indexed_stream_from_meta(tenant, meta).await?;
-        self.reconcile_indexed_stream_read(tenant, StreamKind::File, file_id, read)
-            .await
+        let read = self
+            .read_indexed_stream_from_meta(tenant, meta, BlobBodyLoad::Buffered)
+            .await?;
+        self.reconcile_indexed_stream_read(
+            tenant,
+            StreamKind::File,
+            file_id,
+            read,
+            BlobBodyLoad::Buffered,
+        )
+        .await
     }
 
     #[instrument(skip_all, fields(
@@ -99,12 +119,24 @@ impl ServerState {
             .await?;
         let Some(meta) = meta_by_id.get(file_version_id).cloned() else {
             return self
-                .read_file_version_stream_from_state_fallback(tenant, file_version_id)
+                .read_file_version_stream_from_state_fallback(
+                    tenant,
+                    file_version_id,
+                    BlobBodyLoad::Buffered,
+                )
                 .await;
         };
-        let read = self.read_indexed_stream_from_meta(tenant, meta).await?;
-        self.reconcile_indexed_stream_read(tenant, StreamKind::Version, file_version_id, read)
-            .await
+        let read = self
+            .read_indexed_stream_from_meta(tenant, meta, BlobBodyLoad::Buffered)
+            .await?;
+        self.reconcile_indexed_stream_read(
+            tenant,
+            StreamKind::Version,
+            file_version_id,
+            read,
+            BlobBodyLoad::Buffered,
+        )
+        .await
     }
 
     /// Reconcile an indexed file stream read against the authoritative actor
@@ -119,13 +151,16 @@ impl ServerState {
         kind: StreamKind,
         id: &str,
         read: IndexedFileStreamRead,
+        load: BlobBodyLoad,
     ) -> Result<IndexedFileStreamRead, String> {
         match read {
             IndexedFileStreamRead::StaleIndex {
                 content_hash,
                 mime_type,
             } => {
-                let fallback = self.read_stream_state_fallback(tenant, &kind, id).await?;
+                let fallback = self
+                    .read_stream_state_fallback(tenant, &kind, id, load)
+                    .await?;
                 if stream_read_content_hash(&fallback).is_some_and(|hash| hash != content_hash) {
                     Ok(fallback)
                 } else {
@@ -139,7 +174,9 @@ impl ServerState {
                 content_hash,
                 mime_type,
             } => {
-                let fallback = self.read_stream_state_fallback(tenant, &kind, id).await?;
+                let fallback = self
+                    .read_stream_state_fallback(tenant, &kind, id, load)
+                    .await?;
                 if matches!(fallback, IndexedFileStreamRead::Content { .. }) {
                     Ok(fallback)
                 } else {
@@ -160,11 +197,15 @@ impl ServerState {
         tenant: &TenantId,
         kind: &StreamKind,
         id: &str,
+        load: BlobBodyLoad,
     ) -> Result<IndexedFileStreamRead, String> {
         match kind {
-            StreamKind::File => self.read_file_stream_from_state_fallback(tenant, id).await,
+            StreamKind::File => {
+                self.read_file_stream_from_state_fallback(tenant, id, load)
+                    .await
+            }
             StreamKind::Version => {
-                self.read_file_version_stream_from_state_fallback(tenant, id)
+                self.read_file_version_stream_from_state_fallback(tenant, id, load)
                     .await
             }
         }
@@ -239,7 +280,7 @@ impl ServerState {
                     tenant.as_str(),
                     "File",
                     file_ids,
-                    &["content_hash", "mime_type", "has_content"],
+                    &["content_hash", "mime_type", "has_content", "size_bytes"],
                 )
                 .await
                 .map_err(|e| format!("failed to load File projections: {e}"))?
@@ -265,7 +306,7 @@ impl ServerState {
                     tenant.as_str(),
                     "FileVersion",
                     file_version_ids,
-                    &["content_hash", "mime_type"],
+                    &["content_hash", "mime_type", "size_bytes"],
                 )
                 .await
                 .map_err(|e| format!("failed to load FileVersion projections: {e}"))?
@@ -282,6 +323,7 @@ impl ServerState {
         &self,
         tenant: &TenantId,
         meta: FileProjectionMeta,
+        load: BlobBodyLoad,
     ) -> Result<IndexedFileStreamRead, String> {
         if !meta.has_content || meta.content_hash.is_empty() {
             return Ok(IndexedFileStreamRead::NoContent {
@@ -290,20 +332,41 @@ impl ServerState {
             });
         }
 
-        let Some(bytes) = self
-            .fetch_blob_bytes_for_hash(tenant, &meta.content_hash)
-            .await?
-        else {
-            return Ok(IndexedFileStreamRead::StaleIndex {
-                content_hash: meta.content_hash,
-                mime_type: meta.mime_type,
-            });
+        let body = match load {
+            BlobBodyLoad::Buffered => {
+                let Some(bytes) = self
+                    .fetch_blob_bytes_for_hash(tenant, &meta.content_hash)
+                    .await?
+                else {
+                    return Ok(IndexedFileStreamRead::StaleIndex {
+                        content_hash: meta.content_hash,
+                        mime_type: meta.mime_type,
+                    });
+                };
+                IndexedFileBody::Bytes(bytes)
+            }
+            BlobBodyLoad::Stream => {
+                let Some(object) = self
+                    .open_blob_stream_for_hash(tenant, &meta.content_hash)
+                    .await?
+                else {
+                    return Ok(IndexedFileStreamRead::StaleIndex {
+                        content_hash: meta.content_hash,
+                        mime_type: meta.mime_type,
+                    });
+                };
+                let content_length = object.content_length();
+                IndexedFileBody::Stream {
+                    content_length,
+                    stream: object.into_stream(),
+                }
+            }
         };
 
         Ok(IndexedFileStreamRead::Content {
             content_hash: meta.content_hash,
             mime_type: meta.mime_type,
-            bytes,
+            body,
         })
     }
 
@@ -311,18 +374,24 @@ impl ServerState {
         &self,
         tenant: &TenantId,
         file_id: &str,
+        load: BlobBodyLoad,
     ) -> Result<IndexedFileStreamRead, String> {
         let Ok(resp) = self.get_tenant_entity_state(tenant, "File", file_id).await else {
             return Ok(IndexedFileStreamRead::MissingIndex);
         };
-        self.read_indexed_stream_from_meta(tenant, file_projection_from_state(&resp.state.fields))
-            .await
+        self.read_indexed_stream_from_meta(
+            tenant,
+            file_projection_from_state(&resp.state.fields),
+            load,
+        )
+        .await
     }
 
     async fn read_file_version_stream_from_state_fallback(
         &self,
         tenant: &TenantId,
         file_version_id: &str,
+        load: BlobBodyLoad,
     ) -> Result<IndexedFileStreamRead, String> {
         let Ok(resp) = self
             .get_tenant_entity_state(tenant, "FileVersion", file_version_id)
@@ -333,6 +402,7 @@ impl ServerState {
         self.read_indexed_stream_from_meta(
             tenant,
             file_version_projection_from_state(&resp.state.fields),
+            load,
         )
         .await
     }

@@ -476,6 +476,7 @@ async fn put_local_blob_stream_observed(
         status: None,
         request_bytes,
         response_bytes: 0,
+        ttfb: None,
     });
     result
 }

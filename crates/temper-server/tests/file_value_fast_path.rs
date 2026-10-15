@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sha2::{Digest, Sha256};
@@ -7,12 +9,15 @@ use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::registry::{EntityLevelSummary, EntityVerificationResult, VerificationStatus};
 use temper_server::request_context::AgentContext;
-use temper_server::state::IndexedFileStreamRead;
+use temper_server::secrets::SecretsVault;
+use temper_server::state::{IndexedFileBody, IndexedFileStreamRead};
 use temper_server::storage::StorageStack;
 use temper_server::{ServerState, build_router};
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn authenticate_test_request(
     mut request: axum::extract::Request,
@@ -312,7 +317,7 @@ async fn create_file_with_initial_stream_content_projects_only_ready_content() {
         IndexedFileStreamRead::Content {
             content_hash: expected_hash.clone(),
             mime_type: "text/markdown".to_string(),
-            bytes: body.to_vec(),
+            body: IndexedFileBody::Bytes(body.to_vec()),
         }
     );
     assert_local_blob(data_dir.path(), &expected_hash, body).await;
@@ -478,6 +483,169 @@ async fn odata_file_value_get_applies_cedar_read_policy() {
 }
 
 #[tokio::test]
+async fn odata_file_value_get_streams_bytes_and_answers_304_from_etag() {
+    let (mut state, _store) = build_turso_file_state("odata-stream-get").await;
+    let tenant = TenantId::default();
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    state.data_dir = data_dir.path().to_path_buf();
+    mark_file_verified(&state);
+
+    state
+        .get_or_create_tenant_entity(&tenant, "File", "fl-stream", serde_json::json!({}))
+        .await
+        .expect("create File state");
+    let body = b"streamed file value bytes";
+    state
+        .put_file_stream_content(
+            &tenant,
+            "fl-stream",
+            body,
+            "text/plain",
+            &AgentContext::for_service("test-writer"),
+        )
+        .await
+        .expect("seed stream content");
+
+    let app = authenticated_router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/tdata/Files('fl-stream')/$value")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("Content-Length")
+            .and_then(|value| value.to_str().ok()),
+        Some(body.len().to_string().as_str())
+    );
+    let etag = response
+        .headers()
+        .get("ETag")
+        .and_then(|value| value.to_str().ok())
+        .expect("etag")
+        .to_string();
+    assert!(etag.starts_with("\"sha256:"));
+    assert_eq!(
+        response
+            .headers()
+            .get("Cache-Control")
+            .and_then(|value| value.to_str().ok()),
+        Some("private, max-age=31536000, immutable")
+    );
+    let collected = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("collect streamed body");
+    assert_eq!(collected.as_ref(), body);
+
+    let not_modified = app
+        .oneshot(
+            Request::get("/tdata/Files('fl-stream')/$value")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        not_modified
+            .headers()
+            .get("ETag")
+            .and_then(|value| value.to_str().ok()),
+        Some(etag.as_str())
+    );
+    assert_eq!(
+        not_modified
+            .headers()
+            .get("Cache-Control")
+            .and_then(|value| value.to_str().ok()),
+        Some("private, max-age=31536000, immutable")
+    );
+    let empty = axum::body::to_bytes(not_modified.into_body(), 64)
+        .await
+        .expect("304 body");
+    assert!(empty.is_empty());
+}
+
+#[tokio::test]
+async fn odata_file_value_redirect_is_not_issued_for_a_denied_read() {
+    let (mut state, _store) = build_turso_file_state("odata-redirect-denied").await;
+    let tenant = TenantId::default();
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    state.data_dir = data_dir.path().to_path_buf();
+    mark_file_verified(&state);
+
+    state
+        .get_or_create_tenant_entity(&tenant, "File", "fl-redirect-denied", serde_json::json!({}))
+        .await
+        .expect("create File state");
+    state
+        .put_file_stream_content(
+            &tenant,
+            "fl-redirect-denied",
+            b"private content",
+            "text/plain",
+            &AgentContext::for_service("test-writer"),
+        )
+        .await
+        .expect("seed stream content");
+
+    let blob_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&blob_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&blob_server)
+        .await;
+    let vault = SecretsVault::new(&[7u8; 32]);
+    vault
+        .cache_secret("default", "blob_endpoint", blob_server.uri())
+        .expect("endpoint");
+    vault
+        .cache_secret("default", "blob_bucket", "bucket".to_string())
+        .expect("bucket");
+    vault
+        .cache_secret("default", "blob_access_key", "AKIATEST".to_string())
+        .expect("access key");
+    vault
+        .cache_secret("default", "blob_secret_key", "secret".to_string())
+        .expect("secret key");
+    state.secrets_vault = Some(Arc::new(vault));
+    state
+        .authz
+        .reload_tenant_policies(
+            tenant.as_str(),
+            r#"permit(principal, action == Action::"update", resource is File);"#,
+        )
+        .expect("install Cedar policy");
+
+    let response = authenticated_router(state)
+        .oneshot(
+            Request::get("/tdata/Files('fl-redirect-denied')/$value?redirect=1")
+                .header("x-temper-principal-kind", "customer")
+                .header("x-temper-principal-id", "customer-1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route should respond");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.headers().get("Location").is_none());
+    blob_server.verify().await;
+}
+
+#[tokio::test]
 async fn read_file_stream_indexed_returns_blob_without_actor_materialization() {
     let (state, store) = build_turso_state("content").await;
     let tenant = TenantId::default();
@@ -514,7 +682,7 @@ async fn read_file_stream_indexed_returns_blob_without_actor_materialization() {
         IndexedFileStreamRead::Content {
             content_hash: content_hash.to_string(),
             mime_type: "text/html".to_string(),
-            bytes: bytes.to_vec(),
+            body: IndexedFileBody::Bytes(bytes.to_vec()),
         }
     );
 }
@@ -572,7 +740,7 @@ async fn read_file_stream_indexed_falls_back_to_file_state_when_projection_is_mi
         IndexedFileStreamRead::Content {
             content_hash: content_hash.to_string(),
             mime_type: "text/html".to_string(),
-            bytes: bytes.to_vec(),
+            body: IndexedFileBody::Bytes(bytes.to_vec()),
         }
     );
 }
@@ -645,7 +813,7 @@ async fn read_file_stream_indexed_falls_back_to_file_state_when_projection_is_st
         IndexedFileStreamRead::Content {
             content_hash: current_hash.to_string(),
             mime_type: "text/html".to_string(),
-            bytes: current_bytes.to_vec(),
+            body: IndexedFileBody::Bytes(current_bytes.to_vec()),
         }
     );
 }
@@ -764,7 +932,7 @@ async fn new_file_value_put_is_read_after_write_consistent() {
         IndexedFileStreamRead::Content {
             content_hash: expected_hash.clone(),
             mime_type: "text/markdown".to_string(),
-            bytes: body.to_vec(),
+            body: IndexedFileBody::Bytes(body.to_vec()),
         }
     );
 }

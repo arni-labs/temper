@@ -33,7 +33,9 @@ pub use dispatch::{DispatchCommand, DispatchError, DispatchExtOptions, StateTime
 pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
-pub use file_reads::{IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult};
+pub use file_reads::{
+    IndexedFileBody, IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult,
+};
 pub(crate) use file_writes::FileStreamContentError;
 pub use metrics::MetricsCollector;
 pub use pending_decisions::{
@@ -1283,7 +1285,9 @@ impl ServerState {
         agent_ctx: &crate::request_context::AgentContext,
     ) -> Result<(u16, Vec<u8>), String> {
         match self.read_file_stream_indexed(tenant, file_id).await? {
-            IndexedFileStreamRead::Content { bytes, .. } => return Ok((200, bytes)),
+            IndexedFileStreamRead::Content { body, .. } => {
+                return Ok((200, file_reads::materialize_indexed_body(body).await?));
+            }
             IndexedFileStreamRead::NoContent { .. } => return Ok((404, Vec::new())),
             IndexedFileStreamRead::MissingIndex => {
                 tracing::warn!(

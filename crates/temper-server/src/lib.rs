@@ -3,6 +3,11 @@
 //! HTTP / OData / Cedar / registry live here with EntityActor and
 //! `entity_actor/effects.rs` (the default `apply_effects`). Not a plug.
 
+// The in-process `/tdata` host awaits the OData handler directly. Streaming
+// `$value` adds another generator layer, and rustc's layout query for that
+// async block exceeds the default depth of 128.
+#![recursion_limit = "256"]
+
 pub mod adapters;
 mod admin;
 #[cfg(feature = "observe")]

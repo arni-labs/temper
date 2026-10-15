@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 
@@ -17,6 +17,8 @@ pub(crate) struct BlobTransportFinish<'a> {
     pub(crate) status: Option<StatusCode>,
     pub(crate) request_bytes: u64,
     pub(crate) response_bytes: u64,
+    /// Time until the first response byte. Recorded for streamed and buffered gets.
+    pub(crate) ttfb: Option<Duration>,
 }
 
 impl BlobTransportError {
@@ -52,6 +54,7 @@ pub(crate) fn blob_transport_span(
             status_code_class = tracing::field::Empty,
             http.status_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
+            ttfb_ms = tracing::field::Empty,
         ),
         "put_content" => tracing::info_span!(
             "blob.transport.put_content",
@@ -64,6 +67,7 @@ pub(crate) fn blob_transport_span(
             status_code_class = tracing::field::Empty,
             http.status_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
+            ttfb_ms = tracing::field::Empty,
         ),
         "get" => tracing::info_span!(
             "blob.transport.get",
@@ -76,6 +80,7 @@ pub(crate) fn blob_transport_span(
             status_code_class = tracing::field::Empty,
             http.status_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
+            ttfb_ms = tracing::field::Empty,
         ),
         "head" => tracing::info_span!(
             "blob.transport.head",
@@ -88,6 +93,7 @@ pub(crate) fn blob_transport_span(
             status_code_class = tracing::field::Empty,
             http.status_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
+            ttfb_ms = tracing::field::Empty,
         ),
         _ => tracing::info_span!(
             "blob.transport",
@@ -100,6 +106,7 @@ pub(crate) fn blob_transport_span(
             status_code_class = tracing::field::Empty,
             http.status_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
+            ttfb_ms = tracing::field::Empty,
         ),
     }
 }
@@ -116,14 +123,20 @@ pub(crate) fn finish_blob_transport(record: BlobTransportFinish<'_>) {
     record
         .span
         .record("duration_ms", duration.as_secs_f64() * 1000.0);
+    if let Some(ttfb) = record.ttfb {
+        record.span.record("ttfb_ms", ttfb.as_secs_f64() * 1000.0);
+    }
     crate::runtime_metrics::blob_transport::record(
         duration,
         record.operation,
         record.backend,
         record.outcome,
         status_code_class,
-        record.request_bytes,
-        record.response_bytes,
+        crate::runtime_metrics::blob_transport::BlobTransportMeasurement {
+            request_bytes: record.request_bytes,
+            response_bytes: record.response_bytes,
+            ttfb: record.ttfb,
+        },
     );
 }
 

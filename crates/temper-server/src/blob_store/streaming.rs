@@ -3,12 +3,14 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt as _;
-use reqwest::{Method, StatusCode};
+use reqwest::StatusCode;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument as _;
 
+use super::limits::BLOB_READ_IDLE_TIMEOUT;
+use super::s3_get::{GetStreamObservation, observe_get_stream};
 use super::{
     BLOB_IO_QUEUE_TIMEOUT, BlobByteStream, BlobStore, BlobStoreBackend, S3BlobStore,
     blob_io_semaphore, keys::hex_lower, local_blob_path,
@@ -25,7 +27,6 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const BASE64_INPUT_CHUNK_BYTES: usize = 64 * 1024;
 const BLOB_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOB_BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-const BLOB_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOB_STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_BLOB_STREAM_MAX_CONCURRENCY: usize = 32;
 
@@ -200,20 +201,9 @@ impl S3BlobStore {
         let started_at = Instant::now(); // determinism-ok: production blob transport metric only
         let span = blob_transport_span("get_bounded", "s3", 0);
         let result = async {
-            let url = self.object_url(key);
-            let mut request = self.client.get(&url).timeout(BLOB_BOUNDED_READ_TIMEOUT);
-            let headers = self
-                .signed_headers(Method::GET, &url)
-                .map_err(BlobTransportError::message)?;
-            for (header_name, header_value) in &headers {
-                request = request.header(header_name, header_value);
-            }
-
-            let response = request.send().await.map_err(|error| {
-                BlobTransportError::message(format!(
-                    "bounded blob GET request failed for '{key}': {error}"
-                ))
-            })?;
+            let response = self
+                .send_signed_get(key, Some(BLOB_BOUNDED_READ_TIMEOUT))
+                .await?;
             let status = response.status();
             if status == StatusCode::NOT_FOUND {
                 return Ok((status, BlobReadBounded::Missing));
@@ -269,6 +259,7 @@ impl S3BlobStore {
                     status: Some(status),
                     request_bytes: 0,
                     response_bytes,
+                    ttfb: None,
                 });
                 Ok(outcome)
             }
@@ -282,6 +273,7 @@ impl S3BlobStore {
                     status: error.status,
                     request_bytes: 0,
                     response_bytes: 0,
+                    ttfb: None,
                 });
                 Err(error.message)
             }
@@ -289,31 +281,107 @@ impl S3BlobStore {
     }
 
     async fn get_stream(&self, key: &str, max_bytes: u64) -> Result<BlobStreamRead, String> {
-        let url = self.object_url(key);
-        let mut request = self.client.get(&url).timeout(BLOB_STREAM_TOTAL_TIMEOUT);
-        let headers = self.signed_headers(Method::GET, &url)?;
-        for (header_name, header_value) in &headers {
-            request = request.header(header_name, header_value);
-        }
-        let response = tokio::time::timeout(BLOB_STREAM_OPEN_TIMEOUT, request.send())
-            .await
-            .map_err(|_| format!("streaming blob GET open timed out for '{key}'"))?
-            .map_err(|error| format!("streaming blob GET request failed for '{key}': {error}"))?;
+        // The blob I/O slot is held by `BlobStore::get_stream` only until this
+        // returns — that is, until headers (and Content-Length) arrive. The
+        // body is then pulled by the caller under the stream permit, with a
+        // per-chunk idle timeout in `enforce_stream_bounds`.
+        let started_at = Instant::now(); // determinism-ok: production blob transport metric only
+        let span = blob_transport_span("get", "s3", 0);
+        let response = match tokio::time::timeout(
+            BLOB_STREAM_OPEN_TIMEOUT,
+            self.send_signed_get(key, Some(BLOB_STREAM_TOTAL_TIMEOUT)),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                finish_blob_transport(BlobTransportFinish {
+                    started_at,
+                    span: &span,
+                    operation: "get",
+                    backend: "s3",
+                    outcome: "error",
+                    status: error.status,
+                    request_bytes: 0,
+                    response_bytes: 0,
+                    ttfb: None,
+                });
+                return Err(error.message);
+            }
+            Err(_) => {
+                finish_blob_transport(BlobTransportFinish {
+                    started_at,
+                    span: &span,
+                    operation: "get",
+                    backend: "s3",
+                    outcome: "error",
+                    status: None,
+                    request_bytes: 0,
+                    response_bytes: 0,
+                    ttfb: None,
+                });
+                return Err(format!("streaming blob GET open timed out for '{key}'"));
+            }
+        };
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
+            finish_blob_transport(BlobTransportFinish {
+                started_at,
+                span: &span,
+                operation: "get",
+                backend: "s3",
+                outcome: "not_found",
+                status: Some(status),
+                request_bytes: 0,
+                response_bytes: 0,
+                ttfb: Some(started_at.elapsed()),
+            });
             return Ok(BlobStreamRead::Missing);
         }
         if !status.is_success() {
+            finish_blob_transport(BlobTransportFinish {
+                started_at,
+                span: &span,
+                operation: "get",
+                backend: "s3",
+                outcome: "error",
+                status: Some(status),
+                request_bytes: 0,
+                response_bytes: 0,
+                ttfb: Some(started_at.elapsed()),
+            });
             return Err(format!(
                 "streaming blob GET failed for '{key}' with HTTP {status}"
             ));
         }
         let Some(content_length) = response.content_length() else {
+            finish_blob_transport(BlobTransportFinish {
+                started_at,
+                span: &span,
+                operation: "get",
+                backend: "s3",
+                outcome: "error",
+                status: Some(status),
+                request_bytes: 0,
+                response_bytes: 0,
+                ttfb: Some(started_at.elapsed()),
+            });
             return Err(format!(
                 "streaming blob GET for '{key}' omitted Content-Length"
             ));
         };
         if content_length > max_bytes {
+            finish_blob_transport(BlobTransportFinish {
+                started_at,
+                span: &span,
+                operation: "get",
+                backend: "s3",
+                outcome: "too_large",
+                status: Some(status),
+                request_bytes: 0,
+                response_bytes: content_length,
+                ttfb: Some(started_at.elapsed()),
+            });
             return Ok(BlobStreamRead::TooLarge {
                 actual_bytes: Some(content_length),
             });
@@ -323,9 +391,12 @@ impl S3BlobStore {
                 .bytes_stream()
                 .map(|item| item.map_err(std::io::Error::other)),
         );
+        let bounded = enforce_stream_bounds(source, content_length);
+        let observed =
+            observe_get_stream(bounded, GetStreamObservation::new(started_at, span, status));
         Ok(BlobStreamRead::Found(BlobObjectStream {
             content_length,
-            stream: enforce_stream_bounds(source, content_length),
+            stream: observed,
         }))
     }
 }
@@ -388,7 +459,7 @@ fn enforce_stream_bounds(mut source: BlobByteStream, expected_bytes: u64) -> Blo
             if now >= deadline {
                 Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "blob stream total deadline exceeded"))?;
             }
-            let wait = BLOB_STREAM_IDLE_TIMEOUT.min(deadline.saturating_duration_since(now));
+            let wait = BLOB_READ_IDLE_TIMEOUT.min(deadline.saturating_duration_since(now));
             let next = tokio::time::timeout(wait, source.next())
                 .await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "blob stream idle deadline exceeded"))?;
