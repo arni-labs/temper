@@ -167,8 +167,10 @@ dispatch without its idempotency key. The row is written before the arming
 dispatch returns and removed by the timer's task when it ends; a row with a
 higher journal sequence is never replaced by an earlier one. At boot `temper
 serve` reads each tenant's rows once, loads no entity, and arms each timer for
-the rest of its budget, or at once if it fell due while the server was down. A
-timer fires once; missed ticks are not replayed. The table is not a second
+the rest of its budget, or at once if it fell due while the server was down;
+at most eight of these fire at a time, so a long outage does not end in a burst
+of concurrent writes (1,610 at once on a loaded machine left 861 events
+unwritten). A timer fires once; missed ticks are not replayed. The table is not a second
 source of truth for state: a timer still fires only if its record is in the
 timed state when it wakes. Timers armed before rows existed keep the
 next-action hydration re-arm.

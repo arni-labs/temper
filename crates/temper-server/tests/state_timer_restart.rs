@@ -190,6 +190,33 @@ impl Server {
         });
     }
 
+    /// Arm many records at once: each is created and sent
+    /// `Arm` concurrently, so all are armed well inside one timer's budget.
+    fn arm_all(&self, entity_type: &str, ids: &[String], who: &AgentContext) {
+        self.runtime.block_on(async {
+            let mut arming = tokio::task::JoinSet::new();
+            for id in ids {
+                let (state, id, who) = (self.state.clone(), id.clone(), who.clone());
+                let entity_type = entity_type.to_string();
+                arming.spawn(async move {
+                    let tenant = TenantId::default();
+                    state
+                        .get_or_create_tenant_entity(&tenant, &entity_type, &id, json!({}))
+                        .await
+                        .unwrap();
+                    let response = state
+                        .dispatch_tenant_action(&tenant, &entity_type, &id, "Arm", json!({}), &who)
+                        .await
+                        .unwrap();
+                    assert!(response.success, "Arm on {id}: {:?}", response.error);
+                });
+            }
+            while let Some(armed) = arming.join_next().await {
+                armed.unwrap();
+            }
+        });
+    }
+
     /// `(counter, fired_by)` for one entity.
     fn read(&self, entity_type: &str, id: &str, counter: &str) -> (usize, Value) {
         self.runtime.block_on(async {
@@ -359,6 +386,44 @@ fn repeating_timer_resumes_without_replaying_missed_ticks(backend: &Backend) {
         3,
         "the next tick comes a full period after the catch-up"
     );
+    second.kill();
+}
+
+/// Many timers that fell due while the server was down: at boot they wait
+/// their turn to fire (a few at once), and every one fires exactly once.
+#[test]
+fn many_overdue_timers_each_fire_once_after_restart() {
+    let (_dir, backend) = turso();
+    let ids: Vec<String> = (0..40).map(|i| format!("overdue-{i}")).collect();
+    let first = Server::start(&backend, "burst-run-1");
+    let t0 = Instant::now();
+    first.arm_all("Probe", &ids, &person("alice"));
+    // Each row is written before its Arm returns; a timer that already fired
+    // has ended and left none.
+    let waiting = ids
+        .iter()
+        .filter(|id| first.read("Probe", id, "fires").0 == 0)
+        .count();
+    first.kill();
+    assert!(waiting > 0, "every timer fired before the restart");
+
+    sleep_until(t0 + Duration::from_millis(4_500));
+    let second = Server::start(&backend, "burst-run-2");
+    for id in &ids {
+        assert_eq!(
+            second.wait_for("Probe", id, "fires", 1, Duration::from_secs(10)),
+            1,
+            "{id} fires after the restart"
+        );
+    }
+    std::thread::sleep(Duration::from_secs(1)); // determinism-ok: real-time restart test
+    for id in &ids {
+        assert_eq!(
+            second.read("Probe", id, "fires"),
+            (1, json!("alice")),
+            "{id}"
+        );
+    }
     second.kill();
 }
 

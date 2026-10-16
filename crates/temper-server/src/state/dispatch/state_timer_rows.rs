@@ -9,6 +9,7 @@
 //! replayed.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -17,10 +18,18 @@ use temper_authz::SecurityContext;
 use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
+use tokio::sync::Semaphore;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
+
+/// How many timers armed at boot fire at once. Every timer that fell due while
+/// the server was down is due at boot; firing them all together is a burst of
+/// concurrent writes, and on 2026-10-16 1,610 at once on a loaded machine left
+/// 861 events unwritten (`failed to persist event`) and 1,013 projections
+/// failed, so those timers did not re-arm. The rest wait their turn.
+const BOOT_FIRES_AT_ONCE: usize = 8;
 
 /// A tenant's declared timeouts: `(entity type, state)` to
 /// `(after_seconds, on_timeout)`.
@@ -128,10 +137,12 @@ impl ServerState {
     ///
     /// Call once at boot, after specs, policies and modules are loaded and
     /// before the server takes requests. Reads one row per waiting timer and
-    /// loads no entity: an entity is loaded only when its timer fires.
-    /// Returns how many timers were armed.
+    /// loads no entity: an entity is loaded only when its timer fires. At
+    /// most [`BOOT_FIRES_AT_ONCE`] of these timers fire at once. Returns how
+    /// many timers were armed.
     pub async fn rearm_state_timers(&self) -> usize {
         let started = Instant::now();
+        let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
         let mut armed = 0usize;
         let mut overdue = 0usize;
         for (tenant, timeouts) in self.declared_state_timeouts() {
@@ -184,7 +195,7 @@ impl ServerState {
                     &timer.state,
                     label,
                 );
-                self.spawn_state_timer(timer, delay);
+                self.spawn_state_timer(timer, delay, Some(gate.clone()));
                 armed += 1;
             }
         }

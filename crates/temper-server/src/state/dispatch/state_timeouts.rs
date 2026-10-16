@@ -34,10 +34,11 @@
 //! the dispatch that found it.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use temper_runtime::scheduler::{sim_now, sim_uuid};
@@ -353,14 +354,21 @@ impl crate::state::ServerState {
             };
             let delay = remaining_budget(started_at, st.after_seconds, now);
             self.persist_state_timer(&timer).await;
-            self.spawn_state_timer(timer, delay);
+            self.spawn_state_timer(timer, delay, None);
         }
     }
 
     /// Start one armed timer's task: it waits `delay`, then fires the timer's
     /// action as the timer's identity if no newer arm or state change has
-    /// superseded it, and removes the timer's durable row when it ends.
-    pub(super) fn spawn_state_timer(&self, timer: ArmedTimer, delay: Duration) {
+    /// superseded it, and removes the timer's durable row when it ends. With a
+    /// `gate`, the fire waits for one of its permits and holds it until the
+    /// timer ends.
+    pub(super) fn spawn_state_timer(
+        &self,
+        timer: ArmedTimer,
+        delay: Duration,
+        gate: Option<Arc<Semaphore>>,
+    ) {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         let armed_seq = self.state_timeout_tracker.bump(&key);
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
@@ -398,6 +406,10 @@ impl crate::state::ServerState {
             // determinism-ok: wall-clock timer fires a side-effect action;
             // the action itself is deterministic under DST via sim_now().
             tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
+            let _permit = match gate {
+                Some(gate) => gate.acquire_owned().await.ok(),
+                None => None,
+            };
 
             let span = tracing::info_span!(
                 "dispatch.state_timeout.fire",
