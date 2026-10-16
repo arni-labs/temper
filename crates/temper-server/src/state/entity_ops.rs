@@ -499,14 +499,18 @@ impl ServerState {
             .await
     }
 
-    /// Mark every entity type observed in `entities` as fully hydrated from the
-    /// durable store, so `list_entity_ids_lazy` serves it from the in-memory
-    /// index without a redundant store scan. Used by the paths that load the
+    /// Mark each of these entity types as fully hydrated from the durable
+    /// store, so `list_entity_ids_lazy` serves it from the in-memory index
+    /// without a redundant store scan. Used by the paths that load the
     /// authoritative set for a tenant (full and eager hydration).
-    fn mark_types_hydrated(&self, tenant: &TenantId, entities: &[(String, String)]) {
-        let keys: std::collections::BTreeSet<String> = entities
-            .iter()
-            .map(|(entity_type, _entity_id)| format!("{tenant}:{entity_type}"))
+    fn mark_types_hydrated<'a>(
+        &self,
+        tenant: &TenantId,
+        entity_types: impl IntoIterator<Item = &'a str>,
+    ) {
+        let keys: std::collections::BTreeSet<String> = entity_types
+            .into_iter()
+            .map(|entity_type| format!("{tenant}:{entity_type}"))
             .collect();
         if keys.is_empty() {
             return;
@@ -543,7 +547,10 @@ impl ServerState {
                     }
                 } // write lock dropped before metrics call
                 // A full-store scan is authoritative for every type it observed.
-                self.mark_types_hydrated(tenant, &entities);
+                self.mark_types_hydrated(
+                    tenant,
+                    entities.iter().map(|(entity_type, _)| entity_type.as_str()),
+                );
                 tracing::info!(
                     tenant = %tenant,
                     count = entities.len(),
@@ -848,18 +855,47 @@ impl ServerState {
             match store.list_entity_ids(tenant.as_str()).await {
                 Ok(entities) => {
                     let mut hydrated = 0usize;
+                    let mut unreadable = std::collections::BTreeSet::new();
                     for (entity_type, entity_id) in &entities {
-                        if self
-                            .ensure_entity_loaded(tenant, entity_type, entity_id)
-                            .await
-                        {
+                        let loaded = if self.entity_exists(tenant, entity_type, entity_id) {
+                            self.ensure_entity_loaded(tenant, entity_type, entity_id)
+                                .await
+                        } else {
+                            match self
+                                .load_entity_from_store(tenant, entity_type, entity_id)
+                                .await
+                            {
+                                Ok(loaded) => loaded,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        tenant = %tenant,
+                                        entity_type,
+                                        entity_id,
+                                        error = %error,
+                                        "eager hydration could not read an entity; its type stays unmarked"
+                                    );
+                                    unreadable.insert(entity_type.as_str());
+                                    false
+                                }
+                            }
+                        };
+                        if loaded {
                             hydrated = hydrated.saturating_add(1);
                         }
                     }
-                    // Eager hydration loaded every durable entity, so each
-                    // observed type's index is complete — mark it hydrated so
-                    // the first lazy list does not re-scan the store.
-                    self.mark_types_hydrated(tenant, &entities);
+                    // A type whose every entity was read has a complete index:
+                    // mark it hydrated so the first lazy list does not re-scan
+                    // the store. A type with an unreadable entity stays
+                    // unmarked, so the next list or identity check (an issuer,
+                    // a revoked generation) lists it from the store instead of
+                    // taking the missing id for absence.
+                    self.mark_types_hydrated(
+                        tenant,
+                        entities
+                            .iter()
+                            .map(|(entity_type, _)| entity_type.as_str())
+                            .filter(|entity_type| !unreadable.contains(entity_type)),
+                    );
                     tracing::info!(
                         tenant = %tenant,
                         count = hydrated,
