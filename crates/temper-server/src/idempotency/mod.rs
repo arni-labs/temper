@@ -248,7 +248,8 @@ impl IdempotencyCache {
 
         // A reply larger than the whole budget is not cached. The durable key
         // set still deduplicates its retry, but as after a restart, a retry
-        // of a dropped reply then runs without the reply's spawns and timers.
+        // of a dropped reply then runs without the reply's spawns, timers and
+        // (for a non-composite action) triggers.
         if bytes > self.budget_bytes {
             return;
         }
@@ -296,9 +297,11 @@ impl Default for IdempotencyCache {
     }
 }
 
-/// The part of a reply a replay reads. Replays read event metadata (state
-/// clocks, source status), never event parameters or the durable key set,
-/// which dominate a busy entity's state; neither is copied.
+/// The part of a reply a replay needs. Post-dispatch effects read event
+/// metadata (state clocks, source status); event parameters and the durable
+/// key set dominate a busy entity's state and are not copied. A trigger fired
+/// from a replayed reply that reads `events[].params` sees null there (the
+/// same values are in the entity's fields).
 fn replay_copy(response: &EntityResponse) -> EntityResponse {
     let state = &response.state;
     let events = state

@@ -1125,9 +1125,18 @@ impl Actor for EntityActor {
                     && let Some(cached) = cache.get(&actor_key, key)
                 {
                     // The cache keeps replies without event parameters or the
-                    // durable key set. While nothing has happened since, the
-                    // live state is the reply's state in full.
-                    let reply = if cached.state.sequence_nr == state.sequence_nr {
+                    // durable key set. While this retry's own event is still
+                    // the newest one in memory, the live state is the reply's
+                    // state in full. The sequence number alone cannot tell:
+                    // it stays 0 without a journal, and a state restored from a
+                    // snapshot keeps it but has no recent events.
+                    let newest_is_this_retry = state
+                        .events
+                        .back()
+                        .and_then(|event| event.idempotency_key.as_deref())
+                        == Some(key.as_str())
+                        && state.total_event_count == cached.state.total_event_count;
+                    let reply = if newest_is_this_retry {
                         EntityResponse {
                             state: state.clone(),
                             ..cached
