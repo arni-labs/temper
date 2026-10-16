@@ -22,14 +22,28 @@ impl ServerState {
             let bucket = vault
                 .get_secret(tenant.as_str(), "blob_bucket")
                 .unwrap_or_else(|| DEFAULT_BLOB_BUCKET.to_string());
+            let prefix = vault.get_secret(tenant.as_str(), "blob_prefix");
+            let link = match (
+                vault.get_secret(tenant.as_str(), "blob_link_access_key"),
+                vault.get_secret(tenant.as_str(), "blob_link_secret_key"),
+            ) {
+                (Some(access_key), Some(secret_key)) => Some(super::LinkCredentials {
+                    access_key,
+                    secret_key,
+                    session_token: vault.get_secret(tenant.as_str(), "blob_link_session_token"),
+                }),
+                _ => None,
+            };
             return Ok(BlobStore::s3(
                 endpoint,
                 bucket,
                 vault.get_secret(tenant.as_str(), "blob_access_key"),
                 vault.get_secret(tenant.as_str(), "blob_secret_key"),
                 self.blob_staging_root(tenant),
-                tenant_object_namespace(tenant).map(|namespace| format!("tenants/{namespace}")),
-            ));
+                object_key_prefix(prefix.as_deref(), tenant),
+            )
+            .with_session_token(vault.get_secret(tenant.as_str(), "blob_session_token"))
+            .with_link_credentials(link));
         }
         self.local_blob_store(tenant).ok_or_else(|| {
             "blob object store is not configured; set BLOB_ENDPOINT/BLOB_BUCKET/BLOB_ACCESS_KEY/BLOB_SECRET_KEY or TEMPER_LOCAL_BLOB_DIR"
@@ -49,17 +63,21 @@ impl ServerState {
         self.put_metadata_blob_shadow(tenant, key, body, ttl).await
     }
 
-    /// Write bytes to a tenant-scoped content-addressed blob key.
-    pub(crate) async fn put_content_addressed_blob(
+    /// Write a File's bytes to their content-addressed key. When the tenant's store is a remote object store (R2/S3),
+    /// that store alone keeps them: they are never copied into the database, which for an app's own Temper is its one
+    /// SQLite file. A local store keeps the database copy the default tenant has always had.
+    pub(crate) async fn put_file_content_blob(
         &self,
         tenant: &TenantId,
         key: &str,
         body: &[u8],
-        ttl: Option<Duration>,
     ) -> Result<(), String> {
         let store = self.blob_store_for_tenant(tenant)?;
-        store.put_content_addressed(key, body, ttl).await?;
-        self.put_metadata_blob_shadow(tenant, key, body, ttl).await
+        store.put_content_addressed(key, body, None).await?;
+        if store.is_object_store() {
+            return Ok(());
+        }
+        self.put_metadata_blob_shadow(tenant, key, body, None).await
     }
 
     pub async fn get_blob_with_legacy_fallback(
@@ -261,6 +279,20 @@ impl ServerState {
     }
 }
 
+/// Where a tenant's objects sit in the bucket: under the deployment's own prefix (`blob_prefix`, such as one app's
+/// folder in a bucket many servers share), then, for any tenant but `default`, under `tenants/<sha256 of its name>`.
+fn object_key_prefix(prefix: Option<&str>, tenant: &TenantId) -> Option<String> {
+    let prefix = prefix
+        .map(|p| p.trim_matches('/'))
+        .filter(|p| !p.is_empty());
+    let namespace = tenant_object_namespace(tenant).map(|namespace| format!("tenants/{namespace}"));
+    match (prefix, namespace) {
+        (Some(prefix), Some(namespace)) => Some(format!("{prefix}/{namespace}")),
+        (Some(prefix), None) => Some(prefix.to_string()),
+        (None, namespace) => namespace,
+    }
+}
+
 fn tenant_object_namespace(tenant: &TenantId) -> Option<String> {
     (tenant != &TenantId::default())
         .then(|| super::hex_lower(&Sha256::digest(tenant.as_str().as_bytes())))
@@ -289,6 +321,26 @@ mod tests {
         assert_eq!(
             tenant_object_namespace(&TenantId::new("tenant-a")),
             Some(namespace)
+        );
+    }
+
+    #[test]
+    fn a_deployment_prefix_comes_before_the_tenant_namespace() {
+        let other = TenantId::new("tenant-a");
+        let namespace = tenant_object_namespace(&other).expect("namespace");
+        assert_eq!(object_key_prefix(None, &TenantId::default()), None);
+        assert_eq!(
+            object_key_prefix(Some("/people/t1/a1/"), &TenantId::default()).as_deref(),
+            Some("people/t1/a1")
+        );
+        assert_eq!(object_key_prefix(Some(""), &TenantId::default()), None);
+        assert_eq!(
+            object_key_prefix(None, &other),
+            Some(format!("tenants/{namespace}"))
+        );
+        assert_eq!(
+            object_key_prefix(Some("people/t1"), &other),
+            Some(format!("people/t1/tenants/{namespace}"))
         );
     }
 

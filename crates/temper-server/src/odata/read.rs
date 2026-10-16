@@ -29,7 +29,7 @@ use super::read_support::{
     record_entity_set_not_found, resolve_entity_set_name, try_load_entity_body_from_catalog,
 };
 use super::response::annotate_entity;
-use super::stream_fast_path::try_file_stream_fast_path;
+use super::stream_fast_path::{file_link_response, try_file_stream_fast_path};
 use crate::blobs::{BlobHydrationBudget, hydrate_blob_refs_for_tenant_with_budget};
 use crate::query_eval::{expand_entity, select_fields};
 use crate::response::{ODataResponse, ODataStreamResponse, ODataXmlResponse, odata_error};
@@ -731,7 +731,18 @@ pub(super) async fn handle_odata_get_for_tenant(
         }
 
         ODataPath::Value { ref parent } => {
-            handle_stream_get(&state, &tenant, &security_ctx, parent, &hydration_budget).await
+            let link = query_params
+                .get("redirect")
+                .and_then(|v| super::stream_fast_path::file_link_secs(v));
+            handle_stream_get(
+                &state,
+                &tenant,
+                &security_ctx,
+                parent,
+                &hydration_budget,
+                link,
+            )
+            .await
         }
 
         _ => odata_error(
@@ -1306,6 +1317,7 @@ async fn handle_stream_get(
     security_ctx: &SecurityContext,
     parent: &ODataPath,
     hydration_budget: &BlobHydrationBudget,
+    link: Option<u64>,
 ) -> axum::response::Response {
     if let Some((set_name, key, property)) = resolve_blob_primitive_value_parent(parent) {
         return handle_blob_primitive_stream(
@@ -1349,6 +1361,15 @@ async fn handle_stream_get(
         Ok(body) => body,
         Err(resp) => return resp,
     };
+
+    // `?redirect=1`: once Cedar has let the reader read the File, send them to a short-lived link to its bytes in
+    // the object store, rather than carrying the bytes through this server.
+    if let Some(secs) = link
+        && entity_type == "File"
+        && let Some(response) = file_link_response(state, tenant, &entity_state, secs)
+    {
+        return response;
+    }
 
     if let Some(response) =
         try_file_stream_fast_path(state, tenant, &set_name, &entity_type, &key).await

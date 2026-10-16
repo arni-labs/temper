@@ -34,7 +34,7 @@ pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, Verificati
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
 pub use file_reads::{IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult};
-pub(crate) use file_writes::FileStreamContentError;
+pub(crate) use file_writes::{FileStreamContentError, StoredFileContent, native_file_blob_key};
 pub use metrics::MetricsCollector;
 pub use pending_decisions::{
     ActionScope, DecisionStatus, DurationScope, PendingDecision, PolicyScopeMatrix, PrincipalScope,
@@ -552,6 +552,8 @@ pub struct ServerState {
     /// Weighted declared-byte admission for disk-backed raw Blob ingest.
     /// State ownership permits deterministic capacity injection in simulation.
     pub(crate) raw_blob_ingest_budget: crate::blob_store::BlobIngestBudget,
+    /// Admission and staging budget for streamed File `$value` uploads.
+    pub(crate) file_ingest_budget: crate::blob_store::BlobIngestBudget,
     pub secrets_vault: Option<Arc<SecretsVault>>,
     /// Broadcast channel for agent progress events (SSE subscriptions).
     /// // determinism-ok: broadcast channel for external observation only
@@ -806,6 +808,7 @@ impl ServerState {
             commons_storage_reservations: Arc::new(Mutex::new(BTreeMap::new())),
             commons_write_guardrail_lock: Arc::new(tokio::sync::Mutex::new(())),
             raw_blob_ingest_budget: crate::blob_store::BlobIngestBudget::runtime(),
+            file_ingest_budget: crate::blob_store::BlobIngestBudget::files(),
             secrets_vault: None,
             agent_progress_tx: Arc::new(agent_progress_tx), // determinism-ok: broadcast for external observation
             entity_event_sequences: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1080,6 +1083,7 @@ impl ServerState {
             commons_storage_reservations: Arc::new(Mutex::new(BTreeMap::new())),
             commons_write_guardrail_lock: Arc::new(tokio::sync::Mutex::new(())),
             raw_blob_ingest_budget: crate::blob_store::BlobIngestBudget::runtime(),
+            file_ingest_budget: crate::blob_store::BlobIngestBudget::files(),
             secrets_vault: None,
             agent_progress_tx: Arc::new(agent_progress_tx), // determinism-ok: broadcast for external observation
             entity_event_sequences: Arc::new(Mutex::new(BTreeMap::new())),
