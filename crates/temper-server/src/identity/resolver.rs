@@ -203,11 +203,20 @@ impl IdentityResolver {
         // `iss` is attacker-chosen and unverified, and entity reads spawn the
         // entity on demand — so reading it directly would let anyone presenting
         // a junk token persist an Active TrustedIssuer row with empty fields.
-        // `entity_state` never materialises one: it reads a row that is not in
-        // the in-memory index from the event store, and loads it only when it
-        // has events. An issuer registered through the API is in the store but
-        // not in the index after a restart (only the environment's issuer is
-        // registered again at boot), so the index alone would deny it then.
+        // Check existence in the index first and never materialise one from a
+        // token. The index is made complete for the type once per process: an
+        // issuer registered through the API is in the store but not in the
+        // index after a restart (only the environment's issuer is registered
+        // again at boot), so the index alone would deny its tokens then.
+        state
+            .ensure_type_indexed(tenant, "TrustedIssuer")
+            .await
+            .map_err(|error| {
+                IdentityError::Unavailable(format!("TrustedIssuer index unavailable: {error}"))
+            })?;
+        if !state.entity_exists(tenant, "TrustedIssuer", &issuer_id) {
+            return Err(IdentityError::Invalid);
+        }
         let issuer = classify_dependency_read(
             entity_state(state, tenant, "TrustedIssuer", &issuer_id).await,
             "TrustedIssuer read",
@@ -308,16 +317,29 @@ impl IdentityResolver {
         tenant: &TenantId,
         key: &str,
     ) -> Result<i64, IdentityError> {
-        // From the event store when it is not in the in-memory index: a
-        // generation bumped before a restart must still revoke after it.
-        let generation = entity_state(state, tenant, "PrincipalGeneration", key)
+        // The index is made complete for the type once per process, so a
+        // generation bumped before a restart still revokes after it, and the
+        // common case (never revoked, no row) stays an index check with no
+        // store read. An index that cannot be made complete fails closed.
+        state
+            .ensure_type_indexed(tenant, "PrincipalGeneration")
             .await
             .map_err(|error| {
-                IdentityError::Unavailable(format!("PrincipalGeneration read unavailable: {error}"))
+                IdentityError::Unavailable(format!(
+                    "PrincipalGeneration index unavailable: {error}"
+                ))
             })?;
+        if !state.entity_exists(tenant, "PrincipalGeneration", key) {
+            return Ok(0);
+        }
+        let generation = classify_dependency_read(
+            entity_state(state, tenant, "PrincipalGeneration", key).await,
+            "PrincipalGeneration read",
+        )?;
         Ok(generation
-            .and_then(|state| state.counters.get("generation").copied())
-            .map(|c| c as i64)
+            .counters
+            .get("generation")
+            .map(|c| *c as i64)
             .unwrap_or(0))
     }
 }
