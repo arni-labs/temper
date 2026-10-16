@@ -319,12 +319,18 @@ pub(crate) async fn handle_entity_event_stream(
         .or(params.since)
         .unwrap_or(0);
     let rx = state.entity_observe_tx.subscribe();
-    let replay_events = state
-        .replay_entity_observe_events(tenant.as_str(), &entity_type, &entity_id, since)
-        .into_iter()
-        .collect::<Vec<_>>();
-    let replay_high_water = replay_events.last().map(|event| event.seq).unwrap_or(since);
-    let replay = replay_events.into_iter().map(|event| {
+    let replay = state.entity_observe_replay(tenant.as_str(), &entity_type, &entity_id, since);
+    let replay_high_water = replay.events.last().map(|event| event.seq).unwrap_or(since);
+    // Events after `since` that are no longer buffered are said, never
+    // skipped silently: the client must read the entity again.
+    let gap = replay.missed.then(|| {
+        Ok::<Event, Infallible>(
+            Event::default()
+                .event("replay_gap")
+                .data(serde_json::json!({ "since": since, "reread": true }).to_string()),
+        )
+    });
+    let replay_events = replay.events.into_iter().map(|event| {
         let data = serde_json::to_string(&event.data).unwrap_or_default();
         Ok::<Event, Infallible>(
             Event::default()
@@ -333,7 +339,7 @@ pub(crate) async fn handle_entity_event_stream(
                 .data(data),
         )
     });
-    let replay_stream = tokio_stream::iter(replay);
+    let replay_stream = tokio_stream::iter(gap.into_iter().chain(replay_events));
 
     let live_tenant = tenant.clone();
     let live_entity_type = entity_type.clone();

@@ -1989,17 +1989,19 @@ impl ServerState {
     /// Passivate actors that have been idle longer than the configured timeout.
     ///
     /// Keeps `entity_index` entries intact so future accesses can lazy-spawn.
+    /// Drops a passivated entity's observe replay buffer with its actor.
+    /// Returns how many idle actors were left for a later tick.
     #[instrument(skip_all, fields(otel.name = "entity.passivate_idle_actors"))]
-    pub async fn passivate_idle_actors(&self) {
+    pub async fn passivate_idle_actors(&self) -> usize {
         let timeout_secs = actor_idle_timeout_secs();
         let cutoff = sim_now() - chrono::Duration::seconds(timeout_secs);
 
         let mut candidates: Vec<(String, ActorRef<EntityMsg>, chrono::DateTime<chrono::Utc>)> = {
             let Ok(registry) = self.actor_registry.read() else {
-                return;
+                return 0;
             };
             let Ok(last_accessed) = self.last_accessed.read() else {
-                return;
+                return 0;
             };
             registry
                 .iter()
@@ -2015,12 +2017,15 @@ impl ServerState {
         };
 
         if candidates.is_empty() {
-            return;
+            return 0;
         }
 
         // Oldest idle first so a bounded tick still sheds the actors that have
         // been occupying the registry the longest.
         candidates.sort_by_key(|(_, _, last_seen)| *last_seen);
+        let left = candidates
+            .len()
+            .saturating_sub(PASSIVATE_IDLE_ACTORS_PER_TICK);
         candidates.truncate(PASSIVATE_IDLE_ACTORS_PER_TICK);
         debug_assert!(candidates.len() <= PASSIVATE_IDLE_ACTORS_PER_TICK);
         debug_assert!(!candidates.is_empty());
@@ -2092,6 +2097,13 @@ impl ServerState {
                 if let Ok(mut cache) = self.entity_state_cache.lock() {
                     cache.pop(&actor_key);
                 }
+                // The replay buffer is for clients following a live entity;
+                // kept for every entity ever touched, it grows with each record
+                // an app creates. Its sequence counter stays, so a later event
+                // still sorts after anything a client has seen.
+                if let Ok(mut log) = self.entity_observe_log.lock() {
+                    log.remove(&actor_key);
+                }
                 passivated += 1;
             }
         }
@@ -2099,8 +2111,14 @@ impl ServerState {
         debug_assert!(passivated <= PASSIVATE_IDLE_ACTORS_PER_TICK);
         if passivated > 0 {
             runtime_metrics::record_server_state_metrics(self);
-            tracing::info!(count = passivated, timeout_secs, "passivated idle actors");
+            tracing::info!(
+                count = passivated,
+                left,
+                timeout_secs,
+                "passivated idle actors"
+            );
         }
+        left
     }
 
     /// Update Agent.Hint annotations based on trajectory analysis.

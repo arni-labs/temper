@@ -1135,7 +1135,20 @@ impl Actor for EntityActor {
                     (idempotency_key.as_ref(), self.idempotency_cache.as_ref())
                     && let Some(cached) = cache.get(&actor_key, key)
                 {
-                    ctx.reply(cached);
+                    // The cache keeps replies without event parameters or the
+                    // durable key set; the live state is the reply's state in
+                    // full only while this retry's own event is still newest.
+                    let newest_is_this_retry =
+                        crate::idempotency::live_state_is_the_reply(state, &cached.state, key);
+                    let reply = if newest_is_this_retry {
+                        EntityResponse {
+                            state: state.clone(),
+                            ..cached
+                        }
+                    } else {
+                        cached
+                    };
+                    ctx.reply(reply);
                     return Ok(());
                 }
                 if let Some(key) = idempotency_key.as_deref()
@@ -1686,7 +1699,7 @@ impl Actor for EntityActor {
                     if let (Some(key), Some(cache)) =
                         (idempotency_key.as_ref(), self.idempotency_cache.as_ref())
                     {
-                        cache.put(&actor_key, key, response.clone());
+                        cache.put(&actor_key, key, &response);
                     }
                     ctx.reply(response);
                 } else {

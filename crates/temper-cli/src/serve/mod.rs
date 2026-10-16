@@ -395,23 +395,38 @@ fn spawn_optimization_loop(state: &PlatformState) {
     });
 }
 
+/// Shortest pause before the next passivation tick while idle actors are still
+/// waiting. A tick sheds at most `PASSIVATE_IDLE_ACTORS_PER_TICK` actors; an
+/// app that creates records faster than that per interval would otherwise
+/// grow the registry without end. A backlog is worked off in batches, each
+/// followed by four times its own duration, so snapshot writes take at most a
+/// fifth of the time (ARN-462). The pause never exceeds the configured
+/// interval, so a backlog is never drained slower than ticks already ran.
+const PASSIVATION_BACKLOG_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+const PASSIVATION_BACKLOG_PAUSE_PER_TICK_TIME: u32 = 4;
+
 fn spawn_actor_passivation_loop(state: &PlatformState) {
     let interval_secs = std::env::var("TEMPER_PASSIVATION_CHECK_INTERVAL") // determinism-ok: read once at startup
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(60)
         .clamp(1, 86_400);
+    let interval = std::time::Duration::from_secs(interval_secs);
 
     let server = state.server.clone();
     tokio::spawn(async move {
         // determinism-ok: background task for resource management
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // consume immediate tick
-
+        let mut pause = interval;
         loop {
-            ticker.tick().await;
-            server.passivate_idle_actors().await;
+            tokio::time::sleep(pause).await; // determinism-ok: background resource management
+            let started = std::time::Instant::now(); // determinism-ok: paces a background task
+            let left = server.passivate_idle_actors().await;
+            pause = if left > 0 {
+                (started.elapsed() * PASSIVATION_BACKLOG_PAUSE_PER_TICK_TIME)
+                    .clamp(PASSIVATION_BACKLOG_PAUSE, interval)
+            } else {
+                interval
+            };
         }
     });
 }

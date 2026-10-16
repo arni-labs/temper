@@ -141,6 +141,15 @@ pub struct AgentProgressEvent {
     pub data: Option<serde_json::Value>,
 }
 
+/// What a reconnecting client of an entity's observe stream can be replayed.
+#[derive(Debug, Clone)]
+pub struct EntityObserveReplay {
+    /// Buffered events after the client's last-seen sequence.
+    pub events: Vec<EntityObserveEvent>,
+    /// Some events after the last-seen sequence are no longer buffered.
+    pub missed: bool,
+}
+
 /// Unified replayable event stream for a single entity.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EntityObserveEvent {
@@ -887,25 +896,41 @@ impl ServerState {
         self.push_entity_observe_event(event);
     }
 
-    #[cfg(feature = "observe")]
-    pub(crate) fn replay_entity_observe_events(
+    /// The observe events an entity's buffer still holds after `since`, and
+    /// whether any after it are gone. A buffer keeps at most 512 events and is
+    /// dropped when its entity is passivated, while the sequence counter
+    /// stays; a client that last saw `since` and gets `missed` must read the
+    /// entity again instead of trusting the replay.
+    pub fn entity_observe_replay(
         &self,
         tenant: &str,
         entity_type: &str,
         entity_id: &str,
         since: u64,
-    ) -> Vec<EntityObserveEvent> {
+    ) -> EntityObserveReplay {
         let key = format!("{tenant}:{entity_type}:{entity_id}");
-        let log = self.entity_observe_log.lock().unwrap(); // ci-ok: infallible lock
-        log.get(&key)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|event| event.seq > since)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        let events: Vec<EntityObserveEvent> = {
+            let log = self.entity_observe_log.lock().unwrap(); // ci-ok: infallible lock
+            log.get(&key)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|event| event.seq > since)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let latest = self
+            .entity_event_sequences
+            .lock()
+            .unwrap() // ci-ok: infallible lock
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        let oldest_held = events.iter().map(|event| event.seq).min();
+        let missed = since > 0 && latest > since && oldest_held != Some(since + 1);
+        EntityObserveReplay { events, missed }
     }
 
     pub(crate) fn broadcast_agent_progress(&self, event: AgentProgressEvent) {
