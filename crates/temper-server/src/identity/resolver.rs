@@ -203,23 +203,29 @@ impl IdentityResolver {
         // `iss` is attacker-chosen and unverified, and entity reads spawn the
         // entity on demand — so reading it directly would let anyone presenting
         // a junk token persist an Active TrustedIssuer row with empty fields.
-        // Check existence first and never materialise one from a token.
+        // Check existence in the index first and never materialise one from a
+        // token. The index is made complete for the type once per process: an
+        // issuer registered through the API is in the store but not in the
+        // index after a restart (only the environment's issuer is registered
+        // again at boot), so the index alone would deny its tokens then.
+        state
+            .ensure_type_indexed(tenant, "TrustedIssuer")
+            .await
+            .map_err(|error| {
+                IdentityError::Unavailable(format!("TrustedIssuer index unavailable: {error}"))
+            })?;
         if !state.entity_exists(tenant, "TrustedIssuer", &issuer_id) {
             return Err(IdentityError::Invalid);
         }
-
-        let issuer_response = classify_dependency_read(
-            state
-                .get_tenant_entity_state(tenant, "TrustedIssuer", &issuer_id)
-                .await
-                .map(Some),
+        let issuer = classify_dependency_read(
+            entity_state(state, tenant, "TrustedIssuer", &issuer_id).await,
             "TrustedIssuer read",
         )?;
-        if issuer_response.state.status != "Active" {
+        if issuer.status != "Active" {
             return Err(IdentityError::Invalid);
         }
 
-        let fields = &issuer_response.state.fields;
+        let fields = &issuer.fields;
         let jwks_json = require_field(fields, "jwks_json")?;
         let audience = require_field(fields, "audience")?;
         let jwks: jwt::Jwks =
@@ -311,18 +317,26 @@ impl IdentityResolver {
         tenant: &TenantId,
         key: &str,
     ) -> Result<i64, IdentityError> {
+        // The index is made complete for the type once per process, so a
+        // generation bumped before a restart still revokes after it, and the
+        // common case (never revoked, no row) stays an index check with no
+        // store read. An index that cannot be made complete fails closed.
+        state
+            .ensure_type_indexed(tenant, "PrincipalGeneration")
+            .await
+            .map_err(|error| {
+                IdentityError::Unavailable(format!(
+                    "PrincipalGeneration index unavailable: {error}"
+                ))
+            })?;
         if !state.entity_exists(tenant, "PrincipalGeneration", key) {
             return Ok(0);
         }
-        let response = classify_dependency_read(
-            state
-                .get_tenant_entity_state(tenant, "PrincipalGeneration", key)
-                .await
-                .map(Some),
+        let generation = classify_dependency_read(
+            entity_state(state, tenant, "PrincipalGeneration", key).await,
             "PrincipalGeneration read",
         )?;
-        Ok(response
-            .state
+        Ok(generation
             .counters
             .get("generation")
             .map(|c| *c as i64)

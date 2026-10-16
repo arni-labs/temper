@@ -620,6 +620,64 @@ impl ServerState {
         }
     }
 
+    /// Make one entity type's index complete from the event store, once per
+    /// process: a type already listed (or fully hydrated) is left alone. Unlike
+    /// [`Self::populate_index_from_store_by_type`], a store failure is returned,
+    /// so a caller that must not mistake an incomplete index for absence (the
+    /// identity checks: an issuer, a revoked generation) can fail closed.
+    ///
+    /// A tenant without the type's spec has no rows of it and is left out of
+    /// the index: the tenant can be any name an unauthenticated caller sends,
+    /// and the index never forgets a key.
+    pub async fn ensure_type_indexed(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+    ) -> Result<(), String> {
+        let index_key = format!("{tenant}:{entity_type}");
+        if self
+            .entity_index_hydrated
+            .read()
+            .map_err(|_| "entity index hydrated lock poisoned".to_string())?
+            .contains(&index_key)
+        {
+            return Ok(());
+        }
+        if self
+            .registry
+            .read()
+            .map_err(|_| "registry lock poisoned".to_string())?
+            .get_table(tenant, entity_type)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let Some((store, _backend)) = self.event_journal() else {
+            return Ok(());
+        };
+        let entity_ids = store
+            .list_entity_ids_by_type(tenant.as_str(), entity_type)
+            .await
+            .map_err(|error| {
+                format!("listing {entity_type} from the event store failed: {error}")
+            })?;
+        {
+            let mut index = self
+                .entity_index
+                .write()
+                .map_err(|_| "entity index lock poisoned".to_string())?;
+            index
+                .entry(index_key.clone())
+                .or_default()
+                .extend(entity_ids);
+        }
+        self.entity_index_hydrated
+            .write()
+            .map_err(|_| "entity index hydrated lock poisoned".to_string())?
+            .insert(index_key);
+        Ok(())
+    }
+
     /// Populate the durable query-plane projections for collection reads.
     ///
     /// Two-phase approach:
