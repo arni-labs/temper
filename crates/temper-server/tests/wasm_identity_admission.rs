@@ -488,3 +488,114 @@ async fn missing_module_does_not_execute_admission() {
         "Active"
     );
 }
+
+async fn route_call(state: &ServerState, path: &str) -> (u16, String, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let response = temper_server::http_endpoint_fallback(
+        axum::extract::State(state.clone()),
+        Some(axum::Extension(
+            temper_authz::AuthenticatedRequestContext::new(
+                TenantId::new("probe"),
+                caller("alice").security_ctx.unwrap(),
+            ),
+        )),
+        None,
+        axum::http::Method::GET,
+        path.parse().unwrap(),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::empty(),
+    )
+    .await;
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (
+        status,
+        String::from_utf8_lossy(&body).into_owned(),
+        started.elapsed(),
+    )
+}
+
+async fn install_route(state: &ServerState, path: &str, module: &str, timeout_secs: u32) {
+    let route = temper_server::http_endpoint::route_from_entity_fields(
+        module,
+        &json!({
+            "PathPrefix": path, "Methods": "GET", "IntegrationModule": module, "RequiresAuth": true,
+            "TimeoutSecs": timeout_secs,
+        }),
+    )
+    .unwrap();
+    state
+        .http_endpoint_tables
+        .table_for(&TenantId::new("probe"))
+        .await
+        .replace(vec![route])
+        .await;
+}
+
+/// After a restart the module registry is restored from the store and nothing is compiled yet: a
+/// route compiles its module on first use, as an entity integration does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_compiles_its_module_on_first_use_after_a_restart() {
+    let (state, _dir) = fixture().await;
+    let wasm = include_bytes!("fixtures/wasm-identity/identity.wasm");
+    let hash = temper_wasm::WasmEngine::hash_module(wasm);
+    state
+        .upsert_wasm_module("probe", "capability-probe", wasm, &hash, "upload")
+        .await
+        .unwrap();
+    assert!(
+        state.wasm_engine.evict(&hash),
+        "the fixture had compiled it"
+    );
+    install_route(&state, "/probe", "capability-probe", 5).await;
+    let (status, body, _) = route_call(&state, "/probe").await;
+    assert_eq!(
+        status, 200,
+        "the route answers after compiling its module: {body}"
+    );
+    assert!(state.wasm_engine.is_cached(&hash));
+}
+
+/// A module the store does not hold is refused at once, not at the route's timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_whose_module_cannot_be_loaded_answers_at_once() {
+    let (state, _dir) = fixture().await;
+    state.wasm_module_registry.write().unwrap().register(
+        &TenantId::new("probe"),
+        "ghost",
+        &"0".repeat(64),
+    );
+    install_route(&state, "/ghost", "ghost", 20).await;
+    let (status, body, took) = route_call(&state, "/ghost").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "answered in {took:?}"
+    );
+}
+
+/// A module that ends without submitting a response head is answered at once, not at the route's timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_module_that_ends_without_answering_is_answered_at_once() {
+    let (state, _dir) = fixture().await;
+    let silent = state
+        .wasm_engine
+        .compile_and_cache(
+            br#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i32) unreachable))"#,
+        )
+        .unwrap();
+    state.wasm_module_registry.write().unwrap().register(
+        &TenantId::new("probe"),
+        "silent",
+        &silent,
+    );
+    install_route(&state, "/silent", "silent", 20).await;
+    let (status, body, took) = route_call(&state, "/silent").await;
+    assert_eq!(status, 502, "{body}");
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "answered in {took:?}"
+    );
+}

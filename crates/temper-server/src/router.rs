@@ -270,6 +270,20 @@ async fn dispatch_matched_route(
         std::time::Duration::from_secs(u64::from(route.route.timeout_secs)),
     );
 
+    // Startup recovery restores the module registry without compiling the modules: compile this one
+    // now, as an entity integration does, or answer at once, before any admission action runs.
+    if let Err(response) = crate::http_endpoint::ensure_integration_module(
+        &state,
+        &tenant_id,
+        &route.route.integration_module,
+        &module_hash,
+        &deadline,
+    )
+    .await
+    {
+        return response;
+    }
+
     // Run checks through OData/Cedar/IOA with the original authenticated caller.
     // The module cannot select or forge this identity, and receives only the
     // successful action responses, never a reusable caller credential.
@@ -490,6 +504,7 @@ async fn dispatch_matched_route(
         .await;
     }
 
+    let head_streams = streams.clone();
     let invoke_future = async move {
         match engine
             .invoke_with_blobs(
@@ -519,6 +534,11 @@ async fn dispatch_matched_route(
                 );
             }
         }
+        // A guest that ended without a head never will submit one: the request answers now,
+        // not at the route's timeout. A head already submitted is kept.
+        head_streams
+            .abandon_inbound_response_head(guest_response_body)
+            .await;
     };
     let invoke_task = tokio::spawn(invoke_future); // determinism-ok: detached WASM invocation task, not simulation state
 
