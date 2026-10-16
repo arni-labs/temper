@@ -128,3 +128,51 @@ async fn validate_ioa_rejects_a_budget_out_of_range() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{budget_ms}");
     }
 }
+
+#[tokio::test]
+async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
+    let flags: Vec<String> = (0..13).map(|i| format!("f{i}")).collect();
+    let ioa = format!(
+        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n",
+        flags
+            .iter()
+            .map(|f| format!("[[state]]\nname = \"{f}\"\ntype = \"bool\"\ninitial = false\n"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        flags
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        flags
+            .iter()
+            .map(|f| format!("\"{f} = params.{f}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let app = build_router(test_state_with_registry());
+    let response = app
+        .oneshot(authenticated_post(
+            "/api/specs/validate-ioa",
+            &serde_json::json!({ "ioa_source": ioa }).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an answer about the spec, not a worker panic"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let stopped = json["stopped"]
+        .as_str()
+        .expect("stopped names the type and why");
+    assert!(
+        stopped.starts_with("Flags: L1 Model Check FAILED: Set takes 8192"),
+        "{stopped}"
+    );
+}

@@ -111,43 +111,72 @@ pub fn successors(
     out
 }
 
-/// The cartesian product of each parameter's candidate values.
-fn param_assignments(
-    model: &TemperModel,
-    t: &ResolvedTransition,
-) -> Vec<BTreeMap<String, ParamValue>> {
-    let count_bound = model
+/// The transition with more parameter assignments than one step explores
+/// ([`MAX_PARAM_ASSIGNMENTS`]), and how many it has. Stepping it would stop
+/// at the assertion in `param_assignments`, so a caller asks this first.
+pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
+    let bound = count_bound(model);
+    model.transitions.iter().find_map(|t| {
+        let assignments = t.params.iter().fold(1usize, |n, (name, kind)| {
+            n.saturating_mul(param_candidates(model, t, name, kind, bound).len())
+        });
+        (assignments > MAX_PARAM_ASSIGNMENTS).then_some((t.name.as_str(), assignments))
+    })
+}
+
+/// The largest value a count parameter is explored up to.
+fn count_bound(model: &TemperModel) -> usize {
+    model
         .counter_bounds
         .values()
         .copied()
         .max()
         .unwrap_or(0)
-        .max(model.default_max_counter);
+        .max(model.default_max_counter)
+}
+
+/// The values explored for one parameter of `t`.
+fn param_candidates(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    name: &str,
+    kind: &ParamKind,
+    count_bound: usize,
+) -> Vec<ParamValue> {
+    match kind {
+        ParamKind::Count => (0..=count_bound).map(ParamValue::Count).collect(),
+        ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
+        ParamKind::Str => {
+            let mut values: BTreeSet<String> = BTreeSet::new();
+            for effect in &t.effects {
+                if let ModelEffect::ListAppend {
+                    var,
+                    value: Arg::Param(p),
+                } = effect
+                    && p == name
+                    && let Some(literals) = model.list_literals.get(var)
+                {
+                    values.extend(literals.iter().cloned());
+                }
+            }
+            values
+                .into_iter()
+                .map(ParamValue::Str)
+                .chain(std::iter::once(ParamValue::Fresh))
+                .collect()
+        }
+    }
+}
+
+/// The cartesian product of each parameter's candidate values.
+fn param_assignments(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+) -> Vec<BTreeMap<String, ParamValue>> {
+    let count_bound = count_bound(model);
     let mut assignments = vec![BTreeMap::new()];
     for (name, kind) in &t.params {
-        let candidates: Vec<ParamValue> = match kind {
-            ParamKind::Count => (0..=count_bound).map(ParamValue::Count).collect(),
-            ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
-            ParamKind::Str => {
-                let mut values: BTreeSet<String> = BTreeSet::new();
-                for effect in &t.effects {
-                    if let ModelEffect::ListAppend {
-                        var,
-                        value: Arg::Param(p),
-                    } = effect
-                        && p == name
-                        && let Some(literals) = model.list_literals.get(var)
-                    {
-                        values.extend(literals.iter().cloned());
-                    }
-                }
-                values
-                    .into_iter()
-                    .map(ParamValue::Str)
-                    .chain(std::iter::once(ParamValue::Fresh))
-                    .collect()
-            }
-        };
+        let candidates = param_candidates(model, t, name, kind, count_bound);
         assert!(
             assignments.len() * candidates.len() <= MAX_PARAM_ASSIGNMENTS,
             "transition '{}' has more than {MAX_PARAM_ASSIGNMENTS} parameter assignments",

@@ -9,7 +9,7 @@
 //!
 //! Each level produces a pass/fail result. All levels run independently.
 
-use crate::budget::{Budget, Spending};
+use crate::budget::{Budget, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
 use crate::model::{self, TemperModel};
@@ -110,9 +110,10 @@ pub struct CascadeResult {
     /// detection, and a state-space upper bound for budgeting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite_report: Option<CompositeCascadeReport>,
-    /// Set when the cascade ran out of its [`Budget`]: the type's name and
-    /// the summary of the level that was cut short. The levels after it did
-    /// not run.
+    /// Set when the spec was too large to check: the cascade ran out of its
+    /// [`Budget`], or a move has more parameter choices than one step explores.
+    /// The type's name and the summary of the level that stopped; the levels
+    /// after it did not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
 }
@@ -272,8 +273,18 @@ impl VerificationCascade {
         let spending = spending.as_ref();
         let mut levels = Vec::new();
         let model = self.build_temper_model(self.max_counter, spending);
+        let prop_model = self.build_temper_model(2, spending);
 
         let mut warnings = Vec::new();
+
+        // A move with more parameter choices than one step explores would stop
+        // every level that steps it at an assertion: say so instead.
+        if let Some((action, choices)) = model::semantics::oversized_transition(&model)
+            .or_else(|| model::semantics::oversized_transition(&prop_model))
+        {
+            levels.push(too_many_choices(action, choices));
+            return self.stopped(levels, warnings);
+        }
 
         // Level 0: SMT symbolic verification
         let l0 = self.run_symbolic_verification();
@@ -335,7 +346,7 @@ impl VerificationCascade {
         }
 
         // Level 3: Property-based tests (with shrinking for minimal counterexamples)
-        let l3 = self.run_prop_tests_level(&self.build_temper_model(2, spending));
+        let l3 = self.run_prop_tests_level(&prop_model);
         levels.push(l3);
         if ran_out(spending, &mut levels, None) {
             return self.stopped(levels, warnings);
@@ -666,40 +677,6 @@ fn finish(
         reachable_paths,
         composite_report,
         stopped: None,
-    }
-}
-
-/// Whether the budget ran out during the last level: by the clock, or, for
-/// the model check, by an exploration it left incomplete (`explored` is its
-/// states and whether it finished). A level cut short fails and says so.
-fn ran_out(
-    spending: Option<&Spending>,
-    levels: &mut [LevelResult],
-    explored: Option<(usize, bool)>,
-) -> bool {
-    let Some(spending) = spending else {
-        return false;
-    };
-    let unfinished = explored.is_some_and(|(_, complete)| !complete);
-    let Some(level) = levels.last_mut() else {
-        return false;
-    };
-    if !spending.spent() && !unfinished {
-        return false;
-    }
-    level.passed = false;
-    level.summary = spending.stopped_summary(short_label(level.level), explored.map(|(n, _)| n));
-    true
-}
-
-/// A level's name as its summaries begin.
-fn short_label(level: CascadeLevel) -> &'static str {
-    match level {
-        CascadeLevel::SymbolicVerification => "L0 Symbolic",
-        CascadeLevel::ModelCheck => "L1 Model Check",
-        CascadeLevel::Simulation => "L2 Simulation",
-        CascadeLevel::ActorSimulation => "L2b Actor Simulation",
-        CascadeLevel::PropertyTest => "L3 Property Tests",
     }
 }
 

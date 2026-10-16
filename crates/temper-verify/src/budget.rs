@@ -1,4 +1,5 @@
-//! How much one verification cascade may spend.
+//! How much one verification cascade may spend, and what it says when a
+//! spec is too large to check.
 //!
 //! Every counter, boolean and numeric action parameter multiplies the states
 //! the model check walks and the successors it computes for each, so a small
@@ -8,6 +9,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::cascade::{CascadeLevel, LevelResult};
 use crate::model::{ExploreLimit, TemperModel};
 
 /// The most one cascade may spend.
@@ -75,5 +77,59 @@ impl Spending {
             "{label} STOPPED: {limit}{explored}; every counter, flag and numeric action \
              parameter multiplies the states to check, so use fewer of them or smaller bounds"
         )
+    }
+}
+
+/// Whether the budget ran out during the last level: by the clock, or, for
+/// the model check, by an exploration it left incomplete (`explored` is its
+/// states and whether it finished). A level cut short fails and says so.
+pub(crate) fn ran_out(
+    spending: Option<&Spending>,
+    levels: &mut [LevelResult],
+    explored: Option<(usize, bool)>,
+) -> bool {
+    let Some(spending) = spending else {
+        return false;
+    };
+    let unfinished = explored.is_some_and(|(_, complete)| !complete);
+    let Some(level) = levels.last_mut() else {
+        return false;
+    };
+    if !spending.spent() && !unfinished {
+        return false;
+    }
+    level.passed = false;
+    level.summary = spending.stopped_summary(short_label(level.level), explored.map(|(n, _)| n));
+    true
+}
+
+/// The model check of a move with `choices` parameter assignments, more than
+/// one step explores: failed before it starts.
+pub(crate) fn too_many_choices(action: &str, choices: usize) -> LevelResult {
+    LevelResult {
+        level: CascadeLevel::ModelCheck,
+        passed: false,
+        summary: format!(
+            "L1 Model Check FAILED: {action} takes {choices} combinations of parameter values, \
+             more than the {} the model check tries from one state; every flag and numeric \
+             parameter of one move multiplies them, so give it fewer",
+            crate::model::semantics::MAX_PARAM_ASSIGNMENTS,
+        ),
+        diagnostics: Vec::new(),
+        verification: None,
+        simulation: None,
+        prop_test: None,
+        smt: None,
+    }
+}
+
+/// A level's name as its summaries begin.
+fn short_label(level: CascadeLevel) -> &'static str {
+    match level {
+        CascadeLevel::SymbolicVerification => "L0 Symbolic",
+        CascadeLevel::ModelCheck => "L1 Model Check",
+        CascadeLevel::Simulation => "L2 Simulation",
+        CascadeLevel::ActorSimulation => "L2b Actor Simulation",
+        CascadeLevel::PropertyTest => "L3 Property Tests",
     }
 }

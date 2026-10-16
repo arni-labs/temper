@@ -122,3 +122,38 @@ fn a_spec_within_its_budget_is_checked_as_without_one() {
     };
     assert_eq!(summaries(&budgeted), summaries(&unbudgeted));
 }
+
+/// One move setting thirteen flags from its parameters: 2^13 = 8192 choices,
+/// more than one step of the model check explores.
+fn thirteen_flags() -> String {
+    let flags: Vec<String> = (0..13).map(|i| format!("f{i}")).collect();
+    let states: Vec<String> = flags
+        .iter()
+        .map(|f| format!("  {{ name = \"{f}\", type = \"bool\", initial = false }},"))
+        .collect();
+    let params: Vec<String> = flags.iter().map(|f| format!("\"{f}\"")).collect();
+    let effects: Vec<String> = flags
+        .iter()
+        .map(|f| format!("\"{f} = params.{f}\""))
+        .collect();
+    format!(
+        "state = [\n{}\n]\naction = [\n  {{ name = \"Set\", kind = \"input\", from = [\"On\"], params = [{}], effect = [{}] }},\n]\n\n[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n",
+        states.join("\n"),
+        params.join(", "),
+        effects.join(", "),
+    )
+}
+
+#[test]
+fn a_move_with_too_many_parameter_choices_fails_its_check_instead_of_panicking() {
+    let result = VerificationCascade::from_ioa(&thirteen_flags()).run();
+    let stopped = result
+        .stopped
+        .as_deref()
+        .expect("the cascade says it stopped");
+    assert!(
+        stopped.starts_with("Flags: L1 Model Check FAILED: Set takes 8192 combinations of parameter values, more than the 4096"),
+        "{stopped}"
+    );
+    assert_eq!(result.levels.len(), 1, "no level steps the move");
+}
