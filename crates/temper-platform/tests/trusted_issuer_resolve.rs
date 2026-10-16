@@ -582,3 +582,62 @@ async fn a_generation_bumped_before_a_restart_still_revokes_after_it() {
         "a grant revoked before the restart stays revoked after it"
     );
 }
+
+/// A server over `store` that has loaded nothing yet: a restart, on the
+/// in-memory store whose reads a test can fail.
+fn sim_state(store: &temper_store_sim::SimEventStore) -> PlatformState {
+    let mut state = PlatformState::new(None);
+    state
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_sim(store.clone(), None));
+    let cache = BTreeMap::new();
+    bootstrap_system_tenant(&state, &cache);
+    bootstrap_agent_specs(&state, "default", false, &cache);
+    state
+}
+
+/// Eager hydration at boot (`TEMPER_EAGER_HYDRATE`) that cannot read a revoked
+/// grant's generation must not mark the type complete: the revocation check
+/// then lists the type from the store and still finds the bump, instead of
+/// taking the missing id for generation zero.
+#[tokio::test]
+async fn a_generation_eager_hydration_could_not_read_still_revokes() {
+    let store = temper_store_sim::SimEventStore::no_faults(0);
+    let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let tenant = TenantId::new("default");
+    let token = mint(&sk, header(), contributor_claims()); // grant_id = "grant-e2e"
+
+    let first = sim_state(&store);
+    register(&first, &sk).await;
+    first
+        .server
+        .dispatch_tenant_action(
+            &tenant,
+            "PrincipalGeneration",
+            "grant-e2e",
+            "BumpGeneration",
+            serde_json::json!({}),
+            &AgentContext::system(),
+        )
+        .await
+        .expect("revoke the grant");
+
+    let restarted = sim_state(&store);
+    register(&restarted, &sk).await;
+    store.fail_next_reads("default:PrincipalGeneration:grant-e2e", 1);
+    restarted.server.hydrate_from_store(&tenant).await;
+    assert!(
+        !restarted
+            .server
+            .entity_exists(&tenant, "PrincipalGeneration", "grant-e2e"),
+        "eager hydration could not read the revoked grant's generation"
+    );
+
+    assert!(
+        IdentityResolver::new()
+            .resolve(&restarted.server, &tenant, &token)
+            .await
+            .is_err(),
+        "a grant revoked before the restart stays revoked after an eager hydration that could not read it"
+    );
+}
