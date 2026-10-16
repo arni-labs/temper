@@ -203,23 +203,20 @@ impl IdentityResolver {
         // `iss` is attacker-chosen and unverified, and entity reads spawn the
         // entity on demand — so reading it directly would let anyone presenting
         // a junk token persist an Active TrustedIssuer row with empty fields.
-        // Check existence first and never materialise one from a token.
-        if !state.entity_exists(tenant, "TrustedIssuer", &issuer_id) {
-            return Err(IdentityError::Invalid);
-        }
-
-        let issuer_response = classify_dependency_read(
-            state
-                .get_tenant_entity_state(tenant, "TrustedIssuer", &issuer_id)
-                .await
-                .map(Some),
+        // `entity_state` never materialises one: it reads a row that is not in
+        // the in-memory index from the event store, and loads it only when it
+        // has events. An issuer registered through the API is in the store but
+        // not in the index after a restart (only the environment's issuer is
+        // registered again at boot), so the index alone would deny it then.
+        let issuer = classify_dependency_read(
+            entity_state(state, tenant, "TrustedIssuer", &issuer_id).await,
             "TrustedIssuer read",
         )?;
-        if issuer_response.state.status != "Active" {
+        if issuer.status != "Active" {
             return Err(IdentityError::Invalid);
         }
 
-        let fields = &issuer_response.state.fields;
+        let fields = &issuer.fields;
         let jwks_json = require_field(fields, "jwks_json")?;
         let audience = require_field(fields, "audience")?;
         let jwks: jwt::Jwks =
@@ -311,21 +308,16 @@ impl IdentityResolver {
         tenant: &TenantId,
         key: &str,
     ) -> Result<i64, IdentityError> {
-        if !state.entity_exists(tenant, "PrincipalGeneration", key) {
-            return Ok(0);
-        }
-        let response = classify_dependency_read(
-            state
-                .get_tenant_entity_state(tenant, "PrincipalGeneration", key)
-                .await
-                .map(Some),
-            "PrincipalGeneration read",
-        )?;
-        Ok(response
-            .state
-            .counters
-            .get("generation")
-            .map(|c| *c as i64)
+        // From the event store when it is not in the in-memory index: a
+        // generation bumped before a restart must still revoke after it.
+        let generation = entity_state(state, tenant, "PrincipalGeneration", key)
+            .await
+            .map_err(|error| {
+                IdentityError::Unavailable(format!("PrincipalGeneration read unavailable: {error}"))
+            })?;
+        Ok(generation
+            .and_then(|state| state.counters.get("generation").copied())
+            .map(|c| c as i64)
             .unwrap_or(0))
     }
 }

@@ -405,3 +405,145 @@ async fn resolving_does_not_materialise_generation_rows() {
         );
     }
 }
+
+/// A platform state on a database file, as a server process opens it: a
+/// second one on the same file is that server after a restart.
+async fn persistent_state(database_url: &str) -> PlatformState {
+    let store = temper_store_turso::TursoEventStore::new(database_url, None)
+        .await
+        .expect("open the event store");
+    let mut state = PlatformState::new(None);
+    state
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_turso(store));
+    let cache = BTreeMap::new();
+    bootstrap_system_tenant(&state, &cache);
+    bootstrap_agent_specs(&state, "default", false, &cache);
+    state
+}
+
+async fn register(state: &PlatformState, sk: &SigningKey) {
+    state
+        .server
+        .dispatch_tenant_action(
+            &TenantId::new("default"),
+            "TrustedIssuer",
+            ISSUER,
+            "RegisterIssuer",
+            serde_json::json!({
+                "issuer": ISSUER, "jwks_json": jwks_json(sk, "k1"), "audience": AUD, "algorithms": "ES256",
+                "description": "e2e issuer", "created_by": "e2e",
+            }),
+            &AgentContext::system(),
+        )
+        .await
+        .expect("register issuer");
+}
+
+/// An issuer registered through the API is in the store, not in the restarted
+/// server's in-memory index: only the environment's issuer is registered again
+/// at boot. Its tokens must still resolve after a restart, with nothing touching
+/// the issuer first.
+#[tokio::test]
+async fn an_issuer_registered_through_the_api_still_verifies_after_a_restart() {
+    let directory = tempfile::tempdir().expect("a directory for the store");
+    let database_url = format!("file:{}", directory.path().join("issuers.db").display());
+    let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let tenant = TenantId::new("default");
+    let token = mint(&sk, header(), contributor_claims());
+
+    let first = persistent_state(&database_url).await;
+    register(&first, &sk).await;
+    assert!(
+        IdentityResolver::new()
+            .resolve(&first.server, &tenant, &token)
+            .await
+            .is_ok(),
+        "resolves before the restart"
+    );
+
+    let restarted = persistent_state(&database_url).await;
+    assert!(
+        !restarted
+            .server
+            .entity_exists(&tenant, "TrustedIssuer", ISSUER),
+        "the restarted server has not loaded the issuer into its index"
+    );
+    let id = IdentityResolver::new()
+        .resolve(&restarted.server, &tenant, &token)
+        .await
+        .expect("a token of an issuer registered before the restart resolves after it");
+    assert!(id.verified && id.from_jwt);
+
+    // A token of an issuer nobody registered still resolves to nothing, and leaves no row.
+    let ghost = "https://ghost.attacker.example";
+    let mut claims = contributor_claims();
+    claims["iss"] = serde_json::json!(ghost);
+    assert!(
+        IdentityResolver::new()
+            .resolve(&restarted.server, &tenant, &mint(&sk, header(), claims))
+            .await
+            .is_err()
+    );
+    assert!(
+        !restarted
+            .server
+            .entity_exists(&tenant, "TrustedIssuer", ghost)
+    );
+}
+
+/// Sign-out-everywhere survives a restart: a generation bumped before it still
+/// revokes the older token after it.
+#[tokio::test]
+async fn a_generation_bumped_before_a_restart_still_revokes_after_it() {
+    let directory = tempfile::tempdir().expect("a directory for the store");
+    let database_url = format!("file:{}", directory.path().join("generations.db").display());
+    let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let tenant = TenantId::new("default");
+    let token = mint(&sk, header(), contributor_claims()); // grant_id = "grant-e2e"
+
+    let first = persistent_state(&database_url).await;
+    register(&first, &sk).await;
+    first
+        .server
+        .dispatch_tenant_action(
+            &tenant,
+            "PrincipalGeneration",
+            "grant-e2e",
+            "BumpGeneration",
+            serde_json::json!({}),
+            &AgentContext::system(),
+        )
+        .await
+        .expect("revoke the grant");
+    assert!(
+        IdentityResolver::new()
+            .resolve(&first.server, &tenant, &token)
+            .await
+            .is_err(),
+        "revoked before the restart"
+    );
+
+    // The issuer registered again (as boot does for the environment's), so only the generation decides.
+    let restarted = persistent_state(&database_url).await;
+    register(&restarted, &sk).await;
+    let fresh = {
+        let mut c = contributor_claims();
+        c["grant_id"] = serde_json::json!("grant-other");
+        mint(&sk, header(), c)
+    };
+    assert!(
+        IdentityResolver::new()
+            .resolve(&restarted.server, &tenant, &fresh)
+            .await
+            .is_ok(),
+        "the issuer verifies after the restart"
+    );
+    assert!(
+        IdentityResolver::new()
+            .resolve(&restarted.server, &tenant, &token)
+            .await
+            .is_err(),
+        "a grant revoked before the restart stays revoked after it"
+    );
+}
