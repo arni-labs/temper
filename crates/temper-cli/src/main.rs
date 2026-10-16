@@ -5,9 +5,11 @@
 
 /// Use jemalloc to aggressively return freed pages to the OS via MADV_DONTNEED,
 /// preventing the RSS bloat caused by glibc malloc on Debian bookworm (Railway).
+/// Its purge settings are in [`allocator`].
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod allocator;
 mod audit;
 mod codegen;
 mod decide;
