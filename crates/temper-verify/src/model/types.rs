@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Instant;
 
 use std::collections::BTreeSet;
 
@@ -229,6 +230,28 @@ pub struct TemperModel {
     /// String literals each list is compared against (`'x' in list`) in any
     /// guard or invariant: the values worth choosing for `append(list, params.p)`.
     pub(crate) list_literals: BTreeMap<String, BTreeSet<String>>,
+    /// How far this model may be explored, when a budgeted cascade built it.
+    /// `None` explores to the end.
+    pub(crate) limit: Option<ExploreLimit>,
+}
+
+/// How far one model may be explored: a [`crate::cascade::Budget`] in force.
+#[derive(Clone, Copy, Debug)]
+pub struct ExploreLimit {
+    /// Past this instant the model offers no actions, so every walk of it
+    /// (model check, simulation, property tests) ends at once.
+    pub until: Instant,
+    /// States the model check may generate before it stops (a state reached
+    /// twice counts twice).
+    pub states: usize,
+}
+
+impl TemperModel {
+    /// Whether the time this model may be explored for is spent.
+    pub fn out_of_time(&self) -> bool {
+        self.limit
+            .is_some_and(|limit| Instant::now() >= limit.until)
+    }
 }
 
 #[cfg(test)]

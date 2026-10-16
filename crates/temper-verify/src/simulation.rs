@@ -155,13 +155,22 @@ pub fn run_multi_seed_simulation_from_ioa(
     num_seeds: u64,
 ) -> Result<Vec<SimulationResult>, String> {
     let model = build_model_from_ioa(ioa_toml, base_config.max_counter)?;
-    Ok((0..num_seeds)
+    Ok(run_multi_seed_simulation(&model, base_config, num_seeds))
+}
+
+/// Run simulation across multiple seeds on a pre-built `TemperModel`.
+pub fn run_multi_seed_simulation(
+    model: &TemperModel,
+    base_config: &SimConfig,
+    num_seeds: u64,
+) -> Vec<SimulationResult> {
+    (0..num_seeds)
         .map(|i| {
             let mut config = base_config.clone();
             config.seed = base_config.seed.wrapping_add(i);
-            run_simulation_impl(&model, &config)
+            run_simulation_impl(model, &config)
         })
-        .collect())
+        .collect()
 }
 
 fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationResult {

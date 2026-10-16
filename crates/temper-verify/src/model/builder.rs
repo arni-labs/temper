@@ -102,6 +102,7 @@ pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> 
         counter_bounds,
         default_max_counter: max_counter,
         list_literals: list_literals(automaton),
+        limit: None,
     }
 }
 

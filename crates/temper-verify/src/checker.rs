@@ -38,17 +38,35 @@ pub struct VerificationResult {
 /// Run exhaustive BFS model checking on the given `TemperModel`.
 ///
 /// This spawns Stateright's BFS checker, joins it, and then inspects the
-/// discoveries to build a `VerificationResult`.
+/// discoveries to build a `VerificationResult`. A model with an
+/// [`crate::model::ExploreLimit`] stops at its time or state limit and
+/// reports itself incomplete.
 pub fn check_model(model: &TemperModel) -> VerificationResult {
-    let checker_result = model.clone().checker().spawn_bfs().join();
+    let mut checker = model.clone().checker();
+    if let Some(limit) = model.limit {
+        checker = checker.target_state_count(limit.states);
+    }
+    let checker_result = checker.spawn_bfs().join();
 
     let states_explored = checker_result.unique_state_count();
-    let is_complete = checker_result.is_done();
+    // Neither limit shows in `is_done`: a checker thread that stops at its
+    // target state count closes the job market as it exits, and a spent time
+    // limit ends the BFS normally because the model stopped offering actions.
+    let explored_all = checker_result.is_done()
+        && !model.out_of_time()
+        && model
+            .limit
+            .is_none_or(|limit| checker_result.state_count() < limit.states);
 
     let discoveries = checker_result.discoveries();
     let mut counterexamples = Vec::new();
 
     for (property_name, path) in discoveries {
+        // A walk the time limit cut short looks like one that ended there:
+        // an `eventually` property found false on it proves nothing.
+        if !explored_all && property_name == crate::model::REACHES_TERMINAL {
+            continue;
+        }
         let mut trace = Vec::new();
         let steps: Vec<_> = path.into_vec();
         for (state, action) in steps {
@@ -60,8 +78,17 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         });
     }
 
-    let dead_transitions = find_dead_transitions(model);
-    let all_properties_hold = counterexamples.is_empty() && dead_transitions.is_empty();
+    // An edge never seen in part of the state space may still be enabled in
+    // the rest: dead transitions are named only after a whole exploration.
+    let dead_transitions = if explored_all {
+        find_dead_transitions(model)
+    } else {
+        None
+    };
+    let is_complete = dead_transitions.is_some();
+    let dead_transitions = dead_transitions.unwrap_or_default();
+    let all_properties_hold =
+        is_complete && counterexamples.is_empty() && dead_transitions.is_empty();
 
     VerificationResult {
         states_explored,
@@ -72,7 +99,9 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
     }
 }
 
-fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
+/// The transitions no reachable state enables, or `None` when the model's
+/// time limit ran out before every reachable state was walked.
+fn find_dead_transitions(model: &TemperModel) -> Option<Vec<String>> {
     let mut visited_states = HashSet::new();
     let mut queue = VecDeque::new();
     for init in model.init_states() {
@@ -84,6 +113,9 @@ fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
     let mut covered = vec![false; model.transitions.len()];
 
     while let Some(state) = queue.pop_front() {
+        if model.out_of_time() {
+            return None;
+        }
         for (index, transition) in model.transitions.iter().enumerate() {
             let next_states = step(model, transition, &state);
             if next_states.is_empty() {
@@ -98,7 +130,7 @@ fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
         }
     }
 
-    model
+    let dead = model
         .transitions
         .iter()
         .enumerate()
@@ -109,7 +141,8 @@ fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
                 Some(render_transition_label(transition))
             }
         })
-        .collect()
+        .collect();
+    Some(dead)
 }
 
 /// The states `transition` reaches from `state`: none when it is not

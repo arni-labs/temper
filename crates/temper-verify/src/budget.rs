@@ -1,0 +1,79 @@
+//! How much one verification cascade may spend.
+//!
+//! Every counter, boolean and numeric action parameter multiplies the states
+//! the model check walks and the successors it computes for each, so a small
+//! change to a spec can turn seconds into hours. A server that verifies specs
+//! it was sent gives each cascade a [`Budget`]: the level that runs out of it
+//! stops, fails with a summary saying so, and the levels after it do not run.
+
+use std::time::{Duration, Instant};
+
+use crate::model::{ExploreLimit, TemperModel};
+
+/// The most one cascade may spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// Wall-clock time for the whole cascade.
+    pub time: Duration,
+    /// States the model check may generate. A state reached twice counts
+    /// twice, as Stateright counts toward its target state count.
+    pub states: usize,
+}
+
+/// A budget being spent: when it started and when it ends.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Spending {
+    budget: Budget,
+    started: Instant,
+    limit: ExploreLimit,
+}
+
+impl Spending {
+    pub(crate) fn start(budget: Budget) -> Self {
+        let started = Instant::now();
+        let limit = ExploreLimit {
+            until: started + budget.time,
+            states: budget.states,
+        };
+        Self {
+            budget,
+            started,
+            limit,
+        }
+    }
+
+    /// `model`, explored no further than this budget allows.
+    pub(crate) fn limit(&self, mut model: TemperModel) -> TemperModel {
+        model.limit = Some(self.limit);
+        model
+    }
+
+    pub(crate) fn spent(&self) -> bool {
+        Instant::now() >= self.limit.until
+    }
+
+    /// What a level cut short says, after `label` ("L1 Model Check").
+    /// `states` is how many distinct states the model check explored, when it
+    /// ran.
+    pub(crate) fn stopped_summary(&self, label: &str, states: Option<usize>) -> String {
+        let explored = states.map_or(String::new(), |n| {
+            format!(" ({n} distinct states explored)")
+        });
+        let limit = if self.spent() {
+            format!(
+                "not finished within its {} s budget",
+                self.budget.time.as_secs()
+            )
+        } else {
+            format!(
+                "reached its limit of {} generated states after {:.1} s",
+                self.budget.states,
+                self.started.elapsed().as_secs_f64()
+            )
+        };
+        format!(
+            "{label} STOPPED: {limit}{explored}; every counter, flag and numeric action \
+             parameter multiplies the states to check, so use fewer of them or smaller bounds"
+        )
+    }
+}
