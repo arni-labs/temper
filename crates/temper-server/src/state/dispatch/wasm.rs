@@ -1166,7 +1166,10 @@ impl crate::state::ServerState {
         let hash = self
             .module_hash_to_invoke(ctx.entity_ref.tenant, module_name, hash)
             .await
-            .unwrap_or_else(|_| hash.to_string());
+            .unwrap_or_else(|error| {
+                tracing::warn!(module = %module_name, error = %error, "WASM module could not be loaded");
+                hash.to_string()
+            });
         let phase_parent_span = Span::current();
         let invoke_result = instrument_wasm_dispatch_phase_result(
             phase_parent_span.clone(),

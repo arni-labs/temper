@@ -321,6 +321,48 @@ async fn wasm_http_endpoint_can_admit_an_action_as_the_authenticated_caller() {
     );
 }
 
+/// The router resolves its module again right before invoking. An install can
+/// replace and drop the compiled version while admission runs, and a module
+/// restored at boot is only compiled on first use.
+#[tokio::test(flavor = "multi_thread")]
+async fn endpoint_runs_a_registered_module_that_is_not_compiled() {
+    let (state, _dir) = fixture().await;
+    let tenant = TenantId::new("probe");
+    let wasm = include_bytes!("fixtures/wasm-identity/identity.wasm");
+    let hash = temper_wasm::WasmEngine::hash_module(wasm);
+    state
+        .upsert_wasm_module("probe", "capability-probe", wasm, &hash, "bundled")
+        .await
+        .unwrap();
+    assert!(state.wasm_engine.evict(&hash));
+    state
+        .http_endpoint_tables
+        .table_for(&tenant)
+        .await
+        .replace(vec![temper_server::http_endpoint::route_from_entity_fields("probe-http", &json!({
+            "PathPrefix":"/probe", "Methods":"GET", "IntegrationModule":"capability-probe", "RequiresAuth":true,
+            "AdmissionActions":json!([{"name":"child", "entity_set":"Children", "entity_id":"mine", "action":"Probe.Remove"}]).to_string()
+        })).unwrap()])
+        .await;
+    let response = temper_server::http_endpoint_fallback(
+        axum::extract::State(state.clone()),
+        Some(axum::Extension(
+            temper_authz::AuthenticatedRequestContext::new(
+                tenant,
+                caller("alice").security_ctx.unwrap(),
+            ),
+        )),
+        None,
+        axum::http::Method::GET,
+        "/probe".parse().unwrap(),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(state.wasm_engine.is_cached(&hash));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn module_secret_is_independent_of_requesting_user() {
     let (state, _dir) = fixture().await;

@@ -412,7 +412,18 @@ async fn dispatch_matched_route(
     let invoke_streams = std::sync::Arc::new(std::sync::RwLock::new(
         temper_wasm::stream::StreamRegistry::default(),
     ));
-    let invoke_hash = module_hash.clone();
+    // An install can replace (and drop) the module while admission runs.
+    let invoke_hash = state
+        .module_hash_to_invoke(&tenant_id, &route.route.integration_module, &module_hash)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                integration = %route.route.integration_module,
+                error = %error,
+                "HttpEndpoint module could not be loaded"
+            );
+            module_hash.clone()
+        });
     let invoke_integration = route.route.integration_module.clone();
     tracing::info!(
         endpoint_id = %route.route.id,
