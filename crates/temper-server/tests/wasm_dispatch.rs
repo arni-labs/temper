@@ -436,7 +436,10 @@ async fn a_replaced_module_leaves_the_compiled_cache() {
     );
     assert!(state.wasm_engine.is_cached(&v3));
 
-    // A call prepared with v1 before the install runs the version registered now.
+    // A call prepared with v1 before the install runs the version registered
+    // now, and a v1 that a first-use compile cached after the install had
+    // dropped it is dropped again.
+    compile(1);
     for prepared in [&v1, &v3] {
         let to_invoke = state
             .module_hash_to_invoke(&tenant, "build", prepared)
@@ -444,6 +447,7 @@ async fn a_replaced_module_leaves_the_compiled_cache() {
             .expect("a registered version");
         assert_eq!(&to_invoke, &v3);
     }
+    assert!(!state.wasm_engine.is_cached(&v1));
 }
 
 #[tokio::test(flavor = "multi_thread")]

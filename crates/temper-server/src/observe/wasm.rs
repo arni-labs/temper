@@ -328,14 +328,13 @@ pub async fn handle_delete_wasm_module(
 
     // Remove from in-memory registry after durability is confirmed, then drop
     // the compiled module unless another tenant still runs the same bytes.
-    let unnamed = {
+    {
         let mut wasm_reg = state.wasm_module_registry.write().unwrap();
-        wasm_reg
-            .remove(&tenant, &module_name)
-            .filter(|hash| !wasm_reg.names_hash(hash))
-    };
-    if let Some(hash) = unnamed {
-        state.wasm_engine.evict(&hash);
+        if let Some(hash) = wasm_reg.remove(&tenant, &module_name)
+            && !wasm_reg.names_hash(&hash)
+        {
+            state.wasm_engine.evict(&hash);
+        }
     }
 
     tracing::info!(
