@@ -265,6 +265,44 @@ impl ServerState {
         }
     }
 
+    /// Point a tenant's module at `hash`. The compiled module it replaces is
+    /// dropped once nothing names it; otherwise every app version installed
+    /// since boot keeps its compiled code in memory until restart.
+    pub fn register_wasm_module(&self, tenant: &TenantId, module_name: &str, hash: &str) {
+        let unnamed = {
+            let mut registry = self.wasm_module_registry.write().unwrap(); // ci-ok: infallible lock
+            registry
+                .register(tenant, module_name, hash)
+                .filter(|old| old != hash && !registry.names_hash(old))
+        };
+        if let Some(old) = unnamed {
+            self.wasm_engine.evict(&old);
+        }
+    }
+
+    /// The compiled version of `module_name` to invoke now: `hash` while it is
+    /// cached, else the version registered since. An install can replace (and
+    /// drop) the version a dispatch looked up while the dispatch was still
+    /// preparing its call; the call then runs the new version instead of failing.
+    pub async fn module_hash_to_invoke(
+        &self,
+        tenant: &TenantId,
+        module_name: &str,
+        hash: &str,
+    ) -> Result<String, String> {
+        if self.wasm_engine.is_cached(hash) {
+            return Ok(hash.to_string());
+        }
+        let current = {
+            let registry = self.wasm_module_registry.read().unwrap(); // ci-ok: infallible lock
+            registry.get_hash(tenant, module_name).map(str::to_string)
+        }
+        .ok_or_else(|| format!("WASM module '{module_name}' not found for tenant '{tenant}'"))?;
+        self.ensure_wasm_module_cached(tenant, module_name, &current)
+            .await?;
+        Ok(current)
+    }
+
     /// Ensure a registered WASM module is compiled and cached in-memory.
     ///
     /// Startup recovery restores registry entries without eagerly compiling
@@ -449,8 +487,7 @@ impl ServerState {
                         row.sha256_hash.clone()
                     };
                     let tenant_id = temper_runtime::tenant::TenantId::new(&row.tenant);
-                    let mut wasm_reg = self.wasm_module_registry.write().unwrap(); // ci-ok: infallible lock
-                    wasm_reg.register(&tenant_id, &row.module_name, &hash);
+                    self.register_wasm_module(&tenant_id, &row.module_name, &hash);
                     recovered += 1;
                 }
             }
@@ -466,8 +503,7 @@ impl ServerState {
                     row.sha256_hash
                 };
                 let tenant_id = temper_runtime::tenant::TenantId::new(&row.tenant);
-                let mut wasm_reg = self.wasm_module_registry.write().unwrap(); // ci-ok: infallible lock
-                wasm_reg.register(&tenant_id, &row.module_name, &hash);
+                self.register_wasm_module(&tenant_id, &row.module_name, &hash);
                 recovered += 1;
             }
         }
