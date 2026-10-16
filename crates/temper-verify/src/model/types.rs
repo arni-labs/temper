@@ -5,6 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use std::collections::BTreeSet;
 
@@ -229,6 +232,47 @@ pub struct TemperModel {
     /// String literals each list is compared against (`'x' in list`) in any
     /// guard or invariant: the values worth choosing for `append(list, params.p)`.
     pub(crate) list_literals: BTreeMap<String, BTreeSet<String>>,
+    /// How far this model may be explored, when a budgeted cascade built it.
+    /// `None` explores to the end.
+    pub(crate) limit: Option<ExploreLimit>,
+}
+
+/// How far one model may be explored: a [`crate::Budget`] in force.
+#[derive(Clone, Debug)]
+pub(crate) struct ExploreLimit {
+    /// Past this instant the model offers no actions, so every walk of it
+    /// (model check, simulation, property tests) ends at once.
+    pub(crate) until: Instant,
+    /// States the model check may generate before it stops (a state reached
+    /// twice counts twice).
+    pub(crate) states: usize,
+    /// Set once a walk is over, so the model offers its actions again:
+    /// Stateright rebuilds a found path by stepping the model from the start.
+    pub(crate) lifted: Arc<AtomicBool>,
+}
+
+impl ExploreLimit {
+    /// The same limit for one walk of its own, lifted without lifting it for
+    /// the other walks of the same budget.
+    pub(crate) fn for_one_walk(&self) -> Self {
+        Self {
+            lifted: Arc::new(AtomicBool::new(false)),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn lift(&self) {
+        self.lifted.store(true, Ordering::Relaxed);
+    }
+}
+
+impl TemperModel {
+    /// Whether the time this model may be explored for is spent.
+    pub fn out_of_time(&self) -> bool {
+        self.limit.as_ref().is_some_and(|limit| {
+            !limit.lifted.load(Ordering::Relaxed) && Instant::now() >= limit.until
+        })
+    }
 }
 
 #[cfg(test)]

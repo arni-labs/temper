@@ -13,6 +13,10 @@ use super::types::{
     LivenessKind, ResolvedTransition, TemperModel, TemperModelAction, TemperModelState,
 };
 
+/// The name of the one `eventually` property: found false only at the end of
+/// a walk, so a walk cut short can report it falsely.
+pub(crate) const REACHES_TERMINAL: &str = "ReachesTerminal";
+
 // -- Property condition functions (bare fn pointers) -------------------------
 
 /// Check that the current status is a declared state.
@@ -147,6 +151,11 @@ impl Model for TemperModel {
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
+        // A spent budget ends every walk here: Stateright's own timeout is not
+        // seen by a single-threaded BFS until its whole queue is empty.
+        if self.out_of_time() {
+            return;
+        }
         for t in &self.transitions {
             // Status precondition and guard, via the shared predicate that
             // `action_enabled` also uses -- see there for the guard rationale.
@@ -202,7 +211,7 @@ impl Model for TemperModel {
             .iter()
             .any(|l| matches!(&l.kind, LivenessKind::ReachesState { targets, .. } if !targets.is_empty()));
         if has_reaches {
-            props.push(Property::eventually("ReachesTerminal", check_reaches_state));
+            props.push(Property::eventually(REACHES_TERMINAL, check_reaches_state));
         }
 
         props

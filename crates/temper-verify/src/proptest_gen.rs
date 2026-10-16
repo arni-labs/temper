@@ -420,6 +420,7 @@ mod tests {
             counter_bounds: BTreeMap::new(),
             default_max_counter: 2,
             list_literals: BTreeMap::new(),
+            limit: None,
         }
     }
 }
