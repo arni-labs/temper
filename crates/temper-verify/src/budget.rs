@@ -7,6 +7,8 @@
 //! it was sent gives each cascade a [`Budget`]: the level that runs out of it
 //! stops, fails with a summary saying so, and the levels after it do not run.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::cascade::{CascadeLevel, LevelResult};
@@ -23,7 +25,7 @@ pub struct Budget {
 }
 
 /// A budget being spent: when it started and when it ends.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Spending {
     budget: Budget,
     started: Instant,
@@ -33,9 +35,14 @@ pub(crate) struct Spending {
 impl Spending {
     pub(crate) fn start(budget: Budget) -> Self {
         let started = Instant::now();
+        // A budget too long to add to the clock is no time limit at all.
+        let until = started
+            .checked_add(budget.time)
+            .unwrap_or(started + Duration::from_secs(365 * 24 * 3600));
         let limit = ExploreLimit {
-            until: started + budget.time,
+            until,
             states: budget.states,
+            lifted: Arc::new(AtomicBool::new(false)),
         };
         Self {
             budget,
@@ -46,7 +53,7 @@ impl Spending {
 
     /// `model`, explored no further than this budget allows.
     pub(crate) fn limit(&self, mut model: TemperModel) -> TemperModel {
-        model.limit = Some(self.limit);
+        model.limit = Some(self.limit.clone());
         model
     }
 
@@ -56,27 +63,43 @@ impl Spending {
 
     /// What a level cut short says, after `label` ("L1 Model Check").
     /// `states` is how many distinct states the model check explored, when it
-    /// ran.
-    pub(crate) fn stopped_summary(&self, label: &str, states: Option<usize>) -> String {
+    /// ran, and `found` the properties it found false before it stopped.
+    pub(crate) fn stopped_summary(
+        &self,
+        label: &str,
+        states: Option<usize>,
+        found: &[String],
+    ) -> String {
         let explored = states.map_or(String::new(), |n| {
             format!(" ({n} distinct states explored)")
         });
         let limit = if self.spent() {
-            format!(
-                "not finished within its {} s budget",
-                self.budget.time.as_secs()
-            )
+            format!("ran out of its {} s budget", secs(self.budget.time))
         } else {
             format!(
-                "reached its limit of {} generated states after {:.1} s",
+                "reached its limit of {} generated states after {} s",
                 self.budget.states,
-                self.started.elapsed().as_secs_f64()
+                secs(self.started.elapsed())
             )
         };
+        let found = if found.is_empty() {
+            String::new()
+        } else {
+            format!(", and found {} false before it stopped", found.join(", "))
+        };
         format!(
-            "{label} STOPPED: {limit}{explored}; every counter, flag and numeric action \
+            "{label} STOPPED: {limit}{explored}{found}; every counter, flag and numeric action \
              parameter multiplies the states to check, so use fewer of them or smaller bounds"
         )
+    }
+}
+
+/// Whole seconds as they are, anything finer to a tenth.
+fn secs(time: Duration) -> String {
+    if time.subsec_millis() == 0 {
+        time.as_secs().to_string()
+    } else {
+        format!("{:.1}", time.as_secs_f64())
     }
 }
 
@@ -98,8 +121,14 @@ pub(crate) fn ran_out(
     if !spending.spent() && !unfinished {
         return false;
     }
+    let found: Vec<String> = level
+        .verification
+        .iter()
+        .flat_map(|v| v.counterexamples.iter().map(|c| c.property.clone()))
+        .collect();
     level.passed = false;
-    level.summary = spending.stopped_summary(short_label(level.level), explored.map(|(n, _)| n));
+    level.summary =
+        spending.stopped_summary(short_label(level.level), explored.map(|(n, _)| n), &found);
     true
 }
 

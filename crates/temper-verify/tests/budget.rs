@@ -37,8 +37,7 @@ fn a_spec_too_large_to_check_stops_at_its_budget_and_names_itself() {
         .as_deref()
         .expect("the cascade says it stopped");
     assert!(
-        stopped
-            .starts_with("HeavyFeed: L1 Model Check STOPPED: not finished within its 1 s budget"),
+        stopped.starts_with("HeavyFeed: L1 Model Check STOPPED: ran out of its 1 s budget"),
         "{stopped}"
     );
     assert!(
@@ -81,6 +80,28 @@ name = "Wide"
 states = ["On"]
 initial = "On"
 "#;
+
+#[test]
+fn a_finding_before_the_cut_is_named_and_a_cut_walk_proves_no_liveness_false() {
+    // `offered <= 1` is false as soon as Stepped adds 2, long before the budget
+    // runs out; after the cut every queued state looks like the end of a walk.
+    let spec = format!(
+        "{HEAVY_FEED}\n[[invariant]]\nname = \"FewOffered\"\nassert = \"offered <= 1\"\n\n\
+         [[liveness]]\nname = \"Rests\"\nfrom = [\"Running\"]\nreaches = [\"Resting\"]\n"
+    );
+    let result = VerificationCascade::from_ioa(&spec)
+        .with_budget(budget(Duration::from_secs(1)))
+        .run();
+    let stopped = result
+        .stopped
+        .as_deref()
+        .expect("the cascade says it stopped");
+    assert!(
+        stopped.contains("ran out of its 1 s budget") && stopped.contains("found Invariants false"),
+        "{stopped}"
+    );
+    assert!(!stopped.contains("ReachesTerminal"), "{stopped}");
+}
 
 #[test]
 fn a_state_limit_stops_the_model_check_however_much_time_is_left() {

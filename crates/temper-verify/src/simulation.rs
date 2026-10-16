@@ -305,6 +305,11 @@ fn check_liveness_post_simulation(
     actor_states: &[(String, TemperModelState)],
 ) -> Vec<LivenessViolation> {
     let mut violations = Vec::new();
+    // Past a budget's deadline the model offers no actions, so every actor
+    // would look deadlocked or stuck: the run proves nothing about liveness.
+    if model.out_of_time() {
+        return violations;
+    }
 
     for (actor_id, final_state) in actor_states {
         for live in &model.liveness {
@@ -448,6 +453,35 @@ mod tests {
         assert!(
             results.iter().any(|r| r.total_transitions > 0),
             "fixture applied no transitions at all, so it proves nothing"
+        );
+    }
+
+    /// Past a budget's deadline the model offers no actions, so a liveness
+    /// check would call every actor deadlocked.
+    #[test]
+    fn a_spent_budget_finds_no_liveness_violations() {
+        let spec = "[automaton]\nname = \"Loop\"\nstates = [\"On\"]\ninitial = \"On\"\n\n\
+                    [[action]]\nname = \"Go\"\nkind = \"input\"\nfrom = [\"On\"]\n\n\
+                    [[liveness]]\nname = \"KeepsMoving\"\nfrom = [\"On\"]\nhas_actions = true\n";
+        let mut model = build_model_from_ioa(spec, 2).unwrap();
+        model.limit = Some(crate::model::ExploreLimit {
+            until: std::time::Instant::now(),
+            states: 1,
+            lifted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let config = SimConfig {
+            seed: 7,
+            max_ticks: 20,
+            num_actors: 2,
+            max_actions_per_actor: 5,
+            max_counter: 2,
+            faults: FaultConfig::none(),
+        };
+        let result = run_simulation_impl(&model, &config);
+        assert!(
+            result.liveness_violations.is_empty(),
+            "{:?}",
+            result.liveness_violations
         );
     }
 

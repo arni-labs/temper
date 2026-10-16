@@ -18,7 +18,8 @@ pub mod types;
 
 pub use builder::{build_model_from_automaton, build_model_from_ioa};
 pub(crate) use stateright_impl::REACHES_TERMINAL;
+pub(crate) use types::ExploreLimit;
 pub use types::{
-    ExploreLimit, LivenessKind, ModelEffect, ParamValue, ResolvedInvariant, ResolvedLiveness,
-    ResolvedTransition, TemperModel, TemperModelAction, TemperModelState,
+    LivenessKind, ModelEffect, ParamValue, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
+    TemperModel, TemperModelAction, TemperModelState,
 };

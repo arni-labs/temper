@@ -24,7 +24,8 @@ const DEFAULT_BUDGET_MS: u64 = 30_000;
 const MAX_BUDGET_MS: u64 = 120_000;
 /// States one check's model check may generate, a bound on its memory. A
 /// state reached twice counts twice: Katagami's own KatagamiApp generates
-/// 5.3M (381k distinct) in 14 s.
+/// 5.3M (381k distinct) in 14 s. A spec of cheap steps reaches the cap with
+/// about 1.4M distinct states and 1.1 GB, the most one check holds.
 const BUDGET_STATES: usize = 10_000_000;
 
 /// POST /api/specs/validate-ioa -- validate IOA source without loading it.

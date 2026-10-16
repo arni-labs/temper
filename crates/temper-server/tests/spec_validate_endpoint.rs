@@ -108,8 +108,7 @@ async fn validate_ioa_answers_a_spec_too_large_to_check_within_its_budget() {
         .as_str()
         .expect("stopped names the type and why");
     assert!(
-        stopped
-            .starts_with("HeavyFeed: L1 Model Check STOPPED: not finished within its 1 s budget"),
+        stopped.starts_with("HeavyFeed: L1 Model Check STOPPED: ran out of its 1 s budget"),
         "{stopped}"
     );
 }

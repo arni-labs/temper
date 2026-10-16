@@ -38,12 +38,17 @@ pub struct VerificationResult {
 /// Run exhaustive BFS model checking on the given `TemperModel`.
 ///
 /// This spawns Stateright's BFS checker, joins it, and then inspects the
-/// discoveries to build a `VerificationResult`. A model with an
-/// [`crate::model::ExploreLimit`] stops at its time or state limit and
-/// reports itself incomplete.
+/// discoveries to build a `VerificationResult`. A model with a budget's
+/// limit stops at its time or state limit and reports itself incomplete.
 pub fn check_model(model: &TemperModel) -> VerificationResult {
-    let mut checker = model.clone().checker();
-    if let Some(limit) = model.limit {
+    // The checker's own copy of the model, whose limit is lifted once the
+    // search is over: Stateright rebuilds each found path by stepping it.
+    let walked = TemperModel {
+        limit: model.limit.as_ref().map(|limit| limit.for_one_walk()),
+        ..model.clone()
+    };
+    let mut checker = walked.clone().checker();
+    if let Some(limit) = &model.limit {
         checker = checker.target_state_count(limit.states);
     }
     let checker_result = checker.spawn_bfs().join();
@@ -52,19 +57,25 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
     // Neither limit shows in `is_done`: a checker thread that stops at its
     // target state count closes the job market as it exits, and a spent time
     // limit ends the BFS normally because the model stopped offering actions.
+    let cut_by_time = walked.out_of_time();
     let explored_all = checker_result.is_done()
-        && !model.out_of_time()
+        && !cut_by_time
         && model
             .limit
+            .as_ref()
             .is_none_or(|limit| checker_result.state_count() < limit.states);
+    if let Some(limit) = &walked.limit {
+        limit.lift();
+    }
 
     let discoveries = checker_result.discoveries();
     let mut counterexamples = Vec::new();
 
     for (property_name, path) in discoveries {
-        // A walk the time limit cut short looks like one that ended there:
-        // an `eventually` property found false on it proves nothing.
-        if !explored_all && property_name == crate::model::REACHES_TERMINAL {
+        // After the time cut every state still queued had no actions, so it
+        // looks like the end of a walk: an `eventually` property found false
+        // there proves nothing. (A state-limit stop leaves the queue as it was.)
+        if cut_by_time && property_name == crate::model::REACHES_TERMINAL {
             continue;
         }
         let mut trace = Vec::new();
