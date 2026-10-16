@@ -5,18 +5,20 @@
 //!
 //! Every dispatched action carries a key, so every write adds a reply. The
 //! cache is therefore bounded by the bytes it holds across all actors
-//! ([`IDEMPOTENCY_CACHE_BYTES_BUDGET`]), oldest reply evicted first, and a
-//! cached reply keeps only what a replay reads: its recent events without their
-//! parameters and without the actor's durable key set. An evicted reply is
-//! still deduplicated by the actor's durable `processed_idempotency_keys`; only
-//! the exact earlier reply is lost.
+//! ([`IDEMPOTENCY_CACHE_BYTES_BUDGET`]), and a cached reply leaves out the two
+//! things that dominate a busy entity's state: its recent events' parameters
+//! and the actor's durable key set. Replies whose post-dispatch effects have
+//! run are evicted first, oldest first: the actor's durable
+//! `processed_idempotency_keys` still deduplicates them, without the original
+//! reply. Replies still waiting for their effects go last, because a retry
+//! needs their effects (spawns, timers, triggers) to run once.
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use temper_runtime::scheduler::sim_now;
 
-use crate::entity_actor::EntityResponse;
+use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).
 pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
@@ -45,17 +47,26 @@ struct IdempotencyEntry {
     seq: u64,
 }
 
+/// Insertion order, oldest first: seq → (actor_key, idempotency_key).
+type Order = BTreeMap<u64, (String, String)>;
+
 #[derive(Default)]
 struct Entries {
     /// actor_key → (idempotency_key → entry).
     by_actor: BTreeMap<String, BTreeMap<String, IdempotencyEntry>>,
-    /// Insertion order across all actors, oldest first: seq → (actor_key, idempotency_key).
-    order: BTreeMap<u64, (String, String)>,
+    /// Replies whose post-dispatch effects have run; evicted first.
+    applied: Order,
+    /// Replies still waiting for their post-dispatch effects; evicted last.
+    pending: Order,
     next_seq: u64,
     bytes: usize,
 }
 
 impl Entries {
+    fn len(&self) -> usize {
+        self.applied.len() + self.pending.len()
+    }
+
     fn remove(&mut self, actor_key: &str, idem_key: &str) {
         let Some(actor_entries) = self.by_actor.get_mut(actor_key) else {
             return;
@@ -66,22 +77,53 @@ impl Entries {
         if actor_entries.is_empty() {
             self.by_actor.remove(actor_key);
         }
-        self.order.remove(&entry.seq);
+        self.applied.remove(&entry.seq);
+        self.pending.remove(&entry.seq);
         self.bytes -= entry.bytes;
     }
 
-    fn remove_oldest(&mut self) -> bool {
-        let Some((_, (actor_key, idem_key))) = self.order.pop_first() else {
+    /// Evict one reply: the oldest whose effects have run, else the oldest.
+    fn evict_one(&mut self) -> bool {
+        let Some((_, (actor_key, idem_key))) = self
+            .applied
+            .pop_first()
+            .or_else(|| self.pending.pop_first())
+        else {
             return false;
         };
         self.remove(&actor_key, &idem_key);
         true
     }
 
-    fn oldest_created_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        let (_, (actor_key, idem_key)) = self.order.first_key_value()?;
-        Some(self.by_actor.get(actor_key)?.get(idem_key)?.created_at)
+    /// Evict every reply older than the TTL.
+    fn evict_expired(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        loop {
+            let oldest = [
+                self.applied.first_key_value(),
+                self.pending.first_key_value(),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(seq, _)| **seq)
+            .map(|(_, keys)| keys.clone());
+            let Some((actor_key, idem_key)) = oldest else {
+                return;
+            };
+            let expired = self
+                .by_actor
+                .get(&actor_key)
+                .and_then(|actor_entries| actor_entries.get(&idem_key))
+                .is_some_and(|entry| is_expired(entry, now));
+            if !expired {
+                return;
+            }
+            self.remove(&actor_key, &idem_key);
+        }
     }
+}
+
+fn is_expired(entry: &IdempotencyEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
+    now.signed_duration_since(entry.created_at).num_seconds() > IDEMPOTENCY_TTL_SECS
 }
 
 /// Idempotency cache shared by every entity actor.
@@ -123,10 +165,7 @@ impl IdempotencyCache {
             Err(poisoned) => poisoned.into_inner(),
         };
         let entry = entries.by_actor.get(actor_key)?.get(idem_key)?;
-
-        // Check TTL
-        let age = now.signed_duration_since(entry.created_at);
-        if age.num_seconds() > IDEMPOTENCY_TTL_SECS {
+        if is_expired(entry, now) {
             return None;
         }
 
@@ -146,9 +185,7 @@ impl IdempotencyCache {
         let now = sim_now();
         let entries = self.entries.read().unwrap(); // ci-ok: infallible lock
         let entry = entries.by_actor.get(actor_key)?.get(idem_key)?;
-
-        let age = now.signed_duration_since(entry.created_at);
-        if age.num_seconds() > IDEMPOTENCY_TTL_SECS || !entry.effects_applied {
+        if is_expired(entry, now) || !entry.effects_applied {
             return None;
         }
 
@@ -157,13 +194,14 @@ impl IdempotencyCache {
 
     /// Cache a response for a given actor and idempotency key.
     ///
-    /// When the cache is over budget, the oldest replies are evicted.
-    pub fn put(&self, actor_key: &str, idem_key: &str, response: EntityResponse) {
+    /// Keeps a copy without event parameters or the durable key set. When
+    /// the cache is over budget, replies are evicted (see the module docs).
+    pub fn put(&self, actor_key: &str, idem_key: &str, response: &EntityResponse) {
         self.put_with_effects_applied(actor_key, idem_key, response, false);
     }
 
     /// Cache a response whose post-dispatch effects are known to be complete.
-    pub fn put_effects_applied(&self, actor_key: &str, idem_key: &str, response: EntityResponse) {
+    pub fn put_effects_applied(&self, actor_key: &str, idem_key: &str, response: &EntityResponse) {
         self.put_with_effects_applied(actor_key, idem_key, response, true);
     }
 
@@ -181,13 +219,15 @@ impl IdempotencyCache {
         else {
             return false;
         };
-
-        let age = now.signed_duration_since(entry.created_at);
-        if age.num_seconds() > IDEMPOTENCY_TTL_SECS {
+        if is_expired(entry, now) {
             return false;
         }
 
         entry.effects_applied = true;
+        let seq = entry.seq;
+        if let Some(keys) = entries.pending.remove(&seq) {
+            entries.applied.insert(seq, keys);
+        }
         true
     }
 
@@ -195,28 +235,16 @@ impl IdempotencyCache {
         &self,
         actor_key: &str,
         idem_key: &str,
-        mut response: EntityResponse,
+        response: &EntityResponse,
         effects_applied: bool,
     ) {
-        // A replay reads event metadata (state clocks, source status), never
-        // event parameters or the durable key set, which dominate a busy
-        // entity's state.
-        for event in response.state.events.iter_mut() {
-            event.params = serde_json::Value::Null;
-        }
-        response.state.processed_idempotency_keys.clear();
+        let response = replay_copy(response);
         let bytes = estimated_entry_bytes(actor_key, idem_key, &response);
 
         let now = sim_now();
         let mut entries = self.entries.write().unwrap(); // ci-ok: infallible lock
         entries.remove(actor_key, idem_key);
-
-        // Evict expired entries first: the oldest entry is the first to expire.
-        while entries.oldest_created_at().is_some_and(|created_at| {
-            now.signed_duration_since(created_at).num_seconds() > IDEMPOTENCY_TTL_SECS
-        }) {
-            entries.remove_oldest();
-        }
+        entries.evict_expired(now);
 
         // A reply larger than the whole budget is not cached; the durable
         // key set still deduplicates it.
@@ -226,9 +254,12 @@ impl IdempotencyCache {
 
         let seq = entries.next_seq;
         entries.next_seq += 1;
-        entries
-            .order
-            .insert(seq, (actor_key.to_string(), idem_key.to_string()));
+        let order = if effects_applied {
+            &mut entries.applied
+        } else {
+            &mut entries.pending
+        };
+        order.insert(seq, (actor_key.to_string(), idem_key.to_string()));
         entries
             .by_actor
             .entry(actor_key.to_string())
@@ -246,13 +277,13 @@ impl IdempotencyCache {
         entries.bytes += bytes;
 
         while entries.bytes > self.budget_bytes {
-            if !entries.remove_oldest() {
+            if !entries.evict_one() {
                 break;
             }
         }
         debug_assert!(entries.bytes <= self.budget_bytes);
         debug_assert_eq!(
-            entries.order.len(),
+            entries.len(),
             entries.by_actor.values().map(BTreeMap::len).sum::<usize>()
         );
     }
@@ -261,6 +292,49 @@ impl IdempotencyCache {
 impl Default for IdempotencyCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The part of a reply a replay reads. Replays read event metadata (state
+/// clocks, source status), never event parameters or the durable key set,
+/// which dominate a busy entity's state; neither is copied.
+fn replay_copy(response: &EntityResponse) -> EntityResponse {
+    let state = &response.state;
+    let events = state
+        .events
+        .iter()
+        .map(|event| EntityEvent {
+            action: event.action.clone(),
+            from_status: event.from_status.clone(),
+            to_status: event.to_status.clone(),
+            timestamp: event.timestamp,
+            params: serde_json::Value::Null,
+            idempotency_key: event.idempotency_key.clone(),
+        })
+        .collect();
+    EntityResponse {
+        success: response.success,
+        state: EntityState {
+            entity_type: state.entity_type.clone(),
+            entity_id: state.entity_id.clone(),
+            status: state.status.clone(),
+            item_count: state.item_count,
+            counters: state.counters.clone(),
+            booleans: state.booleans.clone(),
+            lists: state.lists.clone(),
+            fields: state.fields.clone(),
+            events,
+            total_event_count: state.total_event_count,
+            events_since_snapshot: state.events_since_snapshot,
+            last_snapshot_sequence_nr: state.last_snapshot_sequence_nr,
+            sequence_nr: state.sequence_nr,
+            processed_idempotency_keys: BTreeMap::new(),
+        },
+        error: response.error.clone(),
+        custom_effects: response.custom_effects.clone(),
+        scheduled_actions: response.scheduled_actions.clone(),
+        spawn_requests: response.spawn_requests.clone(),
+        spec_governed: response.spec_governed,
     }
 }
 

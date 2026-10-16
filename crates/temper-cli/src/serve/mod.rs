@@ -388,11 +388,14 @@ fn spawn_optimization_loop(state: &PlatformState) {
     });
 }
 
-/// Pause before the next passivation tick while idle actors are still waiting.
-/// A tick sheds at most `PASSIVATE_IDLE_ACTORS_PER_TICK` actors; an app that
-/// creates records faster than that per interval would otherwise grow the
-/// registry without end, so a backlog is worked off in batches a second apart.
+/// Shortest pause before the next passivation tick while idle actors are still
+/// waiting. A tick sheds at most `PASSIVATE_IDLE_ACTORS_PER_TICK` actors; an
+/// app that creates records faster than that per interval would otherwise
+/// grow the registry without end. A backlog is worked off in batches, each
+/// followed by four times its own duration so snapshot writes take at most a
+/// fifth of the time (ARN-462).
 const PASSIVATION_BACKLOG_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+const PASSIVATION_BACKLOG_PAUSE_PER_TICK_TIME: u32 = 4;
 
 fn spawn_actor_passivation_loop(state: &PlatformState) {
     let interval_secs = std::env::var("TEMPER_PASSIVATION_CHECK_INTERVAL") // determinism-ok: read once at startup
@@ -408,9 +411,11 @@ fn spawn_actor_passivation_loop(state: &PlatformState) {
         let mut pause = interval;
         loop {
             tokio::time::sleep(pause).await; // determinism-ok: background resource management
+            let started = std::time::Instant::now(); // determinism-ok: paces a background task
             let left = server.passivate_idle_actors().await;
             pause = if left > 0 {
-                PASSIVATION_BACKLOG_PAUSE
+                (started.elapsed() * PASSIVATION_BACKLOG_PAUSE_PER_TICK_TIME)
+                    .clamp(PASSIVATION_BACKLOG_PAUSE, interval)
             } else {
                 interval
             };

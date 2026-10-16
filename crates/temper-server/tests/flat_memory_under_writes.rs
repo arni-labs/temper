@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
+use temper_server::idempotency::IDEMPOTENCY_CACHE_BYTES_BUDGET;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
 use temper_server::{ServerState, StorageStack};
@@ -102,8 +103,9 @@ const MEASURED_ROUNDS: usize = 40;
 const STEP_BYTES: usize = 64 * 1024;
 /// Growth allowed over the measured rounds. Before the fix every write kept a
 /// reply holding the feed's last 50 events (about 3 MB each), so this budget
-/// was gone within two rounds.
-const GROWTH_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+/// was gone within two rounds. Keeping only each reply's fields (about 70 KB)
+/// without a byte bound would add about 14 MB here; a flat runtime adds about 1.
+const GROWTH_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 fn text(len: usize, seed: usize) -> String {
     let mut out = String::with_capacity(len + 64);
@@ -196,6 +198,7 @@ async fn sustained_writes_keep_the_live_heap_flat() {
         );
     }
 
+    assert!(state.idempotency_cache.held_bytes() <= IDEMPOTENCY_CACHE_BYTES_BUDGET);
     let grown = LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(warm);
     let written = MEASURED_ROUNDS * FEEDS * STEP_BYTES;
     eprintln!(

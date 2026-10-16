@@ -328,11 +328,9 @@ pub(super) async fn dispatch_bound_action(
             if response.success {
                 // Cache for idempotency
                 if let Some(ref idem_key) = idempotency_key {
-                    state.idempotency_cache.put_effects_applied(
-                        &actor_key,
-                        idem_key,
-                        response.clone(),
-                    );
+                    state
+                        .idempotency_cache
+                        .put_effects_applied(&actor_key, idem_key, &response);
                 }
 
                 http_span.set_status(Status::Ok);
