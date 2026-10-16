@@ -84,10 +84,23 @@ initial = "On"
 #[test]
 fn a_finding_before_the_cut_is_named_and_a_cut_walk_proves_no_liveness_false() {
     // `offered <= 1` is false as soon as Stepped adds 2, long before the budget
-    // runs out; after the cut every queued state looks like the end of a walk.
+    // runs out. Rest now goes to Done, a state off the start, so `reaches Done`
+    // is still open on every walk the cut ends: each queued state then looks
+    // like the end of a walk that never got there.
+    let spec = HEAVY_FEED
+        .replace(
+            r#"{ name = "Rest", kind = "input", from = ["Running"], to = "Resting" },"#,
+            r#"{ name = "Rest", kind = "input", from = ["Running"], to = "Done" },
+  { name = "Again", kind = "input", from = ["Done"], to = "Resting" },"#,
+        )
+        .replace(
+            r#"states = ["Resting", "Running"]"#,
+            r#"states = ["Resting", "Running", "Done"]"#,
+        );
+    assert!(spec.contains(r#"to = "Done""#) && spec.contains(r#""Done"]"#));
     let spec = format!(
-        "{HEAVY_FEED}\n[[invariant]]\nname = \"FewOffered\"\nassert = \"offered <= 1\"\n\n\
-         [[liveness]]\nname = \"Rests\"\nfrom = [\"Running\"]\nreaches = [\"Resting\"]\n"
+        "{spec}\n[[invariant]]\nname = \"FewOffered\"\nassert = \"offered <= 1\"\n\n\
+         [[liveness]]\nname = \"Settles\"\nfrom = [\"Running\"]\nreaches = [\"Done\"]\n"
     );
     let result = VerificationCascade::from_ioa(&spec)
         .with_budget(budget(Duration::from_secs(1)))
