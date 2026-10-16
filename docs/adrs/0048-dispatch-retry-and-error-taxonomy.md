@@ -152,7 +152,7 @@ Existing `IdempotencyCache` (`idempotency.rs`, 1h TTL, 1000-entry per-actor budg
 
 ### Risks
 - **Retry amplification under actor outage.** If an actor is genuinely stuck, retries multiply load. Mitigation: total-deadline budget caps amplification at ~6x (3 attempts over 30s vs. one over 5s).
-- **Idempotency cache memory.** More attempt sequences in the cache. Mitigation: existing per-actor 1000-entry budget already enforced.
+- **Idempotency cache memory.** More attempt sequences in the cache. Mitigation: existing per-actor 1000-entry budget already enforced. Amended 2026-10-15 (incident i8): every dispatch carries a key, so that budget let a busy app keep an hour of full replies, each with its recent events and their parameters. The cache is now bounded by estimated bytes across all actors (16 MiB, oldest evicted first) and keeps replies without event parameters; the actor's durable key set still deduplicates an evicted reply.
 
 ### DST Compliance
 - Retry delays drawn from `sim_now()` derived deterministic jitter, not `thread_rng`. `// determinism-ok: jitter seeded from sim_now() + attempt_seq`.
