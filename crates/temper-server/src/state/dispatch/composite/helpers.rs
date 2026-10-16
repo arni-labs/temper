@@ -347,6 +347,7 @@ pub(super) fn composite_batch_persistence_error(error: PersistenceError) -> Disp
         PersistenceError::Serialization(_) | PersistenceError::Storage(_) => {
             DispatchError::Internal(format!("composite batch persistence failed: {error}"))
         }
+        PersistenceError::EventTooLarge { .. } => DispatchError::QuotaExceeded(error.to_string()),
     }
 }
 

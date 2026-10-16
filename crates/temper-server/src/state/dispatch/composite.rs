@@ -389,8 +389,12 @@ impl crate::state::ServerState {
             return Ok(true);
         }
 
-        // No object-store write occurs until every sub-write has staged successfully.
+        // No object-store write occurs until every sub-write has staged successfully,
+        // and none for a batch whose events are too large to be written.
         if !overflow_blobs.is_empty() {
+            store
+                .refuse_oversized(&appends)
+                .map_err(composite_batch_persistence_error)?;
             let blob_store = blob_store.as_ref().ok_or_else(|| {
                 DispatchError::Internal(
                     "field-overflow blobs require a configured object blob store".to_string(),
