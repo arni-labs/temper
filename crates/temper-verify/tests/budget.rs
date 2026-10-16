@@ -178,3 +178,48 @@ fn a_move_with_too_many_parameter_choices_fails_its_check_instead_of_panicking()
     );
     assert_eq!(result.levels.len(), 1, "no level steps the move");
 }
+
+#[test]
+fn a_huge_counter_bound_is_counted_not_built() {
+    // `x = 1000000000` raises the bound every count parameter is explored up
+    // to: building those choices would allocate a billion values.
+    let spec = r#"
+[automaton]
+name = "Big"
+states = ["On"]
+initial = "On"
+
+[[state]]
+name = "x"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Fill"
+kind = "input"
+from = ["On"]
+effect = ["x = 1000000000"]
+
+[[action]]
+name = "Bump"
+kind = "input"
+from = ["On"]
+params = ["n"]
+effect = ["x += params.n"]
+"#;
+    let started = Instant::now();
+    let result = VerificationCascade::from_ioa(spec).run();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "answered in {:?}",
+        started.elapsed()
+    );
+    let stopped = result
+        .stopped
+        .as_deref()
+        .expect("the cascade says it stopped");
+    assert!(
+        stopped.contains("Bump takes 1000000001 combinations"),
+        "{stopped}"
+    );
+}

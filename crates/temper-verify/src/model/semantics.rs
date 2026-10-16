@@ -117,8 +117,15 @@ pub fn successors(
 pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
     let bound = count_bound(model);
     model.transitions.iter().find_map(|t| {
+        // Counted, not built: a counter set to a large literal raises the
+        // bound, and building its candidates would allocate that many.
         let assignments = t.params.iter().fold(1usize, |n, (name, kind)| {
-            n.saturating_mul(param_candidates(model, t, name, kind, bound).len())
+            let choices = match kind {
+                ParamKind::Count => bound.saturating_add(1),
+                ParamKind::Bool => 2,
+                ParamKind::Str => string_literals(model, t, name).len() + 1,
+            };
+            n.saturating_mul(choices)
         });
         (assignments > MAX_PARAM_ASSIGNMENTS).then_some((t.name.as_str(), assignments))
     })
@@ -146,26 +153,30 @@ fn param_candidates(
     match kind {
         ParamKind::Count => (0..=count_bound).map(ParamValue::Count).collect(),
         ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
-        ParamKind::Str => {
-            let mut values: BTreeSet<String> = BTreeSet::new();
-            for effect in &t.effects {
-                if let ModelEffect::ListAppend {
-                    var,
-                    value: Arg::Param(p),
-                } = effect
-                    && p == name
-                    && let Some(literals) = model.list_literals.get(var)
-                {
-                    values.extend(literals.iter().cloned());
-                }
-            }
-            values
-                .into_iter()
-                .map(ParamValue::Str)
-                .chain(std::iter::once(ParamValue::Fresh))
-                .collect()
+        ParamKind::Str => string_literals(model, t, name)
+            .into_iter()
+            .map(ParamValue::Str)
+            .chain(std::iter::once(ParamValue::Fresh))
+            .collect(),
+    }
+}
+
+/// The literals a list `t` appends string parameter `name` to is compared
+/// against: the strings worth choosing for it.
+fn string_literals(model: &TemperModel, t: &ResolvedTransition, name: &str) -> BTreeSet<String> {
+    let mut values: BTreeSet<String> = BTreeSet::new();
+    for effect in &t.effects {
+        if let ModelEffect::ListAppend {
+            var,
+            value: Arg::Param(p),
+        } = effect
+            && p == name
+            && let Some(literals) = model.list_literals.get(var)
+        {
+            values.extend(literals.iter().cloned());
         }
     }
+    values
 }
 
 /// The cartesian product of each parameter's candidate values.
