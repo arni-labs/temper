@@ -1126,6 +1126,62 @@ impl ServerState {
             .map_err(|e| format!("Actor query failed: {e}"))
     }
 
+    /// Refuse a new entity whose first event, `Created` with its initial fields,
+    /// would be larger than the event size limit. Checked before its actor starts,
+    /// so a refused create answers with the refusal instead of a stopped actor and
+    /// an empty entity left in the index.
+    pub(crate) fn check_created_event_size(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: &serde_json::Value,
+    ) -> Result<(), PersistenceError> {
+        let Some((store, _)) = self.event_journal() else {
+            return Ok(());
+        };
+        // Without a limit (the kernel's default) a create pays nothing for this.
+        if store.event_size_limits().max_bytes.is_none() {
+            return Ok(());
+        }
+        let table = {
+            let reg = self.registry.read().unwrap();
+            reg.get_table_live(tenant, entity_type)
+        }
+        .or_else(|| {
+            self.transition_tables
+                .get(entity_type)
+                .map(|t| Arc::new(RwLock::new((**t).clone())))
+        });
+        let Some(table) = table else {
+            return Ok(());
+        };
+        let table = table
+            .read()
+            .expect("transition table lock poisoned")
+            .clone();
+        let fields =
+            crate::entity_actor::effects::sanitize_action_params(initial_fields).into_owned();
+        let state = EntityActor::build_initial_state(entity_type, entity_id, &table, &fields);
+        let created = EntityEvent {
+            action: "Created".to_string(),
+            from_status: String::new(),
+            to_status: state.status.clone(),
+            timestamp: sim_now(),
+            params: fields,
+            idempotency_key: None,
+        };
+        let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
+            .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+        // The actor's own append warns; this only refuses.
+        store.check_event_size(
+            &format!("{tenant}:{entity_type}:{entity_id}"),
+            &created.action,
+            &payload,
+            false,
+        )
+    }
+
     /// Create a new entity with initial fields and return its state.
     #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_or_create_tenant_entity(
@@ -1135,6 +1191,8 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<EntityResponse, String> {
+        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
+            .map_err(|e| e.to_string())?;
         let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
             tenant,
             entity_type,
@@ -1319,6 +1377,11 @@ impl ServerState {
         created_projection_state.push_event_bounded(created.clone());
         let projection_state = self.query_projection_state(&created_projection_state);
         if let Some(native_store) = self.data_only_create_store() {
+            // The native create writes past the journal handle, so it is held to the
+            // same event size limits here.
+            store
+                .check_event_sizes(&persistence_id, std::slice::from_ref(&envelope))
+                .map_err(|e| e.to_string())?;
             let operation = "native_create";
             let source = "data_only_create_fast_path";
             record_projection_update_started(tenant, entity_type, operation, source);

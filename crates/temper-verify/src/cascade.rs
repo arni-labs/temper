@@ -9,6 +9,7 @@
 //!
 //! Each level produces a pass/fail result. All levels run independently.
 
+use crate::budget::{Budget, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
 use crate::model::{self, TemperModel};
@@ -109,6 +110,12 @@ pub struct CascadeResult {
     /// detection, and a state-space upper bound for budgeting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite_report: Option<CompositeCascadeReport>,
+    /// Set when the spec was too large to check: the cascade ran out of its
+    /// [`Budget`], or a move has more parameter choices than one step explores.
+    /// The type's name and the summary of the level that stopped; the levels
+    /// after it did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
 }
 
 /// Serializable summary of a [`crate::composite::CompositeVerificationPlan`].
@@ -168,6 +175,8 @@ pub struct VerificationCascade {
     /// additionally builds a [`crate::composite::CompositeVerificationPlan`]
     /// and reports it alongside single-entity results.
     composite_scope: Option<CompositeScopeConfig>,
+    /// Optional budget: what the cascade may spend before it stops.
+    budget: Option<Budget>,
 }
 
 struct CompositeScopeConfig {
@@ -189,7 +198,15 @@ impl VerificationCascade {
             fail_fast: false,
             path_extraction_config: None,
             composite_scope: None,
+            budget: None,
         }
+    }
+
+    /// Stop at `budget`: the level running when it runs out fails, saying so,
+    /// and the levels after it do not run.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Set the actor simulation runner (Level 2b).
@@ -252,37 +269,47 @@ impl VerificationCascade {
 
     /// Run the full verification cascade.
     pub fn run(&self) -> CascadeResult {
+        let spending = self.budget.map(Spending::start);
+        let spending = spending.as_ref();
         let mut levels = Vec::new();
-        let model = self.build_temper_model();
+        let model = self.build_temper_model(self.max_counter, spending);
+        let prop_model = self.build_temper_model(2, spending);
 
         let mut warnings = Vec::new();
+
+        // A move with more parameter choices than one step explores would stop
+        // every level that steps it at an assertion: say so instead.
+        if let Some((action, choices)) = model::semantics::oversized_transition(&model)
+            .or_else(|| model::semantics::oversized_transition(&prop_model))
+        {
+            levels.push(too_many_choices(action, choices));
+            return self.stopped(levels, warnings);
+        }
 
         // Level 0: SMT symbolic verification
         let l0 = self.run_symbolic_verification();
         let l0_passed = l0.passed;
         levels.push(l0);
+        if ran_out(spending, &mut levels, None) {
+            return self.stopped(levels, warnings);
+        }
         if self.fail_fast && !l0_passed {
-            return CascadeResult {
-                all_passed: false,
-                levels,
-                warnings,
-                reachable_paths: None,
-                composite_report: None,
-            };
+            return finish(levels, warnings, None, None);
         }
 
         // Level 1: Stateright model checking
         let l1 = self.run_model_check(&model);
         let l1_passed = l1.passed;
+        let explored = l1
+            .verification
+            .as_ref()
+            .map(|v| (v.states_explored, v.is_complete));
         levels.push(l1);
+        if ran_out(spending, &mut levels, explored) {
+            return self.stopped(levels, warnings);
+        }
         if self.fail_fast && !l1_passed {
-            return CascadeResult {
-                all_passed: false,
-                levels,
-                warnings,
-                reachable_paths: None,
-                composite_report: None,
-            };
+            return finish(levels, warnings, None, None);
         }
 
         // Run path extraction after L1 passes (if configured).
@@ -295,17 +322,14 @@ impl VerificationCascade {
         };
 
         // Level 2: Deterministic simulation (model-level)
-        let l2 = self.run_simulation_level();
+        let l2 = self.run_simulation_level(&model);
         let l2_passed = l2.passed;
         levels.push(l2);
+        if ran_out(spending, &mut levels, None) {
+            return self.stopped(levels, warnings);
+        }
         if self.fail_fast && !l2_passed {
-            return CascadeResult {
-                all_passed: false,
-                levels,
-                warnings,
-                reachable_paths,
-                composite_report: None,
-            };
+            return finish(levels, warnings, reachable_paths, None);
         }
 
         // Level 2b: Actor simulation (real TransitionTable::evaluate())
@@ -313,20 +337,20 @@ impl VerificationCascade {
             let l2b = self.run_actor_simulation(runner);
             let l2b_passed = l2b.passed;
             levels.push(l2b);
+            if ran_out(spending, &mut levels, None) {
+                return self.stopped(levels, warnings);
+            }
             if self.fail_fast && !l2b_passed {
-                return CascadeResult {
-                    all_passed: false,
-                    composite_report: None,
-                    levels,
-                    warnings,
-                    reachable_paths,
-                };
+                return finish(levels, warnings, reachable_paths, None);
             }
         }
 
         // Level 3: Property-based tests (with shrinking for minimal counterexamples)
-        let l3 = self.run_prop_tests_level(&model);
+        let l3 = self.run_prop_tests_level(&prop_model);
         levels.push(l3);
+        if ran_out(spending, &mut levels, None) {
+            return self.stopped(levels, warnings);
+        }
 
         // ADR-0046: build composite report if a scope was configured.
         // Does not fail the cascade — reported as a warning-level
@@ -337,19 +361,30 @@ impl VerificationCascade {
             .as_ref()
             .and_then(|cfg| build_composite_report(cfg, &mut warnings));
 
-        let all_passed = levels.iter().all(|l| l.passed);
-        CascadeResult {
-            all_passed,
-            levels,
-            warnings,
-            reachable_paths,
-            composite_report,
+        finish(levels, warnings, reachable_paths, composite_report)
+    }
+
+    /// The model the levels explore, limited by the budget being spent.
+    fn build_temper_model(&self, max_counter: usize, spending: Option<&Spending>) -> TemperModel {
+        let model = model::build_model_from_ioa(&self.ioa_source, max_counter)
+            .expect("cascade: IOA spec should have been validated before model building");
+        match spending {
+            Some(spending) => spending.limit(model),
+            None => model,
         }
     }
 
-    fn build_temper_model(&self) -> TemperModel {
-        model::build_model_from_ioa(&self.ioa_source, self.max_counter)
-            .expect("cascade: IOA spec should have been validated before model building")
+    /// The result of a cascade whose budget ran out in its last level.
+    fn stopped(&self, levels: Vec<LevelResult>, warnings: Vec<String>) -> CascadeResult {
+        let name = temper_spec::automaton::parse_automaton(&self.ioa_source)
+            .map(|automaton| automaton.automaton.name)
+            .unwrap_or_default();
+        let summary = levels.last().map_or("", |level| level.summary.as_str());
+        let stopped = Some(format!("{name}: {summary}"));
+        CascadeResult {
+            stopped,
+            ..finish(levels, warnings, None, None)
+        }
     }
 
     /// Level 0: SMT symbolic verification.
@@ -466,7 +501,7 @@ impl VerificationCascade {
     }
 
     /// Level 2: Deterministic simulation with fault injection.
-    fn run_simulation_level(&self) -> LevelResult {
+    fn run_simulation_level(&self, model: &TemperModel) -> LevelResult {
         let base_config = SimConfig {
             seed: 1,
             max_ticks: self.sim_ticks,
@@ -476,12 +511,7 @@ impl VerificationCascade {
             faults: FaultConfig::light(),
         };
 
-        let results = simulation::run_multi_seed_simulation_from_ioa(
-            &self.ioa_source,
-            &base_config,
-            self.sim_seeds,
-        )
-        .expect("cascade: IOA spec should have been validated before simulation");
+        let results = simulation::run_multi_seed_simulation(model, &base_config, self.sim_seeds);
 
         let invariants_ok = results.iter().all(|r| r.all_invariants_held);
         let liveness_ok = results.iter().all(|r| r.liveness_violations.is_empty());
@@ -549,9 +579,9 @@ impl VerificationCascade {
     }
 
     /// Level 3: Property-based tests with shrinking for minimal counterexamples.
-    fn run_prop_tests_level(&self, _model: &TemperModel) -> LevelResult {
-        let result = proptest_gen::run_prop_tests_with_shrinking_from_ioa(
-            &self.ioa_source,
+    fn run_prop_tests_level(&self, model: &TemperModel) -> LevelResult {
+        let result = proptest_gen::run_prop_tests_with_shrinking_on_model(
+            model,
             self.prop_test_cases,
             self.prop_test_max_steps,
         );
@@ -632,6 +662,22 @@ fn failing_representative(results: Vec<SimulationResult>) -> Option<SimulationRe
         .find(|r| !r.all_invariants_held || !r.liveness_violations.is_empty())
         .cloned()
         .or_else(|| results.into_iter().next())
+}
+
+fn finish(
+    levels: Vec<LevelResult>,
+    warnings: Vec<String>,
+    reachable_paths: Option<crate::paths::PathExtractionResult>,
+    composite_report: Option<CompositeCascadeReport>,
+) -> CascadeResult {
+    CascadeResult {
+        all_passed: levels.iter().all(|l| l.passed),
+        levels,
+        warnings,
+        reachable_paths,
+        composite_report,
+        stopped: None,
+    }
 }
 
 /// Build a [`CompositeCascadeReport`] from the configured scope, appending

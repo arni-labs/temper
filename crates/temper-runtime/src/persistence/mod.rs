@@ -506,6 +506,18 @@ pub enum PersistenceError {
     /// Underlying storage backend returned an error.
     #[error("storage error: {0}")]
     Storage(String),
+
+    /// One event is larger than the server's limit for a single change
+    /// (`TEMPER_MAX_EVENT_BYTES`). Nothing was written.
+    #[error(
+        "refused: `{event_type}` on {persistence_id} would record {bytes} bytes, over this server's limit of {limit} bytes for one change. Keep each record small: long lists as their own records (one record per item, pointing back to this one), and pictures or documents as files, holding only their ids here"
+    )]
+    EventTooLarge {
+        event_type: String,
+        persistence_id: String,
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 /// Convert backend-specific errors into [`PersistenceError::Storage`].

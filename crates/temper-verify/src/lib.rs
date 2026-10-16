@@ -9,6 +9,7 @@
 //! 2. **Deterministic simulation** — FoundationDB/TigerBeetle-style fault injection
 //! 3. **Property-based tests** — random action sequences with invariant checking
 
+pub mod budget;
 pub mod cascade;
 pub mod checker;
 pub mod composite;
@@ -20,6 +21,7 @@ pub mod simulation;
 pub mod smt;
 
 // Re-export key types.
+pub use budget::Budget;
 pub use cascade::{ActorSimResult, CascadeLevel, CascadeResult, LevelResult, VerificationCascade};
 pub use checker::{VerificationResult, check_model};
 pub use composite::{CompositePlanError, CompositeVerificationPlan};
@@ -32,7 +34,7 @@ pub use paths::{
 };
 pub use proptest_gen::{PropTestResult, run_prop_tests_from_ioa};
 pub use simulation::{
-    LivenessViolation, SimConfig, SimulationResult, run_multi_seed_simulation_from_ioa,
-    run_simulation_from_ioa,
+    LivenessViolation, SimConfig, SimulationResult, run_multi_seed_simulation,
+    run_multi_seed_simulation_from_ioa, run_simulation_from_ioa,
 };
 pub use smt::{SmtResult, verify_symbolic};

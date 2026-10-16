@@ -38,17 +38,46 @@ pub struct VerificationResult {
 /// Run exhaustive BFS model checking on the given `TemperModel`.
 ///
 /// This spawns Stateright's BFS checker, joins it, and then inspects the
-/// discoveries to build a `VerificationResult`.
+/// discoveries to build a `VerificationResult`. A model with a budget's
+/// limit stops at its time or state limit and reports itself incomplete.
 pub fn check_model(model: &TemperModel) -> VerificationResult {
-    let checker_result = model.clone().checker().spawn_bfs().join();
+    // The checker's own copy of the model, whose limit is lifted once the
+    // search is over: Stateright rebuilds each found path by stepping it.
+    let walked = TemperModel {
+        limit: model.limit.as_ref().map(|limit| limit.for_one_walk()),
+        ..model.clone()
+    };
+    let mut checker = walked.clone().checker();
+    if let Some(limit) = &model.limit {
+        checker = checker.target_state_count(limit.states);
+    }
+    let checker_result = checker.spawn_bfs().join();
 
     let states_explored = checker_result.unique_state_count();
-    let is_complete = checker_result.is_done();
+    // Neither limit shows in `is_done`: a checker thread that stops at its
+    // target state count closes the job market as it exits, and a spent time
+    // limit ends the BFS normally because the model stopped offering actions.
+    let cut_by_time = walked.out_of_time();
+    let explored_all = checker_result.is_done()
+        && !cut_by_time
+        && model
+            .limit
+            .as_ref()
+            .is_none_or(|limit| checker_result.state_count() < limit.states);
+    if let Some(limit) = &walked.limit {
+        limit.lift();
+    }
 
     let discoveries = checker_result.discoveries();
     let mut counterexamples = Vec::new();
 
     for (property_name, path) in discoveries {
+        // After the time cut every state still queued had no actions, so it
+        // looks like the end of a walk: an `eventually` property found false
+        // there proves nothing. (A state-limit stop leaves the queue as it was.)
+        if cut_by_time && property_name == crate::model::REACHES_TERMINAL {
+            continue;
+        }
         let mut trace = Vec::new();
         let steps: Vec<_> = path.into_vec();
         for (state, action) in steps {
@@ -60,8 +89,17 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         });
     }
 
-    let dead_transitions = find_dead_transitions(model);
-    let all_properties_hold = counterexamples.is_empty() && dead_transitions.is_empty();
+    // An edge never seen in part of the state space may still be enabled in
+    // the rest: dead transitions are named only after a whole exploration.
+    let dead_transitions = if explored_all {
+        find_dead_transitions(model)
+    } else {
+        None
+    };
+    let is_complete = dead_transitions.is_some();
+    let dead_transitions = dead_transitions.unwrap_or_default();
+    let all_properties_hold =
+        is_complete && counterexamples.is_empty() && dead_transitions.is_empty();
 
     VerificationResult {
         states_explored,
@@ -72,7 +110,9 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
     }
 }
 
-fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
+/// The transitions no reachable state enables, or `None` when the model's
+/// time limit ran out before every reachable state was walked.
+fn find_dead_transitions(model: &TemperModel) -> Option<Vec<String>> {
     let mut visited_states = HashSet::new();
     let mut queue = VecDeque::new();
     for init in model.init_states() {
@@ -84,6 +124,9 @@ fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
     let mut covered = vec![false; model.transitions.len()];
 
     while let Some(state) = queue.pop_front() {
+        if model.out_of_time() {
+            return None;
+        }
         for (index, transition) in model.transitions.iter().enumerate() {
             let next_states = step(model, transition, &state);
             if next_states.is_empty() {
@@ -98,7 +141,7 @@ fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
         }
     }
 
-    model
+    let dead = model
         .transitions
         .iter()
         .enumerate()
@@ -109,7 +152,8 @@ fn find_dead_transitions(model: &TemperModel) -> Vec<String> {
                 Some(render_transition_label(transition))
             }
         })
-        .collect()
+        .collect();
+    Some(dead)
 }
 
 /// The states `transition` reaches from `state`: none when it is not

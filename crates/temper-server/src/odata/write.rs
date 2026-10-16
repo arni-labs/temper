@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use temper_authz::AuthenticatedRequestContext;
 use temper_odata::path::{ODataPath, parse_path};
+use temper_runtime::persistence::PersistenceError;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 use tracing::instrument;
@@ -739,6 +740,20 @@ pub async fn handle_odata_post(
                         .into_response();
                     }
                 }
+            }
+
+            // A new entity's first event holds its initial fields: one too large is
+            // refused here, before any create path starts.
+            if let Err(error) =
+                state.check_created_event_size(&tenant, &entity_type, &entity_id, &initial_fields)
+            {
+                let (status, code) = match error {
+                    PersistenceError::EventTooLarge { .. } => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "EventTooLarge")
+                    }
+                    _ => (StatusCode::INTERNAL_SERVER_ERROR, "CreateError"),
+                };
+                return odata_error(status, code, &error.to_string()).into_response();
             }
 
             match state
