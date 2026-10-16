@@ -36,6 +36,7 @@ mod query_page;
 mod secrets;
 mod spec_versions;
 mod specs;
+mod state_timers;
 #[cfg(test)]
 mod tests;
 mod trajectory;
@@ -291,6 +292,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_TENANT_SECRETS_TABLE, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_STATE_TIMERS_TABLE, ())
             .await
             .map_err(storage_error)?;
 

@@ -154,6 +154,28 @@ pub struct EntityVectorCandidate {
     pub vector: Vec<f32>,
 }
 
+/// One armed `[[state_timeout]]`, kept so that a restarted server arms it
+/// again (ADR-0056). One row per entity: a state declares at most one timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTimerRecord {
+    pub tenant: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    /// The state the timer was armed in.
+    pub state: String,
+    /// Names this arming, so a timer removes only its own row when it ends.
+    pub arm_id: String,
+    /// The entity's journal sequence when the timer was armed. A store keeps
+    /// the row with the higher sequence, so a late write never undoes a re-arm.
+    pub sequence_nr: u64,
+    /// When the state's clock started (entry or latest `reset_on`), RFC 3339.
+    pub started_at: String,
+    /// The `on_timeout` parameters, read when the timer was armed (JSON).
+    pub params: String,
+    /// The identity the timer fires as: the dispatch that armed it (JSON).
+    pub armed_by: String,
+}
+
 /// Trait for the event store backend (implemented by temper-store-postgres).
 /// Uses desugared async-in-trait to enforce Send bounds on futures.
 pub trait EventStore: Send + Sync + 'static {

@@ -18,23 +18,20 @@
 //! for query visibility. Successor timers are armed after that wait, so an
 //! old deadline cannot fire while a committed reset is being projected.
 //!
-//! Durability (ADR-0056): on every post-dispatch the arm logic also detects
-//! the **hydration case** — the entity is in a state with a declared
-//! timeout but has no live in-memory timer (seq == 0 in the tracker). In
-//! that case we reconstruct how long the entity has been in the current
-//! state from the event log (the most recent transition into
-//! `state.status`, or the most recent `reset_on` event after it), and:
-//!   - if elapsed ≥ `after_seconds` → fire `on_timeout` immediately
-//!     (the entity was overdue before this process ever saw it).
-//!   - otherwise → arm a tokio timer with the remaining budget
-//!     (`after_seconds - elapsed`).
+//! Durability (ADR-0056): every armed timer keeps a durable row with its
+//! clock start, parameters and the identity it fires as, and removes it when
+//! it ends. At boot `rearm_state_timers` (`state_timer_rows.rs`) arms each
+//! waiting row again: for the rest of its budget, or at once if it fell due
+//! while the server was down. A timer fires once and as whoever armed it.
 //!
-//! This closes the gap where an orphaned entity (actor passivated or
-//! server restarted while in a timed state) would otherwise never have
-//! its timer re-armed because no state transition happened on the
-//! hydrated actor. Fully event-log-backed scheduling remains the
-//! longer-term direction; hydration re-arm is the 80%-value prefix
-//! that makes timeouts reliable across the common failure modes.
+//! The arm logic also detects the **hydration case**: the entity is in a
+//! state with a declared timeout but has no live in-memory timer (seq == 0 in
+//! the tracker), as for a timer armed before its row was kept. Then the
+//! dispatch reconstructs how long the entity has been in the current state
+//! from the event log (the most recent transition into `state.status`, or the
+//! most recent `reset_on` event after it), and fires `on_timeout` at once if
+//! that is a full budget, or arms a timer for the rest. That timer fires as
+//! the dispatch that found it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -43,10 +40,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tracing::Instrument;
 
-use temper_runtime::scheduler::sim_now;
+use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{EntityEvent, EntityResponse};
+use crate::request_context::AgentContext;
 
 use super::effects::PostDispatchContext;
 
@@ -240,26 +238,28 @@ impl crate::state::ServerState {
     /// Arm or re-arm state timers based on the just-completed transition.
     ///
     /// Invoked from `run_post_dispatch_effects`. Walks the spec's
-    /// `state_timeouts`, bumps the per-entity seq appropriately, and spawns
-    /// a tokio task per armed timer. Non-durable under the MVP — timers are
-    /// lost across restarts.
-    pub(crate) fn arm_state_timeouts_if_needed(
+    /// `state_timeouts` and arms a timer for each that applies. Each armed
+    /// timer first writes its durable row, so a restart arms it again
+    /// ([`Self::rearm_state_timers`]). The row is written before the dispatch
+    /// returns: a repeating timer's next row then exists before the timer that
+    /// fired it removes its own, so no restart falls between the two.
+    pub(crate) async fn arm_state_timeouts_if_needed(
         &self,
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
-        let registry = match self.registry.read() {
-            Ok(g) => g,
-            Err(_) => return,
+        let state_timeouts = {
+            let Ok(registry) = self.registry.read() else {
+                return;
+            };
+            let Some(spec) = registry.get_spec(ctx.tenant, ctx.entity_type) else {
+                return;
+            };
+            spec.automaton.state_timeouts.clone()
         };
-        let Some(spec) = registry.get_spec(ctx.tenant, ctx.entity_type) else {
-            return;
-        };
-        if spec.automaton.state_timeouts.is_empty() {
+        if state_timeouts.is_empty() {
             return;
         }
-        let state_timeouts = spec.automaton.state_timeouts.clone();
-        drop(registry);
 
         let post_state = response.state.status.clone();
         let pre_state = response
@@ -298,50 +298,32 @@ impl crate::state::ServerState {
                 );
             }
 
-            // Determine the fire delay.
+            // When the state's clock started.
             //
-            // - Entry / reset / fresh-process cases: the full budget.
-            // - Hydration re-arm: budget minus elapsed time since the entity
-            //   entered the current state (or the most recent `reset_on`
-            //   event, whichever is later). If elapsed >= budget, delay is 0
-            //   and the on_timeout action fires on the next tokio tick.
-            let mut delay = Duration::from_secs(st.after_seconds);
+            // - Entry / reset: now, so the timer waits its full budget.
+            // - Hydration re-arm: the entity's entry into the current state
+            //   (or its most recent `reset_on` event, whichever is later). If
+            //   that is a full budget ago, the timer fires on the next tick.
+            let now = sim_now();
+            let mut started_at = now;
             if needs_hydration_rearm {
                 let clock_reset =
                     compute_state_clock_reset_ts(&response.state.events, &post_state, &st.reset_on);
-                if let Some(reset_ts) = clock_reset {
-                    let now = sim_now();
-                    let elapsed = now
-                        .signed_duration_since(reset_ts)
-                        .to_std()
-                        .unwrap_or(Duration::ZERO);
-                    let budget = Duration::from_secs(st.after_seconds);
-                    let overdue = elapsed >= budget;
-                    delay = if overdue {
-                        Duration::ZERO
+                // No entry event found: treat as freshly entered. Safe
+                // default; worst case is one extra budget of wait.
+                started_at = clock_reset.unwrap_or(now);
+                crate::runtime_metrics::record_state_timeout_armed_on_hydration(
+                    ctx.tenant.as_str(),
+                    ctx.entity_type,
+                    &st.state,
+                    if remaining_budget(started_at, st.after_seconds, now).is_zero() {
+                        "overdue"
                     } else {
-                        budget - elapsed
-                    };
-                    crate::runtime_metrics::record_state_timeout_armed_on_hydration(
-                        ctx.tenant.as_str(),
-                        ctx.entity_type,
-                        &st.state,
-                        if overdue { "overdue" } else { "budgeted" },
-                    );
-                } else {
-                    // No entry event found — treat as freshly entered.
-                    // Safe default; worst case is one extra budget of wait.
-                    crate::runtime_metrics::record_state_timeout_armed_on_hydration(
-                        ctx.tenant.as_str(),
-                        ctx.entity_type,
-                        &st.state,
-                        "budgeted",
-                    );
-                }
+                        "budgeted"
+                    },
+                );
             }
 
-            let armed_seq = self.state_timeout_tracker.bump(&key);
-            self.state_timeout_tracker.inc_pending(ctx.entity_type);
             // ADR-0181: `args` are read when the timer is armed, against the
             // entity as it entered the state.
             let (params, missing) = temper_spec::automaton::resolve_args(
@@ -357,108 +339,162 @@ impl crate::state::ServerState {
                     "state_timeout arg reads a missing field; skipping key"
                 );
             }
-            let params = serde_json::Value::Object(params);
+            let timer = ArmedTimer {
+                tenant: ctx.tenant.clone(),
+                entity_type: ctx.entity_type.to_string(),
+                entity_id: ctx.entity_id.to_string(),
+                state: st.state.clone(),
+                action: st.on_timeout.clone(),
+                params: serde_json::Value::Object(params),
+                agent_ctx: timer_agent(ctx.agent_ctx),
+                arm_id: sim_uuid().to_string(),
+                sequence_nr: response.state.sequence_nr,
+                started_at,
+            };
+            let delay = remaining_budget(started_at, st.after_seconds, now);
+            self.persist_state_timer(&timer).await;
+            self.spawn_state_timer(timer, delay);
+        }
+    }
 
-            let state = self.clone();
-            let tracker = self.state_timeout_tracker.clone();
-            let tenant = ctx.tenant.clone();
-            let entity_type = ctx.entity_type.to_string();
-            let entity_id = ctx.entity_id.to_string();
-            let target_state = st.state.clone();
-            let target_action = st.on_timeout.clone();
-            let agent_ctx = ctx.agent_ctx.clone();
-            let key_for_task = key.clone();
-            let entity_type_for_dec = ctx.entity_type.to_string();
-            let workflow_root_entity_type = agent_ctx
-                .workflow_root_entity_type
-                .clone()
-                .unwrap_or_else(|| entity_type.clone());
-            let workflow_root_entity_id = agent_ctx
-                .workflow_root_entity_id
-                .clone()
-                .unwrap_or_else(|| entity_id.clone());
-            let workflow_run_id = agent_ctx
-                .workflow_run_id
-                .clone()
-                .unwrap_or_else(|| format!("{entity_type}:{entity_id}"));
+    /// Start one armed timer's task: it waits `delay`, then fires the timer's
+    /// action as the timer's identity if no newer arm or state change has
+    /// superseded it, and removes the timer's durable row when it ends.
+    pub(super) fn spawn_state_timer(&self, timer: ArmedTimer, delay: Duration) {
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        let armed_seq = self.state_timeout_tracker.bump(&key);
+        self.state_timeout_tracker.inc_pending(&timer.entity_type);
+        let workflow_root_entity_type = timer
+            .agent_ctx
+            .workflow_root_entity_type
+            .clone()
+            .unwrap_or_else(|| timer.entity_type.clone());
+        let workflow_root_entity_id = timer
+            .agent_ctx
+            .workflow_root_entity_id
+            .clone()
+            .unwrap_or_else(|| timer.entity_id.clone());
+        let workflow_run_id = timer
+            .agent_ctx
+            .workflow_run_id
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", timer.entity_type, timer.entity_id));
 
-            tracing::debug!(
-                tenant = %ctx.tenant,
-                entity_type = ctx.entity_type,
-                entity_id = ctx.entity_id,
-                target_state = st.state.as_str(),
-                target_action = st.on_timeout.as_str(),
-                delay_ms = delay.as_millis() as u64,
+        tracing::debug!(
+            tenant = %timer.tenant,
+            entity_type = %timer.entity_type,
+            entity_id = %timer.entity_id,
+            target_state = %timer.state,
+            target_action = %timer.action,
+            delay_ms = delay.as_millis() as u64,
+            workflow.root_entity_type = %workflow_root_entity_type,
+            workflow.root_entity_id = %workflow_root_entity_id,
+            workflow.run_id = %workflow_run_id,
+            "armed state timeout"
+        );
+
+        let state = self.clone();
+        tokio::spawn(async move {
+            // determinism-ok: wall-clock timer fires a side-effect action;
+            // the action itself is deterministic under DST via sim_now().
+            tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
+
+            let span = tracing::info_span!(
+                "dispatch.state_timeout.fire",
+                tenant = %timer.tenant,
+                entity_type = %timer.entity_type,
+                entity_id = %timer.entity_id,
+                target_state = %timer.state,
+                target_action = %timer.action,
                 workflow.root_entity_type = %workflow_root_entity_type,
                 workflow.root_entity_id = %workflow_root_entity_id,
                 workflow.run_id = %workflow_run_id,
-                "armed state timeout"
             );
 
-            tokio::spawn(async move {
-                // determinism-ok: wall-clock timer fires a side-effect action;
-                // the action itself is deterministic under DST via sim_now().
-                tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
-
-                let span = tracing::info_span!(
-                    "dispatch.state_timeout.fire",
-                    tenant = %tenant,
-                    entity_type = %entity_type,
-                    entity_id = %entity_id,
-                    target_state = %target_state,
-                    target_action = %target_action,
-                    workflow.root_entity_type = %workflow_root_entity_type,
-                    workflow.root_entity_id = %workflow_root_entity_id,
-                    workflow.run_id = %workflow_run_id,
-                );
-
-                async move {
-                    // Sequence-based cancellation check. A newer arm (or a
-                    // state change that bumped the seq on exit) renders
-                    // this timer a no-op.
-                    if tracker.current(&key_for_task) != armed_seq {
-                        tracker.dec_pending(&entity_type_for_dec);
-                        return;
-                    }
-
-                    // Secondary check: confirm the entity is still in the
-                    // target state. Covers races where the entity left and
-                    // re-entered the same state with a new seq greater than
-                    // this one (in which case the tracker seq would differ,
-                    // already caught above). This is defense in depth.
-                    match state
-                        .get_tenant_entity_state(&tenant, &entity_type, &entity_id)
+            async move {
+                // Sequence-based cancellation check. A newer arm (or a state
+                // change that bumped the seq on exit) renders this timer a
+                // no-op. The secondary check confirms the entity is still in
+                // the target state: defense in depth, and the only check a
+                // timer armed at boot has against changes made before the
+                // restart.
+                if state.state_timeout_tracker.current(&key) == armed_seq
+                    && let Ok(current) = state
+                        .get_tenant_entity_state(
+                            &timer.tenant,
+                            &timer.entity_type,
+                            &timer.entity_id,
+                        )
                         .await
-                    {
-                        Ok(current) if current.state.status == target_state => {
-                            crate::runtime_metrics::record_state_timeout_fired(
-                                tenant.as_str(),
-                                &entity_type,
-                                &target_state,
-                                &target_action,
-                            );
-                            let _ = state
-                                .dispatch_tenant_action(
-                                    &tenant,
-                                    &entity_type,
-                                    &entity_id,
-                                    &target_action,
-                                    params,
-                                    &agent_ctx,
-                                )
-                                .await;
-                        }
-                        _ => {
-                            // State changed or fetch failed — nothing to do.
-                        }
-                    }
-                    tracker.dec_pending(&entity_type_for_dec);
+                    && current.state.status == timer.state
+                {
+                    crate::runtime_metrics::record_state_timeout_fired(
+                        timer.tenant.as_str(),
+                        &timer.entity_type,
+                        &timer.state,
+                        &timer.action,
+                    );
+                    let _ = state
+                        .dispatch_tenant_action(
+                            &timer.tenant,
+                            &timer.entity_type,
+                            &timer.entity_id,
+                            &timer.action,
+                            timer.params.clone(),
+                            &timer.agent_ctx,
+                        )
+                        .await;
                 }
-                .instrument(span)
-                .await;
-            });
-        }
+                state.forget_state_timer(&timer).await;
+                state.state_timeout_tracker.dec_pending(&timer.entity_type);
+            }
+            .instrument(span)
+            .await;
+        });
     }
+}
+
+/// One armed timer: what fires, when its state's clock started, and who it
+/// fires as.
+pub(super) struct ArmedTimer {
+    pub(super) tenant: TenantId,
+    pub(super) entity_type: String,
+    pub(super) entity_id: String,
+    /// The timed state; the timer fires only while the entity is still in it.
+    pub(super) state: String,
+    /// The `on_timeout` action and its parameters, read when armed.
+    pub(super) action: String,
+    pub(super) params: serde_json::Value,
+    /// The identity the action is dispatched as.
+    pub(super) agent_ctx: AgentContext,
+    /// Names this arming's durable row.
+    pub(super) arm_id: String,
+    /// The entity's journal sequence when the timer was armed.
+    pub(super) sequence_nr: u64,
+    pub(super) started_at: DateTime<Utc>,
+}
+
+/// The identity a timer fires as: the dispatch that armed it, as a new
+/// background action. It does not reuse the arming request's idempotency key:
+/// the entity has already recorded that key, so the fire would be answered as
+/// a duplicate and never run.
+fn timer_agent(armed_by: &AgentContext) -> AgentContext {
+    let mut agent = armed_by.for_background_task();
+    agent.idempotency_key = None;
+    agent
+}
+
+/// How much of a timer's budget is left at `now`; zero once it is due.
+pub(super) fn remaining_budget(
+    started_at: DateTime<Utc>,
+    after_seconds: u64,
+    now: DateTime<Utc>,
+) -> Duration {
+    let elapsed = now
+        .signed_duration_since(started_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    Duration::from_secs(after_seconds).saturating_sub(elapsed)
 }
 
 #[cfg(test)]
@@ -1221,7 +1257,7 @@ queue_timeout_seconds = 30
             action_params: &serde_json::json!({}),
             await_integration: false,
         };
-        state.arm_state_timeouts_if_needed(&ctx, &response);
+        state.arm_state_timeouts_if_needed(&ctx, &response).await;
 
         // Timer is 1s; give it 2s to fire + dispatch + apply.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

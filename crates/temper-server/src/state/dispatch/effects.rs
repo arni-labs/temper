@@ -640,7 +640,7 @@ impl crate::state::ServerState {
 
         // Arm the successor only after visibility, before an inline adapter
         // can return early or dispatch another transition.
-        self.arm_state_timeouts_if_needed(ctx, &response);
+        self.arm_state_timeouts_if_needed(ctx, &response).await;
 
         // 4. Fire webhooks
         self.fire_webhooks(ctx, &response);
