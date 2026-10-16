@@ -392,8 +392,9 @@ fn spawn_optimization_loop(state: &PlatformState) {
 /// waiting. A tick sheds at most `PASSIVATE_IDLE_ACTORS_PER_TICK` actors; an
 /// app that creates records faster than that per interval would otherwise
 /// grow the registry without end. A backlog is worked off in batches, each
-/// followed by four times its own duration so snapshot writes take at most a
-/// fifth of the time (ARN-462).
+/// followed by four times its own duration, so snapshot writes take at most a
+/// fifth of the time (ARN-462). The pause never exceeds the configured
+/// interval, so a backlog is never drained slower than ticks already ran.
 const PASSIVATION_BACKLOG_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
 const PASSIVATION_BACKLOG_PAUSE_PER_TICK_TIME: u32 = 4;
 

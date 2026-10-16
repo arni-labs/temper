@@ -218,3 +218,32 @@ fn replies_waiting_for_their_effects_are_evicted_last() {
     assert!(cache.get("actor-00", "k-00").is_none());
     assert_eq!(cache.held_bytes(), one * 10);
 }
+
+#[test]
+fn estimate_counts_every_collection_a_reply_keeps() {
+    let bare = estimated_entry_bytes("Feed:f", "k", &make_response("S"));
+    let mut response = make_response("S");
+    for index in 0..100 {
+        response
+            .state
+            .counters
+            .insert(format!("counter-{index:03}"), index);
+        response
+            .state
+            .booleans
+            .insert(format!("flag-{index:03}"), true);
+        response
+            .state
+            .lists
+            .insert(format!("list-{index:03}"), vec!["item".to_string(); 10]);
+        response
+            .scheduled_actions
+            .push(crate::entity_actor::ScheduledAction {
+                action: format!("Timer{index:03}"),
+                delay_seconds: 5,
+            });
+    }
+    let populated = estimated_entry_bytes("Feed:f", "k", &response);
+    // 400 named values and 1000 list items, each at least its overhead.
+    assert!(populated >= bare + 1_400 * VALUE_OVERHEAD_BYTES);
+}

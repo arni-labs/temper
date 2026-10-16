@@ -246,8 +246,9 @@ impl IdempotencyCache {
         entries.remove(actor_key, idem_key);
         entries.evict_expired(now);
 
-        // A reply larger than the whole budget is not cached; the durable
-        // key set still deduplicates it.
+        // A reply larger than the whole budget is not cached. The durable key
+        // set still deduplicates its retry, but as after a restart, a retry
+        // of a dropped reply then runs without the reply's spawns and timers.
         if bytes > self.budget_bytes {
             return;
         }
@@ -338,10 +339,11 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
     }
 }
 
-/// Rough heap bytes one cached reply holds: its field values, its recent event
-/// metadata, its spawn copies and the keys that index it.
+/// Rough heap bytes one cached reply holds: everything [`replay_copy`] keeps,
+/// and the keys that index it (held by both the entry map and its order).
 fn estimated_entry_bytes(actor_key: &str, idem_key: &str, response: &EntityResponse) -> usize {
     let state = &response.state;
+    let named = |name: &String| VALUE_OVERHEAD_BYTES + name.len();
     let events: usize = state
         .events
         .iter()
@@ -369,22 +371,29 @@ fn estimated_entry_bytes(actor_key: &str, idem_key: &str, response: &EntityRespo
         .sum();
     let lists: usize = state
         .lists
-        .values()
-        .flatten()
-        .map(|item| VALUE_OVERHEAD_BYTES + item.len())
+        .iter()
+        .map(|(name, items)| named(name) + items.iter().map(named).sum::<usize>())
         .sum();
+    let variables: usize = state.counters.keys().map(named).sum::<usize>()
+        + state.booleans.keys().map(named).sum::<usize>();
+    let effects: usize = response.custom_effects.iter().map(named).sum::<usize>()
+        + response
+            .scheduled_actions
+            .iter()
+            .map(|scheduled| named(&scheduled.action))
+            .sum::<usize>();
     ENTRY_OVERHEAD_BYTES
-        + actor_key.len()
-        + idem_key.len()
+        + 2 * (actor_key.len() + idem_key.len())
+        + state.entity_type.len()
+        + state.entity_id.len()
+        + state.status.len()
+        + response.error.as_ref().map_or(0, String::len)
         + json_bytes(&state.fields)
         + events
         + spawns
         + lists
-        + response
-            .custom_effects
-            .iter()
-            .map(|effect| VALUE_OVERHEAD_BYTES + effect.len())
-            .sum::<usize>()
+        + variables
+        + effects
 }
 
 /// Text bytes plus a per-value overhead, walked without recursion.
