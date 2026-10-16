@@ -20,6 +20,9 @@ use crate::request_context::AgentContext;
 use crate::response::odata_error;
 use crate::state::{DispatchCommand, FileStreamContentError, ServerState};
 
+mod file_body;
+pub(super) use file_body::{handle_file_value_put, streamed_file_target};
+
 type ODataStreamPutError = Box<axum::response::Response>;
 
 fn resolve_entity_type_or_404(

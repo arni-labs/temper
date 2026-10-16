@@ -1,6 +1,7 @@
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
+use super::file_writes::native_file_blob_key;
 
 impl ServerState {
     #[cfg(feature = "observe")]
@@ -53,14 +54,6 @@ fn file_blob_read_keys(blob_endpoint: Option<&str>, content_hash: &str) -> Vec<S
     }
 
     keys
-}
-
-fn native_file_blob_key(content_hash: &str) -> String {
-    format!(
-        "{}/{}",
-        crate::blob_store::DEFAULT_BLOB_BUCKET,
-        content_hash
-    )
 }
 
 #[cfg(test)]
