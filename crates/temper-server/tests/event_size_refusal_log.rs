@@ -24,7 +24,7 @@ const LIMITS: EventSizeLimits = EventSizeLimits {
     max_bytes: Some(4_000),
 };
 
-/// The persistence ids of the "event refused for its size" lines logged.
+/// The size lines logged, as "<kind> <persistence id>": kind refused or large.
 #[derive(Clone, Default)]
 struct Refusals(Arc<Mutex<Vec<String>>>);
 
@@ -49,9 +49,17 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Refusals {
         }
         let mut line = Line::default();
         event.record(&mut line);
-        if line.message.starts_with("event refused for its size") {
-            self.0.lock().unwrap().push(line.persistence_id);
-        }
+        let kind = if line.message.starts_with("event refused for its size") {
+            "refused"
+        } else if line.message.starts_with("large event") {
+            "large"
+        } else {
+            return;
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{kind} {}", line.persistence_id));
     }
 }
 
@@ -103,7 +111,7 @@ async fn each_refusal_is_logged_once_for_a_create_an_action_and_a_batch() {
     assert!(create.is_err());
     assert_eq!(
         logged(),
-        ["default:Order:c-big"],
+        ["refused default:Order:c-big"],
         "a refused create, one line"
     );
 
@@ -133,24 +141,40 @@ async fn each_refusal_is_logged_once_for_a_create_an_action_and_a_batch() {
     assert!(!refused.success);
     assert_eq!(
         logged(),
-        ["default:Order:c-big", "default:Order:a-big"],
+        ["refused default:Order:c-big", "refused default:Order:a-big"],
         "a refused action, one line"
     );
 
     let journal = BoxedEventStore::new(store).with_event_size_limits(LIMITS);
-    let batch = [PersistenceAppend {
-        persistence_id: "default:Order:b-big".into(),
-        expected_sequence: 0,
-        events: vec![envelope("default:Order:b-big", "x".repeat(5_000))],
-    }];
+    // A batch with one change over the warning size and one over the limit writes
+    // nothing, so it warns about nothing: one refusal line only.
+    let batch = [
+        PersistenceAppend {
+            persistence_id: "default:Order:b-warn".into(),
+            expected_sequence: 0,
+            events: vec![envelope("default:Order:b-warn", "w".repeat(2_000))],
+        },
+        PersistenceAppend {
+            persistence_id: "default:Order:b-big".into(),
+            expected_sequence: 0,
+            events: vec![envelope("default:Order:b-big", "x".repeat(5_000))],
+        },
+    ];
     assert!(journal.append_batch(&batch).await.is_err());
     assert_eq!(
         logged(),
         [
-            "default:Order:c-big",
-            "default:Order:a-big",
-            "default:Order:b-big"
+            "refused default:Order:c-big",
+            "refused default:Order:a-big",
+            "refused default:Order:b-big"
         ],
-        "a refused batch, one line"
+        "a refused batch, one line, and no warning for what it did not write"
+    );
+
+    // The same batch without the oversized change is written, with its one warning.
+    assert!(journal.append_batch(&batch[..1]).await.is_ok());
+    assert_eq!(
+        logged().last().map(String::as_str),
+        Some("large default:Order:b-warn")
     );
 }

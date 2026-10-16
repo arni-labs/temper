@@ -38,6 +38,7 @@ use crate::platform_store::PlatformStore;
 use crate::platform_store::SimPlatformStore;
 use crate::state::trajectory::TrajectoryEntry;
 
+mod event_size;
 mod metadata_impls;
 mod observe_read;
 mod policy_impls;
@@ -46,6 +47,7 @@ mod query_plane_impls;
 mod query_plane_read;
 mod redaction;
 mod trajectory_row;
+pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
@@ -470,15 +472,6 @@ pub struct BoxedEventStore {
     limits: EventSizeLimits,
 }
 
-/// How large one event (one recorded change, its payload as JSON) may be.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EventSizeLimits {
-    /// Above this many bytes an event is written and a warning is logged.
-    pub warn_bytes: Option<usize>,
-    /// Above this many bytes an append is refused and nothing is written.
-    pub max_bytes: Option<usize>,
-}
-
 impl BoxedEventStore {
     pub fn new<T>(store: T) -> Self
     where
@@ -497,86 +490,8 @@ impl BoxedEventStore {
         }
     }
 
-    /// Warn about, or refuse, any append carrying an event whose payload, as
-    /// JSON, is larger than the limits. The default warns and refuses nothing.
-    pub fn with_event_size_limits(mut self, limits: EventSizeLimits) -> Self {
-        debug_assert!(
-            limits.warn_bytes != Some(0) && limits.max_bytes != Some(0),
-            "a zero limit would catch every event"
-        );
-        self.limits = limits;
-        self
-    }
-
     pub fn inner(&self) -> Arc<dyn DynEventStore> {
         self.store.clone()
-    }
-
-    /// The size limits every append is held to.
-    pub(crate) fn event_size_limits(&self) -> EventSizeLimits {
-        self.limits
-    }
-
-    /// Warn about, or refuse, `events` by the limits; every append checks.
-    pub(crate) fn check_event_sizes(
-        &self,
-        persistence_id: &str,
-        events: &[PersistenceEnvelope],
-    ) -> Result<(), PersistenceError> {
-        for event in events {
-            self.check_event_size(persistence_id, &event.event_type, &event.payload, true)?;
-        }
-        Ok(())
-    }
-
-    /// Refuse one event's payload over the limit, logging the refusal once, and,
-    /// when `warn`, log one over the warning size.
-    pub(crate) fn check_event_size(
-        &self,
-        persistence_id: &str,
-        event_type: &str,
-        payload: &serde_json::Value,
-        warn: bool,
-    ) -> Result<(), PersistenceError> {
-        let EventSizeLimits {
-            warn_bytes,
-            max_bytes,
-        } = self.limits;
-        if max_bytes.is_none() && (!warn || warn_bytes.is_none()) {
-            return Ok(());
-        }
-        let bytes = json_len(payload)?;
-        if let Some(limit) = max_bytes
-            && bytes > limit
-        {
-            tracing::warn!(
-                persistence_id,
-                event_type,
-                bytes,
-                max_bytes = limit,
-                "event refused for its size: one change was larger than this server's limit; keep long lists as their own records and pictures as files"
-            );
-            return Err(PersistenceError::EventTooLarge {
-                event_type: event_type.to_string(),
-                persistence_id: persistence_id.to_string(),
-                bytes,
-                limit,
-            });
-        }
-        if warn
-            && let Some(warn_at) = warn_bytes
-            && bytes > warn_at
-        {
-            tracing::warn!(
-                persistence_id,
-                event_type,
-                bytes,
-                warn_bytes = warn_at,
-                max_bytes,
-                "large event: one change recorded more than the warning size; keep long lists as their own records and pictures as files"
-            );
-        }
-        Ok(())
     }
 
     pub async fn append(
@@ -595,9 +510,12 @@ impl BoxedEventStore {
         &self,
         appends: &[PersistenceAppend],
     ) -> Result<Vec<PersistenceAppendResult>, PersistenceError> {
-        for append in appends {
-            self.check_event_sizes(&append.persistence_id, &append.events)?;
-        }
+        self.check_appended(appends.iter().flat_map(|append| {
+            append
+                .events
+                .iter()
+                .map(|event| (append.persistence_id.as_str(), event))
+        }))?;
         self.store.append_batch(appends).await
     }
 
@@ -794,24 +712,6 @@ impl BoxedEventStore {
             .list_entity_ids_limited(tenant, entity_type, limit)
             .await
     }
-}
-
-/// The length of `value` serialized as JSON, counted without building the text.
-fn json_len(value: &serde_json::Value) -> Result<usize, PersistenceError> {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, value)
-        .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-    Ok(count.0)
 }
 
 /// Backend label used for metrics and operator-facing diagnostics only.

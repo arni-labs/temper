@@ -1272,6 +1272,33 @@ impl Actor for EntityActor {
                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                     event.idempotency_key = idempotency_key.clone();
 
+                    // An event too large to be written stores no overflow blobs first.
+                    if !result.overflow_blobs.is_empty()
+                        && let Some(store) = self.event_journal.as_ref()
+                        && let Err(e) = super::bootstrap::event_payload(&event, state)
+                            .map_err(|e| PersistenceError::Serialization(e.to_string()))
+                            .and_then(|payload| {
+                                store.check_event_size(
+                                    &self.persistence_id(),
+                                    &event.action,
+                                    &payload,
+                                    false,
+                                )
+                            })
+                    {
+                        *state = state_before;
+                        ctx.reply(EntityResponse {
+                            success: false,
+                            state: state.clone(),
+                            error: Some(persistence_failure(&e)),
+                            custom_effects: vec![],
+                            scheduled_actions: vec![],
+                            spawn_requests: vec![],
+                            spec_governed: true,
+                        });
+                        return Ok(());
+                    }
+
                     if !result.overflow_blobs.is_empty()
                         && let Err(e) = Self::persist_overflow_blobs(
                             self.blob_store.as_ref(),

@@ -106,15 +106,16 @@ pub async fn run(
     // Phase 4: Webhooks
     state.server.webhook_dispatcher = bootstrap::load_webhooks(&apps);
 
-    // Phase 5: Persistence wiring
+    // Phase 5: Persistence wiring. The size limits are read even without a store,
+    // so a bad value stops every start, not only a persisted one.
+    let limits = storage::event_size_limits(
+        std::env::var("TEMPER_WARN_EVENT_BYTES").ok().as_deref(),
+        std::env::var("TEMPER_MAX_EVENT_BYTES").ok().as_deref(),
+    )?;
     if let Some(stack) = storage_stack {
         if let Some(pool) = stack.postgres_pool.clone() {
             state.server.pg_record_store = Some(Arc::new(PostgresRecordStore::new(pool)));
         }
-        let limits = storage::event_size_limits(
-            std::env::var("TEMPER_WARN_EVENT_BYTES").ok().as_deref(),
-            std::env::var("TEMPER_MAX_EVENT_BYTES").ok().as_deref(),
-        )?;
         state
             .server
             .set_storage_stack(stack.with_event_size_limits(limits));
