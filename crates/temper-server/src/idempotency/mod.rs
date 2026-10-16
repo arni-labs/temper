@@ -297,6 +297,21 @@ impl Default for IdempotencyCache {
     }
 }
 
+/// Whether the actor's live state is still exactly the state a cached reply
+/// was taken from, so a retry can be answered with it in full. The sequence
+/// number alone cannot tell: it stays 0 without a journal, and a state
+/// restored from a snapshot keeps it with fewer recent events. So the newest
+/// live event must be this retry's, the event counts must match, and the live
+/// history must be at least as long as the cached one.
+pub(crate) fn live_state_is_the_reply(live: &EntityState, cached: &EntityState, key: &str) -> bool {
+    live.events
+        .back()
+        .and_then(|event| event.idempotency_key.as_deref())
+        == Some(key)
+        && live.total_event_count == cached.total_event_count
+        && live.events.len() >= cached.events.len()
+}
+
 /// The part of a reply a replay needs. Post-dispatch effects read event
 /// metadata (state clocks, source status); event parameters and the durable
 /// key set dominate a busy entity's state and are not copied. A trigger fired

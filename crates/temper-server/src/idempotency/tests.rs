@@ -247,3 +247,52 @@ fn estimate_counts_every_collection_a_reply_keeps() {
     // 400 named values and 1000 list items, each at least its overhead.
     assert!(populated >= bare + 1_400 * VALUE_OVERHEAD_BYTES);
 }
+
+fn keyed_events(state: &mut EntityState, keys: &[&str]) {
+    for key in keys {
+        state.events.push_back(EntityEvent {
+            action: "Stepped".to_string(),
+            from_status: "Running".to_string(),
+            to_status: "Running".to_string(),
+            timestamp: sim_now(),
+            params: serde_json::Value::Null,
+            idempotency_key: Some((*key).to_string()),
+        });
+        state.total_event_count += 1;
+    }
+}
+
+#[test]
+fn live_state_answers_a_retry_only_while_it_is_the_reply() {
+    let mut cached = make_response("Running").state;
+    keyed_events(&mut cached, &["k1", "k2", "k3"]);
+
+    let same = cached.clone();
+    assert!(live_state_is_the_reply(&same, &cached, "k3"));
+
+    let mut moved_on = cached.clone();
+    keyed_events(&mut moved_on, &["k4"]);
+    assert!(
+        !live_state_is_the_reply(&moved_on, &cached, "k3"),
+        "another action ran after the retried one"
+    );
+
+    let mut restored = cached.clone();
+    restored.events.clear();
+    assert!(
+        !live_state_is_the_reply(&restored, &cached, "k3"),
+        "restored from a snapshot at the same sequence, with no recent events"
+    );
+
+    let mut replayed_tail = cached.clone();
+    replayed_tail.events.pop_front();
+    replayed_tail.events.pop_front();
+    assert!(
+        !live_state_is_the_reply(&replayed_tail, &cached, "k3"),
+        "restarted from an older snapshot: only the tail was replayed"
+    );
+
+    let mut recounted = cached.clone();
+    recounted.total_event_count += 1;
+    assert!(!live_state_is_the_reply(&recounted, &cached, "k3"));
+}

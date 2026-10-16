@@ -105,6 +105,15 @@ async fn passivated_actor_respawns_with_correct_state() {
         "the sequence counter stays, so later events still sort after old ones"
     );
 
+    // A client that saw everything is told nothing is missing; one that saw
+    // less is told its replay has a gap, never a silent empty stream.
+    let caught_up =
+        state.entity_observe_replay(tenant.as_str(), "Order", &entity_id, sequence_before);
+    assert!(caught_up.events.is_empty() && !caught_up.missed);
+    let behind =
+        state.entity_observe_replay(tenant.as_str(), "Order", &entity_id, sequence_before - 1);
+    assert!(behind.missed, "the dropped buffer cannot serve this client");
+
     let snapshot = sim_store
         .load_snapshot(&actor_key)
         .await
@@ -119,6 +128,31 @@ async fn passivated_actor_respawns_with_correct_state() {
     assert_eq!(recovered.state.status, "Submitted");
     assert_eq!(recovered.state.item_count, 1);
     assert!(recovered.state.total_event_count >= 3); // Created + AddItem + SubmitOrder
+
+    // After the entity comes back, new events replay to a caught-up client,
+    // and a client from before the passivation still hears about the gap.
+    let confirmed = common::dispatch(
+        &state,
+        &tenant,
+        "Order",
+        &entity_id,
+        "ConfirmOrder",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("ConfirmOrder should succeed");
+    assert!(confirmed.success);
+    let next = state.entity_observe_replay(tenant.as_str(), "Order", &entity_id, sequence_before);
+    assert!(!next.missed);
+    assert_eq!(
+        next.events.first().map(|event| event.seq),
+        Some(sequence_before + 1)
+    );
+    assert!(
+        state
+            .entity_observe_replay(tenant.as_str(), "Order", &entity_id, 1)
+            .missed
+    );
 }
 
 /// ARN-462: one passivation tick must not snapshot-and-stop every idle actor.

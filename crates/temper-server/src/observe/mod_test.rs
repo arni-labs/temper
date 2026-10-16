@@ -2320,3 +2320,64 @@ async fn test_evolution_insights_empty() {
 
 #[path = "mod_test/load_dir_tests.rs"]
 mod load_dir_tests;
+
+/// A client that reconnects after its entity was passivated cannot be replayed
+/// what it missed; the stream says so first instead of staying silent.
+#[tokio::test]
+async fn entity_event_stream_reports_a_replay_gap_after_passivation() {
+    use futures_util::StreamExt;
+
+    let state = test_state_with_registry();
+    let tenant = TenantId::default();
+    for action in ["AddItem", "SubmitOrder"] {
+        let r = state
+            .dispatch_tenant_action(
+                &tenant,
+                "Order",
+                "order-gap-1",
+                action,
+                serde_json::json!({"ProductId": "p1"}),
+                &AgentContext::default(),
+            )
+            .await;
+        assert!(r.is_ok_and(|r| r.success), "{action} failed");
+    }
+    let key = "default:Order:order-gap-1";
+    let latest = state
+        .entity_event_sequences
+        .lock()
+        .unwrap()
+        .get(key)
+        .copied()
+        .expect("dispatches numbered the observe events");
+    assert!(latest >= 2);
+    state
+        .last_accessed
+        .write()
+        .unwrap()
+        .insert(key.to_string(), sim_now() - chrono::Duration::seconds(600));
+    state.passivate_idle_actors().await;
+    assert!(!state.entity_observe_log.lock().unwrap().contains_key(key));
+
+    let response = build_app_with_state(state)
+        .oneshot(system_request(
+            Request::get("/observe/entities/Order/order-gap-1/events")
+                .header("last-event-id", (latest - 1).to_string())
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the gap is sent at once")
+        .expect("stream is open")
+        .expect("frame reads");
+    let text = String::from_utf8_lossy(&first);
+    assert!(
+        text.contains("event: replay_gap") && text.contains("\"reread\":true"),
+        "first frame: {text}"
+    );
+}
