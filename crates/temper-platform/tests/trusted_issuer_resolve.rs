@@ -406,6 +406,41 @@ async fn resolving_does_not_materialise_generation_rows() {
     }
 }
 
+#[tokio::test]
+async fn tokens_for_tenants_without_identity_specs_index_nothing() {
+    let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let directory = tempfile::tempdir().expect("a directory for the store");
+    let database_url = format!("file:{}", directory.path().join("tenants.db").display());
+    let state = persistent_state(&database_url).await;
+    let token = mint(&sk, header(), contributor_claims());
+    let keys = |state: &PlatformState| {
+        (
+            state.server.entity_index.read().unwrap().len(),
+            state.server.entity_index_hydrated.read().unwrap().len(),
+        )
+    };
+    let before = keys(&state);
+
+    // The tenant is whatever the caller's header says. Making the issuer index
+    // complete for each one would keep a key per name, forever.
+    let resolver = IdentityResolver::new();
+    for i in 0..50 {
+        let tenant = TenantId::new(format!("junk-{i}"));
+        assert!(
+            resolver
+                .resolve(&state.server, &tenant, &token)
+                .await
+                .is_err(),
+            "a tenant without TrustedIssuer has no issuer to trust"
+        );
+    }
+    assert_eq!(
+        keys(&state),
+        before,
+        "no index key for a tenant without the specs"
+    );
+}
+
 /// A platform state on a database file, as a server process opens it: a
 /// second one on the same file is that server after a restart.
 async fn persistent_state(database_url: &str) -> PlatformState {

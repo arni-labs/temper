@@ -625,6 +625,10 @@ impl ServerState {
     /// [`Self::populate_index_from_store_by_type`], a store failure is returned,
     /// so a caller that must not mistake an incomplete index for absence (the
     /// identity checks: an issuer, a revoked generation) can fail closed.
+    ///
+    /// A tenant without the type's spec has no rows of it and is left out of
+    /// the index: the tenant can be any name an unauthenticated caller sends,
+    /// and the index never forgets a key.
     pub async fn ensure_type_indexed(
         &self,
         tenant: &TenantId,
@@ -636,6 +640,15 @@ impl ServerState {
             .read()
             .map_err(|_| "entity index hydrated lock poisoned".to_string())?
             .contains(&index_key)
+        {
+            return Ok(());
+        }
+        if self
+            .registry
+            .read()
+            .map_err(|_| "registry lock poisoned".to_string())?
+            .get_table(tenant, entity_type)
+            .is_none()
         {
             return Ok(());
         }
