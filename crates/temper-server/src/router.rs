@@ -294,6 +294,35 @@ async fn dispatch_matched_route(
         }
     };
 
+    // An install can replace (and drop) the module while admission runs, and
+    // a module restored at boot compiles on first use, within the deadline.
+    let invoke_hash = match deadline
+        .wait(state.module_hash_to_invoke(
+            &tenant_id,
+            &route.route.integration_module,
+            &module_hash,
+        ))
+        .await
+    {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                integration = %route.route.integration_module,
+                error = %error,
+                "HttpEndpoint module could not be loaded"
+            );
+            module_hash.clone()
+        }
+        Err(_) => {
+            return crate::response::odata_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "ModuleLoadTimeout",
+                "Endpoint module did not load in time",
+            )
+            .into_response();
+        }
+    };
+
     // Open an inbound exchange on the shared registry.
     let streams = state.http_stream_registry.clone();
     let exchange = streams.open_inbound_exchange().await;
@@ -412,7 +441,6 @@ async fn dispatch_matched_route(
     let invoke_streams = std::sync::Arc::new(std::sync::RwLock::new(
         temper_wasm::stream::StreamRegistry::default(),
     ));
-    let invoke_hash = module_hash.clone();
     let invoke_integration = route.route.integration_module.clone();
     tracing::info!(
         endpoint_id = %route.route.id,

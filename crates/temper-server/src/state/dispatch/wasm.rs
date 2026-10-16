@@ -1163,6 +1163,13 @@ impl crate::state::ServerState {
     ) -> Result<Option<EntityResponse>, String> {
         // Existing action-triggered invocations don't use streams — pass empty registry.
         let streams = Arc::new(std::sync::RwLock::new(StreamRegistry::default()));
+        let hash = self
+            .module_hash_to_invoke(ctx.entity_ref.tenant, module_name, hash)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(module = %module_name, error = %error, "WASM module could not be loaded");
+                hash.to_string()
+            });
         let phase_parent_span = Span::current();
         let invoke_result = instrument_wasm_dispatch_phase_result(
             phase_parent_span.clone(),
@@ -1170,7 +1177,7 @@ impl crate::state::ServerState {
             module_name,
             WASM_DISPATCH_PHASE_ENGINE_INVOKE,
             self.wasm_engine
-                .invoke_with_blobs(hash, &inv_ctx, host, limits, streams, blob_cache),
+                .invoke_with_blobs(&hash, &inv_ctx, host, limits, streams, blob_cache),
         )
         .await;
         match invoke_result {
@@ -1627,6 +1634,9 @@ impl crate::state::ServerState {
             "invoking WASM module directly for $value"
         );
 
+        let hash = self
+            .module_hash_to_invoke(tenant, module_name, &hash)
+            .await?;
         self.wasm_engine
             .invoke(&hash, &context, host, &limits, streams)
             .await
