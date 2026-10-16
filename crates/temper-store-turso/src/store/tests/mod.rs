@@ -43,6 +43,33 @@ async fn make_store(test_name: &str) -> TursoEventStore {
 }
 
 #[tokio::test]
+async fn the_engine_spelling_of_tenant_scoped_ots_ddl_is_recognised() {
+    // The engine stores its own spelling of the CREATE TABLE text. Missing it
+    // made every start rebuild ots_trajectories (DROP and RENAME), which a
+    // synced database cannot copy to its remote.
+    let store = make_store("ots-ddl-spelling").await;
+    let conn = store.connection().await.expect("connection");
+    let mut rows = conn
+        .query(crate::schema::SELECT_OTS_TRAJECTORIES_DDL, ())
+        .await
+        .expect("read ddl");
+    let ddl: String = rows
+        .next()
+        .await
+        .expect("row")
+        .expect("ots_trajectories exists")
+        .get(0)
+        .expect("sql");
+    assert!(
+        crate::schema::ots_trajectories_ddl_is_tenant_scoped(&ddl),
+        "{ddl}"
+    );
+    assert!(!crate::schema::ots_trajectories_ddl_is_tenant_scoped(
+        "CREATE TABLE ots_trajectories (trajectory_id TEXT PRIMARY KEY, tenant TEXT NOT NULL)"
+    ));
+}
+
+#[tokio::test]
 async fn trajectory_stats_never_cross_tenants() {
     // Each of the three statistics queries reads the shared `trajectories`
     // table, and the failed-intent list returns whole rows — error strings and
@@ -576,7 +603,7 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
         .await
         .expect("upsert deleted projection");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     conn.execute(
         "INSERT INTO entity_field_index \
          (tenant, entity_type, entity_id, field_name, field_value, status) \
@@ -1184,7 +1211,7 @@ async fn unchanged_projection_updates_catalog_without_rebuilding_field_rows() {
         .await
         .expect("initial projection upsert");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
             "SELECT rowid FROM entity_field_index \
@@ -1215,7 +1242,7 @@ async fn unchanged_projection_updates_catalog_without_rebuilding_field_rows() {
         .await
         .expect("second projection upsert");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
             "SELECT rowid FROM entity_field_index \
@@ -1294,7 +1321,7 @@ async fn stale_projection_upsert_does_not_overwrite_newer_catalog_row() {
         .await
         .expect("stale projection upsert is ignored");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
             "SELECT sequence_nr, fields FROM entity_catalog \
@@ -1711,7 +1738,7 @@ async fn upsert_specs_and_commit_preserves_identical_spec_version() {
         .await
         .expect("identical spec commit");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
             "SELECT version, verified, verification_status, committed \
@@ -1813,7 +1840,7 @@ async fn persist_spec_verification_keeps_updated_at_for_identical_result() {
         .await
         .expect("persist verification");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
@@ -1880,7 +1907,7 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist first verification");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
@@ -1946,7 +1973,7 @@ async fn commit_specs_keeps_updated_at_when_specs_are_already_committed() {
         .await
         .expect("initial spec commit");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
@@ -2155,7 +2182,7 @@ async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
     assert_eq!(restorable(&store, &tenant).await, committed_view);
 
     // Once abandoned, recovery returns Issue to v1 and removes Task.
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = '2000-01-01 00:00:00' WHERE tenant = ?1 AND committed = 0",
         params![tenant.as_str()],
@@ -2206,7 +2233,7 @@ async fn upsert_wasm_module_preserves_version_for_identical_hash() {
         .await
         .expect("identical wasm upsert");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
             "SELECT version FROM wasm_modules WHERE tenant = ?1 AND module_name = ?2",
@@ -2233,7 +2260,7 @@ async fn upsert_wasm_module_stores_metadata_only_without_db_blob() {
         .await
         .expect("persist wasm artifact");
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
             "SELECT length(wasm_bytes) FROM wasm_modules WHERE tenant = ?1 AND module_name = ?2",
@@ -2282,7 +2309,7 @@ async fn deleted_probes_use_the_tombstone_index() {
     let store = make_store("deleted-probes").await;
     use crate::driver::{Value, params_from_iter};
 
-    let conn = store.connection().expect("connection");
+    let conn = store.connection().await.expect("connection");
     for (name, sql, params) in [
         (
             "list_entity_ids",

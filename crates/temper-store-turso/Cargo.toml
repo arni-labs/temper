@@ -10,7 +10,7 @@ description = "Turso storage backend for Temper entity services"
 temper-runtime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-turso = { version = "=0.7.2", default-features = false }
+turso = { version = "=0.7.2", default-features = false, features = ["sync"] }
 turso_serverless = "=0.1.3"
 thiserror = { workspace = true }
 sha2 = { workspace = true }
