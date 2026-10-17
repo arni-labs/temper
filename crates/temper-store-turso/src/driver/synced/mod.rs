@@ -124,6 +124,11 @@ impl SyncCopy {
     }
 
     async fn build(path: &Path, remote_url: &str, auth_token: &str) -> Result<Self, DriverError> {
+        // The engine's HTTPS client takes the process's rustls crypto provider,
+        // and rustls cannot choose one when the build carries two (the whole
+        // workspace does): the engine's IO thread then panics and every sync
+        // call waits forever. An error here means one is already installed.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let local = path.to_string_lossy();
         let opening = turso::sync::Builder::new_remote(&local)
             .with_remote_url(remote_url)
