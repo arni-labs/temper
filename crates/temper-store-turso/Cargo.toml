@@ -28,4 +28,5 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }

@@ -69,6 +69,9 @@ const REMOTE_STATEMENT_FAILED: &str = "failed to execute sql";
 /// One push attempt. The engine's HTTP client has no timeout of its own.
 const PUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long opening the engine (a restore included) may take.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How long a start keeps trying to check the file against the remote.
 const OPEN_PUSH_BUDGET: Duration = Duration::from_secs(30);
 
@@ -122,13 +125,22 @@ impl SyncCopy {
 
     async fn build(path: &Path, remote_url: &str, auth_token: &str) -> Result<Self, DriverError> {
         let local = path.to_string_lossy();
-        let db = turso::sync::Builder::new_remote(&local)
+        let opening = turso::sync::Builder::new_remote(&local)
             .with_remote_url(remote_url)
             .with_auth_token(auth_token)
             .with_client_name("temper")
             .bootstrap_if_empty(true)
-            .build()
-            .await?;
+            .build();
+        // A restore downloads the whole database; the engine sets no timeout.
+        let db = tokio::time::timeout(BUILD_TIMEOUT, opening)
+            .await
+            .map_err(|_| {
+                DriverError::SyncSetup(format!(
+                    "opening {} with its remote copy took over {} s",
+                    path.display(),
+                    BUILD_TIMEOUT.as_secs()
+                ))
+            })??;
         let diverged = std::sync::OnceLock::new();
         if let Ok(cause) = std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {
             let _ = diverged.set(cause);

@@ -28,6 +28,12 @@ impl SyncServer {
             eprintln!("skipped: TEMPER_TEST_TURSODB is not set");
             return None;
         };
+        // The store's and the sync engine's logs, and the server's below, show
+        // in the output of a test that fails or times out.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("temper_store_turso=debug,turso_sync_engine=info")
+            .with_writer(std::io::stderr)
+            .try_init();
         let dir = tempfile::tempdir().expect("server dir");
         let port = TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
@@ -36,23 +42,52 @@ impl SyncServer {
         let child = Command::new(bin)
             .arg(dir.path().join("remote.db"))
             .args(["--sync-server", &format!("127.0.0.1:{port}")])
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("start tursodb --sync-server");
+        let server = Self {
+            child,
+            url: format!("http://127.0.0.1:{port}"),
+            _dir: dir,
+        };
+        // Ready once it answers a statement, not merely once its port is bound.
         let started = Instant::now();
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        while server
+            .post("SELECT 1")
+            .is_none_or(|answer| !answer.starts_with("HTTP/1.1 200"))
+        {
             assert!(
                 started.elapsed() < Duration::from_secs(10),
                 "sync server did not start"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        Some(Self {
-            child,
-            url: format!("http://127.0.0.1:{port}"),
-            _dir: dir,
+        Some(server)
+    }
+
+    fn post(&self, sql: &str) -> Option<String> {
+        let addr = self.url.trim_start_matches("http://");
+        let body = serde_json::json!({
+            "requests": [{ "type": "execute", "stmt": { "sql": sql } }]
         })
+        .to_string();
+        let mut stream = TcpStream::connect(addr).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ok()?;
+        write!(
+            stream,
+            "POST /v2/pipeline HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .ok()?;
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).ok()?;
+        Some(answer)
     }
 
     pub async fn open(&self, path: &Path) -> TursoEventStore {
@@ -65,23 +100,9 @@ impl SyncServer {
 impl SyncServer {
     /// Run one statement on the remote database directly.
     pub fn remote_sql(&self, sql: &str) {
-        let addr = self.url.trim_start_matches("http://");
-        let body = serde_json::json!({
-            "requests": [{ "type": "execute", "stmt": { "sql": sql } }]
-        })
-        .to_string();
-        let mut stream = TcpStream::connect(addr).expect("connect to sync server");
-        write!(
-            stream,
-            "POST /v2/pipeline HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .expect("send");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read");
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(!response.contains("\"type\":\"error\""), "{response}");
+        let answer = self.post(sql).expect("sync server answers");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(!answer.contains("\"type\":\"error\""), "{answer}");
     }
 }
 
