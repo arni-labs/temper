@@ -9,7 +9,7 @@
 //! - [`constraints`]: Tenant-level cross-entity constraints
 //! - [`event_store`]: [`EventStore`] trait implementation
 
-use crate::driver::Database;
+use crate::driver::{Database, SyncCopy};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use temper_runtime::persistence::{PersistenceError, storage_error};
@@ -55,6 +55,8 @@ pub struct TursoEventStore {
     /// True when connected to a remote Turso Cloud instance (libsql:// URL).
     /// PRAGMAs are skipped for remote connections.
     is_remote: bool,
+    /// Set when the local file's commits are copied to Turso Cloud.
+    sync_copy: Option<SyncCopy>,
 }
 
 impl TursoEventStore {
@@ -76,6 +78,40 @@ impl TursoEventStore {
         };
 
         let is_remote = url.starts_with("libsql://");
+        Self::open(db, is_remote, None).await
+    }
+
+    /// Open a local database file whose commits are copied to its own Turso
+    /// Cloud database at `sync_url` (Turso Sync).
+    ///
+    /// With no local file, the database is first restored from that copy.
+    /// Writes are local; [`Self::sync_copy`] returns the handle that pushes
+    /// them, which callers await before confirming a write.
+    #[instrument(skip_all, fields(otel.name = "turso.new_synced"))]
+    pub async fn new_synced(
+        path: &str,
+        sync_url: &str,
+        auth_token: &str,
+    ) -> Result<Self, PersistenceError> {
+        let local_path = path.strip_prefix("file:").unwrap_or(path);
+        let copy = SyncCopy::open(local_path, sync_url, auth_token)
+            .await
+            .map_err(storage_error)?;
+        let store = Self::open(Database::synced(copy.clone()), false, Some(copy.clone())).await?;
+        store.require_primary_keys().await?;
+        // Schema made by this start goes out now; an answer pushes anything
+        // still left before it confirms a write.
+        if let Err(error) = copy.push_committed().await {
+            tracing::warn!(%error, "turso.sync push after migration failed");
+        }
+        Ok(store)
+    }
+
+    async fn open(
+        db: Database,
+        is_remote: bool,
+        sync_copy: Option<SyncCopy>,
+    ) -> Result<Self, PersistenceError> {
         let store = Self {
             db: Arc::new(db),
             write_gate: Arc::new(Semaphore::new(write_gate::configured_write_concurrency(
@@ -83,9 +119,46 @@ impl TursoEventStore {
             ))),
             high_priority_write_waiters: Arc::new(AtomicUsize::new(0)),
             is_remote,
+            sync_copy,
         };
         store.migrate().await?;
         Ok(store)
+    }
+
+    /// Turso Sync replays each change on the remote by primary key. A table
+    /// without one replays an upsert as a plain insert, which the remote
+    /// refuses; databases made before `specs` and `wasm_modules` had one need
+    /// those two tables rebuilt before they can be synced.
+    async fn require_primary_keys(&self) -> Result<(), PersistenceError> {
+        let conn = self.connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'",
+                (),
+            )
+            .await
+            .map_err(storage_error)?;
+        let mut unkeyed = Vec::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            let name = row.get::<String>(0).unwrap_or_default();
+            let sql = row.get::<String>(1).unwrap_or_default();
+            let internal = name.starts_with("sqlite_") || name.starts_with("turso_");
+            if !internal && !sql.to_ascii_uppercase().contains("PRIMARY KEY") {
+                unkeyed.push(name);
+            }
+        }
+        if unkeyed.is_empty() {
+            return Ok(());
+        }
+        Err(PersistenceError::Storage(format!(
+            "Turso Sync cannot copy tables without a primary key: {}",
+            unkeyed.join(", ")
+        )))
+    }
+
+    /// The Turso Cloud copy of this database, when it has one.
+    pub fn sync_copy(&self) -> Option<&SyncCopy> {
+        self.sync_copy.as_ref()
     }
 
     /// Obtain a connection configured for local-SQLite concurrency.
@@ -95,7 +168,7 @@ impl TursoEventStore {
     /// time to wait for the write lock instead of immediately returning SQLITE_BUSY.
     #[instrument(skip_all, fields(otel.name = "turso.configured_connection"))]
     async fn configured_connection(&self) -> Result<InstrumentedConnection, PersistenceError> {
-        let conn = InstrumentedConnection::new(self.db.connect().map_err(storage_error)?);
+        let conn = InstrumentedConnection::new(self.db.connect().await.map_err(storage_error)?);
         if !self.is_remote {
             let _ = conn
                 .query("PRAGMA busy_timeout=30000", ())
@@ -108,7 +181,7 @@ impl TursoEventStore {
     /// Run schema migrations on connect.
     #[instrument(skip_all, fields(otel.name = "turso.migrate"))]
     async fn migrate(&self) -> Result<(), PersistenceError> {
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
 
         // PRAGMAs are SQLite-specific and not supported on remote Turso Cloud.
         // Turso Cloud manages its own journal mode and concurrency.
@@ -462,7 +535,7 @@ impl TursoEventStore {
                 None => return Ok(()),
             }
         };
-        if ddl.contains(schema::OTS_TRAJECTORIES_TENANT_IDENTITY_MARKER) {
+        if schema::ots_trajectories_ddl_is_tenant_scoped(&ddl) {
             return Ok(());
         }
 
@@ -497,9 +570,9 @@ impl TursoEventStore {
     ///
     /// Local connections share the embedded Turso database. Remote connections
     /// use the official serverless client's HTTP transport.
-    pub(crate) fn connection(&self) -> Result<InstrumentedConnection, PersistenceError> {
+    pub(crate) async fn connection(&self) -> Result<InstrumentedConnection, PersistenceError> {
         Ok(InstrumentedConnection::new(
-            self.db.connect().map_err(storage_error)?,
+            self.db.connect().await.map_err(storage_error)?,
         ))
     }
 }

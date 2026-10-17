@@ -1,0 +1,103 @@
+//! The database file and the files the sync engine keeps beside it.
+
+use std::path::{Path, PathBuf};
+
+use super::DriverError;
+
+/// Written next to the database when the remote refused a change.
+pub(super) const DIVERGED_SUFFIX: &str = "-sync-diverged";
+
+/// Move the database file and every file the engine keeps beside it to
+/// `<name>.behind-<unix seconds>`, so the next open restores from the remote.
+pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
+    let failed =
+        |error: std::io::Error| DriverError::SyncSetup(format!("move {}: {error}", path.display()));
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let stamp = std::time::SystemTime::now() // determinism-ok: names a file moved aside once
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let aside = dir.join(format!("{name}.behind-{stamp}"));
+    std::fs::create_dir_all(&aside).map_err(failed)?;
+    for entry in std::fs::read_dir(dir).map_err(failed)? {
+        let entry = entry.map_err(failed)?;
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file == name || file.starts_with(&format!("{name}-")) {
+            std::fs::rename(entry.path(), aside.join(&file)).map_err(failed)?;
+        }
+    }
+    Ok(aside)
+}
+
+/// Refuse to open a local database that the sync engine would replace.
+///
+/// With no sync metadata next to it, the engine bootstraps the file from the
+/// remote copy, which truncates whatever the file held. That is right for a
+/// fresh machine (no file, or an empty one) and wrong for a database that was
+/// written before sync was turned on: its rows were never sent anywhere.
+pub(super) fn check_local_files(path: &Path) -> Result<(), DriverError> {
+    if sidecar(path, "-info").exists() {
+        return Ok(());
+    }
+    let holds_data = |file: &Path| std::fs::metadata(file).is_ok_and(|meta| meta.len() > 0);
+    let wal = sidecar(path, "-wal");
+    if holds_data(path) || holds_data(&wal) {
+        return Err(DriverError::SyncSetup(format!(
+            "{} holds data that was never copied to the sync database, and opening it with \
+             sync would replace it with the remote copy. Copy the file to the remote database \
+             first, or move it away to restore from the remote copy",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    name.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_a_local_file_written_before_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        std::fs::write(&path, b"SQLite format 3\0").expect("write db");
+
+        let error = check_local_files(&path).expect_err("must refuse");
+        assert!(error.to_string().contains("never copied"), "{error}");
+    }
+
+    #[test]
+    fn refuses_a_wal_written_before_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        std::fs::write(&path, b"").expect("write db");
+        std::fs::write(sidecar(&path, "-wal"), b"frames").expect("write wal");
+
+        assert!(check_local_files(&path).is_err());
+    }
+
+    #[test]
+    fn opens_a_missing_or_empty_file_and_a_synced_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        check_local_files(&path).expect("missing file restores from the remote");
+
+        std::fs::write(&path, b"").expect("write db");
+        check_local_files(&path).expect("empty file restores from the remote");
+
+        std::fs::write(&path, b"SQLite format 3\0").expect("write db");
+        std::fs::write(sidecar(&path, "-info"), b"{}").expect("write info");
+        check_local_files(&path).expect("a synced file opens as it is");
+    }
+}

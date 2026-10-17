@@ -11,6 +11,7 @@ mod actor_runtime;
 mod bootstrap;
 mod loader;
 mod storage;
+mod sync_copy;
 
 use std::collections::{BTreeMap, HashMap};
 use std::{path::Path, sync::Arc};
@@ -74,7 +75,7 @@ pub async fn run(
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
     // Phase 1: Storage backend
-    let (pg_pool, storage_stack) =
+    let (pg_pool, storage_stack, turso_sync_copy) =
         bootstrap::init_storage(storage.clone(), storage_explicit).await?;
 
     // Phase 2: Registry (restore + disk apps)
@@ -267,7 +268,8 @@ pub async fn run(
     }
 
     // Phase 9: Bind, start background tasks, serve
-    let router = build_platform_router(state.clone());
+    let router =
+        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_sync_copy);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .with_context(|| format!("Failed to bind to port {port}"))?;

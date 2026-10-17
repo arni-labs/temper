@@ -177,7 +177,7 @@ impl TenantStoreRouter {
         &self,
         user_id: &str,
     ) -> Result<Vec<TenantUserRow>, PersistenceError> {
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         let mut rows = conn
             .query(
                 "SELECT tenant_id, user_id, role FROM tenant_users WHERE user_id = ?1",
@@ -205,7 +205,7 @@ impl TenantStoreRouter {
         user_id: &str,
         role: &str,
     ) -> Result<(), PersistenceError> {
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         conn.execute(
             "INSERT OR REPLACE INTO tenant_users (tenant_id, user_id, role) VALUES (?1, ?2, ?3)",
             crate::driver::params![tenant_id, user_id, role],
@@ -221,7 +221,7 @@ impl TenantStoreRouter {
         &self,
         tenant_id: &str,
     ) -> Result<Vec<TenantUserRow>, PersistenceError> {
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         let mut rows = conn
             .query(
                 "SELECT tenant_id, user_id, role FROM tenant_users WHERE tenant_id = ?1",
@@ -247,7 +247,7 @@ impl TenantStoreRouter {
     /// and evicts the in-memory store connection.
     #[instrument(skip_all, fields(tenant_id, otel.name = "router.remove_tenant"))]
     pub async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
 
         // Delete associated users and installed apps first.
         conn.execute(
@@ -289,7 +289,7 @@ impl TenantStoreRouter {
         tenant_id: &str,
         user_id: &str,
     ) -> Result<(), PersistenceError> {
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         conn.execute(
             "DELETE FROM tenant_users WHERE tenant_id = ?1 AND user_id = ?2",
             crate::driver::params![tenant_id, user_id],
@@ -312,7 +312,7 @@ impl TenantStoreRouter {
             }
         }
         // Not in memory — check if in DB but not yet connected.
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         let mut rows = conn
             .query(
                 "SELECT turso_db_url, turso_auth_token FROM tenant_registry WHERE tenant_id = ?1",
@@ -361,7 +361,7 @@ impl TenantStoreRouter {
         let store = TursoEventStore::new(&db_url, auth_token.as_deref()).await?;
 
         // Register in platform DB.
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         conn.execute(
             "INSERT INTO tenant_registry (tenant_id, turso_db_url, turso_auth_token)
              VALUES (?1, ?2, ?3)",
@@ -382,7 +382,7 @@ impl TenantStoreRouter {
 
     /// Run platform-specific schema migrations.
     async fn migrate_platform(store: &TursoEventStore) -> Result<(), PersistenceError> {
-        let conn = store.connection().map_err(storage_error)?;
+        let conn = store.connection().await.map_err(storage_error)?;
         conn.execute(schema::CREATE_TENANT_REGISTRY_TABLE, ())
             .await
             .map_err(storage_error)?;
@@ -397,7 +397,7 @@ impl TenantStoreRouter {
 
     /// Load all tenant registry rows from the platform DB.
     async fn load_tenant_registry(&self) -> Result<Vec<TenantRegistryRow>, PersistenceError> {
-        let conn = self.platform.connection().map_err(storage_error)?;
+        let conn = self.platform.connection().await.map_err(storage_error)?;
         let mut rows = conn
             .query(
                 "SELECT tenant_id, turso_db_url, turso_auth_token, status
@@ -955,7 +955,7 @@ mod tests {
             .await
             .expect("router");
 
-        let conn = router.platform_store().connection().expect("conn");
+        let conn = router.platform_store().connection().await.expect("conn");
         conn.execute(
             "INSERT INTO tenant_registry (tenant_id, turso_db_url, turso_auth_token)
              VALUES (?1, ?2, ?3)",
