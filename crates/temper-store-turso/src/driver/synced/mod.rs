@@ -15,7 +15,12 @@ use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
 
-use super::{Connection, DriverError, DriverHandle, Lease, SharedConnection};
+use super::{Connection, DriverError, DriverHandle, Lease};
+
+mod files;
+mod pool;
+use files::{DIVERGED_SUFFIX, check_local_files, move_aside, sidecar};
+pub(crate) use pool::ConnectionPool;
 
 /// The remote copy of one local database, shared by every connection to it.
 #[derive(Clone)]
@@ -64,6 +69,9 @@ const REMOTE_STATEMENT_FAILED: &str = "failed to execute sql";
 /// One push attempt. The engine's HTTP client has no timeout of its own.
 const PUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a start keeps trying to check the file against the remote.
+const OPEN_PUSH_BUDGET: Duration = Duration::from_secs(30);
+
 impl std::fmt::Debug for SyncCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncCopy").finish_non_exhaustive()
@@ -74,11 +82,13 @@ impl SyncCopy {
     /// Open `path` as a synced database, restoring it from `remote_url` when
     /// there is no local database yet.
     ///
-    /// The open pushes what the last run left behind. If that shows the file
-    /// is behind the remote (it came back from an older copy), the file is
-    /// moved aside and the database restored from the remote, which holds
-    /// everything the older copy did. If the remote cannot be reached, the
-    /// file opens as it is and the first push that succeeds decides.
+    /// The open pushes what the last run left behind, before anything new can
+    /// commit. If that shows the file is behind the remote (it came back from
+    /// an older copy), the file is moved aside and the database restored from
+    /// the remote, which holds everything the older copy did. The check needs
+    /// the remote: once new changes commit, a stale file's reused change
+    /// numbers can no longer be told apart, so a start that cannot reach the
+    /// remote fails rather than serve an unchecked file.
     pub(crate) async fn open(
         path: &str,
         remote_url: &str,
@@ -87,8 +97,16 @@ impl SyncCopy {
         let path = Path::new(path);
         check_local_files(path)?;
         let copy = Self::build(path, remote_url, auth_token).await?;
-        if let Err(error) = copy.push_committed().await {
-            tracing::warn!(%error, "turso.sync push at open failed; serving the local file");
+        // A copy already known to be incomplete confirms nothing; it opens for
+        // reads without the check.
+        if copy.inner.diverged.get().is_none()
+            && let Err(error) = copy.push_committed_within(OPEN_PUSH_BUDGET).await
+            && !copy.inner.behind.load(Ordering::Acquire)
+        {
+            return Err(DriverError::SyncSetup(format!(
+                "could not check {} against its remote copy: {error}",
+                path.display()
+            )));
         }
         if !copy.inner.behind.load(Ordering::Acquire) {
             return Ok(copy);
@@ -309,7 +327,20 @@ impl SyncCopy {
     /// `budget` has passed. The remote records the last change it applied in
     /// the same transaction as the changes, so a retry after a push whose
     /// answer was lost does not apply anything twice.
+    ///
+    /// The budget covers the whole call, waiting behind other pushes included.
     pub async fn push_committed_within(&self, budget: Duration) -> Result<(), PersistenceError> {
+        tokio::time::timeout(budget, self.push_committed_retrying(budget))
+            .await
+            .unwrap_or_else(|_| {
+                Err(PersistenceError::Storage(format!(
+                    "turso.sync push not done within {} s",
+                    budget.as_secs()
+                )))
+            })
+    }
+
+    async fn push_committed_retrying(&self, budget: Duration) -> Result<(), PersistenceError> {
         let started = Instant::now();
         let mut delay = Duration::from_millis(50);
         loop {
@@ -348,41 +379,8 @@ impl SyncCopy {
     }
 }
 
-/// Written next to the database when the remote refused a change.
-const DIVERGED_SUFFIX: &str = "-sync-diverged";
-
-/// Move the database file and every file the engine keeps beside it to
-/// `<name>.behind-<unix seconds>`, so the next open restores from the remote.
-fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
-    let failed =
-        |error: std::io::Error| DriverError::SyncSetup(format!("move {}: {error}", path.display()));
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let stamp = std::time::SystemTime::now() // determinism-ok: names a file moved aside once
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default();
-    let aside = dir.join(format!("{name}.behind-{stamp}"));
-    std::fs::create_dir_all(&aside).map_err(failed)?;
-    for entry in std::fs::read_dir(dir).map_err(failed)? {
-        let entry = entry.map_err(failed)?;
-        let file = entry.file_name().to_string_lossy().into_owned();
-        if file == name || file.starts_with(&format!("{name}-")) {
-            std::fs::rename(entry.path(), aside.join(&file)).map_err(failed)?;
-        }
-    }
-    Ok(aside)
-}
-
 /// How long opening a connection retries while another connection writes.
 const CONNECT_BUSY_BUDGET: Duration = Duration::from_secs(5);
-
-/// Most idle connections kept for reuse.
-const MAX_IDLE_CONNECTIONS: usize = 256;
 
 fn is_busy(error: &turso::Error) -> bool {
     matches!(error, turso::Error::Busy(_))
@@ -390,96 +388,4 @@ fn is_busy(error: &turso::Error) -> bool {
             .to_string()
             .to_ascii_lowercase()
             .contains("database is busy")
-}
-
-type IdleConnection = Arc<DriverHandle<'static, turso::Connection>>;
-
-/// Idle connections of one synced database.
-#[derive(Clone, Default)]
-pub(crate) struct ConnectionPool(Arc<std::sync::Mutex<Vec<IdleConnection>>>);
-
-impl ConnectionPool {
-    fn take(&self) -> Option<IdleConnection> {
-        self.0.lock().unwrap().pop()
-    }
-
-    /// Keep the connection under `lease` for reuse unless a result stream or
-    /// transaction still holds the lease or it was left inside a transaction.
-    pub(super) fn give_back(&self, lease: &SharedConnection, conn: &IdleConnection) {
-        if Arc::strong_count(lease) != 1 || !conn.is_autocommit().unwrap_or(false) {
-            return;
-        }
-        let mut idle = self.0.lock().unwrap();
-        if idle.len() < MAX_IDLE_CONNECTIONS {
-            idle.push(conn.clone());
-        }
-    }
-}
-
-/// Refuse to open a local database that the sync engine would replace.
-///
-/// With no sync metadata next to it, the engine bootstraps the file from the
-/// remote copy, which truncates whatever the file held. That is right for a
-/// fresh machine (no file, or an empty one) and wrong for a database that was
-/// written before sync was turned on: its rows were never sent anywhere.
-fn check_local_files(path: &Path) -> Result<(), DriverError> {
-    if sidecar(path, "-info").exists() {
-        return Ok(());
-    }
-    let holds_data = |file: &Path| std::fs::metadata(file).is_ok_and(|meta| meta.len() > 0);
-    let wal = sidecar(path, "-wal");
-    if holds_data(path) || holds_data(&wal) {
-        return Err(DriverError::SyncSetup(format!(
-            "{} holds data that was never copied to the sync database, and opening it with \
-             sync would replace it with the remote copy. Copy the file to the remote database \
-             first, or move it away to restore from the remote copy",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    name.into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refuses_a_local_file_written_before_sync() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("app.db");
-        std::fs::write(&path, b"SQLite format 3\0").expect("write db");
-
-        let error = check_local_files(&path).expect_err("must refuse");
-        assert!(error.to_string().contains("never copied"), "{error}");
-    }
-
-    #[test]
-    fn refuses_a_wal_written_before_sync() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("app.db");
-        std::fs::write(&path, b"").expect("write db");
-        std::fs::write(sidecar(&path, "-wal"), b"frames").expect("write wal");
-
-        assert!(check_local_files(&path).is_err());
-    }
-
-    #[test]
-    fn opens_a_missing_or_empty_file_and_a_synced_one() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("app.db");
-        check_local_files(&path).expect("missing file restores from the remote");
-
-        std::fs::write(&path, b"").expect("write db");
-        check_local_files(&path).expect("empty file restores from the remote");
-
-        std::fs::write(&path, b"SQLite format 3\0").expect("write db");
-        std::fs::write(sidecar(&path, "-info"), b"{}").expect("write info");
-        check_local_files(&path).expect("a synced file opens as it is");
-    }
 }
