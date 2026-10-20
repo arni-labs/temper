@@ -127,8 +127,8 @@ fn timer_armed_by_a_request_with_an_idempotency_key_fires() {
 }
 
 /// A fire that committed before a crash left its row behind (its delete never
-/// happened) is answered as done when the next boot fires that row again: each
-/// arming's fire carries its own idempotency key, so the action runs once.
+/// happened): the next boot arms that row again, finds the action already ran
+/// since the clock started, and ends the timer without firing.
 #[test]
 fn a_fire_whose_row_survived_runs_once_after_a_restart() {
     let (_dir, backend) = turso();
@@ -152,11 +152,15 @@ fn a_fire_whose_row_survived_runs_once_after_a_restart() {
     first.kill();
 
     let second = Server::start(&backend, "kept-row-2");
-    std::thread::sleep(Duration::from_secs(1)); // determinism-ok: real-time restart test
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while second.rows().iter().any(|row| row.entity_id == "kept") {
+        assert!(Instant::now() < deadline, "the boot did not take the row");
+        std::thread::sleep(Duration::from_millis(20)); // determinism-ok: real-time restart test
+    }
     assert_eq!(
         second.read("Probe", "kept", "fires"),
         (1, json!("alice")),
-        "the boot fired the row again, and the action ran once"
+        "the boot took the row and ended it; the action ran once"
     );
     second.kill();
 }

@@ -165,12 +165,18 @@ impl StateTimeoutTracker {
     }
 
     /// Cancel the entity's timer for the transition at journal sequence
-    /// `journal`: no arm from an earlier transition is taken after this.
+    /// `journal`: no arm from an earlier transition is taken after this. A
+    /// cancellation from an earlier transition than the last arm or
+    /// cancellation (a late post-dispatch, or a retry answered from the
+    /// idempotency cache) cancels nothing.
     fn invalidate(&self, key: &EntityKey, journal: u64) -> u64 {
         let mut map = self.seqs.lock().expect("state_timeout tracker poisoned");
         let entry = map.entry(key.clone()).or_default();
+        if journal < entry.journal {
+            return entry.seq;
+        }
         entry.seq += 1;
-        entry.journal = entry.journal.max(journal);
+        entry.journal = journal;
         entry.seq
     }
 
@@ -440,6 +446,36 @@ impl crate::state::ServerState {
         }
     }
 
+    /// Whether `timer`'s action already ran since its clock started, keeping
+    /// the record in its state without resetting the clock: its fire
+    /// committed, and a crash left the row behind before the timer ended. Such
+    /// a timer fires once, so it does not fire again.
+    fn state_timer_already_fired(&self, timer: &ArmedTimer, current: &EntityState) -> bool {
+        let ran_since = current
+            .status_clock
+            .actions
+            .get(&timer.action)
+            .is_some_and(|ran| *ran >= timer.started_at);
+        ran_since && !self.state_timeout_resets_on(timer)
+    }
+
+    /// Whether `timer`'s action is in its state's `reset_on`: a repeating
+    /// timer, whose fire starts the clock again.
+    fn state_timeout_resets_on(&self, timer: &ArmedTimer) -> bool {
+        let Ok(registry) = self.registry.read() else {
+            return false;
+        };
+        registry
+            .get_spec(&timer.tenant, &timer.entity_type)
+            .and_then(|spec| {
+                spec.automaton
+                    .state_timeouts
+                    .iter()
+                    .find(|timeout| timeout.state == timer.state)
+            })
+            .is_some_and(|timeout| timeout.reset_on.contains(&timer.action))
+    }
+
     /// Reserve a cancellation value for `timer` (see [`StateTimeoutTracker`]),
     /// or None when a later transition of its entity already armed or
     /// cancelled a timer.
@@ -532,6 +568,7 @@ impl crate::state::ServerState {
                         )
                         .await
                     && current.state.status == timer.state
+                    && !state.state_timer_already_fired(&timer, &current.state)
                 {
                     crate::runtime_metrics::record_state_timeout_fired(
                         timer.tenant.as_str(),
@@ -546,7 +583,7 @@ impl crate::state::ServerState {
                             &timer.entity_id,
                             &timer.action,
                             timer.params.clone(),
-                            &fire_agent(&timer),
+                            &timer.agent_ctx,
                         )
                         .await;
                 }
@@ -582,21 +619,10 @@ pub(super) struct ArmedTimer {
 /// The identity a timer fires as: the dispatch that armed it, as a new
 /// background action. It does not keep the arming request's idempotency key:
 /// the entity has already recorded that key, so the fire would be answered as
-/// a duplicate and never run. The fire gets a key of its own ([`fire_agent`]).
+/// a duplicate and never run.
 fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
-    agent
-}
-
-/// The timer's identity with one idempotency key per arming
-/// (`state-timer:<arm id>`): a fire that committed before a crash left its row
-/// behind is answered as done when the next boot fires that row again, so the
-/// action runs once. A repeating timer still re-arms on that answer, as its
-/// action is in `reset_on`.
-fn fire_agent(timer: &ArmedTimer) -> AgentContext {
-    let mut agent = timer.agent_ctx.clone();
-    agent.idempotency_key = Some(format!("state-timer:{}", timer.arm_id));
     agent
 }
 
@@ -658,6 +684,11 @@ mod tests {
         assert_eq!(t.current(&k), 1, "the newer timer stays current");
         assert_eq!(t.invalidate(&k, 7), 2);
         assert_eq!(t.reserve(&k, 6), None, "an arm from before the exit");
+        assert_eq!(
+            t.invalidate(&k, 4),
+            2,
+            "a cancellation from an earlier transition cancels nothing"
+        );
         assert_eq!(
             t.reserve(&k, 7),
             Some(3),

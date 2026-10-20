@@ -185,13 +185,15 @@ ran since), which snapshots keep, and the hydration re-arm reads it. A state
 restored from a snapshot made before the clock still falls back to the events;
 with timer rows such a timer is late by at most one budget, once.
 
-Each fire carries one idempotency key per arming (`state-timer:<arm id>`): a
-fire that committed before a crash left its row behind is answered as done
-when the next boot fires that row again, so its action runs once. In memory,
-each arm is reserved against the journal sequence of the transition that
-armed it, before its row is written: an arm whose dispatch finishes after a
-newer transition armed or cancelled the entity's timer is refused, so an older
-timer never replaces a newer one.
+A timer whose action keeps the record in its state without resetting its
+clock fires once: when it wakes, it does not fire if the status clock shows
+its action already ran since the clock started (a fire that committed before a
+crash left its row behind). In memory, each arm and each cancellation is
+taken against the journal sequence of the transition that made it, and an arm
+is reserved before its row is written: an arm or cancellation from an earlier
+transition than the last one is refused, so a dispatch whose post-dispatch work
+finishes late (or a retry answered from the idempotency cache) never replaces
+or cancels a newer timer.
 
 Known limits. A row is replaced only by its record's next arm, so a process
 that dies after a reset or re-entry commits but before its new row is written

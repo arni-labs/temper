@@ -9,6 +9,7 @@
 //! PostgreSQL when `TEMPER_TEST_POSTGRES_URL` names a disposable database.
 use std::time::{Duration, Instant};
 
+#[path = "state_timer_restart/recovery.rs"]
 mod recovery;
 
 use serde_json::{Value, json};
