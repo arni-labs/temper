@@ -10,7 +10,6 @@ use temper_runtime::persistence::PersistenceError;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 use tracing::instrument;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use axum::Extension;
 
@@ -31,7 +30,7 @@ use super::response::annotate_entity;
 use super::storage_guardrails::enforce_commons_storage_cap;
 use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_target};
 use crate::blobs::hydrate_blob_refs_for_tenant;
-use crate::request_context::{AgentContext, extract_agent_context, remote_parent_context};
+use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
@@ -496,9 +495,6 @@ pub async fn handle_odata_post(
     let security_ctx = authenticated.security_context().clone();
     let mut agent_ctx = extract_agent_context(&headers);
     apply_authenticated_context(&mut agent_ctx, &security_ctx);
-    if let Some(remote_parent) = remote_parent_context(&agent_ctx) {
-        tracing::Span::current().set_parent(remote_parent);
-    }
     let await_integration = query_params
         .get("await_integration")
         .map(|v| v == "true")

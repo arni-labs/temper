@@ -252,3 +252,37 @@ fn trace_sampler_config_reads_and_clamps_sample_rate_overrides() {
         },
     );
 }
+
+#[test]
+fn reduced_sample_prefixes_never_trim_a_span_inside_a_trace() {
+    use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceState};
+
+    let sampler = NameBasedSampler {
+        inner: Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+        config: TraceSamplerConfig::default(),
+    };
+    for i in 0..1_000u64 {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&i.to_be_bytes());
+        let trace_id = TraceId::from_bytes(bytes);
+        let parent = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            trace_id,
+            SpanId::from_bytes(7u64.to_be_bytes()),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ));
+        for name in [
+            "wasm:workspace_fs.read",
+            "dispatch.phase.query_projection.queued",
+            "dispatch.scheduled_actions.fire",
+        ] {
+            let result =
+                sampler.should_sample(Some(&parent), trace_id, name, &SpanKind::Internal, &[], &[]);
+            assert!(
+                matches!(result.decision, SamplingDecision::RecordAndSample),
+                "{name} inside a sampled trace must be kept (trace {trace_id})"
+            );
+        }
+    }
+}

@@ -3,8 +3,7 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use opentelemetry::KeyValue as OtelKeyValue;
-use opentelemetry::trace::{Span, Status, Tracer};
-use temper_runtime::scheduler::sim_now;
+use opentelemetry::trace::Status;
 use temper_runtime::tenant::TenantId;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -19,6 +18,20 @@ use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_denial, odata_error};
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
+
+/// Notes for the request's handler span: OpenTelemetry attributes and status set
+/// on the current tracing span.
+struct ActionSpan(tracing::Span);
+
+impl ActionSpan {
+    fn set_attribute(&self, attribute: OtelKeyValue) {
+        self.0.set_attribute(attribute.key, attribute.value);
+    }
+
+    fn set_status(&self, status: Status) {
+        self.0.set_status(status);
+    }
+}
 
 fn idempotency_actor_key(tenant: &TenantId, entity_type: &str, entity_id: &str) -> String {
     format!("{tenant}:{entity_type}:{entity_id}")
@@ -38,33 +51,31 @@ pub(super) async fn dispatch_bound_action(
     idempotency_key: Option<String>,
     security_ctx: &SecurityContext,
 ) -> axum::response::Response {
-    let http_start = sim_now();
-    let tracer = opentelemetry::global::tracer("temper");
-    let http_start_time: std::time::SystemTime = http_start.into();
-    let span_name = format!("HTTP POST {set_name}.{action}");
-    let mut http_span = tracer
-        .span_builder(span_name)
-        .with_start_time(http_start_time)
-        .with_attributes(vec![
-            OtelKeyValue::new("http.method", "POST"),
-            OtelKeyValue::new("odata.entity_set", set_name.to_string()),
-            OtelKeyValue::new("odata.entity_id", key_str.to_string()),
-            OtelKeyValue::new("odata.action", action.to_string()),
-            OtelKeyValue::new("tenant", tenant.as_str().to_string()),
-        ])
-        .start_with_context(&tracer, &tracing::Span::current().context());
+    // The bound action's details are attributes of the request's handler span
+    // (`POST /odata/{path}`). It is not a span of its own: one request is one
+    // server span and one handler span, and only the server span carries the
+    // HTTP status (router.rs records it from the response).
+    let action_span = ActionSpan(tracing::Span::current());
+    for attribute in [
+        OtelKeyValue::new("odata.entity_set", set_name.to_string()),
+        OtelKeyValue::new("odata.entity_id", key_str.to_string()),
+        OtelKeyValue::new("odata.action", action.to_string()),
+        OtelKeyValue::new("tenant", tenant.as_str().to_string()),
+    ] {
+        action_span.set_attribute(attribute);
+    }
 
     if let Some(ref aid) = agent_ctx.agent_id {
-        http_span.set_attribute(OtelKeyValue::new("agent.id", aid.clone()));
+        action_span.set_attribute(OtelKeyValue::new("agent.id", aid.clone()));
     }
     if let Some(ref sid) = agent_ctx.session_id {
-        http_span.set_attribute(OtelKeyValue::new("session.id", sid.clone()));
+        action_span.set_attribute(OtelKeyValue::new("session.id", sid.clone()));
     }
     if let Some(ref intent) = agent_ctx.intent {
-        http_span.set_attribute(OtelKeyValue::new("intent", intent.clone()));
+        action_span.set_attribute(OtelKeyValue::new("intent", intent.clone()));
     }
     for (key, value) in &agent_ctx.observation_metadata {
-        http_span.set_attribute(OtelKeyValue::new(
+        action_span.set_attribute(OtelKeyValue::new(
             format!("temper.observation.{key}"),
             value.clone(),
         ));
@@ -77,20 +88,14 @@ pub(super) async fn dispatch_bound_action(
     let is_governed = match state.is_entity_type_governed(tenant, entity_type) {
         Ok(value) => value,
         Err(e) => {
-            http_span.set_status(Status::error(e.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 500i64));
-            let end_time: std::time::SystemTime = sim_now().into();
-            http_span.end_with_timestamp(end_time);
+            action_span.set_status(Status::error(e.clone()));
             return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "RegistryError", &e)
                 .into_response();
         }
     };
 
     if !is_governed {
-        http_span.set_status(Status::error("EntityTypeNotGoverned"));
-        http_span.set_attribute(OtelKeyValue::new("http.status_code", 404i64));
-        let end_time: std::time::SystemTime = sim_now().into();
-        http_span.end_with_timestamp(end_time);
+        action_span.set_status(Status::error("EntityTypeNotGoverned"));
         return odata_error(
             StatusCode::NOT_FOUND,
             "EntityTypeNotGoverned",
@@ -107,10 +112,7 @@ pub(super) async fn dispatch_bound_action(
     {
         Ok(v) => v,
         Err(e) => {
-            http_span.set_status(Status::error(e.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 500i64));
-            let end_time: std::time::SystemTime = sim_now().into();
-            http_span.end_with_timestamp(end_time);
+            action_span.set_status(Status::error(e.clone()));
             let code = if e.contains("registry lock poisoned") {
                 "RegistryError"
             } else {
@@ -153,17 +155,13 @@ pub(super) async fn dispatch_bound_action(
         )
         .await;
 
-        http_span.set_status(Status::error(reason.clone()));
-        let end_time: std::time::SystemTime = sim_now().into();
-        http_span.end_with_timestamp(end_time);
+        action_span.set_status(Status::error(reason.clone()));
         let reason_with_id = format!("{reason} (decision: {})", pd.id);
         return odata_denial(&reason_with_id, &pd.id).into_response();
     }
 
     if let Err(error) = state.check_verification_gate(tenant, entity_type) {
-        http_span.set_status(Status::error("VerificationRequired"));
-        http_span.set_attribute(OtelKeyValue::new("http.status_code", 423i64));
-        http_span.end_with_timestamp(sim_now().into());
+        action_span.set_status(Status::error("VerificationRequired"));
         return super::common::verification_gate_response(error);
     }
 
@@ -196,10 +194,7 @@ pub(super) async fn dispatch_bound_action(
     )
     .await
     {
-        http_span.set_status(Status::error("AccountVerificationRequired"));
-        http_span.set_attribute(OtelKeyValue::new("http.status_code", 403i64));
-        let end_time: std::time::SystemTime = sim_now().into();
-        http_span.end_with_timestamp(end_time);
+        action_span.set_status(Status::error("AccountVerificationRequired"));
         return *resp;
     }
 
@@ -212,10 +207,7 @@ pub(super) async fn dispatch_bound_action(
     )
     .await
     {
-        http_span.set_status(Status::error("RateLimitExceeded"));
-        http_span.set_attribute(OtelKeyValue::new("http.status_code", 429i64));
-        let end_time: std::time::SystemTime = sim_now().into();
-        http_span.end_with_timestamp(end_time);
+        action_span.set_status(Status::error("RateLimitExceeded"));
         return resp;
     }
 
@@ -231,10 +223,7 @@ pub(super) async fn dispatch_bound_action(
     )
     .await
     {
-        http_span.set_status(Status::error("ConstraintViolation"));
-        http_span.set_attribute(OtelKeyValue::new("http.status_code", 409i64));
-        let end_time: std::time::SystemTime = sim_now().into();
-        http_span.end_with_timestamp(end_time);
+        action_span.set_status(Status::error("ConstraintViolation"));
         return resp;
     }
 
@@ -252,9 +241,7 @@ pub(super) async fn dispatch_bound_action(
                 )
             });
         if let Err(error) = validation {
-            http_span.set_status(Status::error("StrictActionContract"));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 409i64));
-            http_span.end_with_timestamp(sim_now().into());
+            action_span.set_status(Status::error("StrictActionContract"));
             return odata_error(StatusCode::CONFLICT, "StrictActionContract", &error)
                 .into_response();
         }
@@ -294,11 +281,8 @@ pub(super) async fn dispatch_bound_action(
             format!("$metadata#{set_name}/$entity"),
             None,
         );
-        http_span.set_attribute(OtelKeyValue::new("idempotency.hit", true));
-        http_span.set_status(Status::Ok);
-        http_span.set_attribute(OtelKeyValue::new("http.status_code", 200i64));
-        let end_time: std::time::SystemTime = sim_now().into();
-        http_span.end_with_timestamp(end_time);
+        action_span.set_attribute(OtelKeyValue::new("idempotency.hit", true));
+        action_span.set_status(Status::Ok);
         return ODataResponse {
             status: StatusCode::OK,
             body,
@@ -322,8 +306,7 @@ pub(super) async fn dispatch_bound_action(
         )
         .await;
 
-    let http_end: std::time::SystemTime = sim_now().into();
-    let response = match result {
+    match result {
         Ok(response) => {
             if response.success {
                 // Cache for idempotency
@@ -333,8 +316,7 @@ pub(super) async fn dispatch_bound_action(
                         .put_effects_applied(&actor_key, idem_key, &response);
                 }
 
-                http_span.set_status(Status::Ok);
-                http_span.set_attribute(OtelKeyValue::new("http.status_code", 200i64));
+                action_span.set_status(Status::Ok);
 
                 let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
                 if let Some(hook) = state.bound_action_hook.as_ref() {
@@ -362,8 +344,7 @@ pub(super) async fn dispatch_bound_action(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            http_span.set_status(Status::error(error.clone()));
-                            http_span.set_attribute(OtelKeyValue::new("http.status_code", 500i64));
+                            action_span.set_status(Status::error(error.clone()));
                             return odata_error(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 "PostActionHookFailed",
@@ -382,8 +363,7 @@ pub(super) async fn dispatch_bound_action(
                 }
                 .into_response()
             } else {
-                http_span.set_status(Status::error(response.error.clone().unwrap_or_default()));
-                http_span.set_attribute(OtelKeyValue::new("http.status_code", 409i64));
+                action_span.set_status(Status::error(response.error.clone().unwrap_or_default()));
                 odata_error(
                     StatusCode::CONFLICT,
                     "ActionFailed",
@@ -396,32 +376,27 @@ pub(super) async fn dispatch_bound_action(
             let reason = format!(
                 "Entity type '{entity}' has no registered spec — actions are denied by default"
             );
-            http_span.set_status(Status::error("EntityTypeNotGoverned"));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 404i64));
+            action_span.set_status(Status::error("EntityTypeNotGoverned"));
             odata_error(StatusCode::NOT_FOUND, "EntityTypeNotGoverned", &reason).into_response()
         }
         Err(DispatchError::AuthzDenied(reason)) => {
-            http_span.set_status(Status::error(reason.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 403i64));
+            action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::FORBIDDEN, "AuthorizationDenied", &reason).into_response()
         }
         Err(DispatchError::QuotaExceeded(reason)) => {
-            http_span.set_status(Status::error(reason.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 413i64));
+            action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::PAYLOAD_TOO_LARGE, "StorageCapExceeded", &reason)
                 .into_response()
         }
         Err(DispatchError::Conflict(reason)) => {
-            http_span.set_status(Status::error(reason.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 409i64));
+            action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::CONFLICT, "Conflict", &reason).into_response()
         }
         // ADR-0048: transient exhaustion → 503 Retry-After so clients and
         // proxies back off instead of paging someone.
         Err(e @ DispatchError::Transient { .. }) => {
             let reason = e.to_string();
-            http_span.set_status(Status::error(reason.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 503i64));
+            action_span.set_status(Status::error(reason.clone()));
             let mut resp = odata_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "DispatchTransient",
@@ -440,8 +415,7 @@ pub(super) async fn dispatch_bound_action(
         Err(DispatchError::Deferred { retry_after_ms }) => {
             let seconds = retry_after_ms.div_ceil(1000).max(1);
             let reason = format!("dispatch deferred: retry after {retry_after_ms}ms");
-            http_span.set_status(Status::error("DispatchDeferred"));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 503i64));
+            action_span.set_status(Status::error("DispatchDeferred"));
             let mut resp =
                 odata_error(StatusCode::SERVICE_UNAVAILABLE, "DispatchDeferred", &reason)
                     .into_response();
@@ -453,14 +427,10 @@ pub(super) async fn dispatch_bound_action(
         }
         Err(e) => {
             let reason = e.to_string();
-            http_span.set_status(Status::error(reason.clone()));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 500i64));
+            action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::INTERNAL_SERVER_ERROR, "DispatchError", &reason).into_response()
         }
-    };
-
-    http_span.end_with_timestamp(http_end);
-    response
+    }
 }
 
 #[cfg(test)]
