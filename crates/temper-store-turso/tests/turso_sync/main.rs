@@ -344,3 +344,42 @@ async fn a_push_to_a_remote_that_stops_answering_fails_in_bounded_time() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_push_given_up_on_is_checked_with_the_remote_and_a_hung_remote_still_restarts() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (url, open) = valve(&server.url).await;
+    let (_a_dir, a_path) = machine();
+    let a = TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &url, TOKEN)
+        .await
+        .expect("open through the valve");
+    let copy = a.sync_copy().expect("copy").clone();
+    write(&a, "s1", 0).await;
+    copy.push_committed()
+        .await
+        .expect("a push the remote answers");
+    assert!(
+        !copy.remote_record_unsure(),
+        "a push that succeeded is known"
+    );
+
+    // An answer's time limit gives up on a push the remote may still commit.
+    open.store(false, std::sync::atomic::Ordering::Release);
+    write(&a, "s2", 0).await;
+    copy.push_committed_within(Duration::from_millis(300))
+        .await
+        .expect_err("not answered in time");
+    assert!(
+        copy.remote_record_unsure(),
+        "a push given up on may have committed: the next one asks the remote first"
+    );
+
+    // The remote answers nothing at all: asking it counts like a push that
+    // timed out, so the restart after 6 in a row still comes.
+    copy.push_committed()
+        .await
+        .expect_err("a remote that answers nothing");
+    assert_eq!(copy.pushes_timed_out_in_a_row(), 1);
+}
