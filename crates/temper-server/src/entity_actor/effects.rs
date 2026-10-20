@@ -1127,6 +1127,7 @@ to = "Refreshing"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         let result = process_action(&mut state, &table, "Activate", &serde_json::json!({}));
@@ -1155,6 +1156,7 @@ to = "Refreshing"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         }
     }
 
@@ -1250,6 +1252,7 @@ to = "Closed"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         let (custom, scheduled, _spawns, _schedule_at) =
@@ -1291,6 +1294,7 @@ to = "Closed"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         let (_custom, _scheduled, _spawns, _schedule_at) = apply_effects(
@@ -1338,6 +1342,7 @@ effect = ["spawn('TestWorkflow', 'Start', test_wf_id)"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         let result = process_action(&mut state, &table, "StartPlan", &serde_json::json!({}));
@@ -1395,6 +1400,7 @@ guard = "empty(test_wf_id) || TestWorkflow[test_wf_id].status in ['Passed']"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         // Without cross-entity booleans, guard should fail
@@ -1461,6 +1467,7 @@ guard = "(empty(attachment_a_id) || Attachment[attachment_a_id].status in ['Read
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
         let xref: temper_jit::table::RelatedMap = ["a", "b", "c", "d", "e", "f", "g", "h"]
             .into_iter()
@@ -1529,6 +1536,7 @@ from = ["Active"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         // Provide next_run_at as a param (simulates WASM callback)
@@ -1591,6 +1599,7 @@ from = ["Active"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         // Provide a timestamp in the past
@@ -1644,6 +1653,7 @@ from = ["Active"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         let result = process_action(&mut state, &table, "Complete", &serde_json::json!({}));
@@ -1692,6 +1702,7 @@ effect = ["size_bytes = params.payload_size"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         let result = process_action(
@@ -1726,6 +1737,7 @@ effect = ["size_bytes = params.payload_size"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         }
     }
 

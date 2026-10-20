@@ -46,11 +46,13 @@ mod published_artifacts;
 mod query_plane_impls;
 mod query_plane_read;
 mod redaction;
+mod state_timers;
 mod trajectory_row;
 pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
+pub use state_timers::StateTimerStore;
 mod query_plane;
 pub use query_plane::{
     EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPage,
@@ -1211,6 +1213,7 @@ pub trait MetadataStore:
     + WasmMetadataStore
     + WasmInvocationStore
     + PublishedArtifactStore
+    + StateTimerStore
 {
 }
 
@@ -1227,6 +1230,7 @@ impl<T> MetadataStore for T where
         + WasmMetadataStore
         + WasmInvocationStore
         + PublishedArtifactStore
+        + StateTimerStore
 {
 }
 

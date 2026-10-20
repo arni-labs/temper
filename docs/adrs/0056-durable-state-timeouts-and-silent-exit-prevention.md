@@ -2,6 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-04-21
+- Amended: 2026-10-16, armed timers keep a durable row and are armed again at boot (see "Amendment: timer rows and the boot re-arm")
 - Deciders: Temper core maintainers
 - Supersedes: the "Non-durable under the MVP" caveat at `crates/temper-server/src/state/dispatch/state_timeouts.rs:145` introduced by ADR-0049
 - Related:
@@ -148,6 +149,59 @@ if let Some(ref post_response) = inline_response
 Under healthy operation `temper_integration_silent_exit_total` is permanently zero. The consumer (openpaw) is responsible for enforcing the invariant at the WASM layer (per openpaw ADR-0039 Sub-Decision 3a). This platform-side check is a belt-and-suspenders regression guard — if the WASM-side invariant ever regresses, operators see the counter go nonzero and can act before user-visible impact.
 
 **Why no automatic `on_silent_exit` recovery field on actions:** scope control. The consumer-side invariant + persist retries close the common causes. A declarative recovery primitive is appealing but adds spec grammar and requires usage-pattern data we don't have yet. Revisit once we have production evidence that this regression-guard fires — at that point we'll know what shape of recovery operators actually want.
+
+**Amendment: timer rows and the boot re-arm (2026-10-16).** The hydration
+re-arm shipped in the post-dispatch path, not in `pre_start`, so a timer came
+back only when some action on its record succeeded, and it then fired as that
+action's caller. A record nobody touched after a restart stayed silent: on
+2026-10-15 every feed in a Katagami app stopped ticking after each restart, and
+each feed's daily timer was gone until someone pressed something.
+
+The event log cannot restore these timers on its own: it does not record who
+armed a timer, and a timer must fire as that principal (its module's calls are
+authorized as them). Finding the timed records from the log also means loading
+every entity of every timed type at boot. So each armed timer now keeps one row
+in a `state_timers` table (Turso and Postgres): the state, its clock start, the
+`on_timeout` parameters read at arm time, and the identity of the arming
+dispatch without its idempotency key. The row is written before the arming
+dispatch returns and removed by the timer's task when it ends; a row with a
+higher journal sequence is never replaced by an earlier one. At boot `temper
+serve` reads each tenant's rows once, loads no entity, and arms each timer for
+the rest of its budget, or at once if it fell due while the server was down;
+at most eight of these fire at a time, so a long outage does not end in a burst
+of concurrent writes (1,610 at once on a loaded machine left 861 events
+unwritten). A timer fires once; missed ticks are not replayed. The table is not a second
+source of truth for state: a timer still fires only if its record is in the
+timed state when it wakes. Timers armed before rows existed keep the
+next-action hydration re-arm.
+
+That re-arm read how long the entity had been in its state from the retained
+events, which a snapshot leaves out and a window of 50 forgets. Without the
+entry it armed a full budget, on every hydration: from 16 to 20 Oct 2026 the
+daily timers of a Katagami app's 18 feeds were re-armed for a full day after
+each restart (every 2 to 15 hours) and never fired. The entity state now keeps
+a status clock (when the current status was entered, and when each action last
+ran since), which snapshots keep, and the hydration re-arm reads it. A state
+restored from a snapshot made before the clock still falls back to the events;
+with timer rows such a timer is late by at most one budget, once.
+
+A timer whose action keeps the record in its state without resetting its
+clock fires once: when it wakes, it does not fire if the status clock shows
+its action already ran since the clock started (a fire that committed before a
+crash left its row behind). In memory, each arm and each cancellation is
+taken against the journal sequence of the transition that made it, and an arm
+is reserved before its row is written: an arm or cancellation from an earlier
+transition than the last one is refused, so a dispatch whose post-dispatch work
+finishes late (or a retry answered from the idempotency cache) never replaces
+or cancels a newer timer.
+
+Known limits. A row is replaced only by its record's next arm, so a process
+that dies after a reset or re-entry commits but before its new row is written
+(or a row write that fails, which is logged) leaves the old row: at boot a
+repeating timer ticks once more, and a reset timer fires once early. A fire
+whose load or dispatch fails removes its row like any other end, as before
+rows existed. Every boot arms every row, which assumes one process per store,
+as the kernel is single-node today (docs/POSITIONING.md).
 
 ## Readiness Gates
 

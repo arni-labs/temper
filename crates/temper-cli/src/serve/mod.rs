@@ -337,6 +337,10 @@ pub async fn run(
         }
     }
 
+    // ADR-0056: arm again the state timers the last process left waiting,
+    // before the first request can act on their records.
+    state.server.rearm_state_timers().await;
+
     println!("Listening on http://0.0.0.0:{actual_port}");
     axum::serve(listener, router)
         .await
