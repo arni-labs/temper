@@ -1492,10 +1492,9 @@ pub(super) async fn install_os_app_with_plan(
                     "Failed to persist WASM module to durable store (continuing in-memory only)"
                 );
             }
-            {
-                let mut wasm_reg = state.server.wasm_module_registry.write().unwrap(); // ci-ok: infallible lock
-                wasm_reg.register(&tenant_id, module_name, &hash);
-            }
+            state
+                .server
+                .register_wasm_module(&tenant_id, module_name, &hash);
 
             if matches!(
                 module_config.map(|config| config.startup_loading),

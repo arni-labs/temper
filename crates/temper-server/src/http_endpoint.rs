@@ -335,6 +335,41 @@ pub async fn rebuild_tenant_table(state: &crate::state::ServerState, tenant: &Te
     );
 }
 
+/// Compiles a route's integration module on its first use. Startup recovery restores the module
+/// registry without compiling the modules, and an entity integration compiles its module before it
+/// invokes it (`ensure_wasm_module_cached`); a route does the same. When the module cannot be loaded
+/// the answer to send now is returned: 503, or 504 if loading outlasted the route's budget.
+pub(crate) async fn ensure_integration_module(
+    state: &crate::state::ServerState,
+    tenant: &TenantId,
+    integration: &str,
+    hash: &str,
+    deadline: &budget::ExchangeDeadline,
+) -> Result<(), axum::response::Response> {
+    use axum::response::IntoResponse;
+    match deadline
+        .wait(state.ensure_wasm_module_cached(tenant, integration, hash))
+        .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::warn!(tenant = %tenant.as_str(), integration, %error, "HttpEndpoint integration module could not be loaded");
+            Err(crate::response::odata_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "ModuleUnavailable",
+                &format!("WASM integration '{integration}' could not be loaded"),
+            )
+            .into_response())
+        }
+        Err(_) => Err(crate::response::odata_error(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "ModuleLoadTimeout",
+            "Endpoint integration module took too long to load",
+        )
+        .into_response()),
+    }
+}
+
 /// Spawn a long-running task that watches entity state changes and
 /// rebuilds the tenant's route table whenever an HttpEndpoint row
 /// transitions. Must be called once per server instance, after

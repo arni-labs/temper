@@ -179,10 +179,7 @@ pub async fn handle_upload_wasm_module(
     }
 
     // Register in module registry after durability is confirmed.
-    {
-        let mut wasm_reg = state.wasm_module_registry.write().unwrap();
-        wasm_reg.register(&tenant, &module_name, &hash);
-    }
+    state.register_wasm_module(&tenant, &module_name, &hash);
 
     let size_bytes = module_bytes.len();
     tracing::info!(
@@ -303,15 +300,12 @@ pub async fn handle_delete_wasm_module(
         return Err(resp);
     }
 
-    // Get hash before removing from registry (for cache eviction)
-    let hash = {
+    let registered = {
         let wasm_reg = state.wasm_module_registry.read().unwrap();
-        wasm_reg
-            .get_hash(&tenant, &module_name)
-            .map(|s| s.to_string())
+        wasm_reg.get_hash(&tenant, &module_name).is_some()
     };
 
-    if hash.is_none() {
+    if !registered {
         tracing::warn!("WASM module not found for deletion");
         return Err((
             StatusCode::NOT_FOUND,
@@ -332,15 +326,15 @@ pub async fn handle_delete_wasm_module(
         ));
     }
 
-    // Remove from in-memory registry after durability is confirmed.
+    // Remove from in-memory registry after durability is confirmed, then drop
+    // the compiled module unless another tenant still runs the same bytes.
     {
         let mut wasm_reg = state.wasm_module_registry.write().unwrap();
-        wasm_reg.remove(&tenant, &module_name);
-    }
-
-    // Evict from engine cache last.
-    if let Some(ref hash) = hash {
-        state.wasm_engine.evict(hash);
+        if let Some(hash) = wasm_reg.remove(&tenant, &module_name)
+            && !wasm_reg.names_hash(&hash)
+        {
+            state.wasm_engine.evict(&hash);
+        }
     }
 
     tracing::info!(
