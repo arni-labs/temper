@@ -19,6 +19,7 @@ mod mcp;
 mod migrate_predicates;
 mod migrate_turso_to_postgres;
 mod serve;
+mod sync_copy_cmd;
 mod util;
 mod verify;
 mod verify_ioa;
@@ -233,6 +234,11 @@ enum Commands {
         /// Target PostgreSQL URL. Falls back to DATABASE_URL.
         #[arg(long)]
         database_url: Option<String>,
+    },
+    /// Inspect or repair a database copied to Turso Cloud (TURSO_SYNC_URL).
+    SyncCopy {
+        #[command(subcommand)]
+        action: sync_copy_cmd::Action,
     },
     /// Start the stdio MCP server for Code Mode
     Mcp {
@@ -463,6 +469,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             url,
             agent_id,
         } => mcp::run(port, url, agent_id).await?,
+        Commands::SyncCopy { action } => sync_copy_cmd::run(action).await?,
         Commands::MigrateTursoToPostgres {
             tenant,
             dry_run,
