@@ -396,8 +396,8 @@ impl crate::state::ServerState {
             explicit_workflow_context,
             entity_type,
         );
-        let mut enriched_agent_ctx = agent_ctx.for_dispatch_root(entity_type, entity_id);
-        let mut workflow_root_active = false;
+        let enriched_agent_ctx = agent_ctx.for_dispatch_root(entity_type, entity_id);
+        let dispatch_span = tracing::Span::current();
         if use_workflow_root {
             let root_entity_type = enriched_agent_ctx
                 .workflow_root_entity_type
@@ -411,20 +411,103 @@ impl crate::state::ServerState {
                 .workflow_run_id
                 .as_deref()
                 .unwrap_or(root_entity_id);
-            if let Some(parent) = self.workflow_spans.parent_context(
+            match self.workflow_spans.parent_context(
                 tenant.as_str(),
                 root_entity_type,
                 root_entity_id,
                 workflow_run_id,
                 enriched_agent_ctx.session_id.as_deref(),
             ) {
-                workflow_root_active = true;
-                tracing::Span::current().set_parent(parent);
+                crate::workflow_tracing::WorkflowParent::Open(workflow) => {
+                    // The workflow's work is one step span in the workflow's own trace,
+                    // linked both ways to this dispatch span, which stays in the
+                    // request's trace. Each span is in exactly one trace.
+                    record_workflow_span_attrs(
+                        &enriched_agent_ctx,
+                        entity_type,
+                        entity_id,
+                        Some(action),
+                    );
+                    let step = tracing::info_span!(
+                        parent: None,
+                        "dispatch.workflow_step",
+                        otel.name = %format_args!("{entity_type}.{action}"),
+                        tenant = %tenant,
+                        entity_type,
+                        entity_id,
+                        action_name = action,
+                        workflow.root_entity_type = tracing::field::Empty,
+                        workflow.root_entity_id = tracing::field::Empty,
+                        workflow.run_id = tracing::field::Empty,
+                        temper.action = tracing::field::Empty,
+                        session.id = tracing::field::Empty,
+                        session_id = tracing::field::Empty,
+                        intent = tracing::field::Empty,
+                        observation_metadata = tracing::field::Empty,
+                        success = tracing::field::Empty,
+                        error_msg = tracing::field::Empty,
+                    );
+                    crate::trace_context::continue_in(&step, &workflow);
+                    crate::trace_context::link_both(&dispatch_span, &step);
+                    return self
+                        .dispatch_tenant_action_steps(DispatchSteps {
+                            tenant,
+                            entity_type,
+                            entity_id,
+                            action,
+                            params,
+                            agent_ctx: enriched_agent_ctx,
+                            await_integration,
+                            expected_authorization_precondition,
+                            workflow_root_active: true,
+                        })
+                        .instrument(step)
+                        .await;
+                }
+                crate::workflow_tracing::WorkflowParent::Finished(workflow) => {
+                    // Late work for a finished workflow stays in the request that
+                    // brought it, linked to the workflow: never a second workflow trace.
+                    dispatch_span.add_link(workflow);
+                }
+                crate::workflow_tracing::WorkflowParent::None => {}
             }
-        } else if let Some(parent) = remote_parent_context(agent_ctx) {
-            tracing::Span::current().set_parent(parent);
+        } else if let Some(remote) = remote_parent_context(agent_ctx) {
+            // Context handed over in the agent context, not by this span's parent:
+            // a link, never a re-parent, so this span stays in its own trace.
+            crate::trace_context::link_if_other_trace(&dispatch_span, &remote);
         }
-        enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
+        self.dispatch_tenant_action_steps(DispatchSteps {
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            params,
+            agent_ctx: enriched_agent_ctx,
+            await_integration,
+            expected_authorization_precondition,
+            workflow_root_active: false,
+        })
+        .await
+    }
+
+    /// The work of one dispatch, in the current span: the dispatch span, or the
+    /// step span of a workflow's own trace.
+    async fn dispatch_tenant_action_steps(
+        &self,
+        steps: DispatchSteps<'_>,
+    ) -> Result<EntityResponse, DispatchError> {
+        let DispatchSteps {
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            params,
+            agent_ctx: enriched_agent_ctx,
+            await_integration,
+            expected_authorization_precondition,
+            workflow_root_active,
+        } = steps;
+        let enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();
@@ -810,6 +893,20 @@ impl crate::state::ServerState {
 
         Ok(response)
     }
+}
+
+/// One dispatch's inputs, handed to the span its work runs in.
+struct DispatchSteps<'a> {
+    tenant: &'a TenantId,
+    entity_type: &'a str,
+    entity_id: &'a str,
+    action: &'a str,
+    params: serde_json::Value,
+    agent_ctx: AgentContext,
+    await_integration: bool,
+    expected_authorization_precondition: Option<String>,
+    /// The work runs in a workflow's step span.
+    workflow_root_active: bool,
 }
 
 #[cfg(test)]

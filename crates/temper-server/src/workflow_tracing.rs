@@ -1,12 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use opentelemetry::trace::TraceContextExt;
-use tracing::Instrument;
+use opentelemetry::trace::{SpanContext, TraceContextExt};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const WORKFLOW_ROOT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Finished workflow runs remembered so late work links to their trace instead
+/// of opening a second trace for the same run.
+const FINISHED_RUNS_REMEMBERED: usize = 4_096;
 
 #[derive(Debug)]
 struct WorkflowRootSpan {
@@ -19,6 +21,38 @@ struct WorkflowRootSpan {
 #[derive(Debug, Default)]
 pub(crate) struct WorkflowSpanRegistry {
     spans: Mutex<BTreeMap<String, WorkflowRootSpan>>,
+    finished: Mutex<FinishedRuns>,
+}
+
+/// The root span contexts of recently finished workflow runs, oldest first.
+#[derive(Debug, Default)]
+struct FinishedRuns {
+    order: VecDeque<String>,
+    roots: BTreeMap<String, SpanContext>,
+}
+
+impl FinishedRuns {
+    fn remember(&mut self, run_id: &str, root: SpanContext) {
+        if self.roots.insert(run_id.to_string(), root).is_none() {
+            self.order.push_back(run_id.to_string());
+        }
+        while self.order.len() > FINISHED_RUNS_REMEMBERED {
+            if let Some(oldest) = self.order.pop_front() {
+                self.roots.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// Where a workflow dispatch's work goes.
+pub(crate) enum WorkflowParent {
+    /// The run's open root span: the work is a step in the workflow's trace.
+    Open(opentelemetry::Context),
+    /// The run already finished: the work stays in its request's trace, linked
+    /// to the finished workflow's root span.
+    Finished(SpanContext),
+    /// No trace to join (tracing is off).
+    None,
 }
 
 impl WorkflowSpanRegistry {
@@ -29,14 +63,24 @@ impl WorkflowSpanRegistry {
         root_entity_id: &str,
         workflow_run_id: &str,
         session_id: Option<&str>,
-    ) -> Option<opentelemetry::Context> {
-        let mut spans = self.spans.lock().ok()?;
+    ) -> WorkflowParent {
+        let Ok(mut spans) = self.spans.lock() else {
+            return WorkflowParent::None;
+        };
         if let Some(root) = spans.get(workflow_run_id) {
             let context = root.span.context();
             if context.span().span_context().is_valid() {
-                return Some(context);
+                return WorkflowParent::Open(context);
             }
             spans.remove(workflow_run_id);
+        }
+        if let Some(root) = self
+            .finished
+            .lock()
+            .ok()
+            .and_then(|finished| finished.roots.get(workflow_run_id).cloned())
+        {
+            return WorkflowParent::Finished(root);
         }
 
         let span = tracing::info_span!(
@@ -56,7 +100,7 @@ impl WorkflowSpanRegistry {
         );
         let context = span.context();
         if !context.span().span_context().is_valid() {
-            return None;
+            return WorkflowParent::None;
         }
 
         spans.insert(
@@ -67,7 +111,7 @@ impl WorkflowSpanRegistry {
                 span,
             },
         );
-        Some(context)
+        WorkflowParent::Open(context)
     }
 
     pub(crate) fn finish_if_terminal(
@@ -88,8 +132,13 @@ impl WorkflowSpanRegistry {
         let should_finish = spans.get(workflow_run_id).is_some_and(|root| {
             root.root_entity_type == entity_type && root.root_entity_id == entity_id
         });
-        if should_finish {
-            spans.remove(workflow_run_id);
+        if should_finish && let Some(root) = spans.remove(workflow_run_id) {
+            let root_context = root.span.context().span().span_context().clone();
+            if root_context.is_valid()
+                && let Ok(mut finished) = self.finished.lock()
+            {
+                finished.remember(workflow_run_id, root_context);
+            }
         }
         should_finish
     }
@@ -100,11 +149,15 @@ impl WorkflowSpanRegistry {
         entity_type: &str,
         entity_id: &str,
         status: &str,
-    ) -> Option<opentelemetry::Context> {
-        let spans = self.spans.lock().ok()?;
-        let root = spans.get(workflow_run_id)?;
+    ) {
+        let Ok(spans) = self.spans.lock() else {
+            return;
+        };
+        let Some(root) = spans.get(workflow_run_id) else {
+            return;
+        };
         if root.root_entity_type != entity_type || root.root_entity_id != entity_id {
-            return None;
+            return;
         }
 
         root.span.record("workflow.terminal_status", status);
@@ -114,13 +167,6 @@ impl WorkflowSpanRegistry {
         );
         root.span
             .record("workflow.drain_reason", "post_dispatch_telemetry");
-
-        let context = root.span.context();
-        if context.span().span_context().is_valid() {
-            Some(context)
-        } else {
-            None
-        }
     }
 
     pub(crate) fn finish_if_terminal_after_drain(
@@ -135,36 +181,12 @@ impl WorkflowSpanRegistry {
         }
 
         let registry = std::sync::Arc::clone(self);
-        let drain_context = registry.mark_terminal_drain_scheduled(
-            &workflow_run_id,
-            &entity_type,
-            &entity_id,
-            &status,
-        );
+        registry.mark_terminal_drain_scheduled(&workflow_run_id, &entity_type, &entity_id, &status);
         tokio::spawn(async move {
             // determinism-ok: observability-only root span cleanup after
-            // post-dispatch telemetry has had a chance to attach.
-            if let Some(parent_context) = drain_context {
-                let span = tracing::info_span!(
-                    parent: None,
-                    "temper.workflow.drain_grace",
-                    otel.name = "temper.workflow.drain_grace",
-                    workflow.run_id = %workflow_run_id,
-                    workflow.root_entity_type = %entity_type,
-                    workflow.root_entity_id = %entity_id,
-                    workflow.terminal_status = %status,
-                    workflow.drain_grace_ms = workflow_root_drain_grace_ms() as i64,
-                    workflow.drain_reason = "post_dispatch_telemetry",
-                );
-                span.set_parent(parent_context);
-                async {
-                    tokio::time::sleep(WORKFLOW_ROOT_DRAIN_GRACE).await;
-                }
-                .instrument(span)
-                .await;
-            } else {
-                tokio::time::sleep(WORKFLOW_ROOT_DRAIN_GRACE).await;
-            }
+            // post-dispatch telemetry has had a chance to attach. The wait is not
+            // a span of its own: the workflow trace shows only its work.
+            tokio::time::sleep(WORKFLOW_ROOT_DRAIN_GRACE).await;
             registry.finish_if_terminal(&workflow_run_id, &entity_type, &entity_id, &status);
         });
     }
@@ -192,48 +214,51 @@ fn is_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use opentelemetry::trace::TraceContextExt;
-    use opentelemetry::trace::TracerProvider as _;
-    use tracing_opentelemetry::OpenTelemetrySpanExt;
-    use tracing_subscriber::prelude::*;
+
+    use super::WorkflowParent;
+    use crate::test_spans;
+
+    fn open(parent: WorkflowParent) -> opentelemetry::Context {
+        match parent {
+            WorkflowParent::Open(context) => context,
+            _ => panic!("expected an open workflow root"),
+        }
+    }
 
     #[test]
-    fn workflow_root_span_is_not_child_of_short_http_request_span() {
-        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer_provider.tracer("temper-server-workflow-root-test")),
-        );
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-
+    fn workflow_root_span_is_its_own_trace_not_the_requests() {
+        let _spans = test_spans::capture();
         let registry = super::WorkflowSpanRegistry::default();
         let http_span = tracing::info_span!("http.request");
-        let http_trace_id = http_span
-            .context()
-            .span()
-            .span_context()
-            .trace_id()
-            .to_string();
+        let http_trace_id = crate::trace_context::span_context(&http_span).trace_id();
 
-        let workflow_parent = http_span.in_scope(|| {
+        let workflow = open(http_span.in_scope(|| {
             registry.parent_context("default", "Session", "ss-1", "Session:ss-1", Some("ss-1"))
-        });
-        let workflow_parent = workflow_parent.expect("workflow root context");
-        let workflow_trace_id = workflow_parent.span().span_context().trace_id().to_string();
-        assert_ne!(workflow_trace_id, http_trace_id);
-
-        http_span.in_scope(|| {
-            let dispatch_span = tracing::info_span!("dispatch.dispatch_tenant_action_core");
-            dispatch_span.set_parent(workflow_parent);
-            let dispatch_trace_id = dispatch_span
-                .context()
-                .span()
-                .span_context()
-                .trace_id()
-                .to_string();
-            assert_eq!(dispatch_trace_id, workflow_trace_id);
-        });
-
+        }));
+        assert_ne!(workflow.span().span_context().trace_id(), http_trace_id);
+        // The same run joins the same open root.
+        let again =
+            open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None));
+        assert_eq!(again.span().span_context(), workflow.span().span_context());
         assert!(registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Completed"));
+    }
+
+    #[test]
+    fn a_finished_run_never_opens_a_second_workflow_trace() {
+        let _spans = test_spans::capture();
+        let registry = super::WorkflowSpanRegistry::default();
+        let root =
+            open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None));
+        assert!(registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Completed"));
+
+        // A late callback for the same run: linked to the finished root, no new root.
+        match registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None) {
+            WorkflowParent::Finished(finished) => {
+                assert_eq!(&finished, root.span().span_context());
+            }
+            _ => panic!("a finished run must not open a second root"),
+        }
+        assert!(registry.spans.lock().expect("spans lock").is_empty());
     }
 
     #[test]
@@ -251,15 +276,9 @@ mod tests {
 
     #[test]
     fn workflow_root_span_closes_only_on_root_terminal_status() {
-        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer_provider.tracer("temper-server-workflow-root-close-test")),
-        );
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-
+        let _spans = test_spans::capture();
         let registry = super::WorkflowSpanRegistry::default();
-        registry.parent_context("default", "Session", "ss-1", "Session:ss-1", Some("ss-1"));
+        open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", Some("ss-1")));
 
         assert!(!registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Running"));
         assert!(!registry.finish_if_terminal("Session:ss-1", "Child", "child-1", "Completed"));
@@ -272,27 +291,29 @@ mod tests {
         assert_eq!(super::workflow_root_drain_grace_ms(), 2_000);
     }
 
-    #[test]
-    fn workflow_root_drain_attribution_only_marks_root_terminal_status() {
-        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer_provider.tracer("temper-server-workflow-root-drain-test")),
+    #[tokio::test]
+    async fn the_drain_grace_is_not_a_span() {
+        let spans = test_spans::capture();
+        let registry = std::sync::Arc::new(super::WorkflowSpanRegistry::default());
+        open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None));
+        tokio::time::pause();
+        registry.finish_if_terminal_after_drain(
+            "Session:ss-1".into(),
+            "Session".into(),
+            "ss-1".into(),
+            "Completed".into(),
         );
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-
-        let registry = super::WorkflowSpanRegistry::default();
-        registry.parent_context("default", "Session", "ss-1", "Session:ss-1", Some("ss-1"));
-
-        assert!(
-            registry
-                .mark_terminal_drain_scheduled("Session:ss-1", "Child", "child-1", "Completed")
-                .is_none()
-        );
-        assert!(
-            registry
-                .mark_terminal_drain_scheduled("Session:ss-1", "Session", "ss-1", "Completed")
-                .is_some()
+        // Paused time moves on while every task waits, so the drain task runs.
+        tokio::time::sleep(super::WORKFLOW_ROOT_DRAIN_GRACE * 2).await;
+        let names: Vec<_> = spans
+            .finished()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Session.workflow".to_string()],
+            "only the workflow root: {names:?}"
         );
     }
 
@@ -303,7 +324,7 @@ mod tests {
         let parent =
             registry.parent_context("default", "Session", "ss-1", "Session:ss-1", Some("ss-1"));
 
-        assert!(parent.is_none());
+        assert!(matches!(parent, WorkflowParent::None));
         assert!(registry.spans.lock().expect("spans lock").is_empty());
     }
 }

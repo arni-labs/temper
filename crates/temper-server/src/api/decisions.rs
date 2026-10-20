@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use temper_authz::AuthenticatedRequestContext;
 use temper_evolution::records::{Decision, DecisionRecord, RecordHeader, RecordType};
 use temper_runtime::scheduler::sim_now;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 use temper_runtime::tenant::TenantId;
 
@@ -328,7 +328,8 @@ pub(crate) async fn handle_approve_decision(
                 );
             }
         };
-        tokio::spawn(resolution_task); // determinism-ok: async callback dispatch for governance decision resolution
+        // The resolution is part of the approve or deny request.
+        tokio::spawn(resolution_task.in_current_span()); // determinism-ok: async callback dispatch for governance decision resolution
     }
 
     (
@@ -443,7 +444,8 @@ pub(crate) async fn handle_deny_decision(
                 );
             }
         };
-        tokio::spawn(resolution_task); // determinism-ok: async callback dispatch for governance decision resolution
+        // The resolution is part of the approve or deny request.
+        tokio::spawn(resolution_task.in_current_span()); // determinism-ok: async callback dispatch for governance decision resolution
     }
 
     (

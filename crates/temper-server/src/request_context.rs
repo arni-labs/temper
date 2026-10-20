@@ -281,18 +281,7 @@ pub fn intent_from_headers(headers: &HeaderMap) -> Option<String> {
 pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
     let session_id = session_id_from_headers(headers);
     let intent = intent_from_headers(headers);
-    // Extract W3C traceparent: "00-{trace_id}-{parent_span_id}-{flags}"
-    let (trace_id, parent_span_id) = headers
-        .get("traceparent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|tp| {
-            let parts: Vec<&str> = tp.split('-').collect();
-            if parts.len() >= 4 && parts[1].len() == 32 && parts[2].len() == 16 {
-                Some((parts[1].to_string(), parts[2].to_string()))
-            } else {
-                None
-            }
-        })
+    let (trace_id, parent_span_id) = traceparent_ids(headers)
         .map(|(t, s)| (Some(t), Some(s)))
         .unwrap_or((None, None));
 
@@ -338,9 +327,36 @@ pub(crate) fn current_span_trace_context_ids() -> Option<(String, String)> {
     ))
 }
 
+/// The trace and parent span ids of a W3C `traceparent` header:
+/// `00-{trace_id}-{parent_span_id}-{flags}`.
+fn traceparent_ids(headers: &HeaderMap) -> Option<(String, String)> {
+    let traceparent = headers.get("traceparent")?.to_str().ok()?;
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    (parts.len() >= 4 && parts[1].len() == 32 && parts[2].len() == 16)
+        .then(|| (parts[1].to_string(), parts[2].to_string()))
+}
+
+/// The caller's span from a request's `traceparent` header, as the parent of the
+/// request's server span. Only the server span takes it: everything the request
+/// does is then in that one trace.
+pub(crate) fn remote_parent_from_headers(headers: &HeaderMap) -> Option<opentelemetry::Context> {
+    let (trace_id, span_id) = traceparent_ids(headers)?;
+    remote_parent_from_ids(&trace_id, &span_id)
+}
+
 pub(crate) fn remote_parent_context(agent_ctx: &AgentContext) -> Option<opentelemetry::Context> {
-    let trace_id = TraceId::from_hex(agent_ctx.trace_id.as_deref()?).ok()?;
-    let span_id = SpanId::from_hex(agent_ctx.parent_span_id.as_deref()?).ok()?;
+    remote_parent_from_ids(
+        agent_ctx.trace_id.as_deref()?,
+        agent_ctx.parent_span_id.as_deref()?,
+    )
+}
+
+fn remote_parent_from_ids(trace_id: &str, span_id: &str) -> Option<opentelemetry::Context> {
+    let trace_id = TraceId::from_hex(trace_id).ok()?;
+    let span_id = SpanId::from_hex(span_id).ok()?;
+    if trace_id == TraceId::INVALID || span_id == SpanId::INVALID {
+        return None;
+    }
     let span_context = SpanContext::new(
         trace_id,
         span_id,

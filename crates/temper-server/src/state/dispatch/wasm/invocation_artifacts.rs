@@ -273,12 +273,15 @@ impl crate::state::ServerState {
             .observe_refresh_tx
             .send(crate::state::ObserveRefreshHint::Decisions);
         let state_c = self.clone();
-        tokio::spawn(async move {
-            // determinism-ok: background persist of pending decision
-            if let Err(e) = state_c.persist_pending_decision(&pd).await {
-                tracing::error!(error = %e, "failed to persist WASM authz decision");
+        tokio::spawn(
+            async move {
+                // determinism-ok: background persist of pending decision
+                if let Err(e) = state_c.persist_pending_decision(&pd).await {
+                    tracing::error!(error = %e, "failed to persist WASM authz decision");
+                }
             }
-        });
+            .in_current_span(),
+        );
 
         let state_c = self.clone();
         let gd_id = format!("GD-{}", sim_uuid());
@@ -298,7 +301,7 @@ impl crate::state::ServerState {
             ).await {
                 tracing::warn!(error = %e, "failed to create GovernanceDecision for WASM denial");
             }
-        });
+        }.in_current_span());
 
         let traj = TrajectoryEntry {
             timestamp: sim_now().to_rfc3339(),

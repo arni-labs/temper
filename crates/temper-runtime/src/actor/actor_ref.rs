@@ -15,6 +15,10 @@ pub enum Envelope<M: Message> {
     Ask {
         msg: M,
         reply: oneshot::Sender<Result<Box<dyn std::any::Any + Send>, ActorError>>,
+        /// The asker's span: the actor handles the message inside it, so what
+        /// the actor does (storage writes, snapshots) is part of the asker's
+        /// trace. The asker waits for the reply, so the span is open meanwhile.
+        span: tracing::Span,
     },
     /// System-level signal (stop, restart, etc.)
     Signal(SystemSignal),
@@ -85,7 +89,11 @@ impl<M: Message> ActorRef<M> {
     pub async fn ask<R: Send + 'static>(&self, msg: M, timeout: Duration) -> Result<R, ActorError> {
         let (tx, rx) = oneshot::channel();
 
-        self.sender.send(Envelope::Ask { msg, reply: tx })?;
+        self.sender.send(Envelope::Ask {
+            msg,
+            reply: tx,
+            span: tracing::Span::current(),
+        })?;
 
         let result = tokio::time::timeout(timeout, rx)
             .await
