@@ -17,7 +17,8 @@ struct WorkflowRootSpan {
     span: tracing::Span,
 }
 
-/// Keeps workflow root spans open across asynchronous entity actions.
+/// Keeps workflow root spans open across asynchronous entity actions, by
+/// tenant and run: two tenants' runs never share a trace.
 #[derive(Debug, Default)]
 pub(crate) struct WorkflowSpanRegistry {
     spans: Mutex<BTreeMap<String, WorkflowRootSpan>>,
@@ -32,9 +33,9 @@ struct FinishedRuns {
 }
 
 impl FinishedRuns {
-    fn remember(&mut self, run_id: &str, root: SpanContext) {
-        if self.roots.insert(run_id.to_string(), root).is_none() {
-            self.order.push_back(run_id.to_string());
+    fn remember(&mut self, run: &str, root: SpanContext) {
+        if self.roots.insert(run.to_string(), root).is_none() {
+            self.order.push_back(run.to_string());
         }
         while self.order.len() > FINISHED_RUNS_REMEMBERED {
             if let Some(oldest) = self.order.pop_front() {
@@ -64,21 +65,22 @@ impl WorkflowSpanRegistry {
         workflow_run_id: &str,
         session_id: Option<&str>,
     ) -> WorkflowParent {
+        let key = run_key(tenant, workflow_run_id);
         let Ok(mut spans) = self.spans.lock() else {
             return WorkflowParent::None;
         };
-        if let Some(root) = spans.get(workflow_run_id) {
+        if let Some(root) = spans.get(&key) {
             let context = root.span.context();
             if context.span().span_context().is_valid() {
                 return WorkflowParent::Open(context);
             }
-            spans.remove(workflow_run_id);
+            spans.remove(&key);
         }
         if let Some(root) = self
             .finished
             .lock()
             .ok()
-            .and_then(|finished| finished.roots.get(workflow_run_id).cloned())
+            .and_then(|finished| finished.roots.get(&key).cloned())
         {
             return WorkflowParent::Finished(root);
         }
@@ -104,7 +106,7 @@ impl WorkflowSpanRegistry {
         }
 
         spans.insert(
-            workflow_run_id.to_string(),
+            key,
             WorkflowRootSpan {
                 root_entity_type: root_entity_type.to_string(),
                 root_entity_id: root_entity_id.to_string(),
@@ -116,6 +118,7 @@ impl WorkflowSpanRegistry {
 
     pub(crate) fn finish_if_terminal(
         &self,
+        tenant: &str,
         workflow_run_id: &str,
         entity_type: &str,
         entity_id: &str,
@@ -125,19 +128,20 @@ impl WorkflowSpanRegistry {
             return false;
         }
 
+        let key = run_key(tenant, workflow_run_id);
         let Ok(mut spans) = self.spans.lock() else {
             return false;
         };
 
-        let should_finish = spans.get(workflow_run_id).is_some_and(|root| {
+        let should_finish = spans.get(&key).is_some_and(|root| {
             root.root_entity_type == entity_type && root.root_entity_id == entity_id
         });
-        if should_finish && let Some(root) = spans.remove(workflow_run_id) {
+        if should_finish && let Some(root) = spans.remove(&key) {
             let root_context = root.span.context().span().span_context().clone();
             if root_context.is_valid()
                 && let Ok(mut finished) = self.finished.lock()
             {
-                finished.remember(workflow_run_id, root_context);
+                finished.remember(&key, root_context);
             }
         }
         should_finish
@@ -145,6 +149,7 @@ impl WorkflowSpanRegistry {
 
     fn mark_terminal_drain_scheduled(
         &self,
+        tenant: &str,
         workflow_run_id: &str,
         entity_type: &str,
         entity_id: &str,
@@ -153,7 +158,7 @@ impl WorkflowSpanRegistry {
         let Ok(spans) = self.spans.lock() else {
             return;
         };
-        let Some(root) = spans.get(workflow_run_id) else {
+        let Some(root) = spans.get(&run_key(tenant, workflow_run_id)) else {
             return;
         };
         if root.root_entity_type != entity_type || root.root_entity_id != entity_id {
@@ -171,6 +176,7 @@ impl WorkflowSpanRegistry {
 
     pub(crate) fn finish_if_terminal_after_drain(
         self: &std::sync::Arc<Self>,
+        tenant: String,
         workflow_run_id: String,
         entity_type: String,
         entity_id: String,
@@ -181,15 +187,31 @@ impl WorkflowSpanRegistry {
         }
 
         let registry = std::sync::Arc::clone(self);
-        registry.mark_terminal_drain_scheduled(&workflow_run_id, &entity_type, &entity_id, &status);
+        registry.mark_terminal_drain_scheduled(
+            &tenant,
+            &workflow_run_id,
+            &entity_type,
+            &entity_id,
+            &status,
+        );
         tokio::spawn(async move {
             // determinism-ok: observability-only root span cleanup after
             // post-dispatch telemetry has had a chance to attach. The wait is not
             // a span of its own: the workflow trace shows only its work.
             tokio::time::sleep(WORKFLOW_ROOT_DRAIN_GRACE).await;
-            registry.finish_if_terminal(&workflow_run_id, &entity_type, &entity_id, &status);
+            registry.finish_if_terminal(
+                &tenant,
+                &workflow_run_id,
+                &entity_type,
+                &entity_id,
+                &status,
+            );
         });
     }
+}
+
+fn run_key(tenant: &str, workflow_run_id: &str) -> String {
+    format!("{tenant}\u{0}{workflow_run_id}")
 }
 
 fn workflow_root_drain_grace_ms() -> u64 {
@@ -240,7 +262,13 @@ mod tests {
         let again =
             open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None));
         assert_eq!(again.span().span_context(), workflow.span().span_context());
-        assert!(registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Completed"));
+        assert!(registry.finish_if_terminal(
+            "default",
+            "Session:ss-1",
+            "Session",
+            "ss-1",
+            "Completed"
+        ));
     }
 
     #[test]
@@ -249,7 +277,13 @@ mod tests {
         let registry = super::WorkflowSpanRegistry::default();
         let root =
             open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None));
-        assert!(registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Completed"));
+        assert!(registry.finish_if_terminal(
+            "default",
+            "Session:ss-1",
+            "Session",
+            "ss-1",
+            "Completed"
+        ));
 
         // A late callback for the same run: linked to the finished root, no new root.
         match registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None) {
@@ -259,6 +293,20 @@ mod tests {
             _ => panic!("a finished run must not open a second root"),
         }
         assert!(registry.spans.lock().expect("spans lock").is_empty());
+    }
+
+    #[test]
+    fn two_tenants_runs_with_the_same_id_are_two_workflows() {
+        let _spans = test_spans::capture();
+        let registry = super::WorkflowSpanRegistry::default();
+        let a = open(registry.parent_context("a", "Session", "ss-1", "Session:ss-1", None));
+        assert!(registry.finish_if_terminal("a", "Session:ss-1", "Session", "ss-1", "Completed"));
+        let b = open(registry.parent_context("b", "Session", "ss-1", "Session:ss-1", None));
+        assert_ne!(
+            a.span().span_context().trace_id(),
+            b.span().span_context().trace_id(),
+            "tenant b's run opens its own workflow, not late work for tenant a's"
+        );
     }
 
     #[test]
@@ -280,10 +328,34 @@ mod tests {
         let registry = super::WorkflowSpanRegistry::default();
         open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", Some("ss-1")));
 
-        assert!(!registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Running"));
-        assert!(!registry.finish_if_terminal("Session:ss-1", "Child", "child-1", "Completed"));
-        assert!(registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Completed"));
-        assert!(!registry.finish_if_terminal("Session:ss-1", "Session", "ss-1", "Completed"));
+        assert!(!registry.finish_if_terminal(
+            "default",
+            "Session:ss-1",
+            "Session",
+            "ss-1",
+            "Running"
+        ));
+        assert!(!registry.finish_if_terminal(
+            "default",
+            "Session:ss-1",
+            "Child",
+            "child-1",
+            "Completed"
+        ));
+        assert!(registry.finish_if_terminal(
+            "default",
+            "Session:ss-1",
+            "Session",
+            "ss-1",
+            "Completed"
+        ));
+        assert!(!registry.finish_if_terminal(
+            "default",
+            "Session:ss-1",
+            "Session",
+            "ss-1",
+            "Completed"
+        ));
     }
 
     #[test]
@@ -298,6 +370,7 @@ mod tests {
         open(registry.parent_context("default", "Session", "ss-1", "Session:ss-1", None));
         tokio::time::pause();
         registry.finish_if_terminal_after_drain(
+            "default".into(),
             "Session:ss-1".into(),
             "Session".into(),
             "ss-1".into(),

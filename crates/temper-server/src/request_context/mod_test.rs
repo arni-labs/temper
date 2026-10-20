@@ -258,3 +258,42 @@ fn session_and_intent_helpers_ignore_blank_and_missing_headers() {
     assert!(intent_from_headers(&headers).is_none());
     assert!(session_id_from_headers(&HeaderMap::new()).is_none());
 }
+
+#[test]
+fn the_callers_sampling_and_tracestate_reach_the_server_span() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("tracestate", "dd=s:0,vendor=x".parse().unwrap());
+    let remote = remote_parent_from_headers(&headers).expect("a valid traceparent");
+    let span = remote.span();
+    let context = span.span_context();
+    assert!(
+        !context.is_sampled(),
+        "a trace the caller did not sample stays unsampled"
+    );
+    assert_eq!(context.trace_state().get("vendor"), Some("x"));
+
+    headers.insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            .parse()
+            .unwrap(),
+    );
+    let remote = remote_parent_from_headers(&headers).expect("a valid traceparent");
+    assert!(remote.span().span_context().is_sampled());
+
+    for invalid in [
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+    ] {
+        headers.insert("traceparent", invalid.parse().unwrap());
+        assert!(remote_parent_from_headers(&headers).is_none(), "{invalid}");
+    }
+}

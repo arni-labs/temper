@@ -2852,12 +2852,14 @@ async fn a_request_with_a_traceparent_is_one_trace_with_one_root() {
         "only the server span has an HTTP status: {with_status:?}"
     );
 
-    let ids: std::collections::HashSet<_> =
-        finished.iter().map(|s| s.span_context.span_id()).collect();
+    let ids: std::collections::BTreeSet<String> = finished
+        .iter()
+        .map(|s| s.span_context.span_id().to_string())
+        .collect();
     assert_eq!(ids.len(), finished.len(), "no span is exported twice");
     for span in &finished {
         assert!(
-            span.parent_span_id == caller || ids.contains(&span.parent_span_id),
+            span.parent_span_id == caller || ids.contains(&span.parent_span_id.to_string()),
             "{} has a parent that is not in the trace",
             span.name
         );

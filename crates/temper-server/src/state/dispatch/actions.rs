@@ -884,6 +884,7 @@ impl crate::state::ServerState {
         }
         if workflow_root_active && let Some(workflow_run_id) = agent_ctx.workflow_run_id.clone() {
             self.workflow_spans.finish_if_terminal_after_drain(
+                tenant.to_string(),
                 workflow_run_id,
                 entity_type.to_string(),
                 entity_id.to_string(),
