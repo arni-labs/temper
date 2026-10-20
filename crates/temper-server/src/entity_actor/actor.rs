@@ -181,6 +181,7 @@ impl EntityActor {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
+            status_clock: Default::default(),
         }
     }
 

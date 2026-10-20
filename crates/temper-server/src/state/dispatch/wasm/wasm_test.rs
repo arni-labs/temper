@@ -168,6 +168,7 @@ fn llm_model_for_observability_prefers_callback_model() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        status_clock: Default::default(),
     };
     let callback_params = json!({
         "_gen_ai_model": "gpt-5.4",
@@ -227,6 +228,7 @@ fn llm_root_span_stays_on_active_trace() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        status_clock: Default::default(),
     };
     let integration = temper_spec::automaton::Integration {
         name: "provider_caller".to_string(),
@@ -329,6 +331,7 @@ fn llm_parent_context_records_llm_span_and_dispatch_parent_ids() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        status_clock: Default::default(),
     };
     let (llm_trace_id, llm_span_id) = dispatch_parent.in_scope(|| {
         let llm_span = tracing::info_span!("llm_caller.trace");
@@ -425,6 +428,7 @@ fn llm_parent_context_reuses_existing_llmobs_agent_root() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        status_clock: Default::default(),
     };
 
     let mut callback_params = json!({});
@@ -468,6 +472,7 @@ fn llmobs_tool_parent_prefers_workflow_span_id() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        status_clock: Default::default(),
     };
 
     assert_eq!(

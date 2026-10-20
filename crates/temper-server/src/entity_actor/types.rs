@@ -115,6 +115,35 @@ pub struct EntityState {
     /// after process restart can return success without re-applying the action.
     #[serde(default)]
     pub processed_idempotency_keys: BTreeMap<String, u64>,
+    /// When the current status began, and when each action last ran since.
+    /// Kept in snapshots, which leave `events` out.
+    #[serde(default)]
+    pub status_clock: StatusClock,
+}
+
+/// When an entity's current status began, and when each action was last
+/// applied since then: how long a state timer's clock has been running. A state
+/// restored from a snapshot has no `events` before the snapshot to read this
+/// from, so it is kept here instead (ADR-0056).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatusClock {
+    /// When the event that entered the current status was applied.
+    #[serde(default)]
+    pub entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The last time each action was applied since the status was entered.
+    #[serde(default)]
+    pub actions: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+}
+
+impl StatusClock {
+    fn record(&mut self, event: &EntityEvent) {
+        if event.from_status != event.to_status {
+            self.entered_at = Some(event.timestamp);
+            self.actions.clear();
+        } else {
+            self.actions.insert(event.action.clone(), event.timestamp);
+        }
+    }
 }
 
 impl EntityState {
@@ -130,6 +159,7 @@ impl EntityState {
         if let Some(key) = event.idempotency_key.as_deref() {
             self.record_processed_idempotency_key(key);
         }
+        self.status_clock.record(&event);
         self.events.push_back(event);
 
         let budget = recent_events_budget();
@@ -233,6 +263,7 @@ mod tests {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
         let serialized = serde_json::to_string(&state).unwrap();
         let deserialized: EntityState = serde_json::from_str(&serialized).unwrap();
@@ -280,6 +311,7 @@ mod tests {
             last_snapshot_sequence_nr: MAX_EVENTS_SINCE_SNAPSHOT as u64 + 48,
             sequence_nr: MAX_EVENTS_SINCE_SNAPSHOT as u64 + 50,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         assert!(state.can_accept_event());
@@ -302,6 +334,7 @@ mod tests {
             last_snapshot_sequence_nr: 0,
             sequence_nr: MAX_EVENTS_SINCE_SNAPSHOT as u64,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
 
         assert!(!state.can_accept_event());
@@ -342,6 +375,7 @@ mod tests {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            status_clock: Default::default(),
         };
         let resp = EntityResponse {
             success: true,
