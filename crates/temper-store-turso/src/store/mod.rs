@@ -36,6 +36,7 @@ mod query_page;
 mod secrets;
 mod spec_versions;
 mod specs;
+pub mod sync_adopt;
 #[cfg(test)]
 mod tests;
 mod trajectory;
@@ -142,7 +143,9 @@ impl TursoEventStore {
         while let Some(row) = rows.next().await.map_err(storage_error)? {
             let name = row.get::<String>(0).unwrap_or_default();
             let sql = row.get::<String>(1).unwrap_or_default();
-            let internal = name.starts_with("sqlite_") || name.starts_with("turso_");
+            let internal = ["sqlite_", "turso_", "__turso"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
             if !internal && !sql.to_ascii_uppercase().contains("PRIMARY KEY") {
                 unkeyed.push(name);
             }

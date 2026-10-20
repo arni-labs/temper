@@ -14,10 +14,15 @@
 //!   for inspection) and the next start downloads the remote.
 //! - If the stop was raised in error and the remote holds every change:
 //!   `resume` clears it and the next start confirms writes again.
+//!
+//! `adopt` moves a database that was never synced onto an empty remote, with
+//! the app stopped and TURSO_SYNC_URL and TURSO_SYNC_AUTH_TOKEN set: the file
+//! is set aside and kept, and its rows are copied into a fresh synced
+//! database, pushed chunk by chunk.
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use temper_store_turso::SyncCopy;
 
 #[derive(clap::Subcommand)]
@@ -38,9 +43,15 @@ pub enum Action {
         #[arg(long)]
         db: String,
     },
+    /// With the app stopped: copy a never-synced database onto the empty remote
+    /// named by TURSO_SYNC_URL and TURSO_SYNC_AUTH_TOKEN, keeping the original aside.
+    Adopt {
+        #[arg(long)]
+        db: String,
+    },
 }
 
-pub fn run(action: Action) -> Result<()> {
+pub async fn run(action: Action) -> Result<()> {
     let report = match action {
         Action::Status { db } => SyncCopy::describe(&db)?,
         Action::Resume { db } => match SyncCopy::clear_stop(&db)? {
@@ -51,6 +62,12 @@ pub fn run(action: Action) -> Result<()> {
             "moved to {}; the next start restores the database from its remote copy",
             SyncCopy::set_aside(&db)?.display()
         ),
+        Action::Adopt { db } => {
+            let url = std::env::var("TURSO_SYNC_URL").context("TURSO_SYNC_URL is required")?;
+            let token = std::env::var("TURSO_SYNC_AUTH_TOKEN")
+                .context("TURSO_SYNC_AUTH_TOKEN is required")?;
+            temper_store_turso::store::sync_adopt::adopt(&db, &url, &token).await?
+        }
     };
     writeln!(std::io::stdout(), "{report}")?;
     Ok(())

@@ -469,7 +469,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             url,
             agent_id,
         } => mcp::run(port, url, agent_id).await?,
-        Commands::SyncCopy { action } => sync_copy_cmd::run(action)?,
+        Commands::SyncCopy { action } => sync_copy_cmd::run(action).await?,
         Commands::MigrateTursoToPostgres {
             tenant,
             dry_run,
