@@ -346,6 +346,9 @@ fn record_reaction_fanout_span(counts: ReactionFanoutCounts) {
 ///   sees it via `principal.agent_type == "<name>"`.
 /// - When the rule has no principal (`None`), inherit the invoking context
 ///   directly — the trigger runs as whoever called the source action.
+///
+/// Either way the reaction carries its own idempotency key, derived from the
+/// caller's and the rule's name ([`reaction_idempotency_key`]).
 fn resolve_trigger_principal(
     declared_principal: Option<&str>,
     invoking_ctx: &AgentContext,
@@ -354,12 +357,9 @@ fn resolve_trigger_principal(
     source_entity_id: &str,
     source_action: &str,
 ) -> AgentContext {
-    match declared_principal {
+    let mut ctx = match declared_principal {
         Some(service_name) if !service_name.is_empty() => {
             let mut ctx = AgentContext::for_service_inheriting(service_name, invoking_ctx);
-            // Preserve ADR-0048 behavior for declared reaction principals:
-            // existing trigger dispatch copied the caller's idempotency key.
-            ctx.idempotency_key = invoking_ctx.idempotency_key.clone();
             if let Some(security_ctx) = ctx.security_ctx.as_mut() {
                 security_ctx.context_attrs.insert(
                     "triggerRule".to_string(),
@@ -385,7 +385,22 @@ fn resolve_trigger_principal(
             ctx
         }
         _ => invoking_ctx.clone(),
-    }
+    };
+    ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name);
+    ctx
+}
+
+/// A reaction's idempotency key: the caller's, made the rule's own (ADR-0048).
+/// A retry of the source action carries the same caller key, so its reactions
+/// are deduplicated too. The caller's key itself would make a reaction on the
+/// source's own record (`same_id`) a duplicate of the source action, which
+/// that record has just recorded under the key, and the reaction would be
+/// answered as done without running.
+fn reaction_idempotency_key(invoking_ctx: &AgentContext, rule_name: &str) -> Option<String> {
+    invoking_ctx
+        .idempotency_key
+        .as_ref()
+        .map(|key| format!("{key}:reaction:{rule_name}"))
 }
 
 fn effective_trigger_security_context(agent_ctx: &AgentContext) -> SecurityContext {
