@@ -225,3 +225,30 @@ pub async fn valve(upstream: &str) -> (String, std::sync::Arc<std::sync::atomic:
     });
     (url, open)
 }
+
+/// Forwards to the sync server while on; while off, closes every new
+/// connection at once, as a remote that cannot be reached.
+pub async fn switch(upstream: &str) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let upstream = upstream.trim_start_matches("http://").to_string();
+    let flag = on.clone();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            if !flag.load(Ordering::Acquire) {
+                continue;
+            }
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    (url, on)
+}

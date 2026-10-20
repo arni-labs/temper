@@ -9,8 +9,10 @@ mod support;
 
 use std::time::{Duration, Instant};
 
+use std::path::PathBuf;
 use support::*;
-use temper_store_turso::TursoEventStore;
+
+use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 #[tokio::test]
 async fn a_pushed_write_is_restored_on_a_fresh_machine_and_an_unpushed_one_is_not() {
@@ -306,6 +308,15 @@ async fn a_refused_change_still_blocks_confirmation_after_a_restart() {
         .await
         .expect_err("still not confirmed after a restart");
     assert!(error.to_string().contains("missing a change"), "{error}");
+    drop(a);
+
+    // An operator rebuilt the remote, then clears the stop with the app stopped.
+    let cleared = SyncCopy::clear_stop(a_path.to_str().expect("utf-8")).expect("clear");
+    assert!(cleared.is_some_and(|cause| cause.contains("wasm_modules")));
+    let a = server.open(&a_path).await;
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    write(&a, "r1", 2).await;
+    push(&a).await;
 }
 
 #[tokio::test]
@@ -326,6 +337,7 @@ async fn a_push_to_a_remote_that_stops_answering_fails_in_bounded_time() {
         .push_committed()
         .await
         .expect_err("a push nobody answers is not a success");
+    assert_eq!(a.sync_copy().expect("copy").pushes_timed_out_in_a_row(), 1);
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "{:?}",
@@ -334,24 +346,101 @@ async fn a_push_to_a_remote_that_stops_answering_fails_in_bounded_time() {
 }
 
 #[tokio::test]
-async fn a_start_that_cannot_reach_the_remote_fails_rather_than_serve_unchecked() {
-    // Whether the file came back from an older copy can be told only before
-    // new changes commit, and only by asking the remote.
+async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_answers() {
+    // Rita, 17 Oct: "Read only". Whether the file is behind the remote can be
+    // told only by asking the remote, so until then nothing is pushed.
     let Some(server) = SyncServer::start() else {
         return;
     };
+    let (url, on) = switch(&server.url).await;
     let (_a_dir, a_path) = machine();
-    let a = server.open(&a_path).await;
+    let a = TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &url, TOKEN)
+        .await
+        .expect("open");
     write(&a, "u1", 0).await;
     push(&a).await;
     drop(a);
 
-    let unreachable = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        format!("http://{}", listener.local_addr().expect("addr"))
-    };
-    let error = TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &unreachable, TOKEN)
+    on.store(false, std::sync::atomic::Ordering::Release);
+    let a = TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &url, TOKEN)
         .await
-        .expect_err("must not serve an unchecked file");
-    assert!(error.to_string().contains("could not check"), "{error}");
+        .expect("a start without the remote still serves");
+    let copy = a.sync_copy().expect("copy").clone();
+    assert_eq!(copy.state(), CopyState::Unchecked);
+    assert_eq!(count(&a, "u1").await, 1, "reads are served");
+    copy.push_committed()
+        .await
+        .expect_err("nothing is confirmed unchecked");
+    copy.recheck().await.expect_err("still unreachable");
+
+    on.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(copy.recheck().await.expect("recheck"), CopyState::Copying);
+    write(&a, "u1", 1).await;
+    push(&a).await;
+    let (_b_dir, b_path) = machine();
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "u1").await, 2);
+}
+
+#[tokio::test]
+async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (url, on) = switch(&server.url).await;
+    let open = |path: PathBuf| {
+        let url = url.clone();
+        async move {
+            TursoEventStore::new_synced(path.to_str().expect("utf-8"), &url, TOKEN)
+                .await
+                .expect("open")
+        }
+    };
+    let (a_dir, a_path) = machine();
+    let older = tempfile::tempdir().expect("snapshot dir");
+    let a = open(a_path.clone()).await;
+    write(&a, "old", 0).await;
+    push(&a).await;
+    drop(a);
+    copy_files(a_dir.path(), older.path());
+    let a = open(a_path.clone()).await;
+    for i in 0..5 {
+        write(&a, "later", i).await;
+    }
+    push(&a).await;
+    drop(a);
+    remove_files(a_dir.path());
+    copy_files(older.path(), a_dir.path());
+
+    on.store(false, std::sync::atomic::Ordering::Release);
+    let a = open(a_path.clone()).await;
+    let copy = a.sync_copy().expect("copy").clone();
+    assert_eq!(copy.state(), CopyState::Unchecked);
+    // Work the server does on its own still commits locally while unchecked,
+    // here more changes than the remote is ahead by, so the file's newest
+    // change number passes the remote's: only the number at open tells.
+    for i in 0..10 {
+        write(&a, "meanwhile", i).await;
+    }
+    // A restart during the outage keeps the number from the first start.
+    drop((a, copy));
+    let a = open(a_path.clone()).await;
+    let copy = a.sync_copy().expect("copy").clone();
+    assert_eq!(copy.state(), CopyState::Unchecked);
+    on.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(copy.recheck().await.expect("recheck"), CopyState::Behind);
+    copy.push_committed()
+        .await
+        .expect_err("a file behind confirms nothing");
+    drop((a, copy));
+
+    // The restart the server makes restores the file from the remote.
+    let a = open(a_path).await;
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    assert_eq!(count(&a, "later").await, 5);
+    write(&a, "after", 0).await;
+    push(&a).await;
+    let (_b_dir, b_path) = machine();
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "after").await, 1);
 }

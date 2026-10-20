@@ -3,6 +3,7 @@
 //
 //   node scripts/turso-sync/check.mjs kill   # confirmed writes survive a killed server and a lost disk
 //   node scripts/turso-sync/check.mjs time   # time per write and per burst, with and without the copy
+//   node scripts/turso-sync/check.mjs readonly  # a start without the remote serves reads, refuses writes, recovers
 //
 // Env:
 //   TEMPER_BIN        temper binary (default: target/release/temper, then target/debug/temper)
@@ -73,6 +74,16 @@ async function remote() {
   const proxyPort = await freePort();
   delayProxy(proxyPort, port, delay);
   return { url: `http://127.0.0.1:${proxyPort}`, token: "local" };
+}
+
+// Forwards to `upstream` while `on.value`; otherwise closes new connections at once.
+function switchProxy(listen, upstream, on) {
+  net.createServer((client) => {
+    if (!on.value) return client.destroy();
+    const up = net.connect(upstream.port, upstream.host);
+    client.pipe(up).pipe(client);
+    for (const socket of [client, up]) socket.on("error", () => { client.destroy(); up.destroy(); });
+  }).listen(listen, "127.0.0.1");
 }
 
 // Every chunk waits `delay` ms in each direction, in order, so a request and its answer cost twice that.
@@ -249,13 +260,57 @@ async function timeCheck() {
   return Object.values(results).every((r) => r.failed_writes === 0);
 }
 
+async function readonlyCheck() {
+  // The switch sits in front of the local sync server (or a real remote's host).
+  const sync = await remote();
+  const target = new URL(sync.url.replace(/^libsql:/, "https:"));
+  if (target.protocol !== "http:") throw new Error("readonly runs against the local sync server");
+  const on = { value: true };
+  const port = await freePort();
+  switchProxy(port, { host: target.hostname, port: Number(target.port) }, on);
+  const through = { url: `http://127.0.0.1:${port}`, token: sync.token };
+
+  const a = await temper("a", through);
+  for (let i = 0; i < 5; i++) if (!(await write(a.base, `${run}-ro`, i)).ok) throw new Error("setup write failed");
+  a.child.kill("SIGTERM");
+  await new Promise((r) => a.child.once("exit", r));
+
+  on.value = false;
+  const b = await temper("a", through);
+  const read = await get(b.base, `/tdata/ProbeNotes('${run}-ro')`);
+  const paused = await write(b.base, `${run}-ro`, 5);
+  on.value = true;
+  const t0 = Date.now();
+  let resumed = null;
+  for (let i = 0; i < 100 && !resumed?.ok; i++) {
+    resumed = await write(b.base, `${run}-ro`, 6);
+    if (!resumed.ok) await sleep(200);
+  }
+  b.child.kill("SIGKILL");
+  fs.rmSync(b.home, { recursive: true, force: true });
+  const c = await temper("c", sync);
+  const restored = JSON.parse((await get(c.base, `/tdata/ProbeNotes('${run}-ro')`)).text);
+  const n = Number(restored.counters?.n ?? restored.fields?.n ?? restored.n ?? 0);
+  const result = {
+    check: "readonly",
+    read_while_down: read.status,
+    write_while_down: `${paused.status} ${paused.text.slice(0, 80)}`,
+    write_after_remote_back_ms: resumed?.ok ? Date.now() - t0 : null,
+    confirmed: 6,
+    restored_n: n,
+  };
+  out(result);
+  return read.status === 200 && paused.status === 503 && resumed?.ok && n >= 6;
+}
+
 let ok = false;
 try {
   if (!temperBin) throw new Error("no temper binary: build it or set TEMPER_BIN");
   const mode = process.argv[2];
   if (mode === "kill") ok = await killCheck();
   else if (mode === "time") ok = await timeCheck();
-  else throw new Error("usage: check.mjs kill|time");
+  else if (mode === "readonly") ok = await readonlyCheck();
+  else throw new Error("usage: check.mjs kill|time|readonly");
 } catch (error) {
   console.error(String(error));
 } finally {

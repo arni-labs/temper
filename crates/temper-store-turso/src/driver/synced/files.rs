@@ -34,6 +34,84 @@ pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
     Ok(aside)
 }
 
+/// Written next to the database while it waits to be checked against the
+/// remote: the newest change the file held before that start committed
+/// anything. A later start keeps the number, since what it commits meanwhile
+/// says nothing about whether the file is behind.
+const UNCHECKED_SUFFIX: &str = "-sync-unchecked";
+
+pub(super) fn unchecked_since(path: &Path) -> Option<i64> {
+    std::fs::read_to_string(sidecar(path, UNCHECKED_SUFFIX))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub(super) fn mark_unchecked(path: &Path, opened_at: i64) -> Result<(), DriverError> {
+    if unchecked_since(path).is_some() {
+        return Ok(());
+    }
+    std::fs::write(sidecar(path, UNCHECKED_SUFFIX), opened_at.to_string())
+        .map_err(|error| DriverError::SyncSetup(format!("record the unchecked start: {error}")))
+}
+
+pub(super) fn mark_checked(path: &Path) {
+    let _ = std::fs::remove_file(sidecar(path, UNCHECKED_SUFFIX));
+}
+
+/// The sync engine's metadata for the file (`<db>-info`).
+pub(super) fn sync_metadata(path: &Path) -> Result<serde_json::Value, DriverError> {
+    let info = std::fs::read(sidecar(path, "-info"))
+        .map_err(|error| DriverError::SyncSetup(format!("read sync metadata: {error}")))?;
+    serde_json::from_slice(&info)
+        .map_err(|error| DriverError::SyncSetup(format!("parse sync metadata: {error}")))
+}
+
+/// Remove the recorded stop, returning the cause it held.
+pub(super) fn clear_stop(path: &Path) -> Result<Option<String>, DriverError> {
+    let marker = sidecar(path, DIVERGED_SUFFIX);
+    let Ok(cause) = std::fs::read_to_string(&marker) else {
+        return Ok(None);
+    };
+    let cause = cause.trim().to_string();
+    std::fs::remove_file(&marker)
+        .map_err(|error| DriverError::SyncSetup(format!("remove {}: {error}", marker.display())))?;
+    Ok(Some(cause))
+}
+
+/// A short account of the file, its sync metadata and any stop.
+pub(super) fn describe(path: &Path) -> Result<String, DriverError> {
+    let size = |file: &Path| std::fs::metadata(file).map(|meta| meta.len()).ok();
+    let mut lines = vec![match size(path) {
+        Some(bytes) => format!("database: {} ({bytes} bytes)", path.display()),
+        None => format!(
+            "database: {} (missing; the next start restores it from the remote)",
+            path.display()
+        ),
+    }];
+    match sync_metadata(path) {
+        Ok(info) => lines.push(format!(
+            "synced: client {}, last change the remote confirmed {}",
+            info["client_unique_id"].as_str().unwrap_or("?"),
+            info["last_pushed_change_id_hint"].as_i64().unwrap_or(0)
+        )),
+        Err(_) => lines.push("synced: no sync metadata".to_string()),
+    }
+    if let Some(opened_at) = unchecked_since(path) {
+        lines.push(format!(
+            "unchecked: since a start with changes up to {opened_at}"
+        ));
+    }
+    lines.push(
+        match std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {
+            Ok(cause) => format!("stopped: {}", cause.trim()),
+            Err(_) => "stopped: no".to_string(),
+        },
+    );
+    Ok(lines.join("\n"))
+}
+
 /// Refuse to open a local database that the sync engine would replace.
 ///
 /// With no sync metadata next to it, the engine bootstraps the file from the

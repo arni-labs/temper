@@ -17,12 +17,12 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true }
 opentelemetry = { workspace = true }
 
 [features]
 default = []
-cloud = ["reqwest"]
+cloud = []
 
 [dev-dependencies]
 tokio = { workspace = true }
