@@ -154,16 +154,22 @@ async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
     assert!(a_path.exists(), "a failed adoption puts the file back");
     assert!(!a_dir.path().join("app.db-info").exists());
 
-    // A run that was killed after pushing some rows left its staging files.
+    // A run that began copying, then was killed or failed, pushed some rows.
     let staging = a_dir.path().join("app.db.adopting");
     let killed = server.open(&staging).await;
     write(&killed, "stray", 0).await;
     push(&killed).await;
     drop(killed);
+    temper_store_turso::store::sync_adopt::adopt(db, &server.url, TOKEN)
+        .await
+        .expect_err("a remote holding events no run of this adopt began on is refused");
+    let started = a_dir.path().join("app.db.adopt-started");
+    std::fs::write(&started, b"").expect("mark");
 
     let report = temper_store_turso::store::sync_adopt::adopt(db, &server.url, TOKEN)
         .await
-        .expect("adopt, starting over after the killed run");
+        .expect("adopt, starting over after the run that began copying");
+    assert!(!started.exists(), "the mark goes once the file is moved");
     assert!(
         !staging.exists(),
         "the staged database took the file's place"
