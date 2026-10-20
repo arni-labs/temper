@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     PRIMARY KEY(tenant, entity_type, entity_id)
 );";
 
+/// Specs per (tenant, entity_type). A primary key rather than a UNIQUE
+/// constraint: Turso Sync replays every change on its remote by primary key.
 pub const CREATE_SPECS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS specs (
     tenant TEXT NOT NULL,
@@ -65,7 +67,7 @@ CREATE TABLE IF NOT EXISTS specs (
     levels_total INTEGER,
     verification_result TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(tenant, entity_type)
+    PRIMARY KEY(tenant, entity_type)
 );";
 
 pub const CREATE_TRAJECTORIES_TABLE: &str = "\
@@ -101,7 +103,8 @@ CREATE TABLE IF NOT EXISTS tenant_constraints (
 /// CREATE TABLE statement for WASM module storage.
 ///
 /// Stores compiled WASM binaries for agent-generated integration handlers.
-/// Keyed by (tenant, module_name) with version tracking and SHA-256 integrity.
+/// Keyed by (tenant, module_name) with version tracking and SHA-256 integrity;
+/// a primary key, as for `specs`.
 pub const CREATE_WASM_MODULES_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS wasm_modules (
     tenant TEXT NOT NULL,
@@ -112,7 +115,7 @@ CREATE TABLE IF NOT EXISTS wasm_modules (
     size_bytes INTEGER NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     source TEXT NOT NULL DEFAULT 'bundled',
-    UNIQUE(tenant, module_name)
+    PRIMARY KEY(tenant, module_name)
 );";
 
 /// ALTER for existing Turso DBs: add the `source` column. Idempotent via the

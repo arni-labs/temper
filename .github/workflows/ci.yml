@@ -228,6 +228,17 @@ jobs:
             (cd "wasm-modules/$module" && cargo build --target wasm32-unknown-unknown --release)
           done
 
+      # temper-store-turso's turso_sync tests run against Turso's local sync
+      # server, the tursodb release matching the pinned turso crate.
+      - name: Install tursodb for the Turso Sync tests
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/tursodb.tar.xz \
+            https://github.com/tursodatabase/turso/releases/download/v0.7.2/turso_cli-x86_64-unknown-linux-gnu.tar.xz
+          echo "321e401e44f7ee8ea656caff0f85304025f7e905acafe7bedf6a9304f1af1783  /tmp/tursodb.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/tursodb.tar.xz -C /tmp
+          echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
+
       - name: cargo nextest run --workspace (skip dst_)
         run: cargo nextest run --workspace -E 'not test(dst_)'
 
