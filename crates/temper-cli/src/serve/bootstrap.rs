@@ -20,7 +20,7 @@ use temper_server::registry_bootstrap::{
 use temper_server::storage::StorageStack;
 use temper_server::webhooks::WebhookDispatcher;
 use temper_store_redis::RedisEventStore;
-use temper_store_turso::{TenantStoreRouter, TursoEventStore};
+use temper_store_turso::{SyncCopy, TenantStoreRouter, TursoEventStore};
 
 use crate::StorageBackend;
 
@@ -31,11 +31,18 @@ use super::storage::{
 };
 
 /// Phase 1: Initialize the storage backend (Postgres, Turso, Redis, or memory).
+///
+/// Also returns the Turso Cloud copy of a local Turso database when
+/// `TURSO_SYNC_URL` is set; the server answers changes only once they reach it.
 pub(super) async fn init_storage(
     storage: StorageBackend,
     storage_explicit: bool,
-) -> Result<(Option<sqlx::PgPool>, Option<StorageStack>)> {
+) -> Result<(Option<sqlx::PgPool>, Option<StorageStack>, Option<SyncCopy>)> {
     let mut pg_pool: Option<sqlx::PgPool> = None;
+    let mut sync_copy: Option<SyncCopy> = None;
+    if !matches!(storage, StorageBackend::Turso) && std::env::var_os("TURSO_SYNC_URL").is_some() {
+        anyhow::bail!("TURSO_SYNC_URL needs --storage turso");
+    }
     let storage_stack: Option<StorageStack> = match storage {
         StorageBackend::Postgres => {
             if let Ok(database_url) = std::env::var("DATABASE_URL") {
@@ -57,6 +64,11 @@ pub(super) async fn init_storage(
         StorageBackend::Turso => {
             // Multi-tenant cloud mode: TURSO_PLATFORM_URL points at the shared platform DB.
             if let Ok(platform_url) = std::env::var("TURSO_PLATFORM_URL") {
+                if std::env::var_os("TURSO_SYNC_URL").is_some() {
+                    anyhow::bail!(
+                        "TURSO_SYNC_URL works with one local database, not TURSO_PLATFORM_URL"
+                    );
+                }
                 let platform_token = std::env::var("TURSO_PLATFORM_AUTH_TOKEN").ok();
                 let local_base_dir = std::env::var("TURSO_LOCAL_BASE_DIR").ok().or_else(|| {
                     let home = std::env::var("HOME").ok()?;
@@ -104,11 +116,32 @@ pub(super) async fn init_storage(
                         format!("file:{}", db_path.display())
                     }
                 };
-                let turso_token = std::env::var("TURSO_AUTH_TOKEN").ok();
-                let store = TursoEventStore::new(&turso_url, turso_token.as_deref())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to connect to Turso/libSQL: {e}"))?;
-                println!("  Storage: turso ({})", turso_url);
+                let sync_url = std::env::var("TURSO_SYNC_URL")
+                    .ok()
+                    .filter(|url| !url.is_empty());
+                let (store, copied) = if let Some(sync_url) = sync_url {
+                    if turso_url.starts_with("libsql://") {
+                        anyhow::bail!("TURSO_SYNC_URL needs a local TURSO_URL (file:...)");
+                    }
+                    let sync_token = std::env::var("TURSO_SYNC_AUTH_TOKEN")
+                        .context("TURSO_SYNC_AUTH_TOKEN is required with TURSO_SYNC_URL")?;
+                    let store = TursoEventStore::new_synced(&turso_url, &sync_url, &sync_token)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to open synced Turso database: {e}")
+                        })?;
+                    sync_copy = store.sync_copy().cloned();
+                    let copied =
+                        format!(", each change copied to {sync_url} before it is answered");
+                    (store, copied)
+                } else {
+                    let turso_token = std::env::var("TURSO_AUTH_TOKEN").ok();
+                    let store = TursoEventStore::new(&turso_url, turso_token.as_deref())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to connect to Turso/libSQL: {e}"))?;
+                    (store, String::new())
+                };
+                println!("  Storage: turso ({turso_url}){copied}");
                 Some(StorageStack::from_turso(store))
             }
         }
@@ -122,7 +155,7 @@ pub(super) async fn init_storage(
             Some(StorageStack::from_redis(store))
         }
     };
-    Ok((pg_pool, storage_stack))
+    Ok((pg_pool, storage_stack, sync_copy))
 }
 
 /// Phase 2: Build the spec registry from persistent storage and disk apps.
