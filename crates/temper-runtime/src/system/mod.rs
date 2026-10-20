@@ -219,4 +219,50 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1); // fresh state after restart
     }
+
+    // --- An ask is handled inside the asker's span ---
+
+    #[derive(Debug)]
+    struct WhichSpan;
+
+    impl Message for WhichSpan {}
+
+    struct SpanReporter;
+
+    impl Actor for SpanReporter {
+        type Msg = WhichSpan;
+        type State = ();
+
+        async fn pre_start(&self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            _msg: WhichSpan,
+            _state: &mut (),
+            ctx: &mut ActorContext<Self>,
+        ) -> Result<(), ActorError> {
+            ctx.reply(tracing::Span::current().id());
+            Ok(())
+        }
+
+        async fn post_stop(&self, _state: (), _ctx: &mut ActorContext<Self>) {}
+    }
+
+    #[tokio::test]
+    async fn an_ask_is_handled_inside_the_askers_span() {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let system = ActorSystem::new("test");
+        let actor = system.spawn(SpanReporter, "span-reporter");
+        let asker = tracing::info_span!("asker");
+        let handled_in: Option<tracing::Id> = {
+            let ask = actor.ask(WhichSpan, Duration::from_secs(1));
+            tracing::Instrument::instrument(ask, asker.clone())
+                .await
+                .unwrap()
+        };
+        assert!(asker.id().is_some());
+        assert_eq!(handled_in, asker.id());
+    }
 }

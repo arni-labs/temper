@@ -6,8 +6,9 @@
 //! today's schema (primary keys included), every row is copied into it in
 //! chunks, each pushed to the remote before the next, and only then is the
 //! original set aside (kept, for a rollback) and the new one put in its place.
-//! A run that is killed leaves the original where it was; the next run starts
-//! over and copies the same rows again, which replace what got through.
+//! A run that is killed or fails leaves the original where it was; the next
+//! run starts over and copies the same rows again, which replace what got
+//! through (`<db>.adopt-started` says rows may already be on the remote).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -45,9 +46,12 @@ pub async fn adopt(
         )));
     }
     let staging = sidecar(&local, ".adopting");
-    // A run before this one was killed: its rows may already be on the remote.
-    let again = remove_database(&staging);
-    let copied = copy_into_sync(&local, &staging, sync_url, auth_token, again).await;
+    // A run before this one began copying (and was killed or failed): its
+    // rows may already be on the remote, so it may hold events.
+    let started = sidecar(&local, ".adopt-started");
+    let again = started.exists();
+    remove_database(&staging);
+    let copied = copy_into_sync(&local, &staging, &started, sync_url, auth_token, again).await;
     let report = match copied {
         Ok(report) => report,
         Err(error) => {
@@ -57,12 +61,14 @@ pub async fn adopt(
     };
     let aside = set_aside(&local)?;
     move_database(&staging, &local)?;
+    let _ = std::fs::remove_file(&started);
     Ok(format!("set aside: {}\n{report}", aside.display()))
 }
 
 async fn copy_into_sync(
     local: &Path,
     staging: &Path,
+    started: &Path,
     sync_url: &str,
     auth_token: &str,
     again: bool,
@@ -85,6 +91,11 @@ async fn copy_into_sync(
             "the remote database already holds events; adopt needs an empty one".to_string(),
         );
     }
+    // From here rows reach the remote, so a run after this one, killed or
+    // failed, finds it holding some of them and copies them again.
+    std::fs::write(started, b"").map_err(|error| {
+        PersistenceError::Storage(format!("mark {}: {error}", started.display()))
+    })?;
 
     let mut report = Vec::new();
     for table in old.user_tables().await? {
@@ -273,7 +284,11 @@ fn move_database(from: &Path, to: &Path) -> Result<(), PersistenceError> {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    for file in database_files(from) {
+    // The sync metadata last: a file moved without it is refused at start
+    // rather than taken for a synced one.
+    let mut files = database_files(from);
+    files.sort_by_key(|file| file.to_string_lossy().ends_with("-info"));
+    for file in files {
         let name = file
             .file_name()
             .unwrap_or_default()

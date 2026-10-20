@@ -72,13 +72,26 @@ impl Remote {
             }
             return Err(failed(message.to_string()));
         }
-        let value = &result["response"]["result"]["rows"][0][0];
+        // Any other answer is an error, never a 0: a 0 would turn off the
+        // checks that read this.
+        let unexpected = || failed(format!("unexpected answer: {result}"));
+        if result["type"] != "ok" {
+            return Err(unexpected());
+        }
+        let rows = result["response"]["result"]["rows"]
+            .as_array()
+            .ok_or_else(unexpected)?;
+        // No row: nothing has been pushed from this file yet.
+        let Some(value) = rows.first().map(|row| &row[0]) else {
+            return Ok(0);
+        };
         // Integers arrive as strings in the Hrana protocol.
-        Ok(match &value["value"] {
-            serde_json::Value::String(text) => text.parse().unwrap_or(0),
-            serde_json::Value::Number(number) => number.as_i64().unwrap_or(0),
-            _ => 0,
-        })
+        match &value["value"] {
+            serde_json::Value::String(text) => text.parse().map_err(|_| unexpected()),
+            serde_json::Value::Number(number) => number.as_i64().ok_or_else(unexpected),
+            _ if value["type"] == "null" => Ok(0),
+            _ => Err(unexpected()),
+        }
     }
 }
 

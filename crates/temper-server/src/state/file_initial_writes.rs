@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use temper_runtime::persistence::{EventMetadata, PersistenceEnvelope, PersistenceError};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
+use tracing::Instrument;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState, process_action_with_xref};
 use crate::events::EntityStateChange;
@@ -364,24 +365,36 @@ impl ServerState {
             let to_state = response.state.status.clone();
             let fields = response.state.fields.clone();
             let agent_ctx = agent_ctx.clone();
-            tokio::spawn(async move {
-                // determinism-ok: post-commit external reaction side effects
-                // determinism-ok: post-commit reaction side effects mirror the
-                // existing non-awaited File `$value` update behavior.
-                dispatcher
-                    .dispatch_reactions(
-                        &state,
-                        &tenant,
-                        "File",
-                        &file_id,
-                        "StreamUpdated",
-                        &to_state,
-                        &fields,
-                        0,
-                        &agent_ctx,
-                    )
-                    .await;
-            });
+            // The reactions are part of the request that wrote the file: their span
+            // is a child of the current one, as for every background reaction.
+            let span = tracing::info_span!(
+                "reaction.dispatch.background",
+                tenant = %tenant,
+                entity_type = "File",
+                entity_id = %file_id,
+                action_name = "StreamUpdated",
+            );
+            tokio::spawn(
+                async move {
+                    // determinism-ok: post-commit external reaction side effects
+                    // determinism-ok: post-commit reaction side effects mirror the
+                    // existing non-awaited File `$value` update behavior.
+                    dispatcher
+                        .dispatch_reactions(
+                            &state,
+                            &tenant,
+                            "File",
+                            &file_id,
+                            "StreamUpdated",
+                            &to_state,
+                            &fields,
+                            0,
+                            &agent_ctx,
+                        )
+                        .await;
+                }
+                .instrument(span),
+            );
         }
     }
 }

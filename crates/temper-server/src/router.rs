@@ -126,20 +126,33 @@ pub fn build_router(state: ServerState) -> Router {
             HeaderName::from_static("x-repository-id"),
             HeaderName::from_static("x-expected-object-id"),
             HeaderName::from_static("idempotency-key"),
+            // Trace context from the browser (Datadog RUM), so a click and the
+            // request it makes are one trace.
+            HeaderName::from_static("traceparent"),
+            HeaderName::from_static("tracestate"),
         ]);
 
     router
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
-                    tracing::info_span!(
+                    let span = tracing::info_span!(
                         "http.request",
                         otel.name = %format!("{} {}", request.method(), request.uri().path()),
                         http.method = %request.method(),
                         http.route = %request.uri().path(),
                         http.status_code = tracing::field::Empty,
                         otel.kind = "server",
-                    )
+                    );
+                    // A caller's `traceparent` makes this server span its child, so the
+                    // whole request (handler, dispatch, storage, reactions) is in the
+                    // caller's trace. Nothing below re-parents.
+                    if let Some(parent) =
+                        crate::request_context::remote_parent_from_headers(request.headers())
+                    {
+                        tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, parent);
+                    }
+                    span
                 })
                 .on_response(
                     |response: &axum::http::Response<_>,

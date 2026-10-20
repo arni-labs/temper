@@ -6,6 +6,7 @@ use super::errors::ActorError;
 use super::traits::Actor;
 use crate::mailbox::{self, DEFAULT_MAILBOX_CAPACITY, MailboxReceiver};
 use crate::supervision::SupervisionStrategy;
+use tracing::Instrument;
 
 /// The ActorCell is the runtime container for an actor instance.
 /// It owns the actor, its state, its mailbox receiver, and drives the message loop.
@@ -103,9 +104,13 @@ impl<A: Actor> ActorCell<A> {
                             }
                         }
                     }
-                    Envelope::Ask { msg, reply } => {
+                    Envelope::Ask { msg, reply, span } => {
                         ctx.reply_channel = Some(reply);
-                        if let Err(e) = actor.handle(msg, &mut state, &mut ctx).await {
+                        if let Err(e) = actor
+                            .handle(msg, &mut state, &mut ctx)
+                            .instrument(span)
+                            .await
+                        {
                             error!(actor = %id, error = %e, "actor handle (ask) failed");
                             if let Some(tx) = ctx.reply_channel.take() {
                                 let _ = tx
