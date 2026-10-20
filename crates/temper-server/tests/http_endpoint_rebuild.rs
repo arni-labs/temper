@@ -11,7 +11,7 @@ use serde_json::json;
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{install_deterministic_context, sim_now};
 use temper_runtime::tenant::TenantId;
-use temper_server::http_endpoint::rebuild_tenant_table;
+use temper_server::http_endpoint::{rebuild_tenant_table, rebuild_tenant_table_after};
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
 use temper_server::{ServerState, StorageStack};
@@ -120,7 +120,12 @@ async fn a_rebuild_keeps_the_route_of_a_row_that_does_not_answer() {
     )
     .await;
     create(&state, &tenant, "he-pass-files", "/katagami/pass/files").await;
-    rebuild_tenant_table(&state, &tenant).await;
+    let started = tokio::time::Instant::now();
+    rebuild_tenant_table_after(&state, &tenant, Some("he-pass-files")).await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "the rebuild asked the busy row before giving up on it"
+    );
     assert_eq!(
         paths(&state, &tenant).await,
         [
@@ -130,6 +135,29 @@ async fn a_rebuild_keeps_the_route_of_a_row_that_does_not_answer() {
         ],
         "a row the rebuild could not read keeps its route; the new one is added"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_row_that_changed_keeps_no_route_when_it_cannot_be_read() {
+    let (_guard, _clock, _ids) = install_deterministic_context(23);
+    let (state, store) = build(23);
+    let tenant = TenantId::default();
+    create(&state, &tenant, "he-judge", "/katagami/judge").await;
+    create(&state, &tenant, "he-pass-guest", "/katagami/pass/guest").await;
+    rebuild_tenant_table(&state, &tenant).await;
+
+    // The guest pass's row changed and is busy past the rebuild's wait: its old route is what the change is about.
+    let _write = busy(
+        &state,
+        &store,
+        &tenant,
+        "he-pass-guest",
+        "/katagami/pass/guest",
+        Duration::from_secs(600),
+    )
+    .await;
+    rebuild_tenant_table_after(&state, &tenant, Some("he-pass-guest")).await;
+    assert_eq!(paths(&state, &tenant).await, ["/katagami/judge"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -150,7 +178,12 @@ async fn a_rebuild_waits_for_a_row_that_answers_late_and_drops_a_paused_one() {
         Duration::from_secs(3),
     )
     .await;
+    let started = tokio::time::Instant::now();
     rebuild_tenant_table(&state, &tenant).await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the rebuild waited for the late row"
+    );
     assert!(
         write
             .await

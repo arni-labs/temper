@@ -268,6 +268,18 @@ impl Default for HttpEndpointTables {
 /// the table; a row that fails projection is skipped. Metrics +
 /// warn-level logs cover visibility.
 pub async fn rebuild_tenant_table(state: &crate::state::ServerState, tenant: &TenantId) {
+    rebuild_tenant_table_after(state, tenant, None).await;
+}
+
+/// [`rebuild_tenant_table`] after a change of row `changed`, as the
+/// reconciler runs it: that row keeps no earlier route when it cannot
+/// be read, since its change (a Pause, a Delete, a new path) is what the
+/// rebuild is for.
+pub async fn rebuild_tenant_table_after(
+    state: &crate::state::ServerState,
+    tenant: &TenantId,
+    changed: Option<&str>,
+) {
     // On fresh pod boots the in-memory entity_index is lazily
     // populated — we need to prime it from the event store or
     // rebuild sees 0 rows even when there ARE active HttpEndpoint
@@ -302,7 +314,10 @@ pub async fn rebuild_tenant_table(state: &crate::state::ServerState, tenant: &Te
                 ),
             },
             Err(error) => {
-                if let Some(route) = previous.get(&entity_id) {
+                let last = previous
+                    .get(&entity_id)
+                    .filter(|_| changed != Some(entity_id.as_str()));
+                if let Some(route) = last {
                     routes.push(route.clone());
                     kept += 1;
                 }
@@ -310,8 +325,8 @@ pub async fn rebuild_tenant_table(state: &crate::state::ServerState, tenant: &Te
                     tenant = %tenant.as_str(),
                     entity_id,
                     error,
-                    kept_route = previous.contains_key(&entity_id),
-                    "HttpEndpoint row unread during rebuild; its last route stays"
+                    kept_route = last.is_some(),
+                    "HttpEndpoint row unread during rebuild; a row that did not change keeps its last route"
                 );
             }
         }
@@ -378,7 +393,7 @@ pub fn spawn_reconciler(state: crate::state::ServerState) {
             match rx.recv().await {
                 Ok(change) if change.entity_type == "HttpEndpoint" => {
                     let tenant = TenantId::new(&change.tenant);
-                    rebuild_tenant_table(&state, &tenant).await;
+                    rebuild_tenant_table_after(&state, &tenant, Some(&change.entity_id)).await;
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
