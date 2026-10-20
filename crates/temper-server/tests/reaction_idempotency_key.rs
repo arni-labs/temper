@@ -1,10 +1,12 @@
-//! A reaction on the source's own record runs when the source request carried
-//! an `Idempotency-Key` (ADR-0048).
+//! Reactions and the caller's `Idempotency-Key` (ADR-0048).
 //!
-//! The record records the caller's key for the source action. A reaction that
+//! A record records the caller's key for the source action. A reaction that
 //! reused that key on the same record was answered as a duplicate and never
 //! ran: `SetAudience` with the header left a Room Live instead of moving it to
-//! Sharing. A retry of the whole request must still run nothing twice.
+//! Sharing. Each reaction now has a key of its own, derived from the caller's,
+//! so a retry of the whole request still runs nothing twice, and a reaction
+//! that a retried request ran before the upgrade (under the caller's key
+//! itself) is not run again.
 
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
@@ -23,14 +25,21 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
       </EntityType>
+      <EntityType Name="Door">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
       <EntityContainer Name="Container">
         <EntitySet Name="Rooms" EntityType="Temper.ReactKey.Room"/>
+        <EntitySet Name="Doors" EntityType="Temper.ReactKey.Door"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
 </edmx:Edmx>"#;
 
-/// `SetAudience` stays Live and reacts on the same record with `AdmitGuests`.
+/// `SetAudience` reacts on the same Room with `AdmitGuests` and on the Door
+/// of the same id with `Open`. Every action counts its runs, so a reaction
+/// that ran twice shows.
 const ROOM_IOA: &str = r#"
 [automaton]
 name = "Room"
@@ -42,10 +51,15 @@ name = "audiences"
 type = "counter"
 initial = 0
 
+[[state]]
+name = "guests"
+type = "counter"
+initial = 0
+
 [[action]]
 name = "SetAudience"
 kind = "input"
-from = ["Live"]
+from = ["Live", "Sharing"]
 effect = ["audiences += 1"]
 
 [[action.triggers]]
@@ -55,11 +69,37 @@ target_entity = "Room"
 target_action = "AdmitGuests"
 resolve_target = { kind = "same_id" }
 
+[[action.triggers]]
+name = "audience_opens_the_door"
+kind = "entity"
+target_entity = "Door"
+target_action = "Open"
+resolve_target = { kind = "same_id" }
+
 [[action]]
 name = "AdmitGuests"
 kind = "internal"
-from = ["Live"]
+from = ["Live", "Sharing"]
 to = "Sharing"
+effect = ["guests += 1"]
+"#;
+
+const DOOR_IOA: &str = r#"
+[automaton]
+name = "Door"
+states = ["Shut"]
+initial = "Shut"
+
+[[state]]
+name = "opened"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Open"
+kind = "input"
+from = ["Shut"]
+effect = ["opened += 1"]
 "#;
 
 fn build_state(tenant: &str) -> ServerState {
@@ -69,7 +109,7 @@ fn build_state(tenant: &str) -> ServerState {
             tenant,
             parse_csdl(CSDL_XML).expect("CSDL should parse"),
             CSDL_XML.to_string(),
-            &[("Room", ROOM_IOA)],
+            &[("Room", ROOM_IOA), ("Door", DOOR_IOA)],
         )
         .expect("tenant registration");
     let state = ServerState::from_registry(ActorSystem::new("reaction-key"), registry);
@@ -77,7 +117,7 @@ fn build_state(tenant: &str) -> ServerState {
         .authz
         .reload_tenant_policies(
             tenant,
-            r#"permit(principal == Agent::"service:reaction-key-test", action, resource is Room);"#,
+            r#"permit(principal == Agent::"service:reaction-key-test", action, resource);"#,
         )
         .expect("policy should load");
     state.rebuild_reaction_dispatcher();
@@ -89,6 +129,21 @@ fn caller(key: &str) -> AgentContext {
         idempotency_key: Some(key.to_string()),
         ..AgentContext::for_service(SERVICE)
     }
+}
+
+/// `(status, counter)` of one record.
+async fn read(
+    state: &ServerState,
+    tenant: &TenantId,
+    entity_type: &str,
+    counter: &str,
+) -> (String, usize) {
+    let entity = state
+        .get_tenant_entity_state(tenant, entity_type, "r1")
+        .await
+        .expect("record");
+    let count = entity.state.counters.get(counter).copied().unwrap_or(0);
+    (entity.state.status, count)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -109,30 +164,61 @@ async fn a_same_record_reaction_runs_when_the_request_carries_an_idempotency_key
 
     let first = set_audience().await.expect("SetAudience");
     assert!(first.success, "{:?}", first.error);
-    let room = state
-        .get_tenant_entity_state(&tenant, "Room", "r1")
-        .await
-        .expect("room");
     assert_eq!(
-        room.state.status, "Sharing",
+        read(&state, &tenant, "Room", "guests").await,
+        ("Sharing".to_string(), 1),
         "the reaction on the same record ran"
     );
-    let events = room.state.total_event_count;
+    assert_eq!(read(&state, &tenant, "Door", "opened").await.1, 1);
 
-    // The same request again: deduplicated, with its reaction.
+    // The same request again: its reactions keep their keys, and run nothing
+    // twice even though both actions could run again.
     let retry = set_audience().await.expect("retried SetAudience");
     assert!(retry.success, "{:?}", retry.error);
-    let room = state
-        .get_tenant_entity_state(&tenant, "Room", "r1")
+    assert_eq!(read(&state, &tenant, "Room", "audiences").await.1, 1);
+    assert_eq!(read(&state, &tenant, "Room", "guests").await.1, 1);
+    assert_eq!(read(&state, &tenant, "Door", "opened").await.1, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reaction_a_retried_request_ran_before_the_upgrade_is_not_run_again() {
+    let tenant = TenantId::new("rooms-upgraded");
+    let state = build_state("rooms-upgraded");
+    // Before reactions had keys of their own, the Door's reaction recorded the
+    // caller's key itself.
+    let opened = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Door",
+            "r1",
+            "Open",
+            serde_json::json!({}),
+            &caller("request-2"),
+        )
         .await
-        .expect("room");
+        .expect("Open");
+    assert!(opened.success, "{:?}", opened.error);
+
+    let retry = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Room",
+            "r1",
+            "SetAudience",
+            serde_json::json!({}),
+            &caller("request-2"),
+        )
+        .await
+        .expect("SetAudience");
+    assert!(retry.success, "{:?}", retry.error);
     assert_eq!(
-        (
-            room.state.status.as_str(),
-            room.state.total_event_count,
-            room.state.counters["audiences"]
-        ),
-        ("Sharing", events, 1),
-        "a retry runs nothing twice"
+        read(&state, &tenant, "Door", "opened").await.1,
+        1,
+        "the Door's reaction already ran under the caller's key"
+    );
+    assert_eq!(
+        read(&state, &tenant, "Room", "guests").await,
+        ("Sharing".to_string(), 1),
+        "the same-record reaction, which never ran before, runs"
     );
 }
