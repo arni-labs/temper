@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
@@ -88,6 +88,8 @@ struct Inner {
     state: std::sync::Mutex<CopyState>,
     /// Push attempts that ran out of time in a row.
     timeouts: AtomicU32,
+    /// Whether the remote may hold a push the engine never heard back from.
+    unsure: AtomicBool,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -185,6 +187,7 @@ impl SyncCopy {
                 in_use: Arc::new(tokio::sync::RwLock::new(())),
                 state: std::sync::Mutex::new(state),
                 timeouts: AtomicU32::new(0),
+                unsure: AtomicBool::new(true),
             }),
         };
         // Change numbers follow commit order only with one writer at a time

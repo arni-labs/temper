@@ -28,7 +28,7 @@ impl SyncCopy {
         }
         // The push reads the change log after this, so it carries `covered`.
         let covered = self.last_change().await?;
-        let remote_had = self.last_pushed_hint().map_err(storage_error)?;
+        let remote_had = self.remote_had().await?;
         let started = Instant::now();
         let pushed = {
             let _engine = self.inner.engine.lock().await;
@@ -40,6 +40,11 @@ impl SyncCopy {
             ok = matches!(pushed, Ok(Ok(()))),
             "turso.sync push"
         );
+        // A push that failed may still have committed on the remote, past
+        // the engine's own record: the next one reads the remote's.
+        self.inner
+            .unsure
+            .store(!matches!(pushed, Ok(Ok(()))), Ordering::Release);
         match pushed {
             Ok(Ok(())) => self.inner.timeouts.store(0, Ordering::Release),
             Ok(Err(error)) => {
@@ -72,6 +77,25 @@ impl SyncCopy {
         }
         self.inner.pushed.fetch_max(covered, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// The remote's record of this file's last push before the next one.
+    /// The engine's own record is behind it when a push it never heard back
+    /// from committed (it timed out, its answer was lost, or this server
+    /// restarted after one), so then, and first after every start, the
+    /// remote is asked.
+    async fn remote_had(&self) -> Result<i64, PersistenceError> {
+        let hint = self.last_pushed_hint().map_err(storage_error)?;
+        if !self.inner.unsure.load(Ordering::Acquire) {
+            return Ok(hint);
+        }
+        let remote = self
+            .inner
+            .remote
+            .last_change()
+            .await
+            .map_err(storage_error)?;
+        Ok(hint.max(remote))
     }
 
     /// A push the remote answered with a statement error. The remote skips a

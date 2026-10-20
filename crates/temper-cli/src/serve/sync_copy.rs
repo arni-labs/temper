@@ -69,15 +69,15 @@ async fn push_before_answering(
         .max(MIN_PUSH_BUDGET);
     match copy.push_committed_within(budget).await {
         Ok(()) => response,
+        // The request ran, so whatever the copy's state now, the change may
+        // have been saved here: never answer as if nothing happened.
         Err(error) => {
             tracing::error!(%error, "turso.sync: change not copied off this server; not confirming it");
-            refusal(&copy.state()).unwrap_or_else(|| {
-                unavailable(
-                    "NotConfirmed",
-                    "Not confirmed: the change could not be copied to this app's database copy. \
-                     It may still have been saved here; read it back before trying again.",
-                )
-            })
+            unavailable(
+                "NotConfirmed",
+                "Not confirmed: the change could not be copied to this app's database copy. \
+                 It may still have been saved here; read it back before trying again.",
+            )
         }
     }
 }
