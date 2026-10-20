@@ -47,7 +47,9 @@ pub fn build_platform_router(state: PlatformState) -> Router {
         routing::post(temper_server::identity::endpoint::handle_identity_resolve),
     );
 
-    temper_server::build_router(state.server.clone())
+    // The request's span goes on last, so it is outermost: the credential
+    // lookups below happen inside it rather than starting traces of their own.
+    let routes = temper_server::build_routes(state.server.clone())
         .merge(health)
         .merge(identity_api.with_state(state.server.clone()))
         .merge(platform_observe.with_state(state.clone()))
@@ -61,7 +63,8 @@ pub fn build_platform_router(state: PlatformState) -> Router {
         // credential resolution creates a typed request context (ADR-0157).
         .layer(middleware::from_fn(
             temper_server::authz::strip_inbound_identity_headers,
-        ))
+        ));
+    temper_server::with_request_span(routes)
 }
 
 /// Unauthenticated deploy-identity probe: the commit the running binary was built
