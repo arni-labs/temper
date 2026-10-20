@@ -220,12 +220,9 @@ fn emit_workload() {
         SAMPLED_CALLER_TRACE_ID,
         TraceFlags::SAMPLED
     );
-    // A name the name-based filter keeps at a reduced rate, by trace ID.
-    span_from_caller!(
-        "wasm:workspace_fs.read",
-        REDUCED_RATE_KEPT_TRACE_ID,
-        TraceFlags::SAMPLED
-    );
+    // A name the name-based filter trims only when it starts its own trace. In a
+    // caller's trace it is kept, even on a trace ID outside the reduced rate:
+    // trimming it there would leave a hole in a trace that is kept.
     span_from_caller!(
         "wasm:workspace_fs.read",
         REDUCED_RATE_DROPPED_TRACE_ID,

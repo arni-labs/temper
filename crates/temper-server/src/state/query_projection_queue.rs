@@ -42,6 +42,9 @@ struct QueuedProjectionUpdate {
     sequence_nr: u64,
     enqueued_at: Instant,
     source: &'static str,
+    /// The trace of the action that changed the entity (the newest one when
+    /// updates coalesce): the projection write's span continues it.
+    parent: opentelemetry::Context,
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +148,7 @@ impl QueryProjectionWriteQueue {
             sequence_nr,
             enqueued_at: Instant::now(),
             source,
+            parent: crate::trace_context::capture(),
         })
     }
 
@@ -166,6 +170,7 @@ impl QueryProjectionWriteQueue {
             sequence_nr,
             enqueued_at: Instant::now(),
             source,
+            parent: crate::trace_context::capture(),
         })
     }
 
@@ -280,6 +285,7 @@ impl QueryProjectionWriteQueue {
         let operation = update.operation.label();
         let source = update.source;
         let span = tracing::info_span!(
+            parent: None,
             "dispatch.phase.query_projection.queued",
             otel.name = "dispatch.phase.query_projection.queued",
             tenant = %update.key.tenant,
@@ -288,6 +294,7 @@ impl QueryProjectionWriteQueue {
             operation,
             sequence_nr = update.sequence_nr,
         );
+        crate::trace_context::continue_in(&span, &update.parent);
 
         async move {
             let mut attempt = 1;

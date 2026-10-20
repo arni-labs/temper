@@ -2787,3 +2787,81 @@ async fn strict_data_only_creation_and_hydration_share_typed_defaults() {
     assert_eq!(hydrated.fields["Body"], "initial body");
     assert_eq!(hydrated.sequence_nr, 1);
 }
+
+#[tokio::test]
+async fn a_request_with_a_traceparent_is_one_trace_with_one_root() {
+    use opentelemetry::trace::{SpanId, TraceId};
+
+    let spans = crate::test_spans::capture();
+    let caller_trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let caller_span = "00f067aa0ba902b7";
+    let app = authenticated_router(test_state_with_ioa());
+    let response = app
+        .oneshot(
+            Request::post("/tdata/Orders('abc-123')/Temper.Example.CancelOrder")
+                .header("Content-Type", "application/json")
+                .header("X-Temper-Principal-Kind", "admin")
+                .header("traceparent", format!("00-{caller_trace}-{caller_span}-01"))
+                .body(Body::from(r#"{"Reason": "changed mind"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // The server span ends with the response body.
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // Background work (reactions, the trajectory outbox, queued writes) finishes
+    // after the response.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let finished = spans.finished();
+    let trace = TraceId::from_hex(caller_trace).unwrap();
+    let outside: Vec<_> = finished
+        .iter()
+        .filter(|s| s.span_context.trace_id() != trace)
+        .map(|s| s.name.to_string())
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "spans outside the request's trace: {outside:?}"
+    );
+
+    let caller = SpanId::from_hex(caller_span).unwrap();
+    let roots: Vec<_> = finished
+        .iter()
+        .filter(|s| s.parent_span_id == caller || s.parent_span_id == SpanId::INVALID)
+        .map(|s| s.name.to_string())
+        .collect();
+    assert_eq!(roots.len(), 1, "one root, the server span: {roots:?}");
+    let server = finished
+        .iter()
+        .find(|s| s.parent_span_id == caller)
+        .expect("the server span continues the caller's span");
+    assert!(crate::test_spans::has_attribute(server, "http.status_code"));
+
+    let with_status: Vec<_> = finished
+        .iter()
+        .filter(|s| crate::test_spans::has_attribute(s, "http.status_code"))
+        .map(|s| s.name.to_string())
+        .collect();
+    assert_eq!(
+        with_status.len(),
+        1,
+        "only the server span has an HTTP status: {with_status:?}"
+    );
+
+    let ids: std::collections::BTreeSet<String> = finished
+        .iter()
+        .map(|s| s.span_context.span_id().to_string())
+        .collect();
+    assert_eq!(ids.len(), finished.len(), "no span is exported twice");
+    for span in &finished {
+        assert!(
+            span.parent_span_id == caller || ids.contains(&span.parent_span_id.to_string()),
+            "{} has a parent that is not in the trace",
+            span.name
+        );
+    }
+}
