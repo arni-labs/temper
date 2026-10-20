@@ -1169,6 +1169,9 @@ impl ServerState {
         };
         if let Some(obj) = projected.as_object_mut() {
             obj.insert("events".to_string(), serde_json::json!([]));
+            // The status clock is the actor's, for its timers; a query never
+            // reads it, and rows written before it was kept stay comparable.
+            obj.remove("status_clock");
         }
         projected
     }

@@ -313,7 +313,7 @@ pub(crate) fn live_state_is_the_reply(live: &EntityState, cached: &EntityState, 
 }
 
 /// The part of a reply a replay needs. Post-dispatch effects read event
-/// metadata (state clocks, source status); event parameters and the durable
+/// metadata and the status clock (state clocks, source status); event parameters and the durable
 /// key set dominate a busy entity's state and are not copied. A trigger fired
 /// from a replayed reply that reads `events[].params` sees null there (the
 /// same values are in the entity's fields).
@@ -348,7 +348,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
             last_snapshot_sequence_nr: state.last_snapshot_sequence_nr,
             sequence_nr: state.sequence_nr,
             processed_idempotency_keys: BTreeMap::new(),
-            status_clock: Default::default(),
+            status_clock: state.status_clock.clone(),
         },
         error: response.error.clone(),
         custom_effects: response.custom_effects.clone(),

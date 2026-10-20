@@ -338,6 +338,18 @@ impl crate::state::ServerState {
                 // No entry event found: treat as freshly entered. Safe
                 // default; worst case is one extra budget of wait.
                 started_at = clock_reset.unwrap_or(now);
+                // A timer whose action keeps the entity in this state without
+                // resetting its clock fires once: if it already fired since
+                // the clock started, there is nothing to arm.
+                let fired_since = response
+                    .state
+                    .status_clock
+                    .actions
+                    .get(&st.on_timeout)
+                    .is_some_and(|fired| *fired >= started_at);
+                if fired_since && !st.reset_on.contains(&st.on_timeout) {
+                    continue;
+                }
                 crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                     ctx.tenant.as_str(),
                     ctx.entity_type,

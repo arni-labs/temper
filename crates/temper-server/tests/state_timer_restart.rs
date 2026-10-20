@@ -453,8 +453,34 @@ fn a_timer_without_a_row_counts_the_time_already_spent_in_its_state() {
     second.kill();
 }
 
-/// Many timers that fell due while the server was down: at boot they wait
-/// their turn to fire (a few at once), and every one fires exactly once.
+/// A timer whose action keeps the record in its state (and does not reset the
+/// clock) fires once: after a restart, the record's next action finds it
+/// already fired and does not arm it again.
+#[test]
+fn a_timer_that_fired_does_not_fire_again_after_a_restart() {
+    let (_dir, backend) = turso();
+    let first = Server::start(&backend, "fired-run-1");
+    first.act("Probe", "fired", "Arm", &person("alice"));
+    assert_eq!(
+        first.wait_for("Probe", "fired", "fires", 1, Duration::from_secs(6)),
+        1
+    );
+    first.kill();
+
+    let second = Server::start(&backend, "fired-run-2");
+    second.act("Probe", "fired", "Note", &person("bob"));
+    std::thread::sleep(Duration::from_secs(1)); // determinism-ok: real-time restart test
+    assert_eq!(
+        second.read("Probe", "fired", "fires"),
+        (1, json!("alice")),
+        "it fired once, before the restart"
+    );
+    second.kill();
+}
+
+/// Many timers that fell due while the server was down: at boot every one
+/// fires exactly once, as whoever armed it (the boot gate lets a few fire at a
+/// time; this checks it loses and repeats none).
 #[test]
 fn many_overdue_timers_each_fire_once_after_restart() {
     let (_dir, backend) = turso();
