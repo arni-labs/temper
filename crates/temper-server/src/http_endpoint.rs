@@ -31,13 +31,10 @@ pub(crate) mod budget;
 pub mod native;
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use temper_runtime::tenant::TenantId;
 use tokio::spawn as spawn_http_endpoint_reconciler; // determinism-ok: production HTTP route watcher
 use tokio::sync::RwLock;
-
-const ACTOR_ASK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One row of the table. Derived from an `HttpEndpoint` entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +159,11 @@ impl HttpEndpointTable {
         *guard = rows;
     }
 
+    /// The rows now in force.
+    pub async fn rows(&self) -> Vec<HttpEndpointRoute> {
+        self.rows.read().await.clone()
+    }
+
     /// Number of registered rows — for metrics and tests.
     pub async fn len(&self) -> usize {
         self.rows.read().await.len()
@@ -252,18 +254,20 @@ impl Default for HttpEndpointTables {
 }
 
 /// Rebuild the route table for `tenant` by enumerating every
-/// `HttpEndpoint` row that the tenant owns, asking each entity
-/// actor for its current state, and projecting Active rows into
-/// routes. Called on boot and on every HttpEndpoint state change
-/// (see [`spawn_reconciler`]).
+/// `HttpEndpoint` row that the tenant owns, reading each row's
+/// current state, and projecting Active rows into routes. Called on
+/// boot and on every HttpEndpoint state change (see
+/// [`spawn_reconciler`]).
 ///
-/// Fails silently on per-row problems (actor unreachable, state
-/// parse failure, etc.): a single malformed row should not sink
-/// the rest of the table. Metrics + warn-level logs cover
-/// visibility.
+/// Rows are read at once, each as any entity read is: its actor is
+/// spawned and loaded from its events if it was idle, and a slow
+/// answer is asked again (`get_tenant_entity_state`). A row that still
+/// cannot be read keeps the route it had: a rebuild started by one
+/// row's change must never drop the others because they were slow to
+/// load. Only a row read as not Active, or gone from the tenant, leaves
+/// the table; a row that fails projection is skipped. Metrics +
+/// warn-level logs cover visibility.
 pub async fn rebuild_tenant_table(state: &crate::state::ServerState, tenant: &TenantId) {
-    use crate::entity_actor::types::{EntityMsg, EntityResponse};
-
     // On fresh pod boots the in-memory entity_index is lazily
     // populated — we need to prime it from the event store or
     // rebuild sees 0 rows even when there ARE active HttpEndpoint
@@ -271,66 +275,54 @@ pub async fn rebuild_tenant_table(state: &crate::state::ServerState, tenant: &Te
     // populate-if-empty path.
     let ids: Vec<String> = state.list_entity_ids_lazy(tenant, "HttpEndpoint").await;
 
-    // Force-materialise each actor from its snapshot/event log so
-    // the subsequent ask(GetState) finds them in the registry.
-    // Actors materialise lazily on OData reads; for boot-time
-    // table priming we eagerly spawn since the router fallback
-    // can't afford to 404 on the first request after restart.
-    for entity_id in &ids {
-        let _ = state.get_or_spawn_tenant_actor_with_fields(
-            tenant,
-            "HttpEndpoint",
-            entity_id,
-            serde_json::json!({}),
-        );
-    }
-
-    let mut routes: Vec<HttpEndpointRoute> = Vec::with_capacity(ids.len());
-    for entity_id in ids {
-        let actor_key = format!("{}:HttpEndpoint:{}", tenant.as_str(), entity_id);
-        let actor_ref = {
-            let Ok(registry) = state.actor_registry.read() else {
-                continue;
-            };
-            registry.get(&actor_key).cloned()
-        };
-        let Some(actor_ref) = actor_ref else {
-            continue; // actor passivated — will rematerialize on next request
-        };
-        let response: EntityResponse =
-            match actor_ref.ask(EntityMsg::GetState, ACTOR_ASK_TIMEOUT).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        tenant = %tenant.as_str(),
-                        entity_id,
-                        error = %e,
-                        "HttpEndpoint actor ask failed during rebuild"
-                    );
-                    continue;
-                }
-            };
-        if response.state.status != "Active" {
-            continue;
-        }
-        if let Some(route) = route_from_entity_fields(&entity_id, &response.state.fields) {
-            routes.push(route);
-        } else {
-            tracing::warn!(
-                tenant = %tenant.as_str(),
-                entity_id,
-                status = %response.state.status,
-                "HttpEndpoint row failed projection — skipped"
-            );
-        }
-    }
-
     let table = state.http_endpoint_tables.table_for(tenant).await;
+    let previous: BTreeMap<String, HttpEndpointRoute> = table
+        .rows()
+        .await
+        .into_iter()
+        .map(|route| (route.id.clone(), route))
+        .collect();
+    let reads = ids.into_iter().map(|entity_id| async move {
+        let read = state
+            .get_tenant_entity_state(tenant, "HttpEndpoint", &entity_id)
+            .await;
+        (entity_id, read)
+    });
+    let mut routes: Vec<HttpEndpointRoute> = Vec::new();
+    let mut kept = 0usize;
+    for (entity_id, read) in futures_util::future::join_all(reads).await {
+        match read {
+            Ok(response) if response.state.status != "Active" => {}
+            Ok(response) => match route_from_entity_fields(&entity_id, &response.state.fields) {
+                Some(route) => routes.push(route),
+                None => tracing::warn!(
+                    tenant = %tenant.as_str(),
+                    entity_id,
+                    "HttpEndpoint row failed projection — skipped"
+                ),
+            },
+            Err(error) => {
+                if let Some(route) = previous.get(&entity_id) {
+                    routes.push(route.clone());
+                    kept += 1;
+                }
+                tracing::warn!(
+                    tenant = %tenant.as_str(),
+                    entity_id,
+                    error,
+                    kept_route = previous.contains_key(&entity_id),
+                    "HttpEndpoint row unread during rebuild; its last route stays"
+                );
+            }
+        }
+    }
+
     let count = routes.len();
     table.replace(routes).await;
     tracing::info!(
         tenant = %tenant.as_str(),
         route_count = count,
+        kept_unread = kept,
         "HttpEndpoint route table rebuilt"
     );
 }
