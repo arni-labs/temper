@@ -22,6 +22,7 @@ fn make_response(status: &str) -> EntityResponse {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
+            status_clock: Default::default(),
         },
         error: None,
         custom_effects: vec![],

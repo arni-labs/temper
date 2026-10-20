@@ -639,8 +639,10 @@ impl crate::state::ServerState {
         self.broadcast_state_change(ctx, &response);
 
         // Arm the successor only after visibility, before an inline adapter
-        // can return early or dispatch another transition.
-        self.arm_state_timeouts_if_needed(ctx, &response);
+        // can return early or dispatch another transition. Boxed like the
+        // projection update above: the timer row's write inline overflowed a
+        // test thread's stack once dispatch carried request traces.
+        Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
 
         // 4. Fire webhooks
         self.fire_webhooks(ctx, &response);

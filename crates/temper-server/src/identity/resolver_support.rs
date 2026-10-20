@@ -175,6 +175,7 @@ mod tests {
             last_snapshot_sequence_nr: 0,
             sequence_nr,
             processed_idempotency_keys: Default::default(),
+            status_clock: Default::default(),
         };
         let first = state(3, "Active", serde_json::json!({"agent_type_id": "type-a"}));
 

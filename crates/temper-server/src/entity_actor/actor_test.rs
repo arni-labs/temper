@@ -54,6 +54,7 @@ fn event_budget_workspace_id_uses_workspace_entity_id_or_field() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
+        status_clock: Default::default(),
     };
     assert_eq!(event_budget_workspace_id(&workspace_state), "ws-1");
 
@@ -72,6 +73,7 @@ fn event_budget_workspace_id_uses_workspace_entity_id_or_field() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
+        status_clock: Default::default(),
     };
     assert_eq!(event_budget_workspace_id(&file_state), "ws-2");
 }
@@ -103,6 +105,7 @@ async fn queued_snapshot_only_advances_replay_boundary_after_write_applies() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 100,
         processed_idempotency_keys: BTreeMap::new(),
+        status_clock: Default::default(),
     };
 
     EntityActor::maybe_save_snapshot(
@@ -466,6 +469,53 @@ fn snapshot_restore_canonicalizes_runtime_owned_fields() {
     for reserved in ["has_spec", "ctx_owner_status"] {
         assert!(state.fields.get(reserved).is_none(), "restored {reserved}");
     }
+}
+
+/// A snapshot leaves the recent events out, so the status clock (when the
+/// status began, and each action since) is what a state timer reads after a
+/// restore: it must survive the round trip.
+#[test]
+fn snapshot_keeps_the_status_clock() {
+    let mut state = EntityActor::build_initial_state(
+        "Order",
+        "order-clock",
+        &order_table().read().expect("table lock"),
+        &serde_json::json!({}),
+    );
+    let at = |s: i64| chrono::DateTime::from_timestamp(1_790_000_000 + s, 0).unwrap();
+    let event = |action: &str, from: &str, to: &str, s: i64| super::EntityEvent {
+        action: action.to_string(),
+        from_status: from.to_string(),
+        to_status: to.to_string(),
+        timestamp: at(s),
+        params: serde_json::json!({}),
+        idempotency_key: None,
+    };
+    state.push_event_bounded(event("Submit", "Draft", "Submitted", 10));
+    state.push_event_bounded(event("Note", "Submitted", "Submitted", 20));
+    state.push_event_bounded(event("Note", "Submitted", "Submitted", 30));
+    state.status = "Submitted".to_string();
+    assert_eq!(state.status_clock.entered_at, Some(at(10)));
+    assert_eq!(state.status_clock.actions.get("Note"), Some(&at(30)));
+
+    let bytes = EntityActor::serialize_snapshot_state(&state).unwrap();
+    let mut restored = EntityActor::build_initial_state(
+        "Order",
+        "order-clock",
+        &order_table().read().expect("table lock"),
+        &serde_json::json!({}),
+    );
+    assert!(EntityActor::apply_snapshot_bytes(&mut restored, 3, &bytes));
+    assert!(
+        restored.events.is_empty(),
+        "a snapshot leaves the events out"
+    );
+    assert_eq!(restored.status_clock, state.status_clock);
+
+    // Leaving the status starts the clock again.
+    restored.push_event_bounded(event("Approve", "Submitted", "Approved", 40));
+    assert_eq!(restored.status_clock.entered_at, Some(at(40)));
+    assert!(restored.status_clock.actions.is_empty());
 }
 
 #[tokio::test]
@@ -1863,6 +1913,7 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
+            status_clock: Default::default(),
         }
     }
 
@@ -2318,6 +2369,7 @@ fn replaying_a_non_object_field_event_leaves_state_untouched() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
+        status_clock: Default::default(),
     };
     let before = state.fields.clone();
 
