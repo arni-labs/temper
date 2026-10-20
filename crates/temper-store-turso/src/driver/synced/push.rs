@@ -1,0 +1,185 @@
+//! Pushing committed changes to the remote, and what a refused push means.
+
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use temper_runtime::persistence::{PersistenceError, storage_error};
+
+use super::{
+    CopyState, DriverError, PUSH_ATTEMPT_TIMEOUT, REMOTE_STATEMENT_FAILED, SyncCopy, files,
+};
+
+impl SyncCopy {
+    /// Copy every change committed before this call to the remote database.
+    ///
+    /// Returns without a network request when another push already carried
+    /// those changes, so writers that commit together share one push. An
+    /// error means some of them may be only local; they stay in the local
+    /// change log and the next successful push sends them. Nothing is pushed
+    /// unless the copy is [`CopyState::Copying`].
+    pub async fn push_committed(&self) -> Result<(), PersistenceError> {
+        // Changes are numbered in commit order (one writer at a time), so
+        // everything this caller committed is at or below `wanted`.
+        let wanted = self.last_change().await?;
+        let _pushing = self.inner.pushing.lock().await;
+        self.require_copying()?;
+        if self.inner.pushed.load(Ordering::Acquire) >= wanted {
+            return Ok(());
+        }
+        // The push reads the change log after this, so it carries `covered`.
+        let covered = self.last_change().await?;
+        let remote_had = self.last_pushed_hint().map_err(storage_error)?;
+        let started = Instant::now();
+        let pushed = {
+            let _engine = self.inner.engine.lock().await;
+            tokio::time::timeout(PUSH_ATTEMPT_TIMEOUT, self.inner.db.push()).await
+        };
+        tracing::debug!(
+            changes = covered - self.inner.pushed.load(Ordering::Acquire),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = matches!(pushed, Ok(Ok(()))),
+            "turso.sync push"
+        );
+        match pushed {
+            Ok(Ok(())) => self.inner.timeouts.store(0, Ordering::Release),
+            Ok(Err(error)) => {
+                self.inner.timeouts.store(0, Ordering::Release);
+                let message = error.to_string();
+                if message.contains(REMOTE_STATEMENT_FAILED) {
+                    self.after_refusal(remote_had, &message).await;
+                }
+                return Err(storage_error(error));
+            }
+            Err(_) => {
+                self.inner.timeouts.fetch_add(1, Ordering::AcqRel);
+                return Err(PersistenceError::Storage(format!(
+                    "turso.sync push timed out after {} s",
+                    PUSH_ATTEMPT_TIMEOUT.as_secs()
+                )));
+            }
+        }
+        // The engine sends only changes numbered above the remote's record of
+        // this file's last push. A record above everything the file holds
+        // means the remote silently skipped what was just written: a second
+        // server is pushing as this file.
+        let remote_has = self.last_pushed_hint().map_err(storage_error)?;
+        let local_has = self.last_change().await?;
+        if remote_has > local_has {
+            self.enter(CopyState::Behind, &format!(
+                "after a push the remote has changes up to {remote_has}, the file only up to {local_has}"
+            ));
+            return self.require_copying();
+        }
+        self.inner.pushed.fetch_max(covered, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// A push the remote answered with a statement error. The remote skips a
+    /// statement that fails and commits the rest of the push together with
+    /// its record of the push, so a retry would succeed with that change
+    /// missing. Its record moving past where it was shows that happened; a
+    /// refusal that committed nothing (a busy remote) leaves it in place.
+    async fn after_refusal(&self, remote_had: i64, message: &str) {
+        match self.inner.remote.last_change().await {
+            Ok(remote_has) if remote_has <= remote_had => {
+                tracing::warn!(
+                    cause = message,
+                    "turso.sync push refused without committing; will retry"
+                );
+            }
+            Ok(_) => self.enter(
+                CopyState::Stopped(message.to_string()),
+                "the remote refused a change and committed the rest",
+            ),
+            Err(error) => self.enter(
+                CopyState::Stopped(format!(
+                    "{message} (and its progress could not be read: {error})"
+                )),
+                "the remote refused a change and its progress could not be read",
+            ),
+        }
+    }
+
+    pub(super) fn require_copying(&self) -> Result<(), PersistenceError> {
+        match self.state() {
+            CopyState::Copying => Ok(()),
+            CopyState::Unchecked => Err(PersistenceError::Storage(
+                "turso.sync the remote copy has not been reachable since this start".to_string(),
+            )),
+            CopyState::Behind => Err(PersistenceError::Storage(
+                "turso.sync the file is behind its remote copy; it is restored at the next start"
+                    .to_string(),
+            )),
+            CopyState::Stopped(cause) => Err(PersistenceError::Storage(format!(
+                "turso.sync the remote copy is missing a change ({cause})"
+            ))),
+        }
+    }
+
+    /// The remote's record of this file's last pushed change, as the engine
+    /// saved it after its last successful push.
+    fn last_pushed_hint(&self) -> Result<i64, DriverError> {
+        let info = files::sync_metadata(&self.inner.path)?;
+        Ok(info["last_pushed_change_id_hint"].as_i64().unwrap_or(0))
+    }
+
+    /// The number of the newest committed change in the local change log.
+    pub(super) async fn last_change(&self) -> Result<i64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query("SELECT MAX(change_id) FROM turso_cdc", ())
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(0);
+        };
+        Ok(row
+            .get::<Option<i64>>(0)
+            .map_err(storage_error)?
+            .unwrap_or(0))
+    }
+
+    pub(super) async fn query_text(&self, sql: &str) -> Result<String, DriverError> {
+        let conn = self.connect().await?;
+        let mut rows = conn.query(sql, ()).await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(String::new());
+        };
+        Ok(row.get::<String>(0).unwrap_or_default())
+    }
+
+    /// [`Self::push_committed`], retried with backoff until it succeeds or
+    /// `budget` has passed. The remote records the last change it applied in
+    /// the same transaction as the changes, so a retry after a push whose
+    /// answer was lost does not apply anything twice.
+    ///
+    /// The budget covers the whole call, waiting behind other pushes included.
+    pub async fn push_committed_within(&self, budget: Duration) -> Result<(), PersistenceError> {
+        tokio::time::timeout(budget, self.push_committed_retrying(budget))
+            .await
+            .unwrap_or_else(|_| {
+                Err(PersistenceError::Storage(format!(
+                    "turso.sync push not done within {} ms",
+                    budget.as_millis()
+                )))
+            })
+    }
+
+    async fn push_committed_retrying(&self, budget: Duration) -> Result<(), PersistenceError> {
+        let started = Instant::now();
+        let mut delay = Duration::from_millis(50);
+        loop {
+            match self.push_committed().await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if started.elapsed() + delay < budget && self.state() == CopyState::Copying =>
+                {
+                    tracing::warn!(%error, delay_ms = delay.as_millis() as u64, "turso.sync push failed; retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}

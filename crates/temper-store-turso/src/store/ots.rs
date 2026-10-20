@@ -80,7 +80,7 @@ impl TursoEventStore {
         p: &OtsTrajectoryParams<'_>,
     ) -> Result<(), PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.persist_ots_trajectory");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
         conn.execute(
             "INSERT INTO ots_trajectories \
              (trajectory_id, tenant, agent_id, session_id, outcome, turn_count, data, persistence_status, persist_attempts, last_error, created_at, updated_at) \
@@ -116,7 +116,7 @@ impl TursoEventStore {
         p: &OtsTrajectoryParams<'_>,
     ) -> Result<(), PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.enqueue_ots_trajectory");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
         conn.execute(
             "INSERT INTO ots_trajectories \
              (trajectory_id, tenant, agent_id, session_id, outcome, turn_count, data, persistence_status, persist_attempts, last_error, created_at, updated_at) \
@@ -151,7 +151,7 @@ impl TursoEventStore {
         trajectory_id: &str,
     ) -> Result<(), PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.mark_ots_trajectory_persisted");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
         conn.execute(
             "UPDATE ots_trajectories \
              SET persistence_status = 'persisted', last_error = NULL, updated_at = datetime('now') \
@@ -171,7 +171,7 @@ impl TursoEventStore {
         error: &str,
     ) -> Result<(), PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.mark_ots_trajectory_failed");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
         conn.execute(
             "UPDATE ots_trajectories \
              SET persistence_status = 'failed', persist_attempts = persist_attempts + 1, last_error = ?3, updated_at = datetime('now') \
@@ -193,7 +193,7 @@ impl TursoEventStore {
         limit: i64,
     ) -> Result<Vec<OtsQueuedTrajectoryRow>, PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.list_queued_ots_trajectories");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
         let mut rows = conn
             .query(
                 "SELECT trajectory_id, tenant, agent_id, session_id, outcome, turn_count, data, persist_attempts \
@@ -232,7 +232,7 @@ impl TursoEventStore {
         limit: i64,
     ) -> Result<Vec<OtsTrajectoryRow>, PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.list_ots_trajectories");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
 
         // Build query with optional filters.
         let mut sql = String::from(
@@ -293,7 +293,7 @@ impl TursoEventStore {
         trajectory_id: &str,
     ) -> Result<Option<OtsTrajectoryDocument>, PersistenceError> {
         let _timer = TursoQueryTimer::start("turso.get_ots_trajectory");
-        let conn = self.connection()?;
+        let conn = self.connection().await?;
         let mut rows = conn
             .query(
                 "SELECT agent_id, COALESCE(session_id, ''), outcome, data \

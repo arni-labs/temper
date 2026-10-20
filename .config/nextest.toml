@@ -1,0 +1,5 @@
+# The Turso Sync tests talk to a local sync server; a hang there should fail
+# the test with its output, not hold the job until its own timeout.
+[[profile.default.overrides]]
+filter = 'binary(turso_sync)'
+slow-timeout = { period = "60s", terminate-after = 2 }
