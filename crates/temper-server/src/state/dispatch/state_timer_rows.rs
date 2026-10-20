@@ -195,7 +195,10 @@ impl ServerState {
                     &timer.state,
                     label,
                 );
-                self.spawn_state_timer(timer, delay, Some(gate.clone()));
+                let Some(armed_seq) = self.reserve_state_timer(&timer) else {
+                    continue;
+                };
+                self.spawn_state_timer(timer, delay, Some(gate.clone()), armed_seq);
                 armed += 1;
             }
         }

@@ -128,13 +128,24 @@ impl EntityKey {
     }
 }
 
+/// One entity's cancellation counter, and the journal sequence of the
+/// transition that last armed or cancelled its timer.
+#[derive(Default, Debug, Clone, Copy)]
+struct ArmSeq {
+    seq: u64,
+    journal: u64,
+}
+
 /// In-memory cancellation counter keyed by entity instance.
 ///
 /// Each arm increments and captures the new value; firings compare captured
-/// against current and drop the fire when they diverge.
+/// against current and drop the fire when they diverge. An arm from an
+/// earlier journal sequence than the last arm or cancellation is refused, so
+/// a dispatch whose post-dispatch work finishes late never replaces the timer
+/// of a newer transition.
 #[derive(Default, Debug)]
 pub struct StateTimeoutTracker {
-    seqs: Mutex<HashMap<EntityKey, u64>>,
+    seqs: Mutex<HashMap<EntityKey, ArmSeq>>,
     /// ADR-0049: per-entity-type count of armed-but-unfired timers.
     /// Emitted as `temper_scheduler_pending_timers` by the canary loop.
     pending_by_type: Mutex<HashMap<String, u64>>,
@@ -145,11 +156,36 @@ impl StateTimeoutTracker {
         Self::default()
     }
 
+    #[cfg(test)]
     fn bump(&self, key: &EntityKey) -> u64 {
         let mut map = self.seqs.lock().expect("state_timeout tracker poisoned");
-        let entry = map.entry(key.clone()).or_insert(0);
-        *entry += 1;
-        *entry
+        let entry = map.entry(key.clone()).or_default();
+        entry.seq += 1;
+        entry.seq
+    }
+
+    /// Cancel the entity's timer for the transition at journal sequence
+    /// `journal`: no arm from an earlier transition is taken after this.
+    fn invalidate(&self, key: &EntityKey, journal: u64) -> u64 {
+        let mut map = self.seqs.lock().expect("state_timeout tracker poisoned");
+        let entry = map.entry(key.clone()).or_default();
+        entry.seq += 1;
+        entry.journal = entry.journal.max(journal);
+        entry.seq
+    }
+
+    /// Take a new cancellation value for a timer armed by the transition at
+    /// journal sequence `journal`, or None when a later transition already
+    /// armed or cancelled this entity's timer.
+    fn reserve(&self, key: &EntityKey, journal: u64) -> Option<u64> {
+        let mut map = self.seqs.lock().expect("state_timeout tracker poisoned");
+        let entry = map.entry(key.clone()).or_default();
+        if journal < entry.journal {
+            return None;
+        }
+        entry.seq += 1;
+        entry.journal = journal;
+        Some(entry.seq)
     }
 
     fn current(&self, key: &EntityKey) -> u64 {
@@ -157,8 +193,7 @@ impl StateTimeoutTracker {
             .lock()
             .expect("state_timeout tracker poisoned")
             .get(key)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |arm| arm.seq)
     }
 
     /// Increment the pending-timer count for `entity_type`. Called at arm.
@@ -246,11 +281,10 @@ impl crate::state::ServerState {
                     && timeout.reset_on.iter().any(|action| action == ctx.action)
             });
         if cancels_prior || resets_current {
-            self.state_timeout_tracker.bump(&EntityKey::new(
-                ctx.tenant,
-                ctx.entity_type,
-                ctx.entity_id,
-            ));
+            self.state_timeout_tracker.invalidate(
+                &EntityKey::new(ctx.tenant, ctx.entity_type, ctx.entity_id),
+                response.state.sequence_nr,
+            );
         }
         if cancels_prior {
             crate::runtime_metrics::record_state_timeout_cancelled(
@@ -390,24 +424,46 @@ impl crate::state::ServerState {
                 started_at,
             };
             let delay = remaining_budget(started_at, st.after_seconds, now);
+            // Reserved before the row is written: an arm whose dispatch
+            // finishes after a newer transition's is refused, and one that a
+            // newer arm or a state exit supersedes while its row is written
+            // removes the row and does not start.
+            let Some(armed_seq) = self.reserve_state_timer(&timer) else {
+                continue;
+            };
             self.persist_state_timer(&timer).await;
-            self.spawn_state_timer(timer, delay, None);
+            if self.state_timeout_tracker.current(&key) != armed_seq {
+                self.forget_state_timer(&timer).await;
+                continue;
+            }
+            self.spawn_state_timer(timer, delay, None, armed_seq);
         }
     }
 
-    /// Start one armed timer's task: it waits `delay`, then fires the timer's
-    /// action as the timer's identity if no newer arm or state change has
-    /// superseded it, and removes the timer's durable row when it ends. With a
-    /// `gate`, the fire waits for one of its permits and holds it until the
-    /// timer ends.
+    /// Reserve a cancellation value for `timer` (see [`StateTimeoutTracker`]),
+    /// or None when a later transition of its entity already armed or
+    /// cancelled a timer.
+    pub(super) fn reserve_state_timer(&self, timer: &ArmedTimer) -> Option<u64> {
+        self.state_timeout_tracker.reserve(
+            &EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id),
+            timer.sequence_nr,
+        )
+    }
+
+    /// Start one armed timer's task, with the cancellation value
+    /// [`Self::reserve_state_timer`] gave it: it waits `delay`, then fires the
+    /// timer's action as the timer's identity if no newer arm or state change
+    /// has superseded it, and removes the timer's durable row when it ends.
+    /// With a `gate`, the fire waits for one of its permits and holds it until
+    /// the timer ends.
     pub(super) fn spawn_state_timer(
         &self,
         timer: ArmedTimer,
         delay: Duration,
         gate: Option<Arc<Semaphore>>,
+        armed_seq: u64,
     ) {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
-        let armed_seq = self.state_timeout_tracker.bump(&key);
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
             .agent_ctx
@@ -490,7 +546,7 @@ impl crate::state::ServerState {
                             &timer.entity_id,
                             &timer.action,
                             timer.params.clone(),
-                            &timer.agent_ctx,
+                            &fire_agent(&timer),
                         )
                         .await;
                 }
@@ -524,12 +580,23 @@ pub(super) struct ArmedTimer {
 }
 
 /// The identity a timer fires as: the dispatch that armed it, as a new
-/// background action. It does not reuse the arming request's idempotency key:
+/// background action. It does not keep the arming request's idempotency key:
 /// the entity has already recorded that key, so the fire would be answered as
-/// a duplicate and never run.
+/// a duplicate and never run. The fire gets a key of its own ([`fire_agent`]).
 fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
+    agent
+}
+
+/// The timer's identity with one idempotency key per arming
+/// (`state-timer:<arm id>`): a fire that committed before a crash left its row
+/// behind is answered as done when the next boot fires that row again, so the
+/// action runs once. A repeating timer still re-arms on that answer, as its
+/// action is in `reset_on`.
+fn fire_agent(timer: &ArmedTimer) -> AgentContext {
+    let mut agent = timer.agent_ctx.clone();
+    agent.idempotency_key = Some(format!("state-timer:{}", timer.arm_id));
     agent
 }
 
@@ -576,6 +643,26 @@ mod tests {
         assert_eq!(t.bump(&k), 2);
         assert_eq!(t.bump(&k), 3);
         assert_eq!(t.current(&k), 3);
+    }
+
+    #[test]
+    fn an_arm_from_an_earlier_transition_is_refused() {
+        let t = StateTimeoutTracker::new();
+        let k = key();
+        assert_eq!(t.reserve(&k, 5), Some(1));
+        assert_eq!(
+            t.reserve(&k, 3),
+            None,
+            "an older transition's arm that finishes late"
+        );
+        assert_eq!(t.current(&k), 1, "the newer timer stays current");
+        assert_eq!(t.invalidate(&k, 7), 2);
+        assert_eq!(t.reserve(&k, 6), None, "an arm from before the exit");
+        assert_eq!(
+            t.reserve(&k, 7),
+            Some(3),
+            "the same transition again, as a duplicate reply re-arms"
+        );
     }
 
     #[test]
