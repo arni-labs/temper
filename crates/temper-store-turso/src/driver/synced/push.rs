@@ -9,6 +9,10 @@ use super::{
     CopyState, DriverError, PUSH_ATTEMPT_TIMEOUT, REMOTE_STATEMENT_FAILED, SyncCopy, files,
 };
 
+/// How long the remote may take to say how far it got, under the 10 s its
+/// HTTP client allows, so a hung remote is told from a refusing one.
+const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(8);
+
 impl SyncCopy {
     /// Copy every change committed before this call to the remote database.
     ///
@@ -28,7 +32,11 @@ impl SyncCopy {
         }
         // The push reads the change log after this, so it carries `covered`.
         let covered = self.last_change().await?;
-        let remote_had = self.last_pushed_hint().map_err(storage_error)?;
+        let remote_had = self.remote_had().await?;
+        // Until it is known to have succeeded, a push may have committed on
+        // the remote past the engine's own record: set before it starts, so
+        // a caller that gives up on it (an answer's time limit) leaves it set.
+        self.inner.unsure.store(true, Ordering::Release);
         let started = Instant::now();
         let pushed = {
             let _engine = self.inner.engine.lock().await;
@@ -41,7 +49,10 @@ impl SyncCopy {
             "turso.sync push"
         );
         match pushed {
-            Ok(Ok(())) => self.inner.timeouts.store(0, Ordering::Release),
+            Ok(Ok(())) => {
+                self.inner.unsure.store(false, Ordering::Release);
+                self.inner.timeouts.store(0, Ordering::Release);
+            }
             Ok(Err(error)) => {
                 self.inner.timeouts.store(0, Ordering::Release);
                 let message = error.to_string();
@@ -72,6 +83,36 @@ impl SyncCopy {
         }
         self.inner.pushed.fetch_max(covered, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// The remote's record of this file's last push before the next one.
+    /// The engine's own record is behind it when a push it never heard back
+    /// from committed (it timed out, its answer was lost, or this server
+    /// restarted after one), so then, and first after every start, the
+    /// remote is asked.
+    async fn remote_had(&self) -> Result<i64, PersistenceError> {
+        let hint = self.last_pushed_hint().map_err(storage_error)?;
+        if !self.inner.unsure.load(Ordering::Acquire) {
+            return Ok(hint);
+        }
+        // A remote that does not answer this counts like a push that timed
+        // out, so a hung remote still ends in the restart.
+        match tokio::time::timeout(REMOTE_READ_TIMEOUT, self.inner.remote.last_change()).await {
+            Ok(read) => Ok(hint.max(read.map_err(storage_error)?)),
+            Err(_) => {
+                self.inner.timeouts.fetch_add(1, Ordering::AcqRel);
+                Err(PersistenceError::Storage(format!(
+                    "turso.sync the remote did not say how far it got within {} s",
+                    REMOTE_READ_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    /// Whether the next push first asks the remote how far it got, because
+    /// a push since this start may have committed there unheard.
+    pub fn remote_record_unsure(&self) -> bool {
+        self.inner.unsure.load(Ordering::Acquire)
     }
 
     /// A push the remote answered with a statement error. The remote skips a

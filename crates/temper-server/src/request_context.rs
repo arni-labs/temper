@@ -5,6 +5,7 @@
 //! observability, and reaction modules.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use axum::http::HeaderMap;
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
@@ -281,18 +282,7 @@ pub fn intent_from_headers(headers: &HeaderMap) -> Option<String> {
 pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
     let session_id = session_id_from_headers(headers);
     let intent = intent_from_headers(headers);
-    // Extract W3C traceparent: "00-{trace_id}-{parent_span_id}-{flags}"
-    let (trace_id, parent_span_id) = headers
-        .get("traceparent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|tp| {
-            let parts: Vec<&str> = tp.split('-').collect();
-            if parts.len() >= 4 && parts[1].len() == 32 && parts[2].len() == 16 {
-                Some((parts[1].to_string(), parts[2].to_string()))
-            } else {
-                None
-            }
-        })
+    let (trace_id, parent_span_id) = traceparent_ids(headers)
         .map(|(t, s)| (Some(t), Some(s)))
         .unwrap_or((None, None));
 
@@ -338,16 +328,70 @@ pub(crate) fn current_span_trace_context_ids() -> Option<(String, String)> {
     ))
 }
 
+/// The trace and parent span ids of a W3C `traceparent` header:
+/// `00-{trace_id}-{parent_span_id}-{flags}`.
+fn traceparent_ids(headers: &HeaderMap) -> Option<(String, String)> {
+    let traceparent = headers.get("traceparent")?.to_str().ok()?;
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    (parts.len() >= 4 && parts[1].len() == 32 && parts[2].len() == 16)
+        .then(|| (parts[1].to_string(), parts[2].to_string()))
+}
+
+/// The caller's span from a request's `traceparent` header, as the parent of the
+/// request's server span. Only the server span takes it: everything the request
+/// does is then in that one trace. The caller's sampling decision and its
+/// `tracestate` are kept, so a trace the caller did not sample stays unsampled.
+pub(crate) fn remote_parent_from_headers(headers: &HeaderMap) -> Option<opentelemetry::Context> {
+    let traceparent = headers.get("traceparent")?.to_str().ok()?.trim();
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    let [version, trace_id, span_id, flags, rest @ ..] = parts.as_slice() else {
+        return None;
+    };
+    // W3C trace context: version ff is invalid, and version 00 has exactly four
+    // fields; a later version may add fields after them.
+    if version.len() != 2 || *version == "ff" || (*version == "00" && !rest.is_empty()) {
+        return None;
+    }
+    if flags.len() != 2 {
+        return None;
+    }
+    let flags = TraceFlags::new(u8::from_str_radix(flags, 16).ok()?);
+    let state = headers
+        .get("tracestate")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| TraceState::from_str(value).ok())
+        .unwrap_or_default();
+    remote_parent(trace_id, span_id, flags, state)
+}
+
 pub(crate) fn remote_parent_context(agent_ctx: &AgentContext) -> Option<opentelemetry::Context> {
-    let trace_id = TraceId::from_hex(agent_ctx.trace_id.as_deref()?).ok()?;
-    let span_id = SpanId::from_hex(agent_ctx.parent_span_id.as_deref()?).ok()?;
-    let span_context = SpanContext::new(
+    remote_parent_from_ids(
+        agent_ctx.trace_id.as_deref()?,
+        agent_ctx.parent_span_id.as_deref()?,
+    )
+}
+
+fn remote_parent_from_ids(trace_id: &str, span_id: &str) -> Option<opentelemetry::Context> {
+    remote_parent(
         trace_id,
         span_id,
         TraceFlags::SAMPLED,
-        true,
         TraceState::default(),
-    );
+    )
+}
+
+fn remote_parent(
+    trace_id: &str,
+    span_id: &str,
+    flags: TraceFlags,
+    state: TraceState,
+) -> Option<opentelemetry::Context> {
+    let trace_id = TraceId::from_hex(trace_id).ok()?;
+    let span_id = SpanId::from_hex(span_id).ok()?;
+    if trace_id == TraceId::INVALID || span_id == SpanId::INVALID {
+        return None;
+    }
+    let span_context = SpanContext::new(trace_id, span_id, flags, true, state);
     Some(opentelemetry::Context::new().with_remote_span_context(span_context))
 }
 
