@@ -28,10 +28,15 @@
 //! state with a declared timeout but has no live in-memory timer (seq == 0 in
 //! the tracker), as for a timer armed before its row was kept. Then the
 //! dispatch reconstructs how long the entity has been in the current state
-//! from the event log (the most recent transition into `state.status`, or the
-//! most recent `reset_on` event after it), and fires `on_timeout` at once if
-//! that is a full budget, or arms a timer for the rest. That timer fires as
-//! the dispatch that found it.
+//! (the most recent transition into `state.status`, or the most recent
+//! `reset_on` event after it) from the entity's status clock, which snapshots
+//! keep, or from its retained events when the state predates the clock. It
+//! fires `on_timeout` at once if that is a full budget, or arms a timer for the
+//! rest. That timer fires as the dispatch that found it. Before the status
+//! clock, a state restored from a snapshot (which leaves events out) or with
+//! the entry pushed out of the retained events armed a full budget on every
+//! hydration, so a daily timer on a server restarted more often than daily
+//! never fired.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -44,7 +49,7 @@ use tracing::Instrument;
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
-use crate::entity_actor::{EntityEvent, EntityResponse};
+use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 use crate::request_context::AgentContext;
 
 use super::effects::PostDispatchContext;
@@ -83,6 +88,26 @@ fn compute_state_clock_reset_ts(
         .max();
 
     Some(latest_reset_ts.unwrap_or(entry_ts))
+}
+
+/// When the clock of a timer on `current_state` started: from the entity's
+/// status clock, which snapshots keep, or else from its retained events (a
+/// state restored from a snapshot made before the status clock was kept).
+fn state_clock_started_at(
+    state: &EntityState,
+    current_state: &str,
+    reset_on: &[String],
+) -> Option<DateTime<Utc>> {
+    match state.status_clock.entered_at {
+        Some(entered) if state.status == current_state => Some(
+            reset_on
+                .iter()
+                .filter_map(|action| state.status_clock.actions.get(action))
+                .copied()
+                .fold(entered, DateTime::max),
+        ),
+        _ => compute_state_clock_reset_ts(&state.events, current_state, reset_on),
+    }
 }
 
 /// Composite key identifying an entity instance inside the arm-seq tracker.
@@ -309,7 +334,7 @@ impl crate::state::ServerState {
             let mut started_at = now;
             if needs_hydration_rearm {
                 let clock_reset =
-                    compute_state_clock_reset_ts(&response.state.events, &post_state, &st.reset_on);
+                    state_clock_started_at(&response.state, &post_state, &st.reset_on);
                 // No entry event found: treat as freshly entered. Safe
                 // default; worst case is one extra budget of wait.
                 started_at = clock_reset.unwrap_or(now);

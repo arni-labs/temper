@@ -175,6 +175,16 @@ source of truth for state: a timer still fires only if its record is in the
 timed state when it wakes. Timers armed before rows existed keep the
 next-action hydration re-arm.
 
+That re-arm read how long the entity had been in its state from the retained
+events, which a snapshot leaves out and a window of 50 forgets. Without the
+entry it armed a full budget, on every hydration: from 16 to 20 Oct 2026 the
+daily timers of a Katagami app's 18 feeds were re-armed for a full day after
+each restart (every 2 to 15 hours) and never fired. The entity state now keeps
+a status clock (when the current status was entered, and when each action last
+ran since), which snapshots keep, and the hydration re-arm reads it. A state
+restored from a snapshot made before the clock still falls back to the events;
+with timer rows such a timer is late by at most one budget, once.
+
 Known limits. A row is replaced only by its record's next arm, so a process
 that dies after a reset or re-entry commits but before its new row is written
 (or a row write that fails, which is logged) leaves the old row: at boot a

@@ -45,6 +45,11 @@ to = "Armed"
 params = []
 
 [[action]]
+name = "Note"
+from = ["Armed"]
+params = []
+
+[[action]]
 name = "Fire"
 from = ["Armed"]
 params = [{ name = "fired_by", type = "string", source = "authenticated_subject" }]
@@ -101,6 +106,7 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 </EntityType>
 <Action Name="Arm" IsBound="true"><Parameter Name="bindingParameter" Type="Probe.Probe"/></Action>
 <Action Name="Fire" IsBound="true"><Parameter Name="bindingParameter" Type="Probe.Probe"/></Action>
+<Action Name="Note" IsBound="true"><Parameter Name="bindingParameter" Type="Probe.Probe"/></Action>
 <Action Name="Start" IsBound="true"><Parameter Name="bindingParameter" Type="Probe.Ticker"/></Action>
 <Action Name="Tick" IsBound="true"><Parameter Name="bindingParameter" Type="Probe.Ticker"/></Action>
 <EntityContainer Name="Container">
@@ -248,6 +254,23 @@ impl Server {
         }
     }
 
+    /// Remove every timer row, as for timers armed before rows were kept.
+    fn forget_rows(&self) {
+        self.runtime.block_on(async {
+            let store = self
+                .state
+                .metadata_store_for_tenant("default")
+                .await
+                .unwrap();
+            for row in store.list_state_timers("default").await.unwrap() {
+                store
+                    .delete_state_timer("default", &row.entity_type, &row.entity_id, &row.arm_id)
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
     /// Wait until the store holds a timer row for each of `ids`.
     fn wait_for_rows(&self, ids: &[&str]) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -385,6 +408,47 @@ fn repeating_timer_resumes_without_replaying_missed_ticks(backend: &Backend) {
         second.wait_for("Ticker", "feed", "ticks", 3, Duration::from_millis(1_500)),
         3,
         "the next tick comes a full period after the catch-up"
+    );
+    second.kill();
+}
+
+/// A timer with no row (armed before rows were kept) comes back on its
+/// record's next action and counts the time already spent in its state, even
+/// when the entry into the state is no longer among the retained events (the
+/// window keeps 50; a snapshot keeps none). Before the status clock it was
+/// armed for a full budget on every such hydration, so a daily timer on a
+/// server restarted more often than daily never fired (Inspiration Bank's
+/// feeds, 15 to 20 Oct 2026).
+#[test]
+fn a_timer_without_a_row_counts_the_time_already_spent_in_its_state() {
+    let (_dir, backend) = turso();
+    let first = Server::start(&backend, "clock-run-1");
+    let t0 = Instant::now();
+    first.act("Probe", "noted", "Arm", &person("alice"));
+    for _ in 0..55 {
+        first.act("Probe", "noted", "Note", &person("alice"));
+    }
+    first.forget_rows();
+    assert_eq!(
+        first.read("Probe", "noted", "fires").0,
+        0,
+        "armed and waiting"
+    );
+    first.kill();
+
+    // 4.5 s into a state with a 4 s timeout.
+    sleep_until(t0 + Duration::from_millis(4_500));
+    let second = Server::start(&backend, "clock-run-2");
+    assert_eq!(
+        second.read("Probe", "noted", "fires").0,
+        0,
+        "no row: nothing armed at boot"
+    );
+    second.act("Probe", "noted", "Note", &person("bob"));
+    assert_eq!(
+        second.wait_for("Probe", "noted", "fires", 1, Duration::from_secs(1)),
+        1,
+        "overdue: the next action's re-arm fires it at once"
     );
     second.kill();
 }

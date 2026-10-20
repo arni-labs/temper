@@ -348,6 +348,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
             last_snapshot_sequence_nr: state.last_snapshot_sequence_nr,
             sequence_nr: state.sequence_nr,
             processed_idempotency_keys: BTreeMap::new(),
+            status_clock: Default::default(),
         },
         error: response.error.clone(),
         custom_effects: response.custom_effects.clone(),
