@@ -192,29 +192,6 @@ impl ReactionDispatcher {
                 }
             };
 
-            // A reaction that a retried request already ran on another record
-            // before reactions had keys of their own: that record holds the
-            // caller's key itself (ADR-0048). It ran; it is not run again.
-            let other_record =
-                rule.then.entity_type != entity_type || target_entity_id != entity_id;
-            if other_record
-                && let Some(key) = invoking_ctx.idempotency_key.as_deref()
-                && authz_snapshot
-                    .current_state
-                    .state
-                    .has_processed_idempotency_key(key)
-            {
-                success_count += 1;
-                results.push(ReactionResult {
-                    rule_name: rule.name.clone(),
-                    success: true,
-                    target_status: Some(authz_snapshot.current_state.state.status.clone()),
-                    error: None,
-                    depth,
-                });
-                continue;
-            }
-
             let security_ctx = effective_trigger_security_context(&dispatch_ctx);
             if let Err(denial) = state.authorize_with_context(
                 &security_ctx,

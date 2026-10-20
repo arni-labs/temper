@@ -4,9 +4,7 @@
 //! reused that key on the same record was answered as a duplicate and never
 //! ran: `SetAudience` with the header left a Room Live instead of moving it to
 //! Sharing. Each reaction now has a key of its own, derived from the caller's,
-//! so a retry of the whole request still runs nothing twice, and a reaction
-//! that a retried request ran before the upgrade (under the caller's key
-//! itself) is not run again.
+//! so a retry of the whole request still runs nothing twice.
 
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
@@ -178,47 +176,4 @@ async fn a_same_record_reaction_runs_when_the_request_carries_an_idempotency_key
     assert_eq!(read(&state, &tenant, "Room", "audiences").await.1, 1);
     assert_eq!(read(&state, &tenant, "Room", "guests").await.1, 1);
     assert_eq!(read(&state, &tenant, "Door", "opened").await.1, 1);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_reaction_a_retried_request_ran_before_the_upgrade_is_not_run_again() {
-    let tenant = TenantId::new("rooms-upgraded");
-    let state = build_state("rooms-upgraded");
-    // Before reactions had keys of their own, the Door's reaction recorded the
-    // caller's key itself.
-    let opened = state
-        .dispatch_tenant_action(
-            &tenant,
-            "Door",
-            "r1",
-            "Open",
-            serde_json::json!({}),
-            &caller("request-2"),
-        )
-        .await
-        .expect("Open");
-    assert!(opened.success, "{:?}", opened.error);
-
-    let retry = state
-        .dispatch_tenant_action(
-            &tenant,
-            "Room",
-            "r1",
-            "SetAudience",
-            serde_json::json!({}),
-            &caller("request-2"),
-        )
-        .await
-        .expect("SetAudience");
-    assert!(retry.success, "{:?}", retry.error);
-    assert_eq!(
-        read(&state, &tenant, "Door", "opened").await.1,
-        1,
-        "the Door's reaction already ran under the caller's key"
-    );
-    assert_eq!(
-        read(&state, &tenant, "Room", "guests").await,
-        ("Sharing".to_string(), 1),
-        "the same-record reaction, which never ran before, runs"
-    );
 }
