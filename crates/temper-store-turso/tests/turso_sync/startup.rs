@@ -154,9 +154,30 @@ async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
     assert!(a_path.exists(), "a failed adoption puts the file back");
     assert!(!a_dir.path().join("app.db-info").exists());
 
+    // A run that was killed after pushing some rows left its staging files.
+    let staging = a_dir.path().join("app.db.adopting");
+    let killed = server.open(&staging).await;
+    write(&killed, "stray", 0).await;
+    push(&killed).await;
+    drop(killed);
+
     let report = temper_store_turso::store::sync_adopt::adopt(db, &server.url, TOKEN)
         .await
-        .expect("adopt");
+        .expect("adopt, starting over after the killed run");
+    assert!(
+        !staging.exists(),
+        "the staged database took the file's place"
+    );
+    assert!(
+        std::fs::read_dir(a_dir.path())
+            .expect("dir")
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("app.db.before-sync-")),
+        "the original is kept aside"
+    );
     assert!(report.contains("specs: 1 rows"), "{report}");
     temper_store_turso::store::sync_adopt::adopt(db, &server.url, TOKEN)
         .await

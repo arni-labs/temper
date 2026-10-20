@@ -2,10 +2,12 @@
 //!
 //! The sync engine cannot take over an existing file: it would replace it
 //! with the remote's copy, and its change log holds none of the file's rows.
-//! So the file is set aside, a synced database is made fresh with today's
-//! schema (primary keys included), and every row is copied into it in chunks,
-//! each pushed to the remote before the next. The set-aside file stays as it
-//! was, for a rollback.
+//! So a synced database is made fresh beside the file (`<db>.adopting`), with
+//! today's schema (primary keys included), every row is copied into it in
+//! chunks, each pushed to the remote before the next, and only then is the
+//! original set aside (kept, for a rollback) and the new one put in its place.
+//! A run that is killed leaves the original where it was; the next run starts
+//! over and copies the same rows again, which replace what got through.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,35 +32,44 @@ pub async fn adopt(
     auth_token: &str,
 ) -> Result<String, PersistenceError> {
     let local = PathBuf::from(path.strip_prefix("file:").unwrap_or(path));
-    let refuse = |why: String| Err(PersistenceError::Storage(why));
     if !local.exists() {
-        return refuse(format!("{} does not exist", local.display()));
+        return Err(PersistenceError::Storage(format!(
+            "{} does not exist",
+            local.display()
+        )));
     }
     if sidecar(&local, "-info").exists() {
-        return refuse(format!("{} is already synced", local.display()));
+        return Err(PersistenceError::Storage(format!(
+            "{} is already synced",
+            local.display()
+        )));
     }
-    let aside = set_aside(&local)?;
-    match copy_into_sync(&local, &aside, sync_url, auth_token).await {
-        Ok(report) => Ok(format!("set aside: {}\n{report}", aside.display())),
+    let staging = sidecar(&local, ".adopting");
+    // A run before this one was killed: its rows may already be on the remote.
+    let again = remove_database(&staging);
+    let copied = copy_into_sync(&local, &staging, sync_url, auth_token, again).await;
+    let report = match copied {
+        Ok(report) => report,
         Err(error) => {
-            // Leave the app as it was: its file back in place, no synced one.
-            remove_database(&local);
-            put_back(&local, &aside)?;
-            Err(error)
+            remove_database(&staging);
+            return Err(error);
         }
-    }
+    };
+    let aside = set_aside(&local)?;
+    move_database(&staging, &local)?;
+    Ok(format!("set aside: {}\n{report}", aside.display()))
 }
 
 async fn copy_into_sync(
     local: &Path,
-    aside: &Path,
+    staging: &Path,
     sync_url: &str,
     auth_token: &str,
+    again: bool,
 ) -> Result<String, PersistenceError> {
     let refuse = |why: String| Err(PersistenceError::Storage(why));
-    let old_path = aside.join(local.file_name().unwrap_or_default());
-    let old = TursoEventStore::new(&format!("file:{}", old_path.display()), None).await?;
-    let new = TursoEventStore::new_synced(&local.to_string_lossy(), sync_url, auth_token).await?;
+    let old = TursoEventStore::new(&format!("file:{}", local.display()), None).await?;
+    let new = TursoEventStore::new_synced(&staging.to_string_lossy(), sync_url, auth_token).await?;
     let copy = new
         .sync_copy()
         .cloned()
@@ -69,7 +80,7 @@ async fn copy_into_sync(
             copy.state()
         ));
     }
-    if new.count_rows("events").await? > 0 {
+    if !again && new.count_rows("events").await? > 0 {
         return refuse(
             "the remote database already holds events; adopt needs an empty one".to_string(),
         );
@@ -219,37 +230,65 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     name.into()
 }
 
-/// Delete the database at `path` and every file beside it named after it.
-fn remove_database(path: &Path) {
+/// Delete the database at `path` and every file beside it named after it
+/// (`<db>-wal`, `<db>-info`...). Whether there was one.
+fn remove_database(path: &Path) -> bool {
+    let mut found = false;
+    for file in database_files(path) {
+        found = true;
+        let _ = std::fs::remove_file(file);
+    }
+    found
+}
+
+/// `path` and the files beside it named `<db>-...`.
+fn database_files(path: &Path) -> Vec<PathBuf> {
     let name = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let Some(dir) = path.parent() else {
-        return;
+    let Some(entries) = path.parent().and_then(|dir| std::fs::read_dir(dir).ok()) else {
+        return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let file = entry.file_name().to_string_lossy().into_owned();
-        if (file == name || file.starts_with(&format!("{name}-"))) && entry.path().is_file() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    entries
+        .flatten()
+        .filter(|entry| {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            (file == name || file.starts_with(&format!("{name}-"))) && entry.path().is_file()
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
-/// Undo [`set_aside`].
-fn put_back(path: &Path, aside: &Path) -> Result<(), PersistenceError> {
-    let failed = |error: std::io::Error| {
-        PersistenceError::Storage(format!("put back {}: {error}", path.display()))
-    };
-    for entry in std::fs::read_dir(aside).map_err(failed)? {
-        let entry = entry.map_err(failed)?;
-        std::fs::rename(entry.path(), path.with_file_name(entry.file_name())).map_err(failed)?;
+/// Rename the database at `from` and its files to `to`, keeping their suffixes.
+fn move_database(from: &Path, to: &Path) -> Result<(), PersistenceError> {
+    let from_name = from
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let to_name = to
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    for file in database_files(from) {
+        let name = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let target = to.with_file_name(format!("{to_name}{}", &name[from_name.len()..]));
+        std::fs::rename(&file, &target).map_err(|error| {
+            PersistenceError::Storage(format!(
+                "move {} to {}: {error}",
+                file.display(),
+                target.display()
+            ))
+        })?;
     }
-    std::fs::remove_dir(aside).map_err(failed)
+    Ok(())
 }
 
 /// Move the database and its WAL and shared-memory files into
