@@ -66,6 +66,28 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ─────────────────────────────────────────────────────
+  # Gate 1a: TypeScript SDK (packages/temper-sdk-ts)
+  # ─────────────────────────────────────────────────────
+  sdk-ts:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/temper-sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/temper-sdk-ts/package-lock.json
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Tests
+        run: npx vitest run
+
+  # ─────────────────────────────────────────────────────
   # Gate 1b: Bench compile (non-PR events only)
   # ─────────────────────────────────────────────────────
   bench-build:
