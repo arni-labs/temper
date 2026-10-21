@@ -4,6 +4,7 @@
 //! by looking up `AgentCredential` entities and their linked `AgentType`.
 //! See ADR-0033: Platform-Assigned Agent Identity.
 
+mod credential_count;
 pub mod endpoint;
 mod error;
 pub mod jwt;
