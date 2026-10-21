@@ -30,7 +30,12 @@ pub(super) fn refuse_uncompilable(
     tenant: &str,
     combined_policy: Option<&str>,
 ) -> Result<(), String> {
-    match combined_policy.map(|text| authz.validate_tenant_policies(text)) {
+    // The engine's live text compiled when it was loaded; a reinstall that
+    // changes nothing (every boot) need not parse the whole tenant again.
+    let live = authz.get_tenant_policy_text(tenant);
+    let changed =
+        combined_policy.filter(|text| live.as_deref().map(str::trim_end) != Some(text.trim_end()));
+    match changed.map(|text| authz.validate_tenant_policies(text)) {
         Some(Err(error)) => Err(format!(
             "Refusing os-app '{app_name}' for tenant '{tenant}': its Cedar does not compile with the tenant's: {error}"
         )),

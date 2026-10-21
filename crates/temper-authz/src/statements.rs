@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use cedar_policy::{Policy, Template};
+use cedar_policy_core::parser::cst;
 use cedar_policy_core::parser::text_to_cst::parse_policies;
 
 use crate::AuthzError;
@@ -23,21 +24,38 @@ pub struct StatementKey(String);
 ///
 /// Returns [`AuthzError::PolicyParse`] when `text` is not valid Cedar.
 pub fn policy_statements(text: &str) -> Result<Vec<(Range<usize>, StatementKey)>, AuthzError> {
+    statement_spans(text)?
+        .into_iter()
+        .map(|(span, _)| Ok((span.clone(), statement_key(&text[span])?)))
+        .collect()
+}
+
+/// Every statement's source span, and whether it already carries a source
+/// label, read from the syntax tree alone.
+fn statement_spans(text: &str) -> Result<Vec<(Range<usize>, bool)>, AuthzError> {
     let cst = parse_policies(text).map_err(|error| AuthzError::PolicyParse(error.to_string()))?;
     let Some(policies) = cst.node else {
         return Ok(Vec::new());
     };
-    let mut statements = Vec::with_capacity(policies.0.len());
+    let mut spans = Vec::with_capacity(policies.0.len());
     for policy in &policies.0 {
         let loc = policy.loc.as_ref().ok_or_else(|| {
             AuthzError::PolicyParse("a parsed statement has no source location".into())
         })?;
         let span = loc.start()..loc.end();
         assert!(span.end <= text.len(), "statement span outside its text");
-        let key = statement_key(&text[span.clone()])?;
-        statements.push((span, key));
+        #[allow(unreachable_patterns)] // an error node exists only with `tolerant-ast`
+        let labelled = match &policy.node {
+            Some(cst::Policy::Policy(statement)) => statement.annotations.iter().any(|annotation| {
+                annotation.node.as_ref().is_some_and(|annotation| {
+                    matches!(&annotation.key.node, Some(cst::Ident::Ident(key)) if key == SOURCE_ANNOTATION)
+                })
+            }),
+            _ => false,
+        };
+        spans.push((span, labelled));
     }
-    Ok(statements)
+    Ok(spans)
 }
 
 /// The identities of every statement in `text`.
@@ -110,8 +128,8 @@ pub fn label_statements(text: &str, label: &str) -> Result<String, AuthzError> {
     let label = label.replace('\\', "\\\\").replace('"', "\\\"");
     let mut labelled = String::with_capacity(text.len() + 64);
     let mut cursor = 0;
-    for (index, (span, _)) in policy_statements(text)?.into_iter().enumerate() {
-        if has_source_annotation(&text[span.clone()]) {
+    for (index, (span, already_labelled)) in statement_spans(text)?.into_iter().enumerate() {
+        if already_labelled {
             continue;
         }
         labelled.push_str(&text[cursor..span.start]);
@@ -123,14 +141,6 @@ pub fn label_statements(text: &str, label: &str) -> Result<String, AuthzError> {
     }
     labelled.push_str(&text[cursor..]);
     Ok(labelled)
-}
-
-fn has_source_annotation(statement: &str) -> bool {
-    match Policy::parse(None, statement) {
-        Ok(policy) => policy.annotation(SOURCE_ANNOTATION).is_some(),
-        Err(_) => Template::parse(None, statement)
-            .is_ok_and(|template| template.annotation(SOURCE_ANNOTATION).is_some()),
-    }
 }
 
 fn statement_key(source: &str) -> Result<StatementKey, AuthzError> {

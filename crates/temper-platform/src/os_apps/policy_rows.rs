@@ -169,7 +169,7 @@ pub(super) async fn superseded_app_policies(
         bundle_row_ids.insert(os_app_policy_row_id(app_name, &source.relative_path));
     }
     let mut previous = BTreeSet::new();
-    let mut held_by_others = BTreeSet::new();
+    let mut others = Vec::new();
     let mut superseded = SupersededAppPolicies::default();
     for row in &rows {
         if row.created_by == owner {
@@ -181,13 +181,22 @@ pub(super) async fn superseded_app_policies(
             // Boot ignores a disabled snapshot, so only an enabled one matters.
             superseded.primary = row.enabled.then(|| row.clone());
         } else if row.enabled {
+            others.push(row);
+        }
+    }
+    let dropped: BTreeSet<StatementKey> =
+        previous.difference(&bundle_statements).cloned().collect();
+    // Only a dropped statement needs the other rows read; a reinstall of the
+    // same Cedar (every boot) parses none of them.
+    let mut held_by_others = BTreeSet::new();
+    if !dropped.is_empty() {
+        for row in others {
             held_by_others.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
         }
     }
-    superseded.statements = previous
-        .difference(&bundle_statements)
-        .filter(|statement| !held_by_others.contains(*statement))
-        .cloned()
+    superseded.statements = dropped
+        .into_iter()
+        .filter(|statement| !held_by_others.contains(statement))
         .collect();
     debug_assert!(superseded.statements.is_disjoint(&bundle_statements));
     debug_assert!(superseded.statements.is_disjoint(&held_by_others));
