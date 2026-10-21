@@ -92,17 +92,6 @@ pub fn remove_statements(
     Ok(kept)
 }
 
-/// Whether `text` compiles as a whole policy set, as the engine loads it.
-///
-/// # Errors
-///
-/// Returns [`AuthzError::PolicyParse`] with Cedar's reason when it does not.
-pub fn check_compiles(text: &str) -> Result<(), AuthzError> {
-    text.parse::<cedar_policy::PolicySet>()
-        .map(|_| ())
-        .map_err(|error| AuthzError::PolicyParse(error.to_string()))
-}
-
 /// The annotation that names where a statement came from, so a decision can
 /// say which rule decided it (see [`label_statements`]).
 pub const SOURCE_ANNOTATION: &str = "source";

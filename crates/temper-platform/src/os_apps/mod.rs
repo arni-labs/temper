@@ -1203,7 +1203,12 @@ pub(super) async fn install_os_app_with_plan(
         } else {
             None
         };
-    install_guard::refuse_uncompilable(app_name, tenant, combined_policy.as_deref())?;
+    install_guard::refuse_uncompilable(
+        &state.server.authz,
+        app_name,
+        tenant,
+        combined_policy.as_deref(),
+    )?;
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }

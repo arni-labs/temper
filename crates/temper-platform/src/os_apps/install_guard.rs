@@ -25,11 +25,12 @@ pub(super) async fn tenant(tenant: &str) -> OwnedMutexGuard<()> {
 /// compile: going on would persist Cedar the engine then fails to load, and the
 /// tenant would keep running on whatever set was live.
 pub(super) fn refuse_uncompilable(
+    authz: &temper_authz::AuthzEngine,
     app_name: &str,
     tenant: &str,
     combined_policy: Option<&str>,
 ) -> Result<(), String> {
-    match combined_policy.map(temper_authz::statements::check_compiles) {
+    match combined_policy.map(|text| authz.validate_tenant_policies(text)) {
         Some(Err(error)) => Err(format!(
             "Refusing os-app '{app_name}' for tenant '{tenant}': its Cedar does not compile with the tenant's: {error}"
         )),
