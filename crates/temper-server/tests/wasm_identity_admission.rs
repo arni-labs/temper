@@ -599,3 +599,59 @@ async fn a_module_that_ends_without_answering_is_answered_at_once() {
         "answered in {took:?}"
     );
 }
+
+/// A span's name, and its parent's (None for a root).
+type NamedSpan = (String, Option<String>);
+
+/// Each span made, in order.
+#[derive(Clone, Default)]
+struct SpanParents(std::sync::Arc<std::sync::Mutex<Vec<NamedSpan>>>);
+
+impl<S> tracing_subscriber::Layer<S> for SpanParents
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        _attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let span = ctx.span(id).expect("a new span is registered");
+        let parent = span.parent().map(|parent| parent.name().to_string());
+        self.0
+            .lock()
+            .unwrap()
+            .push((span.name().to_string(), parent));
+    }
+}
+
+/// A route's module runs inside the request's span: the request is one trace,
+/// never a module call that starts a trace of its own.
+#[tokio::test]
+async fn a_routes_module_runs_inside_the_request_span() {
+    use tracing::Instrument as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let (state, _dir) = fixture().await;
+    install_route(&state, "/probe", "capability-probe", 5).await;
+    let spans = SpanParents::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+    let (status, body, _) = route_call(&state, "/probe")
+        .instrument(tracing::info_span!("http.request"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let spans = spans.0.lock().unwrap().clone();
+    assert!(
+        spans.iter().any(|(name, _)| name == "wasm.invoke"),
+        "the module ran: {spans:?}"
+    );
+    // The outbox's persist is a tracing root that continues its request's
+    // trace through OpenTelemetry, so only the module's own spans are checked.
+    let module_roots: Vec<&str> = spans
+        .iter()
+        .filter(|(name, parent)| parent.is_none() && name.starts_with("wasm."))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(module_roots.is_empty(), "{spans:?}");
+}
