@@ -484,10 +484,18 @@ pub fn route_from_entity_fields(id: &str, fields: &serde_json::Value) -> Option<
         .unwrap_or(60);
     let git_pack_defaults =
         integration_module == "git_receive_pack" || integration_module == "git_upload_pack";
-    let max_fuel = obj
-        .get("MaxFuel")
-        .and_then(|v| v.as_u64())
-        .or_else(|| git_pack_defaults.then_some(20_000_000_000));
+    let configured_fuel = obj.get("MaxFuel").and_then(|v| v.as_u64());
+    let max_fuel = if integration_module == "git_upload_pack" {
+        // upload-pack (clone/fetch) only emits the server's own pack, so its
+        // instruction count grows with repo size, not client input: a fixed
+        // ceiling silently truncates clones once a repo outgrows it (ARN-57,
+        // 278, 284). Bounded by timeout and memory instead; the stored MaxFuel
+        // can raise the floor, never lower it. receive-pack keeps its tight
+        // bound: its input is a client's pack, ahead of the Cedar-gated ingest.
+        Some(configured_fuel.unwrap_or(0).max(GIT_PACK_FUEL_FLOOR))
+    } else {
+        configured_fuel.or_else(|| git_pack_defaults.then_some(20_000_000_000))
+    };
     let max_memory = obj
         .get("MaxMemory")
         .and_then(|v| v.as_u64())
