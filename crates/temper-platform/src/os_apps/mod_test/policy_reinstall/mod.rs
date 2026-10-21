@@ -329,3 +329,32 @@ async fn reinstall_drops_a_removed_policy_file() {
 }
 
 mod faults;
+
+#[tokio::test]
+async fn a_moved_statement_is_live_once_under_its_new_label() {
+    let fx = Fixture::new("relabel").await;
+    let app = format!("reinstall-relabel-{}", uuid::Uuid::new_v4().simple());
+    fx.write_app(&app, &[("thing.cedar", &thing_policies(FORBID_WITHDRAW))]);
+    fx.install(&app).await;
+    // A new first statement moves the forbid from #2 to #3.
+    let moved = format!("{FORBID_DELETE}\n{}", thing_policies(FORBID_WITHDRAW));
+    fx.write_app(&app, &[("thing.cedar", &moved)]);
+    fx.install(&app).await;
+
+    let live = fx.live_text();
+    assert_eq!(live.matches("Action::\"Withdraw\"").count(), 1, "{live}");
+    assert!(
+        live.contains(&format!(
+            "@source(\"{app}/thing.cedar#3\")\n{FORBID_WITHDRAW}"
+        )),
+        "{live}"
+    );
+    assert!(
+        !live.contains(&format!("{app}/thing.cedar#2\")\n{FORBID_WITHDRAW}")),
+        "{live}"
+    );
+    for state in [&fx.state, &fx.restart().await] {
+        assert!(!fx.allowed(state, "Withdraw", "Thing"));
+        assert!(!fx.allowed(state, "Delete", "Thing"));
+    }
+}

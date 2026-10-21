@@ -87,13 +87,16 @@ pub(super) async fn persist_bundle_policy_rows(
 /// The Cedar a reinstall of one app replaces.
 ///
 /// An earlier install of the app recorded each of its policy files as a row.
-/// Statements in those rows that the new bundle no longer carries are
-/// superseded: they must leave the live set, the legacy aggregate and any
-/// `primary` snapshot, or an old forbid outlives its replacement (forbid beats
-/// every permit). Statements are compared parsed, so layout does not matter.
+/// When the bundle changes, the statements in those rows are superseded: they
+/// leave the live set, the legacy aggregate and any `primary` snapshot, and the
+/// bundle's statements take their place. Otherwise an old forbid outlives its
+/// replacement (forbid beats every permit), or a statement stays live twice,
+/// once under an old label. Statements are compared parsed, ignoring layout
+/// and labels.
 #[derive(Debug, Default)]
 pub(super) struct SupersededAppPolicies {
-    /// Superseded statements that no other owner holds.
+    /// This app's previous statements that no other owner holds; the live
+    /// text loses them and gets the bundle's statements in their place.
     statements: BTreeSet<StatementKey>,
     /// This app's rows whose source file is gone from the new bundle.
     removed_row_ids: Vec<String>,
@@ -184,21 +187,26 @@ pub(super) async fn superseded_app_policies(
             others.push(row);
         }
     }
-    let dropped: BTreeSet<StatementKey> =
-        previous.difference(&bundle_statements).cloned().collect();
-    // Only a dropped statement needs the other rows read; a reinstall of the
-    // same Cedar (every boot) parses none of them.
-    let mut held_by_others = BTreeSet::new();
-    if !dropped.is_empty() {
-        for row in others {
-            held_by_others.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
-        }
+    // A reinstall that drops nothing and whose text, labels included, is
+    // already live (every boot) replaces nothing and reads no other row.
+    let live = super::cached_or_active_tenant_policy_text(state, tenant);
+    let already_live = bundle
+        .cedar_policies
+        .iter()
+        .all(|policy| live.contains(policy.trim()));
+    if previous.is_subset(&bundle_statements) && already_live {
+        return Ok(superseded);
     }
-    superseded.statements = dropped
+    let mut held_by_others = BTreeSet::new();
+    for row in others {
+        held_by_others.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
+    }
+    // Every previous statement goes, kept ones too: the bundle adds them back
+    // under their current labels, so no copy under an old label stays live.
+    superseded.statements = previous
         .into_iter()
         .filter(|statement| !held_by_others.contains(statement))
         .collect();
-    debug_assert!(superseded.statements.is_disjoint(&bundle_statements));
     debug_assert!(superseded.statements.is_disjoint(&held_by_others));
     Ok(superseded)
 }
