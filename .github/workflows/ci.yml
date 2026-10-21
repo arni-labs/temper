@@ -66,7 +66,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ─────────────────────────────────────────────────────
-  # Gate 1b: Bench compile (non-PR events only)
+  # Gate 1a: TypeScript SDK (packages/temper-sdk-ts)
   # ─────────────────────────────────────────────────────
   sdk-ts:
     name: TypeScript SDK
@@ -87,6 +87,9 @@ jobs:
       - name: Tests
         run: npx vitest run
 
+  # ─────────────────────────────────────────────────────
+  # Gate 1b: Bench compile (non-PR events only)
+  # ─────────────────────────────────────────────────────
   bench-build:
     name: Bench Build
     runs-on: ubuntu-latest
