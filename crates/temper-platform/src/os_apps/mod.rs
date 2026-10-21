@@ -1117,6 +1117,19 @@ pub(super) async fn install_os_app_with_plan(
             app_dir.display()
         )
     })?;
+    // A bundle without the binary of a required module is refused before any
+    // spec, policy or install row is written, rather than installing an app
+    // that answers 503 at request time (ARN-61/ARN-273).
+    let missing = reconcile::missing_required_wasm_modules(&bundle);
+    if plan.wasm && !missing.is_empty() {
+        return Err(format!(
+            "Refusing to activate os-app '{app_name}' for tenant '{tenant}': \
+             required WASM module artifact(s) missing from the app bundle: {}. \
+             The published bundle must include a compiled binary for every module \
+             declared platform-required/app-required in app.toml.",
+            missing.join(", ")
+        ));
+    }
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }
@@ -1420,9 +1433,6 @@ pub(super) async fn install_os_app_with_plan(
     let mut wasm_registered = Vec::new();
     let mut wasm_skipped = Vec::new();
     let mut wasm_failures = Vec::new();
-    // Required modules with no binary in the bundle: they fail the install below
-    // rather than answering 503 at request time (ARN-61/ARN-273).
-    let mut missing_required_modules = Vec::new();
     if plan.wasm {
         let existing_sources = match state.server.load_wasm_module_sources(tenant).await {
             Ok(map) => map,
@@ -1542,7 +1552,6 @@ pub(super) async fn install_os_app_with_plan(
                 }
                 WasmModuleCriticality::PlatformRequired | WasmModuleCriticality::AppRequired => {
                     wasm_failures.push(module_name.clone());
-                    missing_required_modules.push(module_name.clone());
                     tracing::error!(
                         tenant,
                         module = %module_name,
@@ -1552,19 +1561,6 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
-    }
-
-    // Before the App entity is bootstrapped or the install recorded, so a bundle
-    // missing a required binary is refused outright. Optional modules only warn.
-    if plan.wasm && !missing_required_modules.is_empty() {
-        missing_required_modules.sort();
-        return Err(format!(
-            "Refusing to activate os-app '{app_name}' for tenant '{tenant}': \
-             required WASM module artifact(s) missing from the app bundle: {}. \
-             The published bundle must include a compiled binary for every module \
-             declared platform-required/app-required in app.toml.",
-            missing_required_modules.join(", ")
-        ));
     }
 
     tracing::info!(
