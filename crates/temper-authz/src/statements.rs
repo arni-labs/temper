@@ -5,8 +5,9 @@
 //! Removal cuts each statement's source span and keeps every other byte, so
 //! comments and layout around the remaining statements survive.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
+use std::sync::{Mutex, OnceLock};
 
 use cedar_policy::{Policy, Template};
 use cedar_policy_core::parser::cst;
@@ -143,7 +144,27 @@ pub fn label_statements(text: &str, label: &str) -> Result<String, AuthzError> {
     Ok(labelled)
 }
 
+/// Statement keys by exact statement text. An install reads every statement
+/// of the tenant's rows and live text, and a boot installs every app, so the
+/// same text comes back many times; the JSON serialisation is the cost.
 fn statement_key(source: &str) -> Result<StatementKey, AuthzError> {
+    static KEYS: OnceLock<Mutex<HashMap<String, StatementKey>>> = OnceLock::new();
+    const MAX_KEYS: usize = 20_000;
+    let keys = KEYS.get_or_init(Default::default);
+    if let Some(key) = keys.lock().ok().and_then(|keys| keys.get(source).cloned()) {
+        return Ok(key);
+    }
+    let key = parse_statement_key(source)?;
+    if let Ok(mut keys) = keys.lock() {
+        if keys.len() >= MAX_KEYS {
+            keys.clear();
+        }
+        keys.insert(source.to_string(), key.clone());
+    }
+    Ok(key)
+}
+
+fn parse_statement_key(source: &str) -> Result<StatementKey, AuthzError> {
     let parse_error = |error: &dyn std::fmt::Display| AuthzError::PolicyParse(error.to_string());
     // A statement with slots parses only as a template, one without only as a policy.
     let mut json = match Policy::parse(None, source) {

@@ -199,7 +199,13 @@ pub(super) async fn superseded_app_policies(
     }
     let mut held_by_others = BTreeSet::new();
     for row in others {
-        held_by_others.extend(parsed_statements(&row.policy_id, &row.cedar_text)?);
+        // A row that does not parse holds no live statement: boot cannot load it.
+        match parsed_statements(&row.policy_id, &row.cedar_text) {
+            Ok(statements) => held_by_others.extend(statements),
+            Err(error) => {
+                tracing::warn!(tenant, policy_id = %row.policy_id, %error, "skipping an unparseable Cedar row")
+            }
+        }
     }
     // Every previous statement goes, kept ones too: the bundle adds them back
     // under their current labels, so no copy under an old label stays live.
