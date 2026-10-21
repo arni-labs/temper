@@ -173,7 +173,9 @@ pub(super) async fn dispatch_matched_route(
         }
         let _ = pump_streams.close(kernel_request_body).await;
     };
-    tokio::spawn(pump_task.in_current_span()); // determinism-ok: detached HTTP body pump, not simulation state
+    // The pump records no spans and can wait on a guest that stops reading, so it holds no request span:
+    // a span it held would stay open, and its trace would never be sent, for as long as the pump waits.
+    tokio::spawn(pump_task); // determinism-ok: detached HTTP body pump, not simulation state
 
     // Build the invocation context. Guest-visible headers go through
     // `guest_visible_headers` so caller credentials are stripped in one audited
