@@ -92,6 +92,7 @@ pub async fn run(
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let data_dir = Path::new(&home).join(".local/share/temper");
     state.server.data_dir = data_dir.clone();
+    state.server.files_need_object_store = storage::files_need_object_store();
 
     seed_cedar_policies(&state, tenant_policy_seed);
     state.server.rebuild_reaction_dispatcher();
