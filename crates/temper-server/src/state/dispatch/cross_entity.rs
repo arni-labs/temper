@@ -305,6 +305,17 @@ impl crate::state::ServerState {
                                     Ok(_) => None,
                                 };
                                 if let Some(error) = refusal {
+                                    // The child stays in its first state: arm
+                                    // that state's timer, as for no initializer.
+                                    state
+                                        .arm_state_timeouts_on_creation(
+                                            &t,
+                                            &child_type,
+                                            &child_id,
+                                            &created,
+                                            &agent,
+                                        )
+                                        .await;
                                     state.record_generated_callback_refusal(
                                         super::WasmEntityRef {
                                             tenant: &t,
