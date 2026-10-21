@@ -65,7 +65,8 @@ impl ServerState {
 
     /// Write a File's bytes to their content-addressed key. When the tenant's store is a remote object store (R2/S3),
     /// that store alone keeps them: they are never copied into the database, which for an app's own Temper is its one
-    /// SQLite file. A local store keeps the database copy the default tenant has always had.
+    /// SQLite file. A local store keeps the database copy the default tenant has always had, unless this server keeps
+    /// Files only in an object store (`files_need_object_store`): then nothing is kept and the write is refused.
     pub(crate) async fn put_file_content_blob(
         &self,
         tenant: &TenantId,
@@ -73,6 +74,11 @@ impl ServerState {
         body: &[u8],
     ) -> Result<(), String> {
         let store = self.blob_store_for_tenant(tenant)?;
+        if self.files_need_object_store && !store.is_object_store() {
+            return Err(format!(
+                "this server keeps Files only in an object store, and tenant '{tenant}' has none (no blob_endpoint in its vault); nothing was kept"
+            ));
+        }
         store.put_content_addressed(key, body, None).await?;
         if store.is_object_store() {
             return Ok(());
@@ -388,6 +394,53 @@ mod tests {
                 .await
                 .expect("tenant C read"),
             None
+        );
+    }
+
+    /// A Katagami app whose vault key was lost (Run probe, 21 Oct 2026) restored its data with no readable
+    /// `blob_endpoint`, and a File put then answered 204 while its bytes went to this disk and the app's database.
+    #[tokio::test]
+    async fn a_server_that_keeps_files_only_in_an_object_store_refuses_them_without_one() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let mut state = ServerState::new(
+            ActorSystem::new("files-need-object-store"),
+            CsdlDocument {
+                version: "4.0".to_string(),
+                schemas: Vec::new(),
+            },
+            String::new(),
+        );
+        state.data_dir = data_dir.path().to_path_buf();
+        let tenant = TenantId::default();
+        let key = "temper-fs/sha256:refused";
+
+        state.files_need_object_store = true;
+        let refused = state
+            .put_file_content_blob(&tenant, key, b"bytes")
+            .await
+            .expect_err("no object store, so no File bytes");
+        assert!(refused.contains("only in an object store"), "{refused}");
+        assert_eq!(
+            state
+                .get_blob_with_legacy_fallback(&tenant, key)
+                .await
+                .expect("read"),
+            None,
+            "nothing kept on disk or in the database"
+        );
+
+        // Without the setting, a local store keeps them as before.
+        state.files_need_object_store = false;
+        state
+            .put_file_content_blob(&tenant, key, b"bytes")
+            .await
+            .expect("a local store keeps Files");
+        assert_eq!(
+            state
+                .get_blob_with_legacy_fallback(&tenant, key)
+                .await
+                .expect("read"),
+            Some(b"bytes".to_vec())
         );
     }
 }
