@@ -542,6 +542,14 @@ pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, St
             eprintln!("  Warning: failed to bootstrap trusted issuer for tenant '{tenant}': {e}");
         }
     }
+
+    // ADR-0069: every tenant has the platform's HttpEndpoint type, so its routes
+    // have somewhere to live from its first boot.
+    for tenant in &agent_spec_tenants {
+        if let Err(e) = temper_platform::bootstrap_http_endpoint_spec(state, tenant) {
+            tracing::warn!(tenant = %tenant, error = %e, "failed to register HttpEndpoint");
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

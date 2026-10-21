@@ -307,8 +307,12 @@ const OPERATOR_CREDENTIAL_SPECS: &[(&str, &str)] = &[
 /// Panics only if `AGENT_CSDL` fails to parse — a compile-time invariant of an
 /// embedded, test-covered constant (see `test_agent_csdl_parses`).
 fn agent_csdl_slice(keep_types: &[&str]) -> CsdlDocument {
-    let mut doc =
-        parse_csdl(AGENT_CSDL).unwrap_or_else(|e| panic!("Agent CSDL failed to parse: {e}"));
+    csdl_slice(AGENT_CSDL, keep_types)
+}
+
+/// [`agent_csdl_slice`] for any of the embedded CSDL documents.
+fn csdl_slice(csdl: &str, keep_types: &[&str]) -> CsdlDocument {
+    let mut doc = parse_csdl(csdl).unwrap_or_else(|e| panic!("embedded CSDL failed to parse: {e}"));
     let is_kept = |type_name: &str| {
         let bare = type_name.rsplit('.').next().unwrap_or(type_name);
         keep_types.contains(&bare)
@@ -352,8 +356,38 @@ fn bootstrap_agent_subset_specs(
     tenant: &str,
     specs: &[(&str, &str)],
 ) -> Result<(), RegistryError> {
+    bootstrap_subset_specs(state, tenant, AGENT_CSDL, specs)
+}
+
+/// The platform's `HttpEndpoint` type (ADR-0069), for a tenant.
+///
+/// ADR-0069 gives every tenant the type, as it does `Observation` and the other
+/// platform entities: a tenant's routes are its own `HttpEndpoint` rows. It sat
+/// only in `temper-system`, so a server built from scratch had nowhere to keep
+/// a route until an app happened to bring the type. Same merge and trust
+/// semantics as [`bootstrap_identity_specs`]: additive, cascade-free.
+pub fn bootstrap_http_endpoint_spec(
+    state: &PlatformState,
+    tenant: &str,
+) -> Result<(), RegistryError> {
+    bootstrap_subset_specs(
+        state,
+        tenant,
+        SYSTEM_CSDL,
+        &[("HttpEndpoint", HTTP_ENDPOINT_IOA)],
+    )
+}
+
+/// Register `specs`, with the slice of `csdl` they need, into a tenant without
+/// the verification cascade (see [`bootstrap_agent_subset_specs`]).
+fn bootstrap_subset_specs(
+    state: &PlatformState,
+    tenant: &str,
+    csdl: &str,
+    specs: &[(&str, &str)],
+) -> Result<(), RegistryError> {
     let keep: Vec<&str> = specs.iter().map(|(entity_type, _)| *entity_type).collect();
-    let csdl_doc = agent_csdl_slice(&keep);
+    let csdl_doc = csdl_slice(csdl, &keep);
     let csdl_xml = emit_csdl_xml(&csdl_doc);
 
     let tenant_id = TenantId::new(tenant);
