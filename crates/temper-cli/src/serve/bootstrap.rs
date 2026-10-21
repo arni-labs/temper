@@ -542,6 +542,14 @@ pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, St
             eprintln!("  Warning: failed to bootstrap trusted issuer for tenant '{tenant}': {e}");
         }
     }
+
+    // ADR-0069: every tenant has the platform's HttpEndpoint type, so its routes
+    // have somewhere to live from its first boot.
+    for tenant in &agent_spec_tenants {
+        if let Err(e) = temper_platform::bootstrap_http_endpoint_spec(state, tenant) {
+            tracing::warn!(tenant = %tenant, error = %e, "failed to register HttpEndpoint");
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -726,6 +734,35 @@ mod tests {
             "agent bootstrap must not hide restored entity sets in default"
         );
         assert!(config.entity_set_map.contains_key("AgentTypes"));
+    }
+
+    /// ADR-0069: every tenant gets the platform's HttpEndpoint type at boot,
+    /// not only temper-system, so a server built from scratch can hold routes.
+    #[tokio::test]
+    async fn every_booted_tenant_has_the_http_endpoint_type() {
+        let state = PlatformState::new(None);
+        bootstrap_tenants(&state, &[("app-tenant".to_string(), String::new())]).await;
+
+        let registry = state.registry.read().unwrap();
+        for tenant in ["default", "app-tenant"] {
+            let config = registry
+                .get_tenant(&TenantId::new(tenant))
+                .unwrap_or_else(|| panic!("tenant {tenant}"));
+            assert_eq!(
+                config
+                    .entity_set_map
+                    .get("HttpEndpoints")
+                    .map(String::as_str),
+                Some("HttpEndpoint"),
+                "tenant {tenant} has no HttpEndpoints set"
+            );
+            assert!(
+                registry
+                    .get_table(&TenantId::new(tenant), "HttpEndpoint")
+                    .is_some(),
+                "tenant {tenant} has no HttpEndpoint table"
+            );
+        }
     }
 
     #[tokio::test]

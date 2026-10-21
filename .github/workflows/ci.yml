@@ -8,10 +8,22 @@ on:
   schedule:
     - cron: "17 8 * * *"
   workflow_dispatch:
+    inputs:
+      changed:
+        description: "Paths to treat as changed (space-separated). Set: the pull-request lane for those paths. Empty: every check, as on main."
+        required: false
+        default: ""
+      save_cache:
+        description: "Save the Rust build caches from this run (only main saves them otherwise)."
+        type: boolean
+        required: false
+        default: false
 
+# A new push to a pull request cancels its older run. Every push to main, schedule and
+# dispatch runs to the end in its own group, so each commit on main gets a full verdict.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,13 +36,48 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # The Actions cache holds 10 GB per repository. When every pull request saved its own
+  # 0.3 to 1.4 GB per job, main's caches were evicted within minutes and pull requests,
+  # which can only restore their own ref's caches or main's, compiled from scratch.
+  # Only main (push, schedule, dispatch) saves; everything restores from main.
+  SAVE_RUST_CACHE: ${{ (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') || inputs.save_cache == true }}
 
 jobs:
+  # ─────────────────────────────────────────────────────
+  # What this run tests. Push, schedule and a plain dispatch: everything (lane "full").
+  # A pull request: only the packages its changes can reach (lane "pr"), see scripts/ci/affected.py.
+  # ─────────────────────────────────────────────────────
+  changes:
+    name: Changed packages
+    runs-on: ubuntu-latest
+    outputs:
+      lane: ${{ steps.affected.outputs.lane }}
+      mode: ${{ steps.affected.outputs.mode }}
+      packages: ${{ steps.affected.outputs.packages }}
+      server: ${{ steps.affected.outputs.server }}
+      rust: ${{ steps.affected.outputs.rust }}
+      shards: ${{ steps.affected.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: affected
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHANGED_PATHS: ${{ inputs.changed }}
+          # cargo metadata --no-deps needs no particular toolchain; skip installing the pinned one.
+          RUSTUP_TOOLCHAIN: stable
+        run: python3 scripts/ci/affected.py
+
   # ─────────────────────────────────────────────────────
   # Gate 1: Fast checks (seconds)
   # ─────────────────────────────────────────────────────
   check:
     name: Compile & Lint
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -39,7 +86,9 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
+      # About 2 minutes of deletes; check and clippy fit without it on pull requests.
       - name: Free disk space for full workspace tests
+        if: needs.changes.outputs.lane == 'full'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h
@@ -53,25 +102,57 @@ jobs:
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: cargo fmt --check
         run: cargo fmt --check
 
       - name: cargo check --workspace
+        if: needs.changes.outputs.rust == 'true'
         run: cargo check --workspace
 
       - name: cargo clippy --workspace --all-targets
+        if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ─────────────────────────────────────────────────────
+  # Gate 1a: TypeScript SDK (packages/temper-sdk-ts)
+  # ─────────────────────────────────────────────────────
+  sdk-ts:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/temper-sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/temper-sdk-ts/package-lock.json
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Tests
+        run: npx vitest run
 
   # ─────────────────────────────────────────────────────
   # Gate 1b: Bench compile (non-PR events only)
   # ─────────────────────────────────────────────────────
   bench-build:
     name: Bench Build
+    needs: changes
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: needs.changes.outputs.lane == 'full'
     timeout-minutes: 45
     env:
       # ARN-439: CI only compiles benches (--no-run), never runs them, so the release-inherited
@@ -93,8 +174,15 @@ jobs:
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: cargo bench --workspace --no-run
         run: cargo bench --workspace --no-run
@@ -116,8 +204,15 @@ jobs:
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: No TODO/FIXME/HACK in production code
         run: |
@@ -192,22 +287,22 @@ jobs:
           echo "Dependency isolation: OK"
 
   # ─────────────────────────────────────────────────────
-  # Gate 3: Full test suite (minutes)
+  # Gate 3a: pull-request tests, split across machines
+  # Only the packages a change can reach (scripts/ci/affected.py), by test-name hash.
+  # temper-server runs with observe and sim on, the features the workspace run gives it,
+  # so its observe-gated tests (spec_validate_endpoint, observe::, api::repl::) run here.
   # ─────────────────────────────────────────────────────
-  test:
-    name: Tests
+  test-shards:
+    name: Tests (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_PASSWORD: temper
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 2s --health-timeout 5s --health-retries 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.shards) }}
     steps:
+      # temper-spec's migration_differential tests read older commits.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -223,18 +318,123 @@ jobs:
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
 
+      # Restores what main's full Tests job saved.
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
 
       - name: Install cargo-nextest
+        if: matrix.args != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Five separate workspaces; built side by side they take a quarter of the time.
+      - name: Build GEPA test WASM modules
+        if: matrix.gepa
+        run: |
+          rustup target add wasm32-unknown-unknown
+          pids=()
+          for module in gepa-replay gepa-reflective gepa-score gepa-pareto gepa-verify; do
+            (cd "wasm-modules/$module" && cargo build --quiet --target wasm32-unknown-unknown --release) &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+
+      - name: Install tursodb for the Turso Sync tests
+        if: matrix.turso
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/tursodb.tar.xz \
+            https://github.com/tursodatabase/turso/releases/download/v0.7.2/turso_cli-x86_64-unknown-linux-gnu.tar.xz
+          echo "321e401e44f7ee8ea656caff0f85304025f7e905acafe7bedf6a9304f1af1783  /tmp/tursodb.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/tursodb.tar.xz -C /tmp
+          echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
+
+      - name: cargo nextest run (affected packages, skip dst_)
+        if: matrix.args != ''
+        run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
+
+      - name: cargo test --doc (affected packages)
+        if: matrix.doc != ''
+        run: cargo test --doc ${{ matrix.doc }}
+
+  # ─────────────────────────────────────────────────────
+  # Gate 3: Full test suite (minutes)
+  # The required "Tests" check. Full lane (push, schedule, plain dispatch): the
+  # whole workspace on one machine, exactly as before. Pull-request lane: passes
+  # when every test shard above passed, or nothing needed testing.
+  # ─────────────────────────────────────────────────────
+  test:
+    name: Tests
+    needs: [changes, test-shards]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Pull-request lane result
+        if: needs.changes.outputs.lane != 'full'
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SHARDS: ${{ needs.test-shards.result }}
+          PACKAGES: ${{ needs.changes.outputs.packages }}
+        run: |
+          echo "Packages tested: ${PACKAGES:-none}"
+          echo "changes: $CHANGES; test shards: $SHARDS"
+          [ "$CHANGES" = success ] || exit 1
+          case "$SHARDS" in success|skipped) ;; *) exit 1 ;; esac
+
+      - uses: actions/checkout@v4
+        if: needs.changes.outputs.lane == 'full'
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        if: needs.changes.outputs.lane == 'full'
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Install pinned Rust toolchain
+        if: needs.changes.outputs.lane == 'full'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up mold linker
+        if: needs.changes.outputs.lane == 'full'
+        uses: rui314/setup-mold@v1
+
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: needs.changes.outputs.lane == 'full'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
+      - name: Cache Rust build
+        if: needs.changes.outputs.lane == 'full'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ env.SAVE_RUST_CACHE }}
+
+      - name: Install cargo-nextest
+        if: needs.changes.outputs.lane == 'full'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
       - name: Install wasm target for GEPA test modules
+        if: needs.changes.outputs.lane == 'full'
         run: rustup target add wasm32-unknown-unknown
 
       - name: Build GEPA test WASM modules
+        if: needs.changes.outputs.lane == 'full'
         run: |
           for module in gepa-replay gepa-reflective gepa-score gepa-pareto gepa-verify; do
             (cd "wasm-modules/$module" && cargo build --target wasm32-unknown-unknown --release)
@@ -243,6 +443,7 @@ jobs:
       # temper-store-turso's turso_sync tests run against Turso's local sync
       # server, the tursodb release matching the pinned turso crate.
       - name: Install tursodb for the Turso Sync tests
+        if: needs.changes.outputs.lane == 'full'
         run: |
           set -euo pipefail
           curl -sSfL -o /tmp/tursodb.tar.xz \
@@ -252,16 +453,8 @@ jobs:
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
       - name: cargo nextest run --workspace (skip dst_)
+        if: needs.changes.outputs.lane == 'full'
         run: cargo nextest run --workspace -E 'not test(dst_)'
-
-      # A rollback boots: a release runs on a Postgres schema a newer release
-      # migrated (crates/temper-store-postgres/migrations/README.md).
-      - name: Postgres rollback migrations
-        env:
-          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
-        run: >-
-          cargo nextest run -p temper-store-postgres --run-ignored only
-          -E 'test(a_release_boots_on_a_schema_a_newer_release_migrated)'
 
       # spec_validate_endpoint declares required-features = ["observe"]. The
       # workspace run above usually still covers it via feature unification
@@ -272,6 +465,7 @@ jobs:
       # narrow name-filtered runs whose whole job is to *guarantee* coverage, and
       # cargo test's positional-substring filter is the exact semantics relied on.
       - name: cargo test observe-gated tests
+        if: needs.changes.outputs.lane == 'full'
         run: |
           cargo test -p temper-server --features observe --test spec_validate_endpoint
           cargo test -p temper-server --features observe --lib observe::
@@ -285,7 +479,56 @@ jobs:
       # compile-checks the public client API. Run doctests explicitly to restore
       # exactly what nextest omits (compile-only for no_run; fast).
       - name: cargo test --doc --workspace
+        if: needs.changes.outputs.lane == 'full'
         run: cargo test --doc --workspace
+
+  # ─────────────────────────────────────────────────────
+  # A rollback boots: a release runs on a Postgres schema a newer release
+  # migrated (crates/temper-store-postgres/migrations/README.md).
+  # ─────────────────────────────────────────────────────
+  postgres-migrations:
+    name: Postgres rollback migrations
+    needs: changes
+    if: needs.changes.outputs.lane == 'full' || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-store-postgres ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: temper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: A release boots on a schema a newer release migrated
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-store-postgres --run-ignored only
+          -E 'test(a_release_boots_on_a_schema_a_newer_release_migrated)'
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
@@ -301,6 +544,7 @@ jobs:
   # ─────────────────────────────────────────────────────
   dst-matrix-setup:
     name: DST matrix setup
+    needs: changes
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
@@ -315,7 +559,7 @@ jobs:
             {"suite":"platform-consistency","command":"cargo nextest run -p temper-server --test dst_platform_cedar --test dst_platform_index --test dst_platform_rollback"}
           ]'
           RANDOM_CMD="cargo nextest run -p temper-server --test dst_platform_random"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ needs.changes.outputs.lane }}" = "pr" ]; then
             RANDOM_CELLS=$(jq -cn --arg cmd "$RANDOM_CMD" '[{suite:"platform-random",command:$cmd}]')
           else
             RANDOM_CELLS=$(jq -cn --arg cmd "$RANDOM_CMD" '[range(0;4) | {suite:"platform-random",shard_index:(.|tostring),shard_count:"4",command:$cmd}]')
@@ -325,39 +569,61 @@ jobs:
 
   dst-platform-tests:
     name: DST/Platform Tests (${{ matrix.suite }}${{ matrix.shard_count && format(' {0}/{1}', matrix.shard_index, matrix.shard_count) || '' }})
-    needs: dst-matrix-setup
+    needs: [changes, dst-matrix-setup]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.dst-matrix-setup.outputs.matrix) }}
+    # The cells always run so each required check reports; on a pull request that
+    # cannot reach temper-server their steps are skipped.
+    env:
+      DST_NEEDED: ${{ needs.changes.outputs.server }}
     steps:
+      - name: Not affected
+        if: env.DST_NEEDED != 'true'
+        run: echo "No change reaches temper-server; its DST suites are not run on this pull request."
+
       - uses: actions/checkout@v4
+        if: env.DST_NEEDED == 'true'
 
       - name: Install system dependencies
+        if: env.DST_NEEDED == 'true'
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
       - name: Install pinned Rust toolchain
+        if: env.DST_NEEDED == 'true'
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Set up mold linker
+        if: env.DST_NEEDED == 'true'
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: env.DST_NEEDED == 'true'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
+        if: env.DST_NEEDED == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: dst
+          save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Install cargo-nextest
+        if: env.DST_NEEDED == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
       - name: cargo nextest DST/platform suite
+        if: env.DST_NEEDED == 'true'
         env:
-          TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && github.event_name == 'pull_request' && 'smoke' || 'full' }}
+          TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && needs.changes.outputs.lane == 'pr' && 'smoke' || 'full' }}
           TEMPER_DST_SHARD_INDEX: ${{ matrix.shard_index }}
           TEMPER_DST_SHARD_COUNT: ${{ matrix.shard_count }}
         run: ${{ matrix.command }}
@@ -367,26 +633,51 @@ jobs:
   # ─────────────────────────────────────────────────────
   verify-specs:
     name: Spec Verification (L0-L3)
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      FULL_LANE: ${{ needs.changes.outputs.lane == 'full' }}
     steps:
+      # These are temper-cli's verify:: tests. On a pull request the Tests shards run
+      # them whenever the change can reach temper-cli (every package except
+      # temper-agents, temper-macros, temper-wasm-sdk and the reference apps leads
+      # there), and any change outside a package tests everything.
+      - name: Pull-request lane
+        if: env.FULL_LANE != 'true'
+        run: echo "On pull requests temper-cli's verify tests run in the Tests shards."
+
       - uses: actions/checkout@v4
+        if: env.FULL_LANE == 'true'
 
       - name: Install system dependencies
+        if: env.FULL_LANE == 'true'
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
       - name: Install pinned Rust toolchain
+        if: env.FULL_LANE == 'true'
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Set up mold linker
+        if: env.FULL_LANE == 'true'
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: env.FULL_LANE == 'true'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
+        if: env.FULL_LANE == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Build temper-cli
+        if: env.FULL_LANE == 'true'
         run: cargo build -p temper-cli
 
       # Source collections include partial fixtures and examples whose Rust
@@ -394,6 +685,7 @@ jobs:
       # collection's CSDL and IOA behavior; test the strict CLI on assembled
       # application fixtures, including missing-policy/module failure cases.
       - name: Verify repository sources and complete application fixtures
+        if: env.FULL_LANE == 'true'
         run: |
           cargo test --locked -p temper-cli verify::
 
@@ -405,20 +697,40 @@ jobs:
   # ─────────────────────────────────────────────────────
   instrumentation-hygiene:
     name: Instrumentation Hygiene (ADR-0052)
+    needs: changes
     runs-on: ubuntu-latest
+    env:
+      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
     steps:
+      - name: Documentation only
+        if: env.RUST_CHANGED != 'true'
+        run: echo "Only documentation changed."
+
       - uses: actions/checkout@v4
+        if: env.RUST_CHANGED == 'true'
 
       - name: Install rust toolchain
+        if: env.RUST_CHANGED == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Set up mold linker
+        if: env.RUST_CHANGED == 'true'
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: env.RUST_CHANGED == 'true'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
+        if: env.RUST_CHANGED == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Run check_instrumentation
+        if: env.RUST_CHANGED == 'true'
         run: cargo run -q -p temper-server --bin check_instrumentation
