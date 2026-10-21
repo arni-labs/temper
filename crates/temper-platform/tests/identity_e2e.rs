@@ -604,6 +604,72 @@ async fn e2e_http_identity_resolve_exempt_from_auth() {
     );
 }
 
+/// A span's name, and its parent's (None for a root).
+type NamedSpan = (String, Option<String>);
+
+/// Each span made, in order.
+#[derive(Clone, Default)]
+struct SpanParents(std::sync::Arc<std::sync::Mutex<Vec<NamedSpan>>>);
+
+impl<S> tracing_subscriber::Layer<S> for SpanParents
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        _attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let span = ctx.span(id).expect("a new span is registered");
+        let parent = span.parent().map(|parent| parent.name().to_string());
+        self.0
+            .lock()
+            .unwrap()
+            .push((span.name().to_string(), parent));
+    }
+}
+
+/// The credential lookup is inside the request's own span: one request is one
+/// trace, never a lookup that starts a trace of its own.
+#[tokio::test]
+async fn e2e_http_credential_lookup_is_inside_the_request_span() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let app = identity_test_router().await;
+    let spans = SpanParents::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+    let response = app
+        .oneshot(
+            // Not the public service document: a read that needs the credential.
+            Request::get("/tdata/AgentTypes")
+                .header("Authorization", format!("Bearer {TEST_OPERATOR_KEY}"))
+                .header("X-Tenant-Id", TEST_TENANT)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The credential is accepted (the test policy may still refuse the read).
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    let seen = spans.0.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|(name, _)| name == "get_tenant_entity_state"),
+        "the credential is looked up: {seen:?}"
+    );
+    let roots: Vec<&str> = seen
+        .iter()
+        .filter(|(_, parent)| parent.is_none())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        roots,
+        ["http.request"],
+        "only the request is a root: {seen:?}"
+    );
+}
+
 /// Bearer auth: valid agent credential resolves identity on HTTP requests.
 #[tokio::test]
 async fn e2e_http_agent_credential_auth() {
