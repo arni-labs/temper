@@ -43,7 +43,10 @@ impl<A: Actor> ActorCell<A> {
             id: id.clone(),
         };
 
-        tokio::spawn(self.run(rx)); // determinism-ok: production actor cell, not on simulation path
+        // The first start loads the actor's state for whoever woke it, so it
+        // runs inside the spawner's span rather than starting its own trace.
+        let woken_by = tracing::Span::current();
+        tokio::spawn(self.run(rx, woken_by)); // determinism-ok: production actor cell, not on simulation path
 
         actor_ref
     }
@@ -52,19 +55,21 @@ impl<A: Actor> ActorCell<A> {
     /// 1. pre_start → initialize state
     /// 2. loop: receive message → handle
     /// 3. post_stop → cleanup
-    async fn run(self, mut rx: MailboxReceiver<A::Msg>) {
+    async fn run(self, mut rx: MailboxReceiver<A::Msg>, woken_by: tracing::Span) {
         let actor = self.actor;
         let id = self.id;
         let strategy = actor.supervision_strategy();
 
         let mut restart_count: u32 = 0;
+        let mut woken_by = Some(woken_by);
 
         loop {
             // Phase 1: Initialize
             let mut ctx = ActorContext::new(id.clone());
             info!(actor = %id, "actor starting");
 
-            let mut state = match actor.pre_start(&mut ctx).await {
+            let start_span = woken_by.take().unwrap_or_else(tracing::Span::none);
+            let mut state = match actor.pre_start(&mut ctx).instrument(start_span).await {
                 Ok(s) => {
                     info!(actor = %id, "actor started");
                     restart_count = 0;

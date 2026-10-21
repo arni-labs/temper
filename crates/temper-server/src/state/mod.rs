@@ -434,6 +434,10 @@ pub struct ServerState {
     pub(crate) ots_trajectory_outbox: Arc<Mutex<Option<Arc<OtsTrajectoryOutbox>>>>,
     /// Runtime data directory for persisted local metadata (e.g. specs registry).
     pub data_dir: std::path::PathBuf,
+    /// Whether a File's bytes may be kept only in a remote object store (`TEMPER_FILES_NEED_OBJECT_STORE`). A tenant
+    /// without one (no `blob_endpoint` in its vault, such as a Temper whose vault key was lost) then refuses a File's
+    /// bytes, rather than keeping them on this server's disk and in its database.
+    pub files_need_object_store: bool,
     /// Agent hints learned from trajectory analysis, keyed by action name.
     pub agent_hints: Arc<RwLock<BTreeMap<TenantId, BTreeMap<String, String>>>>,
     /// Cedar ABAC authorization engine.
@@ -763,6 +767,7 @@ impl ServerState {
             snapshot_write_queue: Arc::new(Mutex::new(None)),
             ots_trajectory_outbox: Arc::new(Mutex::new(None)),
             data_dir: std::path::PathBuf::new(),
+            files_need_object_store: false,
             agent_hints: Arc::new(RwLock::new(BTreeMap::new())),
             // Network and tenant-scoped authorization starts fail-closed.
             // Tests/development that intentionally need a permissive tenant
@@ -1039,6 +1044,7 @@ impl ServerState {
             snapshot_write_queue: Arc::new(Mutex::new(None)),
             ots_trajectory_outbox: Arc::new(Mutex::new(None)),
             data_dir: std::path::PathBuf::new(),
+            files_need_object_store: false,
             agent_hints: Arc::new(RwLock::new(BTreeMap::new())),
             // Missing tenant policy state is never an implicit permit-all
             // compatibility mode (ARN-230).
