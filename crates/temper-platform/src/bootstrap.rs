@@ -655,6 +655,7 @@ pub async fn bootstrap_operator_credential(
             "Operator credential already current for tenant '{tenant}' (key_hash={}...)",
             &key_hash[..8]
         );
+        report_operator_credentials(state, &tenant_id, &key_hash, instance_id).await;
         return Ok(());
     }
 
@@ -687,7 +688,50 @@ pub async fn bootstrap_operator_credential(
         "Operator credential bootstrapped for tenant '{tenant}' (key_hash={}...)",
         &key_hash[..8]
     );
+    report_operator_credentials(state, &tenant_id, &key_hash, instance_id).await;
     Ok(())
+}
+
+/// Count the tenant's Active operator credentials: this boot's key and every
+/// older one still Active. An older one still signs in, so more than one is
+/// worth knowing about; nothing is revoked here.
+async fn report_operator_credentials(
+    state: &PlatformState,
+    tenant_id: &temper_runtime::tenant::TenantId,
+    key_hash: &str,
+    instance_id: &str,
+) {
+    let Some(mut active) = state
+        .server
+        .active_credential_ids(tenant_id, instance_id)
+        .await
+    else {
+        tracing::warn!(tenant = %tenant_id, "operator credentials not countable: the store has no catalog");
+        return;
+    };
+    // This boot's credential counts even before the catalog has projected it.
+    if !active.iter().any(|id| id == key_hash) {
+        active.push(key_hash.to_string());
+    }
+    let others: Vec<&str> = active
+        .iter()
+        .filter(|id| *id != key_hash)
+        .map(|id| &id[..id.len().min(8)])
+        .collect();
+    temper_server::runtime_metrics::record_operator_credentials_active(
+        tenant_id.as_str(),
+        active.len() as u64,
+    );
+    if others.is_empty() {
+        tracing::info!(tenant = %tenant_id, active = 1, "operator credentials active");
+    } else {
+        tracing::warn!(
+            tenant = %tenant_id,
+            active = active.len(),
+            older_key_hashes = %others.join(","),
+            "operator credentials active: older operator keys still sign in"
+        );
+    }
 }
 
 /// Whether the operator credential for `key_hash` exists, is Active and is
