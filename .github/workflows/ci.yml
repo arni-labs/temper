@@ -333,17 +333,6 @@ jobs:
           tar -xJf /tmp/tursodb.tar.xz -C /tmp
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
-      - name: Compile with timings (temporary measurement)
-        if: matrix.args != ''
-        run: cargo test --no-run --timings ${{ matrix.args }}
-
-      - name: Upload timings (temporary measurement)
-        if: matrix.args != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: timings-${{ strategy.job-index }}
-          path: target/cargo-timings/
-
       - name: cargo nextest run (affected packages, skip dst_)
         if: matrix.args != ''
         run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
