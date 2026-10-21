@@ -728,6 +728,35 @@ mod tests {
         assert!(config.entity_set_map.contains_key("AgentTypes"));
     }
 
+    /// ADR-0069: every tenant gets the platform's HttpEndpoint type at boot,
+    /// not only temper-system, so a server built from scratch can hold routes.
+    #[tokio::test]
+    async fn every_booted_tenant_has_the_http_endpoint_type() {
+        let state = PlatformState::new(None);
+        bootstrap_tenants(&state, &[("app-tenant".to_string(), String::new())]).await;
+
+        let registry = state.registry.read().unwrap();
+        for tenant in ["default", "app-tenant"] {
+            let config = registry
+                .get_tenant(&TenantId::new(tenant))
+                .unwrap_or_else(|| panic!("tenant {tenant}"));
+            assert_eq!(
+                config
+                    .entity_set_map
+                    .get("HttpEndpoints")
+                    .map(String::as_str),
+                Some("HttpEndpoint"),
+                "tenant {tenant} has no HttpEndpoints set"
+            );
+            assert!(
+                registry
+                    .get_table(&TenantId::new(tenant), "HttpEndpoint")
+                    .is_some(),
+                "tenant {tenant} has no HttpEndpoint table"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn bootstrap_installed_apps_replays_persisted_app_when_registry_specs_are_stale() {
         let tenant = "bootstrap-drift";
