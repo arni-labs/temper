@@ -102,6 +102,11 @@ jobs:
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -147,6 +152,11 @@ jobs:
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -171,6 +181,11 @@ jobs:
 
       - name: Set up mold linker
         uses: rui314/setup-mold@v1
+
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -276,6 +291,11 @@ jobs:
         uses: rui314/setup-mold@v1
 
       # Restores what main's full Tests job saved.
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -357,6 +377,12 @@ jobs:
       - name: Set up mold linker
         if: needs.changes.outputs.lane == 'full'
         uses: rui314/setup-mold@v1
+
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: needs.changes.outputs.lane == 'full'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache Rust build
         if: needs.changes.outputs.lane == 'full'
@@ -495,6 +521,12 @@ jobs:
         if: env.DST_NEEDED == 'true'
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: env.DST_NEEDED == 'true'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         if: env.DST_NEEDED == 'true'
         uses: Swatinem/rust-cache@v2
@@ -552,6 +584,12 @@ jobs:
         if: env.FULL_LANE == 'true'
         uses: rui314/setup-mold@v1
 
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: env.FULL_LANE == 'true'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
+
       - name: Cache Rust build
         if: env.FULL_LANE == 'true'
         uses: Swatinem/rust-cache@v2
@@ -600,6 +638,12 @@ jobs:
       - name: Set up mold linker
         if: env.RUST_CHANGED == 'true'
         uses: rui314/setup-mold@v1
+
+      # rust-cache hashes every installed toolchain into its key. The runner image's own
+      # stable Rust changes between image versions, which split one cache into several.
+      - name: Keep only the pinned toolchain
+        if: env.RUST_CHANGED == 'true'
+        run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache Rust build
         if: env.RUST_CHANGED == 'true'
