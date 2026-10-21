@@ -6,7 +6,21 @@
 //! not just a bag of startup-time `CREATE TABLE IF NOT EXISTS` statements.
 
 use sqlx::PgPool;
+use sqlx::migrate::Migrator;
 use temper_runtime::persistence::PersistenceError;
+
+/// The migrations this release knows.
+///
+/// A database a newer release migrated has versions this one lacks. Those are
+/// ignored rather than refused, so the previous release still boots after a
+/// rollback; that is safe only because every migration is additive and
+/// backward compatible (`migrations/README.md`). Known versions are still
+/// checked against their checksums.
+fn migrator() -> Migrator {
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator
+}
 
 /// Run all schema migrations.
 ///
@@ -15,11 +29,11 @@ use temper_runtime::persistence::PersistenceError;
 /// been created by the pre-ADR-0065 bootstrap runner before `_sqlx_migrations`
 /// existed.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), PersistenceError> {
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-    MIGRATOR
-        .run(pool)
-        .await
-        .map_err(|e| PersistenceError::Storage(format!("failed to run Postgres migrations: {e}")))
+    run(pool, migrator()).await
+}
+
+async fn run(pool: &PgPool, migrator: Migrator) -> Result<(), PersistenceError> {
+    migrator.run(pool).await.map_err(migration_error)
 }
 
 /// Run migrations in an explicitly selected schema, creating it if necessary.
@@ -34,10 +48,17 @@ pub async fn run_migrations_in_schema(
     pool: &PgPool,
     schema: &crate::PostgresSchema,
 ) -> Result<(), PersistenceError> {
+    run_in_schema(pool, schema, migrator()).await
+}
+
+async fn run_in_schema(
+    pool: &PgPool,
+    schema: &crate::PostgresSchema,
+    mut migrator: Migrator,
+) -> Result<(), PersistenceError> {
     let Some(name) = schema.name() else {
-        return run_migrations(pool).await;
+        return run(pool, migrator).await;
     };
-    let mut migrator = sqlx::migrate!("./migrations");
     if migrator.iter().any(|migration| migration.no_tx) {
         return Err(PersistenceError::Storage(
             "schema-selected migrations must support transactions".into(),
@@ -70,6 +91,10 @@ pub async fn run_migrations_in_schema(
 fn migration_error(error: impl std::fmt::Display) -> PersistenceError {
     PersistenceError::Storage(format!("failed to run Postgres migrations: {error}"))
 }
+
+#[cfg(test)]
+#[path = "migration_compat_test.rs"]
+mod compat_test;
 
 #[cfg(test)]
 mod tests {
