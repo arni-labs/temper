@@ -1030,6 +1030,148 @@ fn test_find_wasm_modules_discovers_packaged_root_wasm() {
     );
 }
 
+/// Register a throwaway single-app catalog dir declaring one wasm module with
+/// the given criticality and NO compiled artifact on disk. Returns the unique
+/// app name so `get_os_app` / `install_os_app_with_plan` can resolve it.
+fn write_wasm_only_app_missing_artifact(criticality: &str) -> (String, std::path::PathBuf) {
+    let app_name = format!("arn61-missing-{}", uuid::Uuid::new_v4());
+    let apps_dir =
+        std::env::temp_dir().join(format!("temper-arn61-catalog-{}", uuid::Uuid::new_v4()));
+    let app_dir = apps_dir.join(&app_name);
+    fs::create_dir_all(&app_dir).expect("create app dir");
+    fs::write(
+        app_dir.join("app.toml"),
+        format!(
+            "name = \"{app_name}\"\n\n[[wasm_modules]]\nname = \"needs_binary\"\ncriticality = \"{criticality}\"\nstartup_loading = \"lazy\"\n"
+        ),
+    )
+    .expect("write app.toml");
+    // The catalog scan requires an APP.md guide alongside app.toml.
+    fs::write(
+        app_dir.join("APP.md"),
+        format!("# {app_name}\n\nTest app.\n"),
+    )
+    .expect("write APP.md");
+    add_os_apps_dir(apps_dir.clone());
+    (app_name, apps_dir)
+}
+
+/// ARN-61/ARN-273: an app declaring an `app-required` WASM module whose binary
+/// is absent from the bundle must FAIL activation loudly instead of installing
+/// and lazy-flapping 503s at request time.
+#[tokio::test]
+async fn test_install_fails_when_app_required_wasm_missing() {
+    let state = PlatformState::new(None);
+    let (app_name, apps_dir) = write_wasm_only_app_missing_artifact("app-required");
+
+    // Sanity: the module is declared but has no artifact in the resolved bundle.
+    let bundle = get_os_app(&app_name).expect("app should be in catalog");
+    assert!(bundle.wasm_module_configs.contains_key("needs_binary"));
+    assert!(!bundle.wasm_modules.contains_key("needs_binary"));
+
+    let result = install_os_app_with_plan(
+        &state,
+        "test-arn61-required",
+        &app_name,
+        OsAppInstallPlan {
+            specs: false,
+            policies: false,
+            wasm: true,
+            content: false,
+            seed: false,
+        },
+    )
+    .await;
+
+    fs::remove_dir_all(&apps_dir).ok();
+
+    let err = result.expect_err("missing app-required artifact must fail activation");
+    assert!(
+        err.contains("needs_binary") && err.contains("missing from the app bundle"),
+        "error should name the missing required module: {err}"
+    );
+}
+
+/// A refused install writes nothing: the check runs before any spec, policy or
+/// installed-app row is persisted, so the next boot does not replay a
+/// half-installed app.
+#[tokio::test]
+async fn test_refused_install_writes_no_policy_or_install_row() {
+    let db_path = format!("/tmp/temper-test-arn61-{}.db", uuid::Uuid::new_v4());
+    let turso = temper_store_turso::TursoEventStore::new(&format!("file:{db_path}"), None)
+        .await
+        .unwrap();
+    let mut state = PlatformState::new(None);
+    state
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_turso(turso));
+    let (app_name, apps_dir) = write_wasm_only_app_missing_artifact("app-required");
+    let policies = apps_dir.join(&app_name).join("policies");
+    fs::create_dir_all(&policies).expect("create policies dir");
+    fs::write(
+        policies.join("app.cedar"),
+        "permit(principal, action, resource);\n",
+    )
+    .expect("write policy");
+    let tenant = "test-arn61-nothing-written";
+
+    let result = install_os_app(&state, tenant, &app_name).await;
+
+    let ps = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+        .expect("platform store");
+    let row = ps.get_installed_app(tenant, &app_name).await;
+    let policy = state.server.authz.get_tenant_policy_text(tenant);
+    fs::remove_dir_all(&apps_dir).ok();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{db_path}{suffix}"));
+    }
+
+    assert!(
+        result.is_err(),
+        "missing app-required artifact must fail activation"
+    );
+    assert!(
+        matches!(row, Ok(None)),
+        "a refused install must not record the app as installed: {row:?}"
+    );
+    assert!(
+        policy.is_none_or(|text| !text.contains("permit(principal, action, resource)")),
+        "a refused install must not load the app's policy"
+    );
+}
+
+/// A missing *optional* WASM artifact must NOT block activation — the install
+/// proceeds and simply skips the module.
+#[tokio::test]
+async fn test_install_proceeds_when_optional_wasm_missing() {
+    let state = PlatformState::new(None);
+    let (app_name, apps_dir) = write_wasm_only_app_missing_artifact("optional");
+
+    let result = install_os_app_with_plan(
+        &state,
+        "test-arn61-optional",
+        &app_name,
+        OsAppInstallPlan {
+            specs: false,
+            policies: false,
+            wasm: true,
+            content: false,
+            seed: false,
+        },
+    )
+    .await;
+
+    fs::remove_dir_all(&apps_dir).ok();
+
+    let result = result.expect("missing optional artifact must not block activation");
+    assert!(result.wasm_modules.is_empty());
+    assert!(result.wasm_skipped.contains(&"needs_binary".to_string()));
+}
+
 #[tokio::test]
 async fn test_install_os_app_registers_entities() {
     let state = PlatformState::new(None);
