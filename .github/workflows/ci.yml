@@ -311,13 +311,17 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Five separate workspaces; built side by side they take a quarter of the time.
       - name: Build GEPA test WASM modules
         if: matrix.gepa
         run: |
           rustup target add wasm32-unknown-unknown
+          pids=()
           for module in gepa-replay gepa-reflective gepa-score gepa-pareto gepa-verify; do
-            (cd "wasm-modules/$module" && cargo build --target wasm32-unknown-unknown --release)
+            (cd "wasm-modules/$module" && cargo build --quiet --target wasm32-unknown-unknown --release) &
+            pids+=($!)
           done
+          for pid in "${pids[@]}"; do wait "$pid"; done
 
       - name: Install tursodb for the Turso Sync tests
         if: matrix.turso
