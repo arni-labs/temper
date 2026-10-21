@@ -791,17 +791,11 @@ impl crate::state::ServerState {
                     // silently. Dispatch them before returning the
                     // integration-updated response.
                     //
-                    // The remaining steps are intentionally NOT re-run on the
-                    // original response on this early-return path:
-                    //   5b platform hooks — the original custom effects were
-                    //      already routed to the inline integration (step 5);
-                    //      routing them to platform hooks too would double-handle.
-                    //   7b state timeouts — the callback's own dispatch already
-                    //      armed the timer for the post-callback state; re-arming
-                    //      on the stale intermediate state would supersede it with
-                    //      a wrong-state timer (7b is not stale-guarded).
-                    //   8  query projection — sequence-guarded, and the callback's
-                    //      higher-sequence projection is already the correct row.
+                    // Platform hooks (5b) stay skipped on this path: the
+                    // original custom effects already went to the inline
+                    // integration, and routing them to the hooks too would
+                    // handle them twice. The projection and the state-timer
+                    // arm ran above, before the integration.
                     self.dispatch_transition_deferred_effects(ctx, &response);
                     return final_response;
                 }
