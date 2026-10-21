@@ -92,6 +92,58 @@ pub fn remove_statements(
     Ok(kept)
 }
 
+/// Whether `text` compiles as a whole policy set, as the engine loads it.
+///
+/// # Errors
+///
+/// Returns [`AuthzError::PolicyParse`] with Cedar's reason when it does not.
+pub fn check_compiles(text: &str) -> Result<(), AuthzError> {
+    text.parse::<cedar_policy::PolicySet>()
+        .map(|_| ())
+        .map_err(|error| AuthzError::PolicyParse(error.to_string()))
+}
+
+/// The annotation that names where a statement came from, so a decision can
+/// say which rule decided it (see [`label_statements`]).
+pub const SOURCE_ANNOTATION: &str = "source";
+
+/// `text` with every statement annotated `@source("{label}#{n}")`, `n` the
+/// statement's 1-based position in `text`, so a denial reads
+/// `katagami-commons/art_style.cedar#2` instead of a positional `policy1874`.
+/// The annotation travels with the text into every store and reload; Cedar
+/// keeps it on the parsed policy. A statement that already has a source
+/// annotation keeps it. Every other byte stays as it was.
+///
+/// # Errors
+///
+/// Returns [`AuthzError::PolicyParse`] when `text` is not valid Cedar.
+pub fn label_statements(text: &str, label: &str) -> Result<String, AuthzError> {
+    let label = label.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut labelled = String::with_capacity(text.len() + 64);
+    let mut cursor = 0;
+    for (index, (span, _)) in policy_statements(text)?.into_iter().enumerate() {
+        if has_source_annotation(&text[span.clone()]) {
+            continue;
+        }
+        labelled.push_str(&text[cursor..span.start]);
+        labelled.push_str(&format!(
+            "@{SOURCE_ANNOTATION}(\"{label}#{}\")\n",
+            index + 1
+        ));
+        cursor = span.start;
+    }
+    labelled.push_str(&text[cursor..]);
+    Ok(labelled)
+}
+
+fn has_source_annotation(statement: &str) -> bool {
+    match Policy::parse(None, statement) {
+        Ok(policy) => policy.annotation(SOURCE_ANNOTATION).is_some(),
+        Err(_) => Template::parse(None, statement)
+            .is_ok_and(|template| template.annotation(SOURCE_ANNOTATION).is_some()),
+    }
+}
+
 fn statement_key(source: &str) -> Result<StatementKey, AuthzError> {
     let parse_error = |error: &dyn std::fmt::Display| AuthzError::PolicyParse(error.to_string());
     // A statement with slots parses only as a template, one without only as a policy.
@@ -111,6 +163,30 @@ mod tests {
 
     const FORBID: &str = "forbid(principal, action == Action::\"Withdraw\", resource is Thing);";
     const PERMIT: &str = "permit(principal, action, resource is Thing);";
+
+    #[test]
+    fn labels_each_statement_with_its_source_and_position() {
+        let text = format!("// rules\n{PERMIT}\n\n{FORBID}\n");
+        let labelled = label_statements(&text, "bank/policies.cedar").unwrap();
+        assert_eq!(
+            labelled,
+            format!(
+                "// rules\n@source(\"bank/policies.cedar#1\")\n{PERMIT}\n\n@source(\"bank/policies.cedar#2\")\n{FORBID}\n"
+            )
+        );
+        // Already labelled statements are left as they are.
+        assert_eq!(
+            label_statements(&labelled, "other.cedar").unwrap(),
+            labelled
+        );
+        let set: cedar_policy::PolicySet = labelled.parse().unwrap();
+        let mut sources: Vec<&str> = set
+            .policies()
+            .filter_map(|policy| policy.annotation(SOURCE_ANNOTATION))
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(sources, ["bank/policies.cedar#1", "bank/policies.cedar#2"]);
+    }
 
     #[test]
     fn same_statement_in_other_layout_has_the_same_key() {

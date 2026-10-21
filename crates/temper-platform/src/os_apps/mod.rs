@@ -24,6 +24,7 @@ mod agent_bootstrap;
 mod app_catalog;
 mod closure_bootstrap;
 mod entity_aliases;
+mod install_guard;
 mod policy_rows;
 mod reconcile;
 mod runtime_heal;
@@ -963,9 +964,10 @@ fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
         .into_iter()
         .filter_map(|path| {
             let text = std::fs::read_to_string(&path).ok()?;
+            let relative_path = app_relative_path(app_dir, &path);
             Some(CedarPolicySource {
-                relative_path: app_relative_path(app_dir, &path),
-                text,
+                text: policy_rows::labelled_policy_text(&manifest.name, &relative_path, text),
+                relative_path,
             })
         })
         .collect();
@@ -1104,6 +1106,7 @@ pub(super) async fn install_os_app_with_plan(
     app_name: &str,
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
+    let _serialized = install_guard::tenant(tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
         cat.paths.get(app_name).cloned().ok_or_else(|| {
@@ -1200,6 +1203,7 @@ pub(super) async fn install_os_app_with_plan(
         } else {
             None
         };
+    install_guard::refuse_uncompilable(app_name, tenant, combined_policy.as_deref())?;
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1400,11 +1404,7 @@ pub(super) async fn install_os_app_with_plan(
             .authz
             .reload_tenant_policies(tenant, policy_text)
         {
-            tracing::warn!(
-                tenant,
-                error = %e,
-                "Failed to reload tenant Cedar policies after os-app install"
-            );
+            return Err(format!("os-app '{app_name}' Cedar did not load: {e}"));
         } else {
             let mut policies = state.server.tenant_policies.write().unwrap(); // ci-ok: infallible lock
             policies.insert(tenant.to_string(), policy_text.clone());

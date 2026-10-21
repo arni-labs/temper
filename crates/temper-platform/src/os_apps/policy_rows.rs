@@ -35,6 +35,18 @@ pub(crate) fn os_app_policy_row_id(app_name: &str, relative_path: &str) -> Strin
     }
 }
 
+/// An app's policy file with each statement labelled `{app}/{file}#{n}`, the
+/// file named as under `policies/`, so a denial names the rule that decided it
+/// (`statements::label_statements`). Text that does not parse is kept as it is,
+/// for the install's own check to refuse.
+pub(super) fn labelled_policy_text(app_name: &str, relative_path: &str, text: String) -> String {
+    let file = relative_path
+        .trim_start_matches('/')
+        .strip_prefix("policies/")
+        .unwrap_or(relative_path);
+    temper_authz::statements::label_statements(&text, &format!("{app_name}/{file}")).unwrap_or(text)
+}
+
 fn os_app_policy_owner(app_name: &str) -> String {
     format!("os-app:{app_name}")
 }

@@ -651,21 +651,20 @@ impl AuthzEngine {
             Decision::Deny => CedarDecisionMetric::Deny,
         });
 
+        // A statement labelled with its source (`@source("app/file.cedar#2")`,
+        // `statements::label_statements`) is named by it; others keep Cedar's id.
+        let named = |id: &PolicyId| {
+            effective_policy_set
+                .annotation(id, crate::statements::SOURCE_ANNOTATION)
+                .map_or_else(|| id.to_string(), str::to_string)
+        };
         match decision {
             Decision::Allow => {
-                let policy_ids: Vec<String> = response
-                    .diagnostics()
-                    .reason()
-                    .map(|id| id.to_string())
-                    .collect();
+                let policy_ids: Vec<String> = response.diagnostics().reason().map(named).collect();
                 AuthzDecision::Allow { policy_ids }
             }
             Decision::Deny => {
-                let policy_ids: Vec<String> = response
-                    .diagnostics()
-                    .reason()
-                    .map(|id| id.to_string())
-                    .collect();
+                let policy_ids: Vec<String> = response.diagnostics().reason().map(named).collect();
                 if policy_ids.is_empty() {
                     AuthzDecision::Deny(AuthzDenial::NoMatchingPermit)
                 } else {
