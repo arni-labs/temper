@@ -4,6 +4,7 @@ use super::action_bridge::{
     action_bridge_error_response, dispatch_action_bridge_result, git_route_params_for_http_dispatch,
 };
 use super::*;
+use tracing::Instrument as _;
 
 /// End-to-end dispatch: open an InboundExchange on the shared
 /// HttpStreamRegistry, spawn tasks to pump axum body into the
@@ -172,6 +173,8 @@ pub(super) async fn dispatch_matched_route(
         }
         let _ = pump_streams.close(kernel_request_body).await;
     };
+    // The pump records no spans and can wait on a guest that stops reading, so it holds no request span:
+    // a span it held would stay open, and its trace would never be sent, for as long as the pump waits.
     tokio::spawn(pump_task); // determinism-ok: detached HTTP body pump, not simulation state
 
     // Build the invocation context. Guest-visible headers go through
@@ -335,7 +338,8 @@ pub(super) async fn dispatch_matched_route(
             .abandon_inbound_response_head(guest_response_body)
             .await;
     };
-    let invoke_task = tokio::spawn(invoke_future); // determinism-ok: detached WASM invocation task, not simulation state
+    // The module runs in its own task but is still this request's work, so it stays in the request's span.
+    let invoke_task = tokio::spawn(invoke_future.in_current_span()); // determinism-ok: detached WASM invocation task, not simulation state
 
     // Await the guest's response head — bounded by the route's
     // configured timeout so a bad guest doesn't wedge the request.
