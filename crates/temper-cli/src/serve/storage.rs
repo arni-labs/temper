@@ -18,6 +18,10 @@
 //! - `TEMPER_WARN_EVENT_BYTES` — a larger event is written and logged as a
 //!   warning.
 //! - `TEMPER_MAX_EVENT_BYTES` — a larger event is refused before it is written.
+//!
+//! Files: `TEMPER_FILES_NEED_OBJECT_STORE` (`1` or `true`) keeps a File's bytes
+//! only in its tenant's remote object store, and refuses them for a tenant
+//! without one, never keeping them on this disk and in the database.
 
 use std::time::Duration;
 
@@ -274,6 +278,12 @@ pub(super) async fn upsert_loaded_specs_to_turso(
             .with_context(|| format!("Failed to persist Cedar policy for {tenant} in Turso"))?;
     }
     Ok(())
+}
+
+/// Whether this server keeps a File's bytes only in an object store (`TEMPER_FILES_NEED_OBJECT_STORE`).
+pub(super) fn files_need_object_store() -> bool {
+    std::env::var("TEMPER_FILES_NEED_OBJECT_STORE") // determinism-ok: deployment config read
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true"))
 }
 
 #[cfg(test)]
