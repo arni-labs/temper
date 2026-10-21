@@ -373,23 +373,10 @@ impl crate::state::ServerState {
             let now = sim_now();
             let mut started_at = now;
             if needs_hydration_rearm {
-                let clock_reset =
-                    state_clock_started_at(&response.state, &post_state, &st.reset_on);
-                // No entry event found: treat as freshly entered. Safe
-                // default; worst case is one extra budget of wait.
-                started_at = clock_reset.unwrap_or(now);
-                // A timer whose action keeps the entity in this state without
-                // resetting its clock fires once: if it already fired since
-                // the clock started, there is nothing to arm.
-                let fired_since = response
-                    .state
-                    .status_clock
-                    .actions
-                    .get(&st.on_timeout)
-                    .is_some_and(|fired| *fired >= started_at);
-                if fired_since && !st.reset_on.contains(&st.on_timeout) {
+                let Some(clock) = rearm_clock_start(st, &response.state, now) else {
                     continue;
-                }
+                };
+                started_at = clock;
                 crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                     ctx.tenant.as_str(),
                     ctx.entity_type,
@@ -402,48 +389,85 @@ impl crate::state::ServerState {
                 );
             }
 
-            // ADR-0181: `args` are read when the timer is armed, against the
-            // entity as it entered the state.
-            let (params, missing) = temper_spec::automaton::resolve_args(
-                &st.args,
+            let timer = declared_timer(
+                ctx.tenant,
+                ctx.entity_type,
                 ctx.entity_id,
-                &response.state.fields,
-            );
-            for field in missing {
-                tracing::warn!(
-                    entity_type = ctx.entity_type,
-                    state = %st.state,
-                    source_field = field,
-                    "state_timeout arg reads a missing field; skipping key"
-                );
-            }
-            let timer = ArmedTimer {
-                tenant: ctx.tenant.clone(),
-                entity_type: ctx.entity_type.to_string(),
-                entity_id: ctx.entity_id.to_string(),
-                state: st.state.clone(),
-                action: st.on_timeout.clone(),
-                params: serde_json::Value::Object(params),
-                agent_ctx: timer_agent(ctx.agent_ctx),
-                arm_id: sim_uuid().to_string(),
-                sequence_nr: response.state.sequence_nr,
+                st,
+                &response.state,
+                ctx.agent_ctx,
                 started_at,
-            };
+            );
             let delay = remaining_budget(started_at, st.after_seconds, now);
-            // Reserved before the row is written: an arm whose dispatch
-            // finishes after a newer transition's is refused, and one that a
-            // newer arm or a state exit supersedes while its row is written
-            // removes the row and does not start.
-            let Some(armed_seq) = self.reserve_state_timer(&timer) else {
+            self.start_armed_timer(timer, delay).await;
+        }
+    }
+
+    /// Arm the timers of a record created straight into a timed state.
+    ///
+    /// Creation is not a dispatch, so nothing else arms them until the
+    /// record's first action. Like any arm, the timer fires as whoever armed
+    /// it: here, whoever created the record. A record that already has a live
+    /// timer keeps it; one that already existed counts from when it entered
+    /// its state, as the hydration re-arm does.
+    pub(crate) async fn arm_state_timeouts_on_creation(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        created: &EntityResponse,
+        created_by: &AgentContext,
+    ) {
+        let state_timeouts = {
+            let Ok(registry) = self.registry.read() else {
+                return;
+            };
+            let Some(spec) = registry.get_spec(tenant, entity_type) else {
+                return;
+            };
+            spec.automaton.state_timeouts.clone()
+        };
+        let key = EntityKey::new(tenant, entity_type, entity_id);
+        for st in state_timeouts
+            .iter()
+            .filter(|st| st.state == created.state.status)
+        {
+            if self.state_timeout_tracker.current(&key) != 0 {
+                return;
+            }
+            let now = sim_now();
+            let Some(started_at) = rearm_clock_start(st, &created.state, now) else {
                 continue;
             };
-            self.persist_state_timer(&timer).await;
-            if self.state_timeout_tracker.current(&key) != armed_seq {
-                self.forget_state_timer(&timer).await;
-                continue;
-            }
-            self.spawn_state_timer(timer, delay, None, armed_seq);
+            let timer = declared_timer(
+                tenant,
+                entity_type,
+                entity_id,
+                st,
+                &created.state,
+                created_by,
+                started_at,
+            );
+            let delay = remaining_budget(started_at, st.after_seconds, now);
+            self.start_armed_timer(timer, delay).await;
         }
+    }
+
+    /// Reserve, save and start one armed timer. Reserved before the row is
+    /// written: an arm whose dispatch finishes after a newer transition's is
+    /// refused, and one that a newer arm or a state exit supersedes while its
+    /// row is written removes the row and does not start.
+    async fn start_armed_timer(&self, timer: ArmedTimer, delay: Duration) {
+        let Some(armed_seq) = self.reserve_state_timer(&timer) else {
+            return;
+        };
+        self.persist_state_timer(&timer).await;
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        if self.state_timeout_tracker.current(&key) != armed_seq {
+            self.forget_state_timer(&timer).await;
+            return;
+        }
+        self.spawn_state_timer(timer, delay, None, armed_seq);
     }
 
     /// Whether `timer`'s action already ran since its clock started, keeping
@@ -624,6 +648,61 @@ fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
     agent
+}
+
+/// When the clock of a timer re-armed without a transition started: the
+/// entity's entry into its state or its latest `reset_on`, else `now` (a safe
+/// default whose worst case is one extra budget of wait). None when the timer
+/// keeps the entity in its state without resetting the clock and already fired
+/// since the clock started: it fires once, so there is nothing to arm.
+fn rearm_clock_start(
+    st: &temper_spec::automaton::StateTimeout,
+    state: &EntityState,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let started_at = state_clock_started_at(state, &st.state, &st.reset_on).unwrap_or(now);
+    let fired_since = state
+        .status_clock
+        .actions
+        .get(&st.on_timeout)
+        .is_some_and(|fired| *fired >= started_at);
+    (!fired_since || st.reset_on.contains(&st.on_timeout)).then_some(started_at)
+}
+
+/// The timer `st` arms on an entity, firing as `armed_by`. ADR-0181: `args`
+/// are read when the timer is armed, against the entity as it entered the
+/// state.
+fn declared_timer(
+    tenant: &TenantId,
+    entity_type: &str,
+    entity_id: &str,
+    st: &temper_spec::automaton::StateTimeout,
+    state: &EntityState,
+    armed_by: &AgentContext,
+    started_at: DateTime<Utc>,
+) -> ArmedTimer {
+    let (params, missing) =
+        temper_spec::automaton::resolve_args(&st.args, entity_id, &state.fields);
+    for field in missing {
+        tracing::warn!(
+            entity_type,
+            state = %st.state,
+            source_field = field,
+            "state_timeout arg reads a missing field; skipping key"
+        );
+    }
+    ArmedTimer {
+        tenant: tenant.clone(),
+        entity_type: entity_type.to_string(),
+        entity_id: entity_id.to_string(),
+        state: st.state.clone(),
+        action: st.on_timeout.clone(),
+        params: serde_json::Value::Object(params),
+        agent_ctx: timer_agent(armed_by),
+        arm_id: sim_uuid().to_string(),
+        sequence_nr: state.sequence_nr,
+        started_at,
+    }
 }
 
 /// How much of a timer's budget is left at `now`; zero once it is due.

@@ -262,7 +262,7 @@ impl crate::state::ServerState {
                         .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(created) => {
                             tracing::info!(
                                 parent_type = %parent_t,
                                 parent_id = %parent_i,
@@ -271,6 +271,19 @@ impl crate::state::ServerState {
                                 "spawned child entity"
                             );
 
+                            // A child with no initial action stays in its
+                            // first state: arm that state's timer here.
+                            if initializer.is_none() {
+                                state
+                                    .arm_state_timeouts_on_creation(
+                                        &t,
+                                        &child_type,
+                                        &child_id,
+                                        &created,
+                                        &agent,
+                                    )
+                                    .await;
+                            }
                             if let Some((action, params)) = initializer {
                                 let result = state
                                     .dispatch_tenant_action(
