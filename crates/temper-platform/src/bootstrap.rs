@@ -295,22 +295,17 @@ const OPERATOR_CREDENTIAL_SPECS: &[(&str, &str)] = &[
     ("AgentCredential", AGENT_CREDENTIAL_IOA),
 ];
 
-/// Derive a minimal CSDL slice for `keep_types` from the authoritative
-/// [`AGENT_CSDL`].
+/// Derive a minimal CSDL slice for `keep_types` from one of the embedded,
+/// authoritative CSDL documents ([`AGENT_CSDL`], [`SYSTEM_CSDL`]).
 ///
 /// The slice is *derived*, never hand-copied: it keeps only the requested
 /// entity types, the bound actions whose binding parameter targets one of them,
 /// and the entity sets backed by them. Unrelated enum types, terms, and
 /// operation imports are dropped so the emitted slice is self-contained. This
-/// keeps a single source of truth (`AGENT_CSDL`) instead of a drifting mirror.
+/// keeps a single source of truth instead of a drifting mirror.
 ///
-/// Panics only if `AGENT_CSDL` fails to parse — a compile-time invariant of an
-/// embedded, test-covered constant (see `test_agent_csdl_parses`).
-fn agent_csdl_slice(keep_types: &[&str]) -> CsdlDocument {
-    csdl_slice(AGENT_CSDL, keep_types)
-}
-
-/// [`agent_csdl_slice`] for any of the embedded CSDL documents.
+/// Panics only if the embedded CSDL fails to parse — a compile-time invariant
+/// of an embedded, test-covered constant (see `test_agent_csdl_parses`).
 fn csdl_slice(csdl: &str, keep_types: &[&str]) -> CsdlDocument {
     let mut doc = parse_csdl(csdl).unwrap_or_else(|e| panic!("embedded CSDL failed to parse: {e}"));
     let is_kept = |type_name: &str| {
@@ -370,6 +365,17 @@ pub fn bootstrap_http_endpoint_spec(
     state: &PlatformState,
     tenant: &str,
 ) -> Result<(), RegistryError> {
+    // A tenant that already has the type, from an app such as temper-git under
+    // its own namespace, keeps it: a second copy would list HttpEndpoints twice
+    // and make that app's install look stale on every boot.
+    let has_type = state.registry.read().is_ok_and(|registry| {
+        registry
+            .get_table(&TenantId::new(tenant), "HttpEndpoint")
+            .is_some()
+    });
+    if has_type {
+        return Ok(());
+    }
     bootstrap_subset_specs(
         state,
         tenant,
@@ -1187,9 +1193,49 @@ initial = "Created"
         }
     }
 
+    /// A tenant whose app brought its own HttpEndpoint (temper-git's, under
+    /// another namespace) keeps it: no second `Temper.System` copy is added.
+    #[test]
+    fn http_endpoint_bootstrap_keeps_an_app_s_own_type() {
+        let state = PlatformState::new(None);
+        let app_csdl =
+            SYSTEM_CSDL.replace("Namespace=\"Temper.System\"", "Namespace=\"Temper.Git\"");
+        let app_doc = csdl_slice(&app_csdl, &["HttpEndpoint"]);
+        let app_xml = emit_csdl_xml(&app_doc);
+        state.registry.write().unwrap().register_tenant(
+            "git-tenant",
+            app_doc,
+            app_xml,
+            &[("HttpEndpoint", HTTP_ENDPOINT_IOA)],
+        );
+
+        bootstrap_http_endpoint_spec(&state, "git-tenant").expect("bootstrap");
+        bootstrap_http_endpoint_spec(&state, "fresh-tenant").expect("bootstrap");
+
+        let registry = state.registry.read().unwrap();
+        let namespaces = |tenant: &str| -> Vec<String> {
+            registry
+                .get_tenant(&TenantId::new(tenant))
+                .map(|config| {
+                    config
+                        .csdl
+                        .schemas
+                        .iter()
+                        .map(|s| s.namespace.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(namespaces("git-tenant"), vec!["Temper.Git".to_string()]);
+        assert_eq!(
+            namespaces("fresh-tenant"),
+            vec!["Temper.System".to_string()]
+        );
+    }
+
     #[test]
     fn agent_csdl_slice_keeps_only_requested_identity_entities() {
-        let doc = agent_csdl_slice(&["TrustedIssuer", "PrincipalGeneration"]);
+        let doc = csdl_slice(AGENT_CSDL, &["TrustedIssuer", "PrincipalGeneration"]);
         let schema = doc
             .schemas
             .iter()
