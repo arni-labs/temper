@@ -7,8 +7,9 @@
 //! `TEMPER_UNDECLARED_PARAMS` chooses:
 //!
 //! - `report` (the default): nothing changes; each undeclared key is counted in
-//!   `temper_undeclared_action_params_total` by type and action, and named once
-//!   per process in a warning, so the apps that still send them can be found;
+//!   `temper_undeclared_action_params_total` by type, action and kind, and the
+//!   keys are named in a warning the first time a type and action get that kind,
+//!   so the apps that still send them can be found;
 //! - `enforce`: undeclared keys are dropped on every dispatch path, and an
 //!   outside call that sends one is answered 400 after Cedar has decided it.
 
@@ -18,6 +19,19 @@ use std::sync::{Mutex, OnceLock};
 
 use temper_jit::TransitionTable;
 use temper_jit::params::{ParamContractError, restrict_to_declared_params, undeclared_param_keys};
+
+/// Keys the kernel adds to an integration's callback, which an app's spec may
+/// not declare: counted as `kind="kernel"` so the report separates them from
+/// keys an app's own code sends.
+const KERNEL_CALLBACK_KEYS: &[&str] = &[
+    "error",
+    "error_message",
+    "integration",
+    "duration_ms",
+    "trigger_action",
+    "decision_id",
+    "authz_denied",
+];
 
 /// What happens to a key an action does not declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +76,13 @@ pub(crate) fn screen<'a>(
         return Ok(Cow::Borrowed(params));
     }
     match undeclared_param_keys(table, action, params) {
-        Ok(keys) if !keys.is_empty() => record(entity_type, action, "undeclared", &keys),
-        Ok(_) => {}
+        Ok(keys) => {
+            let (kernel, sent): (Vec<String>, Vec<String>) = keys
+                .into_iter()
+                .partition(|key| KERNEL_CALLBACK_KEYS.contains(&key.as_str()));
+            record(entity_type, action, "kernel", &kernel);
+            record(entity_type, action, "undeclared", &sent);
+        }
         Err(error) => record(entity_type, action, "ambiguous", &[error.to_string()]),
     }
     match mode() {
@@ -102,9 +121,13 @@ pub(crate) fn external_refusal(
 }
 
 /// Count the keys, and name them in a warning the first time this process sees
-/// them on this type and action. Key names come from callers' code, never
+/// that kind on this type and action (so the warnings are bounded by the
+/// specs, whatever callers send). Key names come from callers' code, never
 /// values, which may be secrets.
 fn record(entity_type: &str, action: &str, kind: &'static str, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
     let mode = mode();
     crate::runtime_metrics::record_undeclared_action_params(
         entity_type,
@@ -115,7 +138,7 @@ fn record(entity_type: &str, action: &str, kind: &'static str, keys: &[String]) 
     );
     static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
-    let first = format!("{entity_type}.{action}:{kind}:{}", keys.join(","));
+    let first = format!("{entity_type}.{action}:{kind}");
     if seen.lock().is_ok_and(|mut seen| seen.insert(first)) {
         tracing::warn!(
             entity_type,

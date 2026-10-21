@@ -218,9 +218,10 @@ fn metrics() -> &'static RuntimeMetrics {
                 .u64_counter("temper_undeclared_action_params_total")
                 .with_description(
                     "nerdsane/temper#351: body keys an action of a non-strict spec does not \
-                     declare, by entity type and action. `kind` is undeclared or ambiguous \
-                     (both spellings of a param, different values); `mode` is report (kept) or \
-                     enforce (dropped, or refused from outside).",
+                     declare, by entity type and action. `kind` is undeclared (sent by a caller), \
+                     kernel (added by the kernel to a callback) or ambiguous (both spellings of a \
+                     param, different values); `mode` is report (kept) or enforce (dropped, or \
+                     refused from outside).",
                 )
                 .build(),
             integration_silent_exit_total: meter
