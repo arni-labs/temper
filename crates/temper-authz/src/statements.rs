@@ -136,13 +136,25 @@ fn has_source_annotation(statement: &str) -> bool {
 fn statement_key(source: &str) -> Result<StatementKey, AuthzError> {
     let parse_error = |error: &dyn std::fmt::Display| AuthzError::PolicyParse(error.to_string());
     // A statement with slots parses only as a template, one without only as a policy.
-    let json = match Policy::parse(None, source) {
+    let mut json = match Policy::parse(None, source) {
         Ok(policy) => policy.to_json().map_err(|error| parse_error(&error))?,
         Err(policy_error) => Template::parse(None, source)
             .map_err(|_| parse_error(&policy_error))?
             .to_json()
             .map_err(|error| parse_error(&error))?,
     };
+    // The source label says where a statement came from, not what it means:
+    // a labelled statement and its unlabelled copy are the same statement.
+    let no_annotations_left = json
+        .get_mut("annotations")
+        .and_then(serde_json::Value::as_object_mut)
+        .is_some_and(|annotations| {
+            annotations.remove(SOURCE_ANNOTATION);
+            annotations.is_empty()
+        });
+    if let (true, Some(statement)) = (no_annotations_left, json.as_object_mut()) {
+        statement.remove("annotations");
+    }
     Ok(StatementKey(json.to_string()))
 }
 
@@ -187,6 +199,21 @@ mod tests {
         assert_ne!(
             statement_keys(FORBID).unwrap(),
             statement_keys(PERMIT).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_labelled_statement_has_its_unlabelled_key() {
+        let labelled = label_statements(FORBID, "bank/vault.cedar").unwrap();
+        assert_ne!(labelled, FORBID);
+        assert_eq!(
+            statement_keys(&labelled).unwrap(),
+            statement_keys(FORBID).unwrap()
+        );
+        let other = format!("@id(\"guard\")\n{FORBID}");
+        assert_ne!(
+            statement_keys(&other).unwrap(),
+            statement_keys(FORBID).unwrap()
         );
     }
 
