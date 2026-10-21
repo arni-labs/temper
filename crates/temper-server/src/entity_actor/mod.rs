@@ -13,6 +13,7 @@ mod replay_validation;
 pub mod sim_handler;
 mod snapshot_queue;
 pub mod types;
+pub(crate) mod undeclared_params;
 
 pub use actor::EntityActor;
 #[cfg(test)]

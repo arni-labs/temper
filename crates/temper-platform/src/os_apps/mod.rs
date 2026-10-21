@@ -1117,6 +1117,19 @@ pub(super) async fn install_os_app_with_plan(
             app_dir.display()
         )
     })?;
+    // A bundle without the binary of a required module is refused before any
+    // spec, policy or install row is written, rather than installing an app
+    // that answers 503 at request time (ARN-61/ARN-273).
+    let missing = reconcile::missing_required_wasm_modules(&bundle);
+    if plan.wasm && !missing.is_empty() {
+        return Err(format!(
+            "Refusing to activate os-app '{app_name}' for tenant '{tenant}': \
+             required WASM module artifact(s) missing from the app bundle: {}. \
+             The published bundle must include a compiled binary for every module \
+             declared platform-required/app-required in app.toml.",
+            missing.join(", ")
+        ));
+    }
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }
