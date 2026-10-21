@@ -297,3 +297,40 @@ fn the_callers_sampling_and_tracestate_reach_the_server_span() {
         assert!(remote_parent_from_headers(&headers).is_none(), "{invalid}");
     }
 }
+
+/// Tensorlake's sandbox ingress keeps the trace id but puts its own span, which
+/// never reaches us, into `traceparent`. The caller's copy still names the
+/// caller's span, so that is the server span's parent; an unusable copy is
+/// ignored.
+#[test]
+fn a_proxy_that_rewrites_traceparent_does_not_take_the_callers_place() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-717c1ab7e810efc1-01"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        temper_observe::otel::TRACEPARENT_COPY,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-25fa1b2dffb9af95-01"
+            .parse()
+            .unwrap(),
+    );
+    let remote = remote_parent_from_headers(&headers).expect("a valid copy");
+    assert_eq!(
+        remote.span().span_context().span_id().to_string(),
+        "25fa1b2dffb9af95",
+        "the caller's span, not the proxy's"
+    );
+
+    headers.insert(
+        temper_observe::otel::TRACEPARENT_COPY,
+        "not-a-traceparent".parse().unwrap(),
+    );
+    let remote = remote_parent_from_headers(&headers).expect("traceparent still serves");
+    assert_eq!(
+        remote.span().span_context().span_id().to_string(),
+        "717c1ab7e810efc1"
+    );
+}

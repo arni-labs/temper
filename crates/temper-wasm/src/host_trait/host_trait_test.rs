@@ -295,6 +295,59 @@ fn current_traceparent_header_prefers_active_span_context() {
     assert_eq!(actual, expected);
 }
 
+/// Every outbound call carries its trace twice: as `traceparent` and as the copy a
+/// rewriting proxy leaves alone. A module's own `traceparent` is the one copied.
+#[test]
+fn an_outbound_call_carries_its_trace_and_the_copy() {
+    let tracer_provider = SdkTracerProvider::builder().build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("temper-wasm-test")),
+    );
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let client = reqwest::Client::new();
+    let headers_of = |builder: reqwest::RequestBuilder| {
+        let request = builder.build().expect("a request");
+        let get = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        (
+            get("traceparent"),
+            get(temper_observe::otel::TRACEPARENT_COPY),
+        )
+    };
+
+    let span = tracing::info_span!("wasm.http_call");
+    let (sent, copy) = span.in_scope(|| {
+        headers_of(with_trace_headers(
+            client.get("http://other.test/"),
+            &[],
+            &tracing::Span::current(),
+            None,
+        ))
+    });
+    assert!(sent.is_some(), "the current span's trace is sent");
+    assert_eq!(copy, sent, "and its copy");
+
+    let own = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string();
+    let (sent, copy) = headers_of(with_trace_headers(
+        client
+            .get("http://other.test/")
+            .header("traceparent", own.as_str()),
+        &[("traceparent".to_string(), own.clone())],
+        &span,
+        None,
+    ));
+    assert_eq!(
+        sent.as_deref(),
+        Some(own.as_str()),
+        "the module's own is kept"
+    );
+    assert_eq!(copy.as_deref(), Some(own.as_str()), "and copied");
+}
+
 #[test]
 fn internal_http_call_replaces_guest_authority_with_fresh_capability() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");

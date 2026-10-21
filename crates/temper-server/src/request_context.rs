@@ -341,8 +341,16 @@ fn traceparent_ids(headers: &HeaderMap) -> Option<(String, String)> {
 /// request's server span. Only the server span takes it: everything the request
 /// does is then in that one trace. The caller's sampling decision and its
 /// `tracestate` are kept, so a trace the caller did not sample stays unsampled.
+/// The caller's own copy (`x-temper-traceparent`) is read first: a proxy between
+/// the two may have put its own span into `traceparent`.
 pub(crate) fn remote_parent_from_headers(headers: &HeaderMap) -> Option<opentelemetry::Context> {
-    let traceparent = headers.get("traceparent")?.to_str().ok()?.trim();
+    [temper_observe::otel::TRACEPARENT_COPY, "traceparent"]
+        .into_iter()
+        .find_map(|name| remote_parent_from_header(headers, name))
+}
+
+fn remote_parent_from_header(headers: &HeaderMap, name: &str) -> Option<opentelemetry::Context> {
+    let traceparent = headers.get(name)?.to_str().ok()?.trim();
     let parts: Vec<&str> = traceparent.split('-').collect();
     let [version, trace_id, span_id, flags, rest @ ..] = parts.as_slice() else {
         return None;
