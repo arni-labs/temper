@@ -259,6 +259,9 @@ jobs:
       - name: Storage dispatch boundary ratchet
         run: bash scripts/check-storage-dispatch-boundary.sh
 
+      - name: Additive migrations
+        run: bash scripts/check-additive-migrations.sh
+
       # DST pattern scan DISABLED (2026-02-17)
       # Reason: Grep-based pattern matching is too brittle and caused 5+ consecutive
       # CI failures from false positives. The DST reviewer agent (.claude/agents/dst-reviewer.md)
@@ -478,6 +481,54 @@ jobs:
       - name: cargo test --doc --workspace
         if: needs.changes.outputs.lane == 'full'
         run: cargo test --doc --workspace
+
+  # ─────────────────────────────────────────────────────
+  # A rollback boots: a release runs on a Postgres schema a newer release
+  # migrated (crates/temper-store-postgres/migrations/README.md).
+  # ─────────────────────────────────────────────────────
+  postgres-migrations:
+    name: Postgres rollback migrations
+    needs: changes
+    if: needs.changes.outputs.lane == 'full' || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-store-postgres ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: temper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: A release boots on a schema a newer release migrated
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-store-postgres --run-ignored only
+          -E 'test(a_release_boots_on_a_schema_a_newer_release_migrated)'
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
