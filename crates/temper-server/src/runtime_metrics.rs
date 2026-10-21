@@ -43,6 +43,8 @@ struct RuntimeMetrics {
     scheduler_pending_timers: Gauge<u64>,
     // ADR-0056: re-arm on actor hydration.
     state_timeout_armed_on_hydration_total: Counter<u64>,
+    // nerdsane/temper#351: params an action does not declare.
+    undeclared_action_params_total: Counter<u64>,
     // ADR-0056 Sub-Decision 3: silent-exit regression guard.
     integration_silent_exit_total: Counter<u64>,
     // ADR-0152: background integration failure that could not be compensated.
@@ -210,6 +212,16 @@ fn metrics() -> &'static RuntimeMetrics {
                      declared [[state_timeout]] but no live in-memory timer. `elapsed_bucket` \
                      tag distinguishes overdue (fired immediately) from budgeted (armed with \
                      remaining delay).",
+                )
+                .build(),
+            undeclared_action_params_total: meter
+                .u64_counter("temper_undeclared_action_params_total")
+                .with_description(
+                    "nerdsane/temper#351: body keys an action of a non-strict spec does not \
+                     declare, by entity type and action. `kind` is undeclared (sent by a caller), \
+                     kernel (added by the kernel to a callback) or ambiguous (both spellings of a \
+                     param, different values); `mode` is report (kept) or enforce (dropped, or \
+                     refused from outside).",
                 )
                 .build(),
             integration_silent_exit_total: meter
@@ -710,6 +722,25 @@ pub fn record_state_timeout_armed_on_hydration(
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("state", state.to_string()),
             KeyValue::new("elapsed_bucket", bucket),
+        ],
+    );
+}
+
+/// Count body keys an action does not declare (`temper_undeclared_action_params_total`).
+pub fn record_undeclared_action_params(
+    entity_type: &str,
+    action: &str,
+    kind: &'static str,
+    mode: &'static str,
+    keys: u64,
+) {
+    metrics().undeclared_action_params_total.add(
+        keys,
+        &[
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
+            KeyValue::new("kind", kind),
+            KeyValue::new("mode", mode),
         ],
     );
 }
