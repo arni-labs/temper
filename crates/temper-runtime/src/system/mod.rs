@@ -265,4 +265,54 @@ mod tests {
         assert!(asker.id().is_some());
         assert_eq!(handled_in, asker.id());
     }
+
+    // --- An actor's first start runs inside the span that woke it ---
+
+    struct StartReporter {
+        started_in: Arc<std::sync::Mutex<Option<tracing::Id>>>,
+        started: Arc<Notify>,
+    }
+
+    impl Actor for StartReporter {
+        type Msg = WhichSpan;
+        type State = ();
+
+        async fn pre_start(&self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            *self.started_in.lock().unwrap() = tracing::Span::current().id();
+            self.started.notify_one();
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            _msg: WhichSpan,
+            _state: &mut (),
+            _ctx: &mut ActorContext<Self>,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+
+        async fn post_stop(&self, _state: (), _ctx: &mut ActorContext<Self>) {}
+    }
+
+    #[tokio::test]
+    async fn an_actor_starts_inside_the_span_that_woke_it() {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let system = ActorSystem::new("test");
+        let started_in = Arc::new(std::sync::Mutex::new(None));
+        let started = Arc::new(Notify::new());
+        let waker = tracing::info_span!("waker");
+        let _actor = waker.in_scope(|| {
+            system.spawn(
+                StartReporter {
+                    started_in: started_in.clone(),
+                    started: started.clone(),
+                },
+                "start-reporter",
+            )
+        });
+        started.notified().await;
+        assert!(waker.id().is_some());
+        assert_eq!(*started_in.lock().unwrap(), waker.id());
+    }
 }
