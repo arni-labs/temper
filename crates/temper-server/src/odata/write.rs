@@ -787,6 +787,17 @@ pub async fn handle_odata_post(
                 .await
             {
                 Ok(response) => {
+                    // Creation is not a dispatch: a record created into a
+                    // timed first state has its timer armed here.
+                    state
+                        .arm_state_timeouts_on_creation(
+                            &tenant,
+                            &entity_type,
+                            &entity_id,
+                            &response,
+                            &agent_ctx,
+                        )
+                        .await;
                     if entity_type == "RateLimit" {
                         state.clear_commons_rate_limit_cache();
                     }

@@ -246,6 +246,18 @@ pub(super) async fn dispatch_bound_action(
                 .into_response();
         }
     }
+    // After Cedar: when enforcing, a body with params the action does not
+    // declare is refused (nerdsane/temper#351).
+    if let Ok(table) = state.transition_table_for_dispatch(tenant, entity_type)
+        && let Some((code, message)) = crate::entity_actor::undeclared_params::external_refusal(
+            &table,
+            action.rsplit('.').next().unwrap_or(action),
+            &resolved_body,
+        )
+    {
+        action_span.set_status(Status::error(code));
+        return odata_error(StatusCode::BAD_REQUEST, code, &message).into_response();
+    }
 
     let snapshot = match state
         .materialize_authorized_snapshot(tenant, entity_type, key_str, authz_snapshot)
