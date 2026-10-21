@@ -342,10 +342,31 @@ fn traceparent_ids(headers: &HeaderMap) -> Option<(String, String)> {
 /// does is then in that one trace. The caller's sampling decision and its
 /// `tracestate` are kept, so a trace the caller did not sample stays unsampled.
 /// The caller's own copy (`x-temper-traceparent`) is read first: a proxy between
-/// the two may have put its own span into `traceparent`.
+/// the two may have put its own span into `traceparent`. A Temper that always
+/// sits behind such a proxy sets `TEMPER_TRUST_TRACEPARENT=false`: only the copy
+/// names a parent there, and a request without one starts its own trace instead
+/// of hanging from the proxy's span, which never reaches the trace.
 pub(crate) fn remote_parent_from_headers(headers: &HeaderMap) -> Option<opentelemetry::Context> {
-    [temper_observe::otel::TRACEPARENT_COPY, "traceparent"]
-        .into_iter()
+    static TRUST_TRACEPARENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trust = *TRUST_TRACEPARENT.get_or_init(|| {
+        std::env::var("TEMPER_TRUST_TRACEPARENT") // determinism-ok: read once at startup
+            .map(|value| !value.trim().eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    });
+    remote_parent_from_trusted_headers(headers, trust)
+}
+
+pub(crate) fn remote_parent_from_trusted_headers(
+    headers: &HeaderMap,
+    trust_traceparent: bool,
+) -> Option<opentelemetry::Context> {
+    let names: &[&str] = if trust_traceparent {
+        &[temper_observe::otel::TRACEPARENT_COPY, "traceparent"]
+    } else {
+        &[temper_observe::otel::TRACEPARENT_COPY]
+    };
+    names
+        .iter()
         .find_map(|name| remote_parent_from_header(headers, name))
 }
 
