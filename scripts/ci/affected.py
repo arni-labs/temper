@@ -116,7 +116,10 @@ def shards(packages):
                           "partition": f"hash:{i}/{count}", "gepa": False,
                           "turso": "temper-store-turso" in rest, "doc": ""})
     if cells:
-        cells[-1]["doc"] = " ".join(f"-p {name}" for name in sorted(packages))
+        # Doctests build the libraries with other features than the test binaries,
+        # so they get a machine of their own rather than lengthening a shard.
+        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False, "turso": False,
+                      "doc": " ".join(f"-p {name}" for name in sorted(packages))})
     return cells
 
 

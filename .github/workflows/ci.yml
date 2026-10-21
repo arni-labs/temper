@@ -283,6 +283,7 @@ jobs:
           save-if: false
 
       - name: Install cargo-nextest
+        if: matrix.args != ''
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -306,6 +307,7 @@ jobs:
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
       - name: cargo nextest run (affected packages, skip dst_)
+        if: matrix.args != ''
         run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
 
       - name: cargo test --doc (affected packages)
