@@ -28,6 +28,8 @@
 
 pub mod admission;
 pub(crate) mod budget;
+#[cfg(test)]
+mod fuel_floor_test;
 pub mod native;
 
 use std::collections::BTreeMap;
@@ -35,6 +37,15 @@ use std::collections::BTreeMap;
 use temper_runtime::tenant::TenantId;
 use tokio::spawn as spawn_http_endpoint_reconciler; // determinism-ok: production HTTP route watcher
 use tokio::sync::RwLock;
+
+/// Fuel floor for the git upload-pack (clone/fetch) module. Pack emission's
+/// instruction count scales with the server's own repo size, so this
+/// bulk-streaming module is bounded by timeout and memory rather than a fixed
+/// instruction budget. 10T is ~100x the previous 100B manual override:
+/// effectively unbounded for any realistic pack while remaining a runaway
+/// safety bound. Not applied to receive-pack, whose input is client-controlled
+/// (see route_from_entity_fields).
+const GIT_PACK_FUEL_FLOOR: u64 = 10_000_000_000_000;
 
 /// One row of the table. Derived from an `HttpEndpoint` entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,7 +842,9 @@ mod tests {
         assert_eq!(r.integration_module, "git_upload_pack");
         assert!(r.requires_auth);
         assert_eq!(r.timeout_secs, 120);
-        assert_eq!(r.max_fuel, Some(20_000_000_000));
+        // Git pack modules are floor-raised: a stored 20B (below the floor)
+        // becomes the 10T git-pack floor so large transfers do not exhaust.
+        assert_eq!(r.max_fuel, Some(GIT_PACK_FUEL_FLOOR));
         assert_eq!(r.max_memory, Some(536_870_912));
         assert_eq!(r.max_response_bytes, Some(134_217_728));
         assert!(r.action_bridge.is_none());
@@ -851,6 +864,8 @@ mod tests {
             "ActionBridgeResponse": "git-receive-pack",
         });
         let r = route_from_entity_fields("he-receive", &fields).unwrap();
+        // receive-pack (client-controlled ingest input) keeps its tight 20B
+        // default; the fuel floor applies only to upload-pack.
         assert_eq!(r.max_fuel, Some(20_000_000_000));
         assert_eq!(r.max_memory, Some(512 * 1024 * 1024));
         assert_eq!(r.max_response_bytes, Some(128 * 1024 * 1024));
