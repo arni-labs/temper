@@ -52,7 +52,17 @@ async fn serve_temper_client() -> (
 ///
 /// Tenant is extracted from the `X-Tenant-Id` header. Falls back to the
 /// first registered tenant in the SpecRegistry.
+///
+/// Every request is one server span ([`with_request_span`]) around all of it.
 pub fn build_router(state: ServerState) -> Router {
+    with_request_span(build_routes(state))
+}
+
+/// The kernel's routes and guards, without the request's span. An embedder
+/// that adds middleware of its own (the platform resolves credentials) adds it
+/// here and then wraps the whole in [`with_request_span`], so that work is in
+/// the request's trace too, not a trace of its own.
+pub fn build_routes(state: ServerState) -> Router {
     let tdata = Router::new()
         .route("/", get(odata::handle_service_document))
         .route("/$metadata", get(odata::handle_metadata))
@@ -133,40 +143,6 @@ pub fn build_router(state: ServerState) -> Router {
         ]);
 
     router
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &axum::http::Request<_>| {
-                    let span = tracing::info_span!(
-                        "http.request",
-                        otel.name = %format!("{} {}", request.method(), request.uri().path()),
-                        http.method = %request.method(),
-                        http.route = %request.uri().path(),
-                        http.status_code = tracing::field::Empty,
-                        otel.kind = "server",
-                    );
-                    // A caller's `traceparent` makes this server span its child, so the
-                    // whole request (handler, dispatch, storage, reactions) is in the
-                    // caller's trace. Nothing below re-parents.
-                    if let Some(parent) =
-                        crate::request_context::remote_parent_from_headers(request.headers())
-                    {
-                        tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, parent);
-                    }
-                    span
-                })
-                .on_response(
-                    |response: &axum::http::Response<_>,
-                     latency: std::time::Duration,
-                     span: &tracing::Span| {
-                        span.record("http.status_code", response.status().as_u16());
-                        tracing::info!(
-                            latency_ms = latency.as_millis() as u64,
-                            status = response.status().as_u16(),
-                            "response"
-                        );
-                    },
-                ),
-        )
         .layer(cors)
         // Axum applies the last layer first: strip caller authority before the
         // typed-context guard or any route handler observes the request.
@@ -177,6 +153,46 @@ pub fn build_router(state: ServerState) -> Router {
             crate::authz::strip_inbound_identity_headers,
         ))
         .with_state(state)
+}
+
+/// One server span per request, as the outermost layer: everything the
+/// request does, its guards and an embedder's middleware included, is inside
+/// it, and a caller's `traceparent` is its parent.
+pub fn with_request_span(router: Router) -> Router {
+    router.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &axum::http::Request<_>| {
+                let span = tracing::info_span!(
+                    "http.request",
+                    otel.name = %format!("{} {}", request.method(), request.uri().path()),
+                    http.method = %request.method(),
+                    http.route = %request.uri().path(),
+                    http.status_code = tracing::field::Empty,
+                    otel.kind = "server",
+                );
+                // A caller's `traceparent` makes this server span its child, so the
+                // whole request (handler, dispatch, storage, reactions) is in the
+                // caller's trace. Nothing below re-parents.
+                if let Some(parent) =
+                    crate::request_context::remote_parent_from_headers(request.headers())
+                {
+                    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, parent);
+                }
+                span
+            })
+            .on_response(
+                |response: &axum::http::Response<_>,
+                 latency: std::time::Duration,
+                 span: &tracing::Span| {
+                    span.record("http.status_code", response.status().as_u16());
+                    tracing::info!(
+                        latency_ms = latency.as_millis() as u64,
+                        status = response.status().as_u16(),
+                        "response"
+                    );
+                },
+            ),
+    )
 }
 
 /// Fallback handler for paths not served by any built-in route.

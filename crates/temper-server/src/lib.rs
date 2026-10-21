@@ -64,6 +64,6 @@ mod rss_pin_suspects;
 
 pub use entity_actor::{EntityActor, EntityActorHandler, EntityMsg, EntityResponse, EntityState};
 pub use registry::SpecRegistry;
-pub use router::{build_router, http_endpoint_fallback};
+pub use router::{build_router, build_routes, http_endpoint_fallback, with_request_span};
 pub use state::ServerState;
 pub use storage::StorageStack;
