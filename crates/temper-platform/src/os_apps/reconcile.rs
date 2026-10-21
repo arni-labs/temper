@@ -269,12 +269,22 @@ fn bundle_policies_present(active_text: &str, cedar_policies: &[String]) -> bool
 }
 
 fn bundle_required_wasm_artifacts_present(bundle: &AppBundle) -> bool {
-    bundle
+    missing_required_wasm_modules(bundle).is_empty()
+}
+
+/// The modules `app.toml` marks platform-required or app-required that the
+/// bundle has no compiled binary for, sorted.
+pub(super) fn missing_required_wasm_modules(bundle: &AppBundle) -> Vec<String> {
+    let mut missing: Vec<String> = bundle
         .wasm_module_configs
         .iter()
-        .all(|(module_name, config)| {
-            !config.is_required() || bundle.wasm_modules.contains_key(module_name)
+        .filter(|(module_name, config)| {
+            config.is_required() && !bundle.wasm_modules.contains_key(*module_name)
         })
+        .map(|(module_name, _)| module_name.clone())
+        .collect();
+    missing.sort();
+    missing
 }
 
 pub(crate) fn tenant_has_registered_wasm_for_bundle(
