@@ -1092,6 +1092,58 @@ async fn test_install_fails_when_app_required_wasm_missing() {
     );
 }
 
+/// A refused install writes nothing: the check runs before any spec, policy or
+/// installed-app row is persisted, so the next boot does not replay a
+/// half-installed app.
+#[tokio::test]
+async fn test_refused_install_writes_no_policy_or_install_row() {
+    let db_path = format!("/tmp/temper-test-arn61-{}.db", uuid::Uuid::new_v4());
+    let turso = temper_store_turso::TursoEventStore::new(&format!("file:{db_path}"), None)
+        .await
+        .unwrap();
+    let mut state = PlatformState::new(None);
+    state
+        .server
+        .set_storage_stack(temper_server::StorageStack::from_turso(turso));
+    let (app_name, apps_dir) = write_wasm_only_app_missing_artifact("app-required");
+    let policies = apps_dir.join(&app_name).join("policies");
+    fs::create_dir_all(&policies).expect("create policies dir");
+    fs::write(
+        policies.join("app.cedar"),
+        "permit(principal, action, resource);\n",
+    )
+    .expect("write policy");
+    let tenant = "test-arn61-nothing-written";
+
+    let result = install_os_app(&state, tenant, &app_name).await;
+
+    let ps = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+        .expect("platform store");
+    let row = ps.get_installed_app(tenant, &app_name).await;
+    let policy = state.server.authz.get_tenant_policy_text(tenant);
+    fs::remove_dir_all(&apps_dir).ok();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{db_path}{suffix}"));
+    }
+
+    assert!(
+        result.is_err(),
+        "missing app-required artifact must fail activation"
+    );
+    assert!(
+        matches!(row, Ok(None)),
+        "a refused install must not record the app as installed: {row:?}"
+    );
+    assert!(
+        policy.is_none_or(|text| !text.contains("permit(principal, action, resource)")),
+        "a refused install must not load the app's policy"
+    );
+}
+
 /// A missing *optional* WASM artifact must NOT block activation — the install
 /// proceeds and simply skips the module.
 #[tokio::test]
