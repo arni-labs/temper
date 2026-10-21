@@ -10,14 +10,16 @@
 mod actor_runtime;
 mod bootstrap;
 mod loader;
+mod observe_ui;
+pub(crate) mod options;
 mod storage;
 mod sync_copy;
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncBufReadExt;
 
 use temper_evolution::PostgresRecordStore;
 use temper_observe::ClickHouseStore;
@@ -56,6 +58,7 @@ struct LoadedTenantSpecs {
 /// 8. Tenant bootstrap  9. Server start
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
+    bind: Ipv4Addr,
     port: u16,
     apps: Vec<(String, String)>,
     os_app_installs: Vec<String>,
@@ -201,16 +204,21 @@ pub async fn run(
                     let _ = std::fs::create_dir_all("/workspace");
 
                     // determinism-ok: subprocess spawn at startup for local dev sandbox
-                    match std::process::Command::new("python3")
+                    let mut sandbox_cmd = std::process::Command::new("python3");
+                    sandbox_cmd
                         .arg(sandbox_script)
                         .arg("--port")
                         .arg(sandbox_port.to_string())
                         .arg("--workdir")
                         .arg("/tmp/temper-sandbox")
                         .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                    {
+                        .stderr(std::process::Stdio::null());
+                    if bind != Ipv4Addr::UNSPECIFIED {
+                        // Keep the sandbox no more reachable than the API. Passed
+                        // only when non-default, so older sandbox scripts still start.
+                        sandbox_cmd.arg("--host").arg(bind.to_string());
+                    }
+                    match sandbox_cmd.spawn() {
                         Ok(_child) => {
                             println!("  Local sandbox: {sandbox_url} (auto-started)");
                         }
@@ -271,9 +279,9 @@ pub async fn run(
     // Phase 9: Bind, start background tasks, serve
     let router =
         sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_sync_copy);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
-        .with_context(|| format!("Failed to bind to port {port}"))?;
+        .with_context(|| format!("Failed to bind to {bind}:{port}"))?;
     let actual_port = listener
         .local_addr()
         .context("Failed to get listener local address")?
@@ -281,7 +289,7 @@ pub async fn run(
     let _ = state.server.listen_port.set(actual_port);
 
     if observe {
-        spawn_observe_ui(actual_port);
+        observe_ui::spawn(bind, actual_port);
     }
     for (tenant, dir) in &apps {
         spawn_background_verification(&state, dir, tenant).await;
@@ -342,7 +350,7 @@ pub async fn run(
     // before the first request can act on their records.
     state.server.rearm_state_timers().await;
 
-    println!("Listening on http://0.0.0.0:{actual_port}");
+    println!("Listening on http://{bind}:{actual_port}");
     axum::serve(listener, router)
         .await
         .context("Server error")?;
@@ -434,150 +442,6 @@ fn spawn_actor_passivation_loop(state: &PlatformState) {
             } else {
                 interval
             };
-        }
-    });
-}
-
-/// Spawn the Observe UI (Next.js dev server) in the background.
-///
-/// Looks for the `ui/observe/` directory relative to the binary or cwd.
-/// Falls back gracefully if npm/node_modules are unavailable.
-fn spawn_observe_ui(api_port: u16) {
-    // The workspace root is embedded at compile time so `temper serve` works
-    // regardless of the current working directory.
-    const WORKSPACE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
-
-    // Try to find the observe directory from multiple locations.
-    let observe_dir = None
-        .or_else(|| {
-            // Compile-time path: workspace_root/../../ui/observe (CARGO_MANIFEST_DIR
-            // points to crates/temper-cli, so go up twice).
-            let d = Path::new(WORKSPACE_ROOT)
-                .parent()?
-                .parent()?
-                .join("ui/observe");
-            if d.exists() { Some(d) } else { None }
-        })
-        .or_else(|| {
-            // Running from the project root.
-            let d = std::env::current_dir().ok()?.join("ui/observe");
-            if d.exists() { Some(d) } else { None }
-        })
-        .or_else(|| {
-            // Walk up from cwd to find a repo root containing ui/observe.
-            let mut dir = std::env::current_dir().ok()?;
-            loop {
-                let candidate = dir.join("ui/observe");
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-                if dir.join(".git").exists() {
-                    return None;
-                }
-                if !dir.pop() {
-                    return None;
-                }
-            }
-        });
-
-    let Some(observe_dir) = observe_dir else {
-        eprintln!("  Warning: ui/observe/ directory not found, skipping Observe UI");
-        return;
-    };
-
-    if !observe_dir.join("node_modules").exists() {
-        eprintln!(
-            "  Warning: ui/observe/node_modules not found. Run `npm install` in {} first.",
-            observe_dir.display()
-        );
-        return;
-    }
-
-    // Find an available port starting from api_port + 1.
-    // Next.js respects the PORT env var.
-    let observe_port = {
-        let mut port = api_port.saturating_add(1);
-        loop {
-            match std::net::TcpListener::bind(("0.0.0.0", port)) {
-                Ok(_listener) => break port, // port is free; listener drops and releases it
-                Err(_) => {
-                    port = port.saturating_add(1);
-                    if port > api_port.saturating_add(20) {
-                        eprintln!(
-                            "  Warning: no free port found for Observe UI (tried {}-{}), skipping",
-                            api_port.saturating_add(1),
-                            port
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-    };
-    println!("  Observe UI: http://localhost:{observe_port}");
-    println!();
-
-    tokio::spawn(async move {
-        let result = tokio::process::Command::new("npm")
-            .arg("run")
-            .arg("dev")
-            .env("TEMPER_API_URL", format!("http://127.0.0.1:{api_port}"))
-            .env("NEXT_PUBLIC_TEMPER_API_PORT", api_port.to_string())
-            .env("PORT", observe_port.to_string())
-            .current_dir(&observe_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
-
-        match result {
-            Ok(mut child) => {
-                use std::sync::Arc;
-                use std::sync::atomic::{AtomicBool, Ordering};
-
-                let opened = Arc::new(AtomicBool::new(false));
-
-                // Drain stdout — watch for the Next.js "Ready" signal.
-                if let Some(stdout) = child.stdout.take() {
-                    let opened = opened.clone();
-                    tokio::spawn(async move {
-                        let mut lines = tokio::io::BufReader::new(stdout).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            if !opened.load(Ordering::Relaxed)
-                                && (line.contains("Ready in") || line.contains("started server on"))
-                            {
-                                opened.store(true, Ordering::Relaxed);
-                                let _ = open::that(format!("http://localhost:{observe_port}"));
-                            }
-                        }
-                    });
-                }
-
-                // Drain stderr — report errors.
-                if let Some(stderr) = child.stderr.take() {
-                    let opened = opened.clone();
-                    tokio::spawn(async move {
-                        let mut lines = tokio::io::BufReader::new(stderr).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            // Next.js may also signal readiness on stderr.
-                            if !opened.load(Ordering::Relaxed)
-                                && (line.contains("Ready in") || line.contains("started server on"))
-                            {
-                                opened.store(true, Ordering::Relaxed);
-                                let _ = open::that(format!("http://localhost:{observe_port}"));
-                            }
-                            if line.contains("error") || line.contains("Error") {
-                                eprintln!("  [observe] {line}");
-                            }
-                        }
-                    });
-                }
-
-                let _ = child.wait().await;
-            }
-            Err(e) => {
-                eprintln!("  Warning: failed to start Observe UI: {e}");
-            }
         }
     });
 }
