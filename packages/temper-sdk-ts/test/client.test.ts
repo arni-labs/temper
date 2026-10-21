@@ -160,12 +160,14 @@ describe("TemperClient.list pagination", () => {
     await expect(client.listPage("Tasks")).rejects.toThrow(/without a value array/);
   });
 
-  it("forwards the configured principal on read requests", async () => {
+  it("sends no principal headers on reads", async () => {
+    // Temper strips x-temper-principal-* at its edge; on a cross-origin read
+    // they would only fail the browser's CORS preflight.
     const headerSink: Record<string, string>[] = [];
     stubPages([{ value: [{ id: 1 }] }], { headerSink });
     const client = new TemperClient({ baseUrl: "http://srv:4200", principal: "agent-1" });
     await client.list("Tasks");
-    expect(headerSink[0]["x-temper-principal-id"]).toBe("agent-1");
-    expect(headerSink[0]["x-temper-principal-kind"]).toBe("Agent");
+    expect(headerSink[0]["x-temper-principal-id"]).toBeUndefined();
+    expect(headerSink[0]["x-tenant-id"]).toBe("default");
   });
 });

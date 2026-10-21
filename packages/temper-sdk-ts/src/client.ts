@@ -321,14 +321,11 @@ export class TemperClient {
 
   /** Build common headers for all requests. */
   private defaultHeaders(): Record<string, string> {
+    // No principal headers on reads: Temper strips every x-temper-principal-*
+    // header at its edge (identity comes from the bearer token), and sending
+    // them would fail a cross-origin browser read at its CORS preflight.
     return {
       "x-tenant-id": this.tenant,
-      // Carry the configured principal on EVERY request, reads included —
-      // otherwise principal-dependent read authorization is evaluated against
-      // no identity (or the wrong one) on list/get.
-      ...(this.principal
-        ? { "x-temper-principal-id": this.principal, "x-temper-principal-kind": "Agent" }
-        : {}),
     };
   }
 
