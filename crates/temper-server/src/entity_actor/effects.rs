@@ -332,6 +332,24 @@ pub(crate) fn process_action_with_xref_and_field_mode(
             error: Some(error),
         };
     }
+    // Every dispatch path comes through here: report, or drop, the keys the
+    // action does not declare (nerdsane/temper#351).
+    let screened = match super::undeclared_params::screen(table, &state.entity_type, action, params)
+    {
+        Ok(screened) => screened,
+        Err(error) => {
+            return ProcessResult {
+                success: false,
+                event: None,
+                custom_effects: vec![],
+                scheduled_actions: vec![],
+                spawn_requests: vec![],
+                overflow_blobs: vec![],
+                error: Some(error),
+            };
+        }
+    };
+    let params: &serde_json::Value = &screened;
 
     if field_sync_mode == FieldSyncMode::InlineTruncate {
         for field in table
