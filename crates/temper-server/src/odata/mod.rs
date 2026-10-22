@@ -8,6 +8,7 @@ mod blob_media;
 mod common;
 pub(crate) mod constraints;
 mod content_addressed;
+mod file_content;
 mod filter_sql;
 mod nearest;
 mod query_plane_read;

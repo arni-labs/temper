@@ -43,6 +43,9 @@ struct RuntimeMetrics {
     scheduler_pending_timers: Gauge<u64>,
     // ADR-0056: re-arm on actor hydration.
     state_timeout_armed_on_hydration_total: Counter<u64>,
+    operator_credentials_active: Gauge<u64>,
+    // nerdsane/temper#351: params an action does not declare.
+    undeclared_action_params_total: Counter<u64>,
     // ADR-0056 Sub-Decision 3: silent-exit regression guard.
     integration_silent_exit_total: Counter<u64>,
     // ADR-0152: background integration failure that could not be compensated.
@@ -203,6 +206,13 @@ fn metrics() -> &'static RuntimeMetrics {
                 .u64_gauge("temper_scheduler_pending_timers")
                 .with_description("ADR-0049: live in-memory timer count per entity type.")
                 .build(),
+            operator_credentials_active: meter
+                .u64_gauge("temper_operator_credentials_active")
+                .with_description(
+                    "Active operator AgentCredentials per tenant, counted at boot; more than \
+                     one means an older operator key still signs in.",
+                )
+                .build(),
             state_timeout_armed_on_hydration_total: meter
                 .u64_counter("temper_state_timeout_armed_on_hydration_total")
                 .with_description(
@@ -210,6 +220,16 @@ fn metrics() -> &'static RuntimeMetrics {
                      declared [[state_timeout]] but no live in-memory timer. `elapsed_bucket` \
                      tag distinguishes overdue (fired immediately) from budgeted (armed with \
                      remaining delay).",
+                )
+                .build(),
+            undeclared_action_params_total: meter
+                .u64_counter("temper_undeclared_action_params_total")
+                .with_description(
+                    "nerdsane/temper#351: body keys an action of a non-strict spec does not \
+                     declare, by entity type and action. `kind` is undeclared (sent by a caller), \
+                     kernel (added by the kernel to a callback) or ambiguous (both spellings of a \
+                     param, different values); `mode` is report (kept) or enforce (dropped, or \
+                     refused from outside).",
                 )
                 .build(),
             integration_silent_exit_total: meter
@@ -714,6 +734,25 @@ pub fn record_state_timeout_armed_on_hydration(
     );
 }
 
+/// Count body keys an action does not declare (`temper_undeclared_action_params_total`).
+pub fn record_undeclared_action_params(
+    entity_type: &str,
+    action: &str,
+    kind: &'static str,
+    mode: &'static str,
+    keys: u64,
+) {
+    metrics().undeclared_action_params_total.add(
+        keys,
+        &[
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
+            KeyValue::new("kind", kind),
+            KeyValue::new("mode", mode),
+        ],
+    );
+}
+
 /// Record a silent integration exit — an inline trigger invocation that
 /// returned successfully without causing a state transition on the
 /// triggering entity. Emits `temper_integration_silent_exit_total` (ADR-0056
@@ -768,6 +807,13 @@ pub fn record_scheduler_overdue_on_replay(tenant: &str, entity_type: &str) {
             KeyValue::new("entity_type", entity_type.to_string()),
         ],
     );
+}
+
+/// Report how many Active operator credentials a tenant has (counted at boot).
+pub fn record_operator_credentials_active(tenant: &str, count: u64) {
+    metrics()
+        .operator_credentials_active
+        .record(count, &[KeyValue::new("tenant", tenant.to_string())]);
 }
 
 /// Report the current in-memory pending-timer count per entity type.

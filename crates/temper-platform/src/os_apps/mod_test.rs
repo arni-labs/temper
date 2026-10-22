@@ -3567,3 +3567,99 @@ async fn test_local_stream_uploads_create_real_file_version_lineage() {
     let _ = fs::remove_file(format!("{db_path}-wal"));
     let _ = fs::remove_file(format!("{db_path}-shm"));
 }
+
+/// nerdsane/temper#418: a denial names the app's policy file and the statement
+/// in it that decided, not a positional `policyN`.
+#[tokio::test]
+async fn test_denial_names_the_app_policy_file_and_statement() {
+    let app_name = format!("labels-{}", uuid::Uuid::new_v4());
+    let apps_dir = std::env::temp_dir().join(format!("temper-labels-{}", uuid::Uuid::new_v4()));
+    let app_dir = apps_dir.join(&app_name);
+    fs::create_dir_all(app_dir.join("policies")).expect("create app dir");
+    fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n")).expect("app.toml");
+    fs::write(app_dir.join("APP.md"), format!("# {app_name}\n")).expect("APP.md");
+    fs::write(
+        app_dir.join("policies").join("vault.cedar"),
+        "// Anyone may look.\npermit(principal, action, resource);\n\n// Nobody withdraws.\nforbid(principal, action == Action::\"Withdraw\", resource);\n",
+    )
+    .expect("policy");
+    add_os_apps_dir(apps_dir.clone());
+
+    let state = PlatformState::new(None);
+    let tenant = "test-policy-labels";
+    install_os_app(&state, tenant, &app_name)
+        .await
+        .expect("install");
+    let decision = state.server.authz.authorize_for_tenant(
+        tenant,
+        &test_admin_security_context("admin-1"),
+        "Withdraw",
+        "Vault",
+        &HashMap::from([("id".to_string(), serde_json::json!("v1"))]),
+    );
+    fs::remove_dir_all(&apps_dir).ok();
+
+    match decision {
+        temper_authz::AuthzDecision::Deny(temper_authz::AuthzDenial::PolicyDenied {
+            policy_ids,
+        }) => assert_eq!(policy_ids, vec![format!("{app_name}/vault.cedar#2")]),
+        other => panic!("expected the forbid to deny: {other:?}"),
+    }
+}
+
+fn write_policy_app(cedar: &str) -> (String, std::path::PathBuf) {
+    let app_name = format!("policy-app-{}", uuid::Uuid::new_v4());
+    let apps_dir = std::env::temp_dir().join(format!("temper-policy-app-{}", uuid::Uuid::new_v4()));
+    let app_dir = apps_dir.join(&app_name);
+    fs::create_dir_all(app_dir.join("policies")).expect("create app dir");
+    fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n")).expect("app.toml");
+    fs::write(app_dir.join("APP.md"), format!("# {app_name}\n")).expect("APP.md");
+    fs::write(app_dir.join("policies").join("rules.cedar"), cedar).expect("policy");
+    add_os_apps_dir(apps_dir.clone());
+    (app_name, apps_dir)
+}
+
+/// nerdsane/temper#418: Cedar that does not compile refuses the install
+/// instead of being persisted while the tenant runs on its old set.
+#[tokio::test]
+async fn test_install_refuses_cedar_that_does_not_compile() {
+    let (app_name, apps_dir) = write_policy_app("permit(principal, action, resource\n");
+    let state = PlatformState::new(None);
+    let tenant = "test-policy-refused";
+    let result = install_os_app(&state, tenant, &app_name).await;
+    fs::remove_dir_all(&apps_dir).ok();
+
+    let error = result.expect_err("an install whose Cedar does not compile is refused");
+    assert!(error.contains("does not compile"), "{error}");
+    assert!(state.server.authz.get_tenant_policy_text(tenant).is_none());
+}
+
+/// nerdsane/temper#418: two installs into one tenant at once both keep their
+/// Cedar; each reads, merges and loads the tenant's set under one lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_concurrent_installs_into_one_tenant_keep_both_apps_cedar() {
+    let (first, first_dir) =
+        write_policy_app("permit(principal, action == Action::\"First\", resource);\n");
+    let (second, second_dir) =
+        write_policy_app("permit(principal, action == Action::\"Second\", resource);\n");
+    let state = PlatformState::new(None);
+    let tenant = "test-policy-concurrent";
+    let (a, b) = tokio::join!(
+        install_os_app(&state, tenant, &first),
+        install_os_app(&state, tenant, &second)
+    );
+    fs::remove_dir_all(&first_dir).ok();
+    fs::remove_dir_all(&second_dir).ok();
+    a.expect("first install");
+    b.expect("second install");
+
+    let text = state
+        .server
+        .authz
+        .get_tenant_policy_text(tenant)
+        .unwrap_or_default();
+    assert!(
+        text.contains("\"First\"") && text.contains("\"Second\""),
+        "{text}"
+    );
+}

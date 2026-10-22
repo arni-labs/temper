@@ -25,6 +25,7 @@ use super::common::{
     verification_gate_response,
 };
 use super::constraints::pre_delete_relation_checks;
+use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
 use super::response::annotate_entity;
 use super::storage_guardrails::enforce_commons_storage_cap;
@@ -527,6 +528,9 @@ pub async fn handle_odata_post(
                 Ok(v) => v,
                 Err(resp) => return *resp,
             };
+            if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
+                return response;
+            }
 
             let initial_status = match state.initial_entity_status(&tenant, &entity_type) {
                 Ok(status) => status,
@@ -787,6 +791,17 @@ pub async fn handle_odata_post(
                 .await
             {
                 Ok(response) => {
+                    // Creation is not a dispatch: a record created into a
+                    // timed first state has its timer armed here.
+                    state
+                        .arm_state_timeouts_on_creation(
+                            &tenant,
+                            &entity_type,
+                            &entity_id,
+                            &response,
+                            &agent_ctx,
+                        )
+                        .await;
                     if entity_type == "RateLimit" {
                         state.clear_commons_rate_limit_cache();
                     }
@@ -1055,6 +1070,9 @@ pub async fn handle_odata_patch(
                 )
                 .into_response();
             }
+            if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
+                return response;
+            }
             let mut prospective_fields = existing.fields;
             if let (Some(dst), Some(src)) =
                 (prospective_fields.as_object_mut(), body_json.as_object())
@@ -1296,6 +1314,9 @@ pub async fn handle_odata_put(
                     "PUT body must be a JSON object",
                 )
                 .into_response();
+            }
+            if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
+                return response;
             }
 
             if let Err(response) = authorize_prospective_mutation(

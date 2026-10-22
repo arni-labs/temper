@@ -2,6 +2,7 @@ use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
 use super::file_writes::native_file_blob_key;
+use crate::blob_store::BlobReadBounded;
 
 impl ServerState {
     #[cfg(feature = "observe")]
@@ -23,13 +24,68 @@ impl ServerState {
             .secrets_vault
             .as_ref()
             .and_then(|vault| vault.get_secret(tenant.as_str(), "blob_endpoint"));
+        // A server that keeps Files only in an object store reads none from a local store, which other servers on the
+        // machine may share: only its own database copy, from before.
+        let own_only = self.files_refused_here(tenant).is_some();
         for blob_key in file_blob_read_keys(blob_endpoint.as_deref(), content_hash) {
-            let blob_bytes = self
-                .get_blob_with_legacy_fallback(tenant, &blob_key)
-                .await
-                .map_err(|e| format!("failed to read blob '{content_hash}': {e}"))?;
+            let read = if own_only {
+                self.get_own_database_blob(tenant, &blob_key).await
+            } else {
+                self.get_blob_with_legacy_fallback(tenant, &blob_key).await
+            };
+            let blob_bytes =
+                read.map_err(|e| format!("failed to read blob '{content_hash}': {e}"))?;
             if blob_bytes.is_some() {
                 return Ok(blob_bytes);
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// File bytes this server stored: how many, when the store says.
+pub(crate) struct StoredFileBytes {
+    pub(crate) size: Option<u64>,
+}
+
+impl ServerState {
+    /// The File bytes this server stored for `tenant` under `content_hash`, where its File reads look for them: their
+    /// size when the store says it, `None` when there are none. Keys are content addressed, so bytes found under a
+    /// hash are bytes that hash to it. A store that cannot be asked is an error, never "none".
+    pub(crate) async fn stored_file_bytes(
+        &self,
+        tenant: &TenantId,
+        content_hash: &str,
+    ) -> Result<Option<StoredFileBytes>, String> {
+        let blob_endpoint = self
+            .secrets_vault
+            .as_ref()
+            .and_then(|vault| vault.get_secret(tenant.as_str(), "blob_endpoint"));
+        // A server that keeps Files only in an object store does not count bytes a shared local store holds.
+        let store = match self.files_refused_here(tenant) {
+            Some(_) => None,
+            None => self.blob_store_for_tenant(tenant).ok(),
+        };
+        for blob_key in file_blob_read_keys(blob_endpoint.as_deref(), content_hash) {
+            if let Some(store) = &store {
+                // Asked for none of the bytes: whether they are there and how many, not what they are.
+                match store.get_bounded(&blob_key, 0).await? {
+                    BlobReadBounded::Found(bytes) => {
+                        return Ok(Some(StoredFileBytes {
+                            size: Some(bytes.len() as u64),
+                        }));
+                    }
+                    BlobReadBounded::TooLarge { actual_bytes } => {
+                        return Ok(Some(StoredFileBytes { size: actual_bytes }));
+                    }
+                    BlobReadBounded::Missing => {}
+                }
+            }
+            // The database copy the default tenant keeps beside a local store: small, and this server's own.
+            if let Some(bytes) = self.get_own_database_blob(tenant, &blob_key).await? {
+                return Ok(Some(StoredFileBytes {
+                    size: Some(bytes.len() as u64),
+                }));
             }
         }
         Ok(None)
@@ -81,5 +137,57 @@ mod tests {
             file_blob_read_keys(None, "sha256:abc"),
             vec!["temper-fs/sha256:abc".to_string()]
         );
+    }
+
+    fn server(name: &str, data_dir: &std::path::Path) -> ServerState {
+        let mut state = ServerState::new(
+            temper_runtime::ActorSystem::new(name),
+            temper_spec::csdl::CsdlDocument {
+                version: "4.0".to_string(),
+                schemas: Vec::new(),
+            },
+            String::new(),
+        );
+        state.data_dir = data_dir.to_path_buf();
+        state
+    }
+
+    /// Two servers on one machine share its local store (each default tenant's is `$HOME/.local/share/temper/blobs`).
+    /// One that keeps Files only in an object store neither serves nor vouches for bytes the other left there; the
+    /// one that stored them finds them by their hash, and no other hash.
+    #[tokio::test]
+    async fn a_server_that_keeps_files_only_in_an_object_store_reads_none_from_a_shared_local_store()
+     {
+        let shared = tempfile::tempdir().expect("data dir");
+        let tenant = TenantId::default();
+        let other = server("files-other-app", shared.path());
+        let (hash, key) =
+            super::super::file_writes::content_hash_and_native_blob_key(b"another app's bytes");
+        other
+            .put_file_content_blob(&tenant, &key, b"another app's bytes")
+            .await
+            .expect("kept locally");
+        let found = other.stored_file_bytes(&tenant, &hash).await.expect("look");
+        assert_eq!(
+            found.and_then(|f| f.size),
+            Some(b"another app's bytes".len() as u64)
+        );
+        let none = other
+            .stored_file_bytes(&tenant, "sha256:00")
+            .await
+            .expect("look");
+        assert!(none.is_none(), "only bytes it stored");
+
+        let mut app = server("files-this-app", shared.path());
+        app.files_need_object_store = true;
+        assert_eq!(
+            app.fetch_blob_bytes_for_hash(&tenant, &hash)
+                .await
+                .expect("read"),
+            None
+        );
+        let theirs = app.stored_file_bytes(&tenant, &hash).await.expect("look");
+        assert!(theirs.is_none(), "not its bytes");
+        assert!(app.files_refused_here(&tenant).is_some());
     }
 }

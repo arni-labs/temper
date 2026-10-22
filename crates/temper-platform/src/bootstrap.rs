@@ -295,20 +295,19 @@ const OPERATOR_CREDENTIAL_SPECS: &[(&str, &str)] = &[
     ("AgentCredential", AGENT_CREDENTIAL_IOA),
 ];
 
-/// Derive a minimal CSDL slice for `keep_types` from the authoritative
-/// [`AGENT_CSDL`].
+/// Derive a minimal CSDL slice for `keep_types` from one of the embedded,
+/// authoritative CSDL documents ([`AGENT_CSDL`], [`SYSTEM_CSDL`]).
 ///
 /// The slice is *derived*, never hand-copied: it keeps only the requested
 /// entity types, the bound actions whose binding parameter targets one of them,
 /// and the entity sets backed by them. Unrelated enum types, terms, and
 /// operation imports are dropped so the emitted slice is self-contained. This
-/// keeps a single source of truth (`AGENT_CSDL`) instead of a drifting mirror.
+/// keeps a single source of truth instead of a drifting mirror.
 ///
-/// Panics only if `AGENT_CSDL` fails to parse — a compile-time invariant of an
-/// embedded, test-covered constant (see `test_agent_csdl_parses`).
-fn agent_csdl_slice(keep_types: &[&str]) -> CsdlDocument {
-    let mut doc =
-        parse_csdl(AGENT_CSDL).unwrap_or_else(|e| panic!("Agent CSDL failed to parse: {e}"));
+/// Panics only if the embedded CSDL fails to parse — a compile-time invariant
+/// of an embedded, test-covered constant (see `test_agent_csdl_parses`).
+fn csdl_slice(csdl: &str, keep_types: &[&str]) -> CsdlDocument {
+    let mut doc = parse_csdl(csdl).unwrap_or_else(|e| panic!("embedded CSDL failed to parse: {e}"));
     let is_kept = |type_name: &str| {
         let bare = type_name.rsplit('.').next().unwrap_or(type_name);
         keep_types.contains(&bare)
@@ -352,8 +351,49 @@ fn bootstrap_agent_subset_specs(
     tenant: &str,
     specs: &[(&str, &str)],
 ) -> Result<(), RegistryError> {
+    bootstrap_subset_specs(state, tenant, AGENT_CSDL, specs)
+}
+
+/// The platform's `HttpEndpoint` type (ADR-0069), for a tenant.
+///
+/// ADR-0069 gives every tenant the type, as it does `Observation` and the other
+/// platform entities: a tenant's routes are its own `HttpEndpoint` rows. It sat
+/// only in `temper-system`, so a server built from scratch had nowhere to keep
+/// a route until an app happened to bring the type. Same merge and trust
+/// semantics as [`bootstrap_identity_specs`]: additive, cascade-free.
+pub fn bootstrap_http_endpoint_spec(
+    state: &PlatformState,
+    tenant: &str,
+) -> Result<(), RegistryError> {
+    // A tenant that already has the type, from an app such as temper-git under
+    // its own namespace, keeps it: a second copy would list HttpEndpoints twice
+    // and make that app's install look stale on every boot.
+    let has_type = state.registry.read().is_ok_and(|registry| {
+        registry
+            .get_table(&TenantId::new(tenant), "HttpEndpoint")
+            .is_some()
+    });
+    if has_type {
+        return Ok(());
+    }
+    bootstrap_subset_specs(
+        state,
+        tenant,
+        SYSTEM_CSDL,
+        &[("HttpEndpoint", HTTP_ENDPOINT_IOA)],
+    )
+}
+
+/// Register `specs`, with the slice of `csdl` they need, into a tenant without
+/// the verification cascade (see [`bootstrap_agent_subset_specs`]).
+fn bootstrap_subset_specs(
+    state: &PlatformState,
+    tenant: &str,
+    csdl: &str,
+    specs: &[(&str, &str)],
+) -> Result<(), RegistryError> {
     let keep: Vec<&str> = specs.iter().map(|(entity_type, _)| *entity_type).collect();
-    let csdl_doc = agent_csdl_slice(&keep);
+    let csdl_doc = csdl_slice(csdl, &keep);
     let csdl_xml = emit_csdl_xml(&csdl_doc);
 
     let tenant_id = TenantId::new(tenant);
@@ -615,6 +655,7 @@ pub async fn bootstrap_operator_credential(
             "Operator credential already current for tenant '{tenant}' (key_hash={}...)",
             &key_hash[..8]
         );
+        report_operator_credentials(state, &tenant_id, &key_hash, instance_id).await;
         return Ok(());
     }
 
@@ -647,7 +688,50 @@ pub async fn bootstrap_operator_credential(
         "Operator credential bootstrapped for tenant '{tenant}' (key_hash={}...)",
         &key_hash[..8]
     );
+    report_operator_credentials(state, &tenant_id, &key_hash, instance_id).await;
     Ok(())
+}
+
+/// Count the tenant's Active operator credentials: this boot's key and every
+/// older one still Active. An older one still signs in, so more than one is
+/// worth knowing about; nothing is revoked here.
+async fn report_operator_credentials(
+    state: &PlatformState,
+    tenant_id: &temper_runtime::tenant::TenantId,
+    key_hash: &str,
+    instance_id: &str,
+) {
+    let Some(mut active) = state
+        .server
+        .active_credential_ids(tenant_id, instance_id)
+        .await
+    else {
+        tracing::warn!(tenant = %tenant_id, "operator credentials not countable: the store has no catalog");
+        return;
+    };
+    // This boot's credential counts even before the catalog has projected it.
+    if !active.iter().any(|id| id == key_hash) {
+        active.push(key_hash.to_string());
+    }
+    let others: Vec<&str> = active
+        .iter()
+        .filter(|id| *id != key_hash)
+        .map(|id| &id[..id.len().min(8)])
+        .collect();
+    temper_server::runtime_metrics::record_operator_credentials_active(
+        tenant_id.as_str(),
+        active.len() as u64,
+    );
+    if others.is_empty() {
+        tracing::info!(tenant = %tenant_id, active = 1, "operator credentials active");
+    } else {
+        tracing::warn!(
+            tenant = %tenant_id,
+            active = active.len(),
+            older_key_hashes = %others.join(","),
+            "operator credentials active: older operator keys still sign in"
+        );
+    }
 }
 
 /// Whether the operator credential for `key_hash` exists, is Active and is
@@ -1153,9 +1237,49 @@ initial = "Created"
         }
     }
 
+    /// A tenant whose app brought its own HttpEndpoint (temper-git's, under
+    /// another namespace) keeps it: no second `Temper.System` copy is added.
+    #[test]
+    fn http_endpoint_bootstrap_keeps_an_app_s_own_type() {
+        let state = PlatformState::new(None);
+        let app_csdl =
+            SYSTEM_CSDL.replace("Namespace=\"Temper.System\"", "Namespace=\"Temper.Git\"");
+        let app_doc = csdl_slice(&app_csdl, &["HttpEndpoint"]);
+        let app_xml = emit_csdl_xml(&app_doc);
+        state.registry.write().unwrap().register_tenant(
+            "git-tenant",
+            app_doc,
+            app_xml,
+            &[("HttpEndpoint", HTTP_ENDPOINT_IOA)],
+        );
+
+        bootstrap_http_endpoint_spec(&state, "git-tenant").expect("bootstrap");
+        bootstrap_http_endpoint_spec(&state, "fresh-tenant").expect("bootstrap");
+
+        let registry = state.registry.read().unwrap();
+        let namespaces = |tenant: &str| -> Vec<String> {
+            registry
+                .get_tenant(&TenantId::new(tenant))
+                .map(|config| {
+                    config
+                        .csdl
+                        .schemas
+                        .iter()
+                        .map(|s| s.namespace.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(namespaces("git-tenant"), vec!["Temper.Git".to_string()]);
+        assert_eq!(
+            namespaces("fresh-tenant"),
+            vec!["Temper.System".to_string()]
+        );
+    }
+
     #[test]
     fn agent_csdl_slice_keeps_only_requested_identity_entities() {
-        let doc = agent_csdl_slice(&["TrustedIssuer", "PrincipalGeneration"]);
+        let doc = csdl_slice(AGENT_CSDL, &["TrustedIssuer", "PrincipalGeneration"]);
         let schema = doc
             .schemas
             .iter()

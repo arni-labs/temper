@@ -543,3 +543,43 @@ async fn denied_developer_cannot_self_approve_operator_can() {
         "{approved}"
     );
 }
+
+/// The catalog projects writes in the background: wait until it holds `n`.
+async fn active_operator_ids(state: &PlatformState, tenant: &TenantId, n: usize) -> Vec<String> {
+    for _ in 0..200 {
+        let mut ids = state
+            .server
+            .active_credential_ids(tenant, "operator")
+            .await
+            .expect("the Turso store has a catalog");
+        if ids.len() >= n {
+            ids.sort();
+            return ids;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the catalog never held {n} Active operator credentials");
+}
+
+#[tokio::test]
+async fn a_changed_operator_key_leaves_the_old_one_active_and_counted() {
+    let tenant = "acme";
+    let (state, _temp) = virgin_state_with_store(tenant).await;
+    let tenant_id = TenantId::new(tenant);
+    const ROTATED_KEY: &str = "tmpr_operator-bootstrap-rotated";
+
+    bootstrap_operator_credential(&state, OPERATOR_KEY, tenant)
+        .await
+        .expect("operator credential bootstrap should succeed");
+    assert_eq!(
+        active_operator_ids(&state, &tenant_id, 1).await,
+        [hash_token(OPERATOR_KEY)]
+    );
+
+    bootstrap_operator_credential(&state, ROTATED_KEY, tenant)
+        .await
+        .expect("operator credential bootstrap should succeed");
+    let mut both = vec![hash_token(OPERATOR_KEY), hash_token(ROTATED_KEY)];
+    both.sort();
+    assert_eq!(active_operator_ids(&state, &tenant_id, 2).await, both);
+}
