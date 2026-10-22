@@ -1330,7 +1330,8 @@ pub(super) async fn install_os_app_with_plan(
     }
 
     if plan.policies {
-        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle).await?;
+        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle, &superseded)
+            .await?;
         policy_rows::delete_dropped_rows(state, tenant, &superseded).await?;
     }
 
