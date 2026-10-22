@@ -400,8 +400,8 @@ impl ServerState {
                 });
         }
 
-        // The adapter says what it stored; the File records the hash of the bytes this server was sent, and an
-        // adapter that names other bytes is refused.
+        // The adapter says what it stored; the File records the hash and size of the bytes this server was sent,
+        // and an adapter that names other bytes is refused.
         let mut params = wasm_result.callback_params;
         let (content_hash, _) = content_hash_and_native_blob_key(body);
         if let Some(fields) = params.as_object_mut()
@@ -420,6 +420,10 @@ impl ServerState {
                     );
                 }
             }
+            fields.insert(
+                "size_bytes".to_string(),
+                serde_json::json!(body.len() as u64),
+            );
         }
         self.dispatch_file_stream_action(FileStreamAction {
             tenant,

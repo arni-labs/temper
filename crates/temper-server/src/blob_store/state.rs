@@ -88,10 +88,13 @@ impl ServerState {
     /// store (`files_need_object_store`) and `store` is a local one. A local store may be shared by every server on
     /// one machine (`$HOME/.local/share/temper/blobs` for each default tenant), so its bytes are not this server's.
     pub(crate) fn files_refused_here(&self, tenant: &TenantId) -> Option<String> {
+        if !self.files_need_object_store {
+            return None;
+        }
         let remote = self
             .blob_store_for_tenant(tenant)
             .is_ok_and(|store| store.is_object_store());
-        (self.files_need_object_store && !remote).then(|| {
+        (!remote).then(|| {
             format!(
                 "this server keeps Files only in an object store, and tenant '{tenant}' has none (no blob_endpoint in its vault)"
             )

@@ -1,8 +1,8 @@
 //! What a File (and a FileVersion) says of its bytes comes from bytes this server stored. Its `$value` PUT hashes the
 //! bytes it keeps and writes `content_hash`, `size_bytes` and `has_content` itself; a read then fetches the bytes
-//! stored under that hash. So no caller writes those fields: a create, PATCH or PUT naming one is refused, and a bound
+//! stored under that hash. So no caller writes those fields: a create, PATCH or PUT naming one is refused, a bound
 //! action that carries a `content_hash` (`File.StreamUpdated`, `FileVersion.Create`) must name bytes this server
-//! stored for the tenant.
+//! stored for the tenant, with their size, and any other bound action names none of them.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -43,9 +43,10 @@ pub(super) fn refuse_content_fields(
     })
 }
 
-/// A bound action whose `content_hash` names no bytes this server stored for the tenant: refused. Actions that carry
-/// none are left alone.
-pub(super) async fn refuse_unstored_hash(
+/// A bound action on a File or FileVersion that says what its bytes are: refused unless they are bytes this server
+/// stored. `File.StreamUpdated` and `FileVersion.Create` may name a `content_hash` of stored bytes, with their
+/// `size_bytes` when the store knows it; `StreamUpdated` must name one. Any other action names none of the fields.
+pub(super) async fn refuse_caller_content(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
@@ -60,28 +61,59 @@ pub(super) async fn refuse_unstored_hash(
         (entity_type, action),
         ("File", "StreamUpdated") | ("FileVersion", "Create")
     ) {
-        return None;
+        return refuse_content_fields(entity_type, body);
     }
-    let hash = body.get("content_hash")?.as_str().unwrap_or_default();
-    if hash.is_empty() {
-        return None;
-    }
-    match state.file_bytes_stored(tenant, hash).await {
-        Ok(true) => None,
-        Ok(false) => Some(
+    let not_stored = |why: String| {
+        Some(
             odata_error(
                 StatusCode::CONFLICT,
                 "FileBytesNotStored",
-                &format!(
-                    "{entity_type}.{action} names content_hash '{hash}', and this server stored no such bytes for this tenant; a File's bytes come from its $value PUT"
-                ),
+                &format!("{why}; a File's bytes come from its $value PUT"),
             )
             .into_response(),
-        ),
-        Err(error) => Some(
-            odata_error(StatusCode::SERVICE_UNAVAILABLE, "FileStoreUnavailable", &error)
+        )
+    };
+    if body.get("has_content").is_some() {
+        return not_stored(format!("{entity_type}.{action} does not take has_content"));
+    }
+    let hash = body
+        .get("content_hash")
+        .and_then(|hash| hash.as_str())
+        .unwrap_or_default();
+    if hash.is_empty() {
+        if entity_type == "File" {
+            return not_stored(
+                "File.StreamUpdated needs the content_hash of bytes this server stored".to_string(),
+            );
+        }
+        return refuse_content_fields(entity_type, body);
+    }
+    let stored = match state.stored_file_bytes(tenant, hash).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return not_stored(format!(
+                "{entity_type}.{action} names content_hash '{hash}', and this server stored no such bytes for this tenant"
+            ));
+        }
+        Err(error) => {
+            return Some(
+                odata_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "FileStoreUnavailable",
+                    &error,
+                )
                 .into_response(),
-        ),
+            );
+        }
+    };
+    let said = body
+        .get("size_bytes")
+        .and_then(|size| size.as_u64().or_else(|| size.as_str()?.parse().ok()));
+    match stored.size {
+        Some(size) if said != Some(size) => not_stored(format!(
+            "{entity_type}.{action} must say size_bytes {size}, the size of the stored bytes"
+        )),
+        _ => None,
     }
 }
 

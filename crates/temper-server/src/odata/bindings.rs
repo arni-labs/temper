@@ -11,7 +11,7 @@ use temper_authz::SecurityContext;
 
 use super::account_verification::enforce_commons_account_verified_for_action;
 use super::common::run_write_prechecks;
-use super::file_content::refuse_unstored_hash;
+use super::file_content::refuse_caller_content;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_action};
 use super::response::annotate_entity;
 use crate::authz::{DenialInput, record_authz_denial};
@@ -228,7 +228,7 @@ pub(super) async fn dispatch_bound_action(
         return resp;
     }
     if let Some(resp) =
-        refuse_unstored_hash(state, tenant, entity_type, action, &resolved_body).await
+        refuse_caller_content(state, tenant, entity_type, action, &resolved_body).await
     {
         action_span.set_status(Status::error("FileBytesNotStored"));
         return resp;

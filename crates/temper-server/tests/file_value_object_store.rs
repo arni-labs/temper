@@ -546,7 +546,8 @@ async fn a_files_content_hash_is_only_ever_the_hash_of_bytes_this_server_stored(
 
     // Another File pointed at bytes this server never stored: refused, and the File stays as it was.
     let elsewhere = content_hash(b"bytes kept somewhere else");
-    let ready = |hash: &str| json!({ "content_hash": hash, "size_bytes": 24, "mime_type": "image/png", "version_number": 1, "previous_version_id": "", "created_by": "member" });
+    let size = stored.len();
+    let ready = |hash: &str| json!({ "content_hash": hash, "size_bytes": size, "mime_type": "image/png", "version_number": 1, "previous_version_id": "", "created_by": "member" });
     let refused = app
         .clone()
         .oneshot(json_request(
@@ -561,14 +562,38 @@ async fn a_files_content_hash_is_only_ever_the_hash_of_bytes_this_server_stored(
         .get_tenant_entity_state(&TenantId::default(), "File", "fl-pointed")
         .await
         .expect("file");
+    let hash = file
+        .state
+        .fields
+        .get("content_hash")
+        .and_then(|h| h.as_str())
+        .unwrap_or_default();
     assert_eq!(
-        (
-            file.state.status.as_str(),
-            &file.state.fields["content_hash"]
-        ),
-        ("Created", &json!("")),
+        (file.state.status.as_str(), hash),
+        ("Created", ""),
         "never made Ready by a hash"
     );
+
+    // Nor without a hash, or with another size than the stored bytes.
+    let mut no_hash = ready("");
+    no_hash
+        .as_object_mut()
+        .expect("object")
+        .remove("content_hash");
+    let mut wrong_size = ready(&stored_hash);
+    wrong_size["size_bytes"] = json!(size + 1);
+    for (action, body) in [("StreamUpdated", no_hash), ("StreamUpdated", wrong_size)] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/tdata/Files('fl-pointed')/Temper.{action}"),
+                body,
+            ))
+            .await
+            .expect("respond");
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{action}");
+    }
 
     // A hash of bytes it did store passes: they are the File's own to name.
     let passed = app
