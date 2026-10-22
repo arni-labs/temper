@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod history_erase;
+pub use history_erase::{HistoryErase, HistoryErased, overflow_blob_keys};
+
 /// Event type used for the parent-journal record of a Composite action.
 ///
 /// Concrete sub-write events remain the state-changing events on their target

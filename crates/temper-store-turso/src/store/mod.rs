@@ -26,6 +26,7 @@ mod entity_listing;
 mod event_store;
 mod evolution;
 pub mod field_index;
+mod history_erase;
 mod instrumentation;
 mod migration_support;
 pub mod ots;

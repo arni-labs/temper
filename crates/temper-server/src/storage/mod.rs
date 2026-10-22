@@ -39,6 +39,7 @@ use crate::platform_store::SimPlatformStore;
 use crate::state::trajectory::TrajectoryEntry;
 
 mod event_size;
+mod history_erase;
 mod metadata_impls;
 mod observe_read;
 mod policy_impls;
@@ -49,6 +50,7 @@ mod redaction;
 mod state_timers;
 mod trajectory_row;
 pub use event_size::EventSizeLimits;
+pub use history_erase::HistoryEraseStore;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
@@ -1214,6 +1216,7 @@ pub trait MetadataStore:
     + WasmInvocationStore
     + PublishedArtifactStore
     + StateTimerStore
+    + HistoryEraseStore
 {
 }
 
@@ -1231,6 +1234,7 @@ impl<T> MetadataStore for T where
         + WasmInvocationStore
         + PublishedArtifactStore
         + StateTimerStore
+        + HistoryEraseStore
 {
 }
 
