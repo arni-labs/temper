@@ -94,17 +94,19 @@ async fn erase_in(
         }
     }
 
-    let mut erased = HistoryErased::default();
-    erased.events = sqlx::query(&q("DELETE FROM {schema}events \
+    let mut erased = HistoryErased {
+        events: sqlx::query(&q("DELETE FROM {schema}events \
          WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND sequence_nr < $4"))
-    .bind(tenant)
-    .bind(entity_type)
-    .bind(entity_id)
-    .bind(seq)
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?
-    .rows_affected();
+        .bind(tenant)
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(seq)
+        .execute(&mut *conn)
+        .await
+        .map_err(storage)?
+        .rows_affected(),
+        ..HistoryErased::default()
+    };
     let payload: serde_json::Value = serde_json::from_str(tombstone_payload)
         .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
     sqlx::query(&q("UPDATE {schema}events SET payload = $5 \

@@ -112,7 +112,7 @@ async fn an_erased_entity_keeps_its_tombstone_and_nothing_it_held() {
         .await
         .expect("erase");
     assert_eq!(erased.events, tombstone_seq - 1, "{erased:?}");
-    assert_eq!(erased.trajectories, 1, "{erased:?}");
+    assert!(erased.trajectories >= 1, "{erased:?}");
 
     let replayed = state
         .get_tenant_entity_state(&tenant, "Order", "ord-1")

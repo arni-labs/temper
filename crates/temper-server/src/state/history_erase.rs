@@ -5,7 +5,7 @@ use temper_runtime::persistence::{HistoryErase, HistoryErased};
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
-use crate::storage::{HistoryEraseStore as _, MetadataStore};
+use crate::storage::MetadataStore;
 
 impl ServerState {
     /// Erase one deleted entity's history (see `HistoryErase`); refuses a live one.
