@@ -9,6 +9,7 @@ mod decisions;
 mod decisions_access;
 mod decisions_get;
 mod files;
+mod history;
 mod policies;
 mod repl;
 mod secrets;
@@ -38,6 +39,7 @@ use crate::state::ServerState;
 /// - POST   /api/wasm/modules/{module_name}            -> upload WASM module
 /// - DELETE /api/wasm/modules/{module_name}             -> delete WASM module
 /// - POST   /api/evolution/records/{id}/decide          -> developer decision on record
+/// - POST   /api/tenants/{tenant}/history/erase          -> erase deleted entities' history
 /// - POST   /api/evolution/trajectories/unmet           -> report unmet user intent
 /// - POST   /api/evolution/sentinel/check               -> trigger sentinel health check
 /// - POST   /api/evolution/analyze                      -> run IntentDiscovery loop
@@ -149,6 +151,11 @@ pub fn build_api_router() -> Router<ServerState> {
         .route(
             "/tenants/{tenant}/policies/entry/{policy_id}/replace",
             post(policies::handle_replace_policy),
+        )
+        // Erase deleted entities' history (operator only, as policy management).
+        .route(
+            "/tenants/{tenant}/history/erase",
+            post(history::handle_erase_history),
         )
         // Cross-tenant policy listing
         .route("/policies", get(policies::handle_list_all_policies))
