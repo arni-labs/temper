@@ -45,7 +45,7 @@ async fn erase_in(
         snapshot,
     } = *erase;
     let seq = tombstone_sequence_nr as i64;
-    let q = |sql: &str| schema.qualify_sql(sql);
+    let q = |sql: &'static str| schema.qualify_sql(sql);
 
     let last = sqlx::query(&q(
         "SELECT sequence_nr, event_type, segment_index FROM {schema}events \
@@ -95,12 +95,6 @@ async fn erase_in(
     }
 
     let mut erased = HistoryErased::default();
-    let entity_rows = |sql: &str| {
-        sqlx::query(&q(sql))
-            .bind(tenant)
-            .bind(entity_type)
-            .bind(entity_id)
-    };
     erased.events = sqlx::query(&q("DELETE FROM {schema}events \
          WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND sequence_nr < $4"))
     .bind(tenant)
@@ -124,21 +118,14 @@ async fn erase_in(
     .await
     .map_err(storage)?;
 
-    erased.snapshots = entity_rows(
-        "DELETE FROM {schema}snapshot_history \
-         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+    erased.snapshots = delete_rows(
+        &mut *conn,
+        &q("DELETE FROM {schema}snapshot_history \
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3"),
+        erase,
     )
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?
-    .rows_affected();
-    erased.snapshots += entity_rows(
-        "DELETE FROM {schema}snapshots WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?
-    .rows_affected();
+    .await?;
+    erased.snapshots += delete_rows(&mut *conn, &q("DELETE FROM {schema}snapshots WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3"), erase).await?;
     if seq > 1 {
         sqlx::query(&q(
             "INSERT INTO {schema}snapshots (tenant, entity_type, entity_id, sequence_nr, state) \
@@ -153,13 +140,13 @@ async fn erase_in(
         .await
         .map_err(storage)?;
     }
-    entity_rows(
-        "DELETE FROM {schema}event_segments \
-         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+    delete_rows(
+        &mut *conn,
+        &q("DELETE FROM {schema}event_segments \
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3"),
+        erase,
     )
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?;
+    .await?;
     sqlx::query(&q(
         "INSERT INTO {schema}event_segments (tenant, entity_type, entity_id, segment_index, \
          start_sequence_nr, end_sequence_nr, snapshot_sequence, event_count, sealed_at) \
@@ -175,29 +162,21 @@ async fn erase_in(
     .await
     .map_err(storage)?;
 
-    erased.trajectories = entity_rows(
-        "DELETE FROM {schema}trajectories WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+    erased.trajectories = delete_rows(&mut *conn, &q("DELETE FROM {schema}trajectories WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3"), erase).await?;
+    erased.wasm_invocations = delete_rows(
+        &mut *conn,
+        &q("DELETE FROM {schema}wasm_invocation_logs \
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3"),
+        erase,
     )
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?
-    .rows_affected();
-    erased.wasm_invocations = entity_rows(
-        "DELETE FROM {schema}wasm_invocation_logs \
-         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+    .await?;
+    erased.pending_decisions = delete_rows(
+        &mut *conn,
+        &q("DELETE FROM {schema}pending_decisions WHERE tenant = $1 \
+         AND data->>'resource_type' = $2 AND data->>'resource_id' = $3"),
+        erase,
     )
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?
-    .rows_affected();
-    erased.pending_decisions = entity_rows(
-        "DELETE FROM {schema}pending_decisions WHERE tenant = $1 \
-         AND data->>'resource_type' = $2 AND data->>'resource_id' = $3",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(storage)?
-    .rows_affected();
+    .await?;
 
     // A blob another event or snapshot of this type still names stays.
     for key in candidates {
@@ -219,4 +198,20 @@ async fn erase_in(
         }
     }
     Ok(erased)
+}
+
+/// Delete the rows of `sql` (bound to the tenant, type and id) and count them.
+async fn delete_rows(
+    conn: &mut PgConnection,
+    sql: &str,
+    erase: &HistoryErase<'_>,
+) -> Result<u64, PersistenceError> {
+    Ok(sqlx::query(sql)
+        .bind(erase.tenant)
+        .bind(erase.entity_type)
+        .bind(erase.entity_id)
+        .execute(conn)
+        .await
+        .map_err(storage)?
+        .rows_affected())
 }
