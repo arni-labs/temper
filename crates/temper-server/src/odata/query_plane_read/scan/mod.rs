@@ -211,7 +211,7 @@ fn row_permitted(
     request
         .state
         .authz
-        .authorize_for_tenant_or_bypass(
+        .authorize_row_for_tenant(
             request.tenant.as_str(),
             request.security_ctx,
             READ_ACTION,

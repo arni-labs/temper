@@ -16,7 +16,7 @@ use cedar_policy::{
 
 use crate::context::{PrincipalKind, SecurityContext, is_cedar_authority_context_key};
 use crate::error::{AuthzDenial, AuthzError};
-use crate::metrics::{CedarDecisionMetric, CedarPhaseOutcome};
+use crate::metrics::{CedarCheck, CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
 mod list_uniformity;
@@ -339,6 +339,7 @@ impl AuthzEngine {
             resource_type,
             resource_attrs,
             &policy_set,
+            CedarCheck::Gate,
         )
     }
 
@@ -358,6 +359,45 @@ impl AuthzEngine {
         resource_type: &str,
         resource_attrs: &HashMap<String, serde_json::Value>,
     ) -> AuthzDecision {
+        self.authorize_for_tenant_checked(
+            tenant,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            CedarCheck::Gate,
+        )
+    }
+
+    /// The same decision as [`Self::authorize_for_tenant`], for the per-row check a list read makes to leave out the
+    /// rows the caller may not see. Only its metric differs: it is counted as `check:row_filter`, never as a refusal.
+    pub fn authorize_row_for_tenant(
+        &self,
+        tenant: &str,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &HashMap<String, serde_json::Value>,
+    ) -> AuthzDecision {
+        self.authorize_for_tenant_checked(
+            tenant,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            CedarCheck::RowFilter,
+        )
+    }
+
+    fn authorize_for_tenant_checked(
+        &self,
+        tenant: &str,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &HashMap<String, serde_json::Value>,
+        check: CedarCheck,
+    ) -> AuthzDecision {
         let tenants = match self.tenant_policies.read() {
             Ok(t) => t,
             Err(e) => {
@@ -374,6 +414,7 @@ impl AuthzEngine {
                 resource_type,
                 resource_attrs,
                 &tp.policies,
+                check,
             );
         }
 
@@ -384,6 +425,7 @@ impl AuthzEngine {
                 resource_type,
                 resource_attrs,
                 &self.platform_policy_set,
+                check,
             );
         }
 
@@ -399,8 +441,9 @@ impl AuthzEngine {
         resource_type: &str,
         resource_attrs: &HashMap<String, serde_json::Value>,
         policies: &CompiledPolicies,
+        check: CedarCheck,
     ) -> AuthzDecision {
-        let mut recorder = CedarEvaluationRecorder::start();
+        let mut recorder = CedarEvaluationRecorder::start(check);
 
         // Build Cedar principal
         let principal_type = match security_ctx.principal.kind {
@@ -867,14 +910,16 @@ fn count_user_policies(ps: &PolicySet) -> usize {
 struct CedarEvaluationRecorder {
     started_at: Instant,
     phase_started_at: Instant,
+    check: CedarCheck,
 }
 
 impl CedarEvaluationRecorder {
-    fn start() -> Self {
+    fn start(check: CedarCheck) -> Self {
         let now = Instant::now();
         Self {
             started_at: now,
             phase_started_at: now,
+            check,
         }
     }
 
@@ -896,12 +941,13 @@ impl CedarEvaluationRecorder {
         crate::metrics::record_cedar_evaluation(
             self.started_at.elapsed(),
             CedarDecisionMetric::Error,
+            self.check,
         );
         AuthzDecision::Deny(denial)
     }
 
     fn finish(&self, decision: CedarDecisionMetric) {
-        crate::metrics::record_cedar_evaluation(self.started_at.elapsed(), decision);
+        crate::metrics::record_cedar_evaluation(self.started_at.elapsed(), decision, self.check);
     }
 }
 
