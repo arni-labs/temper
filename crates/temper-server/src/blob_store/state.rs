@@ -73,17 +73,49 @@ impl ServerState {
         key: &str,
         body: &[u8],
     ) -> Result<(), String> {
-        let store = self.blob_store_for_tenant(tenant)?;
-        if self.files_need_object_store && !store.is_object_store() {
-            return Err(format!(
-                "this server keeps Files only in an object store, and tenant '{tenant}' has none (no blob_endpoint in its vault); nothing was kept"
-            ));
+        if let Some(why) = self.files_refused_here(tenant) {
+            return Err(format!("{why}; nothing was kept"));
         }
+        let store = self.blob_store_for_tenant(tenant)?;
         store.put_content_addressed(key, body, None).await?;
         if store.is_object_store() {
             return Ok(());
         }
         self.put_metadata_blob_shadow(tenant, key, body, None).await
+    }
+
+    /// Why this server neither keeps nor serves a tenant's File bytes in `store`: it keeps Files only in an object
+    /// store (`files_need_object_store`) and `store` is a local one. A local store may be shared by every server on
+    /// one machine (`$HOME/.local/share/temper/blobs` for each default tenant), so its bytes are not this server's.
+    pub(crate) fn files_refused_here(&self, tenant: &TenantId) -> Option<String> {
+        let remote = self
+            .blob_store_for_tenant(tenant)
+            .is_ok_and(|store| store.is_object_store());
+        (self.files_need_object_store && !remote).then(|| {
+            format!(
+                "this server keeps Files only in an object store, and tenant '{tenant}' has none (no blob_endpoint in its vault)"
+            )
+        })
+    }
+
+    /// A blob from the database copy the default tenant keeps beside a local store, and nowhere else: the copy is
+    /// this server's own (an app's Temper has its own database), so it serves Files kept before
+    /// `files_need_object_store` without the shared local store.
+    pub(crate) async fn get_own_database_blob(
+        &self,
+        tenant: &TenantId,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if tenant != &TenantId::default() {
+            return Ok(None);
+        }
+        let Some(store) = self.metadata_store_for_tenant(tenant.as_str()).await else {
+            return Ok(None);
+        };
+        store
+            .get_blob(key)
+            .await
+            .map_err(|error| format!("legacy DB blob read failed for '{key}': {error}"))
     }
 
     pub async fn get_blob_with_legacy_fallback(

@@ -23,16 +23,56 @@ impl ServerState {
             .secrets_vault
             .as_ref()
             .and_then(|vault| vault.get_secret(tenant.as_str(), "blob_endpoint"));
+        // A server that keeps Files only in an object store reads none from a local store, which other servers on the
+        // machine may share: only its own database copy, from before.
+        let own_only = self.files_refused_here(tenant).is_some();
         for blob_key in file_blob_read_keys(blob_endpoint.as_deref(), content_hash) {
-            let blob_bytes = self
-                .get_blob_with_legacy_fallback(tenant, &blob_key)
-                .await
-                .map_err(|e| format!("failed to read blob '{content_hash}': {e}"))?;
+            let read = if own_only {
+                self.get_own_database_blob(tenant, &blob_key).await
+            } else {
+                self.get_blob_with_legacy_fallback(tenant, &blob_key).await
+            };
+            let blob_bytes =
+                read.map_err(|e| format!("failed to read blob '{content_hash}': {e}"))?;
             if blob_bytes.is_some() {
                 return Ok(blob_bytes);
             }
         }
         Ok(None)
+    }
+}
+
+impl ServerState {
+    /// Whether this server stored File bytes whose hash is `content_hash` for `tenant`, where its File reads look for
+    /// them. Keys are content addressed, so bytes found under a hash are bytes that hash to it.
+    pub(crate) async fn file_bytes_stored(
+        &self,
+        tenant: &TenantId,
+        content_hash: &str,
+    ) -> Result<bool, String> {
+        let blob_endpoint = self
+            .secrets_vault
+            .as_ref()
+            .and_then(|vault| vault.get_secret(tenant.as_str(), "blob_endpoint"));
+        let own_only = self.files_refused_here(tenant).is_some();
+        for blob_key in file_blob_read_keys(blob_endpoint.as_deref(), content_hash) {
+            let found = if own_only {
+                self.get_own_database_blob(tenant, &blob_key)
+                    .await?
+                    .is_some()
+            } else {
+                // Asked for none of the bytes: whether they are there, not what they are.
+                !matches!(
+                    self.get_blob_with_legacy_fallback_bounded(tenant, &blob_key, 0)
+                        .await?,
+                    crate::blob_store::BlobReadBounded::Missing
+                )
+            };
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -81,5 +121,57 @@ mod tests {
             file_blob_read_keys(None, "sha256:abc"),
             vec!["temper-fs/sha256:abc".to_string()]
         );
+    }
+
+    fn server(name: &str, data_dir: &std::path::Path) -> ServerState {
+        let mut state = ServerState::new(
+            temper_runtime::ActorSystem::new(name),
+            temper_spec::csdl::CsdlDocument {
+                version: "4.0".to_string(),
+                schemas: Vec::new(),
+            },
+            String::new(),
+        );
+        state.data_dir = data_dir.to_path_buf();
+        state
+    }
+
+    /// Two servers on one machine share its local store (each default tenant's is `$HOME/.local/share/temper/blobs`).
+    /// One that keeps Files only in an object store neither serves nor vouches for bytes the other left there; the
+    /// one that stored them finds them by their hash, and no other hash.
+    #[tokio::test]
+    async fn a_server_that_keeps_files_only_in_an_object_store_reads_none_from_a_shared_local_store()
+     {
+        let shared = tempfile::tempdir().expect("data dir");
+        let tenant = TenantId::default();
+        let other = server("files-other-app", shared.path());
+        let (hash, key) =
+            super::super::file_writes::content_hash_and_native_blob_key(b"another app's bytes");
+        other
+            .put_file_content_blob(&tenant, &key, b"another app's bytes")
+            .await
+            .expect("kept locally");
+        assert!(other.file_bytes_stored(&tenant, &hash).await.expect("look"));
+        assert!(
+            !other
+                .file_bytes_stored(&tenant, "sha256:00")
+                .await
+                .expect("look"),
+            "only bytes it stored"
+        );
+
+        let mut app = server("files-this-app", shared.path());
+        app.files_need_object_store = true;
+        assert_eq!(
+            app.fetch_blob_bytes_for_hash(&tenant, &hash)
+                .await
+                .expect("read"),
+            None
+        );
+        assert!(
+            !app.file_bytes_stored(&tenant, &hash).await.expect("look"),
+            "not its bytes"
+        );
+        assert!(app.files_refused_here(&tenant).is_some());
     }
 }

@@ -1376,6 +1376,18 @@ async fn handle_stream_get(
     {
         return response;
     }
+    // A server that keeps Files only in an object store, without one, serves a File only from its own database copy
+    // (the fast path above), never through the blob adapter from a local store other servers may share.
+    if matches!(entity_type.as_str(), "File" | "FileVersion")
+        && let Some(why) = state.files_refused_here(tenant)
+    {
+        return odata_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "FilesNeedObjectStore",
+            &why,
+        )
+        .into_response();
+    }
 
     // 3. Check if entity has content (boolean may be in top-level `booleans` map or `fields`)
     let has_content = entity_state
