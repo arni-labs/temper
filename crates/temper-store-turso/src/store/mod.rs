@@ -31,6 +31,7 @@ mod migration_support;
 pub mod ots;
 mod policy;
 mod policy_approval;
+mod policy_replace;
 mod published_artifacts;
 mod query_page;
 mod secrets;
