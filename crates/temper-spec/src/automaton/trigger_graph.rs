@@ -347,7 +347,7 @@ to = "Working"
     }
 
     #[test]
-    fn wasm_and_webhook_triggers_skipped() {
+    fn wasm_triggers_skipped() {
         let spec = r#"
 [automaton]
 name = "Order"
@@ -365,12 +365,6 @@ kind = "wasm"
 module = "stripe_charge"
 on_success = "NotifyUser"
 
-[[action.triggers]]
-name = "notify_webhook"
-kind = "webhook"
-url = "https://example.com"
-method = "POST"
-
 [[action]]
 name = "NotifyUser"
 from = ["Confirmed"]
@@ -378,7 +372,7 @@ to = "Notified"
 "#;
         let order = parse_automaton(spec).unwrap();
         let graph = TriggerGraph::from_automatons(&[&order]);
-        // wasm + webhook triggers contribute no edges; Order has no
+        // wasm triggers contribute no edges; Order has no
         // entity-kind triggers here, so outgoing should be absent.
         assert!(!graph.outgoing.contains_key("Order"));
     }

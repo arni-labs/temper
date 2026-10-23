@@ -118,14 +118,16 @@ pub(crate) async fn admit(
     for (name, path, params) in prepared {
         // Do not inherit a user idempotency key: admission is evaluated on EVERY
         // request, even when the remote application receives a repeated key.
-        let response = crate::odata::handle_odata_post(
+        // Boxed: the OData handler's future is among the largest in the
+        // kernel; inlined, every future above this route call would carry it.
+        let response = Box::pin(crate::odata::handle_odata_post(
             State(state.clone()),
             Some(Extension(authenticated.clone())),
             HeaderMap::new(),
             Path(path),
             Query(BTreeMap::new()),
             params,
-        )
+        ))
         .await
         .into_response();
         if response.status() == StatusCode::ACCEPTED {

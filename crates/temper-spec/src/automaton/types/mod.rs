@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 mod action;
 mod state;
 mod trigger;
+mod webhook;
 
 pub use action::*;
 pub use state::*;
 pub use trigger::*;
+pub use webhook::*;
 
 use super::field_invariant::FieldInvariant;
 use crate::predicate::{Arg, Expr};
@@ -218,53 +220,6 @@ pub struct Integration {
 
 fn default_webhook() -> String {
     "webhook".to_string()
-}
-
-/// Default method for webhooks.
-fn default_post() -> String {
-    "POST".to_string()
-}
-
-/// An inbound webhook declaration.
-///
-/// Webhooks allow external systems (OAuth providers, payment gateways) to
-/// call back into Temper, triggering entity actions. They are metadata-only
-/// — they do not affect verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Webhook {
-    /// Webhook name (e.g., "oauth_callback").
-    pub name: String,
-    /// URL path suffix (e.g., "oauth/callback").
-    pub path: String,
-    /// HTTP method (default: POST).
-    #[serde(default = "default_post")]
-    pub method: String,
-    /// Action to dispatch when webhook is called.
-    pub action: String,
-    /// Where the request carries the target entity's id, as
-    /// `query.<name>`: a query-string parameter (the only source today).
-    pub entity_id: String,
-    /// Action parameters read from the request: parameter name → source, in
-    /// the same `query.<name>` form as `entity_id`.
-    #[serde(default)]
-    pub extract: BTreeMap<String, String>,
-    /// Optional HMAC secret for transport-layer validation (supports {secret:key} templates).
-    #[serde(default)]
-    pub hmac_secret: Option<String>,
-    /// Header containing the HMAC signature from the external system.
-    #[serde(default)]
-    pub hmac_header: Option<String>,
-}
-
-impl Webhook {
-    /// The query-string parameter a `query.<name>` source reads; `None` for
-    /// any other spelling.
-    pub fn query_param(source: &str) -> Option<&str> {
-        source
-            .strip_prefix("query.")
-            .filter(|name| !name.is_empty())
-    }
 }
 
 /// A context entity declaration for Cedar authorization.

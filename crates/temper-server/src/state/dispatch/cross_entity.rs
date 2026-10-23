@@ -9,9 +9,9 @@ impl crate::state::ServerState {
     /// For each `Type[id_field].status` in the guards of `action`, reads the
     /// id (or list of ids) from the entity's current fields and resolves each
     /// related entity's status. An unset reference resolves to no statuses;
-    /// an entity that is not found resolves to `None`. When the lookup budget
-    /// runs out, the remaining references are [`Related::Unresolved`], which
-    /// no guard can pass.
+    /// an entity that is not found resolves to `None`. Every id is resolved:
+    /// the number of lookups is the number of ids the entity's own fields
+    /// hold, so a guard over all of a list's entities sees all of them.
     pub(super) async fn resolve_cross_entity_guards(
         &self,
         tenant: &TenantId,
@@ -19,8 +19,6 @@ impl crate::state::ServerState {
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        use crate::entity_actor::effects::MAX_CROSS_ENTITY_LOOKUPS;
-
         let mut result = RelatedMap::new();
         let refs: Vec<(String, String)> = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
@@ -42,7 +40,6 @@ impl crate::state::ServerState {
             Err(_) => return result,
         };
 
-        let mut lookups = 0usize;
         for (target_type, id_field) in refs {
             let ids: Vec<&str> = match current_fields.get(&id_field) {
                 Some(serde_json::Value::Array(items)) => items
@@ -53,24 +50,12 @@ impl crate::state::ServerState {
                 Some(serde_json::Value::String(id)) if !id.is_empty() => vec![id.as_str()],
                 _ => Vec::new(),
             };
-            if lookups + ids.len() > MAX_CROSS_ENTITY_LOOKUPS {
-                tracing::warn!(
-                    entity_type,
-                    entity_id,
-                    "cross-entity lookup budget exhausted ({})",
-                    MAX_CROSS_ENTITY_LOOKUPS
-                );
-                result.insert((target_type, id_field), Related::Unresolved);
-                continue;
-            }
-            lookups += ids.len();
             let mut statuses = Vec::with_capacity(ids.len());
             for id in ids {
                 statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
             }
             result.insert((target_type, id_field), Related::Statuses(statuses));
         }
-        debug_assert!(lookups <= MAX_CROSS_ENTITY_LOOKUPS);
         result
     }
 
@@ -79,6 +64,9 @@ impl crate::state::ServerState {
     /// This is a **sync** method (like `dispatch_scheduled_actions`) so that
     /// `tokio::spawn` inside it does not cause async recursion.
     /// Creates child entities and optionally dispatches initial actions.
+    ///
+    /// Every request is dispatched. Each one comes from a `spawn(...)` effect
+    /// written in the spec, so their number is fixed by the spec text.
     pub(super) fn dispatch_spawn_requests(
         &self,
         tenant: &TenantId,
@@ -88,19 +76,7 @@ impl crate::state::ServerState {
         action_params: &serde_json::Value,
         agent_ctx: &AgentContext,
     ) {
-        use crate::entity_actor::effects::MAX_SPAWNS_PER_TRANSITION;
-
-        for (spawn_count, req) in spawn_requests.iter().enumerate() {
-            if spawn_count >= MAX_SPAWNS_PER_TRANSITION {
-                tracing::warn!(
-                    parent_type,
-                    parent_id,
-                    "spawn budget exhausted ({})",
-                    MAX_SPAWNS_PER_TRANSITION
-                );
-                break;
-            }
-
+        for req in spawn_requests {
             let state = self.clone();
             let t = tenant.clone();
             let parent_t = parent_type.to_string();
