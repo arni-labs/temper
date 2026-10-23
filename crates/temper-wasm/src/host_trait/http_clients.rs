@@ -132,14 +132,16 @@ impl HttpClientCache {
     }
 }
 
-fn build_client(config: &ClientConfig, disable_redirects: bool) -> reqwest::Client {
+fn build_client(config: &ClientConfig, internal: bool) -> reqwest::Client {
+    // The `http_call` gate checks only the URL the guest names, so neither
+    // client follows redirects: the guest gets the 3xx, and any next hop is a
+    // new call the gate checks again.
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(config.timeout);
-    if disable_redirects {
-        builder = builder
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy();
+        .timeout(config.timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if internal {
+        builder = builder.no_proxy();
     }
     for (key, pem) in &config.ca_certs {
         match reqwest::Certificate::from_pem(pem.as_bytes()) {

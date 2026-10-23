@@ -347,9 +347,9 @@ type TextHttpInterceptorFuture =
 
 /// Production host: real HTTP calls via reqwest, real secrets.
 pub struct ProductionWasmHost {
-    /// HTTP client for making real requests.
+    /// HTTP client for making real requests. Follows no redirects.
     client: reqwest::Client,
-    /// Separate client whose redirect policy is disabled for capabilities.
+    /// Separate pool for capability-bearing internal calls, with no proxy.
     internal_client: reqwest::Client,
     /// Secrets from env vars or a secret store.
     secrets: BTreeMap<String, String>,
