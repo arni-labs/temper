@@ -48,9 +48,6 @@ pub enum Related {
     /// One status per id; `None` for an id whose entity was not found. Empty
     /// when the reference is unset.
     Statuses(Vec<Option<String>>),
-    /// Not resolved (lookup budget exhausted). Reads as unknown, so no guard
-    /// that depends on it can pass.
-    Unresolved,
 }
 
 struct GuardEnv<'a> {
@@ -95,7 +92,6 @@ impl Env for GuardEnv<'_> {
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {
         let key = (entity_type.to_string(), id_field.to_string());
         match self.ctx.related.get(&key) {
-            Some(Related::Unresolved) => None,
             Some(Related::Statuses(statuses)) if !statuses.is_empty() => Some(
                 statuses
                     .iter()
@@ -119,7 +115,7 @@ pub fn check(
         ctx,
         declared,
     };
-    // Unknown only arises from an unresolved reference; it must not pass.
+    // A guard holds only when it is true; unknown never passes.
     eval(guard, &env) == Truth::True
 }
 

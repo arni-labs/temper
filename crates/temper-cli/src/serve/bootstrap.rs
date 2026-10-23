@@ -532,6 +532,13 @@ pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, St
     {
         eprintln!("  Warning: failed to bootstrap operator credential for tenant 'default': {e}");
     }
+    // A deployment that is the only holder of its key (a Katagami app's Temper,
+    // keyed by its control plane) retires the credentials earlier boots issued
+    // for other keys, so a key it no longer holds stops working.
+    let retire = std::env::var("TEMPER_RETIRE_OLD_OPERATOR_KEYS").is_ok_and(|v| v == "1"); // determinism-ok: read once at startup
+    if retire && let Some(ref api_key) = state.api_token {
+        temper_platform::retire_other_operator_credentials(state, api_key, "default").await;
+    }
 
     // Register a trusted JWT issuer from env config, if provided (ARN-255).
     // This is how a deployment activates the platform-issued-token path without
