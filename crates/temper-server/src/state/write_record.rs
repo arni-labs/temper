@@ -6,8 +6,15 @@
 //! the same function the entity actor applies for that write (create, field
 //! update, action) and checks that record here, so the record that is checked
 //! is the record that is stored.
+//!
+//! Only writes from outside the kernel are checked. The kernel's own
+//! follow-ons for a spec (reactions, state timers, schedules, WASM callbacks,
+//! a WASM module's requests back into the API, platform code) must be able to
+//! finish what an earlier move started, such as ending a session whose parent
+//! was archived since.
 
 use serde_json::Value;
+use temper_authz::SecurityContext;
 use temper_jit::table::{RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use tracing::instrument::WithSubscriber;
@@ -17,14 +24,45 @@ use crate::entity_actor::effects::{self, FieldSyncMode};
 use crate::entity_actor::{EntityActor, EntityState};
 use crate::odata::constraints::{self, ConstraintViolation};
 
+/// Where a write came from. It decides whether the record the write stores
+/// is checked before it is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteCaller {
+    /// A call from outside the kernel: OData and MCP requests, HttpEndpoint
+    /// routes and inbound webhooks.
+    Outside,
+    /// A follow-on the kernel runs for the spec: reactions, state timers,
+    /// schedules, WASM callbacks and platform code, including a WASM module's
+    /// own requests back into the kernel's API.
+    Kernel,
+}
+
+impl WriteCaller {
+    /// The caller behind an authenticated API request. A request a WASM
+    /// module makes back into the kernel carries `context.module`, which the
+    /// kernel sets when it hands the module its credential and which no
+    /// outside credential resolves to; that request is the module's own work
+    /// for the spec. Every other request comes from outside.
+    pub(crate) fn of_request(security_ctx: &SecurityContext) -> Self {
+        if security_ctx.context_attrs.contains_key("module") {
+            Self::Kernel
+        } else {
+            Self::Outside
+        }
+    }
+}
+
 impl ServerState {
     /// Check the record a write will store against the tenant's relation
-    /// integrity, field invariants and hard cross-invariants.
+    /// integrity, field invariants and hard cross-invariants. A kernel
+    /// follow-on is not checked (see the module docs).
     ///
     /// `action` selects which cross-invariants apply (their `on` trigger);
     /// `operation` labels the write in violations and metrics.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn check_record_to_store(
         &self,
+        caller: WriteCaller,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
@@ -32,6 +70,9 @@ impl ServerState {
         operation: &str,
         record: &Value,
     ) -> Result<(), ConstraintViolation> {
+        if caller == WriteCaller::Kernel {
+            return Ok(());
+        }
         constraints::pre_upsert_relation_checks(
             self,
             tenant,
@@ -64,11 +105,13 @@ impl ServerState {
 
     /// Check the record `action` will store when applied to `current`.
     ///
-    /// Runs before the action is sent to the actor, on every dispatch path.
-    /// Entity types with no relation, field invariant or matching
+    /// Runs before the action is sent to the actor. Kernel follow-ons and
+    /// entity types with no relation, field invariant or matching
     /// cross-invariant skip the work.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn check_action_record(
         &self,
+        caller: WriteCaller,
         tenant: &TenantId,
         table: &TransitionTable,
         current: &EntityState,
@@ -76,13 +119,14 @@ impl ServerState {
         params: &Value,
         related: &RelatedMap,
     ) -> Result<(), ConstraintViolation> {
-        if !self.record_constraints_declared(tenant, &current.entity_type, action) {
+        if !self.action_record_checked(caller, tenant, &current.entity_type, action) {
             return Ok(());
         }
         let record = self
             .action_record(tenant, table, current, action, params, related)
             .await;
         self.check_record_to_store(
+            caller,
             tenant,
             &current.entity_type,
             &current.entity_id,
@@ -93,15 +137,17 @@ impl ServerState {
         .await
     }
 
-    /// Whether the tenant declares a constraint that a write of `action` on
-    /// `entity_type` must satisfy.
-    pub(crate) fn record_constraints_declared(
+    /// Whether the record a `caller`'s `action` on `entity_type` stores is
+    /// checked: the call comes from outside the kernel and the tenant declares
+    /// a constraint that write must satisfy.
+    pub(crate) fn action_record_checked(
         &self,
+        caller: WriteCaller,
         tenant: &TenantId,
         entity_type: &str,
         action: &str,
     ) -> bool {
-        if !self.cross_invariant_enforce {
+        if caller == WriteCaller::Kernel || !self.cross_invariant_enforce {
             return false;
         }
         let registry = self.registry.read().unwrap(); // ci-ok: RwLock read — poisoned lock = prior panic, fail-fast correct

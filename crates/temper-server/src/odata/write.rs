@@ -36,7 +36,7 @@ use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
-use crate::state::write_record::{created_record, field_update_record};
+use crate::state::write_record::{WriteCaller, created_record, field_update_record};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -585,6 +585,7 @@ pub async fn handle_odata_post(
 
             if let Err(resp) = run_write_prechecks(
                 &state,
+                WriteCaller::of_request(&security_ctx),
                 &tenant,
                 &entity_type,
                 &entity_id,
@@ -946,6 +947,7 @@ pub async fn handle_odata_post(
                     current.fields = actor_state.fields.clone();
                     if let Err(violation) = state
                         .check_action_record(
+                            WriteCaller::of_request(&security_ctx),
                             &tenant,
                             &table,
                             &current,
@@ -1131,6 +1133,7 @@ pub async fn handle_odata_patch(
 
             if let Err(resp) = run_write_prechecks(
                 &state,
+                WriteCaller::of_request(&security_ctx),
                 &tenant,
                 &entity_type,
                 &key_str,
@@ -1365,6 +1368,7 @@ pub async fn handle_odata_put(
 
             if let Err(resp) = run_write_prechecks(
                 &state,
+                WriteCaller::of_request(&security_ctx),
                 &tenant,
                 &entity_type,
                 &key_str,
@@ -1552,6 +1556,7 @@ pub async fn handle_odata_delete(
             }
             if let Err(resp) = run_write_prechecks(
                 &state,
+                WriteCaller::of_request(&security_ctx),
                 &tenant,
                 &entity_type,
                 &key_str,

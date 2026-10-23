@@ -154,14 +154,16 @@ pub async fn handle_webhook(
     };
 
     match state
-        .dispatch_tenant_action(
-            &tenant,
-            &entity_type,
-            &entity_id,
+        .dispatch_outside_action(crate::state::DispatchCommand {
+            tenant: &tenant,
+            entity_type: &entity_type,
+            entity_id: &entity_id,
             action,
-            serde_json::Value::Object(params),
-            &agent_ctx,
-        )
+            params: serde_json::Value::Object(params),
+            agent_ctx: &agent_ctx,
+            await_integration: false,
+            await_reactions: true,
+        })
         .await
     {
         Ok(response) => {

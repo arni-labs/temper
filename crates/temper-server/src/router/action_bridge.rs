@@ -66,25 +66,23 @@ pub(super) async fn dispatch_action_bridge_result(
     );
 
     let dispatch = state
-        .dispatch_tenant_action_ext_typed(
-            &tenant_id,
-            &bridge.entity_type,
-            &entity_id,
-            &bridge.action,
-            action_params,
-            crate::state::DispatchExtOptions {
-                agent_ctx: &agent_ctx,
-                await_integration: true,
-                // Await reactions like the OData action path
-                // (dispatch_bound_action) does, so a composite action
-                // dispatched through the bridge — git wire IngestPack,
-                // PR merge — has its declared sub-write reactions applied
-                // before the protocol response is returned. Without this
-                // the reaction is spawned in the background and its
-                // sub_writes are silently dropped.
-                await_reactions: true,
-            },
-        )
+        .dispatch_outside_action(crate::state::DispatchCommand {
+            tenant: &tenant_id,
+            entity_type: &bridge.entity_type,
+            entity_id: &entity_id,
+            action: &bridge.action,
+            params: action_params,
+            agent_ctx: &agent_ctx,
+            await_integration: true,
+            // Await reactions like the OData action path
+            // (dispatch_bound_action) does, so a composite action
+            // dispatched through the bridge — git wire IngestPack,
+            // PR merge — has its declared sub-write reactions applied
+            // before the protocol response is returned. Without this
+            // the reaction is spawned in the background and its
+            // sub_writes are silently dropped.
+            await_reactions: true,
+        })
         .await;
 
     match dispatch {

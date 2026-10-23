@@ -1,6 +1,7 @@
 //! Relation integrity, field invariants and hard cross-invariants hold for
-//! the record a write stores, on every write path: OData create, PATCH and
-//! PUT, OData bound actions, and actions dispatched inside the kernel.
+//! the record a write from outside the kernel stores: OData create, PATCH,
+//! PUT and bound actions. The kernel's own follow-ons are not held to them,
+//! so they can finish what an earlier move started.
 //!
 //! Fixture: a `Session` points at an `Environment` through `EnvironmentId`
 //! (a CSDL referential constraint). A hard cross-invariant keeps a session
@@ -141,7 +142,21 @@ fn build_state() -> ServerState {
     state
 }
 
+fn caller() -> temper_authz::SecurityContext {
+    temper_authz::SecurityContext::from_resolved_identity("stored-record-test", "test-agent", None)
+}
+
 async fn send(state: &ServerState, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
+    send_as(state, method, uri, body, caller()).await
+}
+
+async fn send_as(
+    state: &ServerState,
+    method: Method,
+    uri: &str,
+    body: Value,
+    security_ctx: temper_authz::SecurityContext,
+) -> (StatusCode, Value) {
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
@@ -152,11 +167,7 @@ async fn send(state: &ServerState, method: Method, uri: &str, body: Value) -> (S
         .extensions_mut()
         .insert(temper_authz::AuthenticatedRequestContext::new(
             TenantId::default(),
-            temper_authz::SecurityContext::from_resolved_identity(
-                "stored-record-test",
-                "test-agent",
-                None,
-            ),
+            security_ctx,
         ));
     let response = build_router(state.clone()).oneshot(request).await.unwrap();
     let status = response.status();
@@ -263,39 +274,88 @@ async fn a_valid_bound_action_writes_its_fields() {
 }
 
 #[tokio::test]
-async fn a_kernel_dispatched_action_is_checked_like_a_bound_action() {
+async fn a_kernel_follow_on_finishes_on_a_record_whose_parent_was_archived() {
     let state = seeded().await;
-    let tenant = TenantId::default();
-    let agent = AgentContext::system();
-    for target in ["env-missing", "env-old"] {
-        let response = state
-            .dispatch_tenant_action(
-                &tenant,
-                "Session",
-                "s1",
-                "Move",
-                json!({"EnvironmentId": target}),
-                &agent,
-            )
-            .await
-            .expect("dispatch should answer");
-        assert!(!response.success, "moving to {target} must be refused");
-    }
-    let (_, fields) = stored_session(&state, "s1").await;
-    assert_eq!(fields["EnvironmentId"], "env-a");
+    let (status, body) = bound_action(&state, "Annotate", json!({"Note": "wrapping up"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Environments('env-a')/Temper.Rec.Archive",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "archive env-a: {body}");
 
+    // An outside call is held to the cross-invariant.
+    let (status, body) = bound_action(&state, "Close", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(stored_session(&state, "s1").await.0, "Open");
+
+    // The kernel's own follow-on still ends the session.
     let response = state
         .dispatch_tenant_action(
-            &tenant,
+            &TenantId::default(),
             "Session",
             "s1",
-            "Move",
-            json!({"EnvironmentId": "env-b"}),
-            &agent,
+            "Close",
+            json!({}),
+            &AgentContext::system(),
         )
         .await
         .expect("dispatch should answer");
     assert!(response.success, "{:?}", response.error);
+    assert_eq!(stored_session(&state, "s1").await.0, "Closed");
+}
+
+#[tokio::test]
+async fn a_module_request_back_into_the_api_counts_as_a_kernel_follow_on() {
+    let state = seeded().await;
+    let (status, body) = bound_action(&state, "Annotate", json!({"Note": "wrapping up"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Environments('env-a')/Temper.Rec.Archive",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "archive env-a: {body}");
+
+    // The kernel names the module on the credential it hands a WASM module.
+    let mut module_ctx = caller();
+    module_ctx
+        .context_attrs
+        .insert("module".to_string(), json!("session_closer"));
+    let (status, body) = send_as(
+        &state,
+        Method::POST,
+        "/tdata/Sessions('s1')/Temper.Rec.Close",
+        json!({}),
+        module_ctx.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(stored_session(&state, "s1").await.0, "Closed");
+
+    // The same holds for a record the module creates.
+    let (status, body) = send_as(
+        &state,
+        Method::POST,
+        "/tdata/Sessions",
+        json!({"Id": "s-closing", "EnvironmentId": "env-a"}),
+        module_ctx,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Sessions",
+        json!({"Id": "s-outside", "EnvironmentId": "env-a"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
 #[tokio::test]

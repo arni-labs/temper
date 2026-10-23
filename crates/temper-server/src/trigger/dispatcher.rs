@@ -233,6 +233,7 @@ impl ReactionDispatcher {
                     effective_params,
                     &dispatch_ctx,
                     false,
+                    crate::state::write_record::WriteCaller::Kernel,
                     None,
                 )
                 .await;

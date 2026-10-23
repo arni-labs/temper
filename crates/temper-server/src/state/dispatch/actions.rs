@@ -14,6 +14,7 @@ use super::effects::PostDispatchContext;
 use super::retry;
 use super::{DispatchCommand, DispatchError, DispatchExtOptions, record_workflow_span_attrs};
 use crate::state::admission::AdmissionOutcome;
+use crate::state::write_record::WriteCaller;
 
 const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
 
@@ -179,9 +180,21 @@ impl crate::state::ServerState {
     pub(crate) async fn dispatch_tenant_action_ext_typed_if_current(
         &self,
         cmd: DispatchCommand<'_>,
+        caller: WriteCaller,
         expected_authorization_precondition: String,
     ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, Some(expected_authorization_precondition))
+        self.dispatch_typed_checked(cmd, caller, Some(expected_authorization_precondition))
+            .await
+    }
+
+    /// Dispatch an action a caller outside the kernel sent, such as an
+    /// HttpEndpoint route or an inbound webhook, with no Cedar precondition
+    /// to hold the actor to.
+    pub(crate) async fn dispatch_outside_action(
+        &self,
+        cmd: DispatchCommand<'_>,
+    ) -> Result<EntityResponse, DispatchError> {
+        self.dispatch_typed_checked(cmd, WriteCaller::Outside, None)
             .await
     }
 
@@ -189,12 +202,14 @@ impl crate::state::ServerState {
         &self,
         cmd: DispatchCommand<'_>,
     ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, None).await
+        self.dispatch_typed_checked(cmd, WriteCaller::Kernel, None)
+            .await
     }
 
     async fn dispatch_typed_checked(
         &self,
         cmd: DispatchCommand<'_>,
+        caller: WriteCaller,
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
         let DispatchCommand {
@@ -224,6 +239,7 @@ impl crate::state::ServerState {
                 params,
                 agent_ctx,
                 await_integration,
+                caller,
                 expected_authorization_precondition,
             )
             .await?;
@@ -384,6 +400,7 @@ impl crate::state::ServerState {
         params: serde_json::Value,
         agent_ctx: &AgentContext,
         await_integration: bool,
+        caller: WriteCaller,
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
         let params =
@@ -458,6 +475,7 @@ impl crate::state::ServerState {
                             params,
                             agent_ctx: enriched_agent_ctx,
                             await_integration,
+                            caller,
                             expected_authorization_precondition,
                             workflow_root_active: true,
                         })
@@ -484,6 +502,7 @@ impl crate::state::ServerState {
             params,
             agent_ctx: enriched_agent_ctx,
             await_integration,
+            caller,
             expected_authorization_precondition,
             workflow_root_active: false,
         })
@@ -504,6 +523,7 @@ impl crate::state::ServerState {
             params,
             agent_ctx: enriched_agent_ctx,
             await_integration,
+            caller,
             expected_authorization_precondition,
             workflow_root_active,
         } = steps;
@@ -613,8 +633,8 @@ impl crate::state::ServerState {
             .await;
 
         // Relation integrity, field invariants and cross-invariants hold for the
-        // record this action stores, whichever path dispatched it.
-        if self.record_constraints_declared(tenant, entity_type, action) {
+        // record an outside call's action stores.
+        if self.action_record_checked(caller, tenant, entity_type, action) {
             let current = self
                 .get_tenant_entity_state(tenant, entity_type, entity_id)
                 .await
@@ -627,6 +647,7 @@ impl crate::state::ServerState {
             if !already_applied
                 // Boxed so the preview's future does not deepen every caller's.
                 && let Err(violation) = Box::pin(self.check_action_record(
+                    caller,
                     tenant,
                     &table,
                     &current.state,
@@ -957,6 +978,8 @@ struct DispatchSteps<'a> {
     params: serde_json::Value,
     agent_ctx: AgentContext,
     await_integration: bool,
+    /// Where the action came from.
+    caller: WriteCaller,
     expected_authorization_precondition: Option<String>,
     /// The work runs in a workflow's step span.
     workflow_root_active: bool,

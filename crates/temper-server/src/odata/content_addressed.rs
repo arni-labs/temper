@@ -40,6 +40,7 @@ use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, blob_ref_value};
 use crate::request_context::extract_agent_context;
 use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
+use crate::state::write_record::WriteCaller;
 
 const EXPECTED_OBJECT_ID_HEADER: &str = "x-expected-object-id";
 
@@ -211,6 +212,7 @@ async fn ingest_raw_inner(
 
     if let Err(response) = run_write_prechecks(
         &state,
+        WriteCaller::of_request(&security_ctx),
         &tenant,
         entity_type,
         &expected_object_id,
@@ -359,6 +361,7 @@ async fn ingest_raw_inner(
     }
     if let Err(response) = run_write_prechecks(
         &state,
+        WriteCaller::of_request(&security_ctx),
         &tenant,
         entity_type,
         &expected_object_id,

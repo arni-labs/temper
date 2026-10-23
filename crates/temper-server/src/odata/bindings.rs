@@ -17,6 +17,7 @@ use crate::authz::{DenialInput, record_authz_denial};
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_denial, odata_error};
+use crate::state::write_record::WriteCaller;
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
 
 /// Notes for the request's handler span: OpenTelemetry attributes and status set
@@ -304,6 +305,7 @@ pub(super) async fn dispatch_bound_action(
                 await_integration,
                 await_reactions: true,
             },
+            WriteCaller::of_request(security_ctx),
             expected_authorization_precondition,
         )
         .await;
