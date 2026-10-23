@@ -22,8 +22,8 @@ use temper_wasm::{
 };
 
 use super::{
-    HttpCallAuthzDenialTracker, TrackingWasmAuthzGate, WasmDispatchMode, WasmDispatchRequest,
-    WasmEntityRef, record_workflow_span_attrs,
+    DispatchError, HttpCallAuthzDenialTracker, TrackingWasmAuthzGate, WasmDispatchMode,
+    WasmDispatchRequest, WasmEntityRef, record_workflow_span_attrs,
 };
 use replay_inputs::{extract_trajectory_actions_from_ots, has_replay_trajectory_input};
 
@@ -249,6 +249,32 @@ fn agent_ctx_for_composite_wasm_result(
         composite_agent_ctx.idempotency_key = Some(idempotency_key.to_string());
     }
     composite_agent_ctx
+}
+
+/// Whether a composite's sub-writes were refused, so the composite failed.
+///
+/// A refusal is Cedar denying a sub-write, a sub-write's guard or state no
+/// longer allowing it (its target has moved on), a quota, a target type
+/// with no spec, or the module's answer breaking the action's contract (a
+/// sub-write the action does not declare, or a malformed list), which is
+/// found before anything is written. The kernel checks Cedar and every guard for all sub-writes
+/// before the first write, and the atomic batch writes all or nothing, so a
+/// refusal there means none of the composite's writes landed. On the
+/// per-write path (no journal, or a sub-write with its own effects), a write
+/// refused after an earlier one applied leaves that earlier write in place.
+///
+/// Other errors, such as storage failures or a reload after the batch
+/// committed, are not refusals: the writes may have landed, so the declared
+/// `on_failure` does not run for them and the error propagates.
+fn composite_sub_writes_refused(error: &DispatchError) -> bool {
+    matches!(
+        error,
+        DispatchError::AuthzDenied(_)
+            | DispatchError::Conflict(_)
+            | DispatchError::QuotaExceeded(_)
+            | DispatchError::Ungoverned(_)
+            | DispatchError::WasmFailed(_)
+    )
 }
 
 const HTTP_CALL_AUTHZ_DENIED_PREFIX: &str = "authorization denied for http_call";
@@ -1343,16 +1369,15 @@ impl crate::state::ServerState {
                     .await;
                 }
 
+                // A composite's effect is its sub-writes, so they apply before
+                // the invocation is recorded. A refused sub-write fails the
+                // composite like any integration failure: `on_failure` runs with
+                // the reason as `error`. Any other error propagates, as before.
                 let callback_params = strip_private_observability_params(result.callback_params);
                 let composite_agent_ctx = agent_ctx_for_composite_wasm_result(
                     ctx.agent_ctx,
                     ctx.dispatch_idempotency_key,
                 );
-                // The module ran, but its composite result can still be refused (a sub-write
-                // the action does not declare, or one its target rejects). Then the
-                // integration's effect never landed: fail it like a module failure, so the
-                // declared `on_failure` runs and the invocation is recorded as failed,
-                // instead of returning early past both (ADR-0152).
                 let composite_result_consumed = match self
                     .apply_composite_integration_result(
                         ctx.entity_ref.tenant,
@@ -1365,8 +1390,7 @@ impl crate::state::ServerState {
                     .await
                 {
                     Ok(consumed) => consumed,
-                    Err(e) => {
-                        let error_str = e.to_string();
+                    Err(error) => {
                         tracing::warn!(
                             tenant = %ctx.entity_ref.tenant,
                             entity_type = ctx.entity_ref.entity_type,
@@ -1374,16 +1398,21 @@ impl crate::state::ServerState {
                             action = ctx.action,
                             integration = %integration.name,
                             module = %module_name,
-                            error = %error_str,
+                            error = %error,
                             "composite integration result refused"
                         );
+                        let recovery = if composite_sub_writes_refused(&error) {
+                            integration.on_failure.clone()
+                        } else {
+                            None
+                        };
                         return handle_wasm_failure_boxed(
                             self,
                             ctx,
                             &integration.name,
                             module_name,
-                            &integration.on_failure,
-                            error_str,
+                            &recovery,
+                            error.to_string(),
                             result.duration_ms,
                         )
                         .await;

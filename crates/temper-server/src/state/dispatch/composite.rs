@@ -132,7 +132,7 @@ impl crate::state::ServerState {
         let metadata = self
             .composite_metadata_for(tenant, entity_type, action)?
             .ok_or_else(|| {
-                DispatchError::Internal(format!(
+                DispatchError::WasmFailed(format!(
                     "Integration result for non-Composite action {entity_type}.{action} included sub_writes"
                 ))
             })?;
@@ -201,7 +201,7 @@ impl crate::state::ServerState {
                 .await?;
 
             if !response.success {
-                return Err(DispatchError::Internal(response.error.unwrap_or_else(
+                return Err(DispatchError::Conflict(response.error.unwrap_or_else(
                     || {
                         format!(
                             "composite {entity_type}.{action} sub-write {} failed",
