@@ -184,7 +184,7 @@ async fn cached_hosts_reuse_real_connections_and_keep_redirects_disabled() {
     assert_eq!(
         redirected.status(),
         307,
-        "the http_call gate checks only the first URL, so no hop may be followed"
+        "the client follows no redirect; the host follows them through the gate"
     );
     let _ = redirected.bytes().await.unwrap();
     let internal = clients

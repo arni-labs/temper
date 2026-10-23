@@ -67,6 +67,50 @@ pub fn extract_domain(url: &str) -> Option<String> {
     parsed.host_str().map(str::to_owned)
 }
 
+/// Ask `gate` whether `operation` may send `method` to the host `url` connects
+/// to. Guest calls come through here from [`AuthorizedWasmHost`]; so does every
+/// redirect hop the production host follows (`host_trait/redirects.rs`).
+pub(crate) fn authorize_outbound(
+    gate: &dyn WasmAuthzGate,
+    ctx: &WasmAuthzContext,
+    operation: &str,
+    method: &str,
+    url: &str,
+) -> Result<(), String> {
+    let Some(domain) = extract_domain(url) else {
+        tracing::warn!(
+            tenant = %ctx.tenant,
+            module = %ctx.module_name,
+            entity_type = %ctx.entity_type,
+            trigger_action = %ctx.trigger_action,
+            operation,
+            "WASM host refused an outbound URL with no host or with userinfo"
+        );
+        return Err(format!(
+            "{operation} refused: the URL must name a host and carry no userinfo"
+        ));
+    };
+    match gate.authorize_http_call(&domain, method, url, ctx) {
+        WasmAuthzDecision::Allow => Ok(()),
+        WasmAuthzDecision::Deny(reason) => {
+            tracing::warn!(
+                tenant = %ctx.tenant,
+                module = %ctx.module_name,
+                entity_type = %ctx.entity_type,
+                trigger_action = %ctx.trigger_action,
+                domain = %domain,
+                http_method = %method,
+                operation,
+                reason = %reason,
+                "WASM host authorization denied outbound HTTP call"
+            );
+            Err(format!(
+                "authorization denied for {operation} to {domain}: {reason}"
+            ))
+        }
+    }
+}
+
 /// Decorator that wraps a `WasmHost` and checks authorization before
 /// delegating to the inner host.
 ///
@@ -91,45 +135,8 @@ impl AuthorizedWasmHost {
         Self { inner, gate, ctx }
     }
 
-    /// Ask the gate whether `operation` may send `method` to the host `url`
-    /// connects to. The egress clients follow no redirects: a 3xx goes back to
-    /// the guest, and a hop it makes after one is a new call through here.
     fn authorize_http(&self, operation: &str, method: &str, url: &str) -> Result<(), String> {
-        let Some(domain) = extract_domain(url) else {
-            tracing::warn!(
-                tenant = %self.ctx.tenant,
-                module = %self.ctx.module_name,
-                entity_type = %self.ctx.entity_type,
-                trigger_action = %self.ctx.trigger_action,
-                operation,
-                "WASM host refused an outbound URL with no host or with userinfo"
-            );
-            return Err(format!(
-                "{operation} refused: the URL must name a host and carry no userinfo"
-            ));
-        };
-        match self
-            .gate
-            .authorize_http_call(&domain, method, url, &self.ctx)
-        {
-            WasmAuthzDecision::Allow => Ok(()),
-            WasmAuthzDecision::Deny(reason) => {
-                tracing::warn!(
-                    tenant = %self.ctx.tenant,
-                    module = %self.ctx.module_name,
-                    entity_type = %self.ctx.entity_type,
-                    trigger_action = %self.ctx.trigger_action,
-                    domain = %domain,
-                    http_method = %method,
-                    operation,
-                    reason = %reason,
-                    "WASM host authorization denied outbound HTTP call"
-                );
-                Err(format!(
-                    "authorization denied for {operation} to {domain}: {reason}"
-                ))
-            }
-        }
+        authorize_outbound(self.gate.as_ref(), &self.ctx, operation, method, url)
     }
 }
 

@@ -23,6 +23,7 @@ use temper_observe::wide_event::{self, EventKind, WideEvent};
 mod guest_progress;
 mod http_clients;
 mod internal_http;
+mod redirects;
 pub(crate) mod span_hints;
 
 pub use http_clients::HttpClientCache;
@@ -347,10 +348,15 @@ type TextHttpInterceptorFuture =
 
 /// Production host: real HTTP calls via reqwest, real secrets.
 pub struct ProductionWasmHost {
-    /// HTTP client for making real requests. Follows no redirects.
+    /// HTTP client for making real requests. It follows no redirects; the host
+    /// follows them, each hop checked by `redirect_gate` (`redirects.rs`).
     client: reqwest::Client,
     /// Separate pool for capability-bearing internal calls, with no proxy.
     internal_client: reqwest::Client,
+    /// The gate and context that check each redirect hop: the same pair the
+    /// wrapping `AuthorizedWasmHost` checks the guest's calls with. Without
+    /// it, a 3xx goes back to the guest.
+    redirect_gate: Option<(Arc<dyn crate::WasmAuthzGate>, crate::WasmAuthzContext)>,
     /// Secrets from env vars or a secret store.
     secrets: BTreeMap<String, String>,
     /// Optional lazy secret resolver authoritative for guest secret lookups.
@@ -601,6 +607,7 @@ impl ProductionWasmHost {
         Self {
             client: clients.client.clone(),
             internal_client: clients.internal_client.clone(),
+            redirect_gate: None,
             secrets,
             secret_resolver: None,
             internal_api_base_url: None,
@@ -680,6 +687,24 @@ impl ProductionWasmHost {
     pub fn with_text_http_interceptor(mut self, interceptor: TextHttpInterceptorFn) -> Self {
         self.text_http_interceptor = Some(interceptor);
         self
+    }
+
+    /// Follow redirects, checking each hop with the gate and context the
+    /// wrapping `AuthorizedWasmHost` uses. Pass that same pair.
+    pub fn with_redirect_gate(
+        mut self,
+        gate: Arc<dyn crate::WasmAuthzGate>,
+        ctx: crate::WasmAuthzContext,
+    ) -> Self {
+        self.redirect_gate = Some((gate, ctx));
+        self
+    }
+
+    fn redirects(&self) -> redirects::Redirects {
+        redirects::Redirects {
+            gate: self.redirect_gate.clone(),
+            internal_api_base_url: self.internal_api_base_url.clone(),
+        }
     }
 
     fn is_internal_temper_url(&self, url: &str) -> bool {
@@ -963,14 +988,20 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.body(body.to_string());
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            tracing::warn!(
-                error = %e,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "WASM host HTTP request failed"
-            );
-            format!("HTTP request failed: {e}")
-        })?;
+        let resp = self
+            .redirects()
+            .send(client, builder, "http_call")
+            .await
+            .map_err(|error| {
+                error.into_message(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "WASM host HTTP request failed"
+                    );
+                    format!("HTTP request failed: {e}")
+                })
+            })?;
         let status = resp.status().as_u16();
 
         // Loud auth failure logging for internal API calls (ADR-0043).
@@ -1264,14 +1295,20 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.body(body.to_vec());
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            tracing::warn!(
-                error = %e,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "WASM host binary HTTP request failed"
-            );
-            format!("HTTP binary request failed: {e}")
-        })?;
+        let resp = self
+            .redirects()
+            .send(client, builder, "http_call_binary")
+            .await
+            .map_err(|error| {
+                error.into_message(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "WASM host binary HTTP request failed"
+                    );
+                    format!("HTTP binary request failed: {e}")
+                })
+            })?;
         let status = resp.status().as_u16();
         let resp_bytes = resp.bytes().await.map_err(|e| {
             tracing::warn!(
@@ -1368,10 +1405,15 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.body(encode_connect_json_frame(body));
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            tracing::Span::current().record("duration_ms", started.elapsed().as_millis() as u64);
-            format!("Connect call failed: {e}")
-        })?;
+        let resp = self
+            .redirects()
+            .send(client, builder, "connect_call")
+            .await
+            .map_err(|error| {
+                tracing::Span::current()
+                    .record("duration_ms", started.elapsed().as_millis() as u64);
+                error.into_message(|e| format!("Connect call failed: {e}"))
+            })?;
 
         let status = resp.status().as_u16();
         tracing::Span::current().record("status_code", status);
@@ -1800,6 +1842,7 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.header("traceparent", traceparent);
         }
 
+        let redirects = self.redirects();
         tokio::spawn(
             async move {
                 let started = Instant::now();
@@ -1817,7 +1860,13 @@ impl WasmHost for ProductionWasmHost {
                 };
                 let req_body = reqwest::Body::wrap_stream(body_stream);
 
-                let send_result = builder.body(req_body).send().await;
+                let send_result = redirects
+                    .send(
+                        &client,
+                        builder.body(req_body),
+                        "http_stream_begin_outbound",
+                    )
+                    .await;
                 let _ = streams.close(bridge_req).await;
                 let resp = match send_result {
                     Ok(r) => r,

@@ -134,9 +134,8 @@ impl HttpClientCache {
 
 fn build_client(config: &ClientConfig, internal: bool) -> reqwest::Client {
     // The `http_call` gate checks only the URL the guest names, so neither
-    // client follows redirects: the 3xx goes back to the guest. Only the
-    // streaming API hands the guest response headers such as `Location`; any
-    // next hop is a new call the gate checks.
+    // client follows redirects on its own. The host follows them in
+    // `redirects.rs` and asks the gate about every hop first.
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(config.timeout)
