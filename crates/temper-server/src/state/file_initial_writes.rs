@@ -137,6 +137,8 @@ impl ServerState {
             timestamp: sim_now(),
             params: serde_json::json!({}),
             idempotency_key: None,
+            actor: None,
+            caused_by: None,
         };
         push_synthetic_event(&mut state, &mut events, created);
 

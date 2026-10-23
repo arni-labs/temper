@@ -39,6 +39,7 @@ use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::move_origin::record_origin;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
@@ -680,6 +681,8 @@ impl EntityActor {
                                 timestamp: env.metadata.timestamp,
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
+                                actor: None,
+                                caused_by: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -1055,6 +1058,8 @@ impl Actor for EntityActor {
                 timestamp: sim_now(),
                 params: initial_params,
                 idempotency_key: None,
+                actor: None,
+                caused_by: None,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -1087,6 +1092,7 @@ impl Actor for EntityActor {
                 related,
                 idempotency_key,
                 expected_authorization_precondition,
+                origin,
             } => {
                 // Capture start time for span duration (DST-safe: sim_now()
                 // returns logical clock in simulation, wall clock in production).
@@ -1285,6 +1291,7 @@ impl Actor for EntityActor {
                         .clone()
                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                     event.idempotency_key = idempotency_key.clone();
+                    record_origin(&mut event, origin.as_ref());
 
                     // An event too large to be written stores no overflow blobs first.
                     if !result.overflow_blobs.is_empty()
@@ -1467,6 +1474,7 @@ impl Actor for EntityActor {
                                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                                     let mut retry_event = retry_event;
                                     retry_event.idempotency_key = idempotency_key.clone();
+                                    record_origin(&mut retry_event, origin.as_ref());
 
                                     // Overflow blobs for the re-evaluated result.
                                     if !retry_result.overflow_blobs.is_empty()
@@ -1838,6 +1846,8 @@ impl Actor for EntityActor {
                     timestamp: sim_now(),
                     params: serde_json::json!({}),
                     idempotency_key: None,
+                    actor: None,
+                    caused_by: None,
                 };
 
                 if let (Some(store), Some(backend)) =

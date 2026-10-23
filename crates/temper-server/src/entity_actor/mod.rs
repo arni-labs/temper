@@ -9,6 +9,7 @@ mod actor;
 pub(crate) mod bootstrap;
 pub mod effects;
 mod field_updates;
+pub mod move_origin;
 mod replay_validation;
 pub mod sim_handler;
 mod snapshot_queue;
@@ -23,6 +24,7 @@ pub use effects::{
     ProcessResult, ScheduledAction, apply_effects, apply_new_state_fallback, build_eval_context,
     process_action, process_action_with_xref, sync_fields,
 };
+pub use move_origin::{MoveCause, MoveOrigin, STATE_TIMER_ACTOR, STATE_TIMER_AGENT_TYPE};
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
 pub use types::{EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};

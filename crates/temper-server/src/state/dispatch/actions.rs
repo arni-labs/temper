@@ -714,6 +714,7 @@ impl crate::state::ServerState {
                     idempotency_key: idempotency_key.clone(),
                     expected_authorization_precondition: authorization_precondition_for_retry
                         .clone(),
+                    origin: agent_ctx.origin.clone(),
                 },
                 &policy,
             )

@@ -48,6 +48,9 @@ pub enum EntityMsg {
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
+        /// Set when the runtime makes this move itself (a state timer):
+        /// recorded on the event as its actor and cause.
+        origin: Option<super::MoveOrigin>,
     },
     /// Get the current entity state.
     GetState,
@@ -207,6 +210,15 @@ pub struct EntityEvent {
     /// Optional idempotency key that caused this transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Who made this move, when the runtime made it itself: a state timer's
+    /// move names [`super::STATE_TIMER_ACTOR`]. Absent when the dispatch's
+    /// caller made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The move that led the runtime to make this one (for a state timer,
+    /// the move that armed it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<super::MoveCause>,
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.

@@ -133,6 +133,7 @@ async fn each_refusal_is_logged_once_for_a_create_an_action_and_a_batch() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(5),
         )

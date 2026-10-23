@@ -418,6 +418,8 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 timestamp: sim_now(),
                 params: params.clone(),
                 idempotency_key: None,
+                actor: None,
+                caused_by: None,
             };
 
             ProcessResult {

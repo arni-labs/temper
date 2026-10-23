@@ -123,16 +123,7 @@ pub(crate) async fn handle_get_entity_history(
                 .iter()
                 .filter_map(|env| serde_json::from_value::<EntityEvent>(env.payload.clone()).ok())
                 .enumerate()
-                .map(|(i, event)| {
-                    serde_json::json!({
-                        "sequence": i + 1,
-                        "action": event.action,
-                        "from_state": event.from_status,
-                        "to_state": event.to_status,
-                        "timestamp": event.timestamp,
-                        "params": event.params,
-                    })
-                })
+                .map(|(i, event)| history_event(i + 1, &event))
                 .collect();
 
             return Ok(Json(serde_json::json!({
@@ -373,16 +364,7 @@ fn format_history_response(
     let formatted: Vec<serde_json::Value> = events
         .iter()
         .enumerate()
-        .map(|(i, e)| {
-            serde_json::json!({
-                "sequence": i + 1,
-                "action": e.action,
-                "from_state": e.from_status,
-                "to_state": e.to_status,
-                "timestamp": e.timestamp,
-                "params": e.params,
-            })
-        })
+        .map(|(i, e)| history_event(i + 1, e))
         .collect();
 
     serde_json::json!({
@@ -390,6 +372,26 @@ fn format_history_response(
         "entity_id": entity_id,
         "events": formatted,
     })
+}
+
+/// One event of the history API. `actor` and `caused_by` are present when the
+/// runtime made the move itself (a state timer); a caller's move has neither.
+fn history_event(sequence: usize, event: &EntityEvent) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "sequence": sequence,
+        "action": event.action,
+        "from_state": event.from_status,
+        "to_state": event.to_status,
+        "timestamp": event.timestamp,
+        "params": event.params,
+    });
+    if let Some(actor) = &event.actor {
+        json["actor"] = serde_json::json!(actor);
+    }
+    if let Some(cause) = &event.caused_by {
+        json["caused_by"] = serde_json::json!(cause);
+    }
+    json
 }
 
 // ---------------------------------------------------------------------------
