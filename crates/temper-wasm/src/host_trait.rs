@@ -692,25 +692,6 @@ impl ProductionWasmHost {
         self
     }
 
-    /// Follow redirects, checking each hop with the gate and context the
-    /// wrapping `AuthorizedWasmHost` uses. Pass that same pair.
-    pub fn with_redirect_gate(
-        mut self,
-        gate: Arc<dyn crate::WasmAuthzGate>,
-        ctx: crate::WasmAuthzContext,
-    ) -> Self {
-        self.redirect_gate = Some((gate, ctx));
-        self
-    }
-
-    fn redirects(&self) -> redirects::Redirects {
-        redirects::Redirects {
-            gate: self.redirect_gate.clone(),
-            internal_api_base_url: self.internal_api_base_url.clone(),
-            timeout: self.http_timeout,
-        }
-    }
-
     fn is_internal_temper_url(&self, url: &str) -> bool {
         // Only the server-owned configuration can classify a target as
         // internal. A tenant secret or guest integration value must never

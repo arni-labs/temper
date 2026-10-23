@@ -14,7 +14,28 @@ use reqwest::{Method, StatusCode, Url};
 use crate::authorized_host::{WasmAuthzGate, authorize_outbound};
 use crate::types::WasmAuthzContext;
 
-use super::internal_http;
+use super::{ProductionWasmHost, internal_http};
+
+impl ProductionWasmHost {
+    /// Follow redirects, checking each hop with the gate and context the
+    /// wrapping `AuthorizedWasmHost` uses. Pass that same pair.
+    pub fn with_redirect_gate(
+        mut self,
+        gate: Arc<dyn WasmAuthzGate>,
+        ctx: WasmAuthzContext,
+    ) -> Self {
+        self.redirect_gate = Some((gate, ctx));
+        self
+    }
+
+    pub(super) fn redirects(&self) -> Redirects {
+        Redirects {
+            gate: self.redirect_gate.clone(),
+            internal_api_base_url: self.internal_api_base_url.clone(),
+            timeout: self.http_timeout,
+        }
+    }
+}
 
 /// Most redirects one call follows. A server can answer with redirects
 /// forever, and without a bound one guest call would never end. Ten is
