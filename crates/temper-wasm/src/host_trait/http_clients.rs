@@ -33,6 +33,8 @@ impl ClientConfig {
 pub(super) struct HttpClients {
     pub(super) client: reqwest::Client,
     pub(super) internal_client: reqwest::Client,
+    /// The clients' request timeout. A followed redirect chain shares it.
+    pub(super) timeout: Duration,
 }
 
 impl HttpClients {
@@ -44,6 +46,7 @@ impl HttpClients {
         Self {
             client: build_client(config, false),
             internal_client: build_client(config, true),
+            timeout: config.timeout,
         }
     }
 }

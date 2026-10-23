@@ -6,8 +6,9 @@
 //! sends it, so a 3xx can only lead to a host the guest could call directly.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use reqwest::header::{self, HeaderMap};
+use reqwest::header;
 use reqwest::{Method, StatusCode, Url};
 
 use crate::authorized_host::{WasmAuthzGate, authorize_outbound};
@@ -15,8 +16,10 @@ use crate::types::WasmAuthzContext;
 
 use super::internal_http;
 
-/// Most redirects one call follows: reqwest's own default, which is what guest
-/// calls followed before each hop went through the gate.
+/// Most redirects one call follows. A server can answer with redirects
+/// forever, and without a bound one guest call would never end. Ten is
+/// reqwest's default, which guest calls followed before each hop went through
+/// the gate.
 const REDIRECT_HOP_BUDGET: usize = 10;
 
 /// Why an outbound call ended without a response.
@@ -57,6 +60,8 @@ pub(super) struct Redirects {
     /// The internal Temper API, which redirects neither leave nor enter: its
     /// capabilities are bound to the one request the guest made.
     pub(super) internal_api_base_url: Option<String>,
+    /// The clients' request timeout, shared by the whole chain.
+    pub(super) timeout: Duration,
 }
 
 impl Redirects {
@@ -73,11 +78,13 @@ impl Redirects {
             Some((gate, ctx)) if !self.is_internal(request.url()) => (gate, ctx),
             _ => return client.execute(request).await.map_err(OutboundError::Http),
         };
+        // The chain shares one timeout, as it did when reqwest followed it.
+        let deadline = Instant::now() + self.timeout;
         let mut hop = Hop::of(&request);
         let mut response = client.execute(request).await.map_err(OutboundError::Http)?;
         let mut budget = REDIRECT_HOP_BUDGET;
         while let Some(next) = hop.next(&response) {
-            if self.is_internal(&next.url) {
+            if self.is_internal(next.request.url()) {
                 break;
             }
             if budget == 0 {
@@ -90,12 +97,12 @@ impl Redirects {
                 gate.as_ref(),
                 ctx,
                 &format!("{operation} redirect"),
-                next.method.as_str(),
-                next.url.as_str(),
+                next.request.method().as_str(),
+                next.request.url().as_str(),
             )
             .map_err(OutboundError::Refused)?;
             response = client
-                .execute(next.request())
+                .execute(next.request(deadline))
                 .await
                 .map_err(OutboundError::Http)?;
             hop = next;
@@ -113,64 +120,67 @@ impl Redirects {
 
 /// One request of a redirect chain, kept so the next hop can be built from it.
 struct Hop {
-    method: Method,
-    url: Url,
-    headers: HeaderMap,
-    /// The body, when it can be sent again.
-    body: Option<bytes::Bytes>,
-    /// The body was a stream, which cannot be sent again.
+    /// A copy of the request, sharing its body bytes. A streamed body cannot
+    /// be sent again, so the copy of a streamed request has none.
+    request: reqwest::Request,
+    /// The request's body was a stream.
     streamed: bool,
 }
 
 impl Hop {
     fn of(request: &reqwest::Request) -> Self {
-        let body = request.body().map(reqwest::Body::as_bytes);
+        if let Some(copy) = request.try_clone() {
+            return Self {
+                request: copy,
+                streamed: false,
+            };
+        }
+        let mut copy = reqwest::Request::new(request.method().clone(), request.url().clone());
+        *copy.headers_mut() = request.headers().clone();
         Self {
-            method: request.method().clone(),
-            url: request.url().clone(),
-            headers: request.headers().clone(),
-            body: body.flatten().map(bytes::Bytes::copy_from_slice),
-            streamed: body.is_some_and(|bytes| bytes.is_none()),
+            request: copy,
+            streamed: true,
         }
     }
 
-    /// The request a redirect `response` asks for, following the rules
-    /// reqwest's own policy used; `None` when it is not one to follow.
+    /// The request a redirect `response` asks for, by the rules reqwest's own
+    /// policy (tower-http's `FollowRedirect`) used; `None` when it is not one
+    /// to follow.
     fn next(&self, response: &reqwest::Response) -> Option<Self> {
-        // 301, 302 and 303 resend as GET without the body; 307 and 308 resend
-        // the request as it was, which a streamed body cannot be.
-        let keeps_request = match response.status() {
-            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER => false,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT if !self.streamed => {
-                true
+        // 301 and 302 turn a POST into a GET, and 303 everything but a HEAD;
+        // either way the body is dropped. Any other request is resent as it
+        // was, which a streamed body cannot be.
+        let previous = self.request.url();
+        let to_get = match response.status() {
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => {
+                self.request.method() == Method::POST
             }
+            StatusCode::SEE_OTHER => true,
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => false,
             _ => return None,
         };
+        if self.streamed && !to_get {
+            return None;
+        }
         let location = response.headers().get(header::LOCATION)?.to_str().ok()?;
-        let mut next = Self {
-            method: self.method.clone(),
-            url: self.url.join(location).ok()?,
-            headers: self.headers.clone(),
-            body: self.body.clone(),
-            streamed: self.streamed,
-        };
-        if !keeps_request {
-            if next.method != Method::GET && next.method != Method::HEAD {
-                next.method = Method::GET;
+        let mut next = self.copy();
+        *next.url_mut() = previous.join(location).ok()?;
+        if to_get {
+            if next.method() != Method::HEAD {
+                *next.method_mut() = Method::GET;
             }
-            next.body = None;
-            next.streamed = false;
+            *next.body_mut() = None;
             for name in [
                 header::CONTENT_TYPE,
                 header::CONTENT_LENGTH,
                 header::CONTENT_ENCODING,
                 header::TRANSFER_ENCODING,
             ] {
-                next.headers.remove(name);
+                next.headers_mut().remove(name);
             }
         }
-        if next.url.host_str() != self.url.host_str()
-            || next.url.port_or_known_default() != self.url.port_or_known_default()
+        if next.url().host_str() != previous.host_str()
+            || next.url().port_or_known_default() != previous.port_or_known_default()
         {
             for name in [
                 header::AUTHORIZATION,
@@ -178,17 +188,26 @@ impl Hop {
                 header::PROXY_AUTHORIZATION,
                 header::WWW_AUTHENTICATE,
             ] {
-                next.headers.remove(name);
+                next.headers_mut().remove(name);
             }
-            next.headers.remove("cookie2");
+            next.headers_mut().remove("cookie2");
         }
-        Some(next)
+        Some(Self {
+            request: next,
+            streamed: false,
+        })
     }
 
-    fn request(&self) -> reqwest::Request {
-        let mut request = reqwest::Request::new(self.method.clone(), self.url.clone());
-        *request.headers_mut() = self.headers.clone();
-        *request.body_mut() = self.body.clone().map(reqwest::Body::from);
+    /// The hop's request, with what is left of the chain's `deadline`.
+    fn request(&self, deadline: Instant) -> reqwest::Request {
+        let mut request = self.copy();
+        *request.timeout_mut() = Some(deadline.saturating_duration_since(Instant::now()));
         request
+    }
+
+    fn copy(&self) -> reqwest::Request {
+        self.request
+            .try_clone()
+            .expect("a kept request has no streamed body")
     }
 }

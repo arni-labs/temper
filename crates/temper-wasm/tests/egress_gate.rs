@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::Request;
@@ -56,15 +57,22 @@ fn ctx() -> WasmAuthzContext {
 /// The host chain as the server builds it: the same gate checks the guest's
 /// calls and every redirect hop.
 fn gated_host(allowed: &'static [&'static str]) -> AuthorizedWasmHost {
+    gated_host_with(allowed, ProductionWasmHost::new(BTreeMap::new()))
+}
+
+fn gated_host_with(
+    allowed: &'static [&'static str],
+    production: ProductionWasmHost,
+) -> AuthorizedWasmHost {
     let gate: Arc<dyn WasmAuthzGate> = Arc::new(HostsGate(allowed));
-    let production =
-        ProductionWasmHost::new(BTreeMap::new()).with_redirect_gate(Arc::clone(&gate), ctx());
+    let production = production.with_redirect_gate(Arc::clone(&gate), ctx());
     AuthorizedWasmHost::new(Arc::new(production), gate, ctx())
 }
 
 /// A server on 127.0.0.1 that logs `METHOD host/path auth=<bool> bytes=<n>` for
-/// every request. `/start` answers 302 to this server under the name
-/// `localhost`, `/again` 307 to `/landed`, and `/loop` 302 to itself.
+/// every request. `/start` answers 302 and `/see-other` 303 to this server
+/// under the name `localhost`, `/again` 307 to `/landed`, `/loop` 302 to
+/// itself, and `/slow/<n>` waits 400 ms and then 302 to `/slow/<n - 1>`.
 async fn logging_server() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -87,8 +95,17 @@ async fn logging_server() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
                 headers.contains_key(AUTHORIZATION),
                 body.len()
             ));
+            if let Some(left) = path.strip_prefix("/slow/") {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let left: u32 = left.parse().unwrap();
+                if left > 0 {
+                    let next = format!("/slow/{}", left - 1);
+                    return (StatusCode::FOUND, [(LOCATION, next)]).into_response();
+                }
+            }
             match path.as_str() {
                 "/start" => (StatusCode::FOUND, [(LOCATION, elsewhere)]).into_response(),
+                "/see-other" => (StatusCode::SEE_OTHER, [(LOCATION, elsewhere)]).into_response(),
                 "/again" => {
                     (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, "/landed")]).into_response()
                 }
@@ -186,8 +203,9 @@ async fn gate_checks_the_host_each_outbound_call_reaches() {
 }
 
 /// A redirect to a host the gate allows is followed, as reqwest's own policy
-/// did: 302 resends as GET without the body, 307 resends the request as it
-/// was, and credentials stay behind when the host changes.
+/// did: 301 and 302 turn only a POST into a GET, 303 turns everything into a
+/// GET, any other request is resent as it was unless its body is a stream, and
+/// credentials stay behind when the host changes.
 #[tokio::test]
 async fn redirects_to_an_allowed_host_are_followed() {
     let (address, log) = logging_server().await;
@@ -222,6 +240,18 @@ async fn redirects_to_an_allowed_host_are_followed() {
     );
 
     assert_eq!(
+        host.http_call_binary("PUT", &start, &key, b"kept").await,
+        Ok((200, b"landed".to_vec()))
+    );
+    assert_eq!(
+        take(&log),
+        [
+            format!("PUT 127.0.0.1:{port}/start auth=true bytes=4"),
+            format!("PUT localhost:{port}/landed auth=false bytes=4"),
+        ]
+    );
+
+    assert_eq!(
         host.connect_call(&start, &key, "{}").await,
         Ok(vec![r#""landed""#.to_owned()])
     );
@@ -233,20 +263,28 @@ async fn redirects_to_an_allowed_host_are_followed() {
         ]
     );
 
-    let handles = host
-        .http_stream_begin_outbound(stream_head("GET", &start))
-        .await
-        .unwrap();
-    host.http_stream_close(handles.request_body).await.unwrap();
-    let head = host
-        .http_stream_response_head(handles.response_body)
-        .await
-        .unwrap();
-    assert_eq!(head.status, 200);
+    // A streamed request body cannot be sent twice, so a 302 that keeps the
+    // method goes back to the guest; a 303 drops the body and is followed.
+    let mut statuses = Vec::new();
+    for path in ["/start", "/see-other"] {
+        let url = format!("http://{address}{path}");
+        let handles = host
+            .http_stream_begin_outbound(stream_head("GET", &url))
+            .await
+            .unwrap();
+        host.http_stream_close(handles.request_body).await.unwrap();
+        let head = host
+            .http_stream_response_head(handles.response_body)
+            .await
+            .unwrap();
+        statuses.push(head.status);
+    }
+    assert_eq!(statuses, [302, 200]);
     assert_eq!(
         take(&log),
         [
             format!("GET 127.0.0.1:{port}/start auth=true bytes=0"),
+            format!("GET 127.0.0.1:{port}/see-other auth=true bytes=0"),
             format!("GET localhost:{port}/landed auth=false bytes=0"),
         ]
     );
@@ -259,8 +297,31 @@ async fn redirects_to_an_allowed_host_are_followed() {
     assert_eq!(take(&log).len(), 11, "the first request and 10 hops");
 }
 
+/// A followed chain shares the client's one timeout, as it did when reqwest
+/// followed it: three 400 ms answers do not fit in one second.
+#[tokio::test]
+async fn a_redirect_chain_shares_one_timeout() {
+    let (address, log) = logging_server().await;
+    let production = ProductionWasmHost::with_timeout(BTreeMap::new(), Duration::from_secs(1));
+    let host = gated_host_with(&["127.0.0.1"], production);
+    let result = host
+        .http_call("GET", &format!("http://{address}/slow/2"), &[], "")
+        .await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.starts_with("HTTP request failed")),
+        "{result:?}"
+    );
+    assert_eq!(
+        take(&log).len(),
+        3,
+        "the third hop is cut off by the timeout"
+    );
+}
+
 /// A redirect to a host the gate does not allow is denied before it is sent:
-/// `/start` points at `localhost`, and nothing reaches it.
+/// `/start` and `/see-other` point at `localhost`, and nothing reaches it.
 #[tokio::test]
 async fn redirects_to_a_disallowed_host_are_denied_before_they_are_sent() {
     let (address, log) = logging_server().await;
@@ -284,8 +345,9 @@ async fn redirects_to_a_disallowed_host_are_denied_before_they_are_sent() {
         host.connect_call(&start, &[], "{}").await,
         Err(denied("connect_call"))
     );
+    let see_other = format!("http://{address}/see-other");
     let handles = host
-        .http_stream_begin_outbound(stream_head("GET", &start))
+        .http_stream_begin_outbound(stream_head("GET", &see_other))
         .await
         .unwrap();
     host.http_stream_close(handles.request_body).await.unwrap();
@@ -304,7 +366,9 @@ async fn redirects_to_a_disallowed_host_are_denied_before_they_are_sent() {
     let requests = take(&log);
     assert_eq!(requests.len(), 4, "{requests:?}");
     assert!(
-        requests.iter().all(|request| request.contains("/start ")),
+        requests
+            .iter()
+            .all(|request| !request.contains("localhost")),
         "a denied hop was sent: {requests:?}"
     );
 

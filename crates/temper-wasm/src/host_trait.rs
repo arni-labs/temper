@@ -357,6 +357,8 @@ pub struct ProductionWasmHost {
     /// wrapping `AuthorizedWasmHost` checks the guest's calls with. Without
     /// it, a 3xx goes back to the guest.
     redirect_gate: Option<(Arc<dyn crate::WasmAuthzGate>, crate::WasmAuthzContext)>,
+    /// The clients' request timeout, which a followed redirect chain shares.
+    http_timeout: std::time::Duration,
     /// Secrets from env vars or a secret store.
     secrets: BTreeMap<String, String>,
     /// Optional lazy secret resolver authoritative for guest secret lookups.
@@ -608,6 +610,7 @@ impl ProductionWasmHost {
             client: clients.client.clone(),
             internal_client: clients.internal_client.clone(),
             redirect_gate: None,
+            http_timeout: clients.timeout,
             secrets,
             secret_resolver: None,
             internal_api_base_url: None,
@@ -704,6 +707,7 @@ impl ProductionWasmHost {
         redirects::Redirects {
             gate: self.redirect_gate.clone(),
             internal_api_base_url: self.internal_api_base_url.clone(),
+            timeout: self.http_timeout,
         }
     }
 
