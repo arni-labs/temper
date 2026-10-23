@@ -310,12 +310,12 @@ pub struct StateTimeout {
     pub after_seconds: u64,
     /// Action to dispatch when the timer fires. Must be a declared action.
     pub on_timeout: String,
-    /// Maximum times the timer can fire across repeated entries into `state`.
-    /// Defaults to 1. Set higher for states entered multiple times where
-    /// each entry should receive its own budget (e.g., `Recovering` with
-    /// `max_occurrences = 3`).
-    #[serde(default = "default_one")]
-    pub max_occurrences: u32,
+    /// Has no effect. The timer is armed on every entry into `state` and
+    /// nothing counts how often it fired. The key is still accepted so specs
+    /// that set it keep loading; spec lint warns
+    /// `state_timeout_max_occurrences_ignored` when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_occurrences: Option<u32>,
     /// Actions that, when fired while in `state`, re-arm the timer from
     /// the current moment. Progress signals such as `Heartbeat` go here.
     #[serde(default)]
@@ -326,10 +326,6 @@ pub struct StateTimeout {
     /// Typically includes an `error_message` for observability.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub args: BTreeMap<String, Arg>,
-}
-
-fn default_one() -> u32 {
-    1
 }
 
 /// Admission control declaration (ADR-0051).
