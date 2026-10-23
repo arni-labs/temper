@@ -220,7 +220,9 @@ fn resource_not_found_response(set_name: &str, key: &str) -> Response {
     .into_response()
 }
 
-pub(super) async fn load_existing_entity_descriptor_body(
+/// Load one existing entity's body for an authorization decision, or `404` when
+/// the entity does not exist in the tenant.
+pub(crate) async fn load_existing_entity_descriptor_body(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
