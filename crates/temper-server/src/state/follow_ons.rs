@@ -33,13 +33,20 @@ impl PendingFollowOns {
     /// Record `key` as pending. Returns `false` when the same follow-on is
     /// already pending, so the caller does not start a second one.
     pub(crate) fn claim(&self, key: FollowOnKey) -> bool {
-        self.0.lock().unwrap().insert(key) // ci-ok: infallible lock
+        self.0
+            .lock()
+            .expect("pending follow-ons lock poisoned")
+            .insert(key)
     }
 
     /// Remove `key` as its follow-on fires, so the action may be scheduled
     /// for that record again.
     pub(crate) fn release(&self, key: &FollowOnKey) {
-        let removed = self.0.lock().unwrap().remove(key); // ci-ok: infallible lock
+        let removed = self
+            .0
+            .lock()
+            .expect("pending follow-ons lock poisoned")
+            .remove(key);
         debug_assert!(removed, "a firing follow-on was claimed when scheduled");
     }
 }
