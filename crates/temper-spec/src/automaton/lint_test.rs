@@ -102,6 +102,52 @@ from = ["Draft"]
     );
 }
 
+const TIMED_JOB: &str = r#"
+[automaton]
+name = "Job"
+states = ["Waiting", "Failed"]
+initial = "Waiting"
+
+[[action]]
+name = "TimeoutFail"
+from = ["Waiting"]
+to = "Failed"
+
+[[state_timeout]]
+state = "Waiting"
+after_seconds = 60
+on_timeout = "TimeoutFail"
+"#;
+
+#[test]
+fn max_occurrences_loads_and_is_reported_as_having_no_effect() {
+    let src = format!("{TIMED_JOB}max_occurrences = 3\n");
+    let findings = lint_automaton(&parse(&src));
+    let finding = findings
+        .iter()
+        .find(|finding| finding.code == "state_timeout_max_occurrences_ignored")
+        .expect("a set max_occurrences is reported");
+    assert_eq!(finding.severity, LintSeverity::Warning);
+    assert!(finding.message.contains("'Waiting'"), "{}", finding.message);
+}
+
+#[test]
+fn a_timeout_without_max_occurrences_is_not_reported() {
+    let findings = lint_automaton(&parse(TIMED_JOB));
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.code == "state_timeout_max_occurrences_ignored")
+    );
+}
+
+#[test]
+fn max_occurrences_zero_still_loads() {
+    // It used to be rejected as an invalid budget; it is now a key with no
+    // effect, so no value of it can make a spec fail to load.
+    parse(&format!("{TIMED_JOB}max_occurrences = 0\n"));
+}
+
 fn parse(src: &str) -> Automaton {
     parse_automaton(src).expect("parse")
 }

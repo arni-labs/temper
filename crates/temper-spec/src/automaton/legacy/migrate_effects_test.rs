@@ -271,6 +271,20 @@ fn an_unresolvable_trigger_effect_is_an_error() {
 }
 
 #[test]
+fn an_outbound_webhook_integration_is_an_error() {
+    // It used to become a kind = "webhook" trigger, which installs and never
+    // sends its request (ADR-0182).
+    let err = migrate_source(&format!(
+        "{HEADER}\n[[action]]\nname = \"Go\"\nfrom = [\"A\"]\neffect = \"trigger notify\"\n\n[[integration]]\nname = \"notify\"\ntrigger = \"notify\"\ntype = \"webhook\"\nurl = \"https://example.com/hook\"\n"
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("'notify'") && err.contains("http_fetch"),
+        "{err}"
+    );
+}
+
+#[test]
 fn item_named_actions_get_the_effects_their_name_implied() {
     let (source, notes) = migrate(
         r#"

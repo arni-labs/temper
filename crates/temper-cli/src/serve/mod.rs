@@ -175,13 +175,13 @@ pub async fn run(
         // determinism-ok: env var read at startup for configuration
         if std::env::var("BLOB_ENDPOINT").is_err() {
             let blob_url = format!("http://127.0.0.1:{port}/_internal/blobs");
-            let _ = vault.cache_platform_secret("blob_endpoint", blob_url);
+            vault.cache_platform_secret("blob_endpoint", blob_url);
         }
 
         // temper_api_url — points WASM modules at this server for TemperFS calls.
         {
             let api_url = format!("http://127.0.0.1:{port}");
-            let _ = vault.cache_platform_secret("temper_api_url", api_url);
+            vault.cache_platform_secret("temper_api_url", api_url);
         }
 
         // sandbox_url — local sandbox for tool execution.
@@ -198,7 +198,7 @@ pub async fn run(
 
                 sandbox_url
             };
-            let _ = vault.cache_platform_secret("sandbox_url", sandbox_url);
+            vault.cache_platform_secret("sandbox_url", sandbox_url);
         }
 
         // TEMPER_SECRET_<NAME> — any other secret the operator supplies. Runs
@@ -272,7 +272,7 @@ pub async fn run(
     if let Some(ref token) = discord_token_resolved {
         // Seed into vault so WASM modules can also access it.
         if let Some(ref vault) = state.server.secrets_vault {
-            let _ = vault.cache_platform_secret("discord_bot_token", token.clone());
+            vault.cache_platform_secret("discord_bot_token", token.clone());
         }
         spawn_channel_transport_discord(
             &state,
@@ -342,7 +342,7 @@ fn cache_platform_secret_if_present(
     value: Option<String>,
 ) {
     if let Some(value) = value {
-        let _ = vault.cache_platform_secret(secret_name, value);
+        vault.cache_platform_secret(secret_name, value);
     }
 }
 
