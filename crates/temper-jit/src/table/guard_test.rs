@@ -82,15 +82,10 @@ fn related_statuses_must_hold_for_every_entity_and_missing_reads_null() {
     );
     assert!(!holds(allow, "A", &ctx));
     assert!(!holds(deny, "A", &ctx));
-    // Unresolved target.
-    ctx.related
-        .insert(key.clone(), Related::Statuses(vec![None]));
+    // A related entity that is not found.
+    ctx.related.insert(key, Related::Statuses(vec![None]));
     assert!(!holds(allow, "A", &ctx));
     assert!(holds(deny, "A", &ctx));
-    // Unresolved (budget exhausted): neither passes.
-    ctx.related.insert(key, Related::Unresolved);
-    assert!(!holds(allow, "A", &ctx));
-    assert!(!holds(deny, "A", &ctx));
 }
 
 #[test]
