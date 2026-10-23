@@ -29,6 +29,9 @@ mod tests;
 #[cfg(test)]
 mod stack_tests;
 
+#[cfg(test)]
+mod identity_records_tests;
+
 /// The result of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzDecision {
@@ -826,10 +829,11 @@ impl AuthzEngine {
 pub const VERIFIED_OPERATOR_WHEN: &str = "principal has agent_type && principal.agent_type == \"operator\" && principal has agentTypeVerified && principal.agentTypeVerified == true";
 
 /// Built the built-in system-platform Cedar policy, interpolating the shared
-/// [`VERIFIED_OPERATOR_WHEN`] predicate into the four identity-entity clauses.
+/// [`VERIFIED_OPERATOR_WHEN`] predicate into its identity-entity clauses.
 /// Built-in Cedar in every [`AuthzEngine`] (ADR-0046): System's broad
 /// authority as an auditable policy instead of the old blanket bypass, and
-/// what only the platform may touch (issuers, generations, HTTP routes).
+/// what only the platform may touch (issuers, generations, agent credentials
+/// and types, HTTP routes).
 fn system_platform_policy() -> String {
     format!(
         r#"
@@ -851,6 +855,14 @@ unless {{ principal is System || principal is Admin || ({op}) }};
 @id("system-platform:protect-principal-generation")
 forbid(principal, action, resource is PrincipalGeneration)
 unless {{ principal is System || principal is Admin || ({op}) }};
+
+// The bearer resolver takes an AgentCredential and its AgentType as a verified
+// identity, so only the platform writes them. Reading them is the tenant's to decide.
+@id("system-platform:protect-agent-identity")
+forbid(principal, action, resource)
+when {{ resource is AgentCredential || resource is AgentType }}
+unless {{ principal is System || principal is Admin || ({op})
+  || action in [Action::"read", Action::"list"] }};
 
 // ADR-0069: a route reshapes the tenant's HTTP surface, so only the platform manages one.
 @id("system-platform:http-endpoint-management-permit")
