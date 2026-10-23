@@ -10,12 +10,14 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use temper_authz::SecurityContext;
 
 use super::account_verification::enforce_commons_account_verified_for_action;
+use super::authz::{BoundActionCall, authorize_undeclared_field_write};
 use super::common::run_write_prechecks;
 use super::file_content::refuse_caller_content;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_action};
 use super::response::annotate_entity;
 use crate::authz::{DenialInput, record_authz_denial};
 use crate::blobs::hydrate_blob_refs_for_tenant;
+use crate::entity_actor::undeclared_params;
 use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_denial, odata_error};
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
@@ -161,6 +163,27 @@ pub(super) async fn dispatch_bound_action(
         return odata_denial(&reason_with_id, &pd.id).into_response();
     }
 
+    // Keys the action does not declare are written into fields like a PATCH,
+    // so the caller's own update grant decides them. Enforce mode refuses
+    // them with a 400 below instead.
+    if undeclared_params::mode() == undeclared_params::Mode::Report {
+        let call = BoundActionCall {
+            entity_type,
+            entity_id: key_str,
+            action,
+            status: &current_state.state.status,
+            fields: &current_state.state.fields,
+            attrs: resource_attrs,
+            body: &body_json,
+        };
+        if let Err(response) =
+            authorize_undeclared_field_write(state, tenant, security_ctx, agent_ctx, call).await
+        {
+            action_span.set_status(Status::error("UndeclaredFieldsNeedUpdate"));
+            return response;
+        }
+    }
+
     if let Err(error) = state.check_verification_gate(tenant, entity_type) {
         action_span.set_status(Status::error("VerificationRequired"));
         return super::common::verification_gate_response(error);
@@ -256,7 +279,7 @@ pub(super) async fn dispatch_bound_action(
     // After Cedar: when enforcing, a body with params the action does not
     // declare is refused (nerdsane/temper#351).
     if let Ok(table) = state.transition_table_for_dispatch(tenant, entity_type)
-        && let Some((code, message)) = crate::entity_actor::undeclared_params::external_refusal(
+        && let Some((code, message)) = undeclared_params::external_refusal(
             &table,
             action.rsplit('.').next().unwrap_or(action),
             &resolved_body,
