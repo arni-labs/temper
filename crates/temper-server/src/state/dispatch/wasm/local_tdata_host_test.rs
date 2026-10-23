@@ -573,6 +573,9 @@ async fn allowlisted_public_tdata_calls_use_odata_handlers() {
 #[path = "local_tdata_host_test/delegation_tests.rs"]
 mod delegation_tests;
 
+#[path = "local_tdata_host_test/file_value_tests.rs"]
+mod file_value_tests;
+
 /// ARN-243 / ADR-0166. The engine reads the tenant's content decision off the
 /// host it is handed, and production hands it a three-layer stack:
 /// `AuthorizedWasmHost(LocalTDataWasmHost(ProductionWasmHost))`. Only the

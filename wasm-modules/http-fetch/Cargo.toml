@@ -7,4 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-temper-wasm-sdk = { path = "../../../crates/temper-wasm-sdk" }
+temper-wasm-sdk = { path = "../../crates/temper-wasm-sdk" }
+
+# Its own workspace, so it builds the same wherever the checkout sits.
+[workspace]

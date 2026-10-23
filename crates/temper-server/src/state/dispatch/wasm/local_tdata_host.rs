@@ -22,7 +22,9 @@ const LOCAL_TDATA_RESPONSE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// WASM host wrapper that executes loopback `/tdata` calls in-process.
 ///
 /// This is intentionally a transport optimization only: local calls still run
-/// through the same OData handlers as external HTTP traffic.
+/// through the same OData handlers as external HTTP traffic, File `$value`
+/// reads and writes included, so each call gets the Cedar decision the HTTP
+/// route makes for the same caller.
 pub(super) struct LocalTDataWasmHost {
     state: ServerState,
     authenticated: Option<AuthenticatedRequestContext>,
@@ -64,13 +66,17 @@ impl LocalTDataWasmHost {
         };
 
         let method_upper = method.to_ascii_uppercase();
-        if !matches!(method_upper.as_str(), "GET" | "POST") {
+        if !matches!(method_upper.as_str(), "GET" | "POST" | "PUT") {
             return Ok(None);
         }
         let Some(authenticated) = self.authenticated.clone() else {
             return Ok(None);
         };
-        let headers = header_map(headers);
+        let mut headers = header_map(headers);
+        if method_upper == "PUT" {
+            // The length an HTTP client would send for this body.
+            headers.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+        }
         let path_for_span = request.path.clone();
         let span = tracing::info_span!(
             "wasm.local_tdata_http_call",
@@ -98,6 +104,15 @@ impl LocalTDataWasmHost {
                     Path(request.path),
                     Query(request.query),
                     Bytes::copy_from_slice(body.as_bytes()),
+                )
+                .await
+                .into_response(),
+                "PUT" => crate::odata::handle_odata_put(
+                    State(self.state.clone()),
+                    Some(Extension(authenticated)),
+                    headers,
+                    Path(request.path),
+                    axum::extract::Request::new(axum::body::Body::from(body.to_owned())),
                 )
                 .await
                 .into_response(),
@@ -268,10 +283,6 @@ impl LocalTDataRequest {
             "/tdata" | "/tdata/" => String::new(),
             _ => raw_path.strip_prefix("/tdata/")?.to_string(),
         };
-        if is_file_value_path(&path) {
-            return None;
-        }
-
         let query = parsed
             .query_pairs()
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -290,10 +301,6 @@ fn is_local_tdata_host(host: &str, local_tdata_hosts: &BTreeSet<String>) -> bool
         return true;
     }
     local_tdata_hosts.contains(&host.to_ascii_lowercase())
-}
-
-fn is_file_value_path(path: &str) -> bool {
-    path.starts_with("Files('") && path.ends_with("')/$value")
 }
 
 fn header_map(headers: &[(String, String)]) -> HeaderMap {
