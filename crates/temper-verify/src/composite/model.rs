@@ -29,10 +29,10 @@ use temper_spec::predicate::{Env, Expr, Val, eval};
 
 use super::CompositeVerificationPlan;
 
-/// Maximum cascade depth per `next_state` call. Matches the runtime
-/// `MAX_REACTION_DEPTH` (temper-server) so the verifier bounds exactly
-/// what production also bounds.
-const MAX_TRIGGER_DEPTH: u32 = 8;
+/// Maximum cascade depth per `next_state` call: the runtime's own
+/// `MAX_REACTION_DEPTH`, so the verifier bounds exactly what production
+/// also bounds.
+const MAX_TRIGGER_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 
 /// A cross-entity reaction that was dropped because its target action was
 /// not enabled from the target entity's state at dispatch time (ADR-0150).
