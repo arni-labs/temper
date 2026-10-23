@@ -93,7 +93,15 @@ pub struct AgentContext {
 
 impl AgentContext {
     /// Admit a callback only within both the inline and cumulative budgets.
-    pub(crate) fn for_callback(&self) -> Result<Self, CallbackBudgetExceeded> {
+    ///
+    /// The callback is a new request, so it gets an idempotency key of its
+    /// own, derived from this context's key and the callback request: a retry
+    /// of the parent derives the same key, and sibling callbacks differ.
+    pub(crate) fn for_callback(
+        &self,
+        callback_action: &str,
+        callback_params: &serde_json::Value,
+    ) -> Result<Self, CallbackBudgetExceeded> {
         if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
             return Err(CallbackBudgetExceeded::InlineDepth);
         }
@@ -103,6 +111,11 @@ impl AgentContext {
         let mut next = self.clone();
         next.callback_depth += 1;
         next.callback_hops += 1;
+        next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
+            let request =
+                crate::idempotency::RequestFingerprint::new(callback_action, callback_params);
+            format!("{key}:callback:{callback_action}:{}", request.short_hex())
+        });
         Ok(next)
     }
 

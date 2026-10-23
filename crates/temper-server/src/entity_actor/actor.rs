@@ -120,6 +120,23 @@ fn duplicate_idempotency_custom_effects(
         .unwrap_or_default()
 }
 
+/// The refusal for a request sent with a key this entity already recorded for
+/// a different request (`recorded` names that request's action).
+fn idempotency_key_reused(state: &EntityState, recorded: &str) -> EntityResponse {
+    EntityResponse {
+        success: false,
+        state: state.clone(),
+        error: Some(format!(
+            "this Idempotency-Key was already used on this entity for a different request \
+             (action `{recorded}`); send a new key for a new request"
+        )),
+        custom_effects: vec![],
+        scheduled_actions: vec![],
+        spawn_requests: vec![],
+        spec_governed: true,
+    }
+}
+
 /// The entity actor -- processes actions through a TransitionTable.
 /// Optionally persists events to the configured backend. Wide events are emitted
 /// via the OTEL SDK (no-op when OTEL is not initialised).
@@ -1131,25 +1148,56 @@ impl Actor for EntityActor {
                 // execute. Here we consult the shared cache keyed on the
                 // caller's `Idempotency-Key` before executing; on a hit, the
                 // previously-computed response is returned as the reply.
+                //
+                // A key answers only a retry of the request it was first used
+                // for: the cache compares the whole request (action and
+                // parameters), the durable key set the action. Anything else
+                // sent with the key is refused, so it can never report another
+                // request's success as its own.
                 let actor_key = self.persistence_id();
-                if let (Some(key), Some(cache)) =
-                    (idempotency_key.as_ref(), self.idempotency_cache.as_ref())
-                    && let Some(cached) = cache.get(&actor_key, key)
-                {
-                    // The cache keeps replies without event parameters or the
-                    // durable key set; the live state is the reply's state in
-                    // full only while this retry's own event is still newest.
-                    let newest_is_this_retry =
-                        crate::idempotency::live_state_is_the_reply(state, &cached.state, key);
-                    let reply = if newest_is_this_retry {
-                        EntityResponse {
-                            state: state.clone(),
-                            ..cached
+                let request = idempotency_key
+                    .as_ref()
+                    .map(|_| crate::idempotency::RequestFingerprint::new(&name, &params));
+                if let (Some(key), Some(request), Some(cache)) = (
+                    idempotency_key.as_ref(),
+                    request.as_ref(),
+                    self.idempotency_cache.as_ref(),
+                ) {
+                    match cache.get(&actor_key, key, request) {
+                        crate::idempotency::CachedReply::Replay(cached) => {
+                            // The cache keeps replies without event parameters
+                            // or the durable key set; the live state is the
+                            // reply's state in full only while this retry's own
+                            // event is still newest.
+                            let newest_is_this_retry = crate::idempotency::live_state_is_the_reply(
+                                state,
+                                &cached.state,
+                                key,
+                            );
+                            let reply = if newest_is_this_retry {
+                                EntityResponse {
+                                    state: state.clone(),
+                                    ..cached
+                                }
+                            } else {
+                                cached
+                            };
+                            ctx.reply(reply);
+                            return Ok(());
                         }
-                    } else {
-                        cached
-                    };
-                    ctx.reply(reply);
+                        crate::idempotency::CachedReply::OtherRequest(recorded) => {
+                            ctx.reply(idempotency_key_reused(state, &recorded));
+                            return Ok(());
+                        }
+                        crate::idempotency::CachedReply::Miss => {}
+                    }
+                }
+                if let Some(key) = idempotency_key.as_deref()
+                    && let Some(recorded) = state.processed_idempotency_keys.get(key)
+                    && !recorded.was_for(&name)
+                {
+                    let recorded = recorded.action.clone().unwrap_or_default();
+                    ctx.reply(idempotency_key_reused(state, &recorded));
                     return Ok(());
                 }
                 if let Some(key) = idempotency_key.as_deref()
@@ -1697,10 +1745,12 @@ impl Actor for EntityActor {
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
                     // the cached value instead of re-executing.
-                    if let (Some(key), Some(cache)) =
-                        (idempotency_key.as_ref(), self.idempotency_cache.as_ref())
-                    {
-                        cache.put(&actor_key, key, &response);
+                    if let (Some(key), Some(request), Some(cache)) = (
+                        idempotency_key.as_ref(),
+                        request.as_ref(),
+                        self.idempotency_cache.as_ref(),
+                    ) {
+                        cache.put(&actor_key, key, request, &response);
                     }
                     ctx.reply(response);
                 } else {

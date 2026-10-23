@@ -866,14 +866,34 @@ impl crate::state::ServerState {
             action_params: &action_params,
             await_integration,
         };
-        let response = self.run_post_dispatch_effects(&ctx, response).await;
-        if response.success
-            && let Some(ref idem_key) = idempotency_key
-        {
-            let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-            self.idempotency_cache
-                .mark_effects_applied(&actor_key, idem_key);
-        }
+        // A successful reply's effects run once per key: a retry that reaches
+        // the actor while another dispatcher runs them waits and answers with
+        // that dispatcher's reply, and a retry after they ran does not run
+        // them again.
+        let response = match idempotency_key.as_deref() {
+            Some(idem_key) if response.success => {
+                let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+                match self
+                    .idempotency_cache
+                    .claim_effects(&actor_key, idem_key)
+                    .await
+                {
+                    crate::idempotency::EffectsClaim::Applied(completed) => {
+                        completed.unwrap_or(response)
+                    }
+                    crate::idempotency::EffectsClaim::Owner(owner) => {
+                        let response = self.run_post_dispatch_effects(&ctx, response).await;
+                        if response.success {
+                            let request =
+                                crate::idempotency::RequestFingerprint::new(action, &action_params);
+                            owner.complete(&request, &response);
+                        }
+                        response
+                    }
+                }
+            }
+            _ => self.run_post_dispatch_effects(&ctx, response).await,
+        };
         if response.success {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }

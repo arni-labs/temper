@@ -109,16 +109,62 @@ pub struct EntityState {
     /// Current event sourcing sequence number (for persistence).
     #[serde(default)]
     pub sequence_nr: u64,
-    /// Idempotency keys that have already produced durable events.
+    /// Idempotency keys that have already produced durable events, with the
+    /// action each was used for.
     ///
     /// Rebuilt from [`EntityEvent::idempotency_key`] during replay so a retry
     /// after process restart can return success without re-applying the action.
     #[serde(default)]
-    pub processed_idempotency_keys: BTreeMap<String, u64>,
+    pub processed_idempotency_keys: BTreeMap<String, ProcessedIdempotencyKey>,
     /// When the current status began, and when each action last ran since.
     /// Kept in snapshots, which leave `events` out.
     #[serde(default)]
     pub status_clock: StatusClock,
+}
+
+/// A durable idempotency key: when it was recorded and the action it was for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredIdempotencyKey")]
+pub struct ProcessedIdempotencyKey {
+    /// Sequence position when the key was recorded; the oldest goes first.
+    pub sequence: u64,
+    /// The action the key was used for. `None` for a key restored from a
+    /// snapshot written before actions were kept with keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+impl ProcessedIdempotencyKey {
+    /// Whether a request for `action` is a retry of the one this key recorded.
+    pub fn was_for(&self, action: &str) -> bool {
+        self.action
+            .as_deref()
+            .is_none_or(|recorded| recorded == action)
+    }
+}
+
+/// How a durable key is stored: a bare sequence in older snapshots.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredIdempotencyKey {
+    Recorded {
+        sequence: u64,
+        #[serde(default)]
+        action: Option<String>,
+    },
+    Sequence(u64),
+}
+
+impl From<StoredIdempotencyKey> for ProcessedIdempotencyKey {
+    fn from(stored: StoredIdempotencyKey) -> Self {
+        match stored {
+            StoredIdempotencyKey::Recorded { sequence, action } => Self { sequence, action },
+            StoredIdempotencyKey::Sequence(sequence) => Self {
+                sequence,
+                action: None,
+            },
+        }
+    }
 }
 
 /// When an entity's current status began, and when each action was last
@@ -157,7 +203,7 @@ impl EntityState {
         self.total_event_count = self.total_event_count.saturating_add(1);
         self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
         if let Some(key) = event.idempotency_key.as_deref() {
-            self.record_processed_idempotency_key(key);
+            self.record_processed_idempotency_key(key, &event.action);
         }
         self.status_clock.record(&event);
         self.events.push_back(event);
@@ -168,20 +214,26 @@ impl EntityState {
         }
     }
 
+    /// Whether `key` has already produced a durable event on this entity.
     pub fn has_processed_idempotency_key(&self, key: &str) -> bool {
         self.processed_idempotency_keys.contains_key(key)
     }
 
-    fn record_processed_idempotency_key(&mut self, key: &str) {
+    fn record_processed_idempotency_key(&mut self, key: &str, action: &str) {
         let sequence = self.sequence_nr.max(self.total_event_count as u64);
-        self.processed_idempotency_keys
-            .insert(key.to_string(), sequence);
+        self.processed_idempotency_keys.insert(
+            key.to_string(),
+            ProcessedIdempotencyKey {
+                sequence,
+                action: Some(action.to_string()),
+            },
+        );
 
         while self.processed_idempotency_keys.len() > MAX_DURABLE_IDEMPOTENCY_KEYS_PER_ENTITY {
             let Some(oldest_key) = self
                 .processed_idempotency_keys
                 .iter()
-                .min_by_key(|(_, sequence)| **sequence)
+                .min_by_key(|(_, recorded)| recorded.sequence)
                 .map(|(key, _)| key.clone())
             else {
                 break;
@@ -292,6 +344,38 @@ mod tests {
         assert_eq!(state.events_since_snapshot, 0);
         assert_eq!(state.last_snapshot_sequence_nr, 0);
         assert_eq!(state.sequence_nr, 0);
+    }
+
+    #[test]
+    fn durable_keys_keep_their_action_and_older_snapshots_still_load() {
+        let json = json!({
+            "entity_type": "Task",
+            "entity_id": "task-1",
+            "status": "Open",
+            "item_count": 0,
+            "fields": {},
+            "processed_idempotency_keys": {
+                "older": 3,
+                "newer": { "sequence": 4, "action": "Note" }
+            },
+        });
+        let state: EntityState = serde_json::from_value(json).unwrap();
+        let older = &state.processed_idempotency_keys["older"];
+        assert_eq!((older.sequence, older.action.as_deref()), (3, None));
+        assert!(
+            older.was_for("Close"),
+            "an older key has no action to compare"
+        );
+        let newer = &state.processed_idempotency_keys["newer"];
+        assert!(newer.was_for("Note"));
+        assert!(!newer.was_for("Close"));
+
+        let round_trip: EntityState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.processed_idempotency_keys,
+            state.processed_idempotency_keys
+        );
     }
 
     #[test]

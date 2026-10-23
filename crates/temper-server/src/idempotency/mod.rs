@@ -1,7 +1,9 @@
 //! Idempotency cache for deduplicating agent retries.
 //!
 //! Recent `Idempotency-Key` → `EntityResponse` replies, kept per entity actor.
-//! Entries expire after `IDEMPOTENCY_TTL_SECS`.
+//! Entries expire after `IDEMPOTENCY_TTL_SECS`. Each reply remembers the
+//! request it answered ([`RequestFingerprint`]): a key answers only a retry of
+//! that request, never a different action or body sent with the same key.
 //!
 //! Every dispatched action carries a key, so every write adds a reply. The
 //! cache is therefore bounded by the bytes it holds across all actors
@@ -20,6 +22,12 @@ use temper_runtime::scheduler::sim_now;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 
+mod effects;
+mod request;
+
+pub use effects::{EffectsClaim, EffectsOwner};
+pub use request::RequestFingerprint;
+
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).
 pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
 
@@ -34,6 +42,8 @@ const VALUE_OVERHEAD_BYTES: usize = 32;
 
 /// A cached idempotent response.
 struct IdempotencyEntry {
+    /// The request this reply answered.
+    request: RequestFingerprint,
     /// The cached response to return on duplicate requests.
     response: EntityResponse,
     /// When this entry was created (for TTL eviction).
@@ -133,6 +143,18 @@ fn is_expired(entry: &IdempotencyEntry, now: chrono::DateTime<chrono::Utc>) -> b
 pub struct IdempotencyCache {
     entries: RwLock<Entries>,
     budget_bytes: usize,
+    effects_owners: effects::EffectsOwners,
+}
+
+/// What the cache holds for a key, compared with the request now using it.
+#[derive(Debug)]
+pub enum CachedReply {
+    /// The same request: answer it with this reply.
+    Replay(EntityResponse),
+    /// The key answered a different request, which named this action.
+    OtherRequest(String),
+    /// Nothing is cached for the key.
+    Miss,
 }
 
 impl IdempotencyCache {
@@ -146,6 +168,7 @@ impl IdempotencyCache {
         Self {
             entries: RwLock::new(Entries::default()),
             budget_bytes,
+            effects_owners: effects::EffectsOwners::default(),
         }
     }
 
@@ -157,84 +180,96 @@ impl IdempotencyCache {
         }
     }
 
-    /// Look up a cached response. Returns `None` if not found or expired.
-    pub fn get(&self, actor_key: &str, idem_key: &str) -> Option<EntityResponse> {
+    /// Look up the reply cached for `idem_key`, compared with `request`.
+    pub fn get(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        request: &RequestFingerprint,
+    ) -> CachedReply {
+        self.with_entry(actor_key, idem_key, |entry| {
+            if entry.request == *request {
+                CachedReply::Replay(entry.response.clone())
+            } else {
+                CachedReply::OtherRequest(entry.request.action().to_string())
+            }
+        })
+        .unwrap_or(CachedReply::Miss)
+    }
+
+    /// The reply for a retry of `request`, only once its post-dispatch
+    /// effects have run.
+    ///
+    /// HTTP/OData callers use this stricter lookup so a retry after a dropped
+    /// actor reply re-enters dispatch and fires effects instead of short-
+    /// circuiting at the protocol boundary. A different request sent with the
+    /// key also goes on to dispatch, where the actor refuses it.
+    pub fn get_after_effects_applied(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        request: &RequestFingerprint,
+    ) -> Option<EntityResponse> {
+        self.with_entry(actor_key, idem_key, |entry| {
+            (entry.effects_applied && entry.request == *request).then(|| entry.response.clone())
+        })
+        .flatten()
+    }
+
+    /// The cached reply for `idem_key` once its post-dispatch effects have run.
+    fn applied_reply(&self, actor_key: &str, idem_key: &str) -> Option<EntityResponse> {
+        self.with_entry(actor_key, idem_key, |entry| {
+            entry.effects_applied.then(|| entry.response.clone())
+        })
+        .flatten()
+    }
+
+    /// Read the live (unexpired) entry for `idem_key`.
+    fn with_entry<T>(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        read: impl FnOnce(&IdempotencyEntry) -> T,
+    ) -> Option<T> {
         let now = sim_now();
         let entries = match self.entries.read() {
             Ok(entries) => entries,
             Err(poisoned) => poisoned.into_inner(),
         };
         let entry = entries.by_actor.get(actor_key)?.get(idem_key)?;
-        if is_expired(entry, now) {
-            return None;
-        }
-
-        Some(entry.response.clone())
-    }
-
-    /// Look up a cached response only after post-dispatch effects have run.
-    ///
-    /// HTTP/OData callers use this stricter lookup so a retry after a dropped
-    /// actor reply re-enters dispatch and fires effects instead of short-
-    /// circuiting at the protocol boundary.
-    pub fn get_after_effects_applied(
-        &self,
-        actor_key: &str,
-        idem_key: &str,
-    ) -> Option<EntityResponse> {
-        let now = sim_now();
-        let entries = self.entries.read().unwrap(); // ci-ok: infallible lock
-        let entry = entries.by_actor.get(actor_key)?.get(idem_key)?;
-        if is_expired(entry, now) || !entry.effects_applied {
-            return None;
-        }
-
-        Some(entry.response.clone())
+        (!is_expired(entry, now)).then(|| read(entry))
     }
 
     /// Cache a response for a given actor and idempotency key.
     ///
     /// Keeps a copy without event parameters or the durable key set. When
     /// the cache is over budget, replies are evicted (see the module docs).
-    pub fn put(&self, actor_key: &str, idem_key: &str, response: &EntityResponse) {
-        self.put_with_effects_applied(actor_key, idem_key, response, false);
+    pub fn put(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        request: &RequestFingerprint,
+        response: &EntityResponse,
+    ) {
+        self.put_with_effects_applied(actor_key, idem_key, request, response, false);
     }
 
     /// Cache a response whose post-dispatch effects are known to be complete.
-    pub fn put_effects_applied(&self, actor_key: &str, idem_key: &str, response: &EntityResponse) {
-        self.put_with_effects_applied(actor_key, idem_key, response, true);
-    }
-
-    /// Mark a cached response as having completed post-dispatch effects.
-    pub fn mark_effects_applied(&self, actor_key: &str, idem_key: &str) -> bool {
-        let now = sim_now();
-        let mut entries = match self.entries.write() {
-            Ok(entries) => entries,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let Some(entry) = entries
-            .by_actor
-            .get_mut(actor_key)
-            .and_then(|actor_entries| actor_entries.get_mut(idem_key))
-        else {
-            return false;
-        };
-        if is_expired(entry, now) {
-            return false;
-        }
-
-        entry.effects_applied = true;
-        let seq = entry.seq;
-        if let Some(keys) = entries.pending.remove(&seq) {
-            entries.applied.insert(seq, keys);
-        }
-        true
+    pub fn put_effects_applied(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        request: &RequestFingerprint,
+        response: &EntityResponse,
+    ) {
+        self.put_with_effects_applied(actor_key, idem_key, request, response, true);
     }
 
     fn put_with_effects_applied(
         &self,
         actor_key: &str,
         idem_key: &str,
+        request: &RequestFingerprint,
         response: &EntityResponse,
         effects_applied: bool,
     ) {
@@ -269,6 +304,7 @@ impl IdempotencyCache {
             .insert(
                 idem_key.to_string(),
                 IdempotencyEntry {
+                    request: request.clone(),
                     response,
                     created_at: now,
                     effects_applied,

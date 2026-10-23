@@ -291,9 +291,11 @@ pub(super) async fn dispatch_bound_action(
     // Idempotency cache check
     let actor_key = idempotency_actor_key(tenant, entity_type, key_str);
     if let Some(ref idem_key) = idempotency_key
-        && let Some(cached) = state
-            .idempotency_cache
-            .get_after_effects_applied(&actor_key, idem_key)
+        && let Some(cached) = state.idempotency_cache.get_after_effects_applied(
+            &actor_key,
+            idem_key,
+            &crate::idempotency::RequestFingerprint::new(action, &resolved_body),
+        )
     {
         let body = annotate_entity(
             serde_json::to_value(&cached.state).unwrap_or_default(),
@@ -328,13 +330,7 @@ pub(super) async fn dispatch_bound_action(
     match result {
         Ok(response) => {
             if response.success {
-                // Cache for idempotency
-                if let Some(ref idem_key) = idempotency_key {
-                    state
-                        .idempotency_cache
-                        .put_effects_applied(&actor_key, idem_key, &response);
-                }
-
+                // Dispatch has cached this reply for the key once its effects ran.
                 action_span.set_status(Status::Ok);
 
                 let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
