@@ -15,7 +15,7 @@ use super::{
     RegistryAppRef, parse_registry_app_ref,
 };
 
-const MAX_GENESIS_BUNDLE_FILES: usize = 4096;
+pub(super) const MAX_GENESIS_BUNDLE_FILES: usize = 4096;
 pub(super) const MAX_GENESIS_BUNDLE_APPS: usize = 256;
 pub(super) const MAX_GENESIS_BUNDLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 // Raised from 64 MiB. A real app closure did not fit: dsf-factory alone is
@@ -25,7 +25,7 @@ pub(super) const MAX_GENESIS_BUNDLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 // the platform's own apps already exceed, so give it room while keeping it
 // finite. Per-file (16 MiB) and file-count (4096) limits are unchanged and are
 // what actually catch a runaway publish.
-const MAX_GENESIS_BUNDLE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_GENESIS_BUNDLE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GENESIS_TREE_OBJECTS: usize = 8192;
 const MAX_GENESIS_TREE_ENTRIES: usize = 16_384;
 const MAX_GENESIS_TREE_DEPTH: usize = 128;

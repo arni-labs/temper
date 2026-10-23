@@ -110,14 +110,6 @@ pub struct ScheduleAtRequest {
     pub field: String,
 }
 
-/// Maximum cross-entity lookups per transition (TigerStyle budget).
-///
-/// Rich contracts may legitimately verify several sibling entities in one
-/// guarded transition.
-pub const MAX_CROSS_ENTITY_LOOKUPS: usize = 16;
-/// Maximum entity spawns per transition (TigerStyle budget).
-pub const MAX_SPAWNS_PER_TRANSITION: usize = 8;
-
 /// Build an [`EvalContext`] from current entity state, for the guards of
 /// `action` (or every action, for `None`).
 ///
@@ -1444,7 +1436,7 @@ guard = "empty(test_wf_id) || TestWorkflow[test_wf_id].status in ['Passed']"
     }
 
     #[test]
-    fn cross_entity_budget_covers_multi_entity_guard_contract() {
+    fn multi_entity_guard_passes_when_every_related_entity_is_ready() {
         let _guard = temper_runtime::scheduler::install_deterministic_context(42);
 
         let spec = r#"
@@ -1496,12 +1488,6 @@ guard = "(empty(attachment_a_id) || Attachment[attachment_a_id].status in ['Read
                 )
             })
             .collect();
-        let required_guard_lookup_count = xref.len();
-        assert!(
-            MAX_CROSS_ENTITY_LOOKUPS >= required_guard_lookup_count,
-            "multi-entity guards need at least {required_guard_lookup_count} cross-entity lookups"
-        );
-
         let result =
             process_action_with_xref(&mut state, &table, "Submit", &serde_json::json!({}), &xref);
 

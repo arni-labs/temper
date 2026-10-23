@@ -19,7 +19,8 @@ use super::types::{MAX_REACTION_DEPTH, ReactionResult};
 /// Async reaction dispatcher for production use.
 ///
 /// Holds a shared [`ReactionRegistry`] and dispatches target actions through
-/// the server state. Cascade is bounded by [`MAX_REACTION_DEPTH`].
+/// the server state. Cascade is bounded by [`MAX_REACTION_DEPTH`]; a reaction
+/// past it is reported, not dropped.
 pub struct ReactionDispatcher {
     registry: Arc<ReactionRegistry>,
 }
@@ -49,6 +50,7 @@ impl ReactionDispatcher {
         reaction.target_resolve_error_count = tracing::field::Empty,
         reaction.authz_denied_count = tracing::field::Empty,
         reaction.dispatch_error_count = tracing::field::Empty,
+        reaction.depth_stopped_count = tracing::field::Empty,
         reaction.success_count = tracing::field::Empty,
         reaction.result_count = tracing::field::Empty,
     ))]
@@ -64,18 +66,6 @@ impl ReactionDispatcher {
         depth: u32,
         invoking_ctx: &AgentContext,
     ) -> Vec<ReactionResult> {
-        if depth >= MAX_REACTION_DEPTH {
-            record_reaction_fanout_span(ReactionFanoutCounts::default());
-            tracing::warn!(
-                tenant = %tenant,
-                entity_type,
-                action,
-                depth,
-                "Reaction cascade depth limit reached ({MAX_REACTION_DEPTH})"
-            );
-            return Vec::new();
-        }
-
         let rules: Vec<_> = self
             .registry
             .lookup(tenant, entity_type, action, to_state)
@@ -94,6 +84,7 @@ impl ReactionDispatcher {
         let mut target_resolve_error_count = 0usize;
         let mut authz_denied_count = 0usize;
         let mut dispatch_error_count = 0usize;
+        let mut depth_stopped_count = 0usize;
         let mut success_count = 0usize;
         let mut results = Vec::new();
 
@@ -140,6 +131,22 @@ impl ReactionDispatcher {
                         continue;
                     }
                 };
+
+            if depth >= MAX_REACTION_DEPTH {
+                depth_stopped_count += 1;
+                CascadeStop {
+                    tenant,
+                    entity_type,
+                    entity_id,
+                    action,
+                    rule: &rule,
+                    target_entity_id: &target_entity_id,
+                    depth,
+                }
+                .record(state);
+                results.push(ReactionResult::stopped_at_depth(&rule.name, depth));
+                continue;
+            }
 
             tracing::info!(
                 rule = rule.name,
@@ -300,6 +307,7 @@ impl ReactionDispatcher {
             target_resolve_error_count,
             authz_denied_count,
             dispatch_error_count,
+            depth_stopped_count,
             success_count,
             result_count: results.len(),
         });
@@ -316,6 +324,7 @@ struct ReactionFanoutCounts {
     target_resolve_error_count: usize,
     authz_denied_count: usize,
     dispatch_error_count: usize,
+    depth_stopped_count: usize,
     success_count: usize,
     result_count: usize,
 }
@@ -331,8 +340,60 @@ fn record_reaction_fanout_span(counts: ReactionFanoutCounts) {
     );
     span.record("reaction.authz_denied_count", counts.authz_denied_count);
     span.record("reaction.dispatch_error_count", counts.dispatch_error_count);
+    span.record("reaction.depth_stopped_count", counts.depth_stopped_count);
     span.record("reaction.success_count", counts.success_count);
     span.record("reaction.result_count", counts.result_count);
+}
+
+/// A reaction that was not run because its chain reached
+/// [`MAX_REACTION_DEPTH`], on the entity whose action would have fired it.
+struct CascadeStop<'a> {
+    tenant: &'a TenantId,
+    entity_type: &'a str,
+    entity_id: &'a str,
+    action: &'a str,
+    rule: &'a super::types::ReactionRule,
+    target_entity_id: &'a str,
+    depth: u32,
+}
+
+impl CascadeStop<'_> {
+    /// Say so on the source entity's observe stream, where the app and its
+    /// agents watch it, as well as in the log.
+    fn record(self, state: &crate::ServerState) {
+        let seq = state.next_entity_event_sequence(
+            self.tenant.as_str(),
+            self.entity_type,
+            self.entity_id,
+        );
+        state.record_entity_observe_event_with_seq(
+            self.tenant.as_str(),
+            self.entity_type,
+            self.entity_id,
+            seq,
+            "reaction_cascade_stopped",
+            serde_json::json!({
+                "action": self.action,
+                "rule": self.rule.name,
+                "target_entity_type": self.rule.then.entity_type,
+                "target_entity_id": self.target_entity_id,
+                "target_action": self.rule.then.action,
+                "depth": self.depth,
+                "max_depth": MAX_REACTION_DEPTH,
+            }),
+        );
+        tracing::warn!(
+            tenant = %self.tenant,
+            entity_type = self.entity_type,
+            entity_id = self.entity_id,
+            action = self.action,
+            rule = self.rule.name,
+            target_entity = %self.rule.then.entity_type,
+            target_id = self.target_entity_id,
+            depth = self.depth,
+            "reaction not run: the chain reached {MAX_REACTION_DEPTH} reactions"
+        );
+    }
 }
 
 // Target resolver logic consolidated in super::resolver::resolve_target_id.
@@ -420,3 +481,7 @@ fn effective_trigger_security_context(agent_ctx: &AgentContext) -> SecurityConte
     );
     security_ctx
 }
+
+#[cfg(test)]
+#[path = "dispatcher_test.rs"]
+mod tests;
