@@ -17,8 +17,7 @@ use temper_wasm::host_trait::clamp_redacted_metadata_value;
 use temper_wasm::{
     AuthorizedWasmHost, BinaryHttpInterceptorFn, InternalHttpCapability,
     InternalHttpCapabilityIssuerFn, ProductionWasmHost, ProgressEmitterFn, StreamRegistry,
-    WasmAuthzContext, WasmAuthzGate, WasmHost, WasmInvocationContext,
-    WasmResourceLimits,
+    WasmAuthzContext, WasmAuthzGate, WasmHost, WasmInvocationContext, WasmResourceLimits,
 };
 
 use super::{

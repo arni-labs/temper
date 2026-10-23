@@ -596,7 +596,11 @@ async fn a_files_content_hash_is_only_ever_the_hash_of_bytes_sent_to_it() {
         )
         .await
         .expect("respond");
-    assert_ne!(copy_read.status(), StatusCode::OK, "no bytes were sent to fl-copy");
+    assert_ne!(
+        copy_read.status(),
+        StatusCode::OK,
+        "no bytes were sent to fl-copy"
+    );
 
     // Neither a create nor a PATCH nor a PUT writes what the bytes decide.
     for (verb, uri, body) in [

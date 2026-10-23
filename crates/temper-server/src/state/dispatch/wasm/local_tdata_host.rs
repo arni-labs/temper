@@ -75,7 +75,10 @@ impl LocalTDataWasmHost {
         let mut headers = header_map(headers);
         if method_upper == "PUT" {
             // The length an HTTP client would send for this body.
-            headers.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+            headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                HeaderValue::from(body.len()),
+            );
         }
         let path_for_span = request.path.clone();
         let span = tracing::info_span!(

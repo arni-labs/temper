@@ -2,7 +2,9 @@
 //! the Cedar decision the same caller's HTTP request gets: read for GET, update for PUT.
 
 use super::*;
-use crate::registry::{EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus};
+use crate::registry::{
+    EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
+};
 use crate::request_context::AgentContext;
 use crate::storage::StorageStack;
 

@@ -109,7 +109,8 @@ async fn run(ctx: &WasmInvocationContext) -> (temper_wasm::WasmInvocationResult,
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_request_goes_to_the_configured_url_whatever_the_params_and_fields_name() {
-    let elsewhere = serde_json::json!({ "url": "http://127.0.0.2:9/other", "method": "PUT", "headers": "[]" });
+    let elsewhere =
+        serde_json::json!({ "url": "http://127.0.0.2:9/other", "method": "PUT", "headers": "[]" });
     let ctx = context(
         &[("url", "http://127.0.0.1:9/configured"), ("method", "POST")],
         serde_json::json!({
@@ -129,7 +130,10 @@ async fn the_request_goes_to_the_configured_url_whatever_the_params_and_fields_n
     // The params are the request body, as sent.
     let body: serde_json::Value = serde_json::from_str(&sent[0].body).expect("JSON body");
     assert_eq!(body, ctx.trigger_params);
-    assert_eq!(result.callback_params["response"], serde_json::json!({ "ok": true }));
+    assert_eq!(
+        result.callback_params["response"],
+        serde_json::json!({ "ok": true })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
