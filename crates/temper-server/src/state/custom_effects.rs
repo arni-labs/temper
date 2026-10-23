@@ -11,7 +11,8 @@
 /// Handler for custom effects triggered by entity state machine transitions.
 ///
 /// Implementations registered on [`ServerState::custom_effect_handler`] are
-/// called by the post-dispatch effects pipeline for every custom effect name.
+/// called by the post-dispatch effects pipeline for each custom effect of a
+/// temper-system entity. Entities in other tenants never reach the handler.
 pub trait CustomEffectHandler: Send + Sync {
     /// Handle a custom effect.
     ///
