@@ -728,7 +728,15 @@ impl ProductionWasmHost {
         let headers = if is_internal {
             internal_http::sanitize_internal_headers(headers)
         } else {
-            headers.to_vec()
+            // The `http_call` gate checked the URL's host, and the request
+            // connects there. A guest `Host` header could still make a shared
+            // front end (a CDN, a proxy) route it to another site, so the
+            // client sets `Host` from the URL instead.
+            headers
+                .iter()
+                .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
+                .cloned()
+                .collect()
         };
         (is_internal, headers)
     }
