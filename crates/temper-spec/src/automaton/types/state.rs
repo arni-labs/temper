@@ -208,12 +208,18 @@ pub enum ActionParam {
     },
 }
 
-/// Authenticated runtime values available to declared action parameters.
+/// Runtime values available to declared action parameters. These are the
+/// accepted `source` names; a caller can supply none of them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ParameterSource {
-    /// Verified delegated subject when present, otherwise the principal ID.
+    /// `authenticated_subject`: the verified delegated subject when present,
+    /// otherwise the principal ID.
     AuthenticatedSubject,
+    /// `dispatched_at`: when the runtime dispatched the action, as RFC 3339
+    /// UTC with milliseconds (`2026-10-23T12:34:56.789Z`). Set on every
+    /// dispatch, whoever makes it, a state timer's included.
+    DispatchedAt,
 }
 
 #[derive(Deserialize)]
