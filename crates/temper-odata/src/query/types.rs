@@ -317,13 +317,40 @@ fn parse_orderby(value: &str) -> Result<Vec<OrderByClause>, ODataError> {
 
 /// The most levels one `$expand` may nest (`A($expand=B($expand=C))` is three).
 ///
-/// Forced by what one request may hold: each level can multiply the entities
-/// in the response by the fan-out of that relation, and a relation that leads
-/// back (`Orders($expand=Customer($expand=Orders(...)))`) multiplies at every
-/// second level, so a short query string could make one read build more
-/// entity copies than the server has memory for, taking it down for every
-/// tenant. The value is a choice, not a measurement. A deeper `$expand` is
-/// rejected with a 400 that names this bound; nothing is cut off silently.
+/// Forced by the memory one read may take. Each level copies every related
+/// entity into the response, so a level can multiply the copies by its
+/// relation's fan-out, and it is the query string, not the data, that picks
+/// how many times. A relation that leads back
+/// (`Orders($expand=Customer($expand=Orders(...)))`) can be multiplied as
+/// often as the caller likes, so without a bound one short query from any
+/// reader could build more copies than the server has memory for and take it
+/// down for every tenant.
+///
+/// Measured 23 Oct 2026 through the server's router (release build), reading
+/// `Customers?$expand=Orders($expand=Customer($expand=Orders(...)))`:
+///
+/// | customers x orders each | depth | entity copies | peak heap | response |
+/// |---|---|---|---|---|
+/// | 10 x 10  | 3 | 1,210  | 8.9 MB  | 0.5 MB |
+/// | 10 x 10  | 4 | 2,210  | 15.2 MB | 0.9 MB |
+/// | 10 x 10  | 5 | 12,210 | 86 MB   | 5.0 MB |
+/// | 10 x 10  | 6 | 22,210 | 158 MB  | 9.2 MB |
+/// | 10 x 30  | 4 | 18,610 | 127 MB  | 7.8 MB |
+/// | 100 x 10 | 3 | 12,100 | 85 MB   | 5.0 MB |
+///
+/// Every run cost 6.7 to 7.2 KiB of heap and about 415 bytes of response per
+/// copy, and the copies matched `page x (1 + fan-out + ...)` exactly. So
+/// over the default page of 100 entities, with every level a fan-out of 10,
+/// three levels build 111,100 copies, about 760 MiB, near all the memory a
+/// production Temper process holds at rest (about 0.9 GB). A fourth level
+/// would multiply that by ten, to about 7.4 GiB. Three is the deepest level
+/// that read fits in.
+///
+/// The bound limits what the query adds, not what the data holds: one
+/// relation with 10,000 targets still costs about 70 MB per parent at depth 1.
+///
+/// A deeper `$expand` is rejected with a 400 that names this bound; nothing is
+/// cut off silently.
 pub const MAX_EXPAND_DEPTH: usize = 3;
 
 /// Parse the `$expand` at nesting `level` (the top-level `$expand` is 1).
