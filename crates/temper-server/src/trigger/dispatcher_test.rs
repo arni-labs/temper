@@ -98,7 +98,8 @@ async fn a_looping_chain_stops_at_the_bound_and_says_so() {
         .filter(|event| event.event_name == "reaction_cascade_stopped")
         .collect();
     assert_eq!(stopped.len(), 1, "the stopped reaction is reported once");
-    assert_eq!(stopped[0].data["rule"], "tick_again");
+    // A spec trigger's rule is named `{entity}:{action}:{trigger}`.
+    assert_eq!(stopped[0].data["rule"], "Ticker:Tick:tick_again");
     assert_eq!(stopped[0].data["target_entity_id"], "t1");
     assert_eq!(stopped[0].data["depth"], MAX_REACTION_DEPTH);
 }
@@ -128,7 +129,7 @@ async fn a_reaction_past_the_bound_is_a_failed_result() {
         .await;
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(!results[0].success);
-    assert_eq!(results[0].rule_name, "tick_again");
+    assert_eq!(results[0].rule_name, "Ticker:Tick:tick_again");
     assert_eq!(results[0].depth, MAX_REACTION_DEPTH);
     assert!(
         results[0]
