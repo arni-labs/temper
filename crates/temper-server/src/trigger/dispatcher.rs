@@ -30,6 +30,17 @@ pub struct ReactionDispatcher {
     registry: Arc<ReactionRegistry>,
 }
 
+/// The action a reaction just ran, whose own reactions are the next level of
+/// the chain.
+struct NextLevel<'a> {
+    entity_type: &'a str,
+    entity_id: &'a str,
+    action: &'a str,
+    to_state: &'a str,
+    fields: &'a serde_json::Value,
+    depth: u32,
+}
+
 impl ReactionDispatcher {
     /// Create a new dispatcher with the given registry.
     pub fn new(registry: Arc<ReactionRegistry>) -> Self {
@@ -39,29 +50,23 @@ impl ReactionDispatcher {
     /// [`dispatch_reactions`](Self::dispatch_reactions) for the next level of
     /// a chain, boxed and polled on a stack that grows. The named return type
     /// is what lets the recursive future be `Send`.
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_next_level<'a>(
         &'a self,
         state: &'a crate::ServerState,
         tenant: &'a TenantId,
-        entity_type: &'a str,
-        entity_id: &'a str,
-        action: &'a str,
-        to_state: &'a str,
-        fields: &'a serde_json::Value,
-        depth: u32,
+        level: NextLevel<'a>,
         invoking_ctx: &'a AgentContext,
     ) -> BoxFuture<'a, Vec<ReactionResult>> {
         crate::growable_stack::on_growable_stack(move || {
             self.dispatch_reactions(
                 state,
                 tenant,
-                entity_type,
-                entity_id,
-                action,
-                to_state,
-                fields,
-                depth,
+                level.entity_type,
+                level.entity_id,
+                level.action,
+                level.to_state,
+                level.fields,
+                level.depth,
                 invoking_ctx,
             )
             .boxed()
@@ -332,12 +337,14 @@ impl ReactionDispatcher {
                             .dispatch_next_level(
                                 state,
                                 tenant,
-                                &rule.then.entity_type,
-                                &target_entity_id,
-                                &rule.then.action,
-                                &target_status,
-                                &target_fields,
-                                depth + 1,
+                                NextLevel {
+                                    entity_type: &rule.then.entity_type,
+                                    entity_id: &target_entity_id,
+                                    action: &rule.then.action,
+                                    to_state: &target_status,
+                                    fields: &target_fields,
+                                    depth: depth + 1,
+                                },
                                 &cascade_ctx,
                             )
                             .await;
