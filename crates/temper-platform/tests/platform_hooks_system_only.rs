@@ -178,7 +178,10 @@ async fn a_tenant_spec_naming_a_platform_hook_does_not_act_on_another_tenant() {
 
     let untouched = "ss-tenant-relay";
     let resumed = "ss-governance";
-    assert_eq!(session_status(&state, untouched).await, "WaitingForApproval");
+    assert_eq!(
+        session_status(&state, untouched).await,
+        "WaitingForApproval"
+    );
 
     // The app tenant's own action names the callback hook and the other
     // tenant's session in its params.
