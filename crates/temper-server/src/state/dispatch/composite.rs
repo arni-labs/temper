@@ -199,7 +199,7 @@ impl crate::state::ServerState {
                 .await?;
 
             if !response.success {
-                return Err(DispatchError::Internal(response.error.unwrap_or_else(
+                return Err(DispatchError::Conflict(response.error.unwrap_or_else(
                     || {
                         format!(
                             "composite {entity_type}.{action} sub-write {} failed",
