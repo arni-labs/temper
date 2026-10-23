@@ -38,10 +38,15 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
       </EntityType>
+      <EntityType Name="Clock">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
       <EntityContainer Name="Container">
         <EntitySet Name="Tickets" EntityType="Temper.KeyScope.Ticket"/>
         <EntitySet Name="Tallies" EntityType="Temper.KeyScope.Tally"/>
         <EntitySet Name="Jobs" EntityType="Temper.KeyScope.Job"/>
+        <EntitySet Name="Clocks" EntityType="Temper.KeyScope.Clock"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
@@ -141,6 +146,26 @@ to = "Failed"
 params = ["error_message"]
 "#;
 
+/// `Tick` schedules the next `Tick` until it has run six times.
+const CLOCK_IOA: &str = r#"
+[automaton]
+name = "Clock"
+states = ["Running"]
+initial = "Running"
+
+[[state]]
+name = "ticks"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Tick"
+kind = "input"
+from = ["Running"]
+guard = "ticks < 6"
+effect = ["ticks += 1", "schedule('Tick', 0)"]
+"#;
+
 fn build_state(tenant: &str, job_ioa: &str, cache: Option<IdempotencyCache>) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry
@@ -152,6 +177,7 @@ fn build_state(tenant: &str, job_ioa: &str, cache: Option<IdempotencyCache>) -> 
                 ("Ticket", TICKET_IOA),
                 ("Tally", TALLY_IOA),
                 ("Job", job_ioa),
+                ("Clock", CLOCK_IOA),
             ],
         )
         .expect("tenant registration");
@@ -372,4 +398,49 @@ async fn a_retry_while_the_first_request_runs_its_effects_does_not_run_them_agai
     );
     assert_eq!(events_of(&state, &tenant, "Job", "Start").await, 1);
     assert_eq!(events_of(&state, &tenant, "Job", "Answered").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_rescheduling_chain_keeps_one_key_length_every_cycle() {
+    let tenant = TenantId::new("clocks");
+    let state = build_state("clocks", JOB_IOA, None);
+    let first = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Clock",
+            "t1",
+            "Tick",
+            serde_json::json!({}),
+            &caller("clock-start"),
+        )
+        .await
+        .expect("Tick dispatches");
+    assert!(first.success, "{:?}", first.error);
+
+    let mut ticks = 0;
+    for _ in 0..200 {
+        ticks = read(&state, &tenant, "Clock", "ticks").await.1;
+        if ticks == 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(ticks, 6, "each scheduled Tick ran under a key of its own");
+
+    let entity = state
+        .get_tenant_entity_state(&tenant, "Clock", "t1")
+        .await
+        .expect("record");
+    let lengths: Vec<usize> = entity
+        .state
+        .processed_idempotency_keys
+        .keys()
+        .filter(|key| key.as_str() != "clock-start")
+        .map(String::len)
+        .collect();
+    assert_eq!(lengths.len(), 5, "five scheduled cycles: {lengths:?}");
+    assert!(
+        lengths.windows(2).all(|pair| pair[0] == pair[1]),
+        "a scheduled key does not grow from one cycle to the next: {lengths:?}"
+    );
 }

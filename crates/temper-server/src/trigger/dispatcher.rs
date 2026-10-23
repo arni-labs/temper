@@ -458,10 +458,9 @@ fn resolve_trigger_principal(
 /// that record has just recorded under the key, and the reaction would be
 /// answered as done without running.
 fn reaction_idempotency_key(invoking_ctx: &AgentContext, rule_name: &str) -> Option<String> {
-    invoking_ctx
-        .idempotency_key
-        .as_ref()
-        .map(|key| format!("{key}:reaction:{rule_name}"))
+    invoking_ctx.idempotency_key.as_ref().map(|key| {
+        crate::idempotency::derived_idempotency_key(key, &format!("reaction:{rule_name}"), "")
+    })
 }
 
 fn effective_trigger_security_context(agent_ctx: &AgentContext) -> SecurityContext {

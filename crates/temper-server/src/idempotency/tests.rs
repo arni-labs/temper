@@ -12,7 +12,7 @@ fn req() -> RequestFingerprint {
 /// The reply cached for a retry of [`req`], if any.
 fn hit(cache: &IdempotencyCache, actor_key: &str, idem_key: &str) -> Option<EntityResponse> {
     match cache.get(actor_key, idem_key, &req()) {
-        CachedReply::Replay(response) => Some(response),
+        CachedReply::Replay(response) => Some(*response),
         CachedReply::OtherRequest(action) => panic!("cached for another request: {action}"),
         CachedReply::Miss => None,
     }

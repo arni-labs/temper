@@ -879,7 +879,7 @@ impl crate::state::ServerState {
                     .await
                 {
                     crate::idempotency::EffectsClaim::Applied(completed) => {
-                        completed.unwrap_or(response)
+                        completed.map_or(response, |reply| *reply)
                     }
                     crate::idempotency::EffectsClaim::Owner(owner) => {
                         let response = self.run_post_dispatch_effects(&ctx, response).await;

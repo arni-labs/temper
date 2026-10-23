@@ -1177,10 +1177,10 @@ impl Actor for EntityActor {
                             let reply = if newest_is_this_retry {
                                 EntityResponse {
                                     state: state.clone(),
-                                    ..cached
+                                    ..*cached
                                 }
                             } else {
-                                cached
+                                *cached
                             };
                             ctx.reply(reply);
                             return Ok(());

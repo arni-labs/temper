@@ -114,7 +114,11 @@ impl AgentContext {
         next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
             let request =
                 crate::idempotency::RequestFingerprint::new(callback_action, callback_params);
-            format!("{key}:callback:{callback_action}:{}", request.short_hex())
+            crate::idempotency::derived_idempotency_key(
+                key,
+                &format!("callback:{callback_action}"),
+                &request.short_hex(),
+            )
         });
         Ok(next)
     }

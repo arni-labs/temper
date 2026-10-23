@@ -31,8 +31,9 @@ impl EffectsOwners {
 /// Whether this dispatcher runs a reply's post-dispatch effects.
 pub enum EffectsClaim<'a> {
     /// The effects have already run. Carries the reply the dispatcher that ran
-    /// them completed, when this claim waited for it.
-    Applied(Option<EntityResponse>),
+    /// them completed, when this claim waited for it. Boxed because a reply
+    /// is much larger than an [`EffectsOwner`].
+    Applied(Option<Box<EntityResponse>>),
     /// This dispatcher runs them, and completes the claim when they have run.
     Owner(EffectsOwner<'a>),
 }
@@ -76,7 +77,7 @@ impl IdempotencyCache {
             let mut finished = {
                 let mut owners = self.effects_owners.lock();
                 if let Some(applied) = self.applied_reply(actor_key, idem_key) {
-                    return EffectsClaim::Applied(waited.then_some(applied));
+                    return EffectsClaim::Applied(waited.then(|| Box::new(applied)));
                 }
                 match owners.get(&owner_key) {
                     Some(finished) => finished.clone(),

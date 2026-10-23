@@ -26,7 +26,7 @@ mod effects;
 mod request;
 
 pub use effects::{EffectsClaim, EffectsOwner};
-pub use request::RequestFingerprint;
+pub use request::{RequestFingerprint, derived_idempotency_key};
 
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).
 pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
@@ -149,8 +149,9 @@ pub struct IdempotencyCache {
 /// What the cache holds for a key, compared with the request now using it.
 #[derive(Debug)]
 pub enum CachedReply {
-    /// The same request: answer it with this reply.
-    Replay(EntityResponse),
+    /// The same request: answer it with this reply. Boxed because a reply
+    /// is much larger than the other variants.
+    Replay(Box<EntityResponse>),
     /// The key answered a different request, which named this action.
     OtherRequest(String),
     /// Nothing is cached for the key.
@@ -189,7 +190,7 @@ impl IdempotencyCache {
     ) -> CachedReply {
         self.with_entry(actor_key, idem_key, |entry| {
             if entry.request == *request {
-                CachedReply::Replay(entry.response.clone())
+                CachedReply::Replay(Box::new(entry.response.clone()))
             } else {
                 CachedReply::OtherRequest(entry.request.action().to_string())
             }
