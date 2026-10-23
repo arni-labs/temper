@@ -25,6 +25,10 @@ use super::common::{
     verification_gate_response,
 };
 use super::constraints::pre_delete_relation_checks;
+use super::create_answer::{
+    CreateTarget, EXISTING_ENTITY_STATUS, create_answer_body, existing_entity_for_create,
+    existing_key_conflict, may_read,
+};
 use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
 use super::response::annotate_entity;
@@ -716,13 +720,51 @@ pub async fn handle_odata_post(
                     .into_response();
                 };
                 let namespace = format!("{tenant}/{entity_id}");
-                let spawn_result = actor_sys
-                    .spawn_with_fields(&namespace, &entity_type, initial_fields.clone())
-                    .await;
+                // A key that already names an entity writes nothing: the
+                // caller's read decision on it decides the answer.
+                let status = match actor_sys.load_state(&namespace, &entity_type).await {
+                    Ok(None) => StatusCode::CREATED,
+                    Ok(Some(state_bytes)) => {
+                        let existing: temper_actor_runtime::spec_actor::SpecActorState =
+                            serde_json::from_slice(&state_bytes).unwrap_or_default();
+                        let body = serde_json::json!({
+                            "entity_id": entity_id,
+                            "status": existing.status,
+                            "fields": existing.fields,
+                        });
+                        let target = CreateTarget {
+                            tenant: &tenant,
+                            security_ctx: &security_ctx,
+                            entity_type: &entity_type,
+                            set_name: &name,
+                            entity_id: &entity_id,
+                        };
+                        if !may_read(&state, &target, &body) {
+                            return existing_key_conflict();
+                        }
+                        EXISTING_ENTITY_STATUS
+                    }
+                    Err(error) => {
+                        return odata_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ActorReadError",
+                            &error.to_string(),
+                        )
+                        .into_response();
+                    }
+                };
+                let spawn_result = if status == StatusCode::CREATED {
+                    actor_sys
+                        .spawn_with_fields(&namespace, &entity_type, initial_fields.clone())
+                        .await
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
                 match spawn_result {
-                    Ok(_) => {
+                    Ok(()) => {
                         return ODataResponse {
-                            status: StatusCode::CREATED,
+                            status,
                             body: serde_json::json!({
                                 "@odata.type": format!("#{entity_type}"),
                                 "Id": entity_id,
@@ -740,6 +782,25 @@ pub async fn handle_odata_post(
                         .into_response();
                     }
                 }
+            }
+
+            let target = CreateTarget {
+                tenant: &tenant,
+                security_ctx: &security_ctx,
+                entity_type: &entity_type,
+                set_name: &name,
+                entity_id: &entity_id,
+            };
+            match existing_entity_for_create(&state, &target).await {
+                Ok(None) => {}
+                Ok(Some(existing)) => {
+                    return ODataResponse {
+                        status: EXISTING_ENTITY_STATUS,
+                        body: create_answer_body(&state, &target, &existing).await,
+                    }
+                    .into_response();
+                }
+                Err(response) => return response,
             }
 
             // A new entity's first event holds its initial fields: one too large is
@@ -766,16 +827,9 @@ pub async fn handle_odata_post(
                 .await
             {
                 Ok(Some(response)) => {
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{name}/$entity"),
-                        Some(format!("{name}('{entity_id}')")),
-                    );
                     return ODataResponse {
                         status: StatusCode::CREATED,
-                        body,
+                        body: create_answer_body(&state, &target, &response).await,
                     }
                     .into_response();
                 }
@@ -806,16 +860,9 @@ pub async fn handle_odata_post(
                         state.clear_commons_rate_limit_cache();
                     }
                     state.clear_commons_storage_projection_cache_for_entity(&entity_type);
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{name}/$entity"),
-                        Some(format!("{name}('{entity_id}')")),
-                    );
                     ODataResponse {
                         status: StatusCode::CREATED,
-                        body,
+                        body: create_answer_body(&state, &target, &response).await,
                     }
                     .into_response()
                 }
