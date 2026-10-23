@@ -78,8 +78,10 @@ impl Redirects {
             Some((gate, ctx)) if !self.is_internal(request.url()) => (gate, ctx),
             _ => return client.execute(request).await.map_err(OutboundError::Http),
         };
-        // The chain shares one timeout, as it did when reqwest followed it.
-        let deadline = Instant::now() + self.timeout;
+        // The chain shares one timeout, as it did when reqwest followed it. A
+        // timeout past the clock's range has no deadline: each hop keeps the
+        // client's own, which waits as long.
+        let deadline = Instant::now().checked_add(self.timeout);
         let mut hop = Hop::of(&request);
         let mut response = client.execute(request).await.map_err(OutboundError::Http)?;
         let mut budget = REDIRECT_HOP_BUDGET;
@@ -199,9 +201,11 @@ impl Hop {
     }
 
     /// The hop's request, with what is left of the chain's `deadline`.
-    fn request(&self, deadline: Instant) -> reqwest::Request {
+    fn request(&self, deadline: Option<Instant>) -> reqwest::Request {
         let mut request = self.copy();
-        *request.timeout_mut() = Some(deadline.saturating_duration_since(Instant::now()));
+        if let Some(deadline) = deadline {
+            *request.timeout_mut() = Some(deadline.saturating_duration_since(Instant::now()));
+        }
         request
     }
 

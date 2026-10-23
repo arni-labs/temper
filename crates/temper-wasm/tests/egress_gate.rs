@@ -318,6 +318,17 @@ async fn a_redirect_chain_shares_one_timeout() {
         3,
         "the third hop is cut off by the timeout"
     );
+
+    // A timeout past the clock's range, which an integration's timeout_secs
+    // can name, still sends and follows.
+    let production = ProductionWasmHost::with_timeout(BTreeMap::new(), Duration::MAX);
+    let host = gated_host_with(&["127.0.0.1"], production);
+    assert_eq!(
+        host.http_call("GET", &format!("http://{address}/again"), &[], "")
+            .await,
+        Ok((200, "landed".into()))
+    );
+    assert_eq!(take(&log).len(), 2);
 }
 
 /// A redirect to a host the gate does not allow is denied before it is sent:
