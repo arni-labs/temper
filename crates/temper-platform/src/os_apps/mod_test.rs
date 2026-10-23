@@ -1516,14 +1516,30 @@ async fn test_install_os_app_persists_granular_policy_rows() {
         .load_policies_for_tenant("test-policy-rows")
         .await
         .expect("load granular policies");
+    // ADR-0183: one row per statement, named by its @source label.
+    let issue_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.policy_id.starts_with("project-management/issue.cedar#"))
+        .collect();
     assert!(
-        rows.iter().any(|row| {
-            row.policy_id == "project-management-issue"
-                && row.enabled
-                && row.cedar_text.contains("resource is Issue")
-        }),
-        "project-management install should persist policies/issue.cedar as a granular row: {rows:?}"
+        issue_rows
+            .iter()
+            .any(|row| row.enabled && row.cedar_text.contains("resource is Issue")),
+        "project-management install should persist policies/issue.cedar statement by statement: {rows:?}"
     );
+    for row in &issue_rows {
+        let statements = temper_authz::statements::sourced_statements(&row.cedar_text).unwrap();
+        assert_eq!(
+            statements.len(),
+            1,
+            "a row holds one statement: {}",
+            row.cedar_text
+        );
+        assert_eq!(
+            statements[0].label, row.policy_id,
+            "a row is named by its statement's label"
+        );
+    }
 
     let turso_ref = state.server.platform_turso_store().unwrap();
     let legacy_rows = turso_ref.load_tenant_policies().await.unwrap();
@@ -1975,14 +1991,6 @@ mode = "commons"
     assert_eq!(
         source_paths,
         vec!["policies/base.cedar", "policies/commons/guardrail.cedar"]
-    );
-    assert_eq!(
-        os_app_policy_row_id("katagami-commons", "policies/palette_system.cedar"),
-        "katagami-commons-palette_system"
-    );
-    assert_eq!(
-        os_app_policy_row_id("katagami-commons", "policies/commons/guardrail.cedar"),
-        "katagami-commons-commons-guardrail"
     );
     assert!(
         bundle

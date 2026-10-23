@@ -86,6 +86,15 @@ impl IdentityResolver {
             return Err(IdentityError::Invalid);
         }
 
+        // Group memberships are read before this tenant's first check, so
+        // `principal in` is never answered from a partial set (ADR-0183).
+        state
+            .fill_group_memberships(tenant)
+            .await
+            .map_err(|error| {
+                IdentityError::Unavailable(format!("group memberships unavailable: {error}"))
+            })?;
+
         // JWS-shaped tokens are verified against a registered TrustedIssuer;
         // opaque tokens are looked up in the AgentCredential registry.
         if looks_like_jwt(bearer_token) {

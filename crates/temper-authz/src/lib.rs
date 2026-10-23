@@ -7,6 +7,7 @@
 mod context;
 mod engine;
 mod error;
+pub mod groups;
 mod metrics;
 mod policy_gen;
 pub mod statements;

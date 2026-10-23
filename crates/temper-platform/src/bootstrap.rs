@@ -66,6 +66,7 @@ const POLICY_IOA: &str = include_str!("specs/policy.ioa.toml");
 const AGENT_CREDENTIAL_IOA: &str = include_str!("specs/agent_credential.ioa.toml");
 const TRUSTED_ISSUER_IOA: &str = include_str!("specs/trusted_issuer.ioa.toml");
 const PRINCIPAL_GENERATION_IOA: &str = include_str!("specs/principal_generation.ioa.toml");
+const GROUP_MEMBERSHIP_IOA: &str = include_str!("specs/group_membership.ioa.toml");
 const AGENT_CSDL: &str = include_str!("specs/agent_model.csdl.xml");
 
 /// Agent entity specs as (entity_type, ioa_source) pairs.
@@ -80,6 +81,7 @@ const AGENT_SPECS: &[(&str, &str)] = &[
     ("AgentCredential", AGENT_CREDENTIAL_IOA),
     ("TrustedIssuer", TRUSTED_ISSUER_IOA),
     ("PrincipalGeneration", PRINCIPAL_GENERATION_IOA),
+    ("GroupMembership", GROUP_MEMBERSHIP_IOA),
 ];
 
 /// Verify, parse, and register a set of IOA specs under a tenant.
@@ -285,6 +287,7 @@ pub fn bootstrap_agent_specs(
 const IDENTITY_SPECS: &[(&str, &str)] = &[
     ("TrustedIssuer", TRUSTED_ISSUER_IOA),
     ("PrincipalGeneration", PRINCIPAL_GENERATION_IOA),
+    ("GroupMembership", GROUP_MEMBERSHIP_IOA),
 ];
 
 /// Specs a tenant needs before an operator credential can be issued — the
@@ -1363,7 +1366,10 @@ initial = "Created"
 
     #[test]
     fn agent_csdl_slice_keeps_only_requested_identity_entities() {
-        let doc = csdl_slice(AGENT_CSDL, &["TrustedIssuer", "PrincipalGeneration"]);
+        let doc = csdl_slice(
+            AGENT_CSDL,
+            &["TrustedIssuer", "PrincipalGeneration", "GroupMembership"],
+        );
         let schema = doc
             .schemas
             .iter()
@@ -1376,7 +1382,10 @@ initial = "Created"
             .map(|e| e.name.as_str())
             .collect();
         type_names.sort_unstable();
-        assert_eq!(type_names, vec!["PrincipalGeneration", "TrustedIssuer"]);
+        assert_eq!(
+            type_names,
+            vec!["GroupMembership", "PrincipalGeneration", "TrustedIssuer"]
+        );
 
         let sets: Vec<&str> = schema.entity_containers[0]
             .entity_sets
@@ -1385,12 +1394,14 @@ initial = "Created"
             .collect();
         assert!(sets.contains(&"TrustedIssuers"));
         assert!(sets.contains(&"PrincipalGenerations"));
-        assert_eq!(sets.len(), 2, "no non-identity entity sets should leak in");
+        assert!(sets.contains(&"GroupMemberships"));
+        assert_eq!(sets.len(), 3, "no non-identity entity sets should leak in");
 
         // Bound actions for the identity entities are preserved; nothing bound
         // to a non-identity entity leaks through.
         assert!(schema.actions.iter().any(|a| a.name == "RegisterIssuer"));
         assert!(schema.actions.iter().any(|a| a.name == "BumpGeneration"));
+        assert!(schema.actions.iter().any(|a| a.name == "StartMembership"));
         for action in &schema.actions {
             let binds = action
                 .parameters
@@ -1399,7 +1410,9 @@ initial = "Created"
                 .map(|p| p.type_name.clone())
                 .unwrap_or_default();
             assert!(
-                binds.ends_with("TrustedIssuer") || binds.ends_with("PrincipalGeneration"),
+                binds.ends_with("TrustedIssuer")
+                    || binds.ends_with("PrincipalGeneration")
+                    || binds.ends_with("GroupMembership"),
                 "action {} unexpectedly bound to {binds}",
                 action.name
             );

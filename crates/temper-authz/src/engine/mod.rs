@@ -6,20 +6,27 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityUid, Policy, PolicyId, PolicySet,
-    Request, Response as CedarResponse,
+    Authorizer, Context, Decision, Entities, Entity, EntityUid, PolicyId, PolicySet, Request,
+    Response as CedarResponse,
 };
 
 use crate::context::{PrincipalKind, SecurityContext, is_cedar_authority_context_key};
 use crate::error::{AuthzDenial, AuthzError};
+use crate::groups::GroupMemberships;
 use crate::metrics::{CedarCheck, CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
+mod group_candidates;
 mod list_uniformity;
+mod statement_cache;
+mod tenant_reload;
+
+use tenant_reload::merge_system_platform_policy;
 
 pub use list_uniformity::ListReadUniformity;
 
@@ -28,6 +35,12 @@ mod tests;
 
 #[cfg(test)]
 mod stack_tests;
+
+#[cfg(test)]
+mod groups_tests;
+
+#[cfg(test)]
+mod statement_cache_tests;
 
 /// The result of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,22 +78,41 @@ impl AuthzDecision {
 struct CompiledPolicies {
     policy_set: PolicySet,
     candidate_index: candidates::CandidatePolicyIndex,
+    /// The groups these statements can ask a principal about (ADR-0183).
+    groups: group_candidates::GroupCandidates,
 }
 
 impl CompiledPolicies {
     fn new(policy_set: PolicySet) -> Self {
+        let statements: Vec<group_candidates::StatementGroups> = policy_set
+            .policies()
+            .map(group_candidates::StatementGroups::of)
+            .collect();
+        Self::with_groups(policy_set, &statements)
+    }
+
+    /// Compile a set whose statements' groups are already known, so nothing is
+    /// parsed or walked again (ADR-0183).
+    fn with_groups(
+        policy_set: PolicySet,
+        statements: &[group_candidates::StatementGroups],
+    ) -> Self {
         let candidate_index = candidates::CandidatePolicyIndex::new(&policy_set);
+        let groups = group_candidates::GroupCandidates::from_statements(statements);
         Self {
             policy_set,
             candidate_index,
+            groups,
         }
     }
 }
 
-/// Per-tenant policy data: the compiled policies and the source text.
+/// Per-tenant policy data: the compiled policies, the source text, and its
+/// statements parsed one by one for the next reload.
 struct TenantPolicies {
     policies: CompiledPolicies,
     source_text: String,
+    statements: Arc<statement_cache::StatementCache>,
 }
 
 /// The authorization engine. Holds per-tenant compiled Cedar policies and
@@ -99,6 +131,12 @@ pub struct AuthzEngine {
     /// resolvable principal kinds still fail closed for an unloaded tenant.
     platform_policy_set: CompiledPolicies,
     authorizer: Authorizer,
+    /// Every tenant's group memberships, kept by the server from the
+    /// `GroupMembership` records (ADR-0183).
+    group_memberships: Arc<GroupMemberships>,
+    /// Cedar statements parsed by tenant reloads since start: a reload parses
+    /// only statements it has not seen, so this grows by what changed.
+    statements_parsed: AtomicU64,
 }
 
 impl AuthzEngine {
@@ -118,6 +156,8 @@ impl AuthzEngine {
             fallback_policy_set: RwLock::new(CompiledPolicies::new(policy_set)),
             platform_policy_set: compiled_system_platform_policies(),
             authorizer: Authorizer::new(),
+            group_memberships: Arc::new(GroupMemberships::new()),
+            statements_parsed: AtomicU64::new(0),
         })
     }
 
@@ -136,6 +176,8 @@ impl AuthzEngine {
             fallback_policy_set: RwLock::new(CompiledPolicies::new(policy_set)),
             platform_policy_set: compiled_system_platform_policies(),
             authorizer: Authorizer::new(),
+            group_memberships: Arc::new(GroupMemberships::new()),
+            statements_parsed: AtomicU64::new(0),
         }
     }
 
@@ -157,7 +199,16 @@ impl AuthzEngine {
             fallback_policy_set: RwLock::new(CompiledPolicies::new(policy_set)),
             platform_policy_set: compiled_system_platform_policies(),
             authorizer: Authorizer::new(),
+            group_memberships: Arc::new(GroupMemberships::new()),
+            statements_parsed: AtomicU64::new(0),
         }
+    }
+
+    /// The memberships this engine reads for `principal in` (ADR-0183). The
+    /// server applies every `GroupMembership` change to it and fills each
+    /// tenant before its first check.
+    pub fn group_memberships(&self) -> &Arc<GroupMemberships> {
+        &self.group_memberships
     }
 
     /// Parse and validate policy text without changing the active policy set.
@@ -166,100 +217,6 @@ impl AuthzEngine {
             .parse::<PolicySet>()
             .map(|_| ())
             .map_err(|error| AuthzError::PolicyParse(error.to_string()))
-    }
-
-    /// Hot-reload Cedar policies for a specific tenant. Parses and validates
-    /// the new policy text, then atomically swaps the tenant's policy set.
-    /// If parsing fails, existing policies remain in effect.
-    pub fn reload_tenant_policies(
-        &self,
-        tenant: &str,
-        policy_text: &str,
-    ) -> Result<(), AuthzError> {
-        let mut new_policy_set = policy_text
-            .parse::<PolicySet>()
-            .map_err(|e| AuthzError::PolicyParse(e.to_string()))?;
-        merge_system_platform_policy(&mut new_policy_set);
-
-        let mut tenants = self
-            .tenant_policies
-            .write()
-            .map_err(|e| AuthzError::Engine(format!("tenant policy lock poisoned: {e}")))?;
-
-        tenants.insert(
-            tenant.to_string(),
-            TenantPolicies {
-                policies: CompiledPolicies::new(new_policy_set),
-                source_text: policy_text.to_string(),
-            },
-        );
-        Ok(())
-    }
-
-    /// Hot-reload Cedar policies for a tenant from individually named policy
-    /// entries. Each `(policy_id, cedar_text)` pair is parsed individually and
-    /// assigned a meaningful `PolicyId` of the form `"{tenant}:{policy_id}"`.
-    ///
-    /// Multiple permit/forbid statements in one `cedar_text` are suffixed:
-    /// `"{tenant}:{policy_id}:0"`, `":1"`, etc.
-    ///
-    /// This enables meaningful policy IDs in denial diagnostics instead of
-    /// auto-generated names like `"policy0"`.
-    pub fn reload_tenant_policies_named(
-        &self,
-        tenant: &str,
-        policies: &[(String, String)], // (policy_id, cedar_text)
-    ) -> Result<(), AuthzError> {
-        let mut combined_set = PolicySet::new();
-        let mut combined_text = String::new();
-
-        for (policy_id, cedar_text) in policies {
-            // Parse each entry's Cedar text individually.
-            let entry_set: PolicySet = cedar_text
-                .parse()
-                .map_err(|e| AuthzError::PolicyParse(format!("{policy_id}: {e}")))?;
-
-            // Re-add each policy with a meaningful PolicyId.
-            let entry_policies: Vec<Policy> = entry_set.policies().cloned().collect();
-            if entry_policies.len() == 1 {
-                let named = entry_policies
-                    .into_iter()
-                    .next()
-                    .unwrap() // ci-ok: checked len == 1
-                    .new_id(PolicyId::new(format!("{tenant}:{policy_id}")));
-                combined_set
-                    .add(named)
-                    .map_err(|e| AuthzError::PolicyParse(e.to_string()))?;
-            } else {
-                for (idx, p) in entry_policies.into_iter().enumerate() {
-                    let named = p.new_id(PolicyId::new(format!("{tenant}:{policy_id}:{idx}")));
-                    combined_set
-                        .add(named)
-                        .map_err(|e| AuthzError::PolicyParse(e.to_string()))?;
-                }
-            }
-
-            if !combined_text.is_empty() {
-                combined_text.push('\n');
-            }
-            combined_text.push_str(cedar_text);
-        }
-
-        merge_system_platform_policy(&mut combined_set);
-
-        let mut tenants = self
-            .tenant_policies
-            .write()
-            .map_err(|e| AuthzError::Engine(format!("tenant policy lock poisoned: {e}")))?;
-
-        tenants.insert(
-            tenant.to_string(),
-            TenantPolicies {
-                policies: CompiledPolicies::new(combined_set),
-                source_text: combined_text,
-            },
-        );
-        Ok(())
     }
 
     /// Remove a tenant's policy set entirely.
@@ -334,6 +291,7 @@ impl AuthzEngine {
             }
         };
         self.evaluate_request(
+            None,
             security_ctx,
             action,
             resource_type,
@@ -409,6 +367,7 @@ impl AuthzEngine {
 
         if let Some(tp) = tenants.get(tenant) {
             return self.evaluate_request(
+                Some(tenant),
                 security_ctx,
                 action,
                 resource_type,
@@ -420,6 +379,7 @@ impl AuthzEngine {
 
         if Self::is_system(security_ctx) {
             return self.evaluate_request(
+                Some(tenant),
                 security_ctx,
                 action,
                 resource_type,
@@ -436,6 +396,7 @@ impl AuthzEngine {
     /// `authorize_for_tenant`.
     fn evaluate_request(
         &self,
+        tenant: Option<&str>,
         security_ctx: &SecurityContext,
         action: &str,
         resource_type: &str,
@@ -575,10 +536,22 @@ impl AuthzEngine {
         // Entity schema validation is intentionally None: app specs define
         // tenant-specific attributes that cannot be predicted by a static
         // platform schema. Policy-level type checks still apply.
+        let parents = match tenant {
+            Some(tenant) => self.principal_groups(
+                tenant,
+                policies,
+                security_ctx,
+                &principal_uid,
+                &resource_uid,
+            ),
+            None => HashSet::new(),
+        };
+        recorder.finish_phase("principal_groups");
+
         let principal_entity = match Entity::new(
             principal_uid.clone(),
             principal_attrs.clone(),
-            HashSet::new(),
+            parents.clone(),
         ) {
             Ok(entity) => entity,
             Err(e) => {
@@ -591,7 +564,7 @@ impl AuthzEngine {
         let resource_entity = if resource_uid == principal_uid {
             let mut merged_attrs = principal_attrs;
             merged_attrs.extend(resource_entity_attrs);
-            match Entity::new(resource_uid.clone(), merged_attrs, HashSet::new()) {
+            match Entity::new(resource_uid.clone(), merged_attrs, parents) {
                 Ok(entity) => entity,
                 Err(e) => {
                     return recorder.fail(
@@ -717,6 +690,42 @@ impl AuthzEngine {
         }
     }
 
+    /// The groups `principal in` can find the principal in, for this request:
+    /// each candidate the tenant's statements name (and the resource, when one
+    /// says `principal in resource`) that the principal, or the person an agent
+    /// acts for, is an active member of. One lookup per candidate, so a check
+    /// costs what the policy text asks, however many groups the person is in.
+    fn principal_groups(
+        &self,
+        tenant: &str,
+        policies: &CompiledPolicies,
+        security_ctx: &SecurityContext,
+        principal_uid: &EntityUid,
+        resource_uid: &EntityUid,
+    ) -> HashSet<EntityUid> {
+        let memberships = &self.group_memberships;
+        let groups = &policies.groups;
+        let resource = groups.resource.then_some(resource_uid);
+        let mut parents = HashSet::new(); // determinism-ok: Cedar API requires HashSet
+        for group in resource.into_iter().chain(groups.literals.iter()) {
+            if group == principal_uid || parents.contains(group) {
+                continue;
+            }
+            let key = group.to_string();
+            let member = |who: &str| memberships.contains(tenant, &key, who);
+            if member(&security_ctx.principal.id)
+                || security_ctx
+                    .principal
+                    .acting_for
+                    .as_deref()
+                    .is_some_and(member)
+            {
+                parents.insert(group.clone());
+            }
+        }
+        parents
+    }
+
     /// Whether a list's `read` decision is the same for every row of `resource_type`.
     ///
     /// Callers that get [`ListReadUniformity::Uniform`] evaluate Cedar once and
@@ -825,46 +834,6 @@ impl AuthzEngine {
 /// the identity-entity clauses below.
 pub const VERIFIED_OPERATOR_WHEN: &str = "principal has agent_type && principal.agent_type == \"operator\" && principal has agentTypeVerified && principal.agentTypeVerified == true";
 
-/// Built the built-in system-platform Cedar policy, interpolating the shared
-/// [`VERIFIED_OPERATOR_WHEN`] predicate into the four identity-entity clauses.
-/// Built-in Cedar in every [`AuthzEngine`] (ADR-0046): System's broad
-/// authority as an auditable policy instead of the old blanket bypass, and
-/// what only the platform may touch (issuers, generations, HTTP routes).
-fn system_platform_policy() -> String {
-    format!(
-        r#"
-@id("system-platform:broad-permit")
-permit(principal is System, action, resource);
-
-@id("system-platform:identity-entities-permit-trusted-issuer")
-permit(principal, action, resource is TrustedIssuer)
-when {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:identity-entities-permit-principal-generation")
-permit(principal, action, resource is PrincipalGeneration)
-when {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:protect-trusted-issuer")
-forbid(principal, action, resource is TrustedIssuer)
-unless {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:protect-principal-generation")
-forbid(principal, action, resource is PrincipalGeneration)
-unless {{ principal is System || principal is Admin || ({op}) }};
-
-// ADR-0069: a route reshapes the tenant's HTTP surface, so only the platform manages one.
-@id("system-platform:http-endpoint-management-permit")
-permit(principal, action in [Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Pause", Action::"Resume", Action::"Delete"], resource is HttpEndpoint)
-when {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:protect-http-endpoint-management")
-forbid(principal, action in [Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Pause", Action::"Resume", Action::"Delete"], resource is HttpEndpoint)
-unless {{ principal is System || principal is Admin || ({op}) }};
-"#,
-        op = VERIFIED_OPERATOR_WHEN
-    )
-}
-
 /// PolicyId prefix used for the built-in system-platform policies
 /// (ADR-0046). Used to exclude them from user-facing counts.
 const SYSTEM_PLATFORM_POLICY_ID_PREFIX: &str = "system-platform:";
@@ -876,19 +845,6 @@ const SYSTEM_PLATFORM_POLICY_ID_PREFIX: &str = "system-platform:";
 /// out of user-facing reports (see [`count_user_policies`]). If the
 /// hard-coded system policy fails to parse, the combined set is left
 /// unchanged — preserving availability at the cost of System auth.
-fn merge_system_platform_policy(combined: &mut PolicySet) {
-    let system_set: PolicySet = match system_platform_policy().parse() {
-        Ok(ps) => ps,
-        Err(_) => return,
-    };
-    for (idx, policy) in system_set.policies().enumerate() {
-        let named = policy.clone().new_id(PolicyId::new(format!(
-            "{SYSTEM_PLATFORM_POLICY_ID_PREFIX}broad-permit-{idx}"
-        )));
-        let _ = combined.add(named);
-    }
-}
-
 fn compiled_system_platform_policies() -> CompiledPolicies {
     let mut policy_set = PolicySet::new();
     merge_system_platform_policy(&mut policy_set);

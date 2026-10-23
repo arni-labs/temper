@@ -194,8 +194,12 @@ async fn reinstall_replaces_a_changed_forbid() {
     assert!(!fx.live_text().contains(FORBID_WITHDRAW));
     assert!(!fx.legacy_text().await.contains(FORBID_WITHDRAW));
     let rows = fx.rows().await;
-    assert_eq!(rows.len(), 1, "one row per policy file: {rows:?}");
-    assert!(rows[0].cedar_text.contains(FORBID_DELETE));
+    assert_eq!(rows.len(), 2, "one row per statement: {rows:?}");
+    let forbid_row = rows
+        .iter()
+        .find(|row| row.policy_id == format!("{app}/thing.cedar#2"))
+        .expect("the forbid's row is named by its label");
+    assert!(forbid_row.cedar_text.contains(FORBID_DELETE));
 
     let restarted = fx.restart().await;
     assert!(
@@ -317,7 +321,8 @@ async fn reinstall_drops_a_removed_policy_file() {
 
     let rows = fx.rows().await;
     assert!(
-        rows.iter().all(|row| !row.policy_id.ends_with("-freeze")),
+        rows.iter()
+            .all(|row| !row.policy_id.contains("/freeze.cedar#")),
         "removed file's row kept: {rows:?}"
     );
     for state in [&fx.state, &fx.restart().await] {
@@ -356,5 +361,68 @@ async fn a_moved_statement_is_live_once_under_its_new_label() {
     for state in [&fx.state, &fx.restart().await] {
         assert!(!fx.allowed(state, "Withdraw", "Thing"));
         assert!(!fx.allowed(state, "Delete", "Thing"));
+    }
+}
+
+/// ADR-0183: a database from before one row per statement holds a row per
+/// file. The next install replaces it with a row per statement, including a
+/// file of one statement, whose old row has the new row's text but for the
+/// trailing newline, and the forbid is live before and after a restart.
+#[tokio::test]
+async fn a_row_per_file_becomes_a_row_per_statement_and_keeps_its_forbid() {
+    let fx = Fixture::new("per-file-rows").await;
+    let app = format!("reinstall-per-file-{}", uuid::Uuid::new_v4().simple());
+    fx.write_app(
+        &app,
+        &[
+            ("thing.cedar", PERMIT_THINGS),
+            ("freeze.cedar", FORBID_WITHDRAW),
+        ],
+    );
+    fx.install(&app).await;
+    // Put the rows back the way a kernel before ADR-0183 wrote them.
+    let store = fx.state.server.policy_store().expect("policy store");
+    for row in fx.rows().await {
+        store
+            .delete_policy(&fx.tenant, &row.policy_id)
+            .await
+            .expect("delete row");
+    }
+    let owner = format!("os-app:{app}");
+    for (old_id, file, text) in [
+        (format!("{app}-thing"), "thing.cedar", PERMIT_THINGS),
+        (format!("{app}-freeze"), "freeze.cedar", FORBID_WITHDRAW),
+    ] {
+        let labelled = format!("@source(\"{app}/{file}#1\")\n{text}");
+        store
+            .save_policy(&fx.tenant, &old_id, &labelled, &owner)
+            .await
+            .expect("save a per-file row");
+    }
+
+    fx.install(&app).await;
+
+    let ids: std::collections::BTreeSet<String> = fx
+        .rows()
+        .await
+        .into_iter()
+        .map(|row| row.policy_id)
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            format!("{app}/freeze.cedar#1"),
+            format!("{app}/thing.cedar#1")
+        ]
+        .into_iter()
+        .collect(),
+        "per-file rows replaced by per-statement rows"
+    );
+    for state in [&fx.state, &fx.restart().await] {
+        assert!(
+            !fx.allowed(state, "Withdraw", "Thing"),
+            "the forbid was lost"
+        );
+        assert!(fx.allowed(state, "Read", "Thing"));
     }
 }

@@ -1747,6 +1747,10 @@ impl ServerState {
         .result
         .map_err(|e| format!("Actor update failed: {e}"))?;
 
+        if response.success {
+            // A PATCH can rewrite a membership's group or member (ADR-0183).
+            self.note_group_membership(tenant, &response.state);
+        }
         if response.success
             && let Some(query_plane) = self.query_plane_store()
         {
@@ -1914,6 +1918,12 @@ impl ServerState {
             // and in-memory index entries.
             let _ = actor_ref.stop();
             self.remove_entity(tenant, entity_type, entity_id);
+            self.note_group_membership_deleted(
+                tenant,
+                entity_type,
+                entity_id,
+                response.state.sequence_nr,
+            );
         }
 
         Ok(response)
