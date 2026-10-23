@@ -287,6 +287,8 @@ impl TriggerSources {
 
 /// The `[[action.triggers]]` block for an integration, or `None` for a
 /// webhook integration without a URL (the old runtime never fired those).
+/// A webhook integration with a URL is an error: no trigger kind sends it,
+/// so its call is rewritten by hand as an `http_fetch` WASM trigger.
 fn integration_trigger(ig: &Integration, notes: &mut Vec<String>) -> Result<Option<Table>, String> {
     let mut config = ig.config.clone();
     let mut table = Table::new();
