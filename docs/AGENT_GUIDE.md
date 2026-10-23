@@ -282,7 +282,7 @@ assert = "status in ['Submitted'] => items > 0"
 4. `[[invariant]]`: Define safety invariants with `name` and one `assert` expression, proven over every reachable state.
 5. Every `guard` and `assert` is one expression in the predicate grammar (`&&`, `||`, `!`, `=>`, comparisons, `in`, `empty()`, `len()`, `Type[ref].status`); see [predicates.md](predicates.md).
 6. `effect` is a list of statements in the same grammar: `items += 1`, `retries -= 1`, `quota = params.quota`, `ready = true`, `append(tags, params.tag)`, `remove_at(tags, params.i)`, `schedule('Expire', 3600)`, `schedule_at('Expire', expires_at)`, `spawn('Task', 'Create', last_task_id)`. Statements are type-checked at load, and effects reading `params.p` are verified with `p` unknown. An action's name implies nothing: `AddItem` without an `effect` changes only `status`. See [predicates.md#effects](predicates.md#effects).
-7. `[[action.triggers]]`: the only way an action causes work elsewhere — `kind = "entity"` (another entity's action), `"wasm"`, `"adapter"`, `"webhook"`, or `"hook"` (a platform hook registered by the host). See [Section 9](#9-integration-engine).
+7. `[[action.triggers]]`: the only way an action causes work elsewhere — `kind = "entity"` (another entity's action), `"wasm"`, `"adapter"`, or `"hook"` (a platform hook registered by the host). `kind = "webhook"` is refused at load: make the call with `kind = "wasm"`, `module = "http_fetch"` (ADR-0182). See [Section 9](#9-integration-engine).
 8. Action kinds: `input` = from environment (HTTP), always enabled in from-states; `output` = emitted events; `internal` = private state transitions.
 
 ### 3.3 Cedar (Access Control)
@@ -600,11 +600,11 @@ Work outside the entity is declared as `[[action.triggers]]` on the action that 
 | `entity` | Dispatches an action on another Temper entity (a *reaction*) | `target_entity`, `target_action`, `resolve_target` |
 | `wasm` | Runs a sandboxed WASM module, then optionally `on_success` / `on_failure` on this entity | `module` (`config = { ... }` is passed to it) |
 | `adapter` | Runs a native platform adapter, then `on_success` / `on_failure` | `adapter`, `config` |
-| `webhook` | Outbound HTTP call (parses and installs, but no runtime dispatcher delivers it yet — ADR-0046 known gap; use `webhooks.toml` below) | `url`, `method` (optional `headers`, `body_template`) |
+| `webhook` | Refused at load: no dispatcher sends it (ADR-0182). Make the call with `kind = "wasm"`, `module = "http_fetch"` | |
 | `hook` | A platform hook registered by the host | `hook` (e.g. `"DispatchCallback"`) |
 
 - **Reactions** (`kind = "entity"`) — in-system choreography. Fire-and-forget, bounded cascade, deterministic under `SimReactionSystem`. Use them when both source and target are Temper entities. See [`docs/reactions.md`](reactions.md) for the full reference and [ADR-0045](adrs/0045-reactions-first-class-app-primitive.md) for the design.
-- **WASM, adapter and webhook triggers** — out-of-system work (external HTTP, LLM calls, third-party APIs). Use them when you need computation, I/O beyond the Temper cluster, or explicit retry / timeout semantics.
+- **WASM and adapter triggers** — out-of-system work (external HTTP, LLM calls, third-party APIs). Use them when you need computation, I/O beyond the Temper cluster, or explicit retry / timeout semantics.
 
 Every trigger is authorized by Cedar under the invoking principal, or under the service identity named by its optional `principal`.
 
@@ -928,7 +928,7 @@ any of these causes silent failures that are hard to diagnose after the fact.
 - [ ] `model.csdl.xml` entity types match IOA spec names and states
 - [ ] Cedar policies exist for each entity type in `specs/policies/`
 - [ ] No warnings from L0 SMT (dead guards, unreachable states)
-- [ ] Every WASM / adapter / webhook `[[action.triggers]]` entry names a module, adapter or `url` that exists in the deployment, and its `on_success` / `on_failure` actions are declared
+- [ ] Every WASM / adapter `[[action.triggers]]` entry names a module or adapter that exists in the deployment, and its `on_success` / `on_failure` actions are declared
 
 **Persistence (events survive restart):**
 - [ ] `DATABASE_URL` is set and points to a running Postgres instance

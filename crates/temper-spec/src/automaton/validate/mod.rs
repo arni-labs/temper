@@ -2,6 +2,7 @@
 //! predicates and effects, state timeouts, triggers, webhooks and vectors.
 
 mod triggers;
+mod webhooks;
 
 use super::parser::AutomatonParseError;
 use super::types::*;
@@ -137,7 +138,8 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
 
     // 7. Validate [[action.triggers]] declarations (ADR-0046).
     triggers::validate_action_triggers(automaton, &action_names)?;
-    triggers::validate_timeouts_and_webhooks(automaton)?;
+    triggers::validate_timeout_args(automaton)?;
+    webhooks::validate_webhooks(automaton, &action_names)?;
 
     // 7. Validate [[vector]] access-path declarations (ADR-0155).
     //    - `property` and `model_property` must be declared state variables.
