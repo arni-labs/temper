@@ -23,6 +23,7 @@ use temper_observe::wide_event::{self, EventKind, WideEvent};
 mod guest_progress;
 mod http_clients;
 mod internal_http;
+mod redirects;
 pub(crate) mod span_hints;
 
 pub use http_clients::HttpClientCache;
@@ -347,10 +348,17 @@ type TextHttpInterceptorFuture =
 
 /// Production host: real HTTP calls via reqwest, real secrets.
 pub struct ProductionWasmHost {
-    /// HTTP client for making real requests.
+    /// HTTP client for making real requests. It follows no redirects; the host
+    /// follows them, each hop checked by `redirect_gate` (`redirects.rs`).
     client: reqwest::Client,
-    /// Separate client whose redirect policy is disabled for capabilities.
+    /// Separate pool for capability-bearing internal calls, with no proxy.
     internal_client: reqwest::Client,
+    /// The gate and context that check each redirect hop: the same pair the
+    /// wrapping `AuthorizedWasmHost` checks the guest's calls with. Without
+    /// it, a 3xx goes back to the guest.
+    redirect_gate: Option<(Arc<dyn crate::WasmAuthzGate>, crate::WasmAuthzContext)>,
+    /// The clients' request timeout, which a followed redirect chain shares.
+    http_timeout: std::time::Duration,
     /// Secrets from env vars or a secret store.
     secrets: BTreeMap<String, String>,
     /// Optional lazy secret resolver authoritative for guest secret lookups.
@@ -601,6 +609,8 @@ impl ProductionWasmHost {
         Self {
             client: clients.client.clone(),
             internal_client: clients.internal_client.clone(),
+            redirect_gate: None,
+            http_timeout: clients.timeout,
             secrets,
             secret_resolver: None,
             internal_api_base_url: None,
@@ -728,7 +738,15 @@ impl ProductionWasmHost {
         let headers = if is_internal {
             internal_http::sanitize_internal_headers(headers)
         } else {
-            headers.to_vec()
+            // The `http_call` gate checked the URL's host, and the request
+            // connects there. A guest `Host` header could still make a shared
+            // front end (a CDN, a proxy) route it to another site, so the
+            // client sets `Host` from the URL instead.
+            headers
+                .iter()
+                .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
+                .cloned()
+                .collect()
         };
         (is_internal, headers)
     }
@@ -949,28 +967,32 @@ impl WasmHost for ProductionWasmHost {
         // determinism-ok: is_internal check uses non-deterministic URL comparison,
         // but this runs in WasmHost (not simulation), so wall-clock/network access is fine.
 
-        // Auto-inject traceparent for cross-request trace correlation.
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) =
-                current_traceparent_header(&tracing::Span::current(), self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        // The call carries this request's trace (with_trace_headers).
+        builder = with_trace_headers(
+            builder,
+            &outbound_headers,
+            &tracing::Span::current(),
+            self.trace_id.as_deref(),
+        );
 
         if !body.is_empty() {
             builder = builder.body(body.to_string());
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            tracing::warn!(
-                error = %e,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "WASM host HTTP request failed"
-            );
-            format!("HTTP request failed: {e}")
-        })?;
+        let resp = self
+            .redirects()
+            .send(client, builder, "http_call")
+            .await
+            .map_err(|error| {
+                error.into_message(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "WASM host HTTP request failed"
+                    );
+                    format!("HTTP request failed: {e}")
+                })
+            })?;
         let status = resp.status().as_u16();
 
         // Loud auth failure logging for internal API calls (ADR-0043).
@@ -1251,27 +1273,31 @@ impl WasmHost for ProductionWasmHost {
 
         builder = self.add_internal_temper_headers(builder, method, url, &outbound_headers)?;
 
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) =
-                current_traceparent_header(&tracing::Span::current(), self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        builder = with_trace_headers(
+            builder,
+            &outbound_headers,
+            &tracing::Span::current(),
+            self.trace_id.as_deref(),
+        );
 
         if !body.is_empty() {
             builder = builder.body(body.to_vec());
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            tracing::warn!(
-                error = %e,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "WASM host binary HTTP request failed"
-            );
-            format!("HTTP binary request failed: {e}")
-        })?;
+        let resp = self
+            .redirects()
+            .send(client, builder, "http_call_binary")
+            .await
+            .map_err(|error| {
+                error.into_message(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "WASM host binary HTTP request failed"
+                    );
+                    format!("HTTP binary request failed: {e}")
+                })
+            })?;
         let status = resp.status().as_u16();
         let resp_bytes = resp.bytes().await.map_err(|e| {
             tracing::warn!(
@@ -1355,23 +1381,26 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.header(k.as_str(), v.as_str());
         }
         builder = self.add_internal_temper_headers(builder, "POST", url, &outbound_headers)?;
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) =
-                current_traceparent_header(&tracing::Span::current(), self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        builder = with_trace_headers(
+            builder,
+            &outbound_headers,
+            &tracing::Span::current(),
+            self.trace_id.as_deref(),
+        );
 
         if !body.is_empty() {
             builder = builder.body(encode_connect_json_frame(body));
         }
 
-        let resp = builder.send().await.map_err(|e| {
-            tracing::Span::current().record("duration_ms", started.elapsed().as_millis() as u64);
-            format!("Connect call failed: {e}")
-        })?;
+        let resp = self
+            .redirects()
+            .send(client, builder, "connect_call")
+            .await
+            .map_err(|error| {
+                tracing::Span::current()
+                    .record("duration_ms", started.elapsed().as_millis() as u64);
+                error.into_message(|e| format!("Connect call failed: {e}"))
+            })?;
 
         let status = resp.status().as_u16();
         tracing::Span::current().record("status_code", status);
@@ -1792,14 +1821,9 @@ impl WasmHost for ProductionWasmHost {
             &request.url,
             &outbound_headers,
         )?;
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) = current_traceparent_header(&span, self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        builder = with_trace_headers(builder, &outbound_headers, &span, self.trace_id.as_deref());
 
+        let redirects = self.redirects();
         tokio::spawn(
             async move {
                 let started = Instant::now();
@@ -1817,7 +1841,13 @@ impl WasmHost for ProductionWasmHost {
                 };
                 let req_body = reqwest::Body::wrap_stream(body_stream);
 
-                let send_result = builder.body(req_body).send().await;
+                let send_result = redirects
+                    .send(
+                        &client,
+                        builder.body(req_body),
+                        "http_stream_begin_outbound",
+                    )
+                    .await;
                 let _ = streams.close(bridge_req).await;
                 let resp = match send_result {
                     Ok(r) => r,
@@ -2376,6 +2406,37 @@ fn telemetry_url(url: &str) -> String {
     } else {
         format!("{authority}{path}")
     }
+}
+
+/// The trace an outbound call carries: the module's own `traceparent` when it set one, else the current span's. It
+/// goes as `traceparent` and again as its copy (`temper_observe::otel::TRACEPARENT_COPY`), which a proxy in front of
+/// the other side leaves alone when it puts its own span into `traceparent`.
+fn with_trace_headers(
+    mut builder: reqwest::RequestBuilder,
+    outbound_headers: &[(String, String)],
+    span: &tracing::Span,
+    fallback_trace_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let given = |name: &str| {
+        outbound_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let traceparent = match given("traceparent") {
+        Some(traceparent) => traceparent,
+        None => {
+            let Some(traceparent) = current_traceparent_header(span, fallback_trace_id) else {
+                return builder;
+            };
+            builder = builder.header("traceparent", traceparent.as_str());
+            traceparent
+        }
+    };
+    if given(temper_observe::otel::TRACEPARENT_COPY).is_none() {
+        builder = builder.header(temper_observe::otel::TRACEPARENT_COPY, traceparent);
+    }
+    builder
 }
 
 fn current_traceparent_header(
