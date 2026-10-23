@@ -629,7 +629,7 @@ pub(super) async fn bootstrap_installed_apps(
 
     for ((tenant, app_name), source) in requested {
         if matches!(source, AppBootstrapSource::Persisted)
-            && temper_platform::os_apps::get_os_app(&app_name).is_none()
+            && temper_platform::os_apps::tenant_os_app(&tenant, &app_name).is_none()
         {
             use std::io::Write as _;
 

@@ -303,3 +303,43 @@ async fn requested_install_denial_offers_decision_only_in_credential_tenant() {
         }
     }
 }
+
+#[tokio::test]
+async fn an_install_from_a_registry_other_than_the_configured_one_is_refused() {
+    let state = PlatformState::new(None);
+    state
+        .server
+        .authz
+        .reload_tenant_policies(
+            "tenant-a",
+            r#"permit(principal, action == Action::"install_app", resource);"#,
+        )
+        .expect("install policy should parse");
+    let app = tenant_api_router().with_state(state);
+    // Whether or not this process has a registry configured, a registry_url
+    // that is not it is refused before anything is fetched.
+    let response = app
+        .oneshot(typed_request(
+            Method::POST,
+            "/genesis/apps/install",
+            serde_json::json!({
+                "tenant": "tenant-a",
+                "app_ref": "acme/notes@0123456789abcdef0123456789abcdef01234567",
+                "registry_url": "http://127.0.0.1:9/not-the-configured-registry",
+            }),
+            "tenant-a",
+        ))
+        .await
+        .expect("request should run");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("TEMPER_GENESIS_REGISTRY_URL")),
+        "{body}"
+    );
+}

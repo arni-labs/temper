@@ -32,8 +32,8 @@ mod system_files;
 mod types;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
-    add_os_apps_dir, add_os_apps_dir_preferred, list_startup_os_apps, reload_os_apps,
-    set_os_apps_dir,
+    add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, list_startup_os_apps,
+    reload_os_apps, set_os_apps_dir,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
@@ -46,7 +46,10 @@ use entity_aliases::{
 };
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
-pub use reconcile::{os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order};
+pub use reconcile::{
+    os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
+    resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
+};
 pub(crate) use reconcile::{
     tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
 };
@@ -900,28 +903,40 @@ fn extract_description(guide: &str) -> Option<String> {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/// List all available OS apps.
+/// List the apps of the shared catalog.
 pub fn list_os_apps() -> Vec<AppEntry> {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.entries.clone()
+    cat.app_entries(None)
 }
 
-/// Get the full spec bundle for an OS app by name.
+/// List the apps `tenant` resolves: its own installs and the shared catalog.
+pub fn list_tenant_os_apps(tenant: &str) -> Vec<AppEntry> {
+    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
+    cat.app_entries(Some(tenant))
+}
+
+/// Get the full spec bundle for a shared-catalog app by name.
 ///
 /// Reads IOA, CSDL, and Cedar files from disk on each call so changes
 /// are picked up without a rebuild.
 pub fn get_os_app(name: &str) -> Option<AppBundle> {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    let app_dir = cat.paths.get(name)?;
+    let app_dir = cat.app_dir(None, name)?;
     load_app_bundle(app_dir)
 }
 
-/// Get the full app guide markdown for an app by name.
-pub fn get_app_guide(name: &str) -> Option<String> {
+/// Get the full spec bundle `tenant` resolves for `name`: its own install
+/// when it has one, otherwise the shared catalog's.
+pub fn tenant_os_app(tenant: &str, name: &str) -> Option<AppBundle> {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.entries
-        .iter()
-        .find(|e| e.name == name)
+    let app_dir = cat.app_dir(Some(tenant), name)?;
+    load_app_bundle(app_dir)
+}
+
+/// Get the full app guide markdown `tenant` resolves for `name`.
+pub fn tenant_app_guide(tenant: &str, name: &str) -> Option<String> {
+    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
+    cat.app_entry(Some(tenant), name)
         .and_then(|e| e.app_guide.clone())
 }
 
@@ -1030,10 +1045,10 @@ fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
     })
 }
 
-fn os_app_dependencies(name: &str) -> Vec<String> {
+fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     // Check manifest first.
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    if let Some(entry) = cat.entries.iter().find(|e| e.name == name)
+    if let Some(entry) = cat.app_entry(tenant, name)
         && !entry.dependencies.is_empty()
     {
         return entry
@@ -1080,7 +1095,7 @@ pub async fn install_os_app(
     tenant: &str,
     app_name: &str,
 ) -> Result<InstallResult, String> {
-    let order = resolve_os_app_install_order(&[app_name.to_string()])?;
+    let order = resolve_tenant_os_app_install_order(tenant, &[app_name.to_string()])?;
 
     let mut final_result = None;
     for app in order {
@@ -1109,10 +1124,11 @@ pub(super) async fn install_os_app_with_plan(
     let _serialized = install_guard::tenant(tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-        cat.paths.get(app_name).cloned().ok_or_else(|| {
-            let known: Vec<String> = cat.paths.keys().cloned().collect();
-            format!("OS app '{app_name}' not found in catalog (known path keys: {known:?})")
-        })?
+        cat.app_dir(Some(tenant), app_name)
+            .cloned()
+            .ok_or_else(|| {
+                format!("OS app '{app_name}' not found in catalog for tenant '{tenant}'")
+            })?
     };
     let bundle = load_app_bundle(&app_dir).ok_or_else(|| {
         format!(
@@ -1681,7 +1697,7 @@ async fn uploaded_wasm_replacement_context(
     else {
         return UploadedWasmReplacementContext::default();
     };
-    let digest = reconcile::digest_app_bundle(app_name, bundle);
+    let digest = reconcile::digest_app_bundle(Some(tenant), app_name, bundle);
     match ps.get_installed_app(tenant, app_name).await {
         Ok(Some(record)) => UploadedWasmReplacementContext {
             bundle_wasm_digest_changed: record.wasm_digest != digest.wasm_digest,
@@ -1751,7 +1767,7 @@ async fn bootstrap_app_entity(
     // Read app manifest for metadata.
     let manifest = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-        cat.entries.iter().find(|e| e.name == app_name).cloned()
+        cat.app_entry(Some(tenant), app_name).cloned()
     };
     let description = manifest
         .as_ref()

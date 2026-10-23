@@ -250,7 +250,7 @@ pub async fn recover_installed_app_runtime_state(
     tenant: &str,
     app_name: &str,
 ) -> InstalledAppRuntimeRecoveryOutcome {
-    let Some(bundle) = os_apps::get_os_app(app_name) else {
+    let Some(bundle) = os_apps::tenant_os_app(tenant, app_name) else {
         tracing::warn!(
             tenant,
             app = %app_name,
@@ -267,7 +267,7 @@ pub async fn recover_installed_app_runtime_state(
         return InstalledAppRuntimeRecoveryOutcome::Ready;
     }
 
-    let Some(digest) = os_apps::os_app_bundle_digest(app_name) else {
+    let Some(digest) = os_apps::tenant_os_app_bundle_digest(tenant, app_name) else {
         return InstalledAppRuntimeRecoveryOutcome::MissingBundle;
     };
 
@@ -329,7 +329,7 @@ pub async fn recover_installed_apps_runtime_state(
 
 /// Check if all entity types for an app are already registered.
 fn tenant_has_ready_app_specs(state: &PlatformState, tenant: &str, app_name: &str) -> bool {
-    let Some(bundle) = os_apps::get_os_app(app_name) else {
+    let Some(bundle) = os_apps::tenant_os_app(tenant, app_name) else {
         return false;
     };
     let tenant_id = TenantId::new(tenant);

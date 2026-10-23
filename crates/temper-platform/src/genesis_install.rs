@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Digest as _;
 use temper_runtime::tenant::TenantId;
 use temper_server::platform_store::InstalledAppRecord;
 use temper_server::state::{BoundActionHook, BoundActionHookContext, DispatchCommand, ServerState};
@@ -22,6 +21,7 @@ mod bundles;
 mod cache_paths;
 mod legacy_specs;
 mod object_lookup;
+mod registry;
 use blob_materialization::{
     MAX_GENESIS_TREE_CANONICAL_BYTES, blob_content_len, canonical_field_len, git_object_body,
     materialize_blob_content_field, read_canonical_field_bounded,
@@ -33,9 +33,12 @@ use bundles::{
 #[cfg(test)]
 use bundles::{safe_bundle_relative_path, write_bundle_app};
 use cache_paths::{
-    app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
+    CacheOwner, InstallSource, app_cache_dir, genesis_cache_root, replace_directory,
+    sanitize_fragment, validate_git_object_id, validate_identity_component,
 };
 use object_lookup::load_genesis_object;
+pub(crate) use registry::configured_registry;
+use registry::{RegistryUrl, registry_client};
 
 use crate::genesis_install_verify::{
     InstallVerifyDecision, classify_install_verify, mark_install_failed, platform_store,
@@ -43,7 +46,8 @@ use crate::genesis_install_verify::{
 };
 use crate::os_apps::{
     AppManifest, InstallResult, OsAppReconcileResult, add_os_apps_dir_preferred,
-    os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
+    add_tenant_os_apps_dir, reconcile_os_app, resolve_tenant_os_app_install_order,
+    tenant_os_app_bundle_digest,
 };
 use crate::state::PlatformState;
 
@@ -191,7 +195,17 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
             let app_ref = string_field(&installation.state.fields, "AppRef").unwrap_or_else(|| {
                 format!("{owner}/{name}@{}", version_hash.trim_start_matches('@'))
             });
-            let cache_root = genesis_cache_root(&platform.server, &app_ref);
+            let target_tenant = string_field(&installation.state.fields, "TargetTenant")
+                .filter(|target| !target.trim().is_empty())
+                .unwrap_or_else(|| source_tenant.clone());
+            let cache_root = genesis_cache_root(
+                &platform.server,
+                CacheOwner::Install {
+                    tenant: &target_tenant,
+                    source: InstallSource::Local(&source_tenant),
+                },
+                &app_ref,
+            );
             let root = GenesisAppBundle {
                 owner,
                 name,
@@ -201,7 +215,7 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
             match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
                 Ok(_) => {
                     legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                    add_os_apps_dir_preferred(cache_root);
+                    register_install_cache(&target_tenant, cache_root);
                     restored += 1;
                 }
                 Err(error) => {
@@ -265,14 +279,19 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         if record.source_kind != "genesis" || record.registry_url.trim().is_empty() {
             continue;
         }
-        let seen_key = if record.closure_id.trim().is_empty() {
-            record.app_ref.clone()
-        } else {
-            record.closure_id.clone()
+        let registry = match configured_registry(&record.registry_url) {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    app = %app_name,
+                    app_ref = %record.app_ref,
+                    error = %error,
+                    "Installed Genesis app names a registry this server does not install from"
+                );
+                continue;
+            }
         };
-        if !seen.insert(seen_key) {
-            continue;
-        }
         let root_ref = match parse_registry_app_ref(&record.app_ref) {
             Ok(root_ref) => root_ref,
             Err(error) => {
@@ -286,14 +305,26 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
                 continue;
             }
         };
-        let cache_root = genesis_cache_root(&platform.server, &record.app_ref);
         let registry_tenant = if record.registry_tenant.trim().is_empty() {
             "default"
         } else {
             record.registry_tenant.trim()
         };
+        let cache_root = genesis_cache_root(
+            &platform.server,
+            CacheOwner::Install {
+                tenant: &tenant,
+                source: InstallSource::Registry(registry_tenant),
+            },
+            &record.app_ref,
+        );
+        // Each tenant's install has its own directory, so records restore it
+        // once per directory, from that install's own registry tenant.
+        if !seen.insert(cache_root.clone()) {
+            continue;
+        }
         let materialized = match materialize_registry_app_closure_via_bundle(
-            &record.registry_url,
+            &registry,
             registry_tenant,
             root_ref.clone(),
             &cache_root,
@@ -306,18 +337,18 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
                     tenant = %tenant,
                     app = %app_name,
                     app_ref = %record.app_ref,
-                    registry_url = %record.registry_url,
+                    registry_url = %registry.as_str(),
                     error = %error,
                     "Genesis bundle cache recovery failed; falling back to git clone because TEMPER_GENESIS_INSTALL_GIT_FALLBACK is enabled"
                 );
-                materialize_registry_app_closure(&record.registry_url, root_ref, &cache_root).await
+                materialize_registry_app_closure(&registry, root_ref, &cache_root).await
             }
             Err(error) => Err(error),
         };
         match materialized {
             Ok(_) => {
                 legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                add_os_apps_dir_preferred(cache_root);
+                register_install_cache(&tenant, cache_root);
                 restored += 1;
             }
             Err(error) => {
@@ -386,8 +417,8 @@ pub async fn list_genesis_follow_latest_updates(
                 continue;
             }
         };
-        let registry_url = match normalize_registry_url(&record.registry_url) {
-            Ok(url) => url,
+        let registry = match configured_registry(&record.registry_url) {
+            Ok(registry) => registry,
             Err(error) => {
                 updates.push(follow_latest_error_update(record, error));
                 continue;
@@ -399,7 +430,7 @@ pub async fn list_genesis_follow_latest_updates(
             record.registry_tenant.trim().to_string()
         };
         let latest = match fetch_registry_latest_version_hash(
-            &registry_url,
+            &registry,
             &registry_tenant,
             &parsed.owner,
             &parsed.name,
@@ -421,7 +452,7 @@ pub async fn list_genesis_follow_latest_updates(
             tenant: record.tenant,
             app_name: record.app_name,
             app_ref: record.app_ref,
-            registry_url,
+            registry_url: registry.as_str().to_string(),
             registry_tenant,
             pinned_version_hash: record.pinned_version_hash,
             current_version_hash: current.clone(),
@@ -472,14 +503,26 @@ async fn ensure_prior_bundle_available(
         prior_ref.name,
         prior_hash.trim_start_matches('@')
     );
-    let cache_root = genesis_cache_root(&platform.server, &cache_key);
+    let registry_tenant = if prior.registry_tenant.trim().is_empty() {
+        "default".to_string()
+    } else {
+        prior.registry_tenant.trim().to_string()
+    };
+    let cache_root = genesis_cache_root(
+        &platform.server,
+        CacheOwner::Install {
+            tenant: &prior.tenant,
+            source: InstallSource::Registry(&registry_tenant),
+        },
+        &cache_key,
+    );
     if cache_root.is_dir() {
-        add_os_apps_dir_preferred(cache_root.clone());
+        register_install_cache(&prior.tenant, cache_root.clone());
         // A dir on disk is not proof the bundle is intact: a prior install could have crashed
         // mid-materialize. Trust the cache only if it actually yields the prior app at the expected
         // digest; otherwise fall through and re-materialize from the registry.
-        let cached_digest =
-            os_app_bundle_digest(&prior.app_name).map(|digest| digest.bundle_digest);
+        let cached_digest = tenant_os_app_bundle_digest(&prior.tenant, &prior.app_name)
+            .map(|digest| digest.bundle_digest);
         let cache_is_trustworthy = match cached_digest {
             Some(digest) if !prior.bundle_digest.is_empty() => digest == prior.bundle_digest,
             Some(_) => true, // no recorded digest to check against; the app at least resolves
@@ -497,12 +540,7 @@ async fn ensure_prior_bundle_available(
     if prior.registry_url.trim().is_empty() {
         return Ok(());
     }
-    let registry_url = normalize_registry_url(&prior.registry_url)?;
-    let registry_tenant = if prior.registry_tenant.trim().is_empty() {
-        "default".to_string()
-    } else {
-        prior.registry_tenant.trim().to_string()
-    };
+    let registry = configured_registry(&prior.registry_url)?;
     std::fs::create_dir_all(&cache_root).map_err(|error| {
         format!(
             "create Genesis rollback cache '{}': {error}",
@@ -510,7 +548,7 @@ async fn ensure_prior_bundle_available(
         )
     })?;
     materialize_registry_app_closure_via_bundle(
-        &registry_url,
+        &registry,
         &registry_tenant,
         prior_ref,
         &cache_root,
@@ -522,7 +560,7 @@ async fn ensure_prior_bundle_available(
             prior.app_ref
         )
     })?;
-    add_os_apps_dir_preferred(cache_root);
+    register_install_cache(&prior.tenant, cache_root);
     Ok(())
 }
 
@@ -541,7 +579,8 @@ pub async fn install_genesis_app_from_registry(
     request: GenesisRegistryInstallRequest,
 ) -> Result<GenesisRegistryInstallResult, String> {
     let install_started = Instant::now();
-    let registry_url = normalize_registry_url(&request.registry_url)?;
+    let registry = configured_registry(&request.registry_url)?;
+    let registry_url = registry.as_str().to_string();
     let registry_tenant = if request.registry_tenant.trim().is_empty() {
         "default".to_string()
     } else {
@@ -560,7 +599,14 @@ pub async fn install_genesis_app_from_registry(
         root_ref.name,
         root_hash.trim_start_matches('@')
     );
-    let cache_root = genesis_cache_root(&platform.server, &cache_key);
+    let cache_root = genesis_cache_root(
+        &platform.server,
+        CacheOwner::Install {
+            tenant: &request.tenant,
+            source: InstallSource::Registry(&registry_tenant),
+        },
+        &cache_key,
+    );
     std::fs::create_dir_all(&cache_root).map_err(|error| {
         format!(
             "create Genesis registry cache '{}': {error}",
@@ -570,7 +616,7 @@ pub async fn install_genesis_app_from_registry(
 
     let materialize_started = Instant::now();
     let materialized_refs = match materialize_registry_app_closure_via_bundle(
-        &registry_url,
+        &registry,
         &registry_tenant,
         root_ref.clone(),
         &cache_root,
@@ -596,8 +642,7 @@ pub async fn install_genesis_app_from_registry(
             );
             let git_started = Instant::now();
             let refs =
-                materialize_registry_app_closure(&registry_url, root_ref.clone(), &cache_root)
-                    .await?;
+                materialize_registry_app_closure(&registry, root_ref.clone(), &cache_root).await?;
             log_genesis_install_phase(
                 &request.app_ref,
                 "materialize_git_fallback",
@@ -645,7 +690,7 @@ pub async fn install_genesis_app_from_registry(
         .find(|record| record.app_name == root_ref.name)
         .cloned();
 
-    add_os_apps_dir_preferred(cache_root.clone());
+    register_install_cache(&request.tenant, cache_root.clone());
 
     let install_platform = platform.clone();
     let reconcile_started = Instant::now();
@@ -826,7 +871,7 @@ pub(crate) async fn reconcile_materialized_app_closure(
     tenant: &str,
     root_app_name: &str,
 ) -> Result<InstallResult, String> {
-    let order = resolve_os_app_install_order(&[root_app_name.to_string()])?;
+    let order = resolve_tenant_os_app_install_order(tenant, &[root_app_name.to_string()])?;
     let mut root_result = InstallResult::default();
 
     for app_name in order {
@@ -888,23 +933,6 @@ fn genesis_git_fallback_enabled() -> bool {
     )
 }
 
-fn normalize_registry_url(raw: &str) -> Result<String, String> {
-    let fallback = std::env::var("TEMPER_GENESIS_REGISTRY_URL").unwrap_or_default();
-    let raw = if raw.trim().is_empty() {
-        fallback.as_str()
-    } else {
-        raw
-    };
-    let value = raw.trim().trim_end_matches('/');
-    if value.is_empty() {
-        return Err("registry_url is required for Genesis app install".to_string());
-    }
-    if !(value.starts_with("http://") || value.starts_with("https://")) {
-        return Err("registry_url must start with http:// or https://".to_string());
-    }
-    Ok(value.to_string())
-}
-
 fn follow_latest_error_update(
     record: InstalledAppRecord,
     error: String,
@@ -929,7 +957,7 @@ fn follow_latest_error_update(
 }
 
 async fn fetch_registry_latest_version_hash(
-    registry_url: &str,
+    registry: &RegistryUrl,
     registry_tenant: &str,
     owner: &str,
     name: &str,
@@ -941,10 +969,10 @@ async fn fetch_registry_latest_version_hash(
     );
     let url = format!(
         "{}/tdata/Apps('{}')",
-        registry_url.trim_end_matches('/'),
+        registry.as_str(),
         app_id.replace('\'', "''")
     );
-    let response = reqwest::Client::new()
+    let response = registry_client()?
         .get(&url)
         .header("X-Tenant-Id", registry_tenant)
         .send()
@@ -1018,7 +1046,7 @@ fn parse_registry_app_ref(app_ref: &str) -> Result<RegistryAppRef, String> {
 }
 
 async fn materialize_git_registry_app(
-    registry_url: &str,
+    registry: &RegistryUrl,
     owner: &str,
     name: &str,
     version_hash: Option<&str>,
@@ -1026,7 +1054,7 @@ async fn materialize_git_registry_app(
 ) -> Result<String, String> {
     validate_identity_component("owner", owner)?;
     validate_identity_component("app name", name)?;
-    let remote = registry_git_url(registry_url, owner, name);
+    let remote = registry_git_url(registry, owner, name);
     let git_dir = app_dir.join(".git");
     if app_dir.exists() && !git_dir.is_dir() {
         std::fs::remove_dir_all(app_dir).map_err(|error| {
@@ -1046,10 +1074,17 @@ async fn materialize_git_registry_app(
             })?;
         }
         let app_dir_arg = app_dir.display().to_string();
-        run_git(None, &["clone", &remote, &app_dir_arg]).await?;
+        // Like the registry HTTP client, git takes objects from the configured
+        // registry itself and does not follow redirects.
+        let clone = [
+            GIT_NO_REDIRECTS,
+            &["clone", remote.as_str(), app_dir_arg.as_str()],
+        ];
+        run_git(None, &clone.concat()).await?;
     } else {
         run_git(Some(app_dir), &["remote", "set-url", "origin", &remote]).await?;
-        run_git(Some(app_dir), &["fetch", "origin", "--tags", "--prune"]).await?;
+        let fetch = [GIT_NO_REDIRECTS, &["fetch", "origin", "--tags", "--prune"]];
+        run_git(Some(app_dir), &fetch.concat()).await?;
     }
 
     if let Some(hash) = version_hash {
@@ -1069,7 +1104,7 @@ async fn materialize_git_registry_app(
 }
 
 async fn materialize_registry_app_closure(
-    registry_url: &str,
+    registry: &RegistryUrl,
     root_ref: RegistryAppRef,
     cache_root: &Path,
 ) -> Result<Vec<RegistryAppRef>, String> {
@@ -1085,7 +1120,7 @@ async fn materialize_registry_app_closure(
 
         let app_dir = app_cache_dir(cache_root, &app_ref.name)?;
         let resolved_hash = materialize_git_registry_app(
-            registry_url,
+            registry,
             &app_ref.owner,
             &app_ref.name,
             app_ref.version_hash.as_deref(),
@@ -1111,14 +1146,12 @@ async fn materialize_registry_app_closure(
     Ok(materialized_refs)
 }
 
-fn registry_git_url(registry_url: &str, owner: &str, name: &str) -> String {
-    format!(
-        "{}/{}/{}.git",
-        registry_url.trim_end_matches('/'),
-        owner,
-        name
-    )
+fn registry_git_url(registry: &RegistryUrl, owner: &str, name: &str) -> String {
+    format!("{}/{}/{}.git", registry.as_str(), owner, name)
 }
+
+/// Git options for registry clones and fetches: do not follow HTTP redirects.
+const GIT_NO_REDIRECTS: &[&str] = &["-c", "http.followRedirects=false"];
 
 async fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String, String> {
     let mut command = tokio::process::Command::new("git");
@@ -1202,7 +1235,14 @@ impl BoundActionHook for GenesisInstallHook {
         )?;
         let installation_id = installation_id(entity_id, &target_tenant, &version_hash);
 
-        let cache_root = genesis_cache_root(state, &app_ref);
+        let cache_root = genesis_cache_root(
+            state,
+            CacheOwner::Install {
+                tenant: &target_tenant,
+                source: InstallSource::Local(tenant.as_str()),
+            },
+            &app_ref,
+        );
         let materialized_apps = materialize_app_closure(
             state,
             tenant,
@@ -1216,7 +1256,7 @@ impl BoundActionHook for GenesisInstallHook {
         )
         .await?;
         let app_dir = app_cache_dir(&cache_root, &name)?;
-        add_os_apps_dir_preferred(cache_root);
+        register_install_cache(&target_tenant, cache_root);
 
         let mut platform = self.platform.clone();
         platform.server = state.clone();
@@ -1384,7 +1424,8 @@ async fn record_genesis_install_metadata(
     else {
         return Ok(());
     };
-    let Some(digest) = os_app_bundle_digest(metadata.app_name) else {
+    let Some(digest) = tenant_os_app_bundle_digest(metadata.target_tenant, metadata.app_name)
+    else {
         return Err(format!(
             "installed Genesis app {} but could not compute bundle digest for durable provenance",
             metadata.app_name
@@ -1624,7 +1665,11 @@ pub async fn export_genesis_registry_bundle_for(
         root.name,
         root.version_hash.trim_start_matches('@')
     );
-    let cache_root = genesis_cache_root(&platform.server, &app_ref);
+    let cache_root = genesis_cache_root(
+        &platform.server,
+        CacheOwner::Export { registry_tenant },
+        &app_ref,
+    );
     let closure = resolve_genesis_app_closure(&platform.server, &tenant, root, audience).await?;
     if closure.len() > MAX_GENESIS_BUNDLE_APPS {
         return Err(format!(
@@ -1737,6 +1782,9 @@ async fn resolve_genesis_app_closure(
         }
         let cache_root = genesis_cache_root(
             state,
+            CacheOwner::DependencyRead {
+                tenant: tenant.as_str(),
+            },
             &format!(
                 "{}-{}-dependency-read-{}",
                 app.owner,
@@ -2162,14 +2210,17 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn genesis_cache_root(state: &ServerState, app_ref: &str) -> PathBuf {
-    let root = if state.data_dir.as_os_str().is_empty() {
-        std::env::temp_dir().join("temper-genesis-app-cache")
+/// Make an install's cache directory resolve for the tenant it was made for.
+///
+/// The platform tenant's installs are the shared catalog; every other
+/// tenant's are its own, so they never change what another tenant or a
+/// shared app resolves.
+fn register_install_cache(tenant: &str, cache_root: PathBuf) {
+    if tenant == TenantId::default().as_str() {
+        add_os_apps_dir_preferred(cache_root);
     } else {
-        state.data_dir.join("genesis-app-cache")
-    };
-    let digest = format!("{:x}", sha2::Sha256::digest(app_ref.as_bytes()));
-    root.join(format!("{}-{}", sanitize_fragment(app_ref), &digest[..16]))
+        add_tenant_os_apps_dir(tenant, cache_root);
+    }
 }
 
 fn genesis_source_tenants() -> Vec<String> {
@@ -2198,26 +2249,6 @@ fn installation_id(app_id: &str, tenant: &str, version_hash: &str) -> String {
             .take(16)
             .collect::<String>()
     )
-}
-
-fn sanitize_fragment(input: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in input.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "item".to_string()
-    } else {
-        trimmed
-    }
 }
 
 #[cfg(test)]
@@ -2319,9 +2350,149 @@ mod tests {
         );
         state.data_dir = data_dir.path().to_path_buf();
 
+        let owner = CacheOwner::Install {
+            tenant: "tenant-a",
+            source: InstallSource::Registry("default"),
+        };
         assert_ne!(
-            genesis_cache_root(&state, "owner/app@a-b"),
-            genesis_cache_root(&state, "owner/app@a/b")
+            genesis_cache_root(&state, owner, "owner/app@a-b"),
+            genesis_cache_root(&state, owner, "owner/app@a/b")
+        );
+    }
+
+    #[test]
+    fn each_tenants_install_of_one_ref_has_its_own_cache_directory() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let mut state = ServerState::new(
+            ActorSystem::new("genesis-cache-owner-test"),
+            CsdlDocument {
+                version: "4.0".to_string(),
+                schemas: Vec::new(),
+            },
+            String::new(),
+        );
+        state.data_dir = data_dir.path().to_path_buf();
+        let app_ref = "acme/notes@0123456789abcdef0123456789abcdef01234567";
+        let install = |tenant, source| CacheOwner::Install { tenant, source };
+
+        let roots = [
+            genesis_cache_root(
+                &state,
+                install("tenant-a", InstallSource::Registry("default")),
+                app_ref,
+            ),
+            genesis_cache_root(
+                &state,
+                install("tenant-b", InstallSource::Registry("default")),
+                app_ref,
+            ),
+            genesis_cache_root(
+                &state,
+                install("tenant-a", InstallSource::Registry("other")),
+                app_ref,
+            ),
+            genesis_cache_root(
+                &state,
+                install("tenant-a", InstallSource::Local("default")),
+                app_ref,
+            ),
+            genesis_cache_root(
+                &state,
+                CacheOwner::Export {
+                    registry_tenant: "default",
+                },
+                app_ref,
+            ),
+            genesis_cache_root(
+                &state,
+                CacheOwner::DependencyRead { tenant: "default" },
+                app_ref,
+            ),
+        ];
+        let distinct: BTreeSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), roots.len(), "{roots:?}");
+        assert_eq!(
+            roots[0],
+            genesis_cache_root(
+                &state,
+                install("tenant-a", InstallSource::Registry("default")),
+                app_ref
+            ),
+            "the same install resolves to the same directory"
+        );
+    }
+
+    fn write_catalog_app(root: &Path, app_name: &str, marker: &str) {
+        let app_dir = root.join(app_name);
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        std::fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n"))
+            .expect("app.toml");
+        std::fs::write(
+            app_dir.join("APP.md"),
+            format!("# {app_name}\n\n{marker}\n"),
+        )
+        .expect("APP.md");
+    }
+
+    #[test]
+    fn the_platform_tenants_installs_are_the_shared_catalog() {
+        let app_name = format!("shared-install-{}", uuid::Uuid::new_v4());
+        let root = tempfile::tempdir().expect("cache root");
+        write_catalog_app(root.path(), &app_name, "PLATFORM-INSTALL");
+
+        register_install_cache(TenantId::default().as_str(), root.path().to_path_buf());
+
+        let other_tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let guide = crate::os_apps::tenant_app_guide(&other_tenant, &app_name)
+            .expect("every tenant resolves the platform tenant's install");
+        assert!(guide.contains("PLATFORM-INSTALL"));
+        assert!(crate::os_apps::get_os_app(&app_name).is_some());
+    }
+
+    #[test]
+    fn a_tenant_install_does_not_change_another_tenants_app() {
+        let app_name = format!("tenant-install-{}", uuid::Uuid::new_v4());
+        let shared = tempfile::tempdir().expect("shared root");
+        write_catalog_app(shared.path(), &app_name, "SHARED");
+        add_os_apps_dir_preferred(shared.path().to_path_buf());
+        let tenant_a = format!("tenant-a-{}", uuid::Uuid::new_v4());
+        let tenant_b = format!("tenant-b-{}", uuid::Uuid::new_v4());
+        let root_a = tempfile::tempdir().expect("tenant a root");
+        write_catalog_app(root_a.path(), &app_name, "TENANT-A");
+        let root_b = tempfile::tempdir().expect("tenant b root");
+        write_catalog_app(root_b.path(), &app_name, "TENANT-B");
+
+        register_install_cache(&tenant_a, root_a.path().to_path_buf());
+
+        let guide =
+            |tenant: &str| crate::os_apps::tenant_app_guide(tenant, &app_name).expect("guide");
+        assert!(guide(&tenant_a).contains("TENANT-A"));
+        assert!(guide(&tenant_b).contains("SHARED"));
+        assert!(guide(TenantId::default().as_str()).contains("SHARED"));
+        assert!(
+            crate::os_apps::list_os_apps()
+                .iter()
+                .filter(|entry| entry.name == app_name)
+                .all(|entry| entry
+                    .app_guide
+                    .as_deref()
+                    .is_some_and(|g| g.contains("SHARED")))
+        );
+
+        register_install_cache(&tenant_b, root_b.path().to_path_buf());
+
+        assert!(guide(&tenant_a).contains("TENANT-A"));
+        assert!(guide(&tenant_b).contains("TENANT-B"));
+        let listed: Vec<_> = crate::os_apps::list_tenant_os_apps(&tenant_b)
+            .into_iter()
+            .filter(|entry| entry.name == app_name)
+            .collect();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0]
+                .app_guide
+                .as_deref()
+                .is_some_and(|g| g.contains("TENANT-B"))
         );
     }
 
@@ -2478,7 +2649,11 @@ mod tests {
     #[test]
     fn registry_git_urls_are_stable() {
         assert_eq!(
-            registry_git_url("https://genesis.example/", "temperpaw", "paw-agent"),
+            registry_git_url(
+                &registry::registry_for_test("https://genesis.example/"),
+                "temperpaw",
+                "paw-agent"
+            ),
             "https://genesis.example/temperpaw/paw-agent.git"
         );
     }

@@ -7,7 +7,7 @@ use temper_server::platform_store::InstalledAppRecord;
 use super::{
     AppBundle, AppEntry, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult, catalog,
     get_os_app, install_os_app_with_plan, os_app_dependencies,
-    restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
+    restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle, tenant_os_app,
 };
 use crate::state::PlatformState;
 
@@ -39,10 +39,22 @@ fn collect_install_order_with_dependencies(
     Ok(())
 }
 
-/// Resolve a deduplicated dependency-first install order for a set of apps.
+/// Resolve a deduplicated dependency-first install order for a set of
+/// shared-catalog apps.
 pub fn resolve_os_app_install_order(app_names: &[String]) -> Result<Vec<String>, String> {
     resolve_os_app_install_order_with_dependencies(app_names, |app_name| {
-        os_app_dependencies(app_name)
+        os_app_dependencies(None, app_name)
+    })
+}
+
+/// Resolve a deduplicated dependency-first install order for a set of apps as
+/// `tenant` resolves them (its own installs, then the shared catalog).
+pub fn resolve_tenant_os_app_install_order(
+    tenant: &str,
+    app_names: &[String],
+) -> Result<Vec<String>, String> {
+    resolve_os_app_install_order_with_dependencies(app_names, |app_name| {
+        os_app_dependencies(Some(tenant), app_name)
     })
 }
 
@@ -65,12 +77,9 @@ pub(super) fn resolve_os_app_install_order_with_dependencies(
     Ok(order)
 }
 
-fn app_entry(app_name: &str) -> Option<AppEntry> {
+fn app_entry(tenant: Option<&str>, app_name: &str) -> Option<AppEntry> {
     let cat = catalog().read().expect("OS app catalog lock poisoned");
-    cat.entries
-        .iter()
-        .find(|entry| entry.name == app_name)
-        .cloned()
+    cat.app_entry(tenant, app_name).cloned()
 }
 
 fn digest_bytes(parts: &[(&str, Vec<u8>)]) -> String {
@@ -92,8 +101,12 @@ fn digest_named_parts(parts: &[(String, Vec<u8>)]) -> String {
     digest_bytes(&parts)
 }
 
-pub(super) fn digest_app_bundle(app_name: &str, bundle: &AppBundle) -> OsAppBundleDigest {
-    let entry = app_entry(app_name);
+pub(super) fn digest_app_bundle(
+    tenant: Option<&str>,
+    app_name: &str,
+    bundle: &AppBundle,
+) -> OsAppBundleDigest {
+    let entry = app_entry(tenant, app_name);
     let app_version = entry
         .as_ref()
         .map(|entry| entry.version.clone())
@@ -224,9 +237,14 @@ pub(super) fn digest_app_bundle(app_name: &str, bundle: &AppBundle) -> OsAppBund
     }
 }
 
-/// Compute the current bundle digest for an app in the catalog.
+/// Compute the current bundle digest for an app in the shared catalog.
 pub fn os_app_bundle_digest(app_name: &str) -> Option<OsAppBundleDigest> {
-    get_os_app(app_name).map(|bundle| digest_app_bundle(app_name, &bundle))
+    get_os_app(app_name).map(|bundle| digest_app_bundle(None, app_name, &bundle))
+}
+
+/// Compute the current bundle digest of the app `tenant` resolves for `app_name`.
+pub fn tenant_os_app_bundle_digest(tenant: &str, app_name: &str) -> Option<OsAppBundleDigest> {
+    tenant_os_app(tenant, app_name).map(|bundle| digest_app_bundle(Some(tenant), app_name, &bundle))
 }
 
 pub(super) fn plan_reconcile_from_installed_record(
@@ -393,7 +411,7 @@ pub(super) async fn record_app_install_metadata_for_bundle(
     app_name: &str,
     bundle: &AppBundle,
 ) {
-    let bundle_digest = digest_app_bundle(app_name, bundle);
+    let bundle_digest = digest_app_bundle(Some(tenant), app_name, bundle);
     record_app_install_metadata(state, tenant, &bundle_digest, "installed").await;
 }
 
@@ -406,8 +424,9 @@ pub async fn reconcile_os_app(
     tenant: &str,
     app_name: &str,
 ) -> Result<OsAppReconcileResult, String> {
-    let bundle = get_os_app(app_name).ok_or_else(|| format!("OS app '{app_name}' not found"))?;
-    let digest = digest_app_bundle(app_name, &bundle);
+    let bundle =
+        tenant_os_app(tenant, app_name).ok_or_else(|| format!("OS app '{app_name}' not found"))?;
+    let digest = digest_app_bundle(Some(tenant), app_name, &bundle);
 
     if let Some(ps) = state
         .server
