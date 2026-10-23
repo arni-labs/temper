@@ -899,13 +899,11 @@ async fn batch_file_version_text_read_uses_local_store_for_internal_blob_endpoin
         .expect("persist blob");
 
     let vault = SecretsVault::new(&[7u8; 32]);
-    vault
-        .cache_secret(
-            tenant,
-            "blob_endpoint",
-            "http://127.0.0.1:3474/_internal/blobs".to_string(),
-        )
-        .expect("cache blob endpoint");
+    vault.cache_secret(
+        tenant,
+        "blob_endpoint",
+        "http://127.0.0.1:3474/_internal/blobs".to_string(),
+    );
     state.secrets_vault = Some(Arc::new(vault));
 
     let app = build_app_with_state(state);

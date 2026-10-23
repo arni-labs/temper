@@ -148,9 +148,7 @@ async fn state_with(test: &str, mock: &MockServer, link: bool) -> ServerState {
         ("blob_secret_key", "temporary-secret".to_string()),
         ("blob_session_token", "dGVtcG9yYXJ5".to_string()),
     ] {
-        vault
-            .cache_secret("default", key, value)
-            .expect("cache secret");
+        vault.cache_secret("default", key, value);
     }
     if link {
         for (key, value) in [
@@ -158,9 +156,7 @@ async fn state_with(test: &str, mock: &MockServer, link: bool) -> ServerState {
             ("blob_link_secret_key", "link-secret"),
             ("blob_link_session_token", "bGluaw=="),
         ] {
-            vault
-                .cache_secret("default", key, value.to_string())
-                .expect("cache secret");
+            vault.cache_secret("default", key, value.to_string());
         }
     }
     state.secrets_vault = Some(std::sync::Arc::new(vault));
