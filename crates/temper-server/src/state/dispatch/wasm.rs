@@ -194,6 +194,7 @@ pub(crate) fn authorized_http_endpoint_host(
     .with_internal_api_base_url(internal_api_url)
     .with_internal_capability_issuer(capability_issuer)
     .with_invocation_context(invocation_context.clone())
+    .with_redirect_gate(Arc::clone(&gate), authz_context.clone())
     // ARN-243: the HttpEndpoint path honours the same per-tenant LLM content
     // export decision as the integration path above.
     .with_llm_content_export(state.export_llm_content(tenant.as_str()));
@@ -865,6 +866,7 @@ impl crate::state::ServerState {
                 .with_progress_emitter(progress_emitter)
                 .with_internal_api_base_url(internal_api_url)
                 .with_invocation_context(host_invocation_context)
+                .with_redirect_gate(Arc::clone(&gate), authz_ctx.clone())
                 .with_llm_content_export(self.export_llm_content(ctx.entity_ref.tenant.as_str()))
                 .with_text_http_interceptor(
                     local_file_interceptor
@@ -1612,6 +1614,7 @@ impl crate::state::ServerState {
         .with_progress_emitter(progress_emitter)
         .with_internal_api_base_url(internal_api_base_url(self))
         .with_invocation_context(context.clone())
+        .with_redirect_gate(Arc::clone(&base_gate), authz_ctx.clone())
         .with_llm_content_export(self.export_llm_content(tenant.as_str()));
         if let Some(resolver) = secret_resolver {
             base_host = base_host.with_secret_resolver(resolver);
