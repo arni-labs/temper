@@ -83,7 +83,11 @@ pub fn build_routes(state: ServerState) -> Router {
                 .patch(odata::handle_odata_patch)
                 .put(odata::handle_odata_put)
                 .delete(odata::handle_odata_delete),
-        );
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            odata::refuse_unavailable_tenant,
+        ));
 
     let router = Router::new()
         .nest("/tdata", tdata)

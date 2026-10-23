@@ -15,6 +15,7 @@ use serde::Serialize;
 use temper_runtime::tenant::TenantId;
 use temper_server::state::WasmModuleSource;
 use temper_spec::automaton;
+use temper_spec::cross_invariant::parse_cross_invariants;
 use temper_spec::csdl::{emit_csdl_xml, merge_csdl, parse_csdl};
 
 use crate::bootstrap;
@@ -1178,11 +1179,23 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
+        // The bundle's CSDL and cross-invariants are parsed here, before any
+        // write: a bundle that cannot be registered leaves no stored row for
+        // the next start to restore, and is refused with this error.
+        if let Some(source) = bundle
+            .cross_invariants_toml
+            .as_deref()
+            .filter(|source| !source.trim().is_empty())
+        {
+            parse_cross_invariants(source).map_err(|e| {
+                format!("Failed to parse cross-invariants for os-app '{app_name}': {e}")
+            })?;
+        }
         // App installs must preserve existing tenant types.
         let merged_csdl = if let Some(ref csdl) = bundle.csdl {
+            let incoming = parse_csdl(csdl)
+                .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
             if let Some(existing) = registry.get_tenant(&tenant_id) {
-                let incoming = parse_csdl(csdl)
-                    .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
                 Some(emit_csdl_xml(&merge_csdl(&existing.csdl, &incoming)))
             } else {
                 Some(csdl.clone())
@@ -1383,7 +1396,7 @@ pub(super) async fn install_os_app_with_plan(
                     cross_invariants_source: bundle.cross_invariants_toml.as_deref(),
                     verification_mode: bootstrap::BootstrapSpecVerificationMode::TrustBundle,
                 },
-            );
+            )?;
 
             if let Some(ps) = state
                 .server

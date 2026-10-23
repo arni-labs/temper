@@ -195,6 +195,9 @@ pub(super) async fn build_registry(
             println!("  Restored {total_restored} specs from Turso.");
         }
     }
+    for (tenant, reason) in registry.unavailable_tenants() {
+        eprintln!("  Tenant '{tenant}' is unavailable, its stored specs did not load: {reason}");
+    }
 
     // Load app specs from disk, persisting to backend.
     for (tenant, specs_dir) in apps {
