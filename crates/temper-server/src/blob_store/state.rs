@@ -20,6 +20,14 @@ impl ServerState {
         })
     }
 
+    /// Why `key` names no object this tenant may use, or `None` when it may. A refused key is the caller's to fix,
+    /// unlike a store that fails; a server without a configured store reports that on the read or write itself.
+    pub(crate) fn refused_blob_key(&self, tenant: &TenantId, key: &str) -> Option<String> {
+        self.blob_store_for_tenant(tenant)
+            .ok()
+            .and_then(|store| store.check_key(key).err())
+    }
+
     fn unscoped_blob_store_for_tenant(&self, tenant: &TenantId) -> Result<BlobStore, String> {
         if let Some(vault) = self.secrets_vault.as_ref()
             && let Some(endpoint) = vault.get_secret(tenant.as_str(), "blob_endpoint")

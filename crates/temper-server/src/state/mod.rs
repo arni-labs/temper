@@ -43,11 +43,9 @@ pub use pending_decisions::{
 };
 pub use persistence::WasmModuleSource;
 pub use policy_suggestions::PolicySuggestionEngine;
-pub use published_artifacts::PublishFileArtifactRequest;
 #[cfg(feature = "observe")]
-pub(crate) use published_artifacts::{
-    PUBLISH_ARTIFACT_STALE_AUTHORIZATION, PublishArtifactAuthorization,
-};
+pub(crate) use published_artifacts::PublishArtifactAuthorization;
+pub use published_artifacts::{PublishArtifactError, PublishFileArtifactRequest};
 pub(crate) use query_projection_queue::{ProjectionEnqueueOutcome, QueryProjectionWriteQueue};
 pub use trajectory::{TrajectoryEntry, TrajectorySource};
 pub use wasm_invocation_log::WasmInvocationEntry;

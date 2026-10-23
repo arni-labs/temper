@@ -7,7 +7,7 @@ use temper_store_turso::TursoEventStore;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::PublishFileArtifactRequest;
+use super::{PublishArtifactError, PublishFileArtifactRequest};
 use crate::aws_sigv4::sha256_hex;
 use crate::secrets::vault::SecretsVault;
 use crate::state::ServerState;
@@ -164,5 +164,8 @@ async fn bytes_that_do_not_match_their_content_hash_are_not_published() {
         .publish_file_artifact(&tenant, request())
         .await
         .expect_err("mismatched bytes are refused");
-    assert!(error.contains("do not match"), "{error}");
+    assert!(
+        matches!(&error, PublishArtifactError::Rejected(message) if message.contains("do not match")),
+        "{error}"
+    );
 }

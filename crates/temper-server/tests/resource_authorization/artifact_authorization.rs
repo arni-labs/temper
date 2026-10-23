@@ -242,3 +242,56 @@ async fn local_artifact_publish_uses_direct_tenant_blob_store() {
         .expect("read local artifact blob");
     assert_eq!(stored.as_deref(), Some(b"local artifact body".as_slice()));
 }
+
+#[tokio::test]
+async fn publishing_bytes_that_differ_from_their_recorded_hash_is_the_callers_request_to_fix() {
+    let (mut state, store, _temp) = state_with_turso("artifact-hash-mismatch").await;
+    state.secrets_vault = Some(std::sync::Arc::new(artifact_vault(
+        "http://127.0.0.1:9/_internal/blobs",
+    )));
+    state
+        .authz
+        .reload_tenant_policies(
+            TENANT,
+            r#"permit(
+  principal == Customer::"publisher",
+  action == Action::"publish_artifact",
+  resource == File::"file-a"
+);"#,
+        )
+        .expect("artifact policy should parse");
+    // The recorded hash is that of "local artifact body"; the stored bytes are not.
+    seed_file(
+        &store,
+        "File",
+        "file-a",
+        "sha256:a50e31e40db113009ef1b378f2f9e129cf2a085b595d7bb03a2d8f9b7096d58e",
+        b"other bytes",
+        None,
+    )
+    .await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/files/publish-artifact",
+            artifact_body("artifacts", ""),
+            TENANT,
+            "publisher",
+        ))
+        .await
+        .expect("publish request should run");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read publish response");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("publish JSON");
+    assert_eq!(json["error"]["code"], "PublishArtifactRejected");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("do not match")),
+        "{json}"
+    );
+}

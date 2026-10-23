@@ -109,6 +109,9 @@ pub async fn put_blob(
     body: Bytes,
 ) -> impl IntoResponse {
     let tenant = authenticated.tenant();
+    if let Some(refusal) = state.refused_blob_key(tenant, &path) {
+        return (StatusCode::BAD_REQUEST, refusal).into_response();
+    }
     if let Err(status) =
         require_blob_object_authorization(&state, &authenticated, "write_blob_object", &path)
     {
@@ -131,6 +134,9 @@ pub async fn get_blob(
     Path(path): Path<String>,
 ) -> impl IntoResponse {
     let tenant = authenticated.tenant();
+    if let Some(refusal) = state.refused_blob_key(tenant, &path) {
+        return (StatusCode::BAD_REQUEST, refusal).into_response();
+    }
     if let Err(status) =
         require_blob_object_authorization(&state, &authenticated, "read_blob_object", &path)
     {

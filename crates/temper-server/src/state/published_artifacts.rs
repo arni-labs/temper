@@ -11,12 +11,13 @@ use keys::{check_content_hash, public_storage_key, published_artifact_id, valida
 use super::{IndexedFileStreamRead, ServerState};
 use telemetry::{PublishedArtifactTelemetry, emit_published_artifact_persisted_log};
 
+mod error;
 mod keys;
 mod telemetry;
 
+pub use error::PublishArtifactError;
+
 const DEFAULT_PUBLIC_ARTIFACT_NAMESPACE: &str = "published-artifacts";
-pub(crate) const PUBLISH_ARTIFACT_STALE_AUTHORIZATION: &str =
-    "publish source authorization became stale; retry against current state";
 
 /// Exact source state/resource view used for a public-artifact Cedar decision.
 pub(crate) struct PublishArtifactAuthorization {
@@ -122,7 +123,7 @@ impl ServerState {
         &self,
         tenant: &TenantId,
         request: PublishFileArtifactRequest,
-    ) -> Result<PublishedArtifactStoreRow, String> {
+    ) -> Result<PublishedArtifactStoreRow, PublishArtifactError> {
         self.publish_file_artifact_authorized(tenant, request, Vec::new())
             .await
     }
@@ -134,8 +135,8 @@ impl ServerState {
         tenant: &TenantId,
         request: PublishFileArtifactRequest,
         authorizations: Vec<PublishArtifactAuthorization>,
-    ) -> Result<PublishedArtifactStoreRow, String> {
-        request.validate()?;
+    ) -> Result<PublishedArtifactStoreRow, PublishArtifactError> {
+        request.validate().map_err(PublishArtifactError::Rejected)?;
         let source_display = if request.source_file_version_id.trim().is_empty() {
             format!("File('{}')", request.file_id)
         } else {
@@ -155,21 +156,26 @@ impl ServerState {
                 bytes,
             } => (content_hash, mime_type, bytes),
             IndexedFileStreamRead::NoContent { .. } => {
-                return Err(format!("{source_display} has no content to publish"));
+                return Err(PublishArtifactError::Rejected(format!(
+                    "{source_display} has no content to publish"
+                )));
             }
             IndexedFileStreamRead::MissingIndex => {
                 return Err(format!(
                     "{source_display} is missing from the file read index; rebuild projections before publishing",
-                ));
+                )
+                .into());
             }
             IndexedFileStreamRead::StaleIndex { content_hash, .. } => {
                 return Err(format!(
                     "{source_display} has stale indexed content '{content_hash}'; rebuild projections before publishing",
-                ));
+                )
+                .into());
             }
         };
 
-        check_content_hash(&source_display, &content_hash, &bytes)?;
+        check_content_hash(&source_display, &content_hash, &bytes)
+            .map_err(PublishArtifactError::Rejected)?;
 
         for authorization in authorizations {
             let snapshot = self
@@ -179,7 +185,7 @@ impl ServerState {
                     &authorization.source_entity_id,
                 )
                 .await
-                .map_err(|_| PUBLISH_ARTIFACT_STALE_AUTHORIZATION.to_string())?;
+                .map_err(|_| PublishArtifactError::StaleAuthorization)?;
             let current_precondition =
                 crate::entity_actor::effects::entity_authorization_precondition(
                     &snapshot.current_state.state,
@@ -187,7 +193,7 @@ impl ServerState {
             if current_precondition != authorization.state_precondition
                 || snapshot.resource_attrs != authorization.resource_attrs
             {
-                return Err(PUBLISH_ARTIFACT_STALE_AUTHORIZATION.to_string());
+                return Err(PublishArtifactError::StaleAuthorization);
             }
         }
 
