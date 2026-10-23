@@ -22,6 +22,7 @@ mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
 pub(crate) mod storage_caps;
+mod tenant_removal;
 pub mod trajectory;
 pub mod wasm_invocation_log;
 

@@ -58,8 +58,10 @@ impl Visit for FieldVisitor {
 }
 
 #[test]
-fn public_storage_key_is_generic_and_content_addressed() {
+fn public_storage_key_is_generic_tenant_bound_and_content_addressed() {
+    let tenant = temper_runtime::tenant::TenantId::new("tenant-a");
     let key = public_storage_key(
+        &tenant,
         "public-demo-artifacts",
         "Report",
         "quarterly-2026",
@@ -71,7 +73,10 @@ fn public_storage_key_is_generic_and_content_addressed() {
 
     assert_eq!(
         key,
-        "public-demo-artifacts/Report/quarterly-2026/preview-image-abc123.png"
+        format!(
+            "public-demo-artifacts/tenants/{}/Report/quarterly-2026/preview-image-abc123.png",
+            crate::aws_sigv4::sha256_hex(b"tenant-a")
+        )
     );
 }
 

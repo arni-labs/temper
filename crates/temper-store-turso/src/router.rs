@@ -23,6 +23,8 @@ use temper_runtime::tenant::parse_persistence_id_parts;
 use crate::TursoEventStore;
 use crate::schema;
 
+mod tenant_database;
+
 /// Routes storage operations to per-tenant Turso databases.
 ///
 /// Holds a platform database (for tenant registry, user access, and shared
@@ -31,6 +33,8 @@ use crate::schema;
 pub struct TenantStoreRouter {
     /// Platform database — tenant registry, user mappings, system integrations.
     platform: TursoEventStore,
+    /// URL the platform database was opened from (a tenant delete never removes it).
+    platform_url: String,
     /// Per-tenant database connections, keyed by tenant ID.
     tenants: Arc<RwLock<BTreeMap<String, TursoEventStore>>>,
     /// Turso Cloud API token for dynamic provisioning (optional).
@@ -96,6 +100,7 @@ impl TenantStoreRouter {
 
         let router = Self {
             platform,
+            platform_url: platform_url.to_string(),
             tenants: Arc::new(RwLock::new(BTreeMap::new())),
             #[cfg(feature = "cloud")]
             turso_api_token: None,
@@ -243,10 +248,14 @@ impl TenantStoreRouter {
 
     /// Remove a tenant entirely.
     ///
-    /// Deletes the tenant from `tenant_registry`, removes associated users,
-    /// and evicts the in-memory store connection.
+    /// Removes the tenant's database first, so an id created again starts
+    /// empty, then deletes the tenant from `tenant_registry`, removes
+    /// associated users, and evicts the in-memory store connection. If the
+    /// database cannot be removed nothing else changes, and the delete can be
+    /// retried.
     #[instrument(skip_all, fields(tenant_id, otel.name = "router.remove_tenant"))]
     pub async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
+        self.drop_tenant_database(tenant_id).await?;
         let conn = self.platform.connection().await.map_err(storage_error)?;
 
         // Delete associated users and installed apps first.

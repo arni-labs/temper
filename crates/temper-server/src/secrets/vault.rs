@@ -152,6 +152,12 @@ impl SecretsVault {
             .unwrap_or(false)
     }
 
+    /// Drop every cached secret of a tenant (the tenant was deleted). Platform secrets stay.
+    pub fn remove_tenant(&self, tenant: &str) {
+        let mut cache = self.cache.write().unwrap(); // ci-ok: infallible lock
+        cache.remove(tenant);
+    }
+
     /// List secret key names for a tenant (never values).
     ///
     /// Platform secrets are included because they are visible through the

@@ -79,7 +79,7 @@ when {
         &store,
         "File",
         "file-a",
-        "sha256:artifactcontent",
+        "sha256:9938be87d35f2a7a2b80237e8dc71806b209aaea8252f12c1b12949f61d40476",
         b"artifact body",
         None,
     )
@@ -88,7 +88,7 @@ when {
         &store,
         "FileVersion",
         "version-a",
-        "sha256:artifactversion",
+        "sha256:6c8c7d46f81e53838444f74d1783a3082161068740dcdabe0ac2d578556bb469",
         b"artifact version",
         Some("file-a"),
     )
@@ -97,7 +97,7 @@ when {
         &store,
         "FileVersion",
         "version-mismatch",
-        "sha256:artifactmismatch",
+        "sha256:8b2a120ba4238c34e511f5b84f4d5085265ef08ddc033936fc067738de99ae0c",
         b"artifact mismatch",
         Some("file-b"),
     )
@@ -207,7 +207,7 @@ async fn local_artifact_publish_uses_direct_tenant_blob_store() {
         &store,
         "File",
         "file-a",
-        "sha256:localartifact",
+        "sha256:a50e31e40db113009ef1b378f2f9e129cf2a085b595d7bb03a2d8f9b7096d58e",
         b"local artifact body",
         None,
     )

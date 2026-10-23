@@ -4,11 +4,23 @@ use std::time::Duration;
 use sha2::{Digest as _, Sha256};
 use temper_runtime::tenant::TenantId;
 
-use super::{BlobReadBounded, BlobStore, DEFAULT_BLOB_BUCKET, is_local_internal_blob_endpoint};
+use super::{
+    BlobReadBounded, BlobStore, DEFAULT_BLOB_BUCKET, TENANT_NAMESPACES_DIR,
+    is_local_internal_blob_endpoint,
+};
 use crate::state::ServerState;
 
 impl ServerState {
     pub(crate) fn blob_store_for_tenant(&self, tenant: &TenantId) -> Result<BlobStore, String> {
+        let store = self.unscoped_blob_store_for_tenant(tenant)?;
+        // The default tenant's root and prefix also hold every other tenant's namespace (namespace.rs).
+        Ok(match tenant_object_namespace(tenant) {
+            Some(_) => store,
+            None => store.holding_tenant_namespaces(),
+        })
+    }
+
+    fn unscoped_blob_store_for_tenant(&self, tenant: &TenantId) -> Result<BlobStore, String> {
         if let Some(vault) = self.secrets_vault.as_ref()
             && let Some(endpoint) = vault.get_secret(tenant.as_str(), "blob_endpoint")
             && !endpoint.trim().is_empty()
@@ -322,11 +334,13 @@ impl ServerState {
 
 /// Where a tenant's objects sit in the bucket: under the deployment's own prefix (`blob_prefix`, such as one app's
 /// folder in a bucket many servers share), then, for any tenant but `default`, under `tenants/<sha256 of its name>`.
+/// The default tenant keeps the bare prefix, where its older objects are, and its store refuses keys under `tenants/`.
 fn object_key_prefix(prefix: Option<&str>, tenant: &TenantId) -> Option<String> {
     let prefix = prefix
         .map(|p| p.trim_matches('/'))
         .filter(|p| !p.is_empty());
-    let namespace = tenant_object_namespace(tenant).map(|namespace| format!("tenants/{namespace}"));
+    let namespace = tenant_object_namespace(tenant)
+        .map(|namespace| format!("{TENANT_NAMESPACES_DIR}/{namespace}"));
     match (prefix, namespace) {
         (Some(prefix), Some(namespace)) => Some(format!("{prefix}/{namespace}")),
         (Some(prefix), None) => Some(prefix.to_string()),
@@ -341,7 +355,7 @@ fn tenant_object_namespace(tenant: &TenantId) -> Option<String> {
 
 fn tenant_blob_root(root: PathBuf, tenant: &TenantId) -> PathBuf {
     match tenant_object_namespace(tenant) {
-        Some(namespace) => root.join("tenants").join(namespace),
+        Some(namespace) => root.join(TENANT_NAMESPACES_DIR).join(namespace),
         None => root,
     }
 }

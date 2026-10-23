@@ -290,11 +290,12 @@ pub(crate) async fn delete_tenant(
         );
     }
 
-    // Remove from persistence (Turso registry + users).
+    // Remove the tenant's database, registry row and users, then what this process holds in memory for it, so an id
+    // created again starts empty.
     match provider.remove_tenant(&tenant_id).await {
         Ok(true) => {
-            // Also remove from in-memory SpecRegistry.
             let tid = temper_runtime::tenant::TenantId::new(&tenant_id);
+            state.server.forget_tenant(&tid);
             {
                 let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
                 registry.remove_tenant(&tid);

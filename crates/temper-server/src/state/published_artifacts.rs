@@ -6,10 +6,12 @@ use tracing::{Span, instrument};
 
 use crate::aws_sigv4::{self, parse_url_host_path, sha256_hex};
 use crate::storage::{PublishedArtifactStoreRow, PublishedArtifactStoreUpsert};
+use keys::{check_content_hash, public_storage_key, published_artifact_id, validate_path_segment};
 
 use super::{IndexedFileStreamRead, ServerState};
 use telemetry::{PublishedArtifactTelemetry, emit_published_artifact_persisted_log};
 
+mod keys;
 mod telemetry;
 
 const DEFAULT_PUBLIC_ARTIFACT_NAMESPACE: &str = "published-artifacts";
@@ -167,6 +169,8 @@ impl ServerState {
             }
         };
 
+        check_content_hash(&source_display, &content_hash, &bytes)?;
+
         for authorization in authorizations {
             let snapshot = self
                 .load_authz_resource_snapshot(
@@ -208,6 +212,7 @@ impl ServerState {
         span.record("public_blob_endpoint_host", endpoint_host);
 
         let storage_key = public_storage_key(
+            tenant,
             namespace,
             &request.owner_ref_type,
             &request.owner_ref_id,
@@ -435,77 +440,6 @@ fn build_public_blob_put_headers(
     })
 }
 
-fn public_storage_key(
-    namespace: &str,
-    owner_ref_type: &str,
-    owner_ref_id: &str,
-    label: &str,
-    content_hash: &str,
-    mime_type: &str,
-) -> Result<String, String> {
-    let hash = content_hash.trim_start_matches("sha256:");
-    validate_path_segment("namespace", namespace)?;
-    validate_path_segment("owner_ref_type", owner_ref_type)?;
-    validate_path_segment("owner_ref_id", owner_ref_id)?;
-    validate_path_segment("label", label)?;
-    validate_path_segment("content_hash", hash)?;
-    Ok(format!(
-        "{}/{}/{}/{}-{}.{}",
-        namespace,
-        owner_ref_type,
-        owner_ref_id,
-        label,
-        hash,
-        extension_for_mime(mime_type)
-    ))
-}
-
-fn published_artifact_id(
-    tenant: &str,
-    owner_ref_type: &str,
-    owner_ref_id: &str,
-    label: &str,
-    content_hash: &str,
-) -> String {
-    let seed = format!("{tenant}\n{owner_ref_type}\n{owner_ref_id}\n{label}\n{content_hash}");
-    let digest = sha256_hex(seed.as_bytes());
-    format!("part-{}", &digest[..32])
-}
-
-fn validate_path_segment(field: &str, value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    if value == "." || value == ".." {
-        return Err(format!("{field} must not be a relative path segment"));
-    }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~'))
-    {
-        return Err(format!(
-            "{field} must be one URI-safe path segment using only letters, digits, '-', '_', '.' or '~'"
-        ));
-    }
-    Ok(())
-}
-
-fn extension_for_mime(mime_type: &str) -> &'static str {
-    match mime_type.split(';').next().unwrap_or("").trim() {
-        "text/html" => "html",
-        "text/css" => "css",
-        "text/javascript" | "application/javascript" => "js",
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/svg+xml" => "svg",
-        "application/json" => "json",
-        "text/markdown" => "md",
-        _ => "bin",
-    }
-}
-
 fn stream_content_type(mime_type: &str) -> String {
     if mime_type.trim().is_empty() {
         "application/octet-stream".to_string()
@@ -519,5 +453,7 @@ fn public_blob_http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
+#[cfg(test)]
+mod tenant_keys_tests;
 #[cfg(test)]
 mod tests;
