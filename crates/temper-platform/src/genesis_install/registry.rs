@@ -7,11 +7,12 @@ const REGISTRY_SETTING: &str = "TEMPER_GENESIS_REGISTRY_URL";
 
 /// The Genesis registry this process fetches app bundles and App rows from.
 ///
-/// Only [`configured_registry`] makes one, from `TEMPER_GENESIS_REGISTRY_URL`.
-/// Which host a server takes app code from is a deployment setting, so an
-/// install request or a stored install record may name a registry only to
-/// say which one it means: any other value is refused before a request is
-/// made.
+/// A new install takes its registry from [`configured_registry`], from
+/// `TEMPER_GENESIS_REGISTRY_URL`: which host a server takes new app code from
+/// is a deployment setting, so an install request may name a registry only to
+/// say which one it means, and any other value is refused before a request is
+/// made. Restoring an install this server already made uses
+/// [`recorded_registry`], the registry that install came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryUrl(String);
 
@@ -29,6 +30,19 @@ impl RegistryUrl {
 pub(crate) fn configured_registry(requested: &str) -> Result<RegistryUrl, String> {
     let configured = std::env::var(REGISTRY_SETTING).unwrap_or_default();
     registry_for(&configured, requested)
+}
+
+/// The registry a stored install record was made from, to fetch that same
+/// install's files again when its cache directory is gone.
+///
+/// Restoring reproduces what this server already installed, so it does not
+/// depend on the current setting: a restart with the setting unset or changed
+/// keeps every installed app.
+pub(crate) fn recorded_registry(recorded: &str) -> Result<RegistryUrl, String> {
+    comparable_form(recorded).map_err(|error| format!("recorded registry_url {error}"))?;
+    Ok(RegistryUrl(
+        recorded.trim().trim_end_matches('/').to_string(),
+    ))
 }
 
 /// The registry `configured` names, as if it were this server's setting.
@@ -128,6 +142,15 @@ mod tests {
         ] {
             let error = registry_for(CONFIGURED, requested).expect_err(requested);
             assert!(error.contains("registry_url"), "{requested}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_stored_install_is_fetched_again_from_the_registry_it_came_from() {
+        let registry = recorded_registry(" http://127.0.0.1:18081/ ").expect("recorded");
+        assert_eq!(registry.as_str(), "http://127.0.0.1:18081");
+        for recorded in ["", "file:///etc", "https://genesis.example.test/?x=1"] {
+            assert!(recorded_registry(recorded).is_err(), "{recorded}");
         }
     }
 

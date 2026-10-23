@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
 use temper_spec::automaton;
 
 use super::{
-    AppEntry, StartupInstallMode, extract_description, find_ioa_files, read_app_guide,
-    read_app_manifest,
+    AppBundle, AppEntry, StartupInstallMode, extract_description, find_ioa_files, load_app_bundle,
+    read_app_guide, read_app_manifest,
 };
 
 pub(crate) struct AppCatalog {
@@ -53,6 +53,41 @@ static CATALOG: OnceLock<RwLock<AppCatalog>> = OnceLock::new();
 /// Get or initialize the global app catalog.
 pub fn catalog() -> &'static RwLock<AppCatalog> {
     CATALOG.get_or_init(|| RwLock::new(AppCatalog::discover()))
+}
+
+fn read_catalog() -> RwLockReadGuard<'static, AppCatalog> {
+    catalog().read().unwrap() // ci-ok: infallible lock
+}
+
+/// List the apps of the shared catalog.
+pub fn list_os_apps() -> Vec<AppEntry> {
+    read_catalog().app_entries(None)
+}
+
+/// List the apps `tenant` resolves: its own installs and the shared catalog.
+pub fn list_tenant_os_apps(tenant: &str) -> Vec<AppEntry> {
+    read_catalog().app_entries(Some(tenant))
+}
+
+/// Get the full spec bundle for a shared-catalog app by name.
+///
+/// Reads IOA, CSDL, and Cedar files from disk on each call so changes
+/// are picked up without a rebuild.
+pub fn get_os_app(name: &str) -> Option<AppBundle> {
+    load_app_bundle(read_catalog().app_dir(None, name)?)
+}
+
+/// Get the full spec bundle `tenant` resolves for `name`: its own install
+/// when it has one, otherwise the shared catalog's.
+pub fn tenant_os_app(tenant: &str, name: &str) -> Option<AppBundle> {
+    load_app_bundle(read_catalog().app_dir(Some(tenant), name)?)
+}
+
+/// Get the full app guide markdown `tenant` resolves for `name`.
+pub fn tenant_app_guide(tenant: &str, name: &str) -> Option<String> {
+    read_catalog()
+        .app_entry(Some(tenant), name)
+        .and_then(|entry| entry.app_guide.clone())
 }
 
 /// Override the OS apps directory. Must be called before any catalog access.
@@ -243,7 +278,7 @@ impl AppCatalog {
         }
     }
 
-    fn from_dir(dir: PathBuf) -> Self {
+    pub(super) fn from_dir(dir: PathBuf) -> Self {
         let mut entries = Vec::new();
         let mut paths = BTreeMap::new();
 

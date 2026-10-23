@@ -1,12 +1,14 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 use temper_runtime::tenant::TenantId;
 use temper_server::platform_store::InstalledAppRecord;
 
+use super::app_catalog::AppCatalog;
 use super::{
     AppBundle, AppEntry, OsAppBundleDigest, OsAppInstallPlan, OsAppReconcileResult, catalog,
-    get_os_app, install_os_app_with_plan, os_app_dependencies,
+    get_os_app, install_os_app_with_plan, load_app_bundle, os_app_dependencies,
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle, tenant_os_app,
 };
 use crate::state::PlatformState;
@@ -106,9 +108,30 @@ pub(super) fn digest_app_bundle(
     app_name: &str,
     bundle: &AppBundle,
 ) -> OsAppBundleDigest {
-    let entry = app_entry(tenant, app_name);
+    digest_entry_bundle(app_name, app_entry(tenant, app_name).as_ref(), bundle)
+}
+
+/// The bundle digest of `app_name` as installed in `dir`, read without adding
+/// `dir` to the catalog.
+pub fn os_app_dir_bundle_digest(dir: &Path, app_name: &str) -> Option<OsAppBundleDigest> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let installed = AppCatalog::from_dir(dir.to_path_buf());
+    let bundle = load_app_bundle(installed.app_dir(None, app_name)?)?;
+    Some(digest_entry_bundle(
+        app_name,
+        installed.app_entry(None, app_name),
+        &bundle,
+    ))
+}
+
+fn digest_entry_bundle(
+    app_name: &str,
+    entry: Option<&AppEntry>,
+    bundle: &AppBundle,
+) -> OsAppBundleDigest {
     let app_version = entry
-        .as_ref()
         .map(|entry| entry.version.clone())
         .unwrap_or_else(|| "0.1.0".to_string());
 
@@ -153,7 +176,7 @@ pub(super) fn digest_app_bundle(
     wasm_parts.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut content_parts = Vec::new();
-    if let Some(app_guide) = entry.as_ref().and_then(|entry| entry.app_guide.as_ref()) {
+    if let Some(app_guide) = entry.and_then(|entry| entry.app_guide.as_ref()) {
         content_parts.push(("APP.md".to_string(), app_guide.as_bytes().to_vec()));
     }
     for agent in &bundle.agents {

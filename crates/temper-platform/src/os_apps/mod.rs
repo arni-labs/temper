@@ -32,8 +32,9 @@ mod system_files;
 mod types;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
-    add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, list_startup_os_apps,
-    reload_os_apps, set_os_apps_dir,
+    add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app, list_os_apps,
+    list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir, tenant_app_guide,
+    tenant_os_app,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
@@ -47,7 +48,7 @@ use entity_aliases::{
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub use reconcile::{
-    os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
+    os_app_bundle_digest, os_app_dir_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
     resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
 };
 pub(crate) use reconcile::{
@@ -902,43 +903,6 @@ fn extract_description(guide: &str) -> Option<String> {
 }
 
 // ── Public API ──────────────────────────────────────────────────────
-
-/// List the apps of the shared catalog.
-pub fn list_os_apps() -> Vec<AppEntry> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.app_entries(None)
-}
-
-/// List the apps `tenant` resolves: its own installs and the shared catalog.
-pub fn list_tenant_os_apps(tenant: &str) -> Vec<AppEntry> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.app_entries(Some(tenant))
-}
-
-/// Get the full spec bundle for a shared-catalog app by name.
-///
-/// Reads IOA, CSDL, and Cedar files from disk on each call so changes
-/// are picked up without a rebuild.
-pub fn get_os_app(name: &str) -> Option<AppBundle> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    let app_dir = cat.app_dir(None, name)?;
-    load_app_bundle(app_dir)
-}
-
-/// Get the full spec bundle `tenant` resolves for `name`: its own install
-/// when it has one, otherwise the shared catalog's.
-pub fn tenant_os_app(tenant: &str, name: &str) -> Option<AppBundle> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    let app_dir = cat.app_dir(Some(tenant), name)?;
-    load_app_bundle(app_dir)
-}
-
-/// Get the full app guide markdown `tenant` resolves for `name`.
-pub fn tenant_app_guide(tenant: &str, name: &str) -> Option<String> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.app_entry(Some(tenant), name)
-        .and_then(|e| e.app_guide.clone())
-}
 
 /// Load a complete app bundle from a directory on disk.
 fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
