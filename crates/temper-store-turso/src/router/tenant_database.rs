@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use temper_runtime::persistence::PersistenceError;
 use tracing::info;
 
+use temper_runtime::tenant::TenantId;
+
 use super::TenantStoreRouter;
 
 /// Files SQLite and Turso keep beside a local database: the database itself, its write-ahead log and its shared
@@ -17,8 +19,9 @@ impl TenantStoreRouter {
     /// never removed with this tenant.
     pub(super) async fn drop_tenant_database(
         &self,
-        tenant_id: &str,
+        tenant: &TenantId,
     ) -> Result<(), PersistenceError> {
+        let tenant_id = tenant.as_str();
         let registry = self.load_tenant_registry().await?;
         let Some(entry) = registry.iter().find(|row| row.tenant_id == tenant_id) else {
             return Ok(());
@@ -122,6 +125,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use temper_runtime::persistence::{EventMetadata, EventStore as _, PersistenceEnvelope};
+    use temper_runtime::tenant::TenantId;
 
     use super::super::TenantStoreRouter;
     use crate::driver::params;
@@ -154,22 +158,23 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_created_again_after_delete_starts_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let acme = TenantId::new("acme");
         let first = router(dir.path()).await;
-        first.register_tenant("acme").await.expect("create");
+        first.register_tenant(&acme).await.expect("create");
         first
             .append("acme:AgentCredential:key-1", 0, &event())
             .await
             .expect("append");
 
-        assert!(first.remove_tenant("acme").await.expect("delete"));
+        assert!(first.remove_tenant(&acme).await.expect("delete"));
         assert!(!dir.path().join("tenants").join("acme.db").exists());
         // A retried delete converges.
-        assert!(!first.remove_tenant("acme").await.expect("delete again"));
+        assert!(!first.remove_tenant(&acme).await.expect("delete again"));
         drop(first);
 
         // A new router on the same files, as after a restart, then the same id again.
         let second = router(dir.path()).await;
-        second.register_tenant("acme").await.expect("create again");
+        second.register_tenant(&acme).await.expect("create again");
         let events = second
             .read_events("acme:AgentCredential:key-1", 0)
             .await
@@ -193,7 +198,7 @@ mod tests {
         .expect("registry row");
 
         let error = router
-            .remove_tenant("aliased")
+            .remove_tenant(&TenantId::new("aliased"))
             .await
             .expect_err("the platform database stays");
         assert!(error.to_string().contains("also used by"), "{error}");
@@ -230,7 +235,12 @@ mod tests {
         .await
         .expect("registry row");
 
-        assert!(router.remove_tenant("alpha").await.expect("delete"));
+        assert!(
+            router
+                .remove_tenant(&TenantId::new("alpha"))
+                .await
+                .expect("delete")
+        );
         server.verify().await;
     }
 }

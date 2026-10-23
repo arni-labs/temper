@@ -29,7 +29,7 @@ pub(crate) use apps::{
 };
 use auth::{
     PlatformResourceAuthorization, require_authenticated, require_control_plane,
-    require_resource_authorization, require_same_tenant, validate_tenant_id,
+    require_resource_authorization, require_same_tenant,
 };
 
 /// Request body for `POST /api/tenants`.
@@ -135,24 +135,30 @@ async fn create_tenant(
         Ok(authenticated) => authenticated,
         Err(status) => return authorization_error(status),
     };
-    if let Err(status) = validate_tenant_id(&req.tenant_id)
-        .and_then(|_| require_control_plane(authenticated))
-        .and_then(|_| {
-            require_resource_authorization(
-                &state,
-                authenticated,
-                PlatformResourceAuthorization {
-                    action: "create_tenant",
-                    resource_type: "Tenant",
-                    resource_id: &req.tenant_id,
-                    attrs: std::collections::BTreeMap::from([(
-                        "targetTenant".to_string(),
-                        serde_json::Value::String(req.tenant_id.clone()),
-                    )]),
-                },
-            )
-        })
-    {
+    let tenant = match temper_runtime::tenant::TenantId::try_new(req.tenant_id.as_str()) {
+        Ok(tenant) => tenant,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            );
+        }
+    };
+    if let Err(status) = require_control_plane(authenticated).and_then(|_| {
+        require_resource_authorization(
+            &state,
+            authenticated,
+            PlatformResourceAuthorization {
+                action: "create_tenant",
+                resource_type: "Tenant",
+                resource_id: &req.tenant_id,
+                attrs: std::collections::BTreeMap::from([(
+                    "targetTenant".to_string(),
+                    serde_json::Value::String(req.tenant_id.clone()),
+                )]),
+            },
+        )
+    }) {
         return authorization_error(status);
     }
     let Some(provider) = turso_provider(&state) else {
@@ -169,7 +175,7 @@ async fn create_tenant(
         );
     }
 
-    match provider.register_tenant(&req.tenant_id).await {
+    match provider.register_tenant(&tenant).await {
         Ok(_store) => {
             // Bootstrap agent specs for the new tenant.
             // New tenant — no prior verification cache.
@@ -292,13 +298,14 @@ pub(crate) async fn delete_tenant(
 
     // Remove the tenant's database, registry row and users, then what this process holds in memory for it, so an id
     // created again starts empty.
-    match provider.remove_tenant(&tenant_id).await {
+    // `require_same_tenant` checked that the path names the request's own tenant.
+    let tid = authenticated.tenant();
+    match provider.remove_tenant(tid).await {
         Ok(true) => {
-            let tid = temper_runtime::tenant::TenantId::new(&tenant_id);
-            state.server.forget_tenant(&tid);
+            state.server.forget_tenant(tid);
             {
                 let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
-                registry.remove_tenant(&tid);
+                registry.remove_tenant(tid);
             }
             (
                 StatusCode::OK,

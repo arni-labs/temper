@@ -44,7 +44,10 @@ pub async fn handle_webhook(
     Query(query): Query<BTreeMap<String, String>>,
     request: Request<Body>,
 ) -> impl IntoResponse {
-    let tenant = TenantId::new(&tenant_str);
+    let tenant = match TenantId::try_new(tenant_str.as_str()) {
+        Ok(tenant) => tenant,
+        Err(error) => return (StatusCode::BAD_REQUEST, error),
+    };
 
     // Look up webhook config from registry.
     let lookup = find_webhook(&state, &tenant, &webhook_path);
