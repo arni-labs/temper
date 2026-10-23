@@ -222,9 +222,14 @@ async fn ingest_raw_inner(
     {
         return response;
     }
-    if let Err(response) =
-        enforce_commons_account_verified_for_write(&state, &tenant, entity_type, &admission_fields)
-            .await
+    if let Err(response) = enforce_commons_account_verified_for_write(
+        &state,
+        &tenant,
+        entity_type,
+        &admission_fields,
+        &security_ctx,
+    )
+    .await
     {
         return *response;
     }
@@ -366,9 +371,14 @@ async fn ingest_raw_inner(
         drop(final_guard);
         return response;
     }
-    if let Err(response) =
-        enforce_commons_account_verified_for_write(&state, &tenant, entity_type, &initial_fields)
-            .await
+    if let Err(response) = enforce_commons_account_verified_for_write(
+        &state,
+        &tenant,
+        entity_type,
+        &initial_fields,
+        &security_ctx,
+    )
+    .await
     {
         drop(final_guard);
         return *response;

@@ -548,7 +548,7 @@ impl crate::state::ServerState {
                 .await
                 .map_err(DispatchError::Internal)?;
             if !snapshot.exists {
-                let mut response = snapshot.current_state;
+                let response = snapshot.current_state;
                 if let Err(error) = table.validate_action_params(
                     action,
                     &params,
@@ -556,8 +556,6 @@ impl crate::state::ServerState {
                     &response.state.counters,
                     &response.state.booleans,
                 ) {
-                    response.success = false;
-                    response.error = Some(error);
                     let ctx = PostDispatchContext {
                         tenant,
                         entity_type,
@@ -568,12 +566,7 @@ impl crate::state::ServerState {
                         action_params: &params,
                         await_integration,
                     };
-                    let response = self.run_post_dispatch_effects(&ctx, response).await;
-                    tracing::Span::current().record("success", false);
-                    if let Some(error) = &response.error {
-                        tracing::Span::current().record("error_msg", error.as_str());
-                    }
-                    return Ok(response);
+                    return Ok(self.refuse_before_actor(&ctx, response, error).await);
                 }
             }
         }
@@ -618,6 +611,46 @@ impl crate::state::ServerState {
         let related = self
             .resolve_cross_entity_guards(tenant, entity_type, entity_id, action)
             .await;
+
+        // Relation integrity, field invariants and cross-invariants hold for the
+        // record this action stores, whichever path dispatched it.
+        if self.record_constraints_declared(tenant, entity_type, action) {
+            let current = self
+                .get_tenant_entity_state(tenant, entity_type, entity_id)
+                .await
+                .map_err(DispatchError::Internal)?;
+            // A retry of an action already applied returns its first result.
+            let already_applied = agent_ctx
+                .idempotency_key
+                .as_deref()
+                .is_some_and(|key| current.state.has_processed_idempotency_key(key));
+            if !already_applied
+                // Boxed so the preview's future does not deepen every caller's.
+                && let Err(violation) = Box::pin(self.check_action_record(
+                    tenant,
+                    &table,
+                    &current.state,
+                    action,
+                    &params,
+                    &related,
+                ))
+                .await
+            {
+                let ctx = PostDispatchContext {
+                    tenant,
+                    entity_type,
+                    entity_id,
+                    action,
+                    agent_ctx,
+                    dispatch_idempotency_key: agent_ctx.idempotency_key.as_deref(),
+                    action_params: &params,
+                    await_integration,
+                };
+                return Ok(self
+                    .refuse_before_actor(&ctx, current, violation.message)
+                    .await);
+            }
+        }
 
         let action_params = params.clone();
         // ADR-0051: acquire an admission permit before spending retry budget.
@@ -893,6 +926,25 @@ impl crate::state::ServerState {
         }
 
         Ok(response)
+    }
+
+    /// Answer a dispatch refused before it reached the actor. The refusal runs
+    /// the post-dispatch pipeline like a refusal from the actor, so it is
+    /// recorded the same way.
+    async fn refuse_before_actor(
+        &self,
+        ctx: &PostDispatchContext<'_>,
+        mut response: EntityResponse,
+        error: String,
+    ) -> EntityResponse {
+        response.success = false;
+        response.error = Some(error);
+        let response = self.run_post_dispatch_effects(ctx, response).await;
+        tracing::Span::current().record("success", false);
+        if let Some(error) = &response.error {
+            tracing::Span::current().record("error_msg", error.as_str());
+        }
+        response
     }
 }
 

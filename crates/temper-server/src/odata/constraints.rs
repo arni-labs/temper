@@ -512,7 +512,9 @@ fn defer_eventual_invariant(
         .record_cross_invariant_check(tenant_name, entity_type, "eventual_deferred");
 }
 
-fn trigger_matches(on: &str, entity_type: &str, action: &str) -> bool {
+/// Whether a cross-invariant's `on` trigger (`Entity.Action` or `Entity.*`)
+/// selects a write of `action` on `entity_type`.
+pub(crate) fn trigger_matches(on: &str, entity_type: &str, action: &str) -> bool {
     let Some((entity, action_sel)) = on.split_once('.') else {
         return false;
     };
@@ -523,13 +525,10 @@ fn trigger_matches(on: &str, entity_type: &str, action: &str) -> bool {
     action_sel == "*" || action_sel == action
 }
 
+/// A field of the record being checked. The record is the entity's fields as
+/// they will be stored, so a field is read only at the top level.
 fn extract_field<'a>(fields: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
-    fields.get(name).or_else(|| {
-        fields
-            .get("fields")
-            .and_then(|f| f.as_object())
-            .and_then(|obj| obj.get(name))
-    })
+    fields.get(name)
 }
 
 fn extract_field_as_str<'a>(fields: &'a serde_json::Value, name: &str) -> Option<&'a str> {
@@ -549,16 +548,10 @@ fn extract_field_as_string(fields: &serde_json::Value, name: &str) -> Option<Str
     }
 }
 
-/// Flatten a `fields` payload so leaf predicates see a single-level object.
-///
-/// OData write payloads land here with the entity's properties at the top
-/// level, but some callers wrap them under a `"fields"` key. Normalise both
-/// shapes to the unwrapped form so field_invariant authors don't have to
-/// care which handler invoked the check.
+/// The object field invariants are evaluated on: the record as it will be
+/// stored, with its properties (including `Status`) at the top level.
 fn field_invariant_view(fields: &serde_json::Value) -> serde_json::Value {
-    if let Some(inner) = fields.get("fields").and_then(|f| f.as_object()) {
-        serde_json::Value::Object(inner.clone())
-    } else if fields.is_object() {
+    if fields.is_object() {
         fields.clone()
     } else {
         serde_json::Value::Object(serde_json::Map::new())
@@ -566,7 +559,7 @@ fn field_invariant_view(fields: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Evaluate cross-field invariants declared on an entity's IOA spec against
-/// the post-write `initial_fields` payload.
+/// the record the write will store.
 ///
 /// Runs between [`pre_upsert_relation_checks`] and
 /// [`post_write_invariant_checks`] in the write pipeline. Honours the

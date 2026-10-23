@@ -1088,7 +1088,11 @@ async fn commons_rate_limit_returns_429_per_owner_bucket() {
         .oneshot(claimed_admin_request)
         .await
         .expect("claimed-admin request should run");
-    assert_eq!(claimed_admin.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        claimed_admin.status(),
+        StatusCode::CREATED,
+        "a write naming alice is charged to the caller's own bucket, not alice's"
+    );
 
     let bob_bucket = ServerState::commons_rate_limit_entity_id("bob", "write");
     let response = app
@@ -1755,6 +1759,77 @@ async fn commons_account_verification_blocks_owner_scoped_writes_until_verified(
         .await
         .unwrap();
     assert_eq!(verified_repo.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn commons_account_verification_checks_the_caller_not_the_owner_it_names() {
+    let state = test_state_with_account_verification_ioa();
+    state.enable_commons_guardrails("default");
+    let app = authenticated_router(state.clone());
+
+    for (id, principal) in [("alice", "alice"), ("bob", "bob")] {
+        let owner = app
+            .clone()
+            .oneshot(
+                Request::post("/tdata/Owners")
+                    .header("Content-Type", "application/json")
+                    .header("X-Temper-Principal-Id", principal)
+                    .header("X-Temper-Principal-Kind", "customer")
+                    .body(Body::from(format!(
+                        r#"{{"Id":"{id}","AccountId":"{id}","DisplayName":"{id}","Contact":"{id}@example.test","StorageCapBytes":1024,"RateLimitTier":"free","VerificationProvider":"email","VerificationSubject":"{id}@example.test"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner.status(), StatusCode::CREATED);
+    }
+    let verify_alice = app
+        .clone()
+        .oneshot(
+            Request::post(
+                "/tdata/Owners('alice')/Temper.AccountVerificationTest.MarkVerified",
+            )
+            .header("Content-Type", "application/json")
+            .header("X-Temper-Principal-Id", "operator")
+            .header("X-Temper-Principal-Kind", "admin")
+            .body(Body::from(
+                r#"{"VerificationProvider":"email","VerificationSubject":"alice@example.test","VerifiedAt":"2026-05-19T00:00:00Z"}"#,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(verify_alice.status(), StatusCode::OK);
+
+    // bob is not verified; naming verified alice as the owner does not change
+    // whose verification the write needs.
+    let named_alice = app
+        .clone()
+        .oneshot(
+            Request::post("/tdata/Repositories")
+                .header("Content-Type", "application/json")
+                .header("X-Temper-Principal-Id", "bob")
+                .header("X-Temper-Principal-Kind", "customer")
+                .body(Body::from(
+                    r#"{"Id":"rp-bob-as-alice","OwnerAccountId":"alice","Name":"named","Description":"","DefaultBranch":"refs/heads/main","Visibility":"public"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(named_alice.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(named_alice.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "AccountVerificationRequired");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("'bob'")),
+        "the caller is the account checked: {json}"
+    );
 }
 
 #[tokio::test]

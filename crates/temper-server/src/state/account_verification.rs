@@ -1,10 +1,38 @@
 use serde_json::Value;
+use temper_authz::{PrincipalKind, SecurityContext};
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
 
 const OWNER_ENTITY_TYPE: &str = "Owner";
 const RATE_LIMIT_ENTITY_TYPE: &str = "RateLimit";
+
+/// The commons account a caller's write is charged to and verified as: the
+/// account Cedar sees as `principal.accountId` (a resolved `accountId`
+/// attribute, else the principal id). Owner fields a request or row names do
+/// not change it; Cedar decides separately which owners a caller may name.
+pub(crate) fn commons_subject(security_ctx: &SecurityContext) -> String {
+    let principal = &security_ctx.principal;
+    principal
+        .attributes
+        .get("accountId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|account| !account.is_empty())
+        .unwrap_or(principal.id.as_str())
+        .to_string()
+}
+
+/// Whether the caller acts with platform authority rather than as a commons
+/// account: System, Admin, or a verified operator, the same principals the
+/// built-in `system-platform` Cedar policy names. Such a caller has no Owner
+/// row of its own to verify.
+fn acts_with_platform_authority(security_ctx: &SecurityContext) -> bool {
+    let principal = &security_ctx.principal;
+    matches!(principal.kind, PrincipalKind::System | PrincipalKind::Admin)
+        || (principal.agent_type.as_deref() == Some("operator")
+            && principal.attributes.get("agentTypeVerified") == Some(&Value::Bool(true)))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CommonsAccountVerificationRequired {
@@ -63,6 +91,8 @@ struct OwnerVerificationProfile {
 }
 
 impl ServerState {
+    /// Verify the owner a kernel-issued composite sub-write names. The
+    /// composite's own Cedar check binds that owner to the caller.
     pub(crate) async fn enforce_commons_verified_owner_for_write(
         &self,
         tenant: &TenantId,
@@ -79,28 +109,43 @@ impl ServerState {
         self.require_commons_verified_owner(tenant, &owner_id).await
     }
 
-    pub(crate) async fn enforce_commons_verified_owner_for_action(
+    /// Verify the authenticated caller before an owner-scoped commons write.
+    ///
+    /// A write is owner-scoped when the record (`fields`) or the action's
+    /// `params` name an owner; which owner they name does not choose whose
+    /// status is checked. Callers with platform authority are not commons
+    /// accounts and are not checked here.
+    pub(crate) async fn enforce_commons_verified_subject(
         &self,
         tenant: &TenantId,
         entity_type: &str,
-        current_fields: &Value,
-        params: &Value,
+        fields: &Value,
+        params: Option<&Value>,
+        security_ctx: &SecurityContext,
     ) -> Result<(), CommonsAccountVerificationError> {
-        if !self.commons_account_verification_applies(tenant, entity_type)? {
+        if !self.commons_account_verification_applies(tenant, entity_type)?
+            || acts_with_platform_authority(security_ctx)
+        {
             return Ok(());
         }
 
-        let owner_id = self
-            .owner_id_for_commons_fields(tenant, params)
-            .await?
-            .or(self
-                .owner_id_for_commons_fields(tenant, current_fields)
-                .await?);
-        if let Some(owner_id) = owner_id {
-            self.require_commons_verified_owner(tenant, &owner_id)
-                .await?;
+        let names_params_owner = match params {
+            Some(params) => self
+                .owner_id_for_commons_fields(tenant, params)
+                .await?
+                .is_some(),
+            None => false,
+        };
+        if !names_params_owner
+            && self
+                .owner_id_for_commons_fields(tenant, fields)
+                .await?
+                .is_none()
+        {
+            return Ok(());
         }
-        Ok(())
+        self.require_commons_verified_owner(tenant, &commons_subject(security_ctx))
+            .await
     }
 
     pub(crate) async fn require_commons_verified_owner(

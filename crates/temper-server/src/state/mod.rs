@@ -24,6 +24,7 @@ mod runtime_metrics;
 pub(crate) mod storage_caps;
 pub mod trajectory;
 pub mod wasm_invocation_log;
+pub(crate) mod write_record;
 
 pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;

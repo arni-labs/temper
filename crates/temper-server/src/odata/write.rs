@@ -26,15 +26,17 @@ use super::common::{
 };
 use super::constraints::pre_delete_relation_checks;
 use super::file_content::refuse_content_fields;
-use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
+use super::rate_limit::enforce_commons_write_rate_limit;
 use super::response::annotate_entity;
 use super::storage_guardrails::enforce_commons_storage_cap;
 use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_target};
 use crate::blobs::hydrate_blob_refs_for_tenant;
+use crate::entity_actor::EntityState;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::write_record::{created_record, field_update_record};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -419,15 +421,14 @@ async fn authorize_existing_mutation(
         &snapshot.current_state.state,
     );
     Ok(ExistingMutationResource {
-        status: snapshot.current_state.state.status,
-        fields: snapshot.current_state.state.fields,
+        state: snapshot.current_state.state,
         precondition,
     })
 }
 
 struct ExistingMutationResource {
-    status: String,
-    fields: serde_json::Value,
+    /// The authorized entity state; the write commits only while it is current.
+    state: EntityState,
     precondition: String,
 }
 
@@ -569,6 +570,17 @@ pub async fn handle_odata_post(
                 return odata_error(StatusCode::BAD_REQUEST, "StrictActionContract", &error)
                     .into_response();
             }
+            let created_record = match state.transition_table_for_dispatch(&tenant, &entity_type) {
+                Ok(table) => created_record(&entity_type, &entity_id, &table, &initial_fields),
+                Err(error) => {
+                    return odata_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "RegistryError",
+                        &error.to_string(),
+                    )
+                    .into_response();
+                }
+            };
             let _commons_guardrail_lock = state.acquire_commons_write_guardrail_lock(&tenant).await;
 
             if let Err(resp) = run_write_prechecks(
@@ -578,7 +590,7 @@ pub async fn handle_odata_post(
                 &entity_id,
                 "Create",
                 "create",
-                &initial_fields,
+                &created_record,
             )
             .await
             {
@@ -590,6 +602,7 @@ pub async fn handle_odata_post(
                 &tenant,
                 &entity_type,
                 &initial_fields,
+                &security_ctx,
             )
             .await
             {
@@ -621,14 +634,8 @@ pub async fn handle_odata_post(
                 return resp;
             }
 
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&initial_fields),
-                &security_ctx,
-            )
-            .await
+            if let Err(resp) =
+                enforce_commons_write_rate_limit(&state, &tenant, &entity_type, &security_ctx).await
             {
                 return resp;
             }
@@ -905,23 +912,50 @@ pub async fn handle_odata_post(
                 if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
                     return *resp;
                 }
-                {
-                    let registry = state.registry.read().expect("registry lock poisoned");
-                    if let Some(table) = registry.get_table(&tenant, &entity_type)
-                        && let Err(error) = table.validate_action_params(
-                            action_name,
-                            &body_json,
-                            &actor_state.fields,
-                            &actor_state.counters,
-                            &actor_state.booleans,
-                        )
-                    {
+                let table = state
+                    .registry
+                    .read()
+                    .expect("registry lock poisoned")
+                    .get_table(&tenant, &entity_type);
+                if let Some(table) = table {
+                    if let Err(error) = table.validate_action_params(
+                        action_name,
+                        &body_json,
+                        &actor_state.fields,
+                        &actor_state.counters,
+                        &actor_state.booleans,
+                    ) {
                         return odata_error(
                             StatusCode::BAD_REQUEST,
                             "StrictActionContract",
                             &error,
                         )
                         .into_response();
+                    }
+                    // The actor applies this table's action: check the record it stores.
+                    let mut current = crate::entity_actor::EntityActor::build_initial_state(
+                        &entity_type,
+                        &key_str,
+                        &table,
+                        &serde_json::json!({}),
+                    );
+                    current.status = actor_state.status.clone();
+                    current.counters = actor_state.counters.clone();
+                    current.booleans = actor_state.booleans.clone();
+                    current.lists = actor_state.lists.clone();
+                    current.fields = actor_state.fields.clone();
+                    if let Err(violation) = state
+                        .check_action_record(
+                            &tenant,
+                            &table,
+                            &current,
+                            action_name,
+                            &body_json,
+                            &Default::default(),
+                        )
+                        .await
+                    {
+                        return constraint_violation_response(violation);
                     }
                 }
                 match actor_sys
@@ -1073,16 +1107,8 @@ pub async fn handle_odata_patch(
             if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
                 return response;
             }
-            let mut prospective_fields = existing.fields;
-            if let (Some(dst), Some(src)) =
-                (prospective_fields.as_object_mut(), body_json.as_object())
-            {
-                for (k, v) in src {
-                    dst.insert(k.clone(), v.clone());
-                }
-            } else {
-                prospective_fields = body_json.clone();
-            }
+            // The record this PATCH stores, merged by the actor's own field update.
+            let prospective_fields = field_update_record(&existing.state, &body_json, false);
 
             if let Err(response) = authorize_prospective_mutation(
                 &state,
@@ -1090,7 +1116,7 @@ pub async fn handle_odata_patch(
                     tenant: &tenant,
                     entity_type: &entity_type,
                     entity_id: &key_str,
-                    status: &existing.status,
+                    status: &existing.state.status,
                     fields: &prospective_fields,
                     security_ctx: &security_ctx,
                     agent_ctx: &agent_ctx,
@@ -1122,6 +1148,7 @@ pub async fn handle_odata_patch(
                 &tenant,
                 &entity_type,
                 &prospective_fields,
+                &security_ctx,
             )
             .await
             {
@@ -1140,14 +1167,8 @@ pub async fn handle_odata_patch(
                 return resp;
             }
 
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&prospective_fields),
-                &security_ctx,
-            )
-            .await
+            if let Err(resp) =
+                enforce_commons_write_rate_limit(&state, &tenant, &entity_type, &security_ctx).await
             {
                 return resp;
             }
@@ -1319,14 +1340,18 @@ pub async fn handle_odata_put(
                 return response;
             }
 
+            // The record this PUT stores: the body, with the entity's own id and
+            // status, as the actor's field replacement applies it.
+            let replacement = field_update_record(&existing.state, &body_json, true);
+
             if let Err(response) = authorize_prospective_mutation(
                 &state,
                 ProspectiveMutationAuthorization {
                     tenant: &tenant,
                     entity_type: &entity_type,
                     entity_id: &key_str,
-                    status: &existing.status,
-                    fields: &body_json,
+                    status: &existing.state.status,
+                    fields: &replacement,
                     security_ctx: &security_ctx,
                     agent_ctx: &agent_ctx,
                 },
@@ -1345,7 +1370,7 @@ pub async fn handle_odata_put(
                 &key_str,
                 "Put",
                 "put",
-                &body_json,
+                &replacement,
             )
             .await
             {
@@ -1356,7 +1381,8 @@ pub async fn handle_odata_put(
                 &state,
                 &tenant,
                 &entity_type,
-                &body_json,
+                &replacement,
+                &security_ctx,
             )
             .await
             {
@@ -1368,21 +1394,15 @@ pub async fn handle_odata_put(
                 &tenant,
                 &entity_type,
                 &key_str,
-                &body_json,
+                &replacement,
             )
             .await
             {
                 return resp;
             }
 
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&body_json),
-                &security_ctx,
-            )
-            .await
+            if let Err(resp) =
+                enforce_commons_write_rate_limit(&state, &tenant, &entity_type, &security_ctx).await
             {
                 return resp;
             }
@@ -1537,7 +1557,7 @@ pub async fn handle_odata_delete(
                 &key_str,
                 "Delete",
                 "delete",
-                &existing.fields,
+                &existing.state.fields,
             )
             .await
             {
@@ -1548,21 +1568,16 @@ pub async fn handle_odata_delete(
                 &state,
                 &tenant,
                 &entity_type,
-                &existing.fields,
+                &existing.state.fields,
+                &security_ctx,
             )
             .await
             {
                 return *resp;
             }
 
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&existing.fields),
-                &security_ctx,
-            )
-            .await
+            if let Err(resp) =
+                enforce_commons_write_rate_limit(&state, &tenant, &entity_type, &security_ctx).await
             {
                 return resp;
             }
