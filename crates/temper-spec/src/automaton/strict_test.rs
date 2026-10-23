@@ -403,7 +403,7 @@ fn trigger_keys_belong_to_their_kind() {
 
 #[test]
 fn webhooks_name_the_entity_id_source() {
-    let webhook = "[[webhook]]\nname = \"cb\"\npath = \"cb\"\naction = \"Finish\"\nentity_id = \"query.state\"\n[webhook.extract]\ncode = \"query.code\"";
+    let webhook = "[[webhook]]\nname = \"cb\"\npath = \"cb\"\naction = \"Finish\"\nentity_id = \"query.state\"\nhmac_secret = \"{secret:CB}\"\nhmac_header = \"x-sig\"\n[webhook.extract]\ncode = \"query.code\"";
     let parsed = parse(&spec("", "", webhook)).expect("webhook");
     assert_eq!(parsed.webhooks[0].entity_id, "query.state");
     rejects(
@@ -429,13 +429,21 @@ fn webhooks_name_the_entity_id_source() {
         &spec("", "", &webhook.replace("\"query.code\"", "\"code\"")),
         "query.",
     );
+    // The body and headers are sources too (ADR-0182).
+    let from_body = parse(&spec(
+        "",
+        "",
+        &webhook.replace("\"query.state\"", "\"body.data.object.id\""),
+    ))
+    .expect("body source");
+    assert_eq!(from_body.webhooks[0].entity_id, "body.data.object.id");
     rejects(
         &spec(
             "",
             "",
-            &webhook.replace("\"query.state\"", "\"body.state\""),
+            &webhook.replace("\"query.state\"", "\"form.state\""),
         ),
-        "query.",
+        "query.<name>, header.<name>, body or body.<path>",
     );
 }
 
