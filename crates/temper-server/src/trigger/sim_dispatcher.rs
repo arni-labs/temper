@@ -123,7 +123,8 @@ impl SimReactionSystem {
         Ok(result)
     }
 
-    /// Recursively dispatch reactions, bounded by MAX_REACTION_DEPTH.
+    /// Recursively dispatch reactions, bounded by MAX_REACTION_DEPTH: a
+    /// reaction past it is not run and is reported as a failed result.
     fn dispatch_cascade(
         &mut self,
         entity_type: &str,
@@ -133,10 +134,6 @@ impl SimReactionSystem {
         fields: &serde_json::Value,
         depth: u32,
     ) {
-        if depth >= MAX_REACTION_DEPTH {
-            return;
-        }
-
         // Clone the matching rules to avoid borrow conflict
         let rules: Vec<_> = self
             .registry
@@ -180,6 +177,11 @@ impl SimReactionSystem {
                         continue;
                     }
                 };
+            if depth >= MAX_REACTION_DEPTH {
+                self.last_results
+                    .push(ReactionResult::stopped_at_depth(&rule.name, depth));
+                continue;
+            }
 
             // Find the actor for the target entity
             let target_key = format!("{}:{}", rule.then.entity_type, target_entity_id);
