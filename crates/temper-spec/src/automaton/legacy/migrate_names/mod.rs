@@ -374,6 +374,7 @@ impl Pass<'_> {
                 "action",
                 "entity_id",
                 "extract",
+                "signature",
                 "hmac_secret",
                 "hmac_header",
             ],

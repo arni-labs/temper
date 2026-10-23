@@ -4,13 +4,11 @@
 //! to in-memory entity result sets. Uses the parsed AST from `temper-odata`.
 
 use temper_odata::query::types::{
-    BinaryOperator, FilterExpr, ODataValue, OrderByClause, OrderDirection, QueryOptions,
+    BinaryOperator, FilterExpr, MAX_EXPAND_DEPTH, ODataValue, OrderByClause, OrderDirection,
+    QueryOptions,
 };
 
 use crate::blobs::{BlobHydrationBudget, hydrate_blob_refs_for_tenant_with_budget};
-
-/// Maximum nesting depth for recursive $expand (prevents infinite loops).
-const MAX_EXPAND_DEPTH: u8 = 3;
 
 /// Apply all query options to a collection of entity JSON values.
 ///
@@ -405,7 +403,9 @@ struct ExpansionContext<'a> {
 /// to determine the target entity type, then queries related entities
 /// (by convention: entities with a matching parent reference).
 ///
-/// Supports nested $expand up to [`MAX_EXPAND_DEPTH`] levels with cycle detection.
+/// Follows every nested `$expand` up to [`MAX_EXPAND_DEPTH`] levels, including
+/// ones that return to a type already expanded (a manager's manager). Items
+/// nested deeper are refused with a 400, never dropped.
 pub async fn expand_entity(
     entity: &mut serde_json::Value,
     expand_items: &[temper_odata::query::types::ExpandItem],
@@ -421,17 +421,16 @@ pub async fn expand_entity(
         security_ctx,
         hydration_budget,
     };
-    expand_entity_recursive(entity, expand_items, entity_type, &context, 0, &mut vec![]).await
+    expand_entity_recursive(entity, expand_items, entity_type, &context, 1).await
 }
 
-/// Recursive implementation of $expand with depth and cycle guards.
+/// Recursive implementation of $expand; `level` is 1 for the top-level items.
 async fn expand_entity_recursive(
     entity: &mut serde_json::Value,
     expand_items: &[temper_odata::query::types::ExpandItem],
     entity_type: &str,
     context: &ExpansionContext<'_>,
-    depth: u8,
-    visited: &mut Vec<String>,
+    level: usize,
 ) -> Result<(), axum::response::Response> {
     let ExpansionContext {
         state,
@@ -439,13 +438,19 @@ async fn expand_entity_recursive(
         security_ctx,
         hydration_budget,
     } = context;
-    if depth >= MAX_EXPAND_DEPTH {
-        return Ok(());
+    // The query parser already refuses a deeper `$expand`; items built in
+    // code meet the same bound and the same error here.
+    if level > MAX_EXPAND_DEPTH {
+        use axum::response::IntoResponse as _;
+        return Err(crate::response::odata_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "InvalidQuery",
+            &format!(
+                "$expand nests more than {MAX_EXPAND_DEPTH} levels, the most one read may follow"
+            ),
+        )
+        .into_response());
     }
-    if visited.contains(&entity_type.to_string()) {
-        return Ok(());
-    }
-    visited.push(entity_type.to_string());
     // Resolve all navigation targets up front (while holding registry lock briefly)
     let nav_infos: Vec<(
         &temper_odata::query::types::ExpandItem,
@@ -619,8 +624,7 @@ async fn expand_entity_recursive(
                     nested_expand,
                     &info.target_type,
                     context,
-                    depth + 1,
-                    visited,
+                    level + 1,
                 ))
                 .await?;
             }
@@ -640,7 +644,6 @@ async fn expand_entity_recursive(
             }
         }
     }
-    visited.pop();
     Ok(())
 }
 
