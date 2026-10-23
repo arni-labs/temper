@@ -132,14 +132,17 @@ fn send_verified(
             Ok(0) => break None,
             Ok(read) => read,
             Err(error) => {
-                break Some(anyhow::Error::new(error).context("Cannot read local upload file"));
+                break Some(
+                    anyhow::Error::new(error)
+                        .context("Cannot read local upload file; nothing was stored"),
+                );
             }
         };
         hasher.update(&buf[..read]);
         sent += read as u64;
         if sent > len {
             break Some(anyhow::anyhow!(
-                "Local upload file grew while it was being sent"
+                "Local upload file grew while it was being sent; nothing was stored"
             ));
         }
         if let Some(chunk) = held.replace(buf[..read].to_vec())
@@ -149,13 +152,14 @@ fn send_verified(
         }
     };
     let failure = failure.or_else(|| {
-        (sent != len || format!("{:x}", hasher.finalize()) != expected)
-            .then(|| anyhow::anyhow!("Local upload file changed while it was being sent"))
+        (sent != len || format!("{:x}", hasher.finalize()) != expected).then(|| {
+            anyhow::anyhow!("Local upload file changed while it was being sent; nothing was stored")
+        })
     });
     match failure {
         Some(error) => {
             let _ = sink.blocking_send(Err(std::io::Error::other(error.to_string())));
-            Err(error.context("nothing was stored"))
+            Err(error)
         }
         None => {
             if let Some(chunk) = held {

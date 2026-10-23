@@ -412,16 +412,17 @@ async fn customer_with_one_order() -> (
 
     let csdl_xml = include_str!("../../../test-fixtures/specs/model.csdl.xml");
     let order_ioa = include_str!("../../../test-fixtures/specs/order.ioa.toml");
-    let mut specs = std::collections::BTreeMap::new();
-    specs.insert("Customer".to_string(), order_ioa.to_string());
-    specs.insert("Order".to_string(), order_ioa.to_string());
-    let state = crate::state::ServerState::with_specs(
-        ActorSystem::new("expand-depth"),
+    // A registered tenant, so its relation graph resolves Order.Customer
+    // through the CustomerId constraint.
+    let mut registry = crate::registry::SpecRegistry::new();
+    registry.register_tenant(
+        "default",
         parse_csdl(csdl_xml).expect("test CSDL"),
         csdl_xml.to_string(),
-        specs,
-    )
-    .expect("test state");
+        &[("Customer", order_ioa), ("Order", order_ioa)],
+    );
+    let state =
+        crate::state::ServerState::from_registry(ActorSystem::new("expand-depth"), registry);
     let tenant = TenantId::default();
     state
         .get_or_create_tenant_entity(&tenant, "Customer", "customer-1", serde_json::json!({}))
