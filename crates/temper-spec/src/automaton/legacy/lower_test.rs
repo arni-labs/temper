@@ -268,6 +268,14 @@ fn lowered_field_predicates_match_the_old_evaluator() {
 }
 
 #[test]
+fn an_assert_nested_past_the_budget_is_a_validation_error() {
+    let depth = 200_000;
+    let assert = format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+    let err = invariant_to_expr(&[], &assert).expect_err("over-deep assert must be refused");
+    assert!(err.contains("nested too deeply"), "{err}");
+}
+
+#[test]
 fn lowers_invariant_forms() {
     let lower = |when: &[&str], assert: &str| {
         let when: Vec<String> = when.iter().map(|s| s.to_string()).collect();

@@ -80,7 +80,7 @@ pub enum ParsedAssert {
 pub fn parse_assert_expr(expr: &str) -> Option<ParsedAssert> {
     let tokens = tokenize(expr)?;
     let mut cursor = 0;
-    let result = parse_or(&tokens, &mut cursor)?;
+    let result = parse_or(&tokens, &mut cursor, 0)?;
     // Reject trailing garbage.
     if cursor != tokens.len() {
         return None;
@@ -188,12 +188,18 @@ fn tokenize(input: &str) -> Option<Vec<Tok>> {
 // Recursive-descent parser
 // ---------------------------------------------------------------------------
 
-fn parse_or(tokens: &[Tok], cursor: &mut usize) -> Option<ParsedAssert> {
-    let first = parse_and(tokens, cursor)?;
+/// Nesting budget for `(` and `!`, shared with the predicate parser. Each level
+/// is a stack frame, and assert text comes from tenant-loaded specs, so input
+/// nested past it is not an assert this parser recognizes (`None`) and parsing
+/// stays within a bounded stack.
+const MAX_DEPTH: usize = crate::predicate::MAX_DEPTH;
+
+fn parse_or(tokens: &[Tok], cursor: &mut usize, depth: usize) -> Option<ParsedAssert> {
+    let first = parse_and(tokens, cursor, depth)?;
     let mut parts = vec![first];
     while matches!(tokens.get(*cursor), Some(Tok::Or)) {
         *cursor += 1;
-        parts.push(parse_and(tokens, cursor)?);
+        parts.push(parse_and(tokens, cursor, depth)?);
     }
     if parts.len() == 1 {
         parts.pop()
@@ -202,12 +208,12 @@ fn parse_or(tokens: &[Tok], cursor: &mut usize) -> Option<ParsedAssert> {
     }
 }
 
-fn parse_and(tokens: &[Tok], cursor: &mut usize) -> Option<ParsedAssert> {
-    let first = parse_atom(tokens, cursor)?;
+fn parse_and(tokens: &[Tok], cursor: &mut usize, depth: usize) -> Option<ParsedAssert> {
+    let first = parse_atom(tokens, cursor, depth)?;
     let mut parts = vec![first];
     while matches!(tokens.get(*cursor), Some(Tok::And)) {
         *cursor += 1;
-        parts.push(parse_atom(tokens, cursor)?);
+        parts.push(parse_atom(tokens, cursor, depth)?);
     }
     if parts.len() == 1 {
         parts.pop()
@@ -216,11 +222,15 @@ fn parse_and(tokens: &[Tok], cursor: &mut usize) -> Option<ParsedAssert> {
     }
 }
 
-fn parse_atom(tokens: &[Tok], cursor: &mut usize) -> Option<ParsedAssert> {
+fn parse_atom(tokens: &[Tok], cursor: &mut usize, depth: usize) -> Option<ParsedAssert> {
+    let nested = matches!(tokens.get(*cursor), Some(Tok::LParen | Tok::Not));
+    if nested && depth >= MAX_DEPTH {
+        return None;
+    }
     match tokens.get(*cursor) {
         Some(Tok::LParen) => {
             *cursor += 1;
-            let inner = parse_or(tokens, cursor)?;
+            let inner = parse_or(tokens, cursor, depth + 1)?;
             if !matches!(tokens.get(*cursor), Some(Tok::RParen)) {
                 return None;
             }
@@ -229,7 +239,7 @@ fn parse_atom(tokens: &[Tok], cursor: &mut usize) -> Option<ParsedAssert> {
         }
         Some(Tok::Not) => {
             *cursor += 1;
-            let inner = parse_atom(tokens, cursor)?;
+            let inner = parse_atom(tokens, cursor, depth + 1)?;
             // Only `!bool_var` supported; negating compounds or comparisons needs
             // explicit De Morgan expansion by the spec author.
             if let ParsedAssert::BoolRequired { var, expect } = inner {
@@ -662,5 +672,42 @@ mod tests {
     fn test_trailing_operator_returns_none() {
         assert_eq!(parse_assert_expr("a &&"), None);
         assert_eq!(parse_assert_expr("&& a"), None);
+    }
+
+    #[test]
+    fn test_nesting_within_budget_parses() {
+        let parens = format!("{}a{}", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
+        assert_eq!(
+            parse_assert_expr(&parens),
+            Some(ParsedAssert::BoolRequired {
+                var: "a".into(),
+                expect: true
+            })
+        );
+        let nots = format!("{}a", "!".repeat(MAX_DEPTH));
+        assert!(parse_assert_expr(&nots).is_some());
+    }
+
+    #[test]
+    fn test_nesting_past_budget_returns_none() {
+        let parens = format!(
+            "{}a{}",
+            "(".repeat(MAX_DEPTH + 1),
+            ")".repeat(MAX_DEPTH + 1)
+        );
+        assert_eq!(parse_assert_expr(&parens), None);
+        let nots = format!("{}a", "!".repeat(MAX_DEPTH + 1));
+        assert_eq!(parse_assert_expr(&nots), None);
+    }
+
+    /// Depth far past any stack: the parser stops at the budget instead of
+    /// recursing once per level.
+    #[test]
+    fn test_very_deep_nesting_returns_none() {
+        let depth = 200_000;
+        let parens = format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+        assert_eq!(parse_assert_expr(&parens), None);
+        let mixed = "!(".repeat(depth) + "a" + &")".repeat(depth);
+        assert_eq!(parse_assert_expr(&mixed), None);
     }
 }
