@@ -92,8 +92,8 @@ impl AuthorizedWasmHost {
     }
 
     /// Ask the gate whether `operation` may send `method` to the host `url`
-    /// connects to. The egress clients follow no redirects, so each hop the
-    /// guest makes is a new call that comes through here.
+    /// connects to. The egress clients follow no redirects: a 3xx goes back to
+    /// the guest, and a hop it makes after one is a new call through here.
     fn authorize_http(&self, operation: &str, method: &str, url: &str) -> Result<(), String> {
         let Some(domain) = extract_domain(url) else {
             tracing::warn!(
