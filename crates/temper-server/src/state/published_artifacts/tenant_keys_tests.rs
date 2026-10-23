@@ -38,9 +38,7 @@ async fn harness(public_endpoint: &str) -> Harness {
             format!("{public_endpoint}/public-artifacts"),
         ),
     ] {
-        vault
-            .cache_platform_secret(key, value)
-            .expect("platform secret");
+        vault.cache_platform_secret(key, value);
     }
     let mut state = ServerState::new(
         ActorSystem::new("published-artifact-tenant-keys"),

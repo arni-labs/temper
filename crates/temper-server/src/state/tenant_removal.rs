@@ -98,9 +98,7 @@ mod tests {
                 .authz
                 .reload_tenant_policies(tenant, policy)
                 .expect("policy");
-            vault
-                .cache_secret(tenant, "api_key", format!("{tenant}-value"))
-                .expect("secret");
+            vault.cache_secret(tenant, "api_key", format!("{tenant}-value"));
         }
 
         state.forget_tenant(&TenantId::new("acme"));
