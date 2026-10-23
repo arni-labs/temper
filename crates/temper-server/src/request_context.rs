@@ -16,6 +16,10 @@ mod observation_metadata;
 
 /// Maximum callbacks along one server-owned internal context lineage.
 ///
+/// Integration callbacks, compensations, spawned children and zero-delay
+/// scheduled follow-ons each count one hop; a scheduled follow-on that waits
+/// on the clock starts a new lineage (see `for_scheduled_follow_on`).
+///
 /// This is not a global fanout quota and is not persisted across restarts or
 /// propagated through external HTTP requests.
 pub const MAX_CALLBACK_HOPS: u32 = 512;
@@ -114,6 +118,30 @@ impl AgentContext {
         let mut next = self.clone();
         next.callback_depth = 0;
         next
+    }
+
+    /// Begin a `schedule` / `schedule_at` follow-on of this context.
+    ///
+    /// A follow-on that waits on the clock (a delay of one second or more)
+    /// runs at most once per second per schedule effect, the same floor a
+    /// state timer has (`state_timeout` requires `after_seconds > 0`). That
+    /// wait is what bounds a periodic schedule, so it starts a fresh callback
+    /// lineage and a recurring schedule keeps running however many cycles it
+    /// has completed. A follow-on with no delay, including a `schedule_at`
+    /// whose time has already passed, runs as soon as its parent commits, so
+    /// it continues the parent's lineage in a detached task and spends one
+    /// hop, as an integration callback does.
+    pub(crate) fn for_scheduled_follow_on(
+        &self,
+        delay_seconds: u64,
+    ) -> Result<Self, CallbackBudgetExceeded> {
+        if delay_seconds == 0 {
+            return self.for_background_task().for_callback();
+        }
+        let mut next = self.clone();
+        next.callback_depth = 0;
+        next.callback_hops = 0;
+        Ok(next)
     }
 
     /// Create a system-level agent context for internal operations.

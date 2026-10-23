@@ -548,7 +548,37 @@ impl crate::state::ServerState {
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = agent_ctx.clone();
+            let ctx = match agent_ctx.for_scheduled_follow_on(sched.delay_seconds) {
+                Ok(context) => context,
+                Err(error) => {
+                    let entity = super::WasmEntityRef {
+                        tenant,
+                        entity_type,
+                        entity_id,
+                    };
+                    self.record_generated_callback_refusal(entity, &action, &error.to_string());
+                    continue;
+                }
+            };
+            // The same action due in the same second on this record is already
+            // one pending follow-on (see `state::follow_ons`).
+            let pending = crate::state::follow_ons::FollowOnKey {
+                tenant: tenant.to_string(),
+                entity_type: et.clone(),
+                entity_id: eid.clone(),
+                action: action.clone(),
+                due_second: sim_now()
+                    .timestamp()
+                    .saturating_add_unsigned(sched.delay_seconds),
+            };
+            if !self.pending_follow_ons.claim(pending.clone()) {
+                tracing::debug!(
+                    tenant = %tenant, entity_type, entity_id, action = %action,
+                    due_second = pending.due_second,
+                    "scheduled follow-on merged into the one already pending"
+                );
+                continue;
+            }
             let delay = std::time::Duration::from_secs(sched.delay_seconds);
             let workflow_root_entity_type = ctx
                 .workflow_root_entity_type
@@ -575,6 +605,7 @@ impl crate::state::ServerState {
                 // determinism-ok: timer delivery is a background side-effect
                 async move {
                     tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
+                    state.pending_follow_ons.release(&pending);
                     let _ = state
                         .dispatch_tenant_action(&t, &et, &eid, &action, serde_json::json!({}), &ctx)
                         .await;
