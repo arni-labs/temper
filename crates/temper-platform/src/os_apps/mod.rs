@@ -1107,6 +1107,14 @@ pub(super) async fn install_os_app_with_plan(
     app_name: &str,
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
+    // An install rewrites the tenant's spec and constraints rows; for a tenant
+    // whose stored rows did not load, those rows are what needs repair.
+    if state.tenant_unavailable_reason(tenant).is_some() {
+        return Err(format!(
+            "tenant '{tenant}' is unavailable (its stored specs did not load at startup), so \
+             os-app '{app_name}' is not installed and the stored rows are kept for repair"
+        ));
+    }
     let _serialized = install_guard::tenant(tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock

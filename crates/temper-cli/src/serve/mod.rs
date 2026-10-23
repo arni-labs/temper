@@ -14,6 +14,8 @@ mod observe_ui;
 pub(crate) mod options;
 mod storage;
 mod sync_copy;
+#[cfg(test)]
+mod unavailable_tenant_tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -84,6 +86,16 @@ pub async fn run(
     // Phase 2: Registry (restore + disk apps)
     let (registry, tenant_policy_seed) =
         bootstrap::build_registry(pg_pool.as_ref(), storage_stack.as_ref(), &apps).await?;
+    // build_registry already said which disk apps it skipped; the later phases
+    // (webhooks, hydration, tenant bootstrap, verification) skip them as well.
+    let apps: Vec<(String, String)> = apps
+        .into_iter()
+        .filter(|(tenant, _)| {
+            registry
+                .tenant_unavailable_reason(&temper_runtime::tenant::TenantId::new(tenant))
+                .is_none()
+        })
+        .collect();
 
     // Assemble platform state
     let mut state = PlatformState::with_registry(registry, api_key);

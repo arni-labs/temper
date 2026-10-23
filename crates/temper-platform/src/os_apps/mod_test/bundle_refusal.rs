@@ -141,6 +141,30 @@ async fn a_new_tenants_bundle_with_unparseable_csdl_stores_nothing() {
     );
 }
 
+#[tokio::test]
+async fn an_install_into_an_unavailable_tenant_is_refused_and_stores_nothing() {
+    let fx = Fixture::new("unavailable").await;
+    let good = format!("refusal-unavailable-{}", uuid::Uuid::new_v4().simple());
+    fx.write_app(&good, ORDER_CSDL, None);
+    fx.state
+        .registry
+        .write()
+        .expect("registry writable")
+        .mark_tenant_unavailable("tenant-held", "stored constraints".to_string());
+
+    let error = fx
+        .install("tenant-held", &good)
+        .await
+        .expect_err("a tenant kept for repair gets no install");
+    assert!(error.contains("unavailable"), "{error}");
+    assert!(
+        !fx.stored_spec_tenants()
+            .await
+            .contains(&"tenant-held".to_string()),
+        "a refused install stores no spec rows"
+    );
+}
+
 #[test]
 fn registering_unparseable_cross_invariants_returns_an_error_and_keeps_the_registry_usable() {
     let state = PlatformState::new(None);

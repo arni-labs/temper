@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 use temper_runtime::ActorSystem;
+use temper_runtime::tenant::TenantId;
 use temper_server::ServerState;
 use temper_server::registry::SpecRegistry;
 
@@ -102,6 +103,17 @@ impl PlatformState {
             crate::genesis_install::GenesisInstallHook::new(state.clone()),
         ));
         state
+    }
+
+    /// Why `tenant` is unavailable, if startup could not restore its stored
+    /// specs. Such a tenant's stored rows are kept as they are for repair, so
+    /// nothing installs or writes specs for it until a restart restores it.
+    pub fn tenant_unavailable_reason(&self, tenant: &str) -> Option<String> {
+        self.registry
+            .read()
+            .unwrap() // ci-ok: RwLock read — poisoned lock = prior panic, fail-fast correct
+            .tenant_unavailable_reason(&TenantId::new(tenant))
+            .map(str::to_string)
     }
 
     /// Create a new platform state with a pre-loaded registry.
