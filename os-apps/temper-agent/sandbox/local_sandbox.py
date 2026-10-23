@@ -10,11 +10,18 @@ Implements the sandbox HTTP API that the tool_runner WASM module targets:
 No isolation — runs directly on the host filesystem and shell.
 For production, use E2B sandboxes via the sandbox_provisioner WASM module.
 
+Because it runs commands and touches files as the user who started it, it
+listens on 127.0.0.1 only, and every request must carry
+`Authorization: Bearer <token>`, where the token is read at start from the
+environment variable named by --token-env. `temper serve` generates a fresh
+token at each start and is the only holder.
+
 Usage:
-  python3 local_sandbox.py [--port 9999] [--workdir /tmp/sandbox]
+  TEMPER_SANDBOX_TOKEN=<token> python3 local_sandbox.py [--port 9999] [--workdir /tmp/sandbox]
 """
 
 import argparse
+import hmac
 import json
 import os
 import subprocess
@@ -25,6 +32,22 @@ from urllib.parse import urlparse, parse_qs
 
 class SandboxHandler(BaseHTTPRequestHandler):
     """HTTP handler implementing the sandbox API."""
+
+    def parse_request(self):
+        # Runs before any do_* method, so every endpoint answers only a
+        # request that carries this start's token.
+        if not super().parse_request():
+            return False
+        if not self._has_token():
+            self.close_connection = True
+            self._json(401, {"error": "missing or wrong sandbox token"})
+            return False
+        return True
+
+    def _has_token(self):
+        expected = b"Bearer " + self.server.token.encode()
+        given = (self.headers.get("Authorization") or "").encode()
+        return hmac.compare_digest(given, expected)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -136,21 +159,28 @@ def main():
         help="Port to listen on (default: 9999)"
     )
     parser.add_argument(
-        "--host", type=str, default="0.0.0.0",
-        help="Address to bind (default: 0.0.0.0; 127.0.0.1 for loopback only)"
-    )
-    parser.add_argument(
         "--workdir", type=str, default="/tmp/sandbox",
         help="Working directory for file operations (default: /tmp/sandbox)"
     )
+    parser.add_argument(
+        "--token-env", type=str, default="TEMPER_SANDBOX_TOKEN",
+        help="Environment variable holding the token every request must carry "
+             "(default: TEMPER_SANDBOX_TOKEN)"
+    )
     args = parser.parse_args()
+
+    token = os.environ.get(args.token_env, "")
+    if not token:
+        print(f"Set {args.token_env} to the token requests must carry.", file=sys.stderr)
+        sys.exit(2)
 
     os.makedirs(args.workdir, exist_ok=True)
 
-    server = HTTPServer((args.host, args.port), SandboxHandler)
+    server = HTTPServer(("127.0.0.1", args.port), SandboxHandler)
     server.workdir = args.workdir
+    server.token = token
 
-    print(f"Local sandbox server listening on {args.host}:{args.port}", file=sys.stderr)
+    print(f"Local sandbox server listening on 127.0.0.1:{args.port}", file=sys.stderr)
     print(f"Working directory: {args.workdir}", file=sys.stderr)
     print(f"Endpoints:", file=sys.stderr)
     print(f"  GET  http://localhost:{args.port}/health", file=sys.stderr)

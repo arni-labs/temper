@@ -18,8 +18,9 @@ pub use authorized_host::{AuthorizedWasmHost, WasmAuthzDecision, WasmAuthzGate, 
 pub use engine::{WasmEngine, WasmError};
 pub use host_trait::{
     BinaryHttpInterceptorFn, HttpClientCache, InternalHttpCapability,
-    InternalHttpCapabilityIssuerFn, ProductionWasmHost, ProgressEmitterFn, SecretResolverFn,
-    SimWasmHost, SpecEvaluatorFn, TextHttpInterceptorFn, WasmHost, parse_connect_frames,
+    InternalHttpCapabilityIssuerFn, LocalSandboxAccess, ProductionWasmHost, ProgressEmitterFn,
+    SecretResolverFn, SimWasmHost, SpecEvaluatorFn, TextHttpInterceptorFn, WasmHost,
+    parse_connect_frames,
 };
 pub use stream::{StreamRegistry, StreamRegistryConfig};
 pub use types::{

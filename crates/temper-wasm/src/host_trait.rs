@@ -23,11 +23,13 @@ use temper_observe::wide_event::{self, EventKind, WideEvent};
 mod guest_progress;
 mod http_clients;
 mod internal_http;
+mod local_sandbox;
 mod redirects;
 pub(crate) mod span_hints;
 
 pub use http_clients::HttpClientCache;
 pub use internal_http::{InternalHttpCapability, InternalHttpCapabilityIssuerFn};
+pub use local_sandbox::LocalSandboxAccess;
 
 /// Re-exported so every channel that records guest-supplied `gen_ai.*` metadata
 /// bounds it the same way, including the dispatch callback path in
@@ -367,6 +369,8 @@ pub struct ProductionWasmHost {
     internal_api_base_url: Option<String>,
     /// Trusted callback that issues one request-bound internal capability.
     internal_capability_issuer: Option<InternalHttpCapabilityIssuerFn>,
+    /// The server's local sandbox, whose requests carry its token.
+    local_sandbox: Option<LocalSandboxAccess>,
     /// Optional spec evaluator (provided by temper-server at construction).
     spec_evaluator: Option<SpecEvaluatorFn>,
     /// Optional progress emitter (provided by temper-server at construction).
@@ -615,6 +619,7 @@ impl ProductionWasmHost {
             secret_resolver: None,
             internal_api_base_url: None,
             internal_capability_issuer: None,
+            local_sandbox: None,
             spec_evaluator: None,
             progress_emitter: None,
             trace_id: None,
@@ -707,6 +712,7 @@ impl ProductionWasmHost {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<reqwest::RequestBuilder, String> {
+        builder = self.add_local_sandbox_token(builder, url);
         if !self.is_internal_temper_url(url) {
             return Ok(builder);
         }

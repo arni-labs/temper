@@ -193,6 +193,7 @@ pub(crate) fn authorized_http_endpoint_host(
     .with_progress_emitter(progress_emitter)
     .with_internal_api_base_url(internal_api_url)
     .with_internal_capability_issuer(capability_issuer)
+    .with_local_sandbox(state.local_sandbox.get().cloned())
     .with_invocation_context(invocation_context.clone())
     .with_redirect_gate(Arc::clone(&gate), authz_context.clone())
     // ARN-243: the HttpEndpoint path honours the same per-tenant LLM content
@@ -865,6 +866,7 @@ impl crate::state::ServerState {
                 .with_spec_evaluator(spec_evaluator_fn())
                 .with_progress_emitter(progress_emitter)
                 .with_internal_api_base_url(internal_api_url)
+                .with_local_sandbox(self.local_sandbox.get().cloned())
                 .with_invocation_context(host_invocation_context)
                 .with_redirect_gate(Arc::clone(&gate), authz_ctx.clone())
                 .with_llm_content_export(self.export_llm_content(ctx.entity_ref.tenant.as_str()))
@@ -1613,6 +1615,7 @@ impl crate::state::ServerState {
         .with_spec_evaluator(spec_evaluator_fn())
         .with_progress_emitter(progress_emitter)
         .with_internal_api_base_url(internal_api_base_url(self))
+        .with_local_sandbox(self.local_sandbox.get().cloned())
         .with_invocation_context(context.clone())
         .with_redirect_gate(Arc::clone(&base_gate), authz_ctx.clone())
         .with_llm_content_export(self.export_llm_content(tenant.as_str()));
