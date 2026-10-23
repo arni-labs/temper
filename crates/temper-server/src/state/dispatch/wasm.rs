@@ -1343,6 +1343,53 @@ impl crate::state::ServerState {
                     .await;
                 }
 
+                let callback_params = strip_private_observability_params(result.callback_params);
+                let composite_agent_ctx = agent_ctx_for_composite_wasm_result(
+                    ctx.agent_ctx,
+                    ctx.dispatch_idempotency_key,
+                );
+                // The module ran, but its composite result can still be refused (a sub-write
+                // the action does not declare, or one its target rejects). Then the
+                // integration's effect never landed: fail it like a module failure, so the
+                // declared `on_failure` runs and the invocation is recorded as failed,
+                // instead of returning early past both (ADR-0152).
+                let composite_result_consumed = match self
+                    .apply_composite_integration_result(
+                        ctx.entity_ref.tenant,
+                        ctx.entity_ref.entity_type,
+                        ctx.entity_ref.entity_id,
+                        ctx.action,
+                        &callback_params,
+                        &composite_agent_ctx,
+                    )
+                    .await
+                {
+                    Ok(consumed) => consumed,
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        tracing::warn!(
+                            tenant = %ctx.entity_ref.tenant,
+                            entity_type = ctx.entity_ref.entity_type,
+                            entity_id = ctx.entity_ref.entity_id,
+                            action = ctx.action,
+                            integration = %integration.name,
+                            module = %module_name,
+                            error = %error_str,
+                            "composite integration result refused"
+                        );
+                        return handle_wasm_failure_boxed(
+                            self,
+                            ctx,
+                            &integration.name,
+                            module_name,
+                            &integration.on_failure,
+                            error_str,
+                            result.duration_ms,
+                        )
+                        .await;
+                    }
+                };
+
                 instrument_wasm_dispatch_phase(
                     phase_parent_span.clone(),
                     ctx,
@@ -1360,23 +1407,6 @@ impl crate::state::ServerState {
                     ),
                 )
                 .await;
-
-                let callback_params = strip_private_observability_params(result.callback_params);
-                let composite_agent_ctx = agent_ctx_for_composite_wasm_result(
-                    ctx.agent_ctx,
-                    ctx.dispatch_idempotency_key,
-                );
-                let composite_result_consumed = self
-                    .apply_composite_integration_result(
-                        ctx.entity_ref.tenant,
-                        ctx.entity_ref.entity_type,
-                        ctx.entity_ref.entity_id,
-                        ctx.action,
-                        &callback_params,
-                        &composite_agent_ctx,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
 
                 // Determine callback action: prefer static on_success from spec,
                 // fall back to dynamic callback_action from WASM result. Composite

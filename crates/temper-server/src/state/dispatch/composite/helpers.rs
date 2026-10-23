@@ -32,6 +32,8 @@ pub(super) fn parse_sub_writes(params: &Value) -> Result<Vec<CompositeSubWrite>,
 }
 
 pub(super) fn validate_sub_writes(
+    entity_type: &str,
+    action: &str,
     metadata: &CompositeActionMetadata,
     sub_writes: &[CompositeSubWrite],
 ) -> Result<(), DispatchError> {
@@ -50,7 +52,7 @@ pub(super) fn validate_sub_writes(
     for sub_write in sub_writes {
         if !declared.contains(&(sub_write.entity_type.clone(), sub_write.action.clone())) {
             return Err(DispatchError::Internal(format!(
-                "Composite sub-write {}.{} is not declared by the action contract",
+                "Composite sub-write {}.{} is not declared by the action contract of {entity_type}.{action}",
                 sub_write.entity_type, sub_write.action
             )));
         }
