@@ -131,13 +131,11 @@ fn build_hmac_test_state() -> ServerState {
         );
     }
     let vault = SecretsVault::new(&[7u8; 32]);
-    vault
-        .cache_secret(
-            "test-tenant",
-            "WEBHOOK_HMAC",
-            WEBHOOK_HMAC_SECRET.to_string(),
-        )
-        .expect("cache webhook secret");
+    vault.cache_secret(
+        "test-tenant",
+        "WEBHOOK_HMAC",
+        WEBHOOK_HMAC_SECRET.to_string(),
+    );
     state = state.with_secrets_vault(vault);
     state
         .authz

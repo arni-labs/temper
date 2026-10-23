@@ -1301,7 +1301,7 @@ temper serve [--port PORT] [--specs-dir DIR] [--tenant NAME]
   2. What the server sets itself at start: `anthropic_api_key` when `ANTHROPIC_API_KEY` is set, `exa_api_key` when `EXA_API_KEY` is set, and the addresses the server gives its own modules (such as `temper_api_url`). The prefixed variable of the same name is skipped and logged by name.
   3. The prefixed variable.
 - **What is logged.** One line with the number of secrets seeded, and one warning for each skipped variable with its name. Values are never logged. With no `TEMPER_SECRET_` variable set, startup logs nothing about them.
-- **Budgets.** A value larger than 8192 bytes, the limit of the secrets API, is skipped and logged by name. The platform layer holds at most 100 secrets, the server's own included. Variables are taken in name order, and any beyond that are skipped and logged by name.
+- **Budgets.** A value larger than 8192 bytes, the limit of the secrets API, is skipped and logged by name. There is no limit on how many secrets the platform layer holds. Variables are taken in name order.
 
 ### Telemetry export settings
 
