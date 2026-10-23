@@ -15,11 +15,13 @@ use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
 
-/// Anyone may create; only the customer an order names may read it.
+/// Anyone may create; only the principal an order's number names may read
+/// it. `OrderNumber` is a plain string with no relation, so a create needs no
+/// other record to exist.
 const ORDER_OWNER_READS: &str = r#"
 permit(principal, action == Action::"create", resource is Order);
 permit(principal, action == Action::"read", resource is Order)
-when { resource has CustomerId && resource.CustomerId == principal.id };
+when { resource has OrderNumber && resource.OrderNumber == principal.id };
 "#;
 
 /// Anyone may create; only the owner a note names may read it.
@@ -170,7 +172,7 @@ async fn a_create_with_an_existing_key_answers_only_what_the_caller_may_read() {
     assert_create_with_existing_key_answers_only_what_caller_may_read(
         &state,
         "Orders",
-        "CustomerId",
+        "OrderNumber",
         "Notes",
     )
     .await;
