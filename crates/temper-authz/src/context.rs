@@ -36,10 +36,18 @@ pub struct Principal {
 }
 
 /// Cedar context keys that only a resolved `SecurityContext` may populate.
+/// `module` is set by the kernel for a call an installed module makes; a
+/// record field of that name must never become `context.module` (ADR-0183).
 pub fn is_cedar_authority_context_key(name: &str) -> bool {
     matches!(
         name,
-        "sessionId" | "agentId" | "agentType" | "agentTypeVerified" | "role" | "actingFor"
+        "sessionId"
+            | "agentId"
+            | "agentType"
+            | "agentTypeVerified"
+            | "role"
+            | "actingFor"
+            | "module"
     )
 }
 

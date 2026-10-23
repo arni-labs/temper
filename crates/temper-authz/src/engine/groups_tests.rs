@@ -120,3 +120,60 @@ fn a_tenant_whose_memberships_are_not_read_yet_lets_nobody_in_by_one() {
         "a1"
     ));
 }
+
+#[test]
+fn only_the_platform_or_an_installed_module_writes_memberships() {
+    // A broad app statement in a shared tenant.
+    let engine = AuthzEngine::empty();
+    engine
+        .reload_tenant_policies("t", "permit(principal, action, resource);")
+        .unwrap();
+    let id = group_membership_id("Group::\"app:a1:edit\"", "eve").unwrap();
+    let record = HashMap::from([
+        ("id".to_string(), serde_json::json!(id)),
+        (
+            "group".to_string(),
+            serde_json::json!("Group::\"app:a1:edit\""),
+        ),
+        ("member".to_string(), serde_json::json!("eve")),
+    ]);
+    let check =
+        |who: &SecurityContext, action: &str, attrs: &HashMap<String, serde_json::Value>| {
+            engine
+                .authorize_for_tenant("t", who, action, "GroupMembership", attrs)
+                .is_allowed()
+        };
+    let eve = person("eve");
+    for action in [
+        "StartMembership",
+        "EndMembership",
+        "create",
+        "update",
+        "delete",
+    ] {
+        assert!(
+            !check(&eve, action, &record),
+            "a person must not {action} a membership"
+        );
+    }
+    assert!(
+        check(&eve, "read", &record),
+        "reads stay with the tenant's Cedar"
+    );
+
+    // A record field named `module` is not the module context.
+    let mut spoofed = record.clone();
+    spoofed.insert("module".to_string(), serde_json::json!("katagami-control"));
+    assert!(!check(&eve, "create", &spoofed));
+
+    let mut module_call = person("eve");
+    module_call
+        .context_attrs
+        .insert("module".to_string(), serde_json::json!("katagami-control"));
+    assert!(check(&module_call, "StartMembership", &record));
+    assert!(check(
+        &SecurityContext::system(),
+        "StartMembership",
+        &record
+    ));
+}

@@ -7,7 +7,7 @@ use cedar_policy::{Policy, PolicyId, PolicySet};
 
 use super::{
     AuthzEngine, CompiledPolicies, SYSTEM_PLATFORM_POLICY_ID_PREFIX, TenantPolicies,
-    group_candidates, statement_cache, system_platform_policy,
+    VERIFIED_OPERATOR_WHEN, group_candidates, statement_cache,
 };
 use crate::error::AuthzError;
 
@@ -183,4 +183,54 @@ pub(super) fn merge_system_platform_policy(combined: &mut PolicySet) {
     for (policy, _) in system_platform_statements() {
         let _ = combined.add(policy.clone());
     }
+}
+
+/// Built the built-in system-platform Cedar policy, interpolating the shared
+/// [`VERIFIED_OPERATOR_WHEN`] predicate into the four identity-entity clauses.
+/// Built-in Cedar in every [`AuthzEngine`] (ADR-0046): System's broad
+/// authority as an auditable policy instead of the old blanket bypass, and
+/// what only the platform may touch (issuers, generations, HTTP routes).
+fn system_platform_policy() -> String {
+    format!(
+        r#"
+@id("system-platform:broad-permit")
+permit(principal is System, action, resource);
+
+@id("system-platform:identity-entities-permit-trusted-issuer")
+permit(principal, action, resource is TrustedIssuer)
+when {{ principal is System || principal is Admin || ({op}) }};
+
+@id("system-platform:identity-entities-permit-principal-generation")
+permit(principal, action, resource is PrincipalGeneration)
+when {{ principal is System || principal is Admin || ({op}) }};
+
+@id("system-platform:protect-trusted-issuer")
+forbid(principal, action, resource is TrustedIssuer)
+unless {{ principal is System || principal is Admin || ({op}) }};
+
+@id("system-platform:protect-principal-generation")
+forbid(principal, action, resource is PrincipalGeneration)
+unless {{ principal is System || principal is Admin || ({op}) }};
+
+// ADR-0069: a route reshapes the tenant's HTTP surface, so only the platform manages one.
+@id("system-platform:http-endpoint-management-permit")
+permit(principal, action in [Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Pause", Action::"Resume", Action::"Delete"], resource is HttpEndpoint)
+when {{ principal is System || principal is Admin || ({op}) }};
+
+@id("system-platform:protect-http-endpoint-management")
+forbid(principal, action in [Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Pause", Action::"Resume", Action::"Delete"], resource is HttpEndpoint)
+unless {{ principal is System || principal is Admin || ({op}) }};
+
+// ADR-0183: being in a group is authority. In a tenant several apps share, one
+// app's broad statement such as `permit(principal, action == Action::"create",
+// resource)` would let any signed-in person StartMembership themselves into
+// Group::"app:<id>:edit" of any app. So memberships are written only by the
+// platform or by an installed module (context.module, which only the kernel
+// sets); who may read them stays with the tenant's Cedar.
+@id("system-platform:protect-group-membership-writes")
+forbid(principal, action in [Action::"StartMembership", Action::"EndMembership", Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Delete"], resource is GroupMembership)
+unless {{ principal is System || principal is Admin || ({op}) || context has module }};
+"#,
+        op = VERIFIED_OPERATOR_WHEN
+    )
 }

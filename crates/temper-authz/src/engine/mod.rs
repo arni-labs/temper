@@ -834,46 +834,6 @@ impl AuthzEngine {
 /// the identity-entity clauses below.
 pub const VERIFIED_OPERATOR_WHEN: &str = "principal has agent_type && principal.agent_type == \"operator\" && principal has agentTypeVerified && principal.agentTypeVerified == true";
 
-/// Built the built-in system-platform Cedar policy, interpolating the shared
-/// [`VERIFIED_OPERATOR_WHEN`] predicate into the four identity-entity clauses.
-/// Built-in Cedar in every [`AuthzEngine`] (ADR-0046): System's broad
-/// authority as an auditable policy instead of the old blanket bypass, and
-/// what only the platform may touch (issuers, generations, HTTP routes).
-fn system_platform_policy() -> String {
-    format!(
-        r#"
-@id("system-platform:broad-permit")
-permit(principal is System, action, resource);
-
-@id("system-platform:identity-entities-permit-trusted-issuer")
-permit(principal, action, resource is TrustedIssuer)
-when {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:identity-entities-permit-principal-generation")
-permit(principal, action, resource is PrincipalGeneration)
-when {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:protect-trusted-issuer")
-forbid(principal, action, resource is TrustedIssuer)
-unless {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:protect-principal-generation")
-forbid(principal, action, resource is PrincipalGeneration)
-unless {{ principal is System || principal is Admin || ({op}) }};
-
-// ADR-0069: a route reshapes the tenant's HTTP surface, so only the platform manages one.
-@id("system-platform:http-endpoint-management-permit")
-permit(principal, action in [Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Pause", Action::"Resume", Action::"Delete"], resource is HttpEndpoint)
-when {{ principal is System || principal is Admin || ({op}) }};
-
-@id("system-platform:protect-http-endpoint-management")
-forbid(principal, action in [Action::"create", Action::"Create", Action::"update", Action::"delete", Action::"Pause", Action::"Resume", Action::"Delete"], resource is HttpEndpoint)
-unless {{ principal is System || principal is Admin || ({op}) }};
-"#,
-        op = VERIFIED_OPERATOR_WHEN
-    )
-}
-
 /// PolicyId prefix used for the built-in system-platform policies
 /// (ADR-0046). Used to exclude them from user-facing counts.
 const SYSTEM_PLATFORM_POLICY_ID_PREFIX: &str = "system-platform:";
