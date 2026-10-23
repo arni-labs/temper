@@ -175,7 +175,7 @@ pub fn parse_query_options(query_string: &str) -> Result<QueryOptions, ODataErro
                 opts.select = Some(parse_select(&value));
             }
             "$expand" => {
-                opts.expand = Some(parse_expand(&value)?);
+                opts.expand = Some(parse_expand(&value, 1)?);
             }
             "$orderby" => {
                 opts.orderby = Some(parse_orderby(&value)?);
@@ -315,11 +315,31 @@ fn parse_orderby(value: &str) -> Result<Vec<OrderByClause>, ODataError> {
 // $expand parser
 // ---------------------------------------------------------------------------
 
-fn parse_expand(value: &str) -> Result<Vec<ExpandItem>, ODataError> {
+/// The most levels one `$expand` may nest (`A($expand=B($expand=C))` is three).
+///
+/// Forced by what one request may hold: each level can multiply the entities
+/// in the response by the fan-out of that relation, and a relation that leads
+/// back (`Orders($expand=Customer($expand=Orders(...)))`) multiplies at every
+/// second level, so a short query string could make one read build more
+/// entity copies than the server has memory for, taking it down for every
+/// tenant. The value is a choice, not a measurement. A deeper `$expand` is
+/// rejected with a 400 that names this bound; nothing is cut off silently.
+pub const MAX_EXPAND_DEPTH: usize = 3;
+
+/// Parse the `$expand` at nesting `level` (the top-level `$expand` is 1).
+fn parse_expand(value: &str, level: usize) -> Result<Vec<ExpandItem>, ODataError> {
+    if level > MAX_EXPAND_DEPTH {
+        return Err(ODataError::InvalidQueryOption {
+            option: "$expand".into(),
+            message: format!(
+                "$expand nests more than {MAX_EXPAND_DEPTH} levels, the most one read may follow"
+            ),
+        });
+    }
     let items = split_expand_items(value);
     let mut result = Vec::new();
     for item in items {
-        result.push(parse_expand_item(item.trim())?);
+        result.push(parse_expand_item(item.trim(), level)?);
     }
     Ok(result)
 }
@@ -354,7 +374,7 @@ fn split_expand_items(s: &str) -> Vec<String> {
     items
 }
 
-fn parse_expand_item(item: &str) -> Result<ExpandItem, ODataError> {
+fn parse_expand_item(item: &str, level: usize) -> Result<ExpandItem, ODataError> {
     if let Some(paren_start) = item.find('(') {
         if !item.ends_with(')') {
             return Err(ODataError::InvalidQueryOption {
@@ -364,7 +384,7 @@ fn parse_expand_item(item: &str) -> Result<ExpandItem, ODataError> {
         }
         let property = item[..paren_start].trim().to_string();
         let nested_str = &item[paren_start + 1..item.len() - 1];
-        let options = parse_expand_options(nested_str)?;
+        let options = parse_expand_options(nested_str, level)?;
         Ok(ExpandItem {
             property,
             options: Some(options),
@@ -380,7 +400,7 @@ fn parse_expand_item(item: &str) -> Result<ExpandItem, ODataError> {
 /// Parse the options inside an expand item's parentheses.
 ///
 /// These are semicolon-separated, e.g. `$select=Id,Quantity;$orderby=Quantity desc`.
-fn parse_expand_options(s: &str) -> Result<ExpandOptions, ODataError> {
+fn parse_expand_options(s: &str, level: usize) -> Result<ExpandOptions, ODataError> {
     let mut opts = ExpandOptions::default();
 
     // Split by semicolons, respecting parentheses.
@@ -409,7 +429,7 @@ fn parse_expand_options(s: &str) -> Result<ExpandOptions, ODataError> {
                 opts.skip = Some(parse_usize("$skip", &value)?);
             }
             "$expand" => {
-                opts.expand = Some(parse_expand(&value)?);
+                opts.expand = Some(parse_expand(&value, level + 1)?);
             }
             _ => {
                 // Ignore unknown nested options
@@ -475,6 +495,10 @@ fn parse_bool(option: &str, value: &str) -> Result<bool, ODataError> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "expand_depth_test.rs"]
+mod expand_depth_tests;
 
 #[cfg(test)]
 mod tests {
