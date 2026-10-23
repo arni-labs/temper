@@ -757,7 +757,15 @@ impl ProductionWasmHost {
         let headers = if is_internal {
             internal_http::sanitize_internal_headers(headers)
         } else {
-            headers.to_vec()
+            // The `http_call` gate checked the URL's host, and the request
+            // connects there. A guest `Host` header could still make a shared
+            // front end (a CDN, a proxy) route it to another site, so the
+            // client sets `Host` from the URL instead.
+            headers
+                .iter()
+                .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
+                .cloned()
+                .collect()
         };
         (is_internal, headers)
     }
@@ -978,15 +986,13 @@ impl WasmHost for ProductionWasmHost {
         // determinism-ok: is_internal check uses non-deterministic URL comparison,
         // but this runs in WasmHost (not simulation), so wall-clock/network access is fine.
 
-        // Auto-inject traceparent for cross-request trace correlation.
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) =
-                current_traceparent_header(&tracing::Span::current(), self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        // The call carries this request's trace (with_trace_headers).
+        builder = with_trace_headers(
+            builder,
+            &outbound_headers,
+            &tracing::Span::current(),
+            self.trace_id.as_deref(),
+        );
 
         if !body.is_empty() {
             builder = builder.body(body.to_string());
@@ -1286,14 +1292,12 @@ impl WasmHost for ProductionWasmHost {
 
         builder = self.add_internal_temper_headers(builder, method, url, &outbound_headers)?;
 
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) =
-                current_traceparent_header(&tracing::Span::current(), self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        builder = with_trace_headers(
+            builder,
+            &outbound_headers,
+            &tracing::Span::current(),
+            self.trace_id.as_deref(),
+        );
 
         if !body.is_empty() {
             builder = builder.body(body.to_vec());
@@ -1396,14 +1400,12 @@ impl WasmHost for ProductionWasmHost {
             builder = builder.header(k.as_str(), v.as_str());
         }
         builder = self.add_internal_temper_headers(builder, "POST", url, &outbound_headers)?;
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) =
-                current_traceparent_header(&tracing::Span::current(), self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        builder = with_trace_headers(
+            builder,
+            &outbound_headers,
+            &tracing::Span::current(),
+            self.trace_id.as_deref(),
+        );
 
         if !body.is_empty() {
             builder = builder.body(encode_connect_json_frame(body));
@@ -1838,13 +1840,7 @@ impl WasmHost for ProductionWasmHost {
             &request.url,
             &outbound_headers,
         )?;
-        if !outbound_headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
-            && let Some(traceparent) = current_traceparent_header(&span, self.trace_id.as_deref())
-        {
-            builder = builder.header("traceparent", traceparent);
-        }
+        builder = with_trace_headers(builder, &outbound_headers, &span, self.trace_id.as_deref());
 
         let redirects = self.redirects();
         tokio::spawn(
@@ -2429,6 +2425,37 @@ fn telemetry_url(url: &str) -> String {
     } else {
         format!("{authority}{path}")
     }
+}
+
+/// The trace an outbound call carries: the module's own `traceparent` when it set one, else the current span's. It
+/// goes as `traceparent` and again as its copy (`temper_observe::otel::TRACEPARENT_COPY`), which a proxy in front of
+/// the other side leaves alone when it puts its own span into `traceparent`.
+fn with_trace_headers(
+    mut builder: reqwest::RequestBuilder,
+    outbound_headers: &[(String, String)],
+    span: &tracing::Span,
+    fallback_trace_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let given = |name: &str| {
+        outbound_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let traceparent = match given("traceparent") {
+        Some(traceparent) => traceparent,
+        None => {
+            let Some(traceparent) = current_traceparent_header(span, fallback_trace_id) else {
+                return builder;
+            };
+            builder = builder.header("traceparent", traceparent.as_str());
+            traceparent
+        }
+    };
+    if given(temper_observe::otel::TRACEPARENT_COPY).is_none() {
+        builder = builder.header(temper_observe::otel::TRACEPARENT_COPY, traceparent);
+    }
+    builder
 }
 
 fn current_traceparent_header(
