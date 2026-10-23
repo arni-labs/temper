@@ -12,7 +12,10 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+mod inline_chain;
 mod observation_metadata;
+
+pub use inline_chain::{ChainStep, InlineChain, RepeatedStep, StepEntity};
 
 /// Maximum callbacks along one server-owned internal context lineage.
 ///
@@ -20,10 +23,12 @@ mod observation_metadata;
 /// propagated through external HTTP requests.
 pub const MAX_CALLBACK_HOPS: u32 = 512;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CallbackBudgetExceeded {
-    #[error("integration callback depth budget exhausted")]
-    InlineDepth,
+    /// The callback is a step its inline chain has already taken; see
+    /// [`InlineChain`] for why that, and not a depth, is where a chain stops.
+    #[error("integration callback not run: it would repeat a step its chain is already in ({0})")]
+    RepeatedStep(RepeatedStep),
     #[error("integration callback hop budget exhausted")]
     TotalHops,
 }
@@ -42,8 +47,9 @@ pub(crate) enum CallbackBudgetExceeded {
 ///   namespaced observability metadata supplied by clients
 #[derive(Debug, Clone, Default)]
 pub struct AgentContext {
-    /// Runtime-owned integration nesting depth; never populated from request headers.
-    pub callback_depth: u32,
+    /// Runtime-owned steps of the inline execution this context runs inside;
+    /// never populated from request headers. See [`InlineChain`].
+    pub inline_chain: InlineChain,
     /// Runtime-owned cumulative callback count; never populated from request headers.
     pub callback_hops: u32,
     /// Full Cedar security context when known at the request boundary.
@@ -92,27 +98,57 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
-    /// Admit a callback only within both the inline and cumulative budgets.
-    pub(crate) fn for_callback(&self) -> Result<Self, CallbackBudgetExceeded> {
-        if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
-            return Err(CallbackBudgetExceeded::InlineDepth);
-        }
+    /// Admit a callback running `action` on an entity, unless its inline
+    /// chain has already taken that step or the lineage has used its hops.
+    pub(crate) fn for_callback(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+    ) -> Result<Self, CallbackBudgetExceeded> {
+        let step = self.inline_chain.step(entity_type, entity_id, action);
+        let inline_chain = self
+            .inline_chain
+            .then(step)
+            .map_err(CallbackBudgetExceeded::RepeatedStep)?;
         if self.callback_hops >= MAX_CALLBACK_HOPS {
             return Err(CallbackBudgetExceeded::TotalHops);
         }
         let mut next = self.clone();
-        next.callback_depth += 1;
+        next.inline_chain = inline_chain;
         next.callback_hops += 1;
         Ok(next)
     }
 
+    /// This context inside `action` on an entity: the step of its inline
+    /// chain that the action's own inline work continues.
+    pub(crate) fn entering(&self, entity_type: &str, entity_id: &str, action: &str) -> Self {
+        let mut next = self.clone();
+        let step = self.inline_chain.step(entity_type, entity_id, action);
+        next.inline_chain = self.inline_chain.entering(step);
+        next
+    }
+
+    /// This context after its step made these entities (`(type, id)`), so its
+    /// chain knows them as made rather than found.
+    pub(crate) fn having_made<'a>(
+        &self,
+        made: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        let mut next = self.clone();
+        for (entity_type, entity_id) in made {
+            next.inline_chain = next.inline_chain.making(entity_type, entity_id);
+        }
+        next
+    }
+
     /// Begin a detached task without replenishing its causal callback budget.
     ///
-    /// Call only at a runtime-owned spawn boundary: the parent inline stack
+    /// Call only at a runtime-owned spawn boundary: the parent inline chain
     /// ends there, but its callback lineage continues in the detached task.
     pub(crate) fn for_background_task(&self) -> Self {
         let mut next = self.clone();
-        next.callback_depth = 0;
+        next.inline_chain = InlineChain::default();
         next
     }
 
@@ -123,7 +159,7 @@ impl AgentContext {
     /// dropping identity via `Default`.
     pub fn system() -> Self {
         Self {
-            callback_depth: 0,
+            inline_chain: InlineChain::default(),
             callback_hops: 0,
             security_ctx: Some(SecurityContext::system()),
             agent_id: Some("system".to_string()),
@@ -160,7 +196,7 @@ impl AgentContext {
         security_ctx.principal.role = Some("service".to_string());
 
         Self {
-            callback_depth: 0,
+            inline_chain: InlineChain::default(),
             callback_hops: 0,
             security_ctx: Some(security_ctx),
             agent_id: Some(service_id),
@@ -196,7 +232,7 @@ impl AgentContext {
 
     /// Copy the execution budget and non-authority observability fields from a parent.
     pub fn inherit_observability_from(mut self, parent: &AgentContext) -> Self {
-        self.callback_depth = parent.callback_depth;
+        self.inline_chain = parent.inline_chain.clone();
         self.callback_hops = parent.callback_hops;
         self.session_id = parent.session_id.clone();
         self.intent = parent.intent.clone();
@@ -296,7 +332,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
     let workflow_run_id = header_string(headers, "x-temper-workflow-run-id");
 
     AgentContext {
-        callback_depth: 0,
+        inline_chain: InlineChain::default(),
         callback_hops: 0,
         security_ctx: None,
         agent_id: None,

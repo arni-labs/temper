@@ -16,8 +16,9 @@
 //! entity); their `on_success`/`on_failure` dispatches do show up as edges
 //! from the source entity to itself if the follow-up is a declared action.
 //!
-//! Cycles are permitted (a reaction cascade can feed back) and detected;
-//! the verifier bounds cycle exploration by `MAX_TRIGGER_DEPTH = 8`.
+//! Cycles are permitted (a reaction cascade can feed back) and detected; at
+//! runtime and in the verifier a chain stops the first time it would repeat a
+//! step.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -134,8 +135,8 @@ impl TriggerGraph {
     /// Returns `true` if the graph contains any cycle reachable from `seed`.
     ///
     /// Cycles are not errors (trigger cascades can legally feed back) but
-    /// callers like the composite verifier may want to know so they can
-    /// enforce `MAX_TRIGGER_DEPTH` vs compose a DAG differently.
+    /// callers like the composite verifier may want to know, since a chain
+    /// round a cycle stops at its first repeated step.
     pub fn has_cycle_from(&self, seed: &str) -> bool {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         let mut in_stack: BTreeSet<String> = BTreeSet::new();

@@ -22,6 +22,7 @@ pub mod entity_actor;
 pub mod event_budget_metrics;
 pub mod events;
 pub mod eventual_invariants;
+mod growable_stack;
 pub mod http_endpoint;
 pub mod idempotency;
 pub mod identity;

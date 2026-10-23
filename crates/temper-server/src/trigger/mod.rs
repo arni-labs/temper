@@ -12,6 +12,7 @@ pub mod dispatcher;
 pub(crate) mod guard;
 pub(crate) mod params;
 pub mod registry;
+mod repeat_stop;
 pub(crate) mod resolver;
 pub mod sim_dispatcher;
 pub mod types;
@@ -20,6 +21,6 @@ pub use dispatcher::ReactionDispatcher;
 pub use registry::ReactionRegistry;
 pub use sim_dispatcher::SimReactionSystem;
 pub use types::{
-    MAX_REACTION_DEPTH, MAX_REACTIONS_PER_TENANT, ReactionResult, ReactionRule, ReactionTarget,
-    ReactionTrigger, TargetResolver,
+    MAX_REACTIONS_PER_TENANT, ReactionResult, ReactionRule, ReactionTarget, ReactionTrigger,
+    TargetResolver,
 };

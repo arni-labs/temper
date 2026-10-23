@@ -11,7 +11,8 @@
 //! Action: tagged by source entity type plus the underlying
 //! [`TemperModelAction`]. Only `actions()` advertises entities'
 //! externally-enabled actions. Triggered cascades happen invisibly
-//! inside `next_state` (bounded by `MAX_TRIGGER_DEPTH`).
+//! inside `next_state`, stopping where the runtime stops them: at the first
+//! step a chain would repeat.
 //!
 //! Invariants: each participating entity's local invariants are lifted
 //! into the joint model via `Property::always` closures that project
@@ -29,10 +30,13 @@ use temper_spec::predicate::{Env, Expr, Val, eval};
 
 use super::CompositeVerificationPlan;
 
-/// Maximum cascade depth per `next_state` call: the runtime's own
-/// `MAX_REACTION_DEPTH`, so the verifier bounds exactly what production
-/// also bounds.
-const MAX_TRIGGER_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
+/// A step of a cascade: an action on an entity. The joint state holds one
+/// entity per type, so a step is its type and action, and a target a
+/// `create` trigger makes is that type's entity too. The runtime stops a chain
+/// the first time it would repeat a step (`temper-server`'s `InlineChain`);
+/// a cascade here stops at the same place, so the verifier explores the
+/// chains production runs and every loop ends.
+type CascadeStep = (String, String);
 
 /// A cross-entity reaction that was dropped because its target action was
 /// not enabled from the target entity's state at dispatch time (ADR-0150).
@@ -157,10 +161,11 @@ impl CompositeTemperModel {
 
     /// Apply trigger cascades starting from a post-commit source action.
     ///
-    /// Bounded by [`MAX_TRIGGER_DEPTH`]. Cycles are allowed (the runtime
-    /// permits them) but depth caps prevent infinite exploration. Each
-    /// triggered transition applies the target entity's matching action
-    /// by name if enabled in the target's current state.
+    /// `chain` holds the steps the cascade is inside of. A trigger whose
+    /// target step is already there is not applied: the runtime stops that
+    /// reaction as a loop. Each triggered transition applies the target
+    /// entity's matching action by name if enabled in the target's current
+    /// state.
     ///
     /// When a reaction's target action is NOT enabled from the target's
     /// current state (from-state mismatch or false guard) it is a *dropped
@@ -174,11 +179,8 @@ impl CompositeTemperModel {
         source_entity: &str,
         source_action: &str,
         source_to_state: &str,
-        depth: u32,
+        chain: &mut Vec<CascadeStep>,
     ) {
-        if depth >= MAX_TRIGGER_DEPTH {
-            return;
-        }
         let edges: Vec<&TriggerEdge> = self
             .edges
             .iter()
@@ -189,6 +191,10 @@ impl CompositeTemperModel {
             if let Some(statuses) = &edge.status_filter
                 && !statuses.iter().any(|status| status == source_to_state)
             {
+                continue;
+            }
+            let step = (edge.to.clone(), edge.target_action.clone());
+            if chain.contains(&step) {
                 continue;
             }
             // Find target entity + model
@@ -244,13 +250,15 @@ impl CompositeTemperModel {
             state.entities.insert(edge.to.clone(), new_target_state);
 
             // Recurse: the target action itself may trigger further cascades.
+            chain.push(step);
             self.cascade(
                 state,
                 &edge.to,
                 &target_action.name,
                 &new_target_status,
-                depth + 1,
+                chain,
             );
+            chain.pop();
         }
     }
 
@@ -452,14 +460,15 @@ impl Model for CompositeTemperModel {
             .insert(action.entity.clone(), new_source_state);
 
         // Fire-and-forget cascade: apply triggered transitions
-        // transitively, bounded by MAX_TRIGGER_DEPTH. Records the first
-        // dropped reaction (if any) into `next.dropped`.
+        // transitively, stopping at the first repeated step. Records the
+        // first dropped reaction (if any) into `next.dropped`.
+        let mut chain = vec![(action.entity.clone(), action.action.name.clone())];
         self.cascade(
             &mut next,
             &action.entity,
             &action.action.name,
             &new_source_status,
-            0,
+            &mut chain,
         );
 
         Some(next)

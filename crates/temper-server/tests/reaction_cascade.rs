@@ -233,7 +233,7 @@ fn cascade_stops_without_infinite_loop() {
 }
 
 // =========================================================================
-// A loop stops at MAX_REACTION_DEPTH and says so
+// A loop stops at its first repeated step and says so
 // =========================================================================
 
 /// `Tick` reacts to itself: a loop nothing else ends.
@@ -251,8 +251,6 @@ kind = "internal"
 
 #[test]
 fn looping_cascade_reports_the_reaction_it_stops() {
-    use temper_server::trigger::types::MAX_REACTION_DEPTH;
-
     let (_guard, clock, _id_gen) = install_deterministic_context(7);
     let mut reg = ReactionRegistry::new();
     reg.register_tenant_rules(
@@ -284,21 +282,21 @@ fn looping_cascade_reports_the_reaction_it_stops() {
     clock.advance();
     sys.step("ticker-1", "Tick", "{}").unwrap();
 
-    // Every reaction up to the bound ran; the one past it is a failed result,
-    // not a silent end of the list.
+    // Tick on t1 is the step the cascade started from, so the reaction is a
+    // repeat: it is a failed result naming the loop, not a silent end. The
+    // old depth bound ran Tick eight more times first.
     let results = sys.last_results();
-    let depth = MAX_REACTION_DEPTH as usize;
-    assert_eq!(results.len(), depth + 1, "{results:?}");
-    assert!(results[..depth].iter().all(|result| result.success));
-    let stopped = &results[depth];
+    assert_eq!(results.len(), 1, "{results:?}");
+    let stopped = &results[0];
     assert!(!stopped.success);
     assert_eq!(stopped.rule_name, "tick_again");
-    assert_eq!(stopped.depth, MAX_REACTION_DEPTH);
+    assert_eq!(stopped.depth, 0);
     assert!(
         stopped
             .error
             .as_deref()
-            .is_some_and(|e| e.contains("chain already ran"))
+            .is_some_and(|e| e.contains("Ticker(t1).Tick -> Ticker(t1).Tick")),
+        "{stopped:?}"
     );
 }
 
@@ -385,7 +383,7 @@ fn field_based_target_resolution() {
 }
 
 // =========================================================================
-// Multi-step cascade (Order → Payment → ... stops at depth)
+// Multi-step cascade (Order → Payment → Payment)
 // =========================================================================
 
 #[test]

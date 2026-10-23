@@ -533,7 +533,8 @@ impl crate::state::ServerState {
     /// Schedule delayed actions as fire-and-forget background timers.
     ///
     /// Propagates the originating `AgentContext` so that scheduled actions
-    /// retain identity attribution in trajectories and SSE events.
+    /// retain identity attribution in trajectories and SSE events, as a
+    /// detached task (`AgentContext::for_background_task`).
     pub(crate) fn dispatch_scheduled_actions(
         &self,
         tenant: &TenantId,
@@ -548,7 +549,9 @@ impl crate::state::ServerState {
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = agent_ctx.clone();
+            // A timer is paced by its delay, so the action it fires starts a
+            // new inline chain: an earlier lap is not a step it is inside of.
+            let ctx = agent_ctx.for_background_task();
             let delay = std::time::Duration::from_secs(sched.delay_seconds);
             let workflow_root_entity_type = ctx
                 .workflow_root_entity_type

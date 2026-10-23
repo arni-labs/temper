@@ -16,7 +16,7 @@ This document is the developer reference. For architectural rationale see [ADR-0
 | Where it runs | Temper dispatcher (Rust, in-process) | Wasmtime sandbox |
 | Authorization | Invoking principal, or the trigger's `principal` | Invoking principal, or the trigger's `principal` |
 | Failure mode | Fire-and-forget (non-transactional) | Configurable retry / timeout |
-| Cascade bound | `MAX_REACTION_DEPTH = 8` | None (bounded by wall-clock timeout) |
+| Cascade bound | A chain stops at its first repeated step (same action on the same entity) | None (bounded by wall-clock timeout) |
 | Observable as | Tracing span + `ReactionResult` | Tracing span + integration config |
 | Determinism | Yes — deterministic under `SimReactionSystem` with a seed | No — WASM modules treated as side-effect only |
 
@@ -163,7 +163,7 @@ resolve_target = { kind = "field", id_field = "hold_id" }
 These properties are load-bearing and unchanged by any of the four Phase additions:
 
 - **Fire-and-forget.** A failing reaction does NOT roll back the source transition. The source action is already committed by the time the dispatcher runs.
-- **Cascade bound.** `MAX_REACTION_DEPTH = 8` caps the depth of recursive reaction chains. Beyond 8, further reactions are dropped with a warning.
+- **Cascade bound.** A chain of reactions runs as long as its steps differ. The first reaction that would repeat a step the chain is already in (the same action on the same entity; for an entity the chain made, the same action on that type) is not run. It comes back as a failed `ReactionResult` naming the loop, and the entity whose action would have fired it gets a `reaction_cycle_stopped` observe event. To repeat work on purpose, use a state timer: a timer starts a new chain.
 - **Tenant isolation.** Reactions only fire for rules registered under the same tenant as the source action.
 - **Cedar on every dispatch.** Target actions run under the invoking principal, or under the service identity named by the trigger's `principal`. There is no system-principal bypass.
 - **Determinism under `SimReactionSystem`.** Two seeded runs with the same inputs produce the same reaction firing order and the same `create`-resolver IDs.

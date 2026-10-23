@@ -7,6 +7,9 @@
 
 use std::sync::Arc;
 
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+
 use crate::request_context::AgentContext;
 use temper_authz::SecurityContext;
 use temper_runtime::tenant::TenantId;
@@ -14,13 +17,15 @@ use tracing;
 use tracing::instrument;
 
 use super::registry::ReactionRegistry;
-use super::types::{MAX_REACTION_DEPTH, ReactionResult};
+use super::repeat_stop::RepeatStop;
+use super::types::ReactionResult;
 
 /// Async reaction dispatcher for production use.
 ///
 /// Holds a shared [`ReactionRegistry`] and dispatches target actions through
-/// the server state. Cascade is bounded by [`MAX_REACTION_DEPTH`]; a reaction
-/// past it is reported, not dropped.
+/// the server state. A chain stops the first time a reaction would repeat a
+/// step it is already inside of ([`InlineChain`](crate::request_context::InlineChain)
+/// says why); the reaction it stops is reported, not dropped.
 pub struct ReactionDispatcher {
     registry: Arc<ReactionRegistry>,
 }
@@ -29,6 +34,38 @@ impl ReactionDispatcher {
     /// Create a new dispatcher with the given registry.
     pub fn new(registry: Arc<ReactionRegistry>) -> Self {
         Self { registry }
+    }
+
+    /// [`dispatch_reactions`](Self::dispatch_reactions) for the next level of
+    /// a chain, boxed and polled on a stack that grows. The named return type
+    /// is what lets the recursive future be `Send`.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_next_level<'a>(
+        &'a self,
+        state: &'a crate::ServerState,
+        tenant: &'a TenantId,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        action: &'a str,
+        to_state: &'a str,
+        fields: &'a serde_json::Value,
+        depth: u32,
+        invoking_ctx: &'a AgentContext,
+    ) -> BoxFuture<'a, Vec<ReactionResult>> {
+        crate::growable_stack::on_growable_stack(move || {
+            self.dispatch_reactions(
+                state,
+                tenant,
+                entity_type,
+                entity_id,
+                action,
+                to_state,
+                fields,
+                depth,
+                invoking_ctx,
+            )
+            .boxed()
+        })
     }
 
     /// Dispatch reactions triggered by a successful entity action.
@@ -50,7 +87,7 @@ impl ReactionDispatcher {
         reaction.target_resolve_error_count = tracing::field::Empty,
         reaction.authz_denied_count = tracing::field::Empty,
         reaction.dispatch_error_count = tracing::field::Empty,
-        reaction.depth_stopped_count = tracing::field::Empty,
+        reaction.repeat_stopped_count = tracing::field::Empty,
         reaction.success_count = tracing::field::Empty,
         reaction.result_count = tracing::field::Empty,
     ))]
@@ -66,6 +103,9 @@ impl ReactionDispatcher {
         depth: u32,
         invoking_ctx: &AgentContext,
     ) -> Vec<ReactionResult> {
+        // The source action is the step these reactions continue from.
+        let source_ctx = invoking_ctx.entering(entity_type, entity_id, action);
+        let invoking_ctx = &source_ctx;
         let rules: Vec<_> = self
             .registry
             .lookup(tenant, entity_type, action, to_state)
@@ -84,7 +124,7 @@ impl ReactionDispatcher {
         let mut target_resolve_error_count = 0usize;
         let mut authz_denied_count = 0usize;
         let mut dispatch_error_count = 0usize;
-        let mut depth_stopped_count = 0usize;
+        let mut repeat_stopped_count = 0usize;
         let mut success_count = 0usize;
         let mut results = Vec::new();
 
@@ -132,21 +172,33 @@ impl ReactionDispatcher {
                     }
                 };
 
-            if depth >= MAX_REACTION_DEPTH {
-                depth_stopped_count += 1;
-                CascadeStop {
-                    tenant,
-                    entity_type,
-                    entity_id,
-                    action,
-                    rule: &rule,
-                    target_entity_id: &target_entity_id,
-                    depth,
-                }
-                .record(state);
-                results.push(ReactionResult::stopped_at_depth(&rule.name, depth));
-                continue;
+            // A target the rule makes is new, and the chain knows it as made.
+            let mut chain = invoking_ctx.inline_chain.clone();
+            if super::resolver::mints_target_id(&rule.resolve_target, fields) {
+                chain = chain.making(&rule.then.entity_type, &target_entity_id);
             }
+            let step = chain.step(&rule.then.entity_type, &target_entity_id, &rule.then.action);
+            let chain = match chain.then(step) {
+                Ok(chain) => chain,
+                Err(repeat) => {
+                    repeat_stopped_count += 1;
+                    RepeatStop {
+                        tenant,
+                        entity_type,
+                        entity_id,
+                        action,
+                        rule: &rule,
+                        target_entity_id: &target_entity_id,
+                        repeat: &repeat,
+                        depth,
+                    }
+                    .record(state);
+                    results.push(ReactionResult::stopped_on_repeat(
+                        &rule.name, depth, &repeat,
+                    ));
+                    continue;
+                }
+            };
 
             tracing::info!(
                 rule = rule.name,
@@ -166,7 +218,7 @@ impl ReactionDispatcher {
             // an explicit `principal`, build a synthetic service identity;
             // otherwise inherit the invoking principal's exact
             // `SecurityContext` when available.
-            let dispatch_ctx = resolve_trigger_principal(
+            let mut dispatch_ctx = resolve_trigger_principal(
                 rule.principal.as_deref(),
                 invoking_ctx,
                 &rule.name,
@@ -174,6 +226,7 @@ impl ReactionDispatcher {
                 entity_id,
                 action,
             );
+            dispatch_ctx.inline_chain = chain;
 
             let authz_snapshot = match state
                 .load_authz_resource_snapshot(tenant, &rule.then.entity_type, &target_entity_id)
@@ -264,20 +317,30 @@ impl ReactionDispatcher {
 
                     // Recurse if the target action succeeded. The cascade
                     // fires under the same dispatch context as this rule —
-                    // elevation propagates down the chain.
+                    // elevation propagates down the chain — and knows the
+                    // children the action spawned as entities it made. A
+                    // chain is as deep as its data, so each level is polled
+                    // on a stack that grows.
                     if response.success {
-                        let cascade_results = Box::pin(self.dispatch_reactions(
-                            state,
-                            tenant,
-                            &rule.then.entity_type,
-                            &target_entity_id,
-                            &rule.then.action,
-                            &target_status,
-                            &serde_json::to_value(&response.state.fields).unwrap_or_default(),
-                            depth + 1,
-                            &dispatch_ctx,
-                        ))
-                        .await;
+                        let cascade_ctx =
+                            dispatch_ctx.having_made(response.spawn_requests.iter().map(|spawn| {
+                                (spawn.entity_type.as_str(), spawn.entity_id.as_str())
+                            }));
+                        let target_fields =
+                            serde_json::to_value(&response.state.fields).unwrap_or_default();
+                        let cascade_results = self
+                            .dispatch_next_level(
+                                state,
+                                tenant,
+                                &rule.then.entity_type,
+                                &target_entity_id,
+                                &rule.then.action,
+                                &target_status,
+                                &target_fields,
+                                depth + 1,
+                                &cascade_ctx,
+                            )
+                            .await;
                         results.extend(cascade_results);
                     }
                 }
@@ -306,7 +369,7 @@ impl ReactionDispatcher {
             target_resolve_error_count,
             authz_denied_count,
             dispatch_error_count,
-            depth_stopped_count,
+            repeat_stopped_count,
             success_count,
             result_count: results.len(),
         });
@@ -323,7 +386,7 @@ struct ReactionFanoutCounts {
     target_resolve_error_count: usize,
     authz_denied_count: usize,
     dispatch_error_count: usize,
-    depth_stopped_count: usize,
+    repeat_stopped_count: usize,
     success_count: usize,
     result_count: usize,
 }
@@ -339,60 +402,9 @@ fn record_reaction_fanout_span(counts: ReactionFanoutCounts) {
     );
     span.record("reaction.authz_denied_count", counts.authz_denied_count);
     span.record("reaction.dispatch_error_count", counts.dispatch_error_count);
-    span.record("reaction.depth_stopped_count", counts.depth_stopped_count);
+    span.record("reaction.repeat_stopped_count", counts.repeat_stopped_count);
     span.record("reaction.success_count", counts.success_count);
     span.record("reaction.result_count", counts.result_count);
-}
-
-/// A reaction that was not run because its chain reached
-/// [`MAX_REACTION_DEPTH`], on the entity whose action would have fired it.
-struct CascadeStop<'a> {
-    tenant: &'a TenantId,
-    entity_type: &'a str,
-    entity_id: &'a str,
-    action: &'a str,
-    rule: &'a super::types::ReactionRule,
-    target_entity_id: &'a str,
-    depth: u32,
-}
-
-impl CascadeStop<'_> {
-    /// Say so on the source entity's observe stream, where the app and its
-    /// agents watch it, as well as in the log.
-    fn record(self, state: &crate::ServerState) {
-        let seq = state.next_entity_event_sequence(
-            self.tenant.as_str(),
-            self.entity_type,
-            self.entity_id,
-        );
-        state.record_entity_observe_event_with_seq(
-            self.tenant.as_str(),
-            self.entity_type,
-            self.entity_id,
-            seq,
-            "reaction_cascade_stopped",
-            serde_json::json!({
-                "action": self.action,
-                "rule": self.rule.name,
-                "target_entity_type": self.rule.then.entity_type,
-                "target_entity_id": self.target_entity_id,
-                "target_action": self.rule.then.action,
-                "depth": self.depth,
-                "max_depth": MAX_REACTION_DEPTH,
-            }),
-        );
-        tracing::warn!(
-            tenant = %self.tenant,
-            entity_type = self.entity_type,
-            entity_id = self.entity_id,
-            action = self.action,
-            rule = self.rule.name,
-            target_entity = %self.rule.then.entity_type,
-            target_id = self.target_entity_id,
-            depth = self.depth,
-            "reaction not run: the chain reached {MAX_REACTION_DEPTH} reactions"
-        );
-    }
 }
 
 // Target resolver logic consolidated in super::resolver::resolve_target_id.
