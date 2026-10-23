@@ -313,17 +313,19 @@ fn integration_trigger(ig: &Integration, notes: &mut Vec<String>) -> Result<Opti
             table.insert("adapter", value(adapter));
         }
         "webhook" => {
-            let Some(url) = config.remove("url") else {
+            if !config.contains_key("url") {
                 notes.push(format!(
                     "integration '{}' dropped: a webhook without a url never fired",
                     ig.name
                 ));
                 return Ok(None);
-            };
-            table.insert("kind", value("webhook"));
-            table.insert("url", value(url));
-            let method = config.remove("method").unwrap_or_else(|| "POST".into());
-            table.insert("method", value(method));
+            }
+            // A kind = "webhook" trigger is refused at load (ADR-0182):
+            // nothing sends it, so converting to one would hide the call.
+            return Err(format!(
+                "integration '{}' is an outbound webhook; make the call with kind = \"wasm\" and module = \"http_fetch\" (config = {{ url = ..., method = ... }}) by hand",
+                ig.name
+            ));
         }
         other => {
             return Err(format!(

@@ -285,7 +285,9 @@ to = "Failed"
 }
 
 #[test]
-fn test_action_triggers_webhook_kind() {
+fn webhook_kind_trigger_is_refused_at_load() {
+    // ADR-0182: nothing sends a kind = "webhook" trigger, so it used to
+    // install and never make its request. It is refused with what to write.
     let spec = r#"
 [automaton]
 name = "Order"
@@ -312,19 +314,11 @@ name = "NotificationSent"
 from = ["Confirmed"]
 to = "Notified"
 "#;
-    let automaton = parse_automaton(spec).expect("webhook trigger should parse");
-    let confirm = &automaton.actions[0];
-    let trigger = &confirm.triggers[0];
-    assert_eq!(trigger.kind, TriggerKind::Webhook);
-    assert_eq!(
-        trigger.url.as_deref(),
-        Some("https://hooks.slack.com/services/xxx")
-    );
-    assert_eq!(trigger.method.as_deref(), Some("POST"));
-    assert_eq!(
-        trigger.headers.get("Content-Type").map(String::as_str),
-        Some("application/json")
-    );
+    let err = parse_automaton(spec).expect_err("a webhook trigger must not install");
+    let message = err.to_string();
+    assert!(message.contains("notify_slack"), "{message}");
+    assert!(message.contains("no dispatcher sends"), "{message}");
+    assert!(message.contains("http_fetch"), "{message}");
 }
 
 #[test]
@@ -534,53 +528,6 @@ kind = "wasm"
 }
 
 #[test]
-fn test_webhook_trigger_requires_url_and_method() {
-    let spec_no_url = r#"
-[automaton]
-name = "X"
-states = ["A"]
-initial = "A"
-
-[[action]]
-name = "Go"
-from = ["A"]
-
-[[action.triggers]]
-name = "bad"
-kind = "webhook"
-method = "POST"
-"#;
-    assert!(
-        parse_automaton(spec_no_url)
-            .expect_err("missing url must fail")
-            .to_string()
-            .contains("url")
-    );
-
-    let spec_no_method = r#"
-[automaton]
-name = "X"
-states = ["A"]
-initial = "A"
-
-[[action]]
-name = "Go"
-from = ["A"]
-
-[[action.triggers]]
-name = "bad"
-kind = "webhook"
-url = "https://example.com/hook"
-"#;
-    assert!(
-        parse_automaton(spec_no_method)
-            .expect_err("missing method must fail")
-            .to_string()
-            .contains("method")
-    );
-}
-
-#[test]
 fn test_to_state_must_be_declared_state() {
     let spec = r#"
 [automaton]
@@ -717,7 +664,7 @@ kind = "same_id"
     assert!(err.to_string().contains("empty"));
 }
 
-// ─── ADR-0046: wasm/webhook expansion into integrations ─────────────────
+// ─── ADR-0046: wasm/adapter expansion into integrations ─────────────────
 
 #[test]
 fn wasm_trigger_expands_into_integration_and_effect() {
@@ -918,55 +865,8 @@ hook = "DispatchCallback"
 }
 
 #[test]
-fn webhook_trigger_expands_with_url_and_method_in_config() {
-    let spec = r#"
-[automaton]
-name = "Order"
-states = ["Draft", "Confirmed", "Notified"]
-initial = "Draft"
-
-[[action]]
-name = "ConfirmOrder"
-from = ["Draft"]
-to = "Confirmed"
-
-[[action.triggers]]
-name = "notify_slack"
-kind = "webhook"
-url = "https://hooks.slack.com/services/xxx"
-method = "POST"
-on_success = "NotificationSent"
-
-[action.triggers.headers]
-"Content-Type" = "application/json"
-
-[[action]]
-name = "NotificationSent"
-from = ["Confirmed"]
-to = "Notified"
-"#;
-    let automaton = parse_automaton(spec).expect("webhook expansion should parse");
-    let ig = automaton
-        .integrations
-        .iter()
-        .find(|i| i.trigger == "__trigger__:ConfirmOrder:notify_slack")
-        .expect("synthesized integration");
-    assert_eq!(ig.integration_type, "webhook");
-    assert_eq!(
-        ig.config.get("url").map(String::as_str),
-        Some("https://hooks.slack.com/services/xxx")
-    );
-    assert_eq!(ig.config.get("method").map(String::as_str), Some("POST"));
-    assert_eq!(
-        ig.config.get("header.Content-Type").map(String::as_str),
-        Some("application/json")
-    );
-    assert_eq!(ig.on_success.as_deref(), Some("NotificationSent"));
-}
-
-#[test]
 fn entity_kind_trigger_does_not_synthesize_integration() {
-    // Regression: only Wasm/Webhook expand. Entity-kind triggers go
+    // Regression: only Wasm/Adapter expand. Entity-kind triggers go
     // through the reaction dispatcher and must NOT appear as integrations.
     let spec = r#"
 [automaton]
