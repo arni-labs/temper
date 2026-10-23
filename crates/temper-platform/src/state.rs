@@ -109,11 +109,8 @@ impl PlatformState {
     /// specs. Such a tenant's stored rows are kept as they are for repair, so
     /// nothing installs or writes specs for it until a restart restores it.
     pub fn tenant_unavailable_reason(&self, tenant: &str) -> Option<String> {
-        self.registry
-            .read()
-            .unwrap() // ci-ok: RwLock read — poisoned lock = prior panic, fail-fast correct
+        self.server
             .tenant_unavailable_reason(&TenantId::new(tenant))
-            .map(str::to_string)
     }
 
     /// Create a new platform state with a pre-loaded registry.

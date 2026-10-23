@@ -196,7 +196,7 @@ pub(super) async fn build_registry(
         }
     }
     for (tenant, reason) in registry.unavailable_tenants() {
-        eprintln!("  Tenant '{tenant}' is unavailable, its stored specs did not load: {reason}");
+        tracing::warn!(tenant = %tenant, %reason, "tenant is unavailable, its stored specs did not load");
     }
 
     // Load app specs from disk, persisting to backend.
@@ -229,15 +229,20 @@ pub(super) async fn build_registry(
 /// A tenant whose stored specs did not load keeps its stored rows exactly as
 /// they are, for repair; every startup step that would write for it skips it.
 fn skip_unavailable_tenant(state: &PlatformState, tenant: &str, what: &str) -> bool {
-    skip_if_marked(state.tenant_unavailable_reason(tenant).is_some(), tenant, what)
+    skip_if_marked(
+        state.tenant_unavailable_reason(tenant).is_some(),
+        tenant,
+        what,
+    )
 }
 
 fn skip_if_marked(unavailable: bool, tenant: &str, what: &str) -> bool {
     if !unavailable {
         return false;
     }
-    eprintln!(
-        "  Skipping {what} for tenant '{tenant}': it is unavailable, its stored rows are kept for repair"
+    tracing::warn!(
+        tenant = %tenant,
+        "skipping {what}: the tenant is unavailable, its stored rows are kept for repair"
     );
     true
 }

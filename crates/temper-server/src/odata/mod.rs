@@ -23,12 +23,12 @@ mod unavailable_tenant;
 mod write;
 
 pub(crate) use common::resolve_entity_type;
-pub(crate) use unavailable_tenant::refuse_unavailable_tenant;
 pub use content_addressed::handle_blob_ingest_raw;
 pub use read::handle_hints;
 pub use read::handle_metadata;
 pub use read::handle_odata_get;
 pub use read::handle_service_document;
+pub(crate) use unavailable_tenant::refuse_unavailable_tenant;
 pub use write::handle_odata_delete;
 pub use write::handle_odata_patch;
 pub use write::handle_odata_post;

@@ -15,7 +15,6 @@ use serde::Serialize;
 use temper_runtime::tenant::TenantId;
 use temper_server::state::WasmModuleSource;
 use temper_spec::automaton;
-use temper_spec::cross_invariant::parse_cross_invariants;
 use temper_spec::csdl::{emit_csdl_xml, merge_csdl, parse_csdl};
 
 use crate::bootstrap;
@@ -25,6 +24,7 @@ mod agent_bootstrap;
 mod app_catalog;
 mod closure_bootstrap;
 mod entity_aliases;
+mod install_checks;
 mod install_guard;
 mod policy_rows;
 mod reconcile;
@@ -1107,14 +1107,7 @@ pub(super) async fn install_os_app_with_plan(
     app_name: &str,
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
-    // An install rewrites the tenant's spec and constraints rows; for a tenant
-    // whose stored rows did not load, those rows are what needs repair.
-    if state.tenant_unavailable_reason(tenant).is_some() {
-        return Err(format!(
-            "tenant '{tenant}' is unavailable (its stored specs did not load at startup), so \
-             os-app '{app_name}' is not installed and the stored rows are kept for repair"
-        ));
-    }
+    install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
     let _serialized = install_guard::tenant(tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
@@ -1187,18 +1180,8 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
-        // The bundle's CSDL and cross-invariants are parsed here, before any
-        // write: a bundle that cannot be registered leaves no stored row for
-        // the next start to restore, and is refused with this error.
-        if let Some(source) = bundle
-            .cross_invariants_toml
-            .as_deref()
-            .filter(|source| !source.trim().is_empty())
-        {
-            parse_cross_invariants(source).map_err(|e| {
-                format!("Failed to parse cross-invariants for os-app '{app_name}': {e}")
-            })?;
-        }
+        // Parsed before any write, with the CSDL below (see `install_checks`).
+        install_checks::parse_cross_invariants(bundle.cross_invariants_toml.as_deref(), app_name)?;
         // App installs must preserve existing tenant types.
         let merged_csdl = if let Some(ref csdl) = bundle.csdl {
             let incoming = parse_csdl(csdl)

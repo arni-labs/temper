@@ -42,7 +42,9 @@ impl Fixture {
         fs::create_dir_all(app_dir.join("specs")).expect("create specs dir");
         fs::write(
             app_dir.join("app.toml"),
-            format!("name = \"{app}\"\ndescription = \"Bundle refusal test app\"\nversion = \"0.1.0\"\n"),
+            format!(
+                "name = \"{app}\"\ndescription = \"Bundle refusal test app\"\nversion = \"0.1.0\"\n"
+            ),
         )
         .expect("write app.toml");
         fs::write(app_dir.join("APP.md"), format!("# {app}\n\nTest app.\n")).expect("write APP.md");
@@ -107,7 +109,9 @@ async fn a_bundle_with_unparseable_cross_invariants_is_refused_and_other_tenants
     );
     assert!(fx.other_tenant_is_served("tenant-b"));
     assert!(
-        !fx.stored_spec_tenants().await.contains(&"tenant-a".to_string()),
+        !fx.stored_spec_tenants()
+            .await
+            .contains(&"tenant-a".to_string()),
         "a refused install stores no spec rows"
     );
     assert!(

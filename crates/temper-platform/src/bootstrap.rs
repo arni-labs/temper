@@ -179,8 +179,7 @@ pub(crate) fn bootstrap_tenant_specs(
     }
 
     // Parse CSDL schema.
-    let csdl =
-        parse_csdl(csdl_source).map_err(|e| format!("{label} CSDL failed to parse: {e}"))?;
+    let csdl = parse_csdl(csdl_source).map_err(|e| format!("{label} CSDL failed to parse: {e}"))?;
 
     // Register tenant and mark specs as pre-verified. Registration refuses
     // bad input before it changes the registry, and the guard is released on

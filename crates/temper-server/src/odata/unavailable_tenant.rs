@@ -14,6 +14,19 @@ use temper_authz::AuthenticatedRequestContext;
 use super::common::extract_tenant;
 use crate::response::odata_error;
 use crate::state::ServerState;
+use temper_runtime::tenant::TenantId;
+
+impl ServerState {
+    /// Why `tenant` is unavailable, if startup could not restore its stored
+    /// specs. Such a tenant's stored rows are kept as they are for repair.
+    pub fn tenant_unavailable_reason(&self, tenant: &TenantId) -> Option<String> {
+        self.registry
+            .read()
+            .expect("registry lock poisoned")
+            .tenant_unavailable_reason(tenant)
+            .map(str::to_string)
+    }
+}
 
 /// Refuse `/tdata` requests for a tenant marked unavailable at startup.
 ///
@@ -28,14 +41,7 @@ pub(crate) async fn refuse_unavailable_tenant(
         Some(context) => Some(context.tenant().clone()),
         None => extract_tenant(request.headers(), &state).ok(),
     };
-    let unavailable = tenant.filter(|tenant| {
-        state
-            .registry
-            .read()
-            .unwrap() // ci-ok: RwLock read — poisoned lock = prior panic, fail-fast correct
-            .tenant_unavailable_reason(tenant)
-            .is_some()
-    });
+    let unavailable = tenant.filter(|tenant| state.tenant_unavailable_reason(tenant).is_some());
     if let Some(tenant) = unavailable {
         return odata_error(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -87,7 +87,10 @@ async fn startup_keeps_an_unavailable_tenants_stored_rows_unchanged() {
         .await
         .expect("record installed app");
     let before = stored_rows(&store, tenant).await;
-    assert!(before.iter().any(|row| row.contains("not toml")), "{before:?}");
+    assert!(
+        before.iter().any(|row| row.contains("not toml")),
+        "{before:?}"
+    );
 
     let stack = StorageStack::from_turso(store.clone());
     let (registry, _) = build_registry(None, Some(&stack), &[])
