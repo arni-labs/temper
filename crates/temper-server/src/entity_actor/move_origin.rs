@@ -38,10 +38,3 @@ pub struct MoveOrigin {
     /// The move that led to it.
     pub caused_by: MoveCause,
 }
-
-/// Record on `event` who made it and why, when the runtime made it itself.
-/// A move a caller asked for keeps no actor or cause.
-pub(crate) fn record_origin(event: &mut super::EntityEvent, origin: Option<&MoveOrigin>) {
-    event.actor = origin.map(|origin| origin.actor.clone());
-    event.caused_by = origin.map(|origin| origin.caused_by.clone());
-}

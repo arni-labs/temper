@@ -402,8 +402,10 @@ impl crate::state::ServerState {
                 ctx.entity_id,
                 st,
                 &response.state,
-                ctx.agent_ctx,
-                ctx.action,
+                ArmingMove {
+                    by: ctx.agent_ctx,
+                    action: ctx.action,
+                },
                 started_at,
             );
             let delay = remaining_budget(started_at, st.after_seconds, now);
@@ -459,8 +461,10 @@ impl crate::state::ServerState {
                 entity_id,
                 st,
                 &created.state,
-                created_by,
-                created_with.unwrap_or_default(),
+                ArmingMove {
+                    by: created_by,
+                    action: created_with.unwrap_or_default(),
+                },
                 started_at,
             );
             let delay = remaining_budget(started_at, st.after_seconds, now);
@@ -710,18 +714,21 @@ fn rearm_clock_start(
     (!fired_since || st.reset_on.contains(&st.on_timeout)).then_some(started_at)
 }
 
-/// The timer `st` arms on an entity, armed by `armed_by`'s move `cause_action`.
-/// ADR-0181: `args` are read when the timer is armed, against the entity as it
-/// entered the state.
-#[allow(clippy::too_many_arguments)]
+/// The move that arms a timer: who made it, and its action.
+struct ArmingMove<'a> {
+    by: &'a AgentContext,
+    action: &'a str,
+}
+
+/// The timer `st` arms on an entity, armed by `arming`. ADR-0181: `args` are
+/// read when the timer is armed, against the entity as it entered the state.
 fn declared_timer(
     tenant: &TenantId,
     entity_type: &str,
     entity_id: &str,
     st: &temper_spec::automaton::StateTimeout,
     state: &EntityState,
-    armed_by: &AgentContext,
-    cause_action: &str,
+    arming: ArmingMove<'_>,
     started_at: DateTime<Utc>,
 ) -> ArmedTimer {
     let (params, missing) =
@@ -741,8 +748,8 @@ fn declared_timer(
         state: st.state.clone(),
         action: st.on_timeout.clone(),
         params: serde_json::Value::Object(params),
-        armed_by: timer_agent(armed_by),
-        cause_action: Some(cause_action.to_string()),
+        armed_by: timer_agent(arming.by),
+        cause_action: Some(arming.action.to_string()),
         arm_id: sim_uuid().to_string(),
         sequence_nr: state.sequence_nr,
         started_at,
@@ -852,8 +859,7 @@ mod tests {
             timestamp: ts,
             params: serde_json::json!({}),
             idempotency_key: None,
-            actor: None,
-            caused_by: None,
+            origin: None,
         }
     }
 

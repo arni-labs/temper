@@ -103,8 +103,7 @@ fn envelope(
         timestamp: sim_now(),
         params: serde_json::json!({}),
         idempotency_key: None,
-        actor: None,
-        caused_by: None,
+        origin: None,
     };
     PersistenceEnvelope {
         sequence_nr,
@@ -349,8 +348,7 @@ async fn authoritative_replay_rejects_non_object_field_update_payloads() {
         timestamp: sim_now(),
         params: serde_json::json!([1, 2, 3]),
         idempotency_key: None,
-        actor: None,
-        caused_by: None,
+        origin: None,
     };
     let non_object = PersistenceEnvelope {
         sequence_nr: 1,

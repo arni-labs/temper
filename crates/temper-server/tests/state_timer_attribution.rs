@@ -186,22 +186,21 @@ async fn a_state_timers_move_is_recorded_as_the_timers_with_the_arming_move_as_i
         .find(|event| event.action == "Add")
         .expect("the history keeps the member's Add");
     assert_eq!(
-        add.actor, None,
-        "a caller's own move names no runtime actor"
+        add.origin, None,
+        "a caller's own move names no runtime actor or cause"
     );
-    assert_eq!(add.caused_by, None);
 
     let pass = events.last().expect("the history keeps the timer's move");
     assert_eq!(pass.action, "Pass");
+    let origin = pass
+        .origin
+        .as_ref()
+        .expect("the timer's move records who made it and what led to it");
     assert_eq!(
-        pass.actor.as_deref(),
-        Some(STATE_TIMER_ACTOR),
+        origin.actor, STATE_TIMER_ACTOR,
         "the history says the state timer made the move"
     );
-    let cause = pass
-        .caused_by
-        .as_ref()
-        .expect("the timer's move keeps the move that armed it as its cause");
+    let cause = &origin.caused_by;
     assert_eq!(cause.agent_id.as_deref(), Some("member"));
     assert_eq!(cause.action.as_deref(), Some("Add"));
 }

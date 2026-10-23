@@ -385,11 +385,9 @@ fn history_event(sequence: usize, event: &EntityEvent) -> serde_json::Value {
         "timestamp": event.timestamp,
         "params": event.params,
     });
-    if let Some(actor) = &event.actor {
-        json["actor"] = serde_json::json!(actor);
-    }
-    if let Some(cause) = &event.caused_by {
-        json["caused_by"] = serde_json::json!(cause);
+    if let Some(origin) = &event.origin {
+        json["actor"] = serde_json::json!(origin.actor);
+        json["caused_by"] = serde_json::json!(origin.caused_by);
     }
     json
 }

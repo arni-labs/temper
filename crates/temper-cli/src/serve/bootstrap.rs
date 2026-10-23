@@ -439,12 +439,14 @@ pub(super) async fn recover_secrets(state: &PlatformState) {
     }
 }
 
-/// Print an install's warnings under its summary line, where whoever starts
-/// the server with the app sees them.
-fn print_install_warnings(result: &temper_platform::InstallResult) {
-    for warning in &result.warnings {
-        println!("    Warning: {}", warning.message);
-    }
+/// An install's warnings as lines to print under its summary line, where
+/// whoever starts the server with the app sees them.
+fn install_warning_lines(result: &temper_platform::InstallResult) -> String {
+    result
+        .warnings
+        .iter()
+        .map(|warning| format!("\n    Warning: {}", warning.message))
+        .collect()
 }
 
 /// Load the verification cache from Turso for a tenant (hash + verified status).
@@ -671,10 +673,10 @@ pub(super) async fn bootstrap_installed_apps(
                         .cloned()
                         .collect();
                     println!(
-                        "  Restored app '{app_name}' for '{tenant}': {}",
-                        all.join(", ")
+                        "  Restored app '{app_name}' for '{tenant}': {}{}",
+                        all.join(", "),
+                        install_warning_lines(&result)
                     );
-                    print_install_warnings(&result);
                 }
                 AppBootstrapSource::Cli => {
                     let all: Vec<String> = result
@@ -685,10 +687,10 @@ pub(super) async fn bootstrap_installed_apps(
                         .cloned()
                         .collect();
                     println!(
-                        "  App '{app_name}' installed for '{tenant}': {}",
-                        all.join(", ")
+                        "  App '{app_name}' installed for '{tenant}': {}{}",
+                        all.join(", "),
+                        install_warning_lines(&result)
                     );
-                    print_install_warnings(&result);
                 }
             },
             Err(e) => {

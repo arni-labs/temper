@@ -210,15 +210,11 @@ pub struct EntityEvent {
     /// Optional idempotency key that caused this transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    /// Who made this move, when the runtime made it itself: a state timer's
-    /// move names [`super::STATE_TIMER_ACTOR`]. Absent when the dispatch's
-    /// caller made it.
+    /// Who made this move and what led to it, when the runtime made it
+    /// itself: a state timer's move names [`super::STATE_TIMER_ACTOR`] and the
+    /// move that armed it. Absent when the dispatch's caller made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    /// The move that led the runtime to make this one (for a state timer,
-    /// the move that armed it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caused_by: Option<super::MoveCause>,
+    pub origin: Option<super::MoveOrigin>,
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.
