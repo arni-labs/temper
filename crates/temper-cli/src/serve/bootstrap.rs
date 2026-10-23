@@ -244,6 +244,14 @@ pub(super) fn load_webhooks(apps: &[(String, String)]) -> Option<Arc<WebhookDisp
     }
 }
 
+/// Read a tenant's group memberships at boot (ADR-0183). A failure leaves the
+/// tenant unfilled, so nobody is in a group there until a later read succeeds.
+async fn fill_group_memberships(state: &PlatformState, tenant_id: &TenantId) {
+    if let Err(error) = state.server.fill_group_memberships(tenant_id).await {
+        tracing::error!(tenant = %tenant_id, %error, "group memberships not read at boot; retried at the tenant's first check");
+    }
+}
+
 /// Phase 5: Hydrate entities from the event store for each tenant.
 pub(super) async fn hydrate_entities(state: &PlatformState, apps: &[(String, String)]) {
     if state.server.storage_stack.is_none() {
@@ -266,6 +274,7 @@ pub(super) async fn hydrate_entities(state: &PlatformState, apps: &[(String, Str
         } else {
             state.server.populate_index_from_store(&tenant_id).await;
         }
+        fill_group_memberships(state, &tenant_id).await;
         all_tenants.push(tenant_id);
     }
     // In TenantRouted mode, also hydrate all registered tenants.
@@ -282,6 +291,7 @@ pub(super) async fn hydrate_entities(state: &PlatformState, apps: &[(String, Str
             } else {
                 state.server.populate_index_from_store(&tenant_id).await;
             }
+            fill_group_memberships(state, &tenant_id).await;
             all_tenants.push(tenant_id);
         }
     }

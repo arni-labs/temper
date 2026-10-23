@@ -144,6 +144,54 @@ pub fn label_statements(text: &str, label: &str) -> Result<String, AuthzError> {
     Ok(labelled)
 }
 
+/// One statement as it is stored on its own (ADR-0183): the `@source` label
+/// that names its row, its text, and whether it is a `forbid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedStatement {
+    pub label: String,
+    pub text: String,
+    pub forbid: bool,
+}
+
+/// Every statement of `text` in source order, each with its `@source` label.
+///
+/// # Errors
+///
+/// Returns [`AuthzError::PolicyParse`] when `text` is not valid Cedar or a
+/// statement has no `@source` label (see [`label_statements`]).
+pub fn sourced_statements(text: &str) -> Result<Vec<SourcedStatement>, AuthzError> {
+    statement_spans(text)?
+        .into_iter()
+        .map(|(span, _)| {
+            let statement = &text[span];
+            let (label, effect) = match Policy::parse(None, statement) {
+                Ok(policy) => (
+                    policy.annotation(SOURCE_ANNOTATION).map(str::to_string),
+                    policy.effect(),
+                ),
+                Err(policy_error) => {
+                    let template = Template::parse(None, statement)
+                        .map_err(|_| AuthzError::PolicyParse(policy_error.to_string()))?;
+                    (
+                        template.annotation(SOURCE_ANNOTATION).map(str::to_string),
+                        template.effect(),
+                    )
+                }
+            };
+            let label = label.ok_or_else(|| {
+                AuthzError::PolicyParse(format!(
+                    "a statement has no @{SOURCE_ANNOTATION} label: {statement}"
+                ))
+            })?;
+            Ok(SourcedStatement {
+                label,
+                text: statement.to_string(),
+                forbid: effect == cedar_policy::Effect::Forbid,
+            })
+        })
+        .collect()
+}
+
 /// Statement keys by exact statement text. An install reads every statement
 /// of the tenant's rows and live text, and a boot installs every app, so the
 /// same text comes back many times; the JSON serialisation is the cost.
@@ -195,6 +243,24 @@ mod tests {
 
     const FORBID: &str = "forbid(principal, action == Action::\"Withdraw\", resource is Thing);";
     const PERMIT: &str = "permit(principal, action, resource is Thing);";
+
+    #[test]
+    fn each_labelled_statement_comes_out_alone_with_its_label_and_effect() {
+        let labelled =
+            label_statements(&format!("// head\n{PERMIT}\n{FORBID}\n"), "bank/p.cedar").unwrap();
+        let statements = sourced_statements(&labelled).unwrap();
+        let labels: Vec<&str> = statements.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["bank/p.cedar#1", "bank/p.cedar#2"]);
+        assert_eq!(
+            statements[1].text,
+            format!("@source(\"bank/p.cedar#2\")\n{FORBID}")
+        );
+        assert!(!statements[0].forbid && statements[1].forbid);
+        assert!(
+            sourced_statements(PERMIT).is_err(),
+            "an unlabelled statement has no row name"
+        );
+    }
 
     #[test]
     fn labels_each_statement_with_its_source_and_position() {

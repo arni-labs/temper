@@ -44,8 +44,6 @@ use entity_aliases::{
     content_sha256, ensure_created_file_initialized, ensure_entity_field_aliases,
     file_already_contains, slug_fragment,
 };
-#[cfg(test)]
-pub(super) use policy_rows::os_app_policy_row_id;
 pub use reconcile::{os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order};
 pub(crate) use reconcile::{
     tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
@@ -1202,8 +1200,7 @@ pub(super) async fn install_os_app_with_plan(
     updated.sort();
     skipped.sort();
 
-    // Build the full Cedar policy text for this tenant: the live text without
-    // what this app's previous install wrote, plus the bundle's policies.
+    // The tenant's live Cedar without this app's previous statements, plus the bundle's.
     let superseded = if plan.policies {
         policy_rows::superseded_app_policies(state, tenant, app_name, &bundle).await?
     } else {
@@ -1253,11 +1250,13 @@ pub(super) async fn install_os_app_with_plan(
                 .iter()
                 .map(|(et, ioa, csdl, h)| (et.as_str(), ioa.as_str(), csdl.as_str(), h.as_str()))
                 .collect();
+            // ADR-0183 release B deletes this write; it is kept one release, for rollback only.
             turso
                 .upsert_specs_and_commit(tenant, &refs, combined_policy.as_deref(), app_name)
                 .await
                 .map_err(|e| format!("Failed to persist and commit specs: {e}"))?;
         } else if let Some(ref policy_text) = combined_policy {
+            // ADR-0183 release B deletes this write; it is kept one release, for rollback only.
             turso
                 .upsert_tenant_policy(tenant, policy_text)
                 .await
@@ -1292,6 +1291,7 @@ pub(super) async fn install_os_app_with_plan(
             }
         }
         if let Some(ref policy_text) = combined_policy {
+            // ADR-0183 release B deletes this write; it is kept one release, for rollback only.
             ps.upsert_tenant_policy(tenant, policy_text)
                 .await
                 .map_err(|e| format!("Failed to persist Cedar policy: {e}"))?;

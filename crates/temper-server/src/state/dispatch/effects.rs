@@ -644,6 +644,9 @@ impl crate::state::ServerState {
             return response;
         }
 
+        // A membership counts from the transition that commits it (ADR-0183).
+        self.note_group_membership(ctx.tenant, &response.state);
+
         // Cancellation is bookkeeping for the committed transition, not a
         // dependent launch. An old reset timer must not fire during the wait.
         self.invalidate_state_timeouts_if_needed(ctx, &response);

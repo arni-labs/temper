@@ -1,0 +1,54 @@
+# GroupMembership Entity — I/O Automaton Specification (ADR-0183)
+#
+# One person's (or principal's) membership of one group. The kernel makes the
+# member a Cedar child of the group while the record is Active, so a policy says
+# `principal in resource` or `principal in Team::"ops"` instead of listing
+# members. Joining writes this one record; leaving or a removal ends it. No
+# policy text, list or commit changes.
+#
+# group  — the group as a Cedar entity uid, e.g. KatagamiApp::"a1k7p3x9m2qd".
+# member — the principal id (a person's sub, or an agent's id).
+#
+# The entity id must be hex sha256 of the group (as Cedar prints its uid), a
+# newline, and the member (temper_authz::groups::group_membership_id). A record
+# whose id does not match its fields makes nobody a member, so one person is in
+# one group at most once and an id cannot be reused for another membership.
+# Who may write these records is the tenant's own Cedar.
+
+[automaton]
+name = "GroupMembership"
+states = ["Inactive", "Active", "Ended"]
+initial = "Inactive"
+
+[[state]]
+name = "group"
+type = "string"
+initial = ""
+
+[[state]]
+name = "member"
+type = "string"
+initial = ""
+
+[[action]]
+name = "StartMembership"
+kind = "input"
+from = ["Inactive", "Ended"]
+to = "Active"
+params = ["group", "member"]
+hint = "Make member part of group. The entity id must be sha256 of the group uid, a newline and the member."
+
+[[action]]
+name = "EndMembership"
+kind = "input"
+from = ["Active"]
+to = "Ended"
+hint = "Take member out of group: they are no longer `in` it for any policy."
+
+[[field_invariant]]
+name = "ActiveNamesGroup"
+assert = "status in ['Active'] => group != ''"
+
+[[field_invariant]]
+name = "ActiveNamesMember"
+assert = "status in ['Active'] => member != ''"

@@ -153,6 +153,14 @@
         <Property Name="created_by" Type="Edm.String"/>
       </EntityType>
 
+      <EntityType Name="GroupMembership">
+        <Key><PropertyRef Name="id"/></Key>
+        <Property Name="id" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Edm.String"/>
+        <Property Name="group" Type="Edm.String"/>
+        <Property Name="member" Type="Edm.String"/>
+      </EntityType>
+
       <EntityType Name="PrincipalGeneration">
         <Key><PropertyRef Name="id"/></Key>
         <Property Name="id" Type="Edm.String" Nullable="false"/>
@@ -217,6 +225,18 @@
         <ReturnType Type="Temper.TrustedIssuer"/>
       </Action>
 
+      <Action Name="StartMembership" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Temper.GroupMembership"/>
+        <Parameter Name="group" Type="Edm.String"/>
+        <Parameter Name="member" Type="Edm.String"/>
+        <ReturnType Type="Temper.GroupMembership"/>
+      </Action>
+
+      <Action Name="EndMembership" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Temper.GroupMembership"/>
+        <ReturnType Type="Temper.GroupMembership"/>
+      </Action>
+
       <Action Name="BumpGeneration" IsBound="true">
         <Parameter Name="bindingParameter" Type="Temper.PrincipalGeneration"/>
         <ReturnType Type="Temper.PrincipalGeneration"/>
@@ -249,6 +269,7 @@
         </EntitySet>
         <EntitySet Name="TrustedIssuers" EntityType="Temper.TrustedIssuer"/>
         <EntitySet Name="PrincipalGenerations" EntityType="Temper.PrincipalGeneration"/>
+        <EntitySet Name="GroupMemberships" EntityType="Temper.GroupMembership"/>
       </EntityContainer>
 
     </Schema>
