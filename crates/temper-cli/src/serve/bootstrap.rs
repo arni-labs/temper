@@ -439,6 +439,14 @@ pub(super) async fn recover_secrets(state: &PlatformState) {
     }
 }
 
+/// Print an install's warnings under its summary line, where whoever starts
+/// the server with the app sees them.
+fn print_install_warnings(result: &temper_platform::InstallResult) {
+    for warning in &result.warnings {
+        println!("    Warning: {}", warning.message);
+    }
+}
+
 /// Load the verification cache from Turso for a tenant (hash + verified status).
 ///
 /// Routes to the per-tenant store in TenantRouted mode.
@@ -659,6 +667,7 @@ pub(super) async fn bootstrap_installed_apps(
                         "  Restored app '{app_name}' for '{tenant}': {}",
                         all.join(", ")
                     );
+                    print_install_warnings(&result);
                 }
                 AppBootstrapSource::Cli => {
                     let all: Vec<String> = result
@@ -672,6 +681,7 @@ pub(super) async fn bootstrap_installed_apps(
                         "  App '{app_name}' installed for '{tenant}': {}",
                         all.join(", ")
                     );
+                    print_install_warnings(&result);
                 }
             },
             Err(e) => {

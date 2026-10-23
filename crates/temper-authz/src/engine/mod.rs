@@ -343,6 +343,34 @@ impl AuthzEngine {
         )
     }
 
+    /// Ask the fallback policy set what it would decide for a request, as a
+    /// question about the policies rather than a check of a real request:
+    /// the same decision as [`Self::authorize`], counted as `check:review`.
+    pub fn review(
+        &self,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &HashMap<String, serde_json::Value>,
+    ) -> AuthzDecision {
+        let policy_set = match self.fallback_policy_set.read() {
+            Ok(ps) => ps,
+            Err(e) => {
+                return AuthzDecision::Deny(AuthzDenial::EngineError(format!(
+                    "policy lock poisoned: {e}"
+                )));
+            }
+        };
+        self.evaluate_request(
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            &policy_set,
+            CedarCheck::Review,
+        )
+    }
+
     /// Evaluate an authorization request against a specific tenant's policy set.
     ///
     /// If the tenant has no app policy set loaded, externally resolvable

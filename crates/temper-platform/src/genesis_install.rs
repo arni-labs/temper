@@ -79,6 +79,9 @@ pub struct GenesisRegistryInstallResult {
     pub agent_skills: Vec<String>,
     pub adrs: Vec<String>,
     pub seed_instances: Vec<String>,
+    /// The root app's install warnings (see [`InstallResult::warnings`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::os_apps::timer_policy::StateTimerPolicyWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +769,7 @@ pub async fn install_genesis_app_from_registry(
                 agent_skills: install.skills,
                 adrs: install.adrs_bootstrapped,
                 seed_instances: install.seed_instances,
+                warnings: install.warnings,
             })
         }
         InstallVerifyDecision::RollBackToPrevious => {

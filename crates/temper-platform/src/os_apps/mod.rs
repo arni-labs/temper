@@ -29,6 +29,7 @@ mod policy_rows;
 mod reconcile;
 mod runtime_heal;
 mod system_files;
+pub mod timer_policy;
 mod types;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
@@ -1222,6 +1223,17 @@ pub(super) async fn install_os_app_with_plan(
         tenant,
         combined_policy.as_deref(),
     )?;
+    // Where this app's specs and the tenant's Cedar first meet: report the
+    // state timers that make a move the policies forbid to people who arm them.
+    let warnings = if plan.specs || plan.policies {
+        let policy_text = combined_policy
+            .clone()
+            .unwrap_or_else(|| cached_or_active_tenant_policy_text(state, tenant));
+        timer_policy::state_timer_policy_warnings(&bundle.specs, &policy_text)
+    } else {
+        Vec::new()
+    };
+    timer_policy::log_warnings(tenant, app_name, &warnings);
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1627,6 +1639,7 @@ pub(super) async fn install_os_app_with_plan(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        warnings,
     })
 }
 
