@@ -11,12 +11,12 @@
 //! server was down. Replay never arms one: the rows are the source of truth.
 //!
 //! A fire runs as whoever armed it. The event it writes removes its row in the
-//! same commit, so a row never outlives its fire and a restart cannot fire it
-//! twice. A fire that writes no event (refused, or a duplicate) has its row
-//! removed afterwards; if the process stops first, the next boot fires it
-//! again. Its idempotency key, from the arm id, keeps a retried ask from
-//! running twice. A refused fire is logged here, and its dispatch records it
-//! in the record's trajectory like any refused action.
+//! same commit, so a row is removed only once its action has committed, and a
+//! restart cannot fire it twice. A fire whose write failed or may have landed
+//! keeps its row and is retried on it, with the same idempotency key from the
+//! arm id: a write that did land is a duplicate and does not run again. A
+//! refused fire is final: it is logged here, its dispatch records it in the
+//! record's trajectory like any refused action, and then its row is removed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +34,15 @@ use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
+
+/// The wait before a fire that did not commit is tried again; it doubles
+/// with each try, up to [`LAST_RETRY_WAIT`].
+const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait between tries: a store that is down for long is tried
+/// about once an hour, not hammered, and its row keeps the fire across
+/// restarts.
+const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 /// A scheduled action armed in this process.
 struct ScheduledTimer {
@@ -145,17 +154,15 @@ impl ServerState {
         let server = self.clone();
         let fire = async move {
             tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
-            let _permit = match gate {
-                Some(gate) => gate.acquire_owned().await.ok(),
-                None => None,
-            };
-            server.fire_scheduled_action(&timer).await;
+            server.fire_scheduled_action(&timer, gate).await;
         };
         tokio::spawn(fire.instrument(span)); // determinism-ok: timer delivery is a background side-effect
     }
 
-    /// Fire `timer` once, log a refusal, and remove its row.
-    async fn fire_scheduled_action(&self, timer: &ScheduledTimer) {
+    /// Fire `timer` until its action commits or is refused, each attempt
+    /// through `gate` when one is given. A refusal is logged and its row
+    /// removed; a commit removed the row itself.
+    async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
         let mut agent = timer.agent_ctx.clone();
         agent.idempotency_key = Some(format!("schedule:{}", timer.arm_id));
         agent.fires_scheduled_action = Some(ScheduledFire {
@@ -164,43 +171,55 @@ impl ServerState {
             entity_id: timer.entity_id.clone(),
             arm_id: timer.arm_id.clone(),
         });
-        let outcome = self
-            .dispatch_tenant_action(
-                &timer.tenant,
-                &timer.entity_type,
-                &timer.entity_id,
-                &timer.action,
-                serde_json::json!({}),
-                &agent,
-            )
-            .await;
-        let refused = match outcome {
-            Ok(response) if response.success => None,
-            Ok(response) => Some(
-                response
-                    .error
-                    .unwrap_or_else(|| "guard not met".to_string()),
-            ),
-            Err(error) => Some(error),
-        };
-        if let Some(error) = refused {
+        let mut wait = FIRST_RETRY_WAIT;
+        loop {
+            let outcome = {
+                let _permit = match &gate {
+                    Some(gate) => gate.clone().acquire_owned().await.ok(),
+                    None => None,
+                };
+                self.dispatch_tenant_action(
+                    &timer.tenant,
+                    &timer.entity_type,
+                    &timer.entity_id,
+                    &timer.action,
+                    serde_json::json!({}),
+                    &agent,
+                )
+                .await
+            };
+            let error = match outcome {
+                Ok(response) if response.success => return,
+                Ok(response) if response.refused => {
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "guard not met".to_string());
+                    tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
+                        entity_id = %timer.entity_id, action = %timer.action,
+                        arm_id = %timer.arm_id, %error, "scheduled action refused when it fired");
+                    self.forget_scheduled_action(
+                        &timer.tenant,
+                        &timer.entity_type,
+                        &timer.entity_id,
+                        &timer.arm_id,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(response) => response.error.unwrap_or_else(|| "write failed".to_string()),
+                Err(error) => error,
+            };
             tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id, action = %timer.action, arm_id = %timer.arm_id,
-                %error, "scheduled action refused when it fired");
+                %error, retry_in_ms = wait.as_millis() as u64,
+                "scheduled action did not commit when it fired; retrying on its row");
+            tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+            wait = (wait * 2).min(LAST_RETRY_WAIT);
         }
-        // A fire that wrote its event removed its row with it; this removes
-        // the row of one that wrote none, and is a no-op otherwise.
-        self.forget_scheduled_action(
-            &timer.tenant,
-            &timer.entity_type,
-            &timer.entity_id,
-            &timer.arm_id,
-        )
-        .await;
     }
 
-    /// Remove a scheduled action's row. A row left behind fires again at the
-    /// next boot.
+    /// Remove a refused scheduled action's row, or one that can never fire. A
+    /// row left behind fires again at the next boot.
     async fn forget_scheduled_action(
         &self,
         tenant: &TenantId,
