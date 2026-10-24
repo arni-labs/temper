@@ -1988,7 +1988,6 @@ async fn strict_composite_preflight_uses_defaults_and_sequential_target_state() 
         BackendLabel::Sim,
         &json!({}),
         None,
-        false,
     )
     .await
     .unwrap();
