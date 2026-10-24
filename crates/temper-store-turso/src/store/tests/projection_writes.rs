@@ -13,7 +13,8 @@ use super::make_store;
 const ENTITY_TYPE: &str = "Run";
 
 /// The projected state the server writes for an entity: what the entity holds,
-/// plus the counters every action moves.
+/// plus the counters every action moves (the server leaves the actor's
+/// idempotency keys out).
 fn actor_state(
     entity_id: &str,
     status: &str,
@@ -34,7 +35,6 @@ fn actor_state(
         "events_since_snapshot": seq % 100,
         "last_snapshot_sequence_nr": seq - seq % 100,
         "sequence_nr": seq,
-        "processed_idempotency_keys": { format!("poll-{seq}"): seq },
     })
 }
 

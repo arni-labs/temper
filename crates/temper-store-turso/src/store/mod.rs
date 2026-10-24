@@ -77,9 +77,6 @@ pub struct TursoEventStore {
     is_remote: bool,
     /// Set when the local file's commits are copied to Turso Cloud.
     sync_copy: Option<SyncCopy>,
-    /// Projections found unchanged and not written, so the catalog's ordering
-    /// still refuses older ones.
-    unchanged_projections: Arc<unchanged_projections::UnchangedProjections>,
 }
 
 impl TursoEventStore {
@@ -143,7 +140,6 @@ impl TursoEventStore {
             high_priority_write_waiters: Arc::new(AtomicUsize::new(0)),
             is_remote,
             sync_copy,
-            unchanged_projections: Arc::default(),
         };
         store.migrate().await?;
         Ok(store)
@@ -482,6 +478,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_ENTITY_CATALOG_STATUS_INDEX, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_ENTITY_CATALOG_COUNTERS_TABLE, ())
             .await
             .map_err(storage_error)?;
         let _ = conn

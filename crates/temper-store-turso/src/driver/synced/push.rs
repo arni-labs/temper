@@ -164,6 +164,24 @@ impl SyncCopy {
         Ok(info["last_pushed_change_id_hint"].as_i64().unwrap_or(0))
     }
 
+    /// Bytes of row images the local change log holds for changes numbered
+    /// above `after`.
+    pub async fn change_log_bytes_after(&self, after: i64) -> Result<i64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(SUM(COALESCE(LENGTH(before), 0) + COALESCE(LENGTH(after), 0) \
+                 + COALESCE(LENGTH(updates), 0)), 0) FROM turso_cdc WHERE change_id > ?1",
+                crate::driver::params![after],
+            )
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(0);
+        };
+        row.get::<i64>(0).map_err(storage_error)
+    }
+
     /// The number of the newest committed change in the local change log.
     pub async fn last_change(&self) -> Result<i64, PersistenceError> {
         let conn = self.connect().await.map_err(storage_error)?;

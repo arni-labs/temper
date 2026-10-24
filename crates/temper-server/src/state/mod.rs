@@ -1229,6 +1229,11 @@ impl ServerState {
             // The status clock is the actor's, for its timers; a query never
             // reads it, and rows written before it was kept stay comparable.
             obj.remove("status_clock");
+            // The idempotency keys are the actor's, to drop a repeated
+            // request; a query never reads them. Every dispatch records one
+            // (up to 1,000 per entity), so keeping them would make every
+            // action, a poll that changes nothing included, change the row.
+            obj.remove("processed_idempotency_keys");
         }
         projected
     }
