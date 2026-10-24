@@ -282,10 +282,17 @@ impl LocalTDataRequest {
         }
 
         let raw_path = parsed.path();
-        let path = match raw_path {
-            "/tdata" | "/tdata/" => String::new(),
-            _ => raw_path.strip_prefix("/tdata/")?.to_string(),
+        let encoded_path = match raw_path {
+            "/tdata" | "/tdata/" => "",
+            _ => raw_path.strip_prefix("/tdata/")?,
         };
+        // The HTTP route hands the OData handlers a percent-decoded path
+        // (axum's `Path`), so a key reads the same whichever way it arrives.
+        // A path that does not decode to UTF-8 is left to the HTTP route.
+        let path = percent_encoding::percent_decode_str(encoded_path)
+            .decode_utf8()
+            .ok()?
+            .into_owned();
         let query = parsed
             .query_pairs()
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
