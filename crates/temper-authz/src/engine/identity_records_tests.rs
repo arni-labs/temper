@@ -102,3 +102,74 @@ fn reading_agent_credentials_and_types_stays_with_the_tenant() {
         }
     }
 }
+
+#[test]
+fn adapter_delegation_requires_a_tenant_permit_and_respects_forbids() {
+    let caller = agent("runner", "worker");
+    let empty = AuthzEngine::empty();
+    assert!(!allowed(
+        &empty,
+        &caller,
+        "Delegate",
+        "AdapterCredentialDelegation"
+    ));
+    let permitted = AuthzEngine::permissive();
+    assert!(allowed(
+        &permitted,
+        &caller,
+        "Delegate",
+        "AdapterCredentialDelegation"
+    ));
+    assert!(!allowed(&permitted, &caller, "Delegate", "AgentType"));
+    assert!(!allowed(&permitted, &caller, "Delegate", "AgentCredential"));
+    let forbidden = AuthzEngine::new(
+        r#"
+        permit(principal, action, resource);
+        forbid(principal, action == Action::"Delegate", resource is AdapterCredentialDelegation);
+        "#,
+    )
+    .expect("delegation forbid parses");
+    assert!(!allowed(
+        &forbidden,
+        &caller,
+        "Delegate",
+        "AdapterCredentialDelegation"
+    ));
+}
+
+#[test]
+fn adapter_delegation_is_scoped_to_the_requested_type_and_tenant() {
+    let engine = AuthzEngine::empty();
+    engine
+        .reload_tenant_policies(
+            "default",
+            r#"
+            permit(principal == Agent::"runner", action == Action::"Delegate",
+                   resource is AdapterCredentialDelegation)
+            when { resource.agent_type_id == "worker-type" };
+            "#,
+        )
+        .expect("scoped delegation policy parses");
+    let caller = agent("runner", "worker");
+    for (tenant, agent_type, expected) in [
+        ("default", "worker-type", true),
+        ("default", "operator-type", false),
+        ("other-tenant", "worker-type", false),
+    ] {
+        let attrs = HashMap::from([
+            (
+                "id".to_string(),
+                serde_json::json!("prospective-credential"),
+            ),
+            ("agent_type_id".to_string(), serde_json::json!(agent_type)),
+        ]);
+        let decision = engine.authorize_for_tenant_or_bypass(
+            tenant,
+            &caller,
+            "Delegate",
+            "AdapterCredentialDelegation",
+            &attrs,
+        );
+        assert_eq!(decision.is_allowed(), expected, "{tenant}/{agent_type}");
+    }
+}
