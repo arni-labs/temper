@@ -1141,7 +1141,14 @@ impl crate::state::ServerState {
                 "integration": integration.name.clone(),
             });
             return self
-                .dispatch_wasm_callback(ctx.entity_ref, cb, params, ctx.agent_ctx, ctx.mode)
+                .dispatch_wasm_callback(
+                    ctx.entity_ref,
+                    &integration.name,
+                    cb,
+                    params,
+                    ctx.agent_ctx,
+                    ctx.mode,
+                )
                 .await;
         }
         Ok(None)
@@ -1402,6 +1409,7 @@ impl crate::state::ServerState {
                         WASM_DISPATCH_PHASE_DISPATCH_CALLBACK,
                         self.dispatch_wasm_callback(
                             ctx.entity_ref,
+                            &integration.name,
                             callback_action,
                             callback_params,
                             ctx.agent_ctx,

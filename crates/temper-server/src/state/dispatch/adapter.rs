@@ -409,6 +409,7 @@ impl crate::state::ServerState {
             return self
                 .dispatch_adapter_callback(
                     ctx.entity_ref,
+                    &integration.name,
                     &callback_action,
                     callback_params,
                     ctx.agent_ctx,
@@ -551,6 +552,7 @@ impl crate::state::ServerState {
 
         self.dispatch_adapter_callback(
             ctx.entity_ref,
+            &integration.name,
             &callback_action,
             params,
             ctx.agent_ctx,
@@ -563,19 +565,26 @@ impl crate::state::ServerState {
     async fn dispatch_adapter_callback(
         &self,
         entity_ref: WasmEntityRef<'_>,
+        integration: &str,
         callback_action: &str,
         callback_params: serde_json::Value,
         agent_ctx: &AgentContext,
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
-        let callback_ctx = match agent_ctx.for_callback(callback_action, &callback_params) {
-            Ok(context) => context,
-            Err(error) => {
-                return self
-                    .reject_generated_callback(entity_ref, callback_action, error.to_string(), mode)
-                    .await;
-            }
-        };
+        let callback_ctx =
+            match agent_ctx.for_callback(integration, callback_action, &callback_params) {
+                Ok(context) => context,
+                Err(error) => {
+                    return self
+                        .reject_generated_callback(
+                            entity_ref,
+                            callback_action,
+                            error.to_string(),
+                            mode,
+                        )
+                        .await;
+                }
+            };
         let agent_ctx = &callback_ctx;
         let callback_params = match self.prepare_generated_action_params(
             entity_ref.tenant,

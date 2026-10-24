@@ -95,10 +95,13 @@ impl AgentContext {
     /// Admit a callback only within both the inline and cumulative budgets.
     ///
     /// The callback is a new request, so it gets an idempotency key of its
-    /// own, derived from this context's key and the callback request: a retry
-    /// of the parent derives the same key, and sibling callbacks differ.
+    /// own, derived from this context's key, the integration that sent it
+    /// (`source`) and the callback request: a retry of the parent derives the
+    /// same key, and sibling callbacks differ even when two integrations
+    /// answer with the same action and parameters.
     pub(crate) fn for_callback(
         &self,
+        source: &str,
         callback_action: &str,
         callback_params: &serde_json::Value,
     ) -> Result<Self, CallbackBudgetExceeded> {
@@ -117,7 +120,7 @@ impl AgentContext {
             crate::idempotency::derived_idempotency_key(
                 key,
                 &format!("callback:{callback_action}"),
-                &request.short_hex(),
+                &format!("{source}/{}", request.short_hex()),
             )
         });
         Ok(next)
