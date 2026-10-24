@@ -50,7 +50,7 @@ mod static_web;
 pub mod storage;
 #[cfg(test)]
 pub(crate) mod test_spans;
-pub(crate) mod trace_context;
+pub mod trace_context;
 pub(crate) mod trajectory_outbox;
 pub mod trigger;
 pub mod vector_index;

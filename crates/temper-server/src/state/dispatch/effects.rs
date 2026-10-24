@@ -571,6 +571,7 @@ impl crate::state::ServerState {
                     tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
                     let span = crate::trace_context::runtime_work_span!(
                         scheduled_by,
+                        kind = "scheduled_action",
                         "dispatch.scheduled_actions",
                         workflow.root_entity_type = %workflow_root_entity_type,
                         workflow.root_entity_id = %workflow_root_entity_id,
