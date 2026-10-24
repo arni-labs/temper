@@ -90,6 +90,48 @@ fn authenticated_router(state: ServerState) -> Router {
     super::build_router(state).layer(axum::middleware::from_fn(authenticate_test_request))
 }
 
+/// A router whose requests are authenticated as the principal named by their
+/// `X-Temper-Principal-Id` and `X-Temper-Principal-Kind` headers. It stands in
+/// for the credential that resolves to that principal, for tests where who
+/// the caller is decides the outcome (commons accounts are charged and
+/// verified as the caller). A request without the header is the default
+/// test customer.
+fn named_principal_router(state: ServerState) -> Router {
+    authenticated_router(state).layer(axum::middleware::from_fn(authenticate_named_principal))
+}
+
+fn header_text(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn authenticate_named_principal(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = header_text(request.headers(), "x-temper-principal-id");
+    let kind = header_text(request.headers(), "x-temper-principal-kind");
+    if let Some(id) = id {
+        let mut security_ctx = test_security_context();
+        security_ctx.principal.id = id;
+        security_ctx.principal.kind = match kind.as_deref() {
+            Some("admin") => temper_authz::PrincipalKind::Admin,
+            Some("agent") => temper_authz::PrincipalKind::Agent,
+            Some("system") => temper_authz::PrincipalKind::System,
+            _ => temper_authz::PrincipalKind::Customer,
+        };
+        request
+            .extensions_mut()
+            .insert(temper_authz::AuthenticatedRequestContext::new(
+                TenantId::default(),
+                security_ctx,
+            ));
+    }
+    next.run(request).await
+}
+
 fn git_blob_id(body: &[u8]) -> String {
     let mut hasher = sha1::Sha1::new();
     hasher.update(format!("blob {}\0", body.len()).as_bytes());
@@ -1540,7 +1582,7 @@ async fn commons_storage_reservation_allows_other_writers_and_prevents_overreser
         ),
     );
     state.enable_commons_guardrails("default");
-    let app = authenticated_router(state.clone());
+    let app = named_principal_router(state.clone());
 
     let owner = app
         .clone()
@@ -1590,6 +1632,7 @@ async fn commons_storage_reservation_allows_other_writers_and_prevents_overreser
                 .header("Content-Length", "4")
                 .header("X-Expected-Object-Id", git_blob_id(b"abcd"))
                 .header("X-Repository-Id", "rp-dana")
+                .header("X-Temper-Principal-Id", "dana")
                 .body(slow_body)
                 .unwrap(),
         ),
@@ -1626,6 +1669,7 @@ async fn commons_storage_reservation_allows_other_writers_and_prevents_overreser
                 .header("Content-Length", "4")
                 .header("X-Expected-Object-Id", git_blob_id(b"wxyz"))
                 .header("X-Repository-Id", "rp-dana")
+                .header("X-Temper-Principal-Id", "dana")
                 .body(counted_body(b"wxyz", second_body_polls.clone()))
                 .unwrap(),
         )
@@ -1643,6 +1687,7 @@ async fn commons_storage_reservation_allows_other_writers_and_prevents_overreser
                 .header("Content-Length", "4")
                 .header("X-Expected-Object-Id", git_blob_id(b"abcd"))
                 .header("X-Repository-Id", "rp-dana")
+                .header("X-Temper-Principal-Id", "dana")
                 .body(Body::from("abcd"))
                 .unwrap(),
         )
@@ -1665,7 +1710,7 @@ async fn commons_storage_reservation_allows_other_writers_and_prevents_overreser
 async fn commons_account_verification_blocks_owner_scoped_writes_until_verified() {
     let state = test_state_with_account_verification_ioa();
     state.enable_commons_guardrails("default");
-    let app = authenticated_router(state.clone());
+    let app = named_principal_router(state.clone());
 
     let owner = app
         .clone()
@@ -1765,7 +1810,7 @@ async fn commons_account_verification_blocks_owner_scoped_writes_until_verified(
 async fn commons_account_verification_checks_the_caller_not_the_owner_it_names() {
     let state = test_state_with_account_verification_ioa();
     state.enable_commons_guardrails("default");
-    let app = authenticated_router(state.clone());
+    let app = named_principal_router(state.clone());
 
     for (id, principal) in [("alice", "alice"), ("bob", "bob")] {
         let owner = app
@@ -1836,7 +1881,7 @@ async fn commons_account_verification_checks_the_caller_not_the_owner_it_names()
 async fn commons_app_name_unique_per_owner_on_create_and_patch() {
     let state = test_state_with_owner_app_ioa();
     state.enable_commons_guardrails("default");
-    let app = authenticated_router(state);
+    let app = named_principal_router(state);
 
     let owner = app
         .clone()

@@ -21,13 +21,11 @@ impl ActorSystem {
         state: &[u8],
         msg: M,
     ) -> Result<Vec<u8>, ActorError> {
-        let handler = self
-            .handlers
-            .read()
-            .unwrap()
-            .get(&to.actor_type)
-            .cloned()
-            .ok_or_else(|| ActorError::NotFound(to.actor_type.clone()))?;
+        let handler = {
+            let handlers = self.handlers.read().unwrap();
+            handlers.get(&to.actor_type).cloned()
+        }
+        .ok_or_else(|| ActorError::NotFound(to.actor_type.clone()))?;
         let message_type = {
             let full = std::any::type_name::<M>();
             full.rsplit("::").next().unwrap_or(full)

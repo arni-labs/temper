@@ -444,6 +444,17 @@ async fn create_session_on_archived_managed_agent_is_rejected() {
     make_environment(&state, "env-dead").await;
     make_managed_agent(&state, "agent-dead").await;
 
+    // Field invariants hold on bound actions too: set ArchivedAt first.
+    let (status, body) = patch(
+        &state,
+        "/tdata/ManagedAgents('agent-dead')",
+        r#"{"ArchivedAt":"2026-04-11T00:10:00Z"}"#,
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NO_CONTENT,
+        "PATCH ArchivedAt: {status} {body:?}"
+    );
     let (status, _) = post(
         &state,
         "/tdata/ManagedAgents('agent-dead')/Temper.Crucible.ArchiveManagedAgent",

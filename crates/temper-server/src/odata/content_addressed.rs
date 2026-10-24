@@ -215,7 +215,7 @@ async fn ingest_raw_inner(
         RecordWrite {
             caller: WriteCaller::of_request(&security_ctx),
             tenant: &tenant,
-            entity_type: entity_type,
+            entity_type,
             entity_id: &expected_object_id,
             action: "Create",
             operation: "create",
@@ -366,7 +366,7 @@ async fn ingest_raw_inner(
         RecordWrite {
             caller: WriteCaller::of_request(&security_ctx),
             tenant: &tenant,
-            entity_type: entity_type,
+            entity_type,
             entity_id: &expected_object_id,
             action: "Create",
             operation: "create",
