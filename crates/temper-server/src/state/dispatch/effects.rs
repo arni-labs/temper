@@ -564,24 +564,26 @@ impl crate::state::ServerState {
                 .workflow_run_id
                 .clone()
                 .unwrap_or_else(|| format!("{et}:{eid}"));
-            let span = tracing::info_span!(
-                "dispatch.scheduled_actions",
-                workflow.root_entity_type = %workflow_root_entity_type,
-                workflow.root_entity_id = %workflow_root_entity_id,
-                workflow.run_id = %workflow_run_id,
-                temper.action = %action,
-                entity_type = %et,
-                entity_id = %eid,
-            );
+            let scheduled_by = crate::trace_context::cause();
             spawn_post_dispatch_effect(
                 // determinism-ok: timer delivery is a background side-effect
                 async move {
                     tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
+                    let span = crate::trace_context::runtime_work_span!(
+                        scheduled_by,
+                        "dispatch.scheduled_actions",
+                        workflow.root_entity_type = %workflow_root_entity_type,
+                        workflow.root_entity_id = %workflow_root_entity_id,
+                        workflow.run_id = %workflow_run_id,
+                        temper.action = %action,
+                        entity_type = %et,
+                        entity_id = %eid,
+                    );
                     let _ = state
                         .dispatch_tenant_action(&t, &et, &eid, &action, serde_json::json!({}), &ctx)
+                        .instrument(span)
                         .await;
-                }
-                .instrument(span),
+                },
             );
         }
     }
