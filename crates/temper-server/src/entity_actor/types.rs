@@ -266,9 +266,11 @@ pub struct EntityResponse {
     #[serde(default = "default_spec_governed", skip_serializing_if = "is_true")]
     pub spec_governed: bool,
     /// Whether the action was refused before anything was written: its guard,
-    /// its state or its inputs did not allow it, the record had moved on, or
-    /// the event was too large. A failed answer that is not a refusal (storage
-    /// failed, or a step after the commit failed) may have landed.
+    /// its state or its inputs did not allow it, the record had moved on and
+    /// its journal, read again, does not hold the action, or the event was too
+    /// large. A failed answer that is not a refusal (storage failed, a
+    /// concurrency violation that was not resolved by reading the journal, or
+    /// a step after the commit failed) may have landed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
 }

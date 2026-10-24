@@ -69,27 +69,28 @@ pub(super) fn persistence_failure(error: &PersistenceError) -> String {
     }
 }
 
-/// The answer to an action whose event the store did not take. The journal
-/// having moved on, or an event too large to write, is a refusal: nothing was
-/// written. After a storage or serialization failure the write may have landed.
+/// The answer to an action whose event the store did not take. Only an event
+/// too large to write is a refusal: nothing was written. After any other
+/// failure the write may have landed. That includes a concurrency violation,
+/// which a store that retries a write whose answer was lost reports for a
+/// write that landed (the Turso store does).
 fn persistence_failure_reply(state: EntityState, error: &PersistenceError) -> EntityResponse {
     let said = persistence_failure(error);
     match error {
-        PersistenceError::ConcurrencyViolation { .. } | PersistenceError::EventTooLarge { .. } => {
-            EntityResponse::refused(state, said)
-        }
-        PersistenceError::Storage(_) | PersistenceError::Serialization(_) => {
-            EntityResponse::write_failed(state, said)
-        }
+        PersistenceError::EventTooLarge { .. } => EntityResponse::refused(state, said),
+        PersistenceError::ConcurrencyViolation { .. }
+        | PersistenceError::Storage(_)
+        | PersistenceError::Serialization(_) => EntityResponse::write_failed(state, said),
     }
 }
 
 /// Why a concurrency retry (ADR-0046) gave up without writing the action.
 enum RetryGaveUp {
-    /// The action no longer applies, the journal kept moving, or the event is
-    /// too large: nothing was written.
+    /// The journal, read again, does not hold the action and it no longer
+    /// applies, or its event is too large: nothing was written.
     Refused(String),
-    /// Writing failed, so the action may have landed.
+    /// Writing failed, the journal kept moving, or it already holds the
+    /// action: the action may have landed.
     WriteFailed(String),
 }
 
@@ -1405,6 +1406,25 @@ impl Actor for EntityActor {
                                     state_before = state.clone();
                                     event_count_before = state.total_event_count;
 
+                                    // A store that retries a write whose answer
+                                    // was lost reports that write as a
+                                    // concurrency violation. If the journal now
+                                    // holds this action's key, an earlier attempt
+                                    // landed: writing it again would apply it
+                                    // twice, and its guard refusing it now is
+                                    // not a refusal.
+                                    if let Some(key) = idempotency_key.as_deref()
+                                        && state.has_processed_idempotency_key(key)
+                                    {
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::AlreadyWritten,
+                                            Some(RetryGaveUp::WriteFailed(format!(
+                                                "action {name} may have been written: the journal holds its key after a concurrency violation"
+                                            ))),
+                                        ));
+                                        break;
+                                    }
+
                                     // Re-evaluate the action against the caught-up
                                     // state. It may now fail (entity reached a
                                     // terminal state during the race) — if so,
@@ -1426,13 +1446,21 @@ impl Actor for EntityActor {
                                     .await;
 
                                     if !retry_result.success {
+                                        let error = retry_result.error.unwrap_or_else(|| {
+                                            format!(
+                                                "action {name} no longer legal after concurrency replay"
+                                            )
+                                        });
+                                        // Without a key the journal cannot show
+                                        // whether an earlier attempt landed.
+                                        let gave_up = if idempotency_key.is_some() {
+                                            RetryGaveUp::Refused(error)
+                                        } else {
+                                            RetryGaveUp::WriteFailed(error)
+                                        };
                                         retry_final = Some((
                                             crate::runtime_metrics::ConcurrencyRetryOutcome::ActionIllegal,
-                                            Some(RetryGaveUp::Refused(retry_result.error.unwrap_or_else(|| {
-                                                format!(
-                                                    "action {name} no longer legal after concurrency replay"
-                                                )
-                                            }))),
+                                            Some(gave_up),
                                         ));
                                         break;
                                     }
@@ -1509,9 +1537,11 @@ impl Actor for EntityActor {
                                             continue;
                                         }
                                         Err(PersistenceError::ConcurrencyViolation { .. }) => {
+                                            // The last attempt is not replayed,
+                                            // so it may have landed.
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                                Some(RetryGaveUp::Refused(
+                                                Some(RetryGaveUp::WriteFailed(
                                                     "persistence failed: optimistic concurrency retry exhausted"
                                                         .to_string(),
                                                 )),
