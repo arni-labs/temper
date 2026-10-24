@@ -18,8 +18,9 @@
 //! - the wake's answer, and the report the process sent last, name the
 //!   earliest due time of the rows left;
 //! - a wake right after another fires nothing;
-//! - after the suspensions, with time passing normally again, nothing fires
-//!   twice and every remaining row fires when it is due.
+//! - after the suspensions, the process's timers are late by the time it was
+//!   suspended; woken at each earliest due time it reports, every row left
+//!   fires at its wake, and when the old waits run out nothing fires twice.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -326,9 +327,11 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             settle().await;
         }
         let mut woken = 0;
+        let mut suspended = Duration::ZERO;
         for _ in 0..1 + rng.next_bound(4) {
             let by = Duration::from_secs(rng.next_bound(5400) as u64);
             clock.suspend(by);
+            suspended += by;
             run.trace.push(format!(
                 "suspended {}s, wake at {}",
                 by.as_secs(),
@@ -345,34 +348,39 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             settle().await;
         }
 
-        // Time passes normally again: what the wakes fired does not fire
-        // again when its old timer's wait ends, and the rest fires when due.
-        let left = waiting(&events, &rows).await;
-        let fired_before = fires(&events, &ids).await;
-        // Long enough for every row left to fall due.
-        let end = left
-            .iter()
-            .map(|d| d.at)
-            .max()
-            .unwrap_or_else(sim_now)
-            .max(sim_now())
-            + chrono::Duration::seconds(PERIOD);
-        tokio::time::sleep((end - sim_now()).to_std().unwrap()).await;
-        settle().await;
-        for ((id, action), after) in fires(&events, &ids).await {
-            let was = fired_before[&(id.clone(), action.clone())];
-            let once = left
-                .iter()
-                .filter(|d| d.id == id && d.action == action)
-                .count();
-            let ok = match action.as_str() {
-                "Tick" => after > was || once == 0,
-                _ => after == was + once,
-            };
-            if !ok {
+        // The process runs on, its timers late by the time it was suspended,
+        // and the control plane wakes it at each earliest due time: every row
+        // left fires at its wake, once, until only repeating actions are left.
+        for round in 0.. {
+            let left = waiting(&events, &rows).await;
+            if left.iter().all(|d| d.action == "Tick") {
+                break;
+            }
+            if round == 200 {
                 return Err(run.fail(
-                    "after the wakes nothing fires twice, and what is left fires when due",
-                    format!("{id} {action}: {was} fires, then {after}; rows left {left:?}"),
+                    "woken at each due time, one-shot rows run out",
+                    format!("{left:?}"),
+                ));
+            }
+            if let Some(next) = left.first().map(|d| d.at)
+                && next > sim_now()
+            {
+                tokio::time::sleep((next - sim_now()).to_std().unwrap()).await;
+            }
+            settle().await;
+            run.trace
+                .push(format!("wake at the reported time {}", sim_now()));
+            woken += check_wake(&state, &events, &rows, &reports, &ids, &run).await?;
+        }
+        // When the old waits of the timers the wakes fired run out, nothing
+        // fires again: every record fired its one-shot action at most once.
+        tokio::time::sleep(suspended + Duration::from_secs((TIMEOUT + PERIOD) as u64)).await;
+        settle().await;
+        for ((id, action), fired) in fires(&events, &ids).await {
+            if action != "Tick" && fired > 1 {
+                return Err(run.fail(
+                    "nothing fires twice",
+                    format!("{id} {action} fired {fired} times"),
                 ));
             }
         }
