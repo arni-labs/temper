@@ -116,13 +116,15 @@ impl ServerState {
                         &table,
                         &initial_fields,
                     );
-                    table.validate_action_params(
-                        action,
-                        params,
-                        &prestate.fields,
-                        &prestate.counters,
-                        &prestate.booleans,
-                    )
+                    table
+                        .validate_action_params(
+                            action,
+                            params,
+                            &prestate.fields,
+                            &prestate.counters,
+                            &prestate.booleans,
+                        )
+                        .map_err(String::from)
                 })
                 .map_err(|error| SpawnRefusal::new(action, error))?;
         }

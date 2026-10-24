@@ -576,6 +576,8 @@ impl crate::state::ServerState {
                     &response.state.counters,
                     &response.state.booleans,
                 ) {
+                    let mut response = response;
+                    response.refusal = error.refusal;
                     let ctx = PostDispatchContext {
                         tenant,
                         entity_type,
@@ -586,7 +588,9 @@ impl crate::state::ServerState {
                         action_params: &params,
                         await_integration,
                     };
-                    return Ok(self.refuse_before_actor(&ctx, response, error).await);
+                    return Ok(self
+                        .refuse_before_actor(&ctx, response, error.message)
+                        .await);
                 }
             }
         }

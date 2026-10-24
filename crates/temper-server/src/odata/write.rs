@@ -33,7 +33,7 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::entity_actor::EntityState;
 use crate::request_context::{AgentContext, extract_agent_context};
-use crate::response::{ODataResponse, odata_error};
+use crate::response::{ODataResponse, odata_error, odata_refusal};
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use crate::state::write_record::{RecordWrite, WriteCaller, created_record, field_update_record};
@@ -970,10 +970,11 @@ pub async fn handle_odata_post(
                             &actor_state.booleans,
                         )
                     {
-                        return odata_error(
+                        return odata_refusal(
                             StatusCode::BAD_REQUEST,
                             "StrictActionContract",
-                            &error,
+                            &error.message,
+                            error.refusal.as_ref(),
                         )
                         .into_response();
                     }

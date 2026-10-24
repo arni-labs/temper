@@ -751,6 +751,7 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("WASM integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
@@ -785,6 +786,7 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("adapter integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
