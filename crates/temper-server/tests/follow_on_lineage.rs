@@ -258,6 +258,25 @@ async fn a_retried_request_rings_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_request_retried_after_its_ring_rang_rings_once() {
+    let state = build_state("http://127.0.0.1:9");
+    let tenant = TenantId::default();
+    let agent = AgentContext {
+        idempotency_key: Some("press-once".into()),
+        ..AgentContext::default()
+    };
+    press(&state, &tenant, &agent).await;
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(counter(&state, &tenant, "Bell", "b1").await, 1);
+
+    // The ring has finished; the retry is still answered with the first
+    // reply, which names the same scheduled ring.
+    press(&state, &tenant, &agent).await;
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(counter(&state, &tenant, "Bell", "b1").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_presses_in_the_same_second_ring_twice() {
     let state = build_state("http://127.0.0.1:9");
     let tenant = TenantId::default();
