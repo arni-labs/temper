@@ -2437,7 +2437,9 @@ async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let created = || test_envelope("Created", serde_json::json!({}));
     let updated = || test_envelope("FieldsUpdated", serde_json::json!({}));
-    let project = |id: &'static str, sequence_nr: u64| {
+    let top_level = serde_json::json!({ "OrderId": "ord-1" });
+    let wrapped = serde_json::json!({ "fields": { "OrderId": "ord-1" } });
+    let project = |id: &'static str, sequence_nr: u64, fields: serde_json::Value| {
         let store = store.clone();
         let tenant = tenant.clone();
         async move {
@@ -2447,7 +2449,7 @@ async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
                     "Payment",
                     id,
                     "Pending",
-                    &serde_json::json!({ "OrderId": "ord-1" }),
+                    &fields,
                     &serde_json::json!({}),
                     sequence_nr,
                 )
@@ -2461,13 +2463,13 @@ async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
         .append(&format!("{tenant}:Payment:pay-current"), 0, &[created()])
         .await
         .unwrap();
-    project("pay-current", 1).await;
+    project("pay-current", 1, top_level.clone()).await;
     // A change committed after the projection, which never landed.
     store
         .append(&format!("{tenant}:Payment:pay-stale"), 0, &[created()])
         .await
         .unwrap();
-    project("pay-stale", 1).await;
+    project("pay-stale", 1, top_level.clone()).await;
     store
         .append(&format!("{tenant}:Payment:pay-stale"), 1, &[updated()])
         .await
@@ -2477,7 +2479,7 @@ async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
         .append(&format!("{tenant}:Payment:pay-deleted"), 0, &[created()])
         .await
         .unwrap();
-    project("pay-deleted", 1).await;
+    project("pay-deleted", 1, top_level.clone()).await;
     store
         .append(
             &format!("{tenant}:Payment:pay-deleted"),
@@ -2495,18 +2497,25 @@ async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
         )
         .await
         .unwrap();
+    // Current, with its fields written under a `fields` object.
+    store
+        .append(&format!("{tenant}:Payment:pay-wrapped"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-wrapped", 1, wrapped.clone()).await;
 
     let mut rows = store
         .projection_catalog_freshness(&tenant, "Payment")
         .await
         .expect("read catalog freshness");
-    rows.sort();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         rows,
         vec![
-            ("pay-current".to_string(), true),
-            ("pay-deleted".to_string(), false),
-            ("pay-stale".to_string(), false),
+            ("pay-current".to_string(), true, None),
+            ("pay-deleted".to_string(), false, None),
+            ("pay-stale".to_string(), false, None),
+            ("pay-wrapped".to_string(), true, Some(wrapped)),
         ]
     );
 }

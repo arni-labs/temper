@@ -17,6 +17,12 @@
 //! index, a failed read), every live row is in that set. The set is read only
 //! while it fits [`UNINDEXED_REFERENCE_READ_BUDGET`]; past it the delete is
 //! refused as unverified rather than reading the whole type.
+//!
+//! A row holds a reference where the create check reads it (`extract_field`):
+//! the field at the top level, else inside a `fields` object, which is how a
+//! write that wraps its body under `fields` stores it. The index holds only
+//! top-level fields, so the catalog rows that hold a `fields` object come back
+//! with their projected fields, and a current one is checked from those.
 
 use std::collections::BTreeSet;
 
@@ -74,6 +80,9 @@ struct IndexCoverage {
     stale: BTreeSet<String>,
     /// Live rows the index cannot vouch for: never projected, or stale.
     unvouched: Vec<String>,
+    /// Current catalog rows that hold a `fields` object, with their projected
+    /// fields: the index does not look inside that object.
+    wrapped: Vec<(String, serde_json::Value)>,
 }
 
 /// Check incoming relation policy before deleting an entity.
@@ -217,19 +226,27 @@ async fn index_coverage(
     };
     let mut current = BTreeSet::new();
     let mut stale = BTreeSet::new();
+    let mut wrapped = Vec::new();
     for row in catalog {
-        if row.current {
-            current.insert(row.entity_id);
-        } else {
+        if !row.current {
             stale.insert(row.entity_id);
+            continue;
         }
+        if let Some(fields) = row.wrapped_fields {
+            wrapped.push((row.entity_id.clone(), fields));
+        }
+        current.insert(row.entity_id);
     }
     let unvouched = live_ids
         .iter()
         .filter(|id| !current.contains(*id))
         .cloned()
         .collect();
-    Some(IndexCoverage { stale, unvouched })
+    Some(IndexCoverage {
+        stale,
+        unvouched,
+        wrapped,
+    })
 }
 
 /// Ask the field index for a row the index vouches for whose `source_field`
@@ -278,11 +295,18 @@ async fn probe_field_index(
     {
         Ok(Some(page)) => {
             debug_assert!(page.entity_ids.len() <= top);
-            match page
+            let indexed = page
                 .entity_ids
                 .into_iter()
-                .find(|id| !coverage.stale.contains(id))
-            {
+                .find(|id| !coverage.stale.contains(id));
+            let wrapped = || {
+                coverage
+                    .wrapped
+                    .iter()
+                    .find(|(_, fields)| holds_id(fields, &edge.source_field, entity_id))
+                    .map(|(source_id, _)| source_id.clone())
+            };
+            match indexed.or_else(wrapped) {
                 Some(source_id) => IndexAnswer::Referenced(source_id),
                 None => IndexAnswer::NoVouchedReference,
             }
@@ -344,10 +368,11 @@ async fn read_unindexed_rows(
     ReferenceLookup::Unreferenced
 }
 
-/// Whether `fields[field]` holds `entity_id`, compared as the field index
-/// stores a scalar: its text.
+/// Whether the reference `fields` holds through `field` is `entity_id`, read
+/// where the create check reads it (`extract_field`) and compared as the field
+/// index stores a scalar: its text.
 fn holds_id(fields: &serde_json::Value, field: &str, entity_id: &str) -> bool {
-    match fields.get(field) {
+    match super::extract_field(fields, field) {
         Some(serde_json::Value::String(value)) => value == entity_id,
         Some(serde_json::Value::Number(value)) => value.to_string() == entity_id,
         Some(serde_json::Value::Bool(value)) => value.to_string() == entity_id,
