@@ -1,32 +1,140 @@
-//! Forgetting a deleted tenant's in-memory state.
+//! Removing a tenant from the running server, in an order that keeps its storage until nothing can still write to
+//! it: refuse the tenant's new work, stop its actors and wait for each to end, remove its storage, then forget what
+//! this process holds for it.
 
+use std::future::Future;
+
+use futures_util::FutureExt;
+use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
 
+/// Why a tenant removal did not finish. The tenant stays marked gone (no specs, so no new actors and no new work),
+/// and running the removal again picks up where this one stopped.
+#[derive(Debug)]
+pub enum TenantRemovalError {
+    /// A lock over the tenant's in-memory state was poisoned by a panic elsewhere.
+    LockPoisoned(&'static str),
+    /// Some of the tenant's actors were still handling a message when the wait ended.
+    ActorsStillRunning {
+        /// How many had not ended.
+        running: usize,
+        /// How long the removal waited for them.
+        waited: std::time::Duration,
+    },
+    /// Removing the tenant's storage failed.
+    Storage(PersistenceError),
+}
+
+impl std::fmt::Display for TenantRemovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LockPoisoned(what) => write!(f, "the {what} lock is poisoned"),
+            Self::ActorsStillRunning { running, waited } => write!(
+                f,
+                "{running} of the tenant's actors were still running after {waited:?}; its storage was kept, retry \
+                 the delete"
+            ),
+            Self::Storage(error) => write!(f, "removing the tenant's storage failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TenantRemovalError {}
+
+fn poisoned<T>(what: &'static str) -> impl FnOnce(T) -> TenantRemovalError {
+    move |_| TenantRemovalError::LockPoisoned(what)
+}
+
 impl ServerState {
-    /// Drop everything this process holds in memory for a deleted tenant: its live entity actors and their caches,
-    /// its cached replies, its timer sequences, its HTTP routes, its Cedar policies, its cached secrets, its WASM
-    /// modules and its specs. A tenant created again with the same id then starts from its own (empty) database, not
-    /// from what the deleted tenant left in memory.
+    /// Remove a tenant: refuse its new work, stop its actors and wait until each has ended, then run `remove_storage`,
+    /// then forget everything this process holds for it. Returns what `remove_storage` returned: whether the tenant
+    /// existed.
     ///
-    /// Actors are stopped without the passivation snapshot, so nothing of the deleted tenant is written back.
-    pub async fn forget_tenant(&self, tenant: &TenantId) {
+    /// Storage is removed only once no actor of the tenant is running, so none can write into it afterwards (or into
+    /// a database created again under the same id). Each step converges when repeated, so a removal that failed is
+    /// finished by running it again.
+    pub async fn remove_tenant<F, Fut>(
+        &self,
+        tenant: &TenantId,
+        remove_storage: F,
+    ) -> Result<bool, TenantRemovalError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<bool, PersistenceError>>,
+    {
+        // Without specs, no actor of the tenant is spawned and no request for it is admitted.
+        self.registry
+            .write()
+            .map_err(poisoned("spec registry"))?
+            .remove_tenant(tenant);
+        self.stop_tenant_actors(tenant).await?;
+        let existed = remove_storage()
+            .await
+            .map_err(TenantRemovalError::Storage)?;
+        self.forget_tenant(tenant).await?;
+        Ok(existed)
+    }
+
+    /// Halt every actor of `tenant` and wait until each has ended, for as long as a dispatch waits for its actor
+    /// (`action_dispatch_timeout`): a message still being handled after that has a caller that already gave up.
+    /// A halt needs no mailbox space and drops the actor's queued messages. Actors that ended leave the registry;
+    /// the rest stay there, halted, for the next attempt to wait on.
+    async fn stop_tenant_actors(&self, tenant: &TenantId) -> Result<(), TenantRemovalError> {
+        let prefix = format!("{tenant}:");
+        let actors: Vec<_> = self
+            .actor_registry
+            .read()
+            .map_err(poisoned("actor registry"))?
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, actor)| actor.clone())
+            .collect();
+        for actor in &actors {
+            actor.halt();
+        }
+        let waited = self.action_dispatch_timeout;
+        let all_ended = futures_util::future::join_all(actors.iter().map(|actor| actor.stopped()));
+        let finished = tokio::time::timeout(waited, all_ended).await.is_ok();
+
+        let mut registry = self
+            .actor_registry
+            .write()
+            .map_err(poisoned("actor registry"))?;
+        registry.retain(|key, actor| {
+            !(key.starts_with(&prefix) && actor.stopped().now_or_never().is_some())
+        });
+        let running = registry
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count();
+        drop(registry);
+        if finished && running == 0 {
+            Ok(())
+        } else {
+            Err(TenantRemovalError::ActorsStillRunning { running, waited })
+        }
+    }
+
+    /// Drop everything this process holds in memory for a deleted tenant: its entity caches and indexes, its cached
+    /// replies, its timer sequences, its HTTP routes, its Cedar policies, its cached secrets, its WASM modules and
+    /// its specs. A tenant created again with the same id then starts from its own (empty) database, not from what
+    /// the deleted tenant left in memory. [`Self::remove_tenant`] runs this once the tenant's actors have ended and
+    /// its storage is gone.
+    async fn forget_tenant(&self, tenant: &TenantId) -> Result<(), TenantRemovalError> {
         let prefix = format!("{tenant}:");
         let owned = |key: &String| key.starts_with(&prefix);
 
-        if let Ok(mut registry) = self.actor_registry.write() {
-            let keys: Vec<String> = registry.keys().filter(|key| owned(key)).cloned().collect();
-            for key in keys {
-                if let Some(actor) = registry.remove(&key) {
-                    let _ = actor.stop();
-                }
-            }
-        }
-        if let Ok(mut last_accessed) = self.last_accessed.write() {
-            last_accessed.retain(|key, _| !owned(key));
-        }
-        if let Ok(mut cache) = self.entity_state_cache.lock() {
+        self.last_accessed
+            .write()
+            .map_err(poisoned("last accessed"))?
+            .retain(|key, _| !owned(key));
+        {
+            let mut cache = self
+                .entity_state_cache
+                .lock()
+                .map_err(poisoned("entity state cache"))?;
             let keys: Vec<String> = cache
                 .iter()
                 .map(|(key, _)| key)
@@ -37,103 +145,56 @@ impl ServerState {
                 cache.pop(&key);
             }
         }
-        if let Ok(mut index) = self.entity_index.write() {
-            index.retain(|key, _| !owned(key));
-        }
-        if let Ok(mut hydrated) = self.entity_index_hydrated.write() {
-            hydrated.retain(|key| !owned(key));
-        }
-        if let Ok(mut backfilled) = self.key_index_backfilled.write() {
-            backfilled.retain(|key, _| !owned(key));
-        }
-        if let Ok(mut loaded) = self.key_index_watermarks_loaded.write() {
-            loaded.remove(tenant.as_str());
-        }
-        if let Ok(mut log) = self.entity_observe_log.lock() {
-            log.retain(|key, _| !owned(key));
-        }
-        if let Ok(mut sequences) = self.entity_event_sequences.lock() {
-            sequences.retain(|key, _| !owned(key));
-        }
+        self.entity_index
+            .write()
+            .map_err(poisoned("entity index"))?
+            .retain(|key, _| !owned(key));
+        self.entity_index_hydrated
+            .write()
+            .map_err(poisoned("entity index hydration"))?
+            .retain(|key| !owned(key));
+        self.key_index_backfilled
+            .write()
+            .map_err(poisoned("key index backfill"))?
+            .retain(|key, _| !owned(key));
+        self.key_index_watermarks_loaded
+            .write()
+            .map_err(poisoned("key index watermarks"))?
+            .remove(tenant.as_str());
+        self.entity_observe_log
+            .lock()
+            .map_err(poisoned("entity observe log"))?
+            .retain(|key, _| !owned(key));
+        self.entity_event_sequences
+            .lock()
+            .map_err(poisoned("entity event sequences"))?
+            .retain(|key, _| !owned(key));
 
         self.idempotency_cache.forget_tenant(tenant);
         self.state_timeout_tracker.forget_tenant(tenant);
         self.http_endpoint_tables.remove(tenant).await;
 
         self.authz.remove_tenant(tenant.as_str());
-        if let Ok(mut policies) = self.tenant_policies.write() {
-            policies.remove(tenant.as_str());
-        }
+        self.tenant_policies
+            .write()
+            .map_err(poisoned("tenant policies"))?
+            .remove(tenant.as_str());
         if let Some(vault) = self.secrets_vault.as_ref() {
             vault.remove_tenant(tenant.as_str());
         }
-        if let Ok(mut modules) = self.wasm_module_registry.write() {
-            modules.remove_tenant(tenant);
-        }
-        if let Ok(mut registry) = self.registry.write() {
-            registry.remove_tenant(tenant);
-        }
+        self.wasm_module_registry
+            .write()
+            .map_err(poisoned("WASM module registry"))?
+            .remove_tenant(tenant);
+        self.registry
+            .write()
+            .map_err(poisoned("spec registry"))?
+            .remove_tenant(tenant);
         crate::runtime_metrics::record_server_state_metrics(self);
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use temper_runtime::ActorSystem;
-    use temper_spec::csdl::CsdlDocument;
-
-    use super::*;
-    use crate::secrets::vault::SecretsVault;
-
-    #[tokio::test]
-    async fn a_deleted_tenants_policies_secrets_and_routes_are_forgotten_and_other_tenants_keep_theirs()
-     {
-        let state = ServerState::new(
-            ActorSystem::new("forget-tenant"),
-            CsdlDocument {
-                version: "4.0".to_string(),
-                schemas: Vec::new(),
-            },
-            String::new(),
-        )
-        .with_secrets_vault(SecretsVault::new(&[3_u8; 32]));
-        let policy = r#"permit(principal, action, resource);"#;
-        let vault = state.secrets_vault.clone().expect("vault");
-        for tenant in ["acme", "other"] {
-            state
-                .authz
-                .reload_tenant_policies(tenant, policy)
-                .expect("policy");
-            vault.cache_secret(tenant, "api_key", format!("{tenant}-value"));
-            state
-                .http_endpoint_tables
-                .table_for(&TenantId::new(tenant))
-                .await;
-        }
-
-        state.forget_tenant(&TenantId::new("acme")).await;
-
-        assert_eq!(state.authz.get_tenant_policy_text("acme"), None);
-        assert_eq!(vault.get_secret("acme", "api_key"), None);
-        assert!(
-            state
-                .http_endpoint_tables
-                .get(&TenantId::new("acme"))
-                .await
-                .is_none(),
-            "the deleted tenant's routes are gone"
-        );
-        assert!(state.authz.get_tenant_policy_text("other").is_some());
-        assert!(
-            state
-                .http_endpoint_tables
-                .get(&TenantId::new("other"))
-                .await
-                .is_some()
-        );
-        assert_eq!(
-            vault.get_secret("other", "api_key").as_deref(),
-            Some("other-value")
-        );
-    }
-}
+#[path = "tenant_removal_test.rs"]
+mod tests;

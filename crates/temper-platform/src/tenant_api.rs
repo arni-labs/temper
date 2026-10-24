@@ -279,25 +279,23 @@ pub(crate) async fn delete_tenant(
         );
     }
 
-    // Remove the tenant's database, registry row and users, then what this process holds in memory for it, so an id
-    // created again starts empty.
+    // Refuse the tenant's new work, stop its actors and wait for each to end, and only then remove its database,
+    // registry row and users, then what this process holds in memory for it, so an id created again starts empty.
+    // A removal that fails part way keeps the tenant refused; deleting it again finishes it.
     // `require_same_tenant` checked that the path names the request's own tenant.
     let tid = authenticated.tenant();
-    match provider.remove_tenant(tid).await {
-        Ok(true) => {
-            state.server.forget_tenant(tid).await;
-            {
-                let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
-                registry.remove_tenant(tid);
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "deleted": true,
-                    "tenant_id": tenant_id,
-                })),
-            )
-        }
+    match state
+        .server
+        .remove_tenant(tid, || provider.remove_tenant(tid))
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted": true,
+                "tenant_id": tenant_id,
+            })),
+        ),
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("tenant '{tenant_id}' not found")})),

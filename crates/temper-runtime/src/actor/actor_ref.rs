@@ -73,9 +73,23 @@ impl fmt::Display for ActorId {
 }
 
 impl<M: Message> ActorRef<M> {
-    /// A closed mailbox cannot recover; a new actor incarnation is required.
+    /// Whether the actor takes no more work: its mailbox is gone, or it was
+    /// halted. Neither recovers; a new actor incarnation is required.
     pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        self.sender.is_closed() || self.sender.is_halted()
+    }
+
+    /// Stop the actor ahead of its queued work. Unlike [`Self::stop`] this
+    /// needs no mailbox space. The message being handled finishes; queued
+    /// messages are dropped, and an ask among them gets [`ActorError::Stopped`].
+    /// Wait for the actor to end with [`Self::stopped`].
+    pub fn halt(&self) {
+        self.sender.halt();
+    }
+
+    /// Wait until the actor's task has ended.
+    pub async fn stopped(&self) {
+        self.sender.closed().await;
     }
 
     /// Send a message to the actor without waiting for a response.
