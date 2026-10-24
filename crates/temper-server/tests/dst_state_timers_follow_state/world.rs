@@ -18,6 +18,7 @@ use temper_server::storage::StateTimerStore;
 pub(crate) struct SimTimerRows {
     rows: Mutex<BTreeMap<(String, String, String), StateTimerRecord>>,
     rng: Mutex<DeterministicRng>,
+    failed_writes: Mutex<usize>,
     /// A write takes fewer scheduler turns than this to land.
     round_trip_turns: usize,
 }
@@ -33,9 +34,14 @@ impl SimTimerRows {
     pub(crate) fn with_round_trips(seed: u64, turns: usize) -> Self {
         Self {
             rows: Mutex::new(BTreeMap::new()),
+            failed_writes: Mutex::new(0),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x7177_e125)),
             round_trip_turns: turns,
         }
+    }
+
+    pub(crate) fn fail_next_writes(&self, count: usize) {
+        *self.failed_writes.lock().unwrap() = count;
     }
 
     /// The record's row now.
@@ -63,6 +69,15 @@ impl StateTimerStore for SimTimerRows {
             timer.entity_id.clone(),
         );
         self.round_trip().await;
+        {
+            let mut failures = self.failed_writes.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(PersistenceError::Storage(
+                    "injected timer write failure".into(),
+                ));
+            }
+        }
         let mut rows = self.rows.lock().unwrap();
         if rows
             .get(&key)

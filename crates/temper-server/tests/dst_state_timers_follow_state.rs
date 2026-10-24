@@ -28,7 +28,9 @@
 //!
 //! Two more workloads share this world: `boot_burst` (the timers a boot finds
 //! due fire a few at a time) and `delete_race` (a delete while timer rows are
-//! still landing leaves no row).
+//! still landing leaves no row). So do two regressions: `read_failure` (an
+//! install walk retries a record it could not read) and `unanswered_fire` (a
+//! timer whose fire got no answer is armed again; a refused one is not).
 
 #[path = "dst_state_timers_follow_state/boot_burst.rs"]
 mod boot_burst;
@@ -507,6 +509,8 @@ fn run_seed(seed: u64) -> Result<(), String> {
 
 #[path = "dst_state_timers_follow_state/read_failure.rs"]
 mod read_failure;
+#[path = "dst_state_timers_follow_state/unanswered_fire.rs"]
+mod unanswered_fire;
 
 #[test]
 fn dst_state_timers_follow_the_current_state() {

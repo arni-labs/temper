@@ -672,6 +672,11 @@ impl crate::state::ServerState {
             // The journal is committed: hand the projection to the retrying
             // queue so reads catch up once the store recovers.
             self.apply_query_projection_update(ctx, &response).await;
+            // The old timer was cancelled above, so arm the one the committed
+            // state declares, as on success: otherwise the record has no timer
+            // until its next transition, and a repeating timer whose tick
+            // failed to project stops for good.
+            Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
             let mut response = response;
             response.success = false;
             response.error = Some(format!(
