@@ -20,6 +20,10 @@ use temper_runtime::scheduler::sim_now;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 
+mod request;
+
+pub use request::derived_idempotency_key;
+
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).
 pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
 

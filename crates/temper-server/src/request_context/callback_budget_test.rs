@@ -141,3 +141,54 @@ fn detached_boundary_preserves_authority_and_idempotency() {
         serde_json::to_value(&context.security_ctx).unwrap()
     );
 }
+
+#[test]
+fn immediate_scheduled_follow_ons_keep_the_parent_lineage_and_clocked_ones_start_fresh() {
+    let context = AgentContext {
+        callback_depth: 8,
+        callback_hops: MAX_CALLBACK_HOPS - 1,
+        idempotency_key: Some("press-once".into()),
+        ..AgentContext::for_service("invoker")
+    };
+    let immediate = context.for_scheduled_follow_on("Ring", 0, 0);
+    assert_eq!(immediate.callback_depth, context.callback_depth);
+    assert_eq!(immediate.callback_hops, context.callback_hops);
+
+    let clocked = context.for_scheduled_follow_on("Ring", 0, 1);
+    assert_eq!(clocked.callback_depth, 0);
+    assert_eq!(clocked.callback_hops, 0);
+    assert_eq!(clocked.agent_id, context.agent_id);
+    assert_eq!(clocked.agent_type, context.agent_type);
+}
+
+#[test]
+fn a_scheduled_follow_on_has_a_key_of_its_own_that_a_retry_derives_again() {
+    let context = AgentContext {
+        idempotency_key: Some("press-once".into()),
+        ..AgentContext::default()
+    };
+    let first = context
+        .for_scheduled_follow_on("Ring", 0, 1)
+        .idempotency_key;
+    // The parent's key is the scheduling transition's; reusing it would
+    // answer the follow-on with that transition's reply.
+    assert_ne!(first, context.idempotency_key);
+    assert_eq!(
+        first,
+        context
+            .for_scheduled_follow_on("Ring", 0, 1)
+            .idempotency_key
+    );
+    assert_ne!(
+        first,
+        context
+            .for_scheduled_follow_on("Ring", 1, 1)
+            .idempotency_key
+    );
+    assert_eq!(
+        AgentContext::default()
+            .for_scheduled_follow_on("Ring", 0, 1)
+            .idempotency_key,
+        None
+    );
+}

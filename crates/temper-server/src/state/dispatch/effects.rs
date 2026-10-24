@@ -542,13 +542,13 @@ impl crate::state::ServerState {
         scheduled_actions: &[ScheduledAction],
         agent_ctx: &AgentContext,
     ) {
-        for sched in scheduled_actions {
+        for (index, sched) in scheduled_actions.iter().enumerate() {
             let state = self.clone();
             let t = tenant.clone();
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = agent_ctx.clone();
+            let ctx = agent_ctx.for_scheduled_follow_on(&action, index, sched.delay_seconds);
             let delay = std::time::Duration::from_secs(sched.delay_seconds);
             let workflow_root_entity_type = ctx
                 .workflow_root_entity_type
