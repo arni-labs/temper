@@ -9,7 +9,7 @@
 //! references inside it (a row that references itself, two rows that
 //! reference each other) needs none either. After the write each entity's
 //! actor is stopped, so the next read replays the tombstone, and its query
-//! projection row is removed. A projection removal that fails leaves a row
+//! projection row and any armed timer are removed. A projection removal that fails leaves a row
 //! whose journal has moved past it, which the delete reference lookup does
 //! not trust (`delete_references`).
 //!
@@ -144,6 +144,15 @@ impl ServerState {
                 member.sequence_nr,
             )
             .await;
+            // A deleted record keeps no timer, as a single delete does.
+            self.reconcile_state_timers(
+                tenant,
+                &member.entity_type,
+                &member.entity_id,
+                member,
+                None,
+            )
+            .await;
         }
         Ok(())
     }
@@ -211,8 +220,8 @@ impl ServerState {
                     self.action_dispatch_timeout,
                 )
                 .await;
-            match deleted {
-                Ok(response) if response.success => {}
+            let deleted = match deleted {
+                Ok(response) if response.success => response.state,
                 Ok(response) => {
                     release(&actors[index..], holder);
                     return Err(BatchDeleteError::Storage(format!(
@@ -229,7 +238,7 @@ impl ServerState {
                         member.entity_type, member.entity_id
                     )));
                 }
-            }
+            };
             // Nothing keeps a tombstone without a journal, so the status
             // cache entry goes with the entity, as a single delete does.
             if let Ok(mut cache) = self.entity_state_cache.lock() {
@@ -239,6 +248,14 @@ impl ServerState {
                 ));
             }
             self.stop_and_remove_entity(tenant, &member.entity_type, &member.entity_id);
+            self.reconcile_state_timers(
+                tenant,
+                &member.entity_type,
+                &member.entity_id,
+                &deleted,
+                None,
+            )
+            .await;
         }
         Ok(())
     }
