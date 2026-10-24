@@ -318,6 +318,7 @@ impl ServerState {
             .ok_or_else(|| format!("No transition table for {tenant}/{entity_type}"))?;
             EntityResponse {
                 success: true,
+                refusal: None,
                 state: EntityActor::build_initial_state(
                     entity_type,
                     entity_id,
@@ -1769,6 +1770,7 @@ impl ServerState {
 
         Ok(DataOnlyCreate::Created(Box::new(EntityResponse {
             success: true,
+            refusal: None,
             state,
             error: None,
             custom_effects: vec![],

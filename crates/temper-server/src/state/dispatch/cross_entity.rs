@@ -212,13 +212,15 @@ impl crate::state::ServerState {
                                         table,
                                         &initial_fields,
                                     );
-                                table.validate_action_params(
-                                    action,
-                                    params,
-                                    &prestate.fields,
-                                    &prestate.counters,
-                                    &prestate.booleans,
-                                )
+                                table
+                                    .validate_action_params(
+                                        action,
+                                        params,
+                                        &prestate.fields,
+                                        &prestate.counters,
+                                        &prestate.booleans,
+                                    )
+                                    .map_err(String::from)
                             });
                         if let Err(error) = validation {
                             state.record_generated_callback_refusal(
