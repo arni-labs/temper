@@ -204,6 +204,16 @@ impl TenantGenerations {
             .is_some_and(|current| Arc::ptr_eq(current, generation))
     }
 
+    /// Whether the generation `stamp` names was removed: its tenant's storage is gone and the generation forgotten.
+    /// A generation that is only closed (its removal under way, or one that failed) is not removed. A stamp is
+    /// handed out only for its tenant's current generation, so one that is no longer current was forgotten.
+    pub(crate) fn is_removed(&self, stamp: &TenantStamp) -> bool {
+        self.inner()
+            .current
+            .get(&stamp.tenant)
+            .is_none_or(|current| current.stamp != *stamp)
+    }
+
     /// Wait until every lease of the closed `generation` has ended.
     pub(crate) async fn drained(generation: &Generation) {
         debug_assert!(generation.work().closed, "only a closed generation drains");
@@ -249,6 +259,11 @@ impl GenerationRef {
     /// A lease of the generation, while it is live.
     pub fn lease(&self) -> Option<GenerationLease> {
         self.generations.lease(&self.stamp)
+    }
+
+    /// Whether the generation was removed: its deletion finished and its storage is gone.
+    pub(crate) fn is_removed(&self) -> bool {
+        self.generations.is_removed(&self.stamp)
     }
 }
 

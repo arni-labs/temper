@@ -387,3 +387,7 @@ impl crate::state::ServerState {
 #[cfg(test)]
 #[path = "trajectory_outbox_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "trajectory_outbox/capture_loss_deletion_test.rs"]
+mod capture_loss_deletion_tests;

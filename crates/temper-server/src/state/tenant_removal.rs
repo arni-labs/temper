@@ -208,7 +208,6 @@ impl ServerState {
 
         self.idempotency_cache.forget_tenant(tenant);
         crate::trajectory_outbox::forget_tenant_capture_loss_markers(tenant.as_str());
-        self.capture_health.forget_generation(generation.stamp());
         self.state_timeout_tracker.forget_tenant(tenant);
         self.eventual_tracker
             .write()
@@ -242,6 +241,10 @@ impl ServerState {
             .remove_tenant(tenant);
         // Last: the id's next use starts a new generation only once nothing of this one is left in memory.
         self.tenant_generations.forget(generation);
+        // The one place a generation's capture losses are retired: its deletion finished, so the sessions they would
+        // mark went with its storage. After `forget`, so a loss counted from here on sees the generation removed and
+        // is not counted (`CaptureHealth::record_unconfirmed_loss`), and one counted before is retired here.
+        self.capture_health.forget_generation(generation.stamp());
         crate::runtime_metrics::record_server_state_metrics(self);
         Ok(())
     }

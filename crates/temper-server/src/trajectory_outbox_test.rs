@@ -108,7 +108,7 @@ async fn a_loss_interrupted_before_its_marker_lands_leaves_the_server_degraded()
     let health = CaptureHealth::default();
     assert!(!health.is_degraded());
 
-    health.record_unconfirmed_loss(None);
+    assert!(health.record_unconfirmed_loss(None));
 
     assert!(
         health.is_degraded(),
@@ -126,7 +126,7 @@ async fn a_marker_that_never_lands_leaves_the_loss_unconfirmed() {
     // session has a hole in it.
     release_capture_loss_marker("tenant", "doomed-session");
     let health = CaptureHealth::default();
-    health.record_unconfirmed_loss(None);
+    assert!(health.record_unconfirmed_loss(None));
 
     persist_capture_loss_marker(
         queued_marker_for_test(
@@ -161,7 +161,7 @@ async fn only_a_confirmed_write_clears_the_loss() {
         .await
         .expect("create local turso store");
     let health = CaptureHealth::default();
-    health.record_unconfirmed_loss(None);
+    assert!(health.record_unconfirmed_loss(None));
     assert!(health.is_degraded());
 
     persist_capture_loss_marker(
@@ -347,8 +347,8 @@ async fn a_loss_of_a_deleted_tenant_is_cleared_and_the_tenant_created_again_star
     }
     // `marked-session`'s marker was stored before the delete, `exhausted-session`'s ran out of retries, and
     // `lost-session`'s is still queued when the delete runs.
-    health.record_unconfirmed_loss(Some(generation.stamp()));
-    health.record_unconfirmed_loss(Some(generation.stamp()));
+    assert!(health.record_unconfirmed_loss(Some(&generation)));
+    assert!(health.record_unconfirmed_loss(Some(&generation)));
     persist_capture_loss_marker(
         queued_marker_for_test(
             Arc::new(FailingSink),
@@ -361,7 +361,7 @@ async fn a_loss_of_a_deleted_tenant_is_cleared_and_the_tenant_created_again_star
     )
     .await;
     let other_generation = state.generation_ref(&other);
-    health.record_unconfirmed_loss(Some(other_generation.stamp()));
+    assert!(health.record_unconfirmed_loss(Some(&other_generation)));
     assert_eq!(health.unconfirmed_losses(), 3);
 
     state

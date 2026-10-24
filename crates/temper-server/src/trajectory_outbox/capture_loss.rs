@@ -82,7 +82,10 @@ const CAPTURE_MARKER_RETRY_DELAY: Duration = Duration::from_millis(50);
 ///
 /// Losses are counted per tenant generation (none for an entry whose tenant id
 /// is not one), because a deleted generation's sessions go with its storage:
-/// deleting it retires its losses, and no other tenant's.
+/// deleting it retires its losses, and no other tenant's. Only a deletion that
+/// finished does, in [`Self::forget_generation`]; while one is under way, or
+/// after one failed, the session may still be stored without its marker, so
+/// the loss stays counted.
 #[derive(Clone, Default)]
 pub(crate) struct CaptureHealth {
     unconfirmed: Arc<Mutex<BTreeMap<Option<TenantStamp>, u64>>>,
@@ -112,15 +115,25 @@ impl CaptureHealth {
     }
 
     /// Count a loss of `generation`, before anything is attempted on its behalf.
-    pub(super) fn record_unconfirmed_loss(&self, generation: Option<&TenantStamp>) {
+    /// Returns false, counting nothing, when that generation was already
+    /// removed: the session the loss belongs to went with its storage.
+    ///
+    /// The removed check runs under the counts lock, and a removal forgets the
+    /// generation before it retires the generation's losses under the same lock,
+    /// so a loss is either seen removed here or counted before that retirement.
+    pub(super) fn record_unconfirmed_loss(&self, generation: Option<&GenerationRef>) -> bool {
         let mut counts = self.counts();
-        let count = counts.entry(generation.cloned()).or_default();
+        if generation.is_some_and(GenerationRef::is_removed) {
+            return false;
+        }
+        let count = counts
+            .entry(generation.map(|generation| generation.stamp().clone()))
+            .or_default();
         *count = count.saturating_add(1);
+        true
     }
 
-    /// Clear one loss of `generation`, once its marker is durably stored, or
-    /// once the session it would mark was deleted with its tenant and no stored
-    /// record is left incomplete.
+    /// Clear one loss of `generation`, once its marker is durably stored.
     fn clear_loss(&self, generation: Option<&TenantStamp>) {
         let key = generation.cloned();
         let mut counts = self.counts();
@@ -136,6 +149,8 @@ impl CaptureHealth {
 
     /// Retire every loss of a deleted generation: the sessions they would mark
     /// went with its storage, so none of them leaves a stored record incomplete.
+    /// Called once the generation's storage is removed and the generation
+    /// forgotten, and nowhere else.
     pub(crate) fn forget_generation(&self, generation: &TenantStamp) {
         self.counts().remove(&Some(generation.clone()));
     }
@@ -311,7 +326,13 @@ pub(super) fn record_capture_loss(
         return;
     }
 
-    health.record_unconfirmed_loss(generation.as_ref().map(GenerationRef::stamp));
+    if !health.record_unconfirmed_loss(generation.as_ref()) {
+        // The generation's deletion already finished: its sessions went with
+        // its storage, so there is nothing left to mark.
+        record_capture_loss_marker(&lost.tenant, "tenant_deleted");
+        release_capture_loss_marker(&lost.tenant, session_id);
+        return;
+    }
     let queued = QueuedMarker {
         sink,
         tenant: lost.tenant.clone(),
@@ -342,8 +363,9 @@ pub(super) fn record_capture_loss(
 /// run is never.
 ///
 /// The loss is cleared from [`CaptureHealth`] only on a confirmed write. Every
-/// other ending — exhausted retries, a cancelled worker, a dead process —
-/// leaves it counted.
+/// other ending — exhausted retries, a refused lease, a cancelled worker, a dead
+/// process — leaves it counted. A deletion of the generation that finishes
+/// retires it ([`CaptureHealth::forget_generation`]); this path never does.
 pub(super) async fn persist_capture_loss_marker(queued: QueuedMarker, retry_delay: Duration) {
     let QueuedMarker {
         sink,
@@ -358,14 +380,20 @@ pub(super) async fn persist_capture_loss_marker(queued: QueuedMarker, retry_dela
     let mut delay = retry_delay;
     let mut last_error = String::new();
     for attempt in 1..=CAPTURE_MARKER_ATTEMPTS {
-        // Each attempt holds a lease of the lost entry's generation. Once that one is deleted, the session the marker
-        // would mark went with its storage, so no stored record is left incomplete and the loss is cleared; the marker
-        // would only land in the tenant created again under the id.
+        // Each attempt holds a lease of the lost entry's generation, so the marker never lands in the tenant created
+        // again under the id. A refused lease means the generation is closed: its deletion is under way, failed, or
+        // finished. The marker stops, and the loss is left to the deletion: one that finishes retires it with the
+        // session's storage, and one that does not leaves the session stored without its marker, still counted.
         let lease = match generation.as_ref().map(GenerationRef::lease) {
             Some(None) => {
-                record_capture_loss_marker(&tenant, "tenant_deleted");
+                record_capture_loss_marker(&tenant, "tenant_closed");
                 release_capture_loss_marker(&tenant, &session_id);
-                health.clear_loss(stamp);
+                tracing::warn!(
+                    tenant = %tenant,
+                    session_id = %session_id,
+                    "trajectory capture-loss marker refused by a closed tenant generation; the loss stays \
+                     unconfirmed until the generation's deletion finishes"
+                );
                 return;
             }
             Some(lease) => lease,
