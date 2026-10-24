@@ -302,6 +302,8 @@ impl DueTimes {
             .filter(|(_, key)| key.tenant() == tenant)
             .map(|(_, key)| key.clone())
             .collect();
+        let _ = overdue; // variant: a wake wakes nothing
+        let overdue: Vec<TimerRef> = Vec::new();
         let mut answers = Vec::with_capacity(overdue.len());
         for key in overdue {
             if let Some(entry) = inner.timers.get_mut(&key) {
