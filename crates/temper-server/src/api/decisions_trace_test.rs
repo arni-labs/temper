@@ -246,6 +246,11 @@ async fn decision_resolution_is_its_own_trace_linked_to_the_approving_request() 
     let mut linked = BTreeSet::new();
     for root in &resolutions {
         assert_eq!(root.parent_span_id, SpanId::INVALID, "a trace of its own");
+        assert_eq!(
+            attribute(root, "runtime_work").as_deref(),
+            Some("decision_resolution"),
+            "marked as runtime work of its kind"
+        );
         assert!(
             !requests.contains(&root.span_context.trace_id().to_string()),
             "not part of the request's trace"

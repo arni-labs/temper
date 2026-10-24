@@ -94,6 +94,7 @@ pub(super) fn handle_dispatch_callback(
     // move: a trace of its own, linked to that move (see `trace_context`).
     let span = temper_server::runtime_work_span!(
         temper_server::trace_context::cause(),
+        kind = "governance_callback",
         "governance.dispatch_callback",
         tenant = %tenant,
         entity_set = %entity_set,

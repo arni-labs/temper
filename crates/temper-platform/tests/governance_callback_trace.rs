@@ -214,6 +214,11 @@ async fn governance_callback_is_its_own_trace_linked_to_the_decision_move() {
         SpanId::INVALID,
         "a trace of its own"
     );
+    assert_eq!(
+        attribute(callback, "runtime_work").as_deref(),
+        Some("governance_callback"),
+        "marked as runtime work of its kind"
+    );
     let callback_trace = callback.span_context.trace_id().to_string();
     assert_ne!(
         callback_trace, request_trace,

@@ -43,7 +43,12 @@ compensation, the GovernanceDecision move that an approve or deny request hands
 off without waiting for it (linked to that request), and the platform's
 governance callback that resumes or fails the waiting record (linked to the
 decision's move). The macro is exported (`temper_server::runtime_work_span!`)
-so work handed off outside `temper-server` uses the same rule. A delayed piece
+so work handed off outside `temper-server` uses the same rule. Every root it
+opens carries `runtime_work = "<kind>"` (a required argument: `state_timeout`,
+`scheduled_action`, `background_spawn`, `reaction`, `wasm_integration`,
+`adapter_integration`, `integration_compensation`, `decision_resolution`,
+`governance_callback`), so a trace pipeline keeps runtime work with
+`parent_id:0 @runtime_work:*` and a new kind needs no rule change. A delayed piece
 of work opens its span when the wait ends, so the span's duration is the
 work's.
 

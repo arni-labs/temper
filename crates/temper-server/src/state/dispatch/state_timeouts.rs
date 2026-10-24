@@ -647,6 +647,7 @@ impl crate::state::ServerState {
 
             let span = crate::trace_context::runtime_work_span!(
                 armed_by,
+                kind = "state_timeout",
                 "dispatch.state_timeout.fire",
                 tenant = %timer.tenant,
                 entity_type = %timer.entity_type,

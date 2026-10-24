@@ -430,6 +430,7 @@ fn spawn_governance_resolution(
 ) {
     let span = crate::trace_context::runtime_work_span!(
         crate::trace_context::cause(),
+        kind = "decision_resolution",
         "governance.decision_resolution",
         gd_id,
         action,

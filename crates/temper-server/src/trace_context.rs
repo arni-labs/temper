@@ -21,7 +21,7 @@ use opentelemetry::trace::{SpanContext, TraceContextExt};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Open the root span of work the runtime starts on its own:
-/// `runtime_work_span!(cause, "span.name", fields...)`.
+/// `runtime_work_span!(cause, kind = "state_timeout", "span.name", fields...)`.
 ///
 /// The span has no parent, so the work is its own trace, exported when the work
 /// ends. It links to `cause`, a [`SpanContext`] taken with [`cause`] where the
@@ -29,13 +29,22 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// when the work starts (after a timer's wait, not before), so its duration is
 /// the work's.
 ///
+/// Every such root carries the attribute `runtime_work = kind`, the work's own
+/// name. It is what marks a trace as runtime work (a trace pipeline keeps
+/// `parent_id:0 @runtime_work:*`), so a new kind needs no rule anywhere else.
+///
 /// Exported (`temper_server::runtime_work_span!`) so work handed off outside
 /// this crate, such as the platform's governance callback, follows the same
 /// rule.
 #[macro_export]
 macro_rules! runtime_work_span {
-    ($cause:expr, $name:literal $(, $($field:tt)*)?) => {{
-        let span = ::tracing::info_span!(parent: None, $name $(, $($field)*)?);
+    ($cause:expr, kind = $kind:literal, $name:literal $(, $($field:tt)*)?) => {{
+        let span = ::tracing::info_span!(
+            parent: None,
+            $name,
+            runtime_work = $kind
+            $(, $($field)*)?
+        );
         $crate::trace_context::link_cause(&span, &$cause);
         span
     }};
