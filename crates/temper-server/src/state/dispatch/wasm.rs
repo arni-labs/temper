@@ -17,8 +17,7 @@ use temper_wasm::host_trait::clamp_redacted_metadata_value;
 use temper_wasm::{
     AuthorizedWasmHost, BinaryHttpInterceptorFn, InternalHttpCapability,
     InternalHttpCapabilityIssuerFn, ProductionWasmHost, ProgressEmitterFn, StreamRegistry,
-    TextHttpInterceptorFn, WasmAuthzContext, WasmAuthzGate, WasmHost, WasmInvocationContext,
-    WasmResourceLimits,
+    WasmAuthzContext, WasmAuthzGate, WasmHost, WasmInvocationContext, WasmResourceLimits,
 };
 
 use super::{
@@ -433,93 +432,6 @@ pub(crate) fn internal_api_base_url(state: &crate::state::ServerState) -> Option
         })
 }
 
-fn parse_internal_file_value_request(base_url: &str, url: &str) -> Option<String> {
-    let prefix = format!("{}/tdata/Files('", base_url.trim_end_matches('/'));
-    let remainder = url.strip_prefix(&prefix)?;
-    let file_id = remainder.strip_suffix("')/$value")?;
-    Some(file_id.replace("''", "'"))
-}
-
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-fn local_file_value_text_interceptor(
-    state: crate::state::ServerState,
-    tenant: TenantId,
-    agent_ctx: AgentContext,
-    temper_api_url: Option<String>,
-) -> Option<TextHttpInterceptorFn> {
-    let base_url = temper_api_url?.trim_end_matches('/').to_string();
-    let is_loopback = base_url.starts_with("http://127.0.0.1:")
-        || base_url.starts_with("http://localhost:")
-        || base_url.starts_with("http://[::1]:")
-        || base_url.starts_with("https://localhost:");
-    if !is_loopback {
-        return None;
-    }
-
-    Some(Arc::new(
-        move |method: String, url: String, headers: Vec<(String, String)>, body: String| {
-            let state = state.clone();
-            let tenant = tenant.clone();
-            let agent_ctx = agent_ctx.clone();
-            let base_url = base_url.clone();
-            Box::pin(async move {
-                let file_id = match parse_internal_file_value_request(&base_url, &url) {
-                    Some(file_id) => file_id,
-                    None => return None,
-                };
-
-                tracing::info!(
-                    method = %method,
-                    file_id = %file_id,
-                    "handling internal File $value request without loopback HTTP"
-                );
-
-                match method.as_str() {
-                    "GET" => {
-                        let (status, bytes) = match state
-                            .get_file_stream_content(&tenant, &file_id, &agent_ctx)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        if status != 200 {
-                            return Some(Ok((status, String::new())));
-                        }
-                        match String::from_utf8(bytes) {
-                            Ok(text) => Some(Ok((200, text))),
-                            Err(_) => None,
-                        }
-                    }
-                    "PUT" => {
-                        let content_type = header_value(&headers, "content-type")
-                            .unwrap_or("application/octet-stream");
-                        Some(
-                            state
-                                .put_file_stream_content(
-                                    &tenant,
-                                    &file_id,
-                                    body.as_bytes(),
-                                    content_type,
-                                    &agent_ctx,
-                                )
-                                .await
-                                .map(|_| (204, String::new())),
-                        )
-                    }
-                    _ => None,
-                }
-            })
-        },
-    ))
-}
-
 impl crate::state::ServerState {
     #[instrument(skip_all, fields(
         otel.name = %format_args!("{}.{}.integrations", req.entity_type, req.action),
@@ -794,12 +706,6 @@ impl crate::state::ServerState {
                     ctx.entity_ref.tenant.clone(),
                     tenant_secrets.get("blob_endpoint").cloned(),
                 );
-                let local_file_interceptor = local_file_value_text_interceptor(
-                    self.clone(),
-                    ctx.entity_ref.tenant.clone(),
-                    ctx.agent_ctx.clone(),
-                    internal_api_url.clone(),
-                );
                 // Use integration config timeout for both WASM execution and HTTP client.
                 //
                 // When no explicit `timeout_secs` is configured, fall back to the
@@ -870,10 +776,6 @@ impl crate::state::ServerState {
                 .with_invocation_context(host_invocation_context)
                 .with_redirect_gate(Arc::clone(&gate), authz_ctx.clone())
                 .with_llm_content_export(self.export_llm_content(ctx.entity_ref.tenant.as_str()))
-                .with_text_http_interceptor(
-                    local_file_interceptor
-                        .unwrap_or_else(|| Arc::new(|_, _, _, _| Box::pin(async { None }))),
-                )
                 .with_trace_id(
                     current_otel_trace_id(active_span).or_else(|| ctx.agent_ctx.trace_id.clone()),
                 );

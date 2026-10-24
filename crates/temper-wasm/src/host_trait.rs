@@ -334,20 +334,6 @@ pub type BinaryHttpInterceptorFn = Arc<
         + Sync,
 >;
 
-/// Optional callback that can short-circuit text HTTP requests.
-///
-/// This lets the server handle specific local transport paths directly
-/// (for example, internal OData `$value` reads/writes) without going back
-/// through loopback HTTP when the guest expects a UTF-8 body.
-pub type TextHttpInterceptorFn = Arc<
-    dyn Fn(String, String, Vec<(String, String)>, String) -> TextHttpInterceptorFuture
-        + Send
-        + Sync,
->;
-
-type TextHttpInterceptorFuture =
-    Pin<Box<dyn Future<Output = Option<Result<(u16, String), String>>> + Send>>;
-
 /// Production host: real HTTP calls via reqwest, real secrets.
 pub struct ProductionWasmHost {
     /// HTTP client for making real requests. It follows no redirects; the host
@@ -379,8 +365,6 @@ pub struct ProductionWasmHost {
     trace_id: Option<String>,
     /// Optional short-circuit for binary HTTP calls.
     binary_http_interceptor: Option<BinaryHttpInterceptorFn>,
-    /// Optional short-circuit for text HTTP calls.
-    text_http_interceptor: Option<TextHttpInterceptorFn>,
     /// Invocation context for auto-enriching guest telemetry.
     invocation_context: Option<WasmInvocationContext>,
     /// Whether this invocation's tenant may export raw LLM content (prompts,
@@ -624,7 +608,6 @@ impl ProductionWasmHost {
             progress_emitter: None,
             trace_id: None,
             binary_http_interceptor: None,
-            text_http_interceptor: None,
             invocation_context: None,
             export_llm_content: false,
             http_streams: Arc::new(crate::http_stream::HttpStreamRegistry::new()),
@@ -688,12 +671,6 @@ impl ProductionWasmHost {
     /// Create with a binary HTTP interceptor for local fast paths.
     pub fn with_binary_http_interceptor(mut self, interceptor: BinaryHttpInterceptorFn) -> Self {
         self.binary_http_interceptor = Some(interceptor);
-        self
-    }
-
-    /// Create with a text HTTP interceptor for local fast paths.
-    pub fn with_text_http_interceptor(mut self, interceptor: TextHttpInterceptorFn) -> Self {
-        self.text_http_interceptor = Some(interceptor);
         self
     }
 
@@ -897,17 +874,6 @@ impl WasmHost for ProductionWasmHost {
         // ARN-243: drop LLM content from span hints unless this tenant opted in.
         redact_llm_content_hints(&mut span_hints, self.export_llm_content);
         let (is_internal, outbound_headers) = self.outbound_headers(url, &filtered_headers);
-        if let Some(interceptor) = &self.text_http_interceptor
-            && let Some(result) = interceptor(
-                method.to_string(),
-                url.to_string(),
-                outbound_headers.clone(),
-                body.to_string(),
-            )
-            .await
-        {
-            return result;
-        }
         let span = tracing::info_span!(
             "wasm.host.http_call",
             otel.name = %span_hint_otel_name(&span_hints, "wasm.host.http_call"),
