@@ -50,3 +50,67 @@ fn a_resource_type_that_is_not_a_type_name_is_denied() {
         "{decision:?}"
     );
 }
+
+#[test]
+fn list_classification_preserves_literal_principal_and_action_ids() {
+    // Each escape-like ID must select the same forbid in classification and
+    // authorization. Otherwise the uniform list fast path exposes ord-01.
+    for (principal_id, action, policy) in [
+        (
+            r"\n",
+            "read",
+            r#"
+            permit(principal, action == Action::"read", resource is Order);
+            forbid(principal == Agent::"\\n", action == Action::"read",
+                resource == Order::"ord-01");
+            "#,
+        ),
+        (
+            "agent-a",
+            r"\n",
+            r#"
+            permit(principal, action, resource is Order);
+            forbid(principal, action == Action::"\\n",
+                resource == Order::"ord-01");
+            "#,
+        ),
+        (
+            r"\u{41}",
+            "read",
+            r#"
+            permit(principal, action == Action::"read", resource is Order);
+            forbid(principal == Agent::"\\u{41}", action == Action::"read",
+                resource == Order::"ord-01");
+            "#,
+        ),
+        (
+            "agent-a",
+            r"\u{41}",
+            r#"
+            permit(principal, action, resource is Order);
+            forbid(principal, action == Action::"\\u{41}",
+                resource == Order::"ord-01");
+            "#,
+        ),
+    ] {
+        let engine = engine(policy);
+        let context = SecurityContext::from_resolved_identity(principal_id, "worker", None);
+        // A collection probe alone permits the request, so per-row checks
+        // are necessary to enforce the row-specific forbid.
+        let authorize = |tenant: &str, id: &str| {
+            let attrs = HashMap::from([("id".to_string(), serde_json::json!(id))]);
+            engine.authorize_for_tenant(tenant, &context, action, "Order", &attrs)
+        };
+        assert!(authorize(TENANT, "_list").is_allowed());
+        assert!(authorize(TENANT, "ord-02").is_allowed());
+        assert!(!authorize(TENANT, "ord-01").is_allowed());
+        assert!(!authorize("other-tenant", "ord-02").is_allowed());
+        assert_eq!(
+            engine.list_read_uniformity(TENANT, &context, action, "Order"),
+            ListReadUniformity::PerEntity {
+                attribute_keys: Some(Default::default()),
+            },
+            "principal={principal_id:?}, action={action:?}"
+        );
+    }
+}
