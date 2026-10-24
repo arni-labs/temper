@@ -255,18 +255,21 @@ impl SimReactionSystem {
                     // Recurse: the target action may trigger further reactions.
                     // Propagate actual post-action fields so downstream resolvers
                     // (Field, CreateIfMissing) see real state, matching production
-                    // dispatch behavior.
+                    // dispatch behavior. A chain is as deep as its data, so each
+                    // level runs on a stack that grows.
                     let target_type = rule.then.entity_type.clone();
                     let target_action = rule.then.action.clone();
                     chain.push(step);
-                    self.dispatch_cascade(
-                        &target_type,
-                        &target_entity_id,
-                        &target_action,
-                        &target_status,
-                        result_fields.get("fields").unwrap_or(&result_fields),
-                        chain,
-                    );
+                    crate::growable_stack::grow(|| {
+                        self.dispatch_cascade(
+                            &target_type,
+                            &target_entity_id,
+                            &target_action,
+                            &target_status,
+                            result_fields.get("fields").unwrap_or(&result_fields),
+                            chain,
+                        );
+                    });
                     chain.pop();
                 }
                 Err(e) => {
