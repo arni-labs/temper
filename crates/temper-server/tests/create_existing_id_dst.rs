@@ -9,24 +9,17 @@
 
 mod common;
 
-use common::odata_requests::{mark_verified, send};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use common::odata_requests::send;
+use common::order_projection::ProjectionModel;
+use std::sync::Arc;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use temper_runtime::buggify::install_buggify_context;
-use temper_runtime::persistence::{
-    EventStore, PersistenceEnvelope, PersistenceError, journal_is_deleted,
-};
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
+use temper_server::ServerState;
 use temper_server::request_context::AgentContext;
-use temper_server::storage::{
-    BackendLabel, BoxedEventStore, QueryPlaneStore, QueryProjectionFieldsRow,
-};
-use temper_server::{ServerState, StorageStack};
-use temper_store_sim::SimEventStore;
 
 /// Anyone may create; only the principal an order's number names may read it.
 const ORDER_OWNER_READS: &str = r#"
@@ -85,115 +78,6 @@ from = ["Draft"]
 to = "Deleted"
 "#;
 
-/// Whether the journal leaves the entity without a projection row, as the
-/// stores read it: it holds the kernel's tombstone, or its newest event moves
-/// the entity to the `Deleted` status.
-fn journal_leaves_deleted(journal: &[PersistenceEnvelope]) -> bool {
-    journal_is_deleted(journal)
-        || journal
-            .last()
-            .is_some_and(|event| event.payload["to_status"] == "Deleted")
-}
-
-/// The query projection as rows keyed by entity, with the stores' guards: a
-/// write older than the row it would replace is refused, and so is any write
-/// of an entity whose journal leaves it deleted.
-struct ProjectionModel {
-    rows: Mutex<BTreeMap<(String, String, String), u64>>,
-    journal: SimEventStore,
-}
-
-impl ProjectionModel {
-    fn new(journal: SimEventStore) -> Self {
-        Self {
-            rows: Mutex::default(),
-            journal,
-        }
-    }
-
-    fn holds(&self, entity_type: &str, entity_id: &str) -> bool {
-        let key = (
-            "default".to_string(),
-            entity_type.to_string(),
-            entity_id.to_string(),
-        );
-        self.rows.lock().unwrap().contains_key(&key)
-    }
-}
-
-#[async_trait::async_trait]
-impl QueryPlaneStore for ProjectionModel {
-    async fn upsert_projection(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_id: &str,
-        _status: &str,
-        _fields: &Value,
-        _state: &Value,
-        sequence_nr: u64,
-    ) -> Result<(), PersistenceError> {
-        let journal = self
-            .journal
-            .read_events(&format!("{tenant}:{entity_type}:{entity_id}"), 0)
-            .await?;
-        if journal_leaves_deleted(&journal) {
-            return Ok(());
-        }
-        let key = (
-            tenant.to_string(),
-            entity_type.to_string(),
-            entity_id.to_string(),
-        );
-        let mut rows = self.rows.lock().unwrap();
-        if rows.get(&key).is_none_or(|stored| *stored <= sequence_nr) {
-            rows.insert(key, sequence_nr);
-        }
-        Ok(())
-    }
-
-    async fn remove_projection(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<(), PersistenceError> {
-        let key = (
-            tenant.to_string(),
-            entity_type.to_string(),
-            entity_id.to_string(),
-        );
-        self.rows.lock().unwrap().remove(&key);
-        Ok(())
-    }
-
-    async fn query_field_index(
-        &self,
-        _tenant: &str,
-        _entity_type: &str,
-        _where_clause: &str,
-        _params: Vec<String>,
-    ) -> Result<Option<Vec<String>>, PersistenceError> {
-        Ok(None)
-    }
-
-    async fn load_projection_fields_many(
-        &self,
-        _tenant: &str,
-        _entity_type: &str,
-        _entity_ids: &[String],
-        _field_names: &[&str],
-    ) -> Result<Option<Vec<QueryProjectionFieldsRow>>, PersistenceError> {
-        Ok(None)
-    }
-
-    async fn projected_entity_counts_by_tenant(
-        &self,
-    ) -> Result<Option<Vec<(String, u64)>>, PersistenceError> {
-        Ok(None)
-    }
-}
-
 /// An Order state on the simulated journal with owner-only reads, and the
 /// modelled query projection it writes to.
 fn order_state(seed: u64, system: &str) -> (ServerState, Arc<ProjectionModel>) {
@@ -206,32 +90,7 @@ fn order_state_with_spec(
     system: &str,
     order_ioa: &str,
 ) -> (ServerState, Arc<ProjectionModel>) {
-    let journal = SimEventStore::no_faults(seed);
-    let projection = Arc::new(ProjectionModel::new(journal.clone()));
-    let mut state = common::build_single_tenant_state_with_store(
-        journal.clone(),
-        system,
-        "default",
-        &[("Order", order_ioa)],
-    );
-    state.set_storage_stack(StorageStack::new(
-        BackendLabel::Sim,
-        BoxedEventStore::new(journal),
-        None,
-        None,
-        None,
-        None,
-        Some(projection.clone()),
-        None,
-        None,
-        None,
-    ));
-    mark_verified(&state, "Order");
-    state
-        .authz
-        .reload_tenant_policies("default", ORDER_OWNER_READS)
-        .unwrap();
-    (state, projection)
+    common::order_projection::order_state(seed, system, order_ioa, ORDER_OWNER_READS)
 }
 
 /// Two principals create the same key at once. Exactly one create wins it,

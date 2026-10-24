@@ -10,6 +10,12 @@
 //! `409 Conflict` with no body, and the deleted record is not revived. A create
 //! that makes a new entity answers with it as before: it holds what the caller
 //! sent.
+//!
+//! A create stores its entity before it writes the query projection and arms
+//! the entity's timers, so a create can fail after its entity is stored. A
+//! repeat that answers with the existing entity finishes that create: it
+//! writes the projection and runs [`finish_create`], as the first create
+//! would have.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -21,6 +27,7 @@ use super::authz::{READ_ACTION, authorize_read};
 use super::response::annotate_entity;
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::entity_actor::EntityResponse;
+use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
 
@@ -34,6 +41,8 @@ pub(super) const EXISTING_ENTITY_STATUS: StatusCode = StatusCode::CREATED;
 pub(super) struct CreateTarget<'a> {
     pub(super) tenant: &'a TenantId,
     pub(super) security_ctx: &'a SecurityContext,
+    /// The caller, whom a timer the create arms fires as.
+    pub(super) agent_ctx: &'a AgentContext,
     pub(super) entity_type: &'a str,
     pub(super) set_name: &'a str,
     pub(super) entity_id: &'a str,
@@ -47,6 +56,9 @@ pub(super) struct CreateTarget<'a> {
 /// The entity's query projection is written again first. A create stores the
 /// entity before its projection, so a create that failed between the two
 /// leaves the entity out of collection queries until the repeat writes it.
+/// A caller who may read the entity also gets the rest of the create
+/// ([`finish_create`]), so its timer is armed even when the first create
+/// failed before arming it.
 pub(super) async fn taken_key_answer(
     state: &ServerState,
     target: &CreateTarget<'_>,
@@ -80,7 +92,35 @@ pub(super) async fn taken_key_answer(
     if !may_read(state, target, &body) {
         return Err(existing_key_conflict());
     }
+    finish_create(state, target, &existing).await;
     Ok(existing)
+}
+
+/// What a create does once its entity is stored and in the query projection:
+/// arm the timer of the state the entity is in, and drop the caches that
+/// count entities of its type. Repeating it changes nothing: an entity whose
+/// timer is already armed keeps it and its deadline, and an entity whose
+/// timer it arms late counts from when the entity entered its state.
+pub(super) async fn finish_create(
+    state: &ServerState,
+    target: &CreateTarget<'_>,
+    created: &EntityResponse,
+) {
+    // Creation is not a dispatch: a record created into a timed first state
+    // has its timer armed here.
+    state
+        .arm_state_timeouts_on_creation(
+            target.tenant,
+            target.entity_type,
+            target.entity_id,
+            created,
+            target.agent_ctx,
+        )
+        .await;
+    if target.entity_type == "RateLimit" {
+        state.clear_commons_rate_limit_cache();
+    }
+    state.clear_commons_storage_projection_cache_for_entity(target.entity_type);
 }
 
 /// [`taken_key_answer`] as a collection create's response.

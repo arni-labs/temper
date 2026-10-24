@@ -26,8 +26,8 @@ use super::common::{
 };
 use super::constraints::pre_delete_relation_checks;
 use super::create_answer::{
-    CreateTarget, EXISTING_ENTITY_STATUS, create_answer_body, existing_key_conflict, may_read,
-    taken_key_response,
+    CreateTarget, EXISTING_ENTITY_STATUS, create_answer_body, existing_key_conflict, finish_create,
+    may_read, taken_key_response,
 };
 use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
@@ -739,6 +739,7 @@ pub async fn handle_odata_post(
                         let target = CreateTarget {
                             tenant: &tenant,
                             security_ctx: &security_ctx,
+                            agent_ctx: &agent_ctx,
                             entity_type: &entity_type,
                             set_name: &name,
                             entity_id: &entity_id,
@@ -793,6 +794,7 @@ pub async fn handle_odata_post(
             let target = CreateTarget {
                 tenant: &tenant,
                 security_ctx: &security_ctx,
+                agent_ctx: &agent_ctx,
                 entity_type: &entity_type,
                 set_name: &name,
                 entity_id: &entity_id,
@@ -830,6 +832,7 @@ pub async fn handle_odata_post(
                 .await
             {
                 Ok(DataOnlyCreate::Created(response)) => {
+                    finish_create(&state, &target, &response).await;
                     return ODataResponse {
                         status: StatusCode::CREATED,
                         body: create_answer_body(&state, &target, &response).await,
@@ -859,21 +862,7 @@ pub async fn handle_odata_post(
                 // A concurrent create of this key started its actor first.
                 Ok(None) => taken_key_response(&state, &target).await,
                 Ok(Some(response)) => {
-                    // Creation is not a dispatch: a record created into a
-                    // timed first state has its timer armed here.
-                    state
-                        .arm_state_timeouts_on_creation(
-                            &tenant,
-                            &entity_type,
-                            &entity_id,
-                            &response,
-                            &agent_ctx,
-                        )
-                        .await;
-                    if entity_type == "RateLimit" {
-                        state.clear_commons_rate_limit_cache();
-                    }
-                    state.clear_commons_storage_projection_cache_for_entity(&entity_type);
+                    finish_create(&state, &target, &response).await;
                     ODataResponse {
                         status: StatusCode::CREATED,
                         body: create_answer_body(&state, &target, &response).await,

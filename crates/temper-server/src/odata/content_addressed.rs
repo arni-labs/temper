@@ -33,7 +33,7 @@ use super::authz::{
     require_authenticated_context,
 };
 use super::common::run_write_prechecks;
-use super::create_answer::CreateTarget;
+use super::create_answer::{CreateTarget, finish_create};
 use super::storage_guardrails::storage_cap_error_response;
 use crate::blob_store::{BlobByteStream, BlobIngestAdmissionError, MAX_RAW_BLOB_BYTES};
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, blob_ref_value};
@@ -169,6 +169,7 @@ async fn ingest_raw_inner(
     let target = CreateTarget {
         tenant: &tenant,
         security_ctx: &security_ctx,
+        agent_ctx: &agent_ctx,
         entity_type,
         set_name: &set_name,
         entity_id: &expected_object_id,
@@ -412,8 +413,7 @@ async fn ingest_raw_inner(
         .await;
     match create_result {
         Ok(Some(response)) => {
-            let _ = agent_ctx;
-            state.clear_commons_storage_projection_cache_for_entity(entity_type);
+            finish_create(&state, &target, &response).await;
             drop(final_guard);
             blob_create_response(&target, StatusCode::CREATED, &response)
         }
