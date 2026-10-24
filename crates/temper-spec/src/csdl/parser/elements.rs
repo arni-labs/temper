@@ -72,7 +72,37 @@ pub(super) fn nav_prop_from_attrs(element: &BytesStart) -> NavigationProperty {
         nullable: attr_str(element, "Nullable").is_none_or(|v| v != "false"),
         contains_target: attr_str(element, "ContainsTarget").is_some_and(|v| v == "true"),
         referential_constraints: Vec::new(),
+        delete_policy: None,
     }
+}
+
+/// Read a navigation property's delete policy annotation. Any other annotation
+/// on a navigation property is ignored, as before.
+fn read_delete_policy(
+    navigation_property: &mut NavigationProperty,
+    annotation: Annotation,
+) -> Result<(), CsdlParseError> {
+    let short_term = DELETE_POLICY_TERM.trim_start_matches("Temper.Vocab.");
+    if annotation.term != DELETE_POLICY_TERM
+        && !annotation.term.ends_with(&format!(".{short_term}"))
+    {
+        return Ok(());
+    }
+    let invalid = |reason: String| {
+        CsdlParseError::Invalid(format!(
+            "NavigationProperty '{}': {DELETE_POLICY_TERM} {reason}",
+            navigation_property.name
+        ))
+    };
+    let AnnotationValue::String(value) = annotation.value else {
+        return Err(invalid("must be a String".to_string()));
+    };
+    let policy: crate::cross_invariant::DeletePolicy = value.parse().map_err(invalid)?;
+    if !policy.is_implemented() {
+        return Err(invalid(format!("'{value}' is not implemented")));
+    }
+    navigation_property.delete_policy = Some(policy);
+    Ok(())
 }
 
 pub(super) fn annotation_from_attrs(element: &BytesStart) -> Option<Annotation> {
@@ -100,6 +130,19 @@ pub(super) fn parse_navigation_property_children(
                         referenced_property: attr_str(element, "ReferencedProperty")
                             .unwrap_or_default(),
                     });
+            }
+            Ok(quick_xml::events::Event::Empty(ref element))
+                if local_name(element) == "Annotation" =>
+            {
+                if let Some(annotation) = annotation_from_attrs(element) {
+                    read_delete_policy(&mut navigation_property, annotation)?;
+                }
+            }
+            Ok(quick_xml::events::Event::Start(ref element))
+                if local_name(element) == "Annotation" =>
+            {
+                let annotation = parse_annotation_children(reader, element)?;
+                read_delete_policy(&mut navigation_property, annotation)?;
             }
             Ok(quick_xml::events::Event::End(ref element))
                 if local_name_end(element) == "NavigationProperty" =>

@@ -3,6 +3,7 @@
 pub(crate) mod account_verification;
 pub mod admission;
 pub(crate) mod app_uniqueness;
+pub(crate) mod batch_delete;
 pub mod custom_effects;
 mod dispatch;
 mod entity_ops;
@@ -340,6 +341,12 @@ fn tenant_exports_llm_content(opted_in: &BTreeSet<String>, tenant: &str) -> bool
 fn state_cache_budget() -> usize {
     static STATE_CACHE_BUDGET: OnceLock<usize> = OnceLock::new();
     *STATE_CACHE_BUDGET.get_or_init(|| env_usize("TEMPER_STATE_CACHE_BUDGET", 10_000))
+}
+
+/// A `[[state]]` declared `query_indexed = false` stays in entity state but is
+/// kept out of the durable query projection and its field index.
+fn left_out_of_query_projection(state_var: &temper_spec::automaton::StateVar) -> bool {
+    state_var.query_indexed == Some(false)
 }
 
 /// Summary of a query-projection replay parity verification run.
@@ -1179,12 +1186,30 @@ impl ServerState {
 
         let mut projected = obj.clone();
         for state_var in &spec.automaton.state {
-            if state_var.query_indexed == Some(false) {
+            if left_out_of_query_projection(state_var) {
                 projected.remove(&state_var.name);
             }
         }
 
         serde_json::Value::Object(projected)
+    }
+
+    /// Whether the query projection's field index can hold `field_name` for
+    /// `entity_type`: false when the spec declares that field
+    /// `query_indexed = false`, which [`Self::query_projection_fields`] drops.
+    pub(crate) fn query_projection_indexes_field(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        field_name: &str,
+    ) -> bool {
+        let registry = self.registry.read().unwrap();
+        let Some(spec) = registry.get_spec(tenant, entity_type) else {
+            return true;
+        };
+        !spec.automaton.state.iter().any(|state_var| {
+            state_var.name == field_name && left_out_of_query_projection(state_var)
+        })
     }
 
     pub(crate) fn query_projection_state(
@@ -1252,6 +1277,21 @@ impl ServerState {
             || self
                 .actor_backed_types
                 .contains(&format!("{}:{entity_type}", tenant.as_str()))
+    }
+
+    /// Whether `entity_type` takes only the actions its spec declares: its
+    /// entities are never changed or deleted by a generic write.
+    pub(crate) fn has_strict_action_params(&self, tenant: &TenantId, entity_type: &str) -> bool {
+        let registry = self.registry.read().expect("registry lock poisoned");
+        registry
+            .get_table(tenant, entity_type)
+            .map(|table| table.strict_action_params)
+            .or_else(|| {
+                self.transition_tables
+                    .get(entity_type)
+                    .map(|table| table.strict_action_params)
+            })
+            .unwrap_or(false)
     }
 
     /// Attach an encrypted secrets vault.
