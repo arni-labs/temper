@@ -208,7 +208,7 @@ fn dst_a_request_that_resumes_the_sandbox_retimes_its_timers() {
 fn dst_a_minute_chain_reports_about_once_a_window() {
     for busy in [false, true] {
         let failures = failures(16, || Setup {
-            awake: Some(AWAKE),
+            awake: None,
             kind: Kind::Chain { busy },
         });
         assert!(
