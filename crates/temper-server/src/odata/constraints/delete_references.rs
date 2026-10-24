@@ -6,14 +6,19 @@
 //! read from its actor. A type with thousands of rows costs the same as one
 //! with none.
 //!
-//! The index is written after the journal (ADR-0148), so it can only vouch for
-//! rows it has projected. Live rows it has no projection for yet are read from
-//! their actors, which covers projection lag. When the index cannot answer at
-//! all (no query plane, a field declared `query_indexed = false`, an id too
-//! long to index, a failed probe), every live row of the type is in that set.
-//! The set is read once per type per delete, and only while it fits
-//! [`UNINDEXED_REFERENCE_READ_BUDGET`]; past it the lookup reports that it
-//! could not check the rows instead of reading the whole type.
+//! The index is written after the journal (ADR-0148), and a committed change
+//! stays committed when its projection fails, so the index can only vouch for
+//! rows whose catalog entry is current: no journal event newer than the one it
+//! was projected from. Before a type is first probed, the finder reads which of
+//! its catalog rows are current. A probe hit counts only on a row that is not
+//! stale, and the live rows the index cannot vouch for (never projected, or
+//! projected before a later change) are read from their actors. When the index
+//! cannot answer at all (no query plane, a field declared
+//! `query_indexed = false`, an id too long to index, a failed read), every live
+//! row of the type is in that set. The set is read once per type per delete,
+//! and only while it fits [`UNINDEXED_REFERENCE_READ_BUDGET`]; past it the
+//! lookup reports that it could not check the rows instead of reading the
+//! whole type.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,33 +30,48 @@ use crate::state::ServerState;
 
 /// Most referencing rows one delete reads from their actors, per type.
 ///
-/// Reading a row the index has not projected can restore its actor from
+/// Reading a row the index cannot vouch for can restore its actor from
 /// storage, and production restores about 40 actors a second, so this keeps a
-/// delete to a few seconds of reads. Projection lag leaves a handful of rows
-/// unprojected; a larger set means the type has no usable projection, and
-/// reading all of it is the request that ran for minutes before this lookup.
+/// delete to a few seconds of reads. Projection lag or a failed projection
+/// leaves a handful of rows unvouched; a larger set means the type has no
+/// usable projection, and reading all of it is the request that ran for
+/// minutes before this lookup.
 const UNINDEXED_REFERENCE_READ_BUDGET: usize = 100;
-
-/// A clause every projected row passes: lists the type's projection catalog.
-const EVERY_PROJECTED_ROW: &str = "entity_id IS NOT NULL";
 
 /// Which live rows of a type the field index cannot vouch for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Unvouched {
-    /// The index answered: only rows with no projection yet.
-    Unprojected,
+    /// The index answered: rows whose catalog entry is not current.
+    NotCurrent,
     /// The index could not answer: every live row.
     Every,
+}
+
+/// A type's projection catalog as the finder read it, before its first probe.
+///
+/// A row that is current when this is read holds, by the time of a later
+/// probe, either those fields or ones a later commit projected; a change
+/// committed after this read races the delete as any concurrent write does. A
+/// row projected after this read is in neither set: a hit on it is a committed
+/// state that held the id, and it is read from its actor when live.
+struct Catalog {
+    /// Rows whose journal holds no event newer than the one projected.
+    current: BTreeSet<String>,
+    /// Rows whose journal has moved past them. Their index entries may hold
+    /// earlier fields, so a probe hit on one proves nothing.
+    stale: BTreeSet<String>,
 }
 
 /// Rows read from their actors because the index could not vouch for them.
 type ReadRows = Vec<(String, serde_json::Value)>;
 
 /// Answers "which rows reference this id" for every relation one delete
-/// looks at, reading each type's unvouched rows at most once.
+/// looks at, reading each type's catalog and unvouched rows at most once.
 pub(super) struct ReferenceFinder<'a> {
     state: &'a ServerState,
     tenant: &'a TenantId,
+    /// Per type; `None` when the store cannot say which rows are current.
+    catalogs: BTreeMap<String, Option<Catalog>>,
     read_rows: BTreeMap<(String, Unvouched), Result<ReadRows, String>>,
 }
 
@@ -60,6 +80,7 @@ impl<'a> ReferenceFinder<'a> {
         Self {
             state,
             tenant,
+            catalogs: BTreeMap::new(),
             read_rows: BTreeMap::new(),
         }
     }
@@ -76,13 +97,18 @@ impl<'a> ReferenceFinder<'a> {
     ) -> Result<Vec<String>, String> {
         debug_assert!(!edge.from_entity.is_empty());
         debug_assert!(!edge.source_field.is_empty());
-        // Skipped ids can fill the first page; ask for enough to see past them.
-        let top = limit.saturating_add(skip.len());
-        let (mut found, unvouched) = match self.probe_field_index(edge, entity_id, top).await {
-            Some(ids) => (ids, Unvouched::Unprojected),
+        self.load_catalog(&edge.from_entity).await;
+        let probed = match self.catalogs[&edge.from_entity].as_ref() {
+            Some(catalog) => {
+                self.probe_field_index(edge, entity_id, skip, limit, &catalog.stale)
+                    .await
+            }
+            None => None,
+        };
+        let (mut found, unvouched) = match probed {
+            Some(ids) => (ids, Unvouched::NotCurrent),
             None => (Vec::new(), Unvouched::Every),
         };
-        found.retain(|id| !skip.contains(id));
         if found.len() >= limit {
             found.truncate(limit);
             return Ok(found);
@@ -103,14 +129,53 @@ impl<'a> ReferenceFinder<'a> {
         Ok(found)
     }
 
-    /// Ask the field index for the first `top` projected rows whose
-    /// `source_field` is `entity_id`, using the same predicate an OData
+    /// Read which catalog rows of `entity_type` are current, once per delete.
+    async fn load_catalog(&mut self, entity_type: &str) {
+        if self.catalogs.contains_key(entity_type) {
+            return;
+        }
+        let catalog = match self.state.query_plane_store() {
+            Some(query_plane) => match query_plane
+                .projection_catalog_freshness(self.tenant.as_str(), entity_type)
+                .await
+            {
+                Ok(rows) => rows.map(|rows| {
+                    let mut catalog = Catalog {
+                        current: BTreeSet::new(),
+                        stale: BTreeSet::new(),
+                    };
+                    for row in rows {
+                        if row.current {
+                            catalog.current.insert(row.entity_id);
+                        } else {
+                            catalog.stale.insert(row.entity_id);
+                        }
+                    }
+                    catalog
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        tenant = %self.tenant, entity_type, error = %error,
+                        "projection catalog freshness read failed; treating every live row as unindexed"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        self.catalogs.insert(entity_type.to_string(), catalog);
+    }
+
+    /// Ask the field index for up to `limit` rows outside `skip` and `stale`
+    /// whose `source_field` is `entity_id`, using the same predicate an OData
     /// `$filter` equality pushes down. `None` when the index cannot answer.
     async fn probe_field_index(
         &self,
         edge: &RelationEdge,
         entity_id: &str,
-        top: usize,
+        skip: &BTreeSet<String>,
+        limit: usize,
+        stale: &BTreeSet<String>,
     ) -> Option<Vec<String>> {
         let query_plane = self.state.query_plane_store()?;
         if !self.state.query_projection_indexes_field(
@@ -129,6 +194,11 @@ impl<'a> ReferenceFinder<'a> {
         };
         // `None` when the id is longer than the index stores a value.
         let predicate = crate::odata::filter_sql::try_translate_candidate_filter(&equality)?;
+        // Skipped and stale rows can fill the page; asking for that many more
+        // than `limit` reaches `limit` others whenever that many match.
+        let top = limit
+            .saturating_add(skip.len())
+            .saturating_add(stale.len());
         match query_plane
             .query_field_index_page(
                 self.tenant.as_str(),
@@ -144,7 +214,12 @@ impl<'a> ReferenceFinder<'a> {
         {
             Ok(Some(page)) => {
                 debug_assert!(page.entity_ids.len() <= top);
-                Some(page.entity_ids)
+                Some(
+                    page.entity_ids
+                        .into_iter()
+                        .filter(|id| !skip.contains(id) && !stale.contains(id))
+                        .collect(),
+                )
             }
             Ok(None) => None,
             Err(error) => {
@@ -166,13 +241,16 @@ impl<'a> ReferenceFinder<'a> {
     ) -> Result<&ReadRows, String> {
         let key = (entity_type.to_string(), unvouched);
         if !self.read_rows.contains_key(&key) {
-            let ids = match unvouched {
-                Unvouched::Unprojected => self.unprojected_live_ids(entity_type).await,
-                Unvouched::Every => {
-                    self.state
-                        .list_entity_ids_lazy(self.tenant, entity_type)
-                        .await
-                }
+            let live_ids = self
+                .state
+                .list_entity_ids_lazy(self.tenant, entity_type)
+                .await;
+            let ids = match (unvouched, self.catalogs.get(entity_type)) {
+                (Unvouched::NotCurrent, Some(Some(catalog))) => live_ids
+                    .into_iter()
+                    .filter(|id| !catalog.current.contains(id))
+                    .collect(),
+                _ => live_ids,
             };
             let rows = self.read_within_budget(entity_type, &ids).await;
             self.read_rows.insert(key.clone(), rows);
@@ -183,53 +261,6 @@ impl<'a> ReferenceFinder<'a> {
         }
     }
 
-    /// Live ids of `entity_type` that have no row in the projection catalog.
-    ///
-    /// A projected row's field index rows are written in the same transaction
-    /// as its catalog row, so a projected row the probe did not return does not
-    /// hold the id. Only the ids returned here are unknown to the index.
-    async fn unprojected_live_ids(&self, entity_type: &str) -> Vec<String> {
-        let live_ids = self
-            .state
-            .list_entity_ids_lazy(self.tenant, entity_type)
-            .await;
-        if live_ids.is_empty() {
-            return live_ids;
-        }
-        let Some(query_plane) = self.state.query_plane_store() else {
-            return live_ids;
-        };
-        // The catalog lists the type's projected rows: about as many ids as the
-        // live listing above already holds in memory.
-        let catalog = query_plane
-            .query_field_index_page(
-                self.tenant.as_str(),
-                entity_type,
-                EVERY_PROJECTED_ROW,
-                Vec::new(),
-                &[],
-                0,
-                usize::MAX,
-                false,
-            )
-            .await;
-        let projected: BTreeSet<String> = match catalog {
-            Ok(Some(page)) => page.entity_ids.into_iter().collect(),
-            Ok(None) => return live_ids,
-            Err(error) => {
-                tracing::warn!(
-                    tenant = %self.tenant, entity_type, error = %error,
-                    "projection catalog listing failed; treating every live row as unindexed"
-                );
-                return live_ids;
-            }
-        };
-        live_ids
-            .into_iter()
-            .filter(|id| !projected.contains(id))
-            .collect()
-    }
-
     /// Read the rows the index could not vouch for, while they fit the budget.
     async fn read_within_budget(
         &self,
@@ -238,13 +269,13 @@ impl<'a> ReferenceFinder<'a> {
     ) -> Result<ReadRows, String> {
         tracing::debug!(
             entity_type,
-            unindexed = ids.len(),
+            unvouched = ids.len(),
             "delete reference rows to read"
         );
         if ids.len() > UNINDEXED_REFERENCE_READ_BUDGET {
             return Err(format!(
-                "{} {} rows are not in the query index, more than the {} a delete reads \
-                 one by one; retry once the index has caught up",
+                "{} {} rows are not current in the query index, more than the {} a delete \
+                 reads one by one; retry once the index has caught up",
                 ids.len(),
                 entity_type,
                 UNINDEXED_REFERENCE_READ_BUDGET
@@ -262,8 +293,8 @@ impl<'a> ReferenceFinder<'a> {
                 Ok(response) => rows.push((source_id.clone(), response.state.fields)),
                 Err(error) => {
                     return Err(format!(
-                        "{entity_type}('{source_id}') is not in the query index and could not \
-                         be read: {error}"
+                        "{entity_type}('{source_id}') is not current in the query index and \
+                         could not be read: {error}"
                     ));
                 }
             }
@@ -274,7 +305,7 @@ impl<'a> ReferenceFinder<'a> {
 
 /// Whether `fields[field]` holds `entity_id`, compared as the field index
 /// stores a scalar: its text.
-fn holds_id(fields: &serde_json::Value, field: &str, entity_id: &str) -> bool {
+pub(super) fn holds_id(fields: &serde_json::Value, field: &str, entity_id: &str) -> bool {
     match fields.get(field) {
         Some(serde_json::Value::String(value)) => value == entity_id,
         Some(serde_json::Value::Number(value)) => value.to_string() == entity_id,
