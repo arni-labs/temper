@@ -253,6 +253,9 @@ pub struct EntityResponse {
     pub state: EntityState,
     /// Error message if the action failed.
     pub error: Option<String>,
+    /// Why the action was refused, as typed data beside `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<temper_jit::table::Refusal>,
     /// Custom effects emitted during this transition (for hook dispatch).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_effects: Vec<String>,
@@ -270,7 +273,10 @@ pub struct EntityResponse {
     /// its journal, read again, does not hold the action, or the event was too
     /// large. A failed answer that is not a refusal (storage failed, a
     /// concurrency violation that was not resolved by reading the journal, or
-    /// a step after the commit failed) may have landed.
+    /// a step after the commit failed) may have landed. `refusal` says why a
+    /// guard, state or input refused it; it can be set when this is not, for a
+    /// replay refused after a concurrency violation that an earlier attempt of
+    /// the same action may have caused.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
 }
@@ -290,6 +296,7 @@ impl EntityResponse {
             success: false,
             state,
             error: Some(error),
+            refusal: None,
             custom_effects: vec![],
             scheduled_actions: vec![],
             spawn_requests: vec![],
@@ -437,6 +444,7 @@ mod tests {
         };
         let resp = EntityResponse {
             success: true,
+            refusal: None,
             state,
             error: None,
             custom_effects: vec![],

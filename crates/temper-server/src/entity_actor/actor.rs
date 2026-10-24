@@ -1171,6 +1171,7 @@ impl Actor for EntityActor {
                     }
                     ctx.reply(EntityResponse {
                         success: true,
+                        refusal: None,
                         state: response_state,
                         error: None,
                         custom_effects,
@@ -1362,6 +1363,8 @@ impl Actor for EntityActor {
                                     crate::runtime_metrics::ConcurrencyRetryOutcome,
                                     Option<RetryGaveUp>,
                                 )> = None;
+                                // The typed reason when the replayed action is refused.
+                                let mut retry_refusal = None;
                                 // ADR-0046 Sub-Decision 4: track the most
                                 // recent authoritative sequence across retries
                                 // so the post-replay assertion catches a
@@ -1446,6 +1449,7 @@ impl Actor for EntityActor {
                                     .await;
 
                                     if !retry_result.success {
+                                        retry_refusal = retry_result.refusal;
                                         let error = retry_result.error.unwrap_or_else(|| {
                                             format!(
                                                 "action {name} no longer legal after concurrency replay"
@@ -1582,13 +1586,17 @@ impl Actor for EntityActor {
                                     );
                                     if let Some(gave_up) = gave_up {
                                         *state = state_before;
-                                        ctx.reply(match gave_up {
+                                        let reply = match gave_up {
                                             RetryGaveUp::Refused(error) => {
                                                 EntityResponse::refused(state.clone(), error)
                                             }
                                             RetryGaveUp::WriteFailed(error) => {
                                                 EntityResponse::write_failed(state.clone(), error)
                                             }
+                                        };
+                                        ctx.reply(EntityResponse {
+                                            refusal: retry_refusal,
+                                            ..reply
                                         });
                                         return Ok(());
                                     }
@@ -1683,6 +1691,7 @@ impl Actor for EntityActor {
 
                     let response = EntityResponse {
                         success: true,
+                        refusal: None,
                         state: state.clone(),
                         error: None,
                         custom_effects: result.custom_effects,
@@ -1723,12 +1732,15 @@ impl Actor for EntityActor {
                     wide_event::emit_span(&wide);
                     wide_event::emit_metrics(&wide);
 
-                    ctx.reply(EntityResponse::refused(
-                        state.clone(),
-                        result
-                            .error
-                            .unwrap_or_else(|| format!("action {name} refused")),
-                    ));
+                    ctx.reply(EntityResponse {
+                        refusal: result.refusal,
+                        ..EntityResponse::refused(
+                            state.clone(),
+                            result
+                                .error
+                                .unwrap_or_else(|| format!("action {name} refused")),
+                        )
+                    });
                 }
                 // Inside-actor ask reply latency (excludes dispatch and retry
                 // overhead). Early-exit error paths above `return Ok(())` are
@@ -1743,6 +1755,7 @@ impl Actor for EntityActor {
             EntityMsg::GetState => {
                 ctx.reply(EntityResponse {
                     success: true,
+                    refusal: None,
                     state: state.clone(),
                     error: None,
                     custom_effects: vec![],
@@ -1778,6 +1791,7 @@ impl Actor for EntityActor {
                 .await;
                 ctx.reply(EntityResponse {
                     success: outcome.is_ok(),
+                    refusal: None,
                     state: state.clone(),
                     error: outcome.err(),
                     custom_effects: vec![],
@@ -1844,6 +1858,7 @@ impl Actor for EntityActor {
 
                 ctx.reply(EntityResponse {
                     success: true,
+                    refusal: None,
                     state: state.clone(),
                     error: None,
                     custom_effects: vec![],
