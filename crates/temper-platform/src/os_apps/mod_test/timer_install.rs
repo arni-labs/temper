@@ -28,7 +28,7 @@ impl TursoStoreProvider for ObserveModuleInstall {
             .modules
             .registry
             .read()
-            .unwrap()
+            .expect("registry lock")
             .get_spec(&self.tenant, "Job")
             .is_some_and(|spec| !spec.automaton.state_timeouts.is_empty());
         if tenant == self.tenant.as_str()
@@ -92,14 +92,14 @@ async fn overdue_install_timer_waits_for_module_registration() {
     let root = std::env::temp_dir().join(format!("timer-install-{}", uuid::Uuid::new_v4()));
     let app = "timer-install";
     let dir = root.join(app);
-    fs::create_dir_all(dir.join("specs")).unwrap();
-    fs::create_dir_all(dir.join("wasm")).unwrap();
-    fs::create_dir_all(dir.join("policies")).unwrap();
+    fs::create_dir_all(dir.join("specs")).expect("create specs dir");
+    fs::create_dir_all(dir.join("wasm/echo")).expect("create the echo module dir");
+    fs::create_dir_all(dir.join("policies")).expect("create policies dir");
     fs::write(
         dir.join("policies/allow.cedar"),
         "permit(principal, action, resource);",
     )
-    .unwrap();
+    .expect("write policy");
     fs::write(
         dir.join("app.toml"),
         r#"name = "timer-install"
@@ -110,14 +110,14 @@ criticality = "app-required"
 startup_loading = "lazy"
 "#,
     )
-    .unwrap();
-    fs::write(dir.join("APP.md"), "# Timer install").unwrap();
+    .expect("write app.toml");
+    fs::write(dir.join("APP.md"), "# Timer install").expect("write APP.md");
     let wasm = fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../temper-wasm/tests/fixtures/echo_integration.wasm"),
     )
-    .unwrap();
-    fs::write(dir.join("wasm/echo.wasm"), &wasm).unwrap();
+    .expect("read echo fixture");
+    fs::write(dir.join("wasm/echo/echo.wasm"), &wasm).expect("write echo module");
     let spec = r#"
 [automaton]
 name = "Job"
@@ -133,43 +133,57 @@ from = ["Waiting"]
 to = "Done"
 "#;
     let csdl = r#"<?xml version="1.0"?><edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx"><edmx:DataServices><Schema Namespace="Timers" xmlns="http://docs.oasis-open.org/odata/ns/edm"><EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key><Property Name="Id" Type="Edm.String" Nullable="false"/></EntityType><EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Timers.Job"/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"#;
-    fs::write(dir.join("specs/model.csdl.xml"), csdl).unwrap();
-    fs::write(dir.join("specs/job.ioa.toml"), spec).unwrap();
+    fs::write(dir.join("specs/model.csdl.xml"), csdl).expect("write csdl");
+    fs::write(dir.join("specs/job.ioa.toml"), spec).expect("write spec");
     let store = TursoEventStore::new(&format!("file:{}", root.join("events.db").display()), None)
         .await
-        .unwrap();
+        .expect("open turso store");
     let mut state = PlatformState::new(None);
     state.server.data_dir = root.join("data");
     state
         .server
         .set_storage_stack(temper_server::StorageStack::from_turso(store.clone()));
     let tenant = TenantId::new("timer-install");
-    state.registry.write().unwrap().register_tenant(
-        tenant.as_str(),
-        parse_csdl(csdl).unwrap(),
-        csdl.to_string(),
-        &[("Job", spec)],
-    );
-    state.registry.write().unwrap().set_verification_status(
-        &tenant,
-        "Job",
-        VerificationStatus::Completed(EntityVerificationResult {
-            all_passed: true,
-            levels: vec![],
-            verified_at: "2026-10-24T00:00:00Z".to_string(),
-        }),
-    );
+    state
+        .registry
+        .write()
+        .expect("registry lock")
+        .register_tenant(
+            tenant.as_str(),
+            parse_csdl(csdl).expect("parse csdl"),
+            csdl.to_string(),
+            &[("Job", spec)],
+        );
+    state
+        .registry
+        .write()
+        .expect("registry lock")
+        .set_verification_status(
+            &tenant,
+            "Job",
+            VerificationStatus::Completed(EntityVerificationResult {
+                all_passed: true,
+                levels: vec![],
+                verified_at: "2026-10-24T00:00:00Z".to_string(),
+            }),
+        );
     state
         .server
         .authz
         .reload_tenant_policies(tenant.as_str(), "permit(principal, action, resource);")
-        .unwrap();
-    state.server.start_runtime().await.unwrap().await.unwrap();
+        .expect("load policies");
+    state
+        .server
+        .start_runtime()
+        .await
+        .expect("first start")
+        .await
+        .expect("boot walk");
     state
         .server
         .get_or_create_tenant_entity(&tenant, "Job", "r", serde_json::json!({}))
         .await
-        .unwrap();
+        .expect("create record");
     let response = state
         .server
         .dispatch_tenant_action(
@@ -181,7 +195,7 @@ to = "Done"
             &AgentContext::system(),
         )
         .await
-        .unwrap();
+        .expect("dispatch Poke");
     assert!(
         response.success,
         "initial dispatch failed: {:?}",
@@ -193,11 +207,11 @@ to = "Done"
         .server
         .storage_stack
         .as_ref()
-        .unwrap()
+        .expect("storage stack")
         .as_ref()
         .clone();
     stack.turso = Some(Arc::new(ObserveModuleInstall {
-        inner: stack.turso.take().unwrap(),
+        inner: stack.turso.take().expect("turso provider"),
         modules: state.server.clone(),
         tenant: tenant.clone(),
         entered: entered.clone(),
@@ -217,7 +231,7 @@ on_timeout = "Expire"
 "#
         ),
     )
-    .unwrap();
+    .expect("write timed spec");
     add_os_apps_dir(root.clone());
     let install = INSTALLER.scope(
         true,
@@ -244,7 +258,7 @@ on_timeout = "Expire"
             .server
             .wasm_module_registry
             .read()
-            .unwrap()
+            .expect("module registry lock")
             .get_hash(&tenant, "echo")
             .is_none()
     );
@@ -254,19 +268,19 @@ on_timeout = "Expire"
         store
             .read_events("timer-install:Job:r", 0)
             .await
-            .unwrap()
+            .expect("read events")
             .len(),
         2,
         "overdue timeout dispatched while module installation was blocked"
     );
     release.close();
-    install.await.unwrap();
+    install.await.expect("install the app");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if store
                 .read_events("timer-install:Job:r", 0)
                 .await
-                .unwrap()
+                .expect("read events")
                 .len()
                 == 3
             {
@@ -274,7 +288,7 @@ on_timeout = "Expire"
                     .server
                     .get_tenant_entity_state(&tenant, "Job", "r")
                     .await
-                    .unwrap();
+                    .expect("read record");
                 assert_eq!(record.state.status, "Done");
                 break;
             }
@@ -283,5 +297,5 @@ on_timeout = "Expire"
     })
     .await
     .expect("the overdue record must leave its timed state after installation");
-    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(root).expect("remove temp dir");
 }
