@@ -86,6 +86,7 @@ impl crate::state::ServerState {
             let initial_action = req.initial_action.clone();
             let parent_params = action_params.clone();
             let copied_fields = req.copied_fields.clone();
+            let request = req.clone();
             let agent = agent_ctx.clone();
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
@@ -130,29 +131,25 @@ impl crate::state::ServerState {
                     let child_table = match state.transition_table_for_dispatch(&t, &child_type) {
                         Ok(table) => table,
                         Err(error) => {
-                            state.record_generated_callback_refusal(
-                                super::WasmEntityRef {
-                                    tenant: &t,
-                                    entity_type: &parent_t,
-                                    entity_id: &parent_i,
-                                },
-                                "spawn",
-                                &error.to_string(),
-                            );
+                            let error = error.to_string();
+                            state
+                                .refuse_spawn(&t, &parent_t, &parent_i, &request, "spawn", &error)
+                                .await;
                             return;
                         }
                     };
                     let strict_child = child_table.strict_action_params;
                     if strict_child && initial_action.is_none() {
-                        state.record_generated_callback_refusal(
-                            super::WasmEntityRef {
-                                tenant: &t,
-                                entity_type: &parent_t,
-                                entity_id: &parent_i,
-                            },
-                            "spawn",
-                            "Strict child requires a declared initializer for its generated fields",
-                        );
+                        state
+                            .refuse_spawn(
+                                &t,
+                                &parent_t,
+                                &parent_i,
+                                &request,
+                                "spawn",
+                                "Strict child requires a declared initializer for its generated fields",
+                            )
+                            .await;
                         return;
                     }
                     let initializer = if let Some(action) = initial_action {
@@ -171,15 +168,9 @@ impl crate::state::ServerState {
                         ) {
                             Ok(params) => Some((action, params)),
                             Err(error) => {
-                                state.record_generated_callback_refusal(
-                                    super::WasmEntityRef {
-                                        tenant: &t,
-                                        entity_type: &parent_t,
-                                        entity_id: &parent_i,
-                                    },
-                                    &action,
-                                    &error,
-                                );
+                                state
+                                    .refuse_spawn(&t, &parent_t, &parent_i, &request, &action, &error)
+                                    .await;
                                 return;
                             }
                         }
@@ -224,15 +215,9 @@ impl crate::state::ServerState {
                                     .map_err(String::from)
                             });
                         if let Err(error) = validation {
-                            state.record_generated_callback_refusal(
-                                super::WasmEntityRef {
-                                    tenant: &t,
-                                    entity_type: &parent_t,
-                                    entity_id: &parent_i,
-                                },
-                                action,
-                                &error,
-                            );
+                            state
+                                .refuse_spawn(&t, &parent_t, &parent_i, &request, action, &error)
+                                .await;
                             return;
                         }
                     }
@@ -314,10 +299,86 @@ impl crate::state::ServerState {
                                 error = %e,
                                 "failed to spawn child entity"
                             );
+                            state
+                                .refuse_spawn(&t, &parent_t, &parent_i, &request, "spawn", &e)
+                                .await;
                         }
                     }
                 }
                 .instrument(span),
+            );
+        }
+    }
+
+    /// A spawn whose child was not created. The refusal goes to the parent's
+    /// observe stream, as before, and into its journal as `SpawnRefused`,
+    /// which clears the field the transition stored the child's id in. The
+    /// field keeps the id if the child exists anyway or could not be looked
+    /// up.
+    async fn refuse_spawn(
+        &self,
+        tenant: &TenantId,
+        parent_type: &str,
+        parent_id: &str,
+        request: &crate::entity_actor::effects::SpawnRequest,
+        action: &str,
+        error: &str,
+    ) {
+        self.record_generated_callback_refusal(
+            super::WasmEntityRef {
+                tenant,
+                entity_type: parent_type,
+                entity_id: parent_id,
+            },
+            action,
+            error,
+        );
+        use crate::entity_actor::spawn_refusal::{ChildLookup, SpawnRefusal};
+        let child = match self
+            .entity_exists_durably(tenant, &request.entity_type, &request.entity_id)
+            .await
+        {
+            Ok(true) => ChildLookup::Exists,
+            Ok(false) => ChildLookup::Absent,
+            Err(lookup_error) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    parent_type,
+                    parent_id,
+                    child_type = %request.entity_type,
+                    child_id = %request.entity_id,
+                    lookup_error = %lookup_error,
+                    "refused child could not be looked up; the parent keeps its id"
+                );
+                ChildLookup::Unreadable
+            }
+        };
+        let refusal = SpawnRefusal {
+            child_type: request.entity_type.clone(),
+            child_id: request.entity_id.clone(),
+            field: request.store_id_in.clone(),
+            child,
+            error: error.to_owned(),
+        };
+        // Logged once, not retried: the parent was deleted, its event budget
+        // is spent or the store is down, and the observe event above already
+        // holds the refusal. This runs after the parent's transition commits,
+        // so a refusal lost to a crash in that window is not replayed after
+        // restart. Durable recovery of post-commit work belongs with durable
+        // scheduled actions (#104), not a second journal here.
+        if let Err(record_error) = self
+            .record_spawn_refusal(tenant, parent_type, parent_id, refusal)
+            .await
+        {
+            tracing::error!(
+                tenant = %tenant,
+                parent_type,
+                parent_id,
+                child_type = %request.entity_type,
+                child_id = %request.entity_id,
+                error,
+                record_error = %record_error,
+                "spawn refusal could not be recorded on the parent"
             );
         }
     }

@@ -737,6 +737,33 @@ impl EntityActor {
                         break;
                     }
 
+                    // A refused spawn is the kernel's event too: it changes only
+                    // the field that named the child, through the live helper.
+                    if env.event_type == super::spawn_refusal::SPAWN_REFUSED_EVENT {
+                        match parsed_event {
+                            Ok(event) => {
+                                super::spawn_refusal::apply(state, &event.params);
+                                state.push_event_bounded(event);
+                            }
+                            Err(e) => {
+                                if replay_policy.strict_event_validation() {
+                                    return Err(ActorError::custom(format!(
+                                        "invalid spawn-refusal event for {}:{} at sequence {}: {e}",
+                                        state.entity_type, state.entity_id, env.sequence_nr
+                                    )));
+                                }
+                                tracing::warn!(
+                                    entity = %state.entity_id,
+                                    sequence_nr = env.sequence_nr,
+                                    error = %e,
+                                    "skipping spawn-refusal event with incompatible schema during replay"
+                                );
+                            }
+                        }
+                        state.sequence_nr = env.sequence_nr;
+                        continue;
+                    }
+
                     // PATCH/PUT field updates are journaled outside the spec's
                     // action vocabulary (ARN-189). Re-apply them through the
                     // same helper the live handler uses so a rehydrated entity
@@ -1139,10 +1166,11 @@ impl Actor for EntityActor {
                 // where a domain action first enters the actor.
                 if name == super::effects::FIELDS_UPDATED_EVENT
                     || name == super::effects::FIELDS_REPLACED_EVENT
+                    || name == super::spawn_refusal::SPAWN_REFUSED_EVENT
                 {
                     ctx.reply(EntityResponse::refused(
                         state.clone(),
-                        format!("action name `{name}` is reserved for journaled field updates"),
+                        format!("action name `{name}` is reserved for events the kernel journals"),
                     ));
                     return Ok(());
                 }
@@ -1808,6 +1836,21 @@ impl Actor for EntityActor {
                     expected_precondition,
                 )
                 .await;
+                ctx.reply(EntityResponse {
+                    success: outcome.is_ok(),
+                    refusal: None,
+                    state: state.clone(),
+                    error: outcome.err(),
+                    custom_effects: vec![],
+                    scheduled_actions: vec![],
+                    spawn_requests: vec![],
+                    spec_governed: true,
+                    refused: false,
+                });
+            }
+
+            EntityMsg::RecordSpawnRefusal { refusal } => {
+                let outcome = super::spawn_refusal::commit(self, state, &refusal).await;
                 ctx.reply(EntityResponse {
                     success: outcome.is_ok(),
                     refusal: None,

@@ -226,7 +226,7 @@ fn budget_refusal(actor: &EntityActor, state: &EntityState, replace: bool) -> Op
 /// the caller, upserted into the query projection, and made durable by the next
 /// snapshot. Rolling back `fields` alone cannot help — those other fields were
 /// never part of the speculative update.
-async fn catch_up(
+pub(super) async fn catch_up(
     actor: &EntityActor,
     state: &mut EntityState,
     attempt: u32,
