@@ -82,7 +82,6 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     //    - `on_timeout` must be a declared action.
     //    - each `reset_on` entry must be a declared action.
     //    - `after_seconds` must be > 0 (a zero delay is almost certainly a typo).
-    //    - `max_occurrences` must be >= 1.
     //    - the same state must not be declared twice (ambiguous timer contract).
     let mut seen_states: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for st in &automaton.state_timeouts {
@@ -101,12 +100,6 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
         if st.after_seconds == 0 {
             return Err(AutomatonParseError::Validation(format!(
                 "state_timeout for '{}' must have after_seconds > 0",
-                st.state
-            )));
-        }
-        if st.max_occurrences == 0 {
-            return Err(AutomatonParseError::Validation(format!(
-                "state_timeout for '{}' must have max_occurrences >= 1",
                 st.state
             )));
         }
