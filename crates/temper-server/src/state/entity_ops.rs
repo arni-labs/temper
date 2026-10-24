@@ -327,6 +327,7 @@ impl ServerState {
                 scheduled_actions: vec![],
                 spawn_requests: vec![],
                 spec_governed: true,
+                refused: false,
             }
         };
 
@@ -1660,6 +1661,7 @@ impl ServerState {
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         }))
     }
 

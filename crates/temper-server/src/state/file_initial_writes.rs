@@ -243,6 +243,7 @@ impl ServerState {
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         };
         self.broadcast_synthetic_file_stream_update(tenant, file_id, &response, agent_ctx);
         Ok(response)
