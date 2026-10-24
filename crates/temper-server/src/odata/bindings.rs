@@ -17,6 +17,7 @@ use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_action};
 use super::response::annotate_entity;
 use crate::authz::{DenialInput, record_authz_denial};
 use crate::blobs::hydrate_blob_refs_for_tenant;
+use crate::entity_actor::effects::action_param_writes_field;
 use crate::entity_actor::undeclared_params;
 use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_denial, odata_error};
@@ -164,17 +165,18 @@ pub(super) async fn dispatch_bound_action(
     }
 
     // Keys the action does not declare are written into fields like a PATCH,
-    // so the caller's own update grant decides them. Enforce mode refuses
-    // them with a 400 below instead.
+    // so the caller's own update grant decides the ones the actor writes.
+    // Enforce mode refuses them with a 400 below instead.
     if undeclared_params::mode() == undeclared_params::Mode::Report {
+        let entity = &current_state.state;
         let call = BoundActionCall {
             entity_type,
             entity_id: key_str,
             action,
-            status: &current_state.state.status,
-            fields: &current_state.state.fields,
-            attrs: resource_attrs,
+            status: &entity.status,
+            fields: &entity.fields,
             body: &body_json,
+            writes: &|key| action_param_writes_field(entity, key),
         };
         if let Err(response) =
             authorize_undeclared_field_write(state, tenant, security_ctx, agent_ctx, call).await

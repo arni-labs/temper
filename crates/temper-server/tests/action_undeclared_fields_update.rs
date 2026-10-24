@@ -50,6 +50,12 @@ name = "Comment"
 kind = "input"
 from = ["Open"]
 params = ["text"]
+effect = ["comment_count += 1"]
+
+[[state]]
+name = "comment_count"
+type = "counter"
+initial = 0
 "#;
 
 /// Anyone may comment; only the note's owner may update it.
@@ -239,4 +245,38 @@ async fn inside_dispatches_are_unchanged() {
     assert!(response.success, "{:?}", response.error);
     let fields = note(&state).await;
     assert_eq!(fields["label"], "kept", "{fields}");
+}
+
+/// A body key naming a counter the entity holds writes nothing: the actor
+/// keeps its own counter value, so the key needs no update grant.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_the_actor_keeps_its_own_values_for_need_no_update_grant() {
+    let state = note_owned_by_alice().await;
+    let (status, body) = post(
+        &state,
+        "alice",
+        "/tdata/Notes('n1')/Temper.Notes.Comment",
+        r#"{"text":"first"}"#,
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(note(&state).await["comment_count"], 1);
+
+    let (status, body) = post(
+        &state,
+        "bob",
+        "/tdata/Notes('n1')/Temper.Notes.Comment",
+        r#"{"text":"hi","comment_count":99}"#,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "bob may comment, and the counter key changes nothing: {body}"
+    );
+    let fields = note(&state).await;
+    assert_eq!(fields["text"], "hi", "{fields}");
+    assert_eq!(
+        fields["comment_count"], 2,
+        "the actor's own count: {fields}"
+    );
 }

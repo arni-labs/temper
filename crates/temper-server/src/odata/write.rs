@@ -906,25 +906,14 @@ pub async fn handle_odata_post(
                 // This runtime writes every key of a non-strict action's body
                 // into fields, so the caller's own update grant decides the
                 // keys the action does not declare.
-                let current_attrs = resource_attrs_from_body(
-                    &state,
-                    &tenant,
-                    &entity_type,
-                    &key_str,
-                    &serde_json::json!({
-                        "entity_id": key_str,
-                        "status": actor_state.status,
-                        "fields": actor_state.fields,
-                    }),
-                );
                 let call = BoundActionCall {
                     entity_type: &entity_type,
                     entity_id: &key_str,
                     action: &action,
                     status: &actor_state.status,
                     fields: &actor_state.fields,
-                    attrs: &current_attrs,
                     body: &body_json,
+                    writes: &|_| true,
                 };
                 if let Err(response) = authorize_undeclared_field_write(
                     &state,

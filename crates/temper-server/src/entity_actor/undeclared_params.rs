@@ -124,35 +124,37 @@ pub(crate) fn external_refusal(
 
 /// The fields an entity would hold after an outside call to a non-strict
 /// action whose body carries keys the action does not declare, or `None` when
-/// every key is declared (or the spec is strict, which refuses such keys).
+/// no such key is written (or the spec is strict, which refuses such keys).
 ///
 /// Those keys are written into fields just as a PATCH writes its body, so the
 /// caller's own `update` grant decides them, on these prospective fields as on
-/// the current ones. Server-derived names are never written and do not count.
+/// the current ones. `writes` is the runtime's own rule for which body keys
+/// reach fields: a key it does not write changes nothing and does not count.
+/// Server-derived names are never written.
 pub(crate) fn fields_after_undeclared_write(
     table: &TransitionTable,
     action: &str,
     current_fields: &serde_json::Value,
     body: &serde_json::Value,
+    writes: &dyn Fn(&str) -> bool,
 ) -> Option<serde_json::Value> {
     if table.strict_action_params {
         return None;
     }
     let object = body.as_object()?;
+    let written =
+        |key: &str| !temper_spec::automaton::is_server_derived_field_name(key) && writes(key);
     let undeclared = match undeclared_param_keys(table, action, body) {
         Ok(keys) => keys,
         // A body the declared params cannot be read from is written as sent.
         Err(_) => object.keys().cloned().collect(),
     };
-    if undeclared
-        .iter()
-        .all(|key| temper_spec::automaton::is_server_derived_field_name(key))
-    {
+    if !undeclared.iter().any(|key| written(key)) {
         return None;
     }
     let mut fields = current_fields.as_object().cloned().unwrap_or_default();
     for (key, value) in object {
-        if !temper_spec::automaton::is_server_derived_field_name(key) {
+        if written(key) {
             fields.insert(key.clone(), value.clone());
         }
     }
@@ -231,7 +233,8 @@ params = ["status_code"]
                 &table(false),
                 "Fetched",
                 &current,
-                &json!({ "StatusCode": 2 })
+                &json!({ "StatusCode": 2 }),
+                &|_| true,
             ),
             None,
             "declared params, in either spelling, need no update grant"
@@ -241,7 +244,8 @@ params = ["status_code"]
                 &table(false),
                 "Fetched",
                 &current,
-                &json!({ "Id": "x", "Status": "y" })
+                &json!({ "Id": "x", "Status": "y" }),
+                &|_| true,
             ),
             None,
             "server-derived names are never written"
@@ -251,16 +255,40 @@ params = ["status_code"]
                 &table(false),
                 "Fetched",
                 &current,
-                &json!({ "status_code": 3, "owner": "b", "Id": "x" })
+                &json!({ "status_code": 3, "owner": "b", "Id": "x" }),
+                &|_| true,
             ),
             Some(json!({ "owner": "b", "status_code": 3 }))
+        );
+        let keeps_count = |key: &str| key != "count";
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &json!({ "owner": "a", "count": 10 }),
+                &json!({ "count": 11 }),
+                &keeps_count,
+            ),
+            None,
+            "a key the runtime keeps its own value for writes nothing"
+        );
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &json!({ "owner": "a", "count": 10 }),
+                &json!({ "count": 11, "owner": "b" }),
+                &keeps_count,
+            ),
+            Some(json!({ "owner": "b", "count": 10 }))
         );
         assert_eq!(
             fields_after_undeclared_write(
                 &table(true),
                 "Fetched",
                 &current,
-                &json!({ "owner": "b" })
+                &json!({ "owner": "b" }),
+                &|_| true,
             ),
             None,
             "strict specs refuse the key themselves"
