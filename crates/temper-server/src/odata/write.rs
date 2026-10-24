@@ -26,8 +26,8 @@ use super::common::{
 };
 use super::constraints::pre_delete_relation_checks;
 use super::create_answer::{
-    CreateTarget, EXISTING_ENTITY_STATUS, create_answer_body, existing_entity_for_create,
-    existing_key_conflict, may_read,
+    CreateTarget, EXISTING_ENTITY_STATUS, create_answer_body, existing_key_conflict, may_read,
+    taken_key_response,
 };
 use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
@@ -37,8 +37,8 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error};
-use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{DataOnlyCreate, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -791,16 +791,11 @@ pub async fn handle_odata_post(
                 set_name: &name,
                 entity_id: &entity_id,
             };
-            match existing_entity_for_create(&state, &target).await {
-                Ok(None) => {}
-                Ok(Some(existing)) => {
-                    return ODataResponse {
-                        status: EXISTING_ENTITY_STATUS,
-                        body: create_answer_body(&state, &target, &existing).await,
-                    }
-                    .into_response();
-                }
-                Err(response) => return response,
+            if state
+                .ensure_entity_loaded(&tenant, &entity_type, &entity_id)
+                .await
+            {
+                return taken_key_response(&state, &target).await;
             }
 
             // A new entity's first event holds its initial fields: one too large is
@@ -826,14 +821,23 @@ pub async fn handle_odata_post(
                 )
                 .await
             {
-                Ok(Some(response)) => {
+                Ok(DataOnlyCreate::Created(response)) => {
                     return ODataResponse {
                         status: StatusCode::CREATED,
                         body: create_answer_body(&state, &target, &response).await,
                     }
                     .into_response();
                 }
-                Ok(None) => {}
+                // A concurrent create of this key wrote its entity first.
+                Ok(DataOnlyCreate::KeyTaken)
+                    if state
+                        .ensure_entity_loaded(&tenant, &entity_type, &entity_id)
+                        .await =>
+                {
+                    return taken_key_response(&state, &target).await;
+                }
+                // No entity holds the key: the create takes the generic path.
+                Ok(DataOnlyCreate::KeyTaken | DataOnlyCreate::Ineligible) => {}
                 Err(e) => {
                     return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
                         .into_response();
@@ -841,10 +845,12 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
+                .create_new_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
                 .await
             {
-                Ok(response) => {
+                // A concurrent create of this key started its actor first.
+                Ok(None) => taken_key_response(&state, &target).await,
+                Ok(Some(response)) => {
                     // Creation is not a dispatch: a record created into a
                     // timed first state has its timer armed here.
                     state

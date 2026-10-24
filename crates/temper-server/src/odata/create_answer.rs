@@ -18,7 +18,7 @@ use super::authz::{READ_ACTION, authorize_read};
 use super::response::annotate_entity;
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::entity_actor::EntityResponse;
-use crate::response::odata_error;
+use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
 
 /// Status of a create answered with an entity that already existed and that
@@ -36,33 +36,52 @@ pub(super) struct CreateTarget<'a> {
     pub(super) entity_id: &'a str,
 }
 
-/// The existing entity a create's key names, when there is one.
+/// The answer to a create whose key another entity holds, including one a
+/// concurrent create took after this create's own check: the entity when the
+/// caller may read it, `409 Conflict` otherwise.
 ///
-/// `Ok(None)`: no entity has this key and the create goes ahead.
-/// `Ok(Some(_))`: the caller may read the existing entity; answer with it.
-/// `Err(_)`: `409 Conflict` when the caller may not read it, or the read
-/// failure.
-pub(super) async fn existing_entity_for_create(
+/// The entity's query projection is written again first. A create stores the
+/// entity before its projection, so a create that failed between the two
+/// leaves the entity out of collection queries until the repeat writes it.
+pub(super) async fn taken_key_answer(
     state: &ServerState,
     target: &CreateTarget<'_>,
-) -> Result<Option<EntityResponse>, Response> {
-    if !state
-        .ensure_entity_loaded(target.tenant, target.entity_type, target.entity_id)
-        .await
-    {
-        return Ok(None);
-    }
+) -> Result<EntityResponse, Response> {
     let existing = state
         .get_tenant_entity_state(target.tenant, target.entity_type, target.entity_id)
         .await
         .map_err(|error| {
             odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error).into_response()
         })?;
+    state
+        .upsert_entity_query_projection(
+            target.tenant,
+            target.entity_type,
+            target.entity_id,
+            &existing,
+            "create_repeat",
+        )
+        .await
+        .map_err(|error| {
+            odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &error).into_response()
+        })?;
     let body = serde_json::to_value(&existing.state).unwrap_or_default();
     if !may_read(state, target, &body) {
         return Err(existing_key_conflict());
     }
-    Ok(Some(existing))
+    Ok(existing)
+}
+
+/// [`taken_key_answer`] as a collection create's response.
+pub(super) async fn taken_key_response(state: &ServerState, target: &CreateTarget<'_>) -> Response {
+    match taken_key_answer(state, target).await {
+        Ok(existing) => ODataResponse {
+            status: EXISTING_ENTITY_STATUS,
+            body: create_answer_body(state, target, &existing).await,
+        }
+        .into_response(),
+        Err(response) => response,
+    }
 }
 
 /// Whether the caller may read the entity `body` describes: the decision a

@@ -998,7 +998,7 @@ async fn test_data_only_create_fast_path_declines_action_bearing_entities() {
         .await
         .unwrap();
     assert!(
-        response.is_none(),
+        matches!(response, crate::state::DataOnlyCreate::Ineligible),
         "entities with transition rules must stay on the actor-backed create path"
     );
 }

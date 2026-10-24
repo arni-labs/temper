@@ -24,6 +24,18 @@ use crate::storage::DataOnlyCreateRecord;
 /// occupy the request pool for the whole idle set (ARN-462).
 pub const PASSIVATE_IDLE_ACTORS_PER_TICK: usize = 32;
 
+/// What a data-only create did.
+#[derive(Debug)]
+pub enum DataOnlyCreate {
+    /// The entity was created; its state.
+    Created(EntityResponse),
+    /// The entity type does not take the data-only path; nothing was written.
+    Ineligible,
+    /// The store already holds this key, usually because a concurrent create
+    /// wrote it first; nothing was written.
+    KeyTaken,
+}
+
 fn actor_idle_timeout_secs() -> i64 {
     static ACTOR_IDLE_TIMEOUT: OnceLock<i64> = OnceLock::new();
     *ACTOR_IDLE_TIMEOUT.get_or_init(|| {
@@ -942,7 +954,6 @@ impl ServerState {
     }
 
     /// Get or spawn an entity actor with initial fields for a specific tenant.
-    #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
     pub fn get_or_spawn_tenant_actor_with_fields(
         &self,
         tenant: &TenantId,
@@ -950,6 +961,21 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<ActorRef<EntityMsg>, String> {
+        self.get_or_spawn_tenant_actor_reporting(tenant, entity_type, entity_id, initial_fields)
+            .map(|(actor_ref, _spawned)| actor_ref)
+    }
+
+    /// Get or spawn an entity actor, and whether this call spawned it. A live
+    /// actor already registered for the key is returned with `false`: its
+    /// initial fields came from whoever spawned it, not from this call.
+    #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
+    fn get_or_spawn_tenant_actor_reporting(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+    ) -> Result<(ActorRef<EntityMsg>, bool), String> {
         if !initial_fields
             .as_object()
             .is_some_and(|fields| fields.is_empty())
@@ -963,7 +989,7 @@ impl ServerState {
             let registry = self.actor_registry.read().unwrap();
             if let Some(actor_ref) = registry.get(&key).filter(|actor| !actor.is_closed()) {
                 self.touch_actor_access(&key);
-                return Ok(actor_ref.clone());
+                return Ok((actor_ref.clone(), false));
             }
         }
 
@@ -1027,7 +1053,7 @@ impl ServerState {
         let actor_ref = {
             let mut registry = self.actor_registry.write().unwrap();
             if let Some(existing) = registry.get(&key).filter(|actor| !actor.is_closed()) {
-                return Ok(existing.clone());
+                return Ok((existing.clone(), false));
             }
             let actor_ref = self.actor_system.spawn(actor, &key);
             registry.insert(key.clone(), actor_ref.clone());
@@ -1046,7 +1072,7 @@ impl ServerState {
         self.touch_actor_access(&key);
         runtime_metrics::record_server_state_metrics(self);
 
-        Ok(actor_ref)
+        Ok((actor_ref, true))
     }
 
     /// Remove an entity from the index and actor registry.
@@ -1276,7 +1302,8 @@ impl ServerState {
         )
     }
 
-    /// Create a new entity with initial fields and return its state.
+    /// Create a new entity with initial fields and return its state. A key
+    /// whose actor is already live returns that entity's state.
     #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_or_create_tenant_entity(
         &self,
@@ -1287,16 +1314,56 @@ impl ServerState {
     ) -> Result<EntityResponse, String> {
         self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
             .map_err(|e| e.to_string())?;
-        let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
+        let (actor_ref, _spawned) = self.get_or_spawn_tenant_actor_reporting(
             tenant,
             entity_type,
             entity_id,
             initial_fields,
         )?;
+        self.finish_tenant_entity_create(tenant, entity_type, entity_id, &actor_ref)
+            .await
+    }
 
+    /// Create a new entity with initial fields, only when this call starts it.
+    ///
+    /// `Ok(None)`: the key's actor was already live, so another create holds
+    /// the key; nothing was written and no create effect ran.
+    #[instrument(skip_all, fields(otel.name = "entity.create_new_tenant_entity", tenant = %tenant, entity_type, entity_id))]
+    pub async fn create_new_tenant_entity(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+    ) -> Result<Option<EntityResponse>, String> {
+        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
+            .map_err(|e| e.to_string())?;
+        let (actor_ref, spawned) = self.get_or_spawn_tenant_actor_reporting(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+        )?;
+        if !spawned {
+            return Ok(None);
+        }
+        self.finish_tenant_entity_create(tenant, entity_type, entity_id, &actor_ref)
+            .await
+            .map(Some)
+    }
+
+    /// Read a created entity's state, announce the create and write its
+    /// query projection.
+    async fn finish_tenant_entity_create(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        actor_ref: &ActorRef<EntityMsg>,
+    ) -> Result<EntityResponse, String> {
         let policy = self.dispatch_retry_policy();
         let response = retry::ask_with_backoff::<_, EntityResponse, _>(
-            &actor_ref,
+            actor_ref,
             || EntityMsg::GetState,
             &policy,
         )
@@ -1328,64 +1395,77 @@ impl ServerState {
         );
         let _ = self.event_tx.send(change);
 
-        if let Some(query_plane) = self.query_plane_store() {
-            let status = response.state.status.clone();
-            let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
-            let projected_state = self.query_projection_state(&response.state);
-            let sequence_nr = response.state.sequence_nr;
-            let operation = "upsert";
-            let source = "create";
-            record_projection_update_started(tenant, entity_type, operation, source);
-            let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
-            if let Err(e) = query_plane
-                .upsert_projection(
-                    tenant.as_str(),
-                    entity_type,
-                    entity_id,
-                    &status,
-                    &fields,
-                    &projected_state,
-                    sequence_nr,
-                )
-                .await
-            {
-                record_projection_update_error(
-                    tenant,
-                    entity_type,
-                    operation,
-                    source,
-                    projection_started_at,
-                );
-                // Surface the projection failure instead of swallowing it.
-                // Previously this was a `warn` followed by `Ok(response)`,
-                // which produced HTTP 201 even when the entity wasn't
-                // discoverable via $filter — silently corrupting any caller
-                // that does write-then-read-back. Returning Err propagates
-                // up through the OData write handler to a 5xx so the client
-                // knows to retry. The event is already durable in the
-                // events table; on retry the actor's idempotent UPSERT into
-                // entity_catalog/entity_field_index will succeed (or fail
-                // again loudly).
-                tracing::error!(
-                    error = %e,
-                    tenant = %tenant,
-                    entity_type = %entity_type,
-                    entity_id = %entity_id,
-                    "failed to update query projection during create"
-                );
-                return Err(format!("query projection write failed during create: {e}"));
-            }
-            record_projection_update_success(
+        self.upsert_entity_query_projection(tenant, entity_type, entity_id, &response, "create")
+            .await?;
+        Ok(response)
+    }
+
+    /// Write an entity's current state to the query projection. The write is
+    /// keyed on the entity's sequence, so repeating it is harmless.
+    ///
+    /// A create stores the entity before its projection, and the projection
+    /// write can fail on its own. A repeated create of the same key calls
+    /// this too, so the repeat leaves the entity visible to collection
+    /// queries.
+    pub(crate) async fn upsert_entity_query_projection(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        response: &EntityResponse,
+        source: &str,
+    ) -> Result<(), String> {
+        let Some(query_plane) = self.query_plane_store() else {
+            return Ok(());
+        };
+        let status = response.state.status.clone();
+        let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
+        let projected_state = self.query_projection_state(&response.state);
+        let sequence_nr = response.state.sequence_nr;
+        let operation = "upsert";
+        record_projection_update_started(tenant, entity_type, operation, source);
+        let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
+        if let Err(e) = query_plane
+            .upsert_projection(
+                tenant.as_str(),
+                entity_type,
+                entity_id,
+                &status,
+                &fields,
+                &projected_state,
+                sequence_nr,
+            )
+            .await
+        {
+            record_projection_update_error(
                 tenant,
                 entity_type,
                 operation,
                 source,
-                sequence_nr,
                 projection_started_at,
             );
+            // A failed projection write fails the request, so the caller
+            // retries instead of trusting a record that $filter cannot find.
+            // The event is already durable; the retry writes the projection.
+            tracing::error!(
+                error = %e,
+                tenant = %tenant,
+                entity_type = %entity_type,
+                entity_id = %entity_id,
+                source,
+                "failed to update query projection during create"
+            );
+            return Err(format!("query projection write failed during create: {e}"));
         }
-
-        Ok(response)
+        record_projection_update_success(
+            tenant,
+            entity_type,
+            operation,
+            source,
+            sequence_nr,
+            projection_started_at,
+        );
+        Ok(())
     }
 
     /// Create a durable data-only entity without spawning an actor.
@@ -1400,12 +1480,12 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
-    ) -> Result<Option<EntityResponse>, String> {
+    ) -> Result<DataOnlyCreate, String> {
         if !initial_fields.is_object() {
-            return Ok(None);
+            return Ok(DataOnlyCreate::Ineligible);
         }
         if self.is_pg_actor_backed(tenant, entity_type) {
-            return Ok(None);
+            return Ok(DataOnlyCreate::Ineligible);
         }
 
         let table = {
@@ -1418,7 +1498,7 @@ impl ServerState {
                 .map(|t| Arc::new(RwLock::new((**t).clone())))
         });
         let Some(table_ref) = table else {
-            return Ok(None);
+            return Ok(DataOnlyCreate::Ineligible);
         };
         let table = table_ref
             .read()
@@ -1426,14 +1506,14 @@ impl ServerState {
             .clone();
         table.validate_initial_fields(&initial_fields)?;
         if !table.rules.is_empty() {
-            return Ok(None);
+            return Ok(DataOnlyCreate::Ineligible);
         }
 
         let Some((store, backend)) = self.event_journal() else {
-            return Ok(None);
+            return Ok(DataOnlyCreate::Ineligible);
         };
         let Some(query_plane) = self.query_plane_store() else {
-            return Ok(None);
+            return Ok(DataOnlyCreate::Ineligible);
         };
 
         let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
@@ -1519,7 +1599,7 @@ impl ServerState {
                         source,
                         projection_started_at,
                     );
-                    return Ok(None);
+                    return Ok(DataOnlyCreate::KeyTaken);
                 }
                 Err(e) => {
                     record_projection_update_error(
@@ -1556,7 +1636,7 @@ impl ServerState {
                     state.sequence_nr = new_seq;
                 }
                 Err(PersistenceError::ConcurrencyViolation { .. }) => {
-                    return Ok(None);
+                    return Ok(DataOnlyCreate::KeyTaken);
                 }
                 Err(e) => {
                     return Err(format!(
@@ -1643,7 +1723,7 @@ impl ServerState {
         );
         let _ = self.event_tx.send(change);
 
-        Ok(Some(EntityResponse {
+        Ok(DataOnlyCreate::Created(EntityResponse {
             success: true,
             state,
             error: None,
