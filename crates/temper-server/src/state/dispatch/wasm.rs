@@ -21,8 +21,8 @@ use temper_wasm::{
 };
 
 use super::{
-    HttpCallAuthzDenialTracker, TrackingWasmAuthzGate, WasmDispatchMode, WasmDispatchRequest,
-    WasmEntityRef, record_workflow_span_attrs,
+    DispatchError, HttpCallAuthzDenialTracker, TrackingWasmAuthzGate, WasmDispatchMode,
+    WasmDispatchRequest, WasmEntityRef, record_workflow_span_attrs,
 };
 use replay_inputs::{extract_trajectory_actions_from_ots, has_replay_trajectory_input};
 
@@ -192,6 +192,7 @@ pub(crate) fn authorized_http_endpoint_host(
     .with_progress_emitter(progress_emitter)
     .with_internal_api_base_url(internal_api_url)
     .with_internal_capability_issuer(capability_issuer)
+    .with_local_sandbox(state.local_sandbox.get().cloned())
     .with_invocation_context(invocation_context.clone())
     .with_redirect_gate(Arc::clone(&gate), authz_context.clone())
     // ARN-243: the HttpEndpoint path honours the same per-tenant LLM content
@@ -248,6 +249,30 @@ fn agent_ctx_for_composite_wasm_result(
         composite_agent_ctx.idempotency_key = Some(idempotency_key.to_string());
     }
     composite_agent_ctx
+}
+
+/// Whether a composite's sub-writes were refused, so the composite failed.
+///
+/// A refusal is Cedar denying a sub-write, a sub-write's guard or state no
+/// longer allowing it (its target has moved on), a quota, or a target type
+/// with no spec. The kernel checks Cedar and every guard for all sub-writes
+/// before the first write, and the atomic batch writes all or nothing, so a
+/// refusal there means none of the composite's writes landed. On the
+/// per-write path (no journal, or a sub-write with its own effects), a write
+/// refused after an earlier one applied leaves that earlier write in place.
+///
+/// Other errors, such as storage failures, a reload after the batch
+/// committed, or a sub-write that committed before its query projection
+/// failed, are not refusals: the writes may have landed, so the declared
+/// `on_failure` does not run for them and the error propagates.
+fn composite_sub_writes_refused(error: &DispatchError) -> bool {
+    matches!(
+        error,
+        DispatchError::AuthzDenied(_)
+            | DispatchError::Conflict(_)
+            | DispatchError::QuotaExceeded(_)
+            | DispatchError::Ungoverned(_)
+    )
 }
 
 const HTTP_CALL_AUTHZ_DENIED_PREFIX: &str = "authorization denied for http_call";
@@ -771,6 +796,7 @@ impl crate::state::ServerState {
                 .with_spec_evaluator(spec_evaluator_fn())
                 .with_progress_emitter(progress_emitter)
                 .with_internal_api_base_url(internal_api_url)
+                .with_local_sandbox(self.local_sandbox.get().cloned())
                 .with_invocation_context(host_invocation_context)
                 .with_redirect_gate(Arc::clone(&gate), authz_ctx.clone())
                 .with_llm_content_export(self.export_llm_content(ctx.entity_ref.tenant.as_str()))
@@ -1245,6 +1271,46 @@ impl crate::state::ServerState {
                     .await;
                 }
 
+                // A composite's effect is its sub-writes, so they apply before
+                // the invocation is recorded. A refused sub-write fails the
+                // composite like any integration failure: `on_failure` runs with
+                // the reason as `error`. Any other error propagates, as before.
+                let callback_params = strip_private_observability_params(result.callback_params);
+                let composite_agent_ctx = agent_ctx_for_composite_wasm_result(
+                    ctx.agent_ctx,
+                    ctx.dispatch_idempotency_key,
+                );
+                let composite_result_consumed = match self
+                    .apply_composite_integration_result(
+                        ctx.entity_ref.tenant,
+                        ctx.entity_ref.entity_type,
+                        ctx.entity_ref.entity_id,
+                        ctx.action,
+                        &callback_params,
+                        &composite_agent_ctx,
+                    )
+                    .await
+                {
+                    Ok(consumed) => consumed,
+                    Err(error) => {
+                        let recovery = if composite_sub_writes_refused(&error) {
+                            integration.on_failure.clone()
+                        } else {
+                            None
+                        };
+                        return handle_wasm_failure_boxed(
+                            self,
+                            ctx,
+                            &integration.name,
+                            module_name,
+                            &recovery,
+                            error.to_string(),
+                            result.duration_ms,
+                        )
+                        .await;
+                    }
+                };
+
                 instrument_wasm_dispatch_phase(
                     phase_parent_span.clone(),
                     ctx,
@@ -1262,23 +1328,6 @@ impl crate::state::ServerState {
                     ),
                 )
                 .await;
-
-                let callback_params = strip_private_observability_params(result.callback_params);
-                let composite_agent_ctx = agent_ctx_for_composite_wasm_result(
-                    ctx.agent_ctx,
-                    ctx.dispatch_idempotency_key,
-                );
-                let composite_result_consumed = self
-                    .apply_composite_integration_result(
-                        ctx.entity_ref.tenant,
-                        ctx.entity_ref.entity_type,
-                        ctx.entity_ref.entity_id,
-                        ctx.action,
-                        &callback_params,
-                        &composite_agent_ctx,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
 
                 // Determine callback action: prefer static on_success from spec,
                 // fall back to dynamic callback_action from WASM result. Composite
@@ -1515,6 +1564,7 @@ impl crate::state::ServerState {
         .with_spec_evaluator(spec_evaluator_fn())
         .with_progress_emitter(progress_emitter)
         .with_internal_api_base_url(internal_api_base_url(self))
+        .with_local_sandbox(self.local_sandbox.get().cloned())
         .with_invocation_context(context.clone())
         .with_redirect_gate(Arc::clone(&base_gate), authz_ctx.clone())
         .with_llm_content_export(self.export_llm_content(tenant.as_str()));

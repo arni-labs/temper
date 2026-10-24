@@ -20,11 +20,11 @@ use crate::metrics::{CedarCheck, CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
 mod list_uniformity;
-mod platform;
+mod platform_policy;
 
 pub use list_uniformity::ListReadUniformity;
-pub use platform::VERIFIED_OPERATOR_WHEN;
-use platform::{
+pub use platform_policy::VERIFIED_OPERATOR_WHEN;
+use platform_policy::{
     compiled_system_platform_policies, count_user_policies, merge_system_platform_policy,
     platform_authority_policy,
 };
@@ -34,6 +34,9 @@ mod tests;
 
 #[cfg(test)]
 mod stack_tests;
+
+#[cfg(test)]
+mod identity_records_tests;
 
 /// The result of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]

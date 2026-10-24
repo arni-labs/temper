@@ -34,9 +34,10 @@ pub const CREATE_EVENTS_ENTITY_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_events_entity
     ON events(tenant, entity_type, entity_id, sequence_nr);";
 
-/// Tombstones only. Entity listings keep an entity unless it has a `Deleted`
-/// event; without this index that check reads the entity's whole journal once
-/// per journal row, so a 30,000-event entity took 15 minutes to list.
+/// Events of the tombstone's type only. Entity listings keep an entity unless
+/// its journal has the kernel's tombstone (`store::tombstone_sql`); without
+/// this index that check reads the entity's whole journal once per journal
+/// row, so a 30,000-event entity took 15 minutes to list.
 pub const CREATE_EVENTS_DELETED_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_events_deleted
     ON events(tenant, entity_type, entity_id) WHERE event_type = 'Deleted';";

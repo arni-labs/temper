@@ -39,7 +39,8 @@ fn platform_authority_when() -> String {
 
 /// Built-in Cedar in every [`AuthzEngine`] (ADR-0046): System's broad
 /// authority as an auditable policy instead of an unchecked allow, and
-/// what only the platform may touch (issuers, generations, HTTP routes).
+/// what only the platform may touch (issuers, generations, agent credentials
+/// and types, HTTP routes).
 fn system_platform_policy() -> String {
     format!(
         r#"
@@ -61,6 +62,19 @@ unless {{ {authority} }};
 @id("system-platform:protect-principal-generation")
 forbid(principal, action, resource is PrincipalGeneration)
 unless {{ {authority} }};
+
+// The bearer resolver takes an AgentCredential and its AgentType as a verified
+// identity, so only the platform writes them. Reading them is the tenant's to decide.
+// Each type is in the scope, not the condition, so other types' list reads stay one decision.
+@id("system-platform:protect-agent-credential")
+forbid(principal, action, resource is AgentCredential)
+unless {{ {authority}
+  || action in [Action::"read", Action::"list"] }};
+
+@id("system-platform:protect-agent-type")
+forbid(principal, action, resource is AgentType)
+unless {{ {authority}
+  || action in [Action::"read", Action::"list"] }};
 
 // ADR-0069: a route reshapes the tenant's HTTP surface, so only the platform manages one.
 @id("system-platform:http-endpoint-management-permit")
@@ -153,5 +167,5 @@ pub(super) fn count_user_policies(ps: &PolicySet) -> usize {
 }
 
 #[cfg(test)]
-#[path = "platform_test.rs"]
+#[path = "platform_policy_test.rs"]
 mod tests;
