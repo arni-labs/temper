@@ -21,6 +21,7 @@ mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
+mod start_runtime;
 pub mod status_cache;
 pub(crate) mod storage_caps;
 pub mod trajectory;
@@ -30,7 +31,10 @@ pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
-pub use dispatch::{DispatchCommand, DispatchError, DispatchExtOptions, StateTimeoutTracker};
+pub use dispatch::{
+    BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
+    StateTimeoutTracker, TimerFollowHold,
+};
 pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
@@ -338,6 +342,12 @@ fn state_cache_budget() -> usize {
     *STATE_CACHE_BUDGET.get_or_init(|| env_usize("TEMPER_STATE_CACHE_BUDGET", 10_000))
 }
 
+/// A `[[state]]` declared `query_indexed = false` stays in entity state but is
+/// kept out of the durable query projection and its field index.
+fn left_out_of_query_projection(state_var: &temper_spec::automaton::StateVar) -> bool {
+    state_var.query_indexed == Some(false)
+}
+
 /// Summary of a query-projection replay parity verification run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct QueryProjectionReplayParityReport {
@@ -511,6 +521,13 @@ pub struct ServerState {
     /// counter used to cancel stale timers when the entity transitions out
     /// of a declared state or reset_on fires.
     pub state_timeout_tracker: Arc<StateTimeoutTracker>,
+    /// Where armed timer rows are kept when the storage stack has no metadata
+    /// store to keep them, as under simulation. None: the metadata store.
+    pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
+    /// Published under the registry lock after durable timer recovery.
+    pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once [`Self::start_runtime`] has run in this process.
+    pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -811,6 +828,9 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
+            state_timer_rows: None,
+            timer_recovery_complete: Arc::default(),
+            runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1088,6 +1108,9 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
+            state_timer_rows: None,
+            timer_recovery_complete: Arc::default(),
+            runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1163,12 +1186,30 @@ impl ServerState {
 
         let mut projected = obj.clone();
         for state_var in &spec.automaton.state {
-            if state_var.query_indexed == Some(false) {
+            if left_out_of_query_projection(state_var) {
                 projected.remove(&state_var.name);
             }
         }
 
         serde_json::Value::Object(projected)
+    }
+
+    /// Whether the query projection's field index can hold `field_name` for
+    /// `entity_type`: false when the spec declares that field
+    /// `query_indexed = false`, which [`Self::query_projection_fields`] drops.
+    pub(crate) fn query_projection_indexes_field(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        field_name: &str,
+    ) -> bool {
+        let registry = self.registry.read().unwrap();
+        let Some(spec) = registry.get_spec(tenant, entity_type) else {
+            return true;
+        };
+        !spec.automaton.state.iter().any(|state_var| {
+            state_var.name == field_name && left_out_of_query_projection(state_var)
+        })
     }
 
     pub(crate) fn query_projection_state(

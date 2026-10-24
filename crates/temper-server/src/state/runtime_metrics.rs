@@ -149,7 +149,7 @@ fn allow_indefinite_state_counts(state: &ServerState) -> Vec<(String, u64)> {
 
 impl ServerState {
     /// Start periodic runtime metric export for process + actor-system state.
-    pub fn spawn_runtime_metrics_loop(&self) {
+    pub(super) fn spawn_runtime_metrics_loop(&self) {
         let interval_secs = configured_u64("TEMPER_RUNTIME_METRICS_INTERVAL_SECS", 60, 1, 86_400);
 
         let state = self.clone();

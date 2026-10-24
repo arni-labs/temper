@@ -46,6 +46,7 @@ mod policy_router_impls;
 mod published_artifacts;
 mod query_plane_impls;
 mod query_plane_read;
+mod query_plane_router_impls;
 mod redaction;
 mod state_timers;
 mod trajectory_row;
@@ -53,11 +54,11 @@ pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
-pub use state_timers::StateTimerStore;
+pub use state_timers::{MetadataTimerRows, StateTimerStore};
 mod query_plane;
 pub use query_plane::{
-    EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
+    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 pub(crate) use query_plane_read::{
     CatalogRowsLoad, load_catalog_rows_by_id, load_selected_catalog_rows_by_id,

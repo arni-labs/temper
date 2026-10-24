@@ -1108,7 +1108,7 @@ pub(super) async fn install_os_app_with_plan(
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
-    let _serialized = install_guard::tenant(tenant).await;
+    let mut install = install_guard::tenant(&state.server, tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
         cat.paths.get(app_name).cloned().ok_or_else(|| {
@@ -1407,15 +1407,9 @@ pub(super) async fn install_os_app_with_plan(
                 .await;
             }
         }
-        // App installs can introduce or update inline entity triggers.
-        // Refresh the live dispatcher after the registry mutation so the
-        // newly bootstrapped trigger graph is active for subsequent traffic.
-        state.server.rebuild_reaction_dispatcher();
     }
 
-    // App installs can add or change cross-entity reactions. Refresh the live
-    // dispatcher immediately so the newly registered tenant config takes effect
-    // without requiring a process restart or a separate specs reload.
+    // Installed specs can change triggers and cross-entity reactions: refresh the dispatcher.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
@@ -1572,6 +1566,9 @@ pub(super) async fn install_os_app_with_plan(
             }
         }
     }
+
+    // Overdue timers may fire at once: reconcile only now that policies and modules are in.
+    install.installed(&state.server, plan.specs);
 
     tracing::info!(
         "Installed os-app '{app_name}' for tenant '{tenant}': added={added:?} updated={updated:?} skipped={skipped:?} wasm={wasm_registered:?}"
