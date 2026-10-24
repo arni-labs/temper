@@ -143,14 +143,51 @@ async fn a_retry_waits_for_the_running_effects_and_answers_with_their_reply() {
 
     owner.complete(&req(), &make_response("Started"));
     match waiting.await {
-        EffectsClaim::Applied(Some(reply)) => assert_eq!(reply.state.status, "Started"),
-        EffectsClaim::Applied(None) => panic!("the waiting retry gets the completed reply"),
+        EffectsClaim::Applied(reply) => assert_eq!(reply.state.status, "Started"),
         EffectsClaim::Owner(_) => panic!("the effects ran; the retry must not run them again"),
     }
-    assert!(matches!(
-        cache.claim_effects("Job:j1", "k").await,
-        EffectsClaim::Applied(None)
-    ));
+}
+
+#[tokio::test]
+async fn a_retry_after_the_effects_ran_answers_with_their_reply() {
+    // The retry's actor reply is the one cached before the effects ran; by
+    // the time it claims them, they have run and completed a later reply.
+    let cache = IdempotencyCache::new();
+    cache.put("Job:j1", "k", &req(), &make_response("Pending"));
+    let EffectsClaim::Owner(owner) = cache.claim_effects("Job:j1", "k").await else {
+        panic!("the first dispatcher runs the effects");
+    };
+    owner.complete(&req(), &make_response("Started"));
+    match cache.claim_effects("Job:j1", "k").await {
+        EffectsClaim::Applied(reply) => assert_eq!(
+            reply.state.status, "Started",
+            "the retry answers with the completed reply, not the one before the effects"
+        ),
+        EffectsClaim::Owner(_) => panic!("the effects ran; the retry must not run them again"),
+    }
+}
+
+#[tokio::test]
+async fn a_waiting_retry_sees_the_effects_ran_when_the_cache_no_longer_holds_the_reply() {
+    use futures_util::FutureExt;
+
+    // A cache that keeps no reply: as when other writes evict the completed
+    // reply before the waiting retry wakes.
+    let cache = IdempotencyCache::with_budget_bytes(0);
+    let EffectsClaim::Owner(owner) = cache.claim_effects("Job:j1", "k").await else {
+        panic!("the first dispatcher runs the effects");
+    };
+    let waiting = cache.claim_effects("Job:j1", "k");
+    tokio::pin!(waiting);
+    assert!(waiting.as_mut().now_or_never().is_none());
+
+    owner.complete(&req(), &make_response("Started"));
+    match waiting.await {
+        EffectsClaim::Applied(reply) => assert_eq!(reply.state.status, "Started"),
+        EffectsClaim::Owner(_) => {
+            panic!("the effects ran; the waiting retry must not run them again")
+        }
+    }
 }
 
 #[tokio::test]
