@@ -390,7 +390,8 @@ impl crate::state::ServerState {
         let workflow_root_entity_type = workflow_root_type(&agent_ctx, &entity_type);
         let workflow_root_entity_id = workflow_root_id(&agent_ctx, &entity_id);
         let workflow_run_id = workflow_run_id(&agent_ctx, &entity_type, &entity_id);
-        let span = tracing::info_span!(
+        let span = crate::trace_context::runtime_work_span!(
+            crate::trace_context::cause(),
             "dispatch.background_wasm_integrations",
             workflow.root_entity_type = %workflow_root_entity_type,
             workflow.root_entity_id = %workflow_root_entity_id,
@@ -440,3 +441,7 @@ impl crate::state::ServerState {
 #[cfg(test)]
 #[path = "dispatch_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runtime_work_trace_test.rs"]
+mod runtime_work_trace_tests;

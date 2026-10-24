@@ -619,8 +619,6 @@ pub struct ServerState {
     /// receive a clone of this Arc via `with_shared_streams` so
     /// FFI calls from the guest resolve to the same handle IDs.
     pub http_stream_registry: Arc<temper_wasm::http_stream::HttpStreamRegistry>,
-    /// Long-lived workflow root spans keyed by workflow.run_id.
-    pub(crate) workflow_spans: Arc<crate::workflow_tracing::WorkflowSpanRegistry>,
     /// Public hostnames owned by this process that may use in-process TData
     /// dispatch from WASM guests instead of leaving through the public edge.
     pub(crate) local_tdata_hosts: Arc<BTreeSet<String>>,
@@ -855,7 +853,6 @@ impl ServerState {
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
-            workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
@@ -1135,7 +1132,6 @@ impl ServerState {
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
-            workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
