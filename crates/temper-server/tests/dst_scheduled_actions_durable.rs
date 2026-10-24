@@ -2,14 +2,18 @@
 //!
 //! Workload, per seed: records arm `schedule(...)` and `schedule_at(...)`
 //! actions, once (`Fire`) or repeating (`Tick`, which schedules the next
-//! one). The process stops before some are due and after others, sometimes
-//! right after a fire, before any removal that is not part of its commit. The
-//! next process boots with `start_runtime` and nobody touches the records.
+//! one). Some `Fire`s meet a store that fails their write, or writes it and
+//! loses the answer. The process stops before some are due and after others,
+//! sometimes right after a fire, before any removal that is not part of its
+//! commit. The next process boots with `start_runtime` and nobody touches the
+//! records.
 //!
 //! Invariants:
 //! - every armed `Fire` fires exactly once, never before it is due, and at its
 //!   due time when that falls after the boot, or soon after the boot when the
-//!   process was down at that time;
+//!   process was down at that time; a write that failed or may have landed is
+//!   retried on the same row, so it is late by its retries, never lost and
+//!   never run twice;
 //! - a repeating `Tick` keeps going after the restart, never twice within one
 //!   period;
 //! - a fire's event and the removal of its row commit together: no stop
@@ -51,6 +55,10 @@ const PERIOD: i64 = 600;
 /// A fire after the boot must come at its due time; one that fell due while
 /// the process was down, within this long of the boot (eight fire at once).
 const BOOT_FIRE_WINDOW: i64 = 5;
+
+/// How late a `Fire` whose writes fail may land: its retries (the store
+/// fails up to three writes).
+const RETRY_WINDOW: i64 = 15;
 
 const JOB: &str = r#"
 [automaton]
@@ -109,8 +117,8 @@ const TENANT: &str = "alpha";
 /// What a record of the workload armed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
-    /// `Fire`, due at this time.
-    Once(DateTime<Utc>),
+    /// `Fire`, due at this time; whether the store faults its write.
+    Once(DateTime<Utc>, bool),
     /// `Tick` every [`PERIOD`].
     Repeat,
 }
@@ -267,14 +275,14 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 0 => (
                     "Start",
                     json!({}),
-                    Arm::Once(now + chrono::Duration::seconds(PERIOD)),
+                    Arm::Once(now + chrono::Duration::seconds(PERIOD), false),
                 ),
                 1 => {
                     let due = now + chrono::Duration::seconds(rng.next_bound(7200) as i64);
                     (
                         "StartAt",
                         json!({ "due": due.to_rfc3339() }),
-                        Arm::Once(due),
+                        Arm::Once(due, false),
                     )
                 }
                 _ => ("Activate", json!({}), Arm::Repeat),
@@ -282,6 +290,28 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             if !act(state, &id, action, params).await {
                 return Err(run.fail("records arm their actions", format!("{id} {action}")));
             }
+            // The record's next write is its fire's: the store may fail it,
+            // or write it and lose the answer.
+            let arm = match (arm, rng.next_bound(3)) {
+                (Arm::Once(due, _), 1) => {
+                    let failures = 1 + rng.next_bound(3);
+                    world
+                        .events
+                        .fail_next_appends(&format!("{TENANT}:Job:{id}"), failures);
+                    run.trace
+                        .push(format!("{id}: its next {failures} writes fail"));
+                    Arm::Once(due, true)
+                }
+                (Arm::Once(due, _), 2) => {
+                    world
+                        .events
+                        .lose_next_append_answers(&format!("{TENANT}:Job:{id}"), 1);
+                    run.trace
+                        .push(format!("{id}: its next write's answer is lost"));
+                    Arm::Once(due, true)
+                }
+                (arm, _) => arm,
+            };
             run.trace.push(format!("{id}: {action} at {now}, {arm:?}"));
             arms.insert(id, arm);
         }
@@ -295,7 +325,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
         let dues: Vec<(&String, DateTime<Utc>)> = arms
             .iter()
             .filter_map(|(id, arm)| match arm {
-                Arm::Once(due) if *due > now => Some((id, *due)),
+                Arm::Once(due, _) if *due > now => Some((id, *due)),
                 _ => None,
             })
             .collect();
@@ -356,7 +386,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
         let last_due = arms
             .values()
             .filter_map(|arm| match arm {
-                Arm::Once(due) => Some(*due),
+                Arm::Once(due, _) => Some(*due),
                 Arm::Repeat => None,
             })
             .max()
@@ -372,7 +402,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 return Err(run.fail("scheduled actions keep no state timer row", id.clone()));
             }
             match arm {
-                Arm::Once(due) => {
+                Arm::Once(due, faulted) => {
                     let fires = fired_at(state, id, "Fire").await;
                     let [fire] = fires.as_slice() else {
                         return Err(run.fail(
@@ -382,10 +412,12 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                     };
                     // Due after the boot, or fired before the stop: at its due
                     // time. Due while the process was down: soon after the boot.
+                    // Either way late by its retries when its writes fail.
+                    let late = if *faulted { RETRY_WINDOW } else { 1 };
                     let on_time = if *due > boot || *fire < boot {
-                        (*fire - *due).num_seconds().abs() <= 1
+                        (-1..=late).contains(&(*fire - *due).num_seconds())
                     } else {
-                        (*fire - boot).num_seconds() <= BOOT_FIRE_WINDOW
+                        (*fire - boot).num_seconds() <= BOOT_FIRE_WINDOW + late
                     };
                     if !on_time {
                         return Err(run.fail(
