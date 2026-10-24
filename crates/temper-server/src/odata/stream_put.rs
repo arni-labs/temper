@@ -304,6 +304,8 @@ pub(super) async fn handle_stream_put(
                     await_integration: false,
                     await_reactions: true,
                 },
+                // The upload module's callback action, a kernel follow-on.
+                crate::state::write_record::WriteCaller::Kernel,
                 expected_authorization_precondition,
             )
             .await

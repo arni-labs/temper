@@ -26,6 +26,7 @@ pub use list_uniformity::ListReadUniformity;
 pub use platform_policy::VERIFIED_OPERATOR_WHEN;
 use platform_policy::{
     compiled_system_platform_policies, count_user_policies, merge_system_platform_policy,
+    platform_authority_policy,
 };
 
 #[cfg(test)]
@@ -106,6 +107,8 @@ pub struct AuthzEngine {
     /// Only System principals are evaluated against this set; all externally
     /// resolvable principal kinds still fail closed for an unloaded tenant.
     platform_policy_set: CompiledPolicies,
+    /// Permits exactly the principals with platform authority.
+    platform_authority_policy: CompiledPolicies,
     authorizer: Authorizer,
 }
 
@@ -125,6 +128,7 @@ impl AuthzEngine {
             tenant_policies: RwLock::new(BTreeMap::new()),
             fallback_policy_set: RwLock::new(CompiledPolicies::new(policy_set)),
             platform_policy_set: compiled_system_platform_policies(),
+            platform_authority_policy: platform_authority_policy(),
             authorizer: Authorizer::new(),
         })
     }
@@ -143,6 +147,7 @@ impl AuthzEngine {
             tenant_policies: RwLock::new(BTreeMap::new()),
             fallback_policy_set: RwLock::new(CompiledPolicies::new(policy_set)),
             platform_policy_set: compiled_system_platform_policies(),
+            platform_authority_policy: platform_authority_policy(),
             authorizer: Authorizer::new(),
         }
     }
@@ -164,6 +169,7 @@ impl AuthzEngine {
             tenant_policies: RwLock::new(BTreeMap::new()),
             fallback_policy_set: RwLock::new(CompiledPolicies::new(policy_set)),
             platform_policy_set: compiled_system_platform_policies(),
+            platform_authority_policy: platform_authority_policy(),
             authorizer: Authorizer::new(),
         }
     }

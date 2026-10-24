@@ -566,6 +566,9 @@ pub enum ConcurrencyRetryOutcome {
     /// Replay caught the entity in a state where the action is no longer legal
     /// (e.g., the entity reached a terminal state during the race).
     ActionIllegal,
+    /// The caller held the action to the state it read, and the journal held
+    /// a newer one; the action was refused as stale, not re-applied.
+    Stale,
 }
 
 impl ConcurrencyRetryOutcome {
@@ -575,6 +578,7 @@ impl ConcurrencyRetryOutcome {
             ConcurrencyRetryOutcome::Success => "success",
             ConcurrencyRetryOutcome::Exhausted => "exhausted",
             ConcurrencyRetryOutcome::ActionIllegal => "action_illegal",
+            ConcurrencyRetryOutcome::Stale => "stale",
         }
     }
 }

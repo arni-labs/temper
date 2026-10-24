@@ -460,6 +460,8 @@ impl ServerState {
                         await_integration: options.await_integration,
                         await_reactions: options.await_reactions,
                     },
+                    // The file module's callback action, a kernel follow-on.
+                    crate::state::write_record::WriteCaller::Kernel,
                     expected,
                 )
                 .await

@@ -418,3 +418,41 @@ pub(crate) async fn hydrate_comparison_fields(
     }
     Ok(())
 }
+
+/// `fields` with each field named in `names` that a write stored out of line
+/// (a field-overflow reference) holding its value again, read from `source`
+/// and verified against its key, so a check on the record reads the value
+/// and not the reference. `None` when no named field holds a reference, so
+/// `fields` already reads as its values. `Err` when a referenced value could
+/// not be read and verified.
+pub(crate) async fn resolve_stored_fields(
+    source: &BlobReadSource<'_>,
+    fields: &Value,
+    names: &BTreeSet<String>,
+) -> Result<Option<Value>, String> {
+    let holds_reference = |value: &Value| {
+        let mut pointers = Vec::new();
+        collect_blob_ref_pointers(value, "", &mut pointers);
+        !pointers.is_empty()
+    };
+    let Some(map) = fields.as_object() else {
+        return Ok(None);
+    };
+    let stored: serde_json::Map<String, Value> = names
+        .iter()
+        .filter_map(|name| {
+            let value = map.get(name).filter(|value| holds_reference(value))?;
+            Some((name.clone(), value.clone()))
+        })
+        .collect();
+    if stored.is_empty() {
+        return Ok(None);
+    }
+    let mut stored = Value::Object(stored);
+    hydrate_comparison_fields(source, &mut stored).await?;
+    let mut resolved = map.clone();
+    if let Value::Object(stored) = stored {
+        resolved.extend(stored);
+    }
+    Ok(Some(Value::Object(resolved)))
+}

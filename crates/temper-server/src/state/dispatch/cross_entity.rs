@@ -19,16 +19,9 @@ impl crate::state::ServerState {
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        let mut result = RelatedMap::new();
-        let refs: Vec<(String, String)> = {
-            let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
-            let Some(spec) = registry.get_spec(tenant, entity_type) else {
-                return result;
-            };
-            spec.table().guard_related_refs(action)
-        };
+        let refs = self.guard_related_refs(tenant, entity_type, action);
         if refs.is_empty() {
-            return result;
+            return RelatedMap::new();
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -37,9 +30,37 @@ impl crate::state::ServerState {
             .await
         {
             Ok(resp) => resp.state.fields,
-            Err(_) => return result,
+            Err(_) => return RelatedMap::new(),
         };
+        self.resolve_guard_refs(tenant, refs, &current_fields, None)
+            .await
+    }
 
+    /// The `(related type, id field)` pairs the guards of `action` read.
+    pub(super) fn guard_related_refs(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        action: &str,
+    ) -> Vec<(String, String)> {
+        let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
+        registry
+            .get_spec(tenant, entity_type)
+            .map(|spec| spec.table().guard_related_refs(action))
+            .unwrap_or_default()
+    }
+
+    /// Resolve each related entity `refs` names through the ids in
+    /// `current_fields`. A related entity that is `committed` is read as that
+    /// state instead of the store.
+    pub(super) async fn resolve_guard_refs(
+        &self,
+        tenant: &TenantId,
+        refs: Vec<(String, String)>,
+        current_fields: &serde_json::Value,
+        committed: Option<&crate::entity_actor::EntityState>,
+    ) -> RelatedMap {
+        let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
             let ids: Vec<&str> = match current_fields.get(&id_field) {
                 Some(serde_json::Value::Array(items)) => items
@@ -52,7 +73,13 @@ impl crate::state::ServerState {
             };
             let mut statuses = Vec::with_capacity(ids.len());
             for id in ids {
-                statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
+                let status = match committed {
+                    Some(record) if record.entity_type == target_type && record.entity_id == id => {
+                        Some(record.status.clone())
+                    }
+                    _ => self.resolve_entity_status(tenant, &target_type, id).await,
+                };
+                statuses.push(status);
             }
             result.insert((target_type, id_field), Related::Statuses(statuses));
         }
@@ -81,11 +108,10 @@ impl crate::state::ServerState {
             let t = tenant.clone();
             let parent_t = parent_type.to_string();
             let parent_i = parent_id.to_string();
+            let req = req.clone();
             let child_type = req.entity_type.clone();
             let child_id = req.entity_id.clone();
-            let initial_action = req.initial_action.clone();
             let parent_params = action_params.clone();
-            let copied_fields = req.copied_fields.clone();
             let agent = agent_ctx.clone();
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
@@ -113,128 +139,29 @@ impl crate::state::ServerState {
             tokio::spawn(
                 async move {
                     // determinism-ok: spawn dispatch is a background side-effect
-                    let mut parent_fields = serde_json::Map::new();
-                    parent_fields.insert(
-                        "parent_type".to_string(),
-                        serde_json::Value::String(parent_t.clone()),
-                    );
-                    parent_fields.insert(
-                        "parent_id".to_string(),
-                        serde_json::Value::String(parent_i.clone()),
-                    );
-                    parent_fields.insert(
-                        format!("{}_id", to_snake_case(&parent_t)),
-                        serde_json::Value::String(parent_i.clone()),
-                    );
-                    let child_table = match state.transition_table_for_dispatch(&t, &child_type) {
-                        Ok(table) => table,
-                        Err(error) => {
+                    let plan = match state
+                        .spawn_plan(&t, &parent_t, &parent_i, &req, &parent_params)
+                        .await
+                    {
+                        Ok(plan) => plan,
+                        Err(refusal) => {
                             state.record_generated_callback_refusal(
                                 super::WasmEntityRef {
                                     tenant: &t,
                                     entity_type: &parent_t,
                                     entity_id: &parent_i,
                                 },
-                                "spawn",
-                                &error.to_string(),
+                                &refusal.action,
+                                &refusal.error,
                             );
                             return;
                         }
                     };
-                    let strict_child = child_table.strict_action_params;
-                    if strict_child && initial_action.is_none() {
-                        state.record_generated_callback_refusal(
-                            super::WasmEntityRef {
-                                tenant: &t,
-                                entity_type: &parent_t,
-                                entity_id: &parent_i,
-                            },
-                            "spawn",
-                            "Strict child requires a declared initializer for its generated fields",
-                        );
-                        return;
-                    }
-                    let initializer = if let Some(action) = initial_action {
-                        // Copied parent fields fill in what this action's own
-                        // params do not carry; a param wins, so a value the
-                        // spawning action just set is never overwritten by the
-                        // field as it stood before the action.
-                        let mut params = copied_fields;
-                        params.extend(parent_params.as_object().cloned().unwrap_or_default());
-                        params.extend(parent_fields.clone());
-                        match state.prepare_generated_action_params(
-                            &t,
-                            &child_type,
-                            &action,
-                            serde_json::Value::Object(params),
-                        ) {
-                            Ok(params) => Some((action, params)),
-                            Err(error) => {
-                                state.record_generated_callback_refusal(
-                                    super::WasmEntityRef {
-                                        tenant: &t,
-                                        entity_type: &parent_t,
-                                        entity_id: &parent_i,
-                                    },
-                                    &action,
-                                    &error,
-                                );
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    // A strict child's declared initializer accepts its data. The
-                    // spawn effect supplies only identity to generic creation.
-                    let initial_fields = if strict_child {
-                        serde_json::json!({})
-                    } else {
-                        serde_json::Value::Object(parent_fields.clone())
-                    };
-
-                    if let Some((action, params)) = &initializer {
-                        let table = &child_table;
-                        let validation = state
-                            .load_authz_resource_snapshot(&t, &child_type, &child_id)
-                            .await
-                            .and_then(|snapshot| {
-                                // Existing actors validate against their hydrated blob
-                                // values and execution-time state. Only absent children
-                                // need this check before creation can persist anything.
-                                if snapshot.exists {
-                                    return Ok(());
-                                }
-                                let prestate =
-                                    crate::entity_actor::EntityActor::build_initial_state(
-                                        &child_type,
-                                        &child_id,
-                                        table,
-                                        &initial_fields,
-                                    );
-                                table
-                                    .validate_action_params(
-                                        action,
-                                        params,
-                                        &prestate.fields,
-                                        &prestate.counters,
-                                        &prestate.booleans,
-                                    )
-                                    .map_err(String::from)
-                            });
-                        if let Err(error) = validation {
-                            state.record_generated_callback_refusal(
-                                super::WasmEntityRef {
-                                    tenant: &t,
-                                    entity_type: &parent_t,
-                                    entity_id: &parent_i,
-                                },
-                                action,
-                                &error,
-                            );
-                            return;
-                        }
-                    }
+                    let super::spawn_plan::SpawnPlan {
+                        initial_fields,
+                        initializer,
+                        ..
+                    } = plan;
 
                     match state
                         .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
@@ -320,23 +247,6 @@ impl crate::state::ServerState {
             );
         }
     }
-}
-
-fn to_snake_case(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    for (index, ch) in value.chars().enumerate() {
-        match ch {
-            'A'..='Z' => {
-                if index > 0 {
-                    result.push('_');
-                }
-                result.push(ch.to_ascii_lowercase());
-            }
-            '-' | ' ' => result.push('_'),
-            _ => result.push(ch.to_ascii_lowercase()),
-        }
-    }
-    result
 }
 
 #[cfg(test)]

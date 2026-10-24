@@ -10,14 +10,14 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use temper_authz::SecurityContext;
 
 use super::account_verification::enforce_commons_account_verified_for_action;
-use super::common::run_write_prechecks;
 use super::file_content::refuse_caller_content;
-use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_action};
+use super::rate_limit::enforce_commons_write_rate_limit;
 use super::response::annotate_entity;
 use crate::authz::{DenialInput, record_authz_denial};
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_denial, odata_error, odata_refusal};
+use crate::state::write_record::WriteCaller;
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
 use temper_jit::table::ContractError;
 
@@ -193,6 +193,7 @@ pub(super) async fn dispatch_bound_action(
         entity_type,
         &current_state.state.fields,
         &resolved_body,
+        security_ctx,
     )
     .await
     {
@@ -200,34 +201,8 @@ pub(super) async fn dispatch_bound_action(
         return *resp;
     }
 
-    if let Err(resp) = enforce_commons_write_rate_limit(
-        state,
-        tenant,
-        entity_type,
-        owner_id_from_action(&current_state.state.fields, &resolved_body),
-        security_ctx,
-    )
-    .await
-    {
-        action_span.set_status(Status::error("RateLimitExceeded"));
-        return resp;
-    }
-
-    let current_fields = current_state.state.fields.clone();
-    if let Err(resp) = run_write_prechecks(
-        state,
-        tenant,
-        entity_type,
-        key_str,
-        action,
-        "bound_action",
-        &current_fields,
-    )
-    .await
-    {
-        action_span.set_status(Status::error("ConstraintViolation"));
-        return resp;
-    }
+    // Relation integrity, field invariants and cross-invariants are checked by
+    // dispatch on the record the action stores, as on every other action path.
     if let Some(resp) = refuse_caller_content(entity_type, action, &resolved_body) {
         action_span.set_status(Status::error("FileContentFields"));
         return resp;
@@ -268,6 +243,15 @@ pub(super) async fn dispatch_bound_action(
     {
         action_span.set_status(Status::error(code));
         return odata_error(StatusCode::BAD_REQUEST, code, &message).into_response();
+    }
+
+    // Charged only once the action contract accepts the request: a refused
+    // request spends no write token.
+    if let Err(resp) =
+        enforce_commons_write_rate_limit(state, tenant, entity_type, security_ctx).await
+    {
+        action_span.set_status(Status::error("RateLimitExceeded"));
+        return resp;
     }
 
     let snapshot = match state
@@ -325,6 +309,7 @@ pub(super) async fn dispatch_bound_action(
                 await_integration,
                 await_reactions: true,
             },
+            WriteCaller::of_request(security_ctx),
             expected_authorization_precondition,
         )
         .await;
@@ -415,6 +400,10 @@ pub(super) async fn dispatch_bound_action(
         Err(DispatchError::Conflict(reason)) => {
             action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::CONFLICT, "Conflict", &reason).into_response()
+        }
+        Err(DispatchError::StaleWrite(stale)) => {
+            action_span.set_status(Status::error(stale.to_string()));
+            (StatusCode::CONFLICT, axum::Json(stale.body())).into_response()
         }
         // ADR-0048: transient exhaustion → 503 Retry-After so clients and
         // proxies back off instead of paging someone.
