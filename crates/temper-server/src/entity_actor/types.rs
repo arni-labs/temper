@@ -147,15 +147,14 @@ impl StatusClock {
 }
 
 impl EntityState {
-    /// Whether the entity is deleted: its newest event is the kernel's
-    /// tombstone, as [`temper_runtime::persistence::journal_is_deleted`] reads
-    /// a journal. A spec action named or leading to `Deleted` does not delete.
-    /// The tombstone is terminal and always the newest event, so a deleted
-    /// entity never takes another action and its id is never created again.
+    /// Whether the entity is gone: its status is `Deleted`. The kernel's
+    /// tombstone (`journal_is_deleted`) always leaves that status, and so does
+    /// a spec action that leads to `Deleted`. The loader, the query projection
+    /// and composite reloads all treat that status as gone, so a create of the
+    /// key answers 409 and never returns the stored fields. A spec action
+    /// named `Deleted` that leads to another status leaves the entity live.
     pub fn is_deleted(&self) -> bool {
-        self.events
-            .back()
-            .is_some_and(|event| event.kind == temper_runtime::persistence::EventKind::Tombstone)
+        self.status == "Deleted"
     }
 
     /// Return true if this entity can accept one more event under budget.

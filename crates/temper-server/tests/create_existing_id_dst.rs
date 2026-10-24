@@ -52,10 +52,8 @@ const DELETED_KEY_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 12, 22, 2
 
 /// Seeds whose schedule put an order back into the query projection after a
 /// declared action moved it to `Deleted`, while the stores checked only for the
-/// tombstone: 14 of seeds 0..64 (3, 6, 9, 12, 15, 18, 24, 30 kept), and every
-/// seed once a create read such an order as live rather than deleted (0-7
-/// kept).
-const DELETING_ACTION_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 9, 12, 15, 18, 24, 30];
+/// tombstone (14 of seeds 0..64 did; these are the first eight).
+const DELETING_ACTION_REGRESSION_SEEDS: &[u64] = &[3, 6, 9, 12, 15, 18, 24, 30];
 
 /// Seeds explored on every run besides the regression cases.
 const EXPLORED_SEEDS: u64 = 64;
@@ -350,7 +348,7 @@ async fn repeated_create_racing_a_deleting_action(seed: u64) -> Result<(), Strin
         state.dispatch_tenant_action(&tenant, "Order", "raced-key", "Discard", json!({}), &system,),
     );
     match discarded {
-        Ok(response) if response.success && response.state.status == "Deleted" => {}
+        Ok(response) if response.success && response.state.is_deleted() => {}
         other => return Err(format!("the discard failed: {other:?}")),
     }
     if projection.holds("Order", "raced-key") {
@@ -361,14 +359,27 @@ async fn repeated_create_racing_a_deleting_action(seed: u64) -> Result<(), Strin
     Ok(())
 }
 
+/// How a scenario takes an order out of existence.
+#[derive(Clone, Copy, Debug)]
+enum Deletion {
+    /// The kernel's delete, which journals the tombstone.
+    Kernel,
+    /// A declared action that moves the order to its `Deleted` status.
+    DeclaredAction,
+}
+
 /// An order is created and deleted, then its owner and another caller create
 /// its key at once. Deletion is terminal: both get 409 with no body (never a
 /// 500 from an actor the other create stopped), neither sees the deleted
 /// order's fields, and the order stays out of reads, the
 /// entity index and the query projection. `Err` names the broken invariant.
-async fn creates_of_a_deleted_key(seed: u64) -> Result<(), String> {
+async fn creates_of_a_deleted_key(seed: u64, deletion: Deletion) -> Result<(), String> {
     let _sim = install_deterministic_context(seed);
-    let (state, projection) = order_state(seed, &format!("create-deleted-{seed}"));
+    let system = format!("create-deleted-{deletion:?}-{seed}");
+    let (state, projection) = match deletion {
+        Deletion::Kernel => order_state(seed, &system),
+        Deletion::DeclaredAction => order_state_with_spec(seed, &system, ORDER_DISCARDABLE_IOA),
+    };
     let tenant = TenantId::default();
     let (status, body) = send(
         &state,
@@ -381,12 +392,28 @@ async fn creates_of_a_deleted_key(seed: u64) -> Result<(), String> {
     if status != StatusCode::CREATED {
         return Err(format!("the first create got {status} {body}"));
     }
-    match state
-        .delete_tenant_entity(&tenant, "Order", "raced-key")
-        .await
-    {
-        Ok(response) if response.success => {}
-        other => return Err(format!("the delete failed: {other:?}")),
+    let deleted = match deletion {
+        Deletion::Kernel => {
+            state
+                .delete_tenant_entity(&tenant, "Order", "raced-key")
+                .await
+        }
+        Deletion::DeclaredAction => {
+            state
+                .dispatch_tenant_action(
+                    &tenant,
+                    "Order",
+                    "raced-key",
+                    "Discard",
+                    json!({}),
+                    &AgentContext::system(),
+                )
+                .await
+        }
+    };
+    match deleted {
+        Ok(response) if response.success && response.state.is_deleted() => {}
+        other => return Err(format!("the deletion failed: {other:?}")),
     }
 
     let _faults = install_buggify_context(seed);
@@ -450,8 +477,10 @@ async fn a_repeated_create_racing_a_deleting_action_leaves_the_record_out_of_que
 #[tokio::test]
 async fn creates_of_a_deleted_key_answer_409_and_leave_it_deleted() {
     for seed in seeds(DELETED_KEY_REGRESSION_SEEDS) {
-        if let Err(violation) = creates_of_a_deleted_key(seed).await {
-            panic!("seed {seed}: {violation}");
+        for deletion in [Deletion::Kernel, Deletion::DeclaredAction] {
+            if let Err(violation) = creates_of_a_deleted_key(seed, deletion).await {
+                panic!("seed {seed}, {deletion:?}: {violation}");
+            }
         }
     }
 }
