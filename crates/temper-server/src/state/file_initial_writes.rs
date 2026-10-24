@@ -236,12 +236,14 @@ impl ServerState {
 
         let response = EntityResponse {
             success: true,
+            refusal: None,
             state,
             error: None,
             custom_effects: vec![],
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         };
         self.broadcast_synthetic_file_stream_update(tenant, file_id, &response, agent_ctx);
         Ok(response)

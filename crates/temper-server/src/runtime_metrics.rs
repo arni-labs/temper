@@ -2,7 +2,7 @@
 //!
 //! This module provides metric recording helpers called from hot paths
 //! (entity actor replay, entity ops).  The periodic canary loop and
-//! sampler live in `state::runtime_metrics` via `spawn_runtime_metrics_loop`.
+//! sampler live in `state::runtime_metrics`, started by `ServerState::start_runtime`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -566,6 +566,9 @@ pub enum ConcurrencyRetryOutcome {
     /// Replay caught the entity in a state where the action is no longer legal
     /// (e.g., the entity reached a terminal state during the race).
     ActionIllegal,
+    /// Replay found the action's own event in the journal: an earlier attempt
+    /// landed although the store answered with a concurrency violation.
+    AlreadyWritten,
 }
 
 impl ConcurrencyRetryOutcome {
@@ -575,6 +578,7 @@ impl ConcurrencyRetryOutcome {
             ConcurrencyRetryOutcome::Success => "success",
             ConcurrencyRetryOutcome::Exhausted => "exhausted",
             ConcurrencyRetryOutcome::ActionIllegal => "action_illegal",
+            ConcurrencyRetryOutcome::AlreadyWritten => "already_written",
         }
     }
 }

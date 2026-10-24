@@ -299,6 +299,7 @@ impl ServerState {
             .ok_or_else(|| format!("No transition table for {tenant}/{entity_type}"))?;
             EntityResponse {
                 success: true,
+                refusal: None,
                 state: EntityActor::build_initial_state(
                     entity_type,
                     entity_id,
@@ -310,6 +311,7 @@ impl ServerState {
                 scheduled_actions: vec![],
                 spawn_requests: vec![],
                 spec_governed: true,
+                refused: false,
             }
         };
 
@@ -1008,7 +1010,8 @@ impl ServerState {
                 .with_idempotency_cache(self.idempotency_cache.clone())
                 .with_blob_store(tenant_blob_store),
         }
-        .with_legacy_blob_store(legacy_blob_store);
+        .with_legacy_blob_store(legacy_blob_store)
+        .with_on_rehydrated(self.state_timer_rehydrate_hook(tenant, entity_type, entity_id));
 
         // Slow-path: atomically re-check and spawn under write lock.
         // This prevents duplicate actors when concurrent requests race to create
@@ -1636,12 +1639,14 @@ impl ServerState {
 
         Ok(Some(EntityResponse {
             success: true,
+            refusal: None,
             state,
             error: None,
             custom_effects: vec![],
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         }))
     }
 
@@ -1914,9 +1919,11 @@ impl ServerState {
             }
 
             // Tombstone persisted successfully; now it is safe to remove actor
-            // and in-memory index entries.
+            // and in-memory index entries. A deleted record keeps no timer.
             let _ = actor_ref.stop();
             self.remove_entity(tenant, entity_type, entity_id);
+            self.reconcile_state_timers(tenant, entity_type, entity_id, &response.state, None)
+                .await;
         }
 
         Ok(response)

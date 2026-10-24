@@ -751,12 +751,14 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("WASM integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
                             scheduled_actions: Vec::new(),
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
+                            refused: false,
                         };
                     }
                 }
@@ -785,12 +787,14 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("adapter integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
                             scheduled_actions: Vec::new(),
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
+                            refused: false,
                         };
                     }
                 }
