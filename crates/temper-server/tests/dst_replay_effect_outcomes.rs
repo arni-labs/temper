@@ -11,6 +11,7 @@
 //! child is real when its own journal exists.
 
 use temper_runtime::ActorSystem;
+use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
 use temper_server::entity_actor::EntityResponse;
@@ -285,5 +286,68 @@ async fn dst_restart_under_a_changed_effect_keeps_the_stored_counter() {
         let after = dispatch(&state, &doc_id, "Ask").await;
         assert_eq!(asks(&after), 7, "seed {seed}: a new Ask under v2");
         wait_for_raised_note(&store, &notice(&after)).await;
+    }
+}
+
+// =========================================================================
+// Events journaled before outcomes were recorded: a minted child id was never
+// journaled, so replay leaves the field unknown instead of minting one.
+// =========================================================================
+
+#[tokio::test]
+async fn dst_legacy_events_never_mint_a_child_id() {
+    for seed in 0..NUM_SEEDS {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let store = SimEventStore::no_faults(seed);
+        let doc_id = format!("doc-legacy-{seed}");
+        let doc_journal = format!("default:Doc:{doc_id}");
+
+        {
+            let state = server(&store, "replay-outcomes-legacy-live", 1);
+            ask_twice(&state, &store, &doc_id).await;
+        }
+
+        // The same journal as an older build wrote it: no recorded outcomes.
+        let legacy = SimEventStore::no_faults(seed);
+        for (index, mut envelope) in store.dump_journal(&doc_journal).into_iter().enumerate() {
+            if let Some(payload) = envelope.payload.as_object_mut() {
+                payload.remove("outcome");
+            }
+            legacy
+                .append(&doc_journal, index as u64, &[envelope])
+                .await
+                .expect("copy the journal");
+        }
+        for persistence_id in store.list_all_persistence_ids() {
+            if persistence_id.starts_with("default:Note:") {
+                for (index, envelope) in store.dump_journal(&persistence_id).into_iter().enumerate()
+                {
+                    legacy
+                        .append(&persistence_id, index as u64, &[envelope])
+                        .await
+                        .expect("copy the child journal");
+                }
+            }
+        }
+        assert!(
+            legacy
+                .dump_journal(&doc_journal)
+                .iter()
+                .all(|env| env.payload.get("outcome").is_none()),
+            "seed {seed}: the copied journal records no outcomes"
+        );
+
+        let (_guard2, _clock2, _ids2) = install_deterministic_context(seed + 30_000);
+        let state = server(&legacy, "replay-outcomes-legacy-restart", 1);
+        let rebuilt = read_doc(&state, &doc_id).await;
+        let stored = notice(&rebuilt);
+        assert!(
+            stored.is_empty(),
+            "seed {seed}: replay of a legacy spawn wrote notice {stored} (record exists: {}); \
+             the minted id was never journaled, so it must stay unknown",
+            note_exists(&legacy, &stored)
+        );
+        assert_eq!(asks(&rebuilt), 2, "seed {seed}: legacy counters re-derive");
+        assert_eq!(rebuilt.state.status, "Asked", "seed {seed}: status");
     }
 }

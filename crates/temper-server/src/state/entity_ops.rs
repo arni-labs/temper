@@ -1254,6 +1254,7 @@ impl ServerState {
             params: fields,
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
@@ -1440,6 +1441,7 @@ impl ServerState {
             params: initial_fields,
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;

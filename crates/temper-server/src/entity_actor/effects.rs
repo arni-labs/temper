@@ -13,7 +13,7 @@ use temper_runtime::scheduler::{sim_now, sim_uuid};
 
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, OverflowBlobWrite, blob_ref_value};
 
-use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
+use super::types::{EffectOutcome, EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 /// Journal event type for a PATCH-style field merge (ARN-189).
 pub(crate) const FIELDS_UPDATED_EVENT: &str = "FieldsUpdated";
@@ -389,8 +389,12 @@ pub(crate) fn process_action_with_xref_and_field_mode(
             let sanitized_params = sanitize_action_params(effective_params.as_ref());
             let params = sanitized_params.as_ref();
 
-            let (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests) =
-                apply_effects(state, &transition_result.effects, params);
+            let (
+                (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests),
+                outcome,
+            ) = record_effect_outcome(state, |state| {
+                apply_effects(state, &transition_result.effects, params)
+            });
             apply_new_state_fallback(state, &from_status, &to_status);
             let overflow_blobs = sync_fields_with_metadata(
                 state,
@@ -411,6 +415,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 params: params.clone(),
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                outcome: Some(outcome),
             };
 
             ProcessResult {
@@ -825,6 +830,123 @@ fn set_counter(state: &mut EntityState, var: &str, value: usize) {
     state.counters.insert(var.to_string(), value);
     if var == "items" {
         state.item_count = value;
+    }
+}
+
+/// Run `apply` (a transition's effects) on `state` and record what it wrote.
+///
+/// The record is the difference between the state before and after, so it
+/// covers every effect, including one added later. The event carries it and
+/// replay restores it with [`EffectOutcome::restore`].
+pub(crate) fn record_effect_outcome<R>(
+    state: &mut EntityState,
+    apply: impl FnOnce(&mut EntityState) -> R,
+) -> (R, EffectOutcome) {
+    let counters = state.counters.clone();
+    let booleans = state.booleans.clone();
+    let lists = state.lists.clone();
+    let fields = state.fields.as_object().cloned().unwrap_or_default();
+
+    let applied = apply(state);
+
+    let outcome = EffectOutcome {
+        counters: changed_entries(&counters, &state.counters),
+        booleans: changed_entries(&booleans, &state.booleans),
+        lists: changed_entries(&lists, &state.lists),
+        fields: state
+            .fields
+            .as_object()
+            .map(|after| {
+                debug_assert!(
+                    fields.keys().all(|key| after.contains_key(key)),
+                    "an effect removed a field; the outcome records only set values"
+                );
+                after
+                    .iter()
+                    .filter(|(key, value)| fields.get(*key) != Some(*value))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    (applied, outcome)
+}
+
+/// The entries of `after` that are new or differ from `before`.
+fn changed_entries<V: PartialEq + Clone>(
+    before: &std::collections::BTreeMap<String, V>,
+    after: &std::collections::BTreeMap<String, V>,
+) -> std::collections::BTreeMap<String, V> {
+    debug_assert!(
+        before.keys().all(|key| after.contains_key(key)),
+        "an effect removed a state variable; the outcome records only set values"
+    );
+    after
+        .iter()
+        .filter(|(key, value)| before.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+impl EffectOutcome {
+    /// Write the recorded values back: what the effects wrote when the event
+    /// was committed, whatever the active spec's effects would compute now.
+    pub(crate) fn restore(&self, state: &mut EntityState) {
+        for (var, value) in &self.counters {
+            set_counter(state, var, *value);
+        }
+        for (var, value) in &self.booleans {
+            state.booleans.insert(var.clone(), *value);
+        }
+        for (var, value) in &self.lists {
+            state.lists.insert(var.clone(), value.clone());
+        }
+        if let Some(fields) = state.fields.as_object_mut() {
+            for (key, value) in &self.fields {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Re-derive the effects of a transition journaled before outcomes were
+/// recorded, without producing any value the journal does not hold.
+///
+/// A spawn whose child id came from the event's params writes that id again.
+/// A spawn that minted its id did so when the action ran, and the id was
+/// never journaled, so its field is removed: unknown, rather than a new id
+/// that names no record or an older child's id. Every other effect is
+/// re-derived from the table, as before. The spawn, schedule and custom
+/// requests are dropped: replay dispatches nothing.
+pub(crate) fn apply_legacy_replay_effects(
+    state: &mut EntityState,
+    effects: &[Effect],
+    params: &serde_json::Value,
+) {
+    for effect in effects {
+        if let Effect::SpawnEntity {
+            store_id_in, id, ..
+        } = effect
+            && id
+                .as_ref()
+                .and_then(|id| effect_args::string(id, params))
+                .is_none()
+        {
+            if let Some(field) = store_id_in
+                && let Some(fields) = state.fields.as_object_mut()
+                && fields.remove(field).is_some()
+            {
+                tracing::warn!(
+                    entity_type = %state.entity_type,
+                    entity_id = %state.entity_id,
+                    field = %field,
+                    "replay cleared a spawned child id that an event from before \
+                     recorded outcomes did not journal"
+                );
+            }
+            continue;
+        }
+        let _requests = apply_effects(state, std::slice::from_ref(effect), params);
     }
 }
 

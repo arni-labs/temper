@@ -491,6 +491,7 @@ fn snapshot_keeps_the_status_clock() {
         params: serde_json::json!({}),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     };
     state.push_event_bounded(event("Submit", "Draft", "Submitted", 10));
     state.push_event_bounded(event("Note", "Submitted", "Submitted", 20));
@@ -2614,6 +2615,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         params: serde_json::json!({"Customer": "Alice"}),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,
