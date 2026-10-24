@@ -22,6 +22,9 @@
 //! client disconnected) cannot leave members held, or live actors serving the
 //! state from before a committed tombstone.
 
+use std::time::Duration;
+
+use temper_runtime::actor::{ActorError, ActorRef};
 use temper_runtime::persistence::{
     EventMetadata, PersistenceAppend, PersistenceEnvelope, PersistenceError,
 };
@@ -30,6 +33,7 @@ use temper_runtime::tenant::TenantId;
 use tracing::{Instrument, instrument};
 
 use super::ServerState;
+use super::dispatch::retry;
 use crate::entity_actor::effects::entity_authorization_precondition;
 use crate::entity_actor::{EntityEvent, EntityMsg, EntityResponse, EntityState};
 
@@ -164,6 +168,9 @@ impl ServerState {
         members: Vec<EntityState>,
     ) -> Result<(), BatchDeleteError> {
         let holder = sim_uuid();
+        // A full mailbox or a lost answer is retried (ADR-0048); each message
+        // below means the same thing when it arrives twice.
+        let policy = self.dispatch_retry_policy();
         let mut actors = Vec::with_capacity(members.len());
         for member in &members {
             let Some(actor) =
@@ -175,17 +182,17 @@ impl ServerState {
                     member.entity_type
                 )));
             };
-            let held = actor
-                .ask::<EntityResponse>(
-                    EntityMsg::Hold {
-                        expected_authorization_precondition: entity_authorization_precondition(
-                            member,
-                        ),
-                        holder,
-                    },
-                    self.action_dispatch_timeout,
-                )
-                .await;
+            let expected = entity_authorization_precondition(member);
+            let held = retry::ask_with_backoff::<_, EntityResponse, _>(
+                &actor,
+                || EntityMsg::Hold {
+                    expected_authorization_precondition: expected.clone(),
+                    holder,
+                },
+                &policy,
+            )
+            .await
+            .result;
             // Sent a hold, so it may hold even when its answer did not arrive.
             actors.push(actor);
             match held {
@@ -210,16 +217,17 @@ impl ServerState {
         }
 
         // Every member is held at the state it was checked in, so each
-        // delete below finds that state. A delete that does not answer leaves
-        // the members after it held by nothing but this call, so they are
-        // released.
+        // delete below finds that state. A delete that does not answer after
+        // its retries leaves the members after it held by nothing but this
+        // call, so they are released.
         for (index, (actor, member)) in actors.iter().zip(&members).enumerate() {
-            let deleted = actor
-                .ask::<EntityResponse>(
-                    EntityMsg::DeleteHeld { holder },
-                    self.action_dispatch_timeout,
-                )
-                .await;
+            let deleted = retry::ask_with_backoff::<_, EntityResponse, _>(
+                actor,
+                || EntityMsg::DeleteHeld { holder },
+                &policy,
+            )
+            .await
+            .result;
             let deleted = match deleted {
                 Ok(response) if response.success => response.state,
                 Ok(response) => {
@@ -263,10 +271,38 @@ impl ServerState {
 
 /// End `holder`'s holds on every actor a hold was sent to; a release reaches
 /// an actor after its hold, and leaves another delete's hold alone.
-fn release(actors: &[temper_runtime::actor::ActorRef<EntityMsg>], holder: uuid::Uuid) {
+///
+/// Every release is delivered. One that finds its actor's mailbox full is
+/// sent again after a pause, on its own task so the delete can answer, until
+/// the actor takes it or stops; a stopped actor's hold ends with it.
+fn release(actors: &[ActorRef<EntityMsg>], holder: uuid::Uuid) {
+    let mut busy = Vec::new();
     for actor in actors {
-        let _ = actor.tell(EntityMsg::Release { holder });
+        if let Err(ActorError::MailboxFull) = actor.tell(EntityMsg::Release { holder }) {
+            busy.push(actor.clone());
+        }
     }
+    if busy.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        busy = busy.len(),
+        "batch delete release found full mailboxes; sending again"
+    );
+    // determinism-ok: a release outlives the delete only while a mailbox is
+    // full; the entity refuses writes until it lands.
+    tokio::spawn(
+        async move {
+            for actor in busy {
+                let mut pause = Duration::from_millis(10);
+                while let Err(ActorError::MailboxFull) = actor.tell(EntityMsg::Release { holder }) {
+                    tokio::time::sleep(pause).await;
+                    pause = (pause * 2).min(Duration::from_secs(1));
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
 }
 
 #[cfg(test)]

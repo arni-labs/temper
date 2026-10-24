@@ -21,8 +21,11 @@ impl EntityActor {
         msg: &EntityMsg,
         state: &EntityState,
     ) -> Option<EntityResponse> {
-        self.holder()?;
+        let held_by = self.holder()?;
         match msg {
+            // A retry of the hold this entity is under, whose first answer
+            // was lost.
+            EntityMsg::Hold { holder, .. } if *holder == held_by => None,
             EntityMsg::Action { .. }
             | EntityMsg::UpdateFields { .. }
             | EntityMsg::Delete { .. }
@@ -52,13 +55,16 @@ impl EntityActor {
 
     /// Hold this entity for `holder` while its state still has `expected`,
     /// the digest of the state the delete checked. The caller has checked
-    /// that no delete holds it.
+    /// that no other delete holds it; a hold `holder` already has stands.
     pub(super) fn hold(
         &self,
         state: &EntityState,
         expected: &str,
         holder: uuid::Uuid,
     ) -> EntityResponse {
+        if self.holder() == Some(holder) {
+            return reply(state, Ok(()));
+        }
         debug_assert!(self.holder().is_none());
         // A hold promises a delete, so an entity the delete would refuse is
         // not held, and the batch refuses before it deletes anything.
@@ -93,6 +99,11 @@ impl EntityActor {
         holder: uuid::Uuid,
     ) -> EntityResponse {
         if self.holder() != Some(holder) {
+            // A retry whose first attempt deleted the entity: while `holder`
+            // held it, nothing else could.
+            if state.status == "Deleted" {
+                return reply(state, Ok(()));
+            }
             return reply(
                 state,
                 Err("this delete does not hold the entity".to_string()),

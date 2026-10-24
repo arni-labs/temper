@@ -356,3 +356,46 @@ async fn without_a_journal_a_member_only_an_action_deletes_refuses_before_any_de
     }
     assert!(state.ensure_entity_loaded(&tenant, "Credit", "c-1").await);
 }
+
+#[tokio::test]
+async fn a_hold_and_its_delete_mean_the_same_when_sent_twice() {
+    use crate::entity_actor::{EntityMsg, EntityResponse};
+    let state = &memory_only("batch-delete-memory-resent");
+    let tenant = TenantId::default();
+    create_tracks(state, &["t-1"], "a-1").await;
+    let track = read(state, "t-1").await;
+    let holder = uuid::Uuid::from_u128(9);
+    let actor = state
+        .get_or_spawn_tenant_actor(&tenant, "Track", "t-1")
+        .expect("Track actor");
+    let ask = |msg: EntityMsg| {
+        let actor = actor.clone();
+        async move {
+            actor
+                .ask::<EntityResponse>(msg, std::time::Duration::from_secs(5))
+                .await
+                .expect("the actor answers")
+        }
+    };
+    let hold = || EntityMsg::Hold {
+        expected_authorization_precondition:
+            crate::entity_actor::effects::entity_authorization_precondition(&track),
+        holder,
+    };
+
+    // A hold sent again, as after a lost answer, stands.
+    for attempt in ["first", "again"] {
+        let held = ask(hold()).await;
+        assert!(held.success, "{attempt} hold: {:?}", held.error);
+    }
+    assert!(
+        try_move_track(state, "t-1", "a-2").await.is_err(),
+        "a held entity refuses writes"
+    );
+    // So does a delete sent again: the entity stays deleted.
+    for attempt in ["first", "again"] {
+        let deleted = ask(EntityMsg::DeleteHeld { holder }).await;
+        assert!(deleted.success, "{attempt} delete: {:?}", deleted.error);
+        assert_eq!(deleted.state.status, "Deleted");
+    }
+}
