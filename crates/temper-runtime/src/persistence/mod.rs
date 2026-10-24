@@ -181,7 +181,8 @@ pub struct StateTimerRecord {
 
 /// One pending `schedule(...)` or `schedule_at(...)` action, kept so that a
 /// restarted server arms it again. An entity can have many; each row is
-/// removed when its action has fired.
+/// removed in the commit of the event its action fires, or after a fire that
+/// wrote no event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledActionRecord {
     pub tenant: String,
@@ -212,6 +213,17 @@ pub struct CommitRows<'a> {
     /// The scheduled actions the appended transition armed: they exist if and
     /// only if its event does.
     pub scheduled_actions: &'a [ScheduledActionRecord],
+    /// The arm id of this entity's scheduled action that the appended
+    /// transition fired: its row is removed in the same commit, so a row
+    /// never outlives its fire's event and a restart cannot fire it again.
+    pub fired_scheduled_action: Option<&'a str>,
+}
+
+impl CommitRows<'_> {
+    /// Whether the commit writes or removes a scheduled-action row.
+    pub fn changes_scheduled_actions(&self) -> bool {
+        !self.scheduled_actions.is_empty() || self.fired_scheduled_action.is_some()
+    }
 }
 
 /// Trait for the event store backend (implemented by temper-store-postgres).
@@ -268,7 +280,7 @@ pub trait EventStore: Send + Sync + 'static {
         events: &[PersistenceEnvelope],
         rows: CommitRows<'_>,
     ) -> impl std::future::Future<Output = Result<u64, PersistenceError>> + Send {
-        if !rows.scheduled_actions.is_empty() {
+        if rows.changes_scheduled_actions() {
             tracing::error!(
                 persistence_id,
                 scheduled = rows.scheduled_actions.len(),

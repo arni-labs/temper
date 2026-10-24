@@ -101,8 +101,13 @@ impl EventStore for TursoEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        self.append_retrying(persistence_id, expected_sequence, events, &[])
-            .await
+        self.append_retrying(
+            persistence_id,
+            expected_sequence,
+            events,
+            CommitRows::default(),
+        )
+        .await
     }
 
     async fn list_scheduled_actions(
@@ -177,12 +182,19 @@ impl EventStore for TursoEventStore {
             vector_rows,
             reconcile_vectors,
             scheduled_actions,
+            fired_scheduled_action,
             ..
         } = rows;
         // The journal append is the durable event, with the scheduled actions
-        // it armed (keys are not maintained on Turso, per the note above).
+        // it armed and fired (keys are not maintained on Turso, per the note
+        // above).
+        let scheduled = CommitRows {
+            scheduled_actions,
+            fired_scheduled_action,
+            ..CommitRows::default()
+        };
         let new_seq = self
-            .append_retrying(persistence_id, expected_sequence, events, scheduled_actions)
+            .append_retrying(persistence_id, expected_sequence, events, scheduled)
             .await?;
         // Write-behind vector maintenance: reconcile the entity's rows (delete stale,
         // insert current — an empty `vector_rows` purges a deleted/cleared entity),
@@ -780,14 +792,14 @@ impl TursoEventStore {
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        scheduled: &[ScheduledActionRecord],
+        scheduled: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         if events.is_empty() {
             return Ok(expected_sequence);
         }
 
         if let [event] = events
-            && scheduled.is_empty()
+            && !scheduled.changes_scheduled_actions()
         {
             return self
                 .append_single_event_inner(persistence_id, expected_sequence, event)
@@ -952,9 +964,10 @@ impl TursoEventStore {
             .map_err(storage_error)?;
         }
 
-        // The scheduled actions these events armed, in THIS transaction: they
-        // exist exactly when the events do. A repeated arm keeps its row.
-        for action in scheduled {
+        // The scheduled actions these events armed, and the one they fired, in
+        // THIS transaction: a row exists exactly while its action waits. A
+        // repeated arm keeps its row.
+        for action in scheduled.scheduled_actions {
             tx.execute(
                 "INSERT INTO scheduled_actions \
                      (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by) \
@@ -973,19 +986,29 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         }
+        if let Some(arm_id) = scheduled.fired_scheduled_action {
+            tx.execute(
+                "DELETE FROM scheduled_actions \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND arm_id = ?4",
+                params![tenant, entity_type, entity_id, arm_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        }
 
         tx.commit().await.map_err(storage_error)?;
         Ok(new_seq)
     }
 
-    /// Append `events`, and the scheduled actions they armed in the same
-    /// transaction, retrying transient errors (ADR-0056).
+    /// Append `events`, and the scheduled-action rows they arm and fire
+    /// (`scheduled`; other rows are ignored) in the same transaction, retrying
+    /// transient errors (ADR-0056).
     async fn append_retrying(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        scheduled: &[ScheduledActionRecord],
+        scheduled: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         if events.is_empty() {
             return Ok(expected_sequence);
@@ -1001,7 +1024,7 @@ impl TursoEventStore {
         let attempt_timeout = append_attempt_timeout();
         let total_attempts = append_max_attempts();
         let mut last_err: Option<PersistenceError> = None;
-        let bypass_write_gate = events.len() == 1 && scheduled.is_empty();
+        let bypass_write_gate = events.len() == 1 && !scheduled.changes_scheduled_actions();
         for attempt in 0..total_attempts {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(retry_delay_ms(attempt - 1))).await;

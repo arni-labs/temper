@@ -175,9 +175,8 @@ struct SimEventStoreInner {
     /// Pending scheduled actions, committed with the event that armed them
     /// under the same lock. `(tenant, entity_type, entity_id, arm_id) -> row`.
     scheduled_actions: BTreeMap<(String, String, String, String), ScheduledActionRecord>,
-    /// While set, `delete_scheduled_action` never completes: the process stops
-    /// after a fire's event is written and before its row is removed. See
-    /// `hold_scheduled_action_deletes`.
+    /// While set, `delete_scheduled_action` never completes, as when the
+    /// process stops before it. See `hold_scheduled_action_deletes`.
     scheduled_deletes_held: bool,
     /// ADR-0155 backfill watermark: `(tenant, entity_type) -> vector_set` — each
     /// completed type mapped to the sorted comma-joined declared vector-path names the
@@ -242,9 +241,9 @@ impl SimEventStore {
     }
 
     /// While `held`, every `delete_scheduled_action` call waits forever and
-    /// removes nothing, as when the process stops between a fire's event and
-    /// the removal of its row. A test sets it, lets a fire run, stops the
-    /// process, and clears it before the next boot.
+    /// removes nothing, as when the process stops right after a fire, before
+    /// any removal that is not part of the fire's commit. A test sets it, lets
+    /// a fire run, stops the process, and clears it before the next boot.
     pub fn hold_scheduled_action_deletes(&self, held: bool) {
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         inner.scheduled_deletes_held = held;
@@ -486,6 +485,7 @@ impl EventStore for SimEventStore {
             vector_rows,
             reconcile_vectors,
             scheduled_actions,
+            fired_scheduled_action,
         } = rows;
         let append_delay = {
             let mut inner = self
@@ -717,6 +717,17 @@ impl EventStore for SimEventStore {
                     action.arm_id.clone(),
                 ))
                 .or_insert_with(|| action.clone());
+        }
+        // The scheduled action the transition fired goes in the same commit.
+        if let Some(arm_id) = fired_scheduled_action
+            && let Ok((tenant, entity_type, entity_id)) = parse_persistence_id_parts(persistence_id)
+        {
+            inner.scheduled_actions.remove(&(
+                tenant.to_string(),
+                entity_type.to_string(),
+                entity_id.to_string(),
+                arm_id.to_string(),
+            ));
         }
 
         // The write landed; a lost answer reaches the caller as the retry's

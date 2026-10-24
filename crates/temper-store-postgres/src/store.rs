@@ -101,6 +101,7 @@ impl EventStore for PostgresEventStore {
             vector_rows,
             reconcile_vectors,
             scheduled_actions,
+            fired_scheduled_action,
         } = rows;
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
@@ -320,10 +321,14 @@ impl EventStore for PostgresEventStore {
             }
         }
 
-        // The scheduled actions the transition armed, in THIS transaction: they
-        // exist exactly when the event does.
+        // The scheduled actions the transition armed, and the one it fired, in
+        // THIS transaction: a row exists exactly while its action waits.
         self.insert_scheduled_actions(&mut tx, scheduled_actions)
             .await?;
+        if let Some(arm_id) = fired_scheduled_action {
+            self.delete_scheduled_action_row(&mut tx, tenant, entity_type, entity_id, arm_id)
+                .await?;
+        }
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {

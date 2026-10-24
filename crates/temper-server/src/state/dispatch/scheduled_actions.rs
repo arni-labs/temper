@@ -10,11 +10,13 @@
 //! boot gate, for the rest of its wait or at once if it fell due while the
 //! server was down. Replay never arms one: the rows are the source of truth.
 //!
-//! A fire runs as whoever armed it, with an idempotency key from its arm id,
-//! so a fire repeated after a restart (its event written, its row not yet
-//! removed) is a duplicate and does not run again. Once it has fired, its row
-//! is removed. A refused fire is logged here, and its dispatch records it in
-//! the record's trajectory like any refused action.
+//! A fire runs as whoever armed it. The event it writes removes its row in the
+//! same commit, so a row never outlives its fire and a restart cannot fire it
+//! twice. A fire that writes no event (refused, or a duplicate) has its row
+//! removed afterwards; if the process stops first, the next boot fires it
+//! again. Its idempotency key, from the arm id, keeps a retried ask from
+//! running twice. A refused fire is logged here, and its dispatch records it
+//! in the record's trajectory like any refused action.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,8 +31,8 @@ use tracing::Instrument;
 use super::effects::PostDispatchContext;
 use super::state_timer_follow::BootTimers;
 use crate::entity_actor::EntityResponse;
-use crate::request_context::AgentContext;
 use crate::request_context::armed_by::decode_armed_by;
+use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
 
 /// A scheduled action armed in this process.
@@ -156,6 +158,12 @@ impl ServerState {
     async fn fire_scheduled_action(&self, timer: &ScheduledTimer) {
         let mut agent = timer.agent_ctx.clone();
         agent.idempotency_key = Some(format!("schedule:{}", timer.arm_id));
+        agent.fires_scheduled_action = Some(ScheduledFire {
+            tenant: timer.tenant.as_str().to_string(),
+            entity_type: timer.entity_type.clone(),
+            entity_id: timer.entity_id.clone(),
+            arm_id: timer.arm_id.clone(),
+        });
         let outcome = self
             .dispatch_tenant_action(
                 &timer.tenant,
@@ -180,6 +188,8 @@ impl ServerState {
                 entity_id = %timer.entity_id, action = %timer.action, arm_id = %timer.arm_id,
                 %error, "scheduled action refused when it fired");
         }
+        // A fire that wrote its event removed its row with it; this removes
+        // the row of one that wrote none, and is a no-op otherwise.
         self.forget_scheduled_action(
             &timer.tenant,
             &timer.entity_type,
@@ -190,7 +200,7 @@ impl ServerState {
     }
 
     /// Remove a scheduled action's row. A row left behind fires again at the
-    /// next boot, as a duplicate that does not run.
+    /// next boot.
     async fn forget_scheduled_action(
         &self,
         tenant: &TenantId,

@@ -4,8 +4,9 @@
 //! row is written in the same commit as the event that armed it, so a restart
 //! arms it again (`ServerState::rearm_scheduled_actions`). Its id is the
 //! arming event's journal sequence and the action's place among the event's
-//! schedules, `<seq>.<index>`; the fire's idempotency key derives from it, so
-//! a fire repeated after a restart is a duplicate and never runs twice.
+//! schedules, `<seq>.<index>`. The event a fire writes removes the fired
+//! row in its own commit, so a row never outlives its fire and a restart
+//! cannot fire it again.
 
 use temper_runtime::persistence::ScheduledActionRecord;
 
@@ -15,9 +16,19 @@ use super::types::{EntityEvent, EntityState};
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::encode_armed_by;
 
+/// The scheduled-action rows an event changes in its commit.
+#[derive(Debug, Default)]
+pub(super) struct ScheduledRows {
+    /// The rows of the scheduled actions it arms.
+    pub(super) armed: Vec<ScheduledActionRecord>,
+    /// The arm id of this record's scheduled action it fires.
+    pub(super) fired: Option<String>,
+}
+
 impl EntityActor {
-    /// Name each scheduled action `event` arms and return the rows to write
-    /// with it. `state` is the entity before the event is written. Without a
+    /// Name each scheduled action `event` arms, and return the rows to write
+    /// with it and the row it fires, if `caller` is firing one of this
+    /// record's. `state` is the entity before the event is written. Without a
     /// journal nothing is kept and no row is returned; the ids stay unique in
     /// this process.
     pub(super) fn arm_scheduled_actions(
@@ -26,7 +37,7 @@ impl EntityActor {
         state: &EntityState,
         event: &EntityEvent,
         caller: Option<&AgentContext>,
-    ) -> Vec<ScheduledActionRecord> {
+    ) -> ScheduledRows {
         let journaled = self.event_journal.is_some() && self.event_backend.is_some();
         let sequence = if journaled {
             state.sequence_nr + 1
@@ -36,8 +47,22 @@ impl EntityActor {
         for (index, action) in scheduled.iter_mut().enumerate() {
             action.arm_id = format!("{sequence}.{index}");
         }
-        if !journaled || scheduled.is_empty() {
-            return Vec::new();
+        if !journaled {
+            return ScheduledRows::default();
+        }
+        let fired = caller
+            .and_then(|caller| caller.fires_scheduled_action.as_ref())
+            .filter(|fire| {
+                fire.tenant == self.tenant
+                    && fire.entity_type == state.entity_type
+                    && fire.entity_id == state.entity_id
+            })
+            .map(|fire| fire.arm_id.clone());
+        if scheduled.is_empty() {
+            return ScheduledRows {
+                armed: Vec::new(),
+                fired,
+            };
         }
         let armed_by =
             encode_armed_by(caller.unwrap_or(&AgentContext::default())).unwrap_or_else(|error| {
@@ -45,7 +70,7 @@ impl EntityActor {
                     %error, "scheduled action caller not encodable; it fires with no identity");
                 "{}".to_string()
             });
-        scheduled
+        let armed = scheduled
             .iter()
             .map(|action| ScheduledActionRecord {
                 tenant: self.tenant.clone(),
@@ -61,6 +86,7 @@ impl EntityActor {
                     .to_rfc3339(),
                 armed_by: armed_by.clone(),
             })
-            .collect()
+            .collect();
+        ScheduledRows { armed, fired }
     }
 }

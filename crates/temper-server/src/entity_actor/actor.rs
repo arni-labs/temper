@@ -29,7 +29,6 @@ use temper_observe::wide_event;
 use temper_runtime::actor::{Actor, ActorContext, ActorError};
 use temper_runtime::persistence::{
     COMPOSITE_EVENT_TYPE, CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError,
-    ScheduledActionRecord,
 };
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 pub(super) use tokio::time::sleep as sleep_persistence_retry; // determinism-ok: production persistence retry backoff
@@ -40,6 +39,7 @@ use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
@@ -414,14 +414,15 @@ impl EntityActor {
     }
 
     /// Persist an event to the configured event store, with the rows of the
-    /// scheduled actions it arms in the same commit.
+    /// scheduled actions it arms and the removal of the one it fires in the
+    /// same commit.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
         backend: BackendLabel,
         state: &mut EntityState,
         event: &EntityEvent,
-        scheduled: &[ScheduledActionRecord],
+        scheduled: &ScheduledRows,
     ) -> Result<u64, PersistenceError> {
         let persistence_id = self.persistence_id();
         let payload = super::bootstrap::event_payload(event, state)
@@ -505,7 +506,8 @@ impl EntityActor {
                     key_rows: &key_rows,
                     vector_rows: &vector_rows,
                     reconcile_vectors,
-                    scheduled_actions: scheduled,
+                    scheduled_actions: &scheduled.armed,
+                    fired_scheduled_action: scheduled.fired.as_deref(),
                 },
             )
             .await;
@@ -1102,14 +1104,20 @@ impl Actor for EntityActor {
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
             {
-                self.persist_event(store, backend, &mut state, &created, &[])
-                    .await
-                    .map_err(|e| {
-                        ActorError::custom(format!(
-                            "failed to persist bootstrap Created event for {}:{}: {}",
-                            self.entity_type, self.entity_id, e
-                        ))
-                    })?;
+                self.persist_event(
+                    store,
+                    backend,
+                    &mut state,
+                    &created,
+                    &ScheduledRows::default(),
+                )
+                .await
+                .map_err(|e| {
+                    ActorError::custom(format!(
+                        "failed to persist bootstrap Created event for {}:{}: {}",
+                        self.entity_type, self.entity_id, e
+                    ))
+                })?;
             }
             state.push_event_bounded(created);
         }
@@ -1883,7 +1891,7 @@ impl Actor for EntityActor {
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
                     && let Err(e) = self
-                        .persist_event(store, backend, state, &deleted, &[])
+                        .persist_event(store, backend, state, &deleted, &ScheduledRows::default())
                         .await
                 {
                     ctx.reply(persistence_failure_reply(state.clone(), &e));

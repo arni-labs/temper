@@ -84,12 +84,30 @@ pub struct AgentContext {
     /// `Idempotency-Key` header. Threaded into `EntityMsg::Action` so the
     /// actor can dedupe duplicate asks produced by dispatch-layer retries.
     pub idempotency_key: Option<String>,
+    /// Runtime-owned; never populated from request headers. The scheduled
+    /// action this dispatch fires: the actor removes its row in the commit of
+    /// the fire's event, and only for that record, so a child dispatch that
+    /// inherits this context removes nothing.
+    pub fires_scheduled_action: Option<ScheduledFire>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
     /// `workflow.run_id`, `producer.work_item_id`, or `support.ticket_id`.
     /// Temper core treats these keys as opaque correlation metadata.
     pub observation_metadata: BTreeMap<String, String>,
+}
+
+/// A scheduled action's row, named for the dispatch that fires it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The row's arm id.
+    pub arm_id: String,
 }
 
 impl AgentContext {
@@ -137,6 +155,7 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -174,6 +193,7 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -310,6 +330,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_root_entity_id,
         workflow_run_id,
         idempotency_key,
+        fires_scheduled_action: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }

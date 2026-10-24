@@ -2,10 +2,9 @@
 //!
 //! Workload, per seed: records arm `schedule(...)` and `schedule_at(...)`
 //! actions, once (`Fire`) or repeating (`Tick`, which schedules the next
-//! one). The process stops before some are due and after others, sometimes in
-//! the middle of a fire: its event may be written while its row is not yet
-//! removed. The next process boots with `start_runtime` and nobody touches the
-//! records.
+//! one). The process stops before some are due and after others, sometimes
+//! right after a fire, before any removal that is not part of its commit. The
+//! next process boots with `start_runtime` and nobody touches the records.
 //!
 //! Invariants:
 //! - every armed `Fire` fires exactly once, never before it is due, and at its
@@ -13,6 +12,8 @@
 //!   process was down at that time;
 //! - a repeating `Tick` keeps going after the restart, never twice within one
 //!   period;
+//! - a fire's event and the removal of its row commit together: no stop
+//!   leaves a row behind a written fire;
 //! - no row is left for a fired action, and a repeating record keeps one.
 //!
 //! Each server runs in its own single-threaded, paused-clock Tokio runtime;
@@ -234,8 +235,8 @@ async fn fired_at(state: &ServerState, id: &str, action: &str) -> Vec<DateTime<U
         .unwrap_or_default()
 }
 
-/// One seed's run. Ok: how many rows the stop left behind a fire whose event
-/// was already written, which the boot fires again.
+/// One seed's run. Ok: whether it stopped right after a fire whose event was
+/// written, with removals outside the fire's commit held.
 fn run_seed(seed: u64) -> Result<usize, String> {
     let clock = Arc::new(ProcessClock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
@@ -252,7 +253,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
     let mut arms: BTreeMap<String, Arm> = BTreeMap::new();
 
     let first = Process::start(&world, &format!("sched-{seed}-a"));
-    first.runtime.block_on(async {
+    let held_fires = first.runtime.block_on(async {
         let state = &first.state;
         for i in 0..2 + rng.next_bound(5) {
             let id = format!("job-{i}");
@@ -286,10 +287,10 @@ fn run_seed(seed: u64) -> Result<usize, String> {
         }
         settle().await;
         // Stop at a seeded time. Half the time, stop at an armed action's due
-        // instant instead: either at once, or after its fire's event is
-        // written but before its row is removed (the store holds the
-        // removal), so the next boot fires it again and only its idempotency
-        // key keeps that from running twice.
+        // instant instead: either at once, or right after its fire, with
+        // every removal outside the fire's commit held, as when the process
+        // stops before one. A row removed only after the fire is left behind
+        // and the next boot would fire it again.
         let now = sim_now();
         let dues: Vec<(&String, DateTime<Utc>)> = arms
             .iter()
@@ -307,10 +308,12 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 world.events.hold_scheduled_action_deletes(true);
                 until(due).await;
                 settle().await;
+                let fired = journal_has(&world.events, &format!("{TENANT}:Job:{id}"), "Fire").await;
                 run.trace.push(format!(
-                    "stop at {} after {id}'s Fire, its row not yet removed",
+                    "stop at {} after {id}'s Fire (written: {fired}), removals held",
                     sim_now()
                 ));
+                return Ok(usize::from(fired));
             }
         } else {
             until(now + chrono::Duration::seconds(rng.next_bound(3600) as i64)).await;
@@ -321,7 +324,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             run.trace
                 .push(format!("stop at {} after {turns} turns", sim_now()));
         }
-        Ok::<(), String>(())
+        Ok::<usize, String>(0)
     })?;
     let downtime = Duration::from_secs(rng.next_bound(7200) as u64);
     first.kill(&world, downtime);
@@ -338,8 +341,12 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             }
             left_behind
         });
-    run.trace
-        .push(format!("{left_behind} rows left behind a written fire"));
+    if left_behind > 0 {
+        return Err(run.fail(
+            "a fire's event and its row's removal commit together",
+            format!("{left_behind} rows left behind a written fire"),
+        ));
+    }
 
     let second = Process::start(&world, &format!("sched-{seed}-b"));
     let result = second.runtime.block_on(async {
@@ -425,17 +432,17 @@ fn run_seed(seed: u64) -> Result<usize, String> {
         Ok(())
     });
     second.kill(&world, Duration::ZERO);
-    result.map(|()| left_behind)
+    result.map(|()| held_fires)
 }
 
 #[test]
 fn dst_scheduled_actions_outlive_a_restart() {
     // Seeds that broke each invariant, and the first such seed's report.
     let mut broken: BTreeMap<String, (Vec<u64>, String)> = BTreeMap::new();
-    let mut left_behind = 0;
+    let mut held_fires = 0;
     for seed in 0..SEEDS {
         match run_seed(seed) {
-            Ok(rows) => left_behind += rows,
+            Ok(fires) => held_fires += fires,
             Err(report) => {
                 let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
                 let entry = broken
@@ -454,11 +461,10 @@ fn dst_scheduled_actions_outlive_a_restart() {
         "invariants broken over {SEEDS} seeds:\n\n{}",
         summary.join("\n\n")
     );
-    // The duplicate a boot could fire exists only if some stop fell between
-    // a fire's event and its row's removal; a harness that never stops there
-    // cannot catch it.
+    // A row removed only after its fire is left behind only by a stop right
+    // after a fire; a harness that never stops there cannot catch it.
     assert!(
-        left_behind > 0,
-        "no stop over {SEEDS} seeds left a row behind a written fire"
+        held_fires > 0,
+        "no stop over {SEEDS} seeds came right after a written fire"
     );
 }

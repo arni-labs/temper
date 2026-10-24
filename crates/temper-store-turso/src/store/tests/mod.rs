@@ -11,6 +11,7 @@ use crate::TursoSpecVerificationUpdate;
 
 mod evolution_tenant;
 mod policy_approval;
+mod scheduled_actions;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
     PersistenceEnvelope {
