@@ -269,7 +269,7 @@ impl ServerState {
                             let value = String::from_utf8(plaintext).map_err(|e| {
                                 format!("secret {key_name} is not valid UTF-8: {e}")
                             })?;
-                            vault.cache_secret(tenant, key_name, value)?;
+                            vault.cache_secret(tenant, key_name, value);
                             count += 1;
                         }
                         Err(e) => {
@@ -296,7 +296,7 @@ impl ServerState {
                             let value = String::from_utf8(plaintext).map_err(|e| {
                                 format!("secret {key_name} is not valid UTF-8: {e}")
                             })?;
-                            vault.cache_secret(tenant, key_name, value)?;
+                            vault.cache_secret(tenant, key_name, value);
                             count += 1;
                         }
                         Err(e) => {

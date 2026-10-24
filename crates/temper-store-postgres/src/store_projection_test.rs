@@ -258,7 +258,29 @@ fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
             .append(
                 &format!("{tenant}:{entity_type}:dl-deleted"),
                 0,
-                &[test_envelope("Deleted", serde_json::json!({}))],
+                &[test_envelope(
+                    "Deleted",
+                    serde_json::json!({
+                        "action": "Deleted", "from_status": "Published",
+                        "to_status": "Deleted", "params": {}, "kind": "tombstone"
+                    }),
+                )],
+            )
+            .await
+            .unwrap();
+        // A spec action named Deleted, journaled before events had a kind:
+        // its params tell it from the kernel's tombstone, so it stays listed.
+        store
+            .append(
+                &format!("{tenant}:{entity_type}:dl-spec-deleted"),
+                0,
+                &[test_envelope(
+                    "Deleted",
+                    serde_json::json!({
+                        "action": "Deleted", "from_status": "Deleting",
+                        "to_status": "Deleted", "params": { "note": "gone" }
+                    }),
+                )],
             )
             .await
             .unwrap();
@@ -274,6 +296,7 @@ fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
                 "dl-catalog".to_string(),
                 "dl-event".to_string(),
                 "dl-index".to_string(),
+                "dl-spec-deleted".to_string(),
             ]
         );
 

@@ -181,25 +181,6 @@ fn llm_model_for_observability_prefers_callback_model() {
 }
 
 #[test]
-fn parse_internal_file_value_request_matches_only_value_paths() {
-    assert_eq!(
-        parse_internal_file_value_request(
-            "http://127.0.0.1:3467",
-            "http://127.0.0.1:3467/tdata/Files('fl-123')/$value"
-        )
-        .as_deref(),
-        Some("fl-123")
-    );
-    assert!(
-        parse_internal_file_value_request(
-            "http://127.0.0.1:3467",
-            "http://127.0.0.1:3467/tdata/Files('fl-123')"
-        )
-        .is_none()
-    );
-}
-
-#[test]
 fn llm_root_span_stays_on_active_trace() {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;

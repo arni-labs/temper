@@ -27,6 +27,20 @@ fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnv
     }
 }
 
+/// The kernel's delete tombstone as it is journaled now.
+fn tombstone_envelope() -> PersistenceEnvelope {
+    test_envelope(
+        "Deleted",
+        serde_json::json!({
+            "action": "Deleted",
+            "from_status": "Draft",
+            "to_status": "Deleted",
+            "params": {},
+            "kind": "tombstone"
+        }),
+    )
+}
+
 fn sqlite_test_url(test_name: &str) -> String {
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -632,7 +646,7 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
         .append(
             &format!("{tenant}:AgentRoute:route-deleted"),
             0,
-            &[test_envelope("Deleted", serde_json::json!({}))],
+            &[tombstone_envelope()],
         )
         .await
         .expect("append deleted tombstone");
@@ -670,11 +684,7 @@ async fn list_entity_ids_by_type_includes_events_and_excludes_deleted() {
         .await
         .unwrap();
     store
-        .append(
-            &deleted_order,
-            1,
-            &[test_envelope("Deleted", serde_json::json!({}))],
-        )
+        .append(&deleted_order, 1, &[tombstone_envelope()])
         .await
         .unwrap();
     store
@@ -726,7 +736,8 @@ async fn list_entity_ids_excludes_entities_with_deleted_tombstones() {
                 serde_json::json!({
                     "action": "Deleted",
                     "from_status": "Draft",
-                    "to_status": "Deleted"
+                    "to_status": "Deleted",
+                    "params": {}
                 }),
             )],
         )
@@ -750,6 +761,70 @@ async fn list_entity_ids_excludes_entities_with_deleted_tombstones() {
     assert_eq!(
         entities,
         vec![("Order".to_string(), "ord-active".to_string())]
+    );
+}
+
+/// A spec action named `Deleted` is not the kernel's tombstone: every listing
+/// keeps its entity, whether it was journaled with a kind or before kinds.
+#[tokio::test]
+async fn listings_keep_entities_whose_spec_action_is_named_deleted() {
+    let store = make_store("entity-list-spec-deleted").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let spec_actions = [
+        (
+            "kept-marked",
+            serde_json::json!({
+                "action": "Deleted", "from_status": "Deleting", "to_status": "Deleted",
+                "params": {}, "kind": "transition"
+            }),
+        ),
+        (
+            "kept-legacy",
+            serde_json::json!({
+                "action": "Deleted", "from_status": "Deleting", "to_status": "Deleted",
+                "params": { "note": "gone", "deleted_at": "2026-11-22T00:00:00Z" }
+            }),
+        ),
+    ];
+    for (id, payload) in spec_actions {
+        let pid = format!("{tenant}:KeptData:{id}");
+        store
+            .append(&pid, 0, &[test_envelope("Created", serde_json::json!({}))])
+            .await
+            .unwrap();
+        store
+            .append(&pid, 1, &[test_envelope("Deleted", payload)])
+            .await
+            .unwrap();
+    }
+    let gone = format!("{tenant}:KeptData:gone");
+    store
+        .append(&gone, 0, &[test_envelope("Created", serde_json::json!({}))])
+        .await
+        .unwrap();
+    store
+        .append(&gone, 1, &[tombstone_envelope()])
+        .await
+        .unwrap();
+
+    let kept = vec!["kept-legacy".to_string(), "kept-marked".to_string()];
+    assert_eq!(
+        store
+            .list_entity_ids_by_type(&tenant, "KeptData")
+            .await
+            .unwrap(),
+        kept
+    );
+    let mut all = store.list_entity_ids(&tenant).await.unwrap();
+    all.sort();
+    assert_eq!(all.into_iter().map(|(_, id)| id).collect::<Vec<_>>(), kept);
+    let limited = store
+        .list_entity_ids_limited(&tenant, Some("KeptData"), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        limited.into_iter().map(|(_, id)| id).collect::<Vec<_>>(),
+        kept
     );
 }
 
