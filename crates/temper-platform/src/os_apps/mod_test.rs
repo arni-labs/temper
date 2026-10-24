@@ -895,6 +895,7 @@ fn test_intent_discovery_specs_verify() {
     }
 }
 
+mod bundle_refusal;
 mod directed_evolution;
 mod policy_reinstall;
 #[test]
@@ -3663,3 +3664,6 @@ async fn test_concurrent_installs_into_one_tenant_keep_both_apps_cedar() {
         "{text}"
     );
 }
+
+#[path = "mod_test/timer_install.rs"]
+mod timer_install;

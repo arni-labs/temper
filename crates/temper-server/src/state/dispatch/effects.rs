@@ -18,6 +18,10 @@ use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
+/// The only tenant whose entities reach the platform custom effect handler:
+/// the system tenant, where the platform installs its own specs.
+const PLATFORM_HOOK_TENANT: &str = "temper-system";
+
 /// Collected context needed by post-dispatch effect handlers.
 pub(crate) struct PostDispatchContext<'a> {
     pub tenant: &'a TenantId,
@@ -367,7 +371,7 @@ impl crate::state::ServerState {
         self.persist_trajectory_entry_background(entry);
     }
 
-    /// Broadcast state change to SSE subscribers and update entity cache.
+    /// Broadcast state change to SSE subscribers.
     pub(crate) fn broadcast_state_change(
         &self,
         ctx: &PostDispatchContext<'_>,
@@ -437,8 +441,6 @@ impl crate::state::ServerState {
                 }),
             );
         }
-        let cache_key = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
-        self.cache_entity_status(cache_key, response.state.status.clone());
         let _ = self
             .observe_refresh_tx
             .send(crate::state::ObserveRefreshHint::Entities);
@@ -648,6 +650,16 @@ impl crate::state::ServerState {
         // dependent launch. An old reset timer must not fire during the wait.
         self.invalidate_state_timeouts_if_needed(ctx, &response);
 
+        // The status is committed, so guards decide on it from here on, even
+        // when the projection below fails and the action answers with an
+        // error. Simulation runs other requests between the commit and this
+        // write, as a slow writer would.
+        temper_runtime::buggify::buggify_yield(
+            crate::state::status_cache::STATUS_WRITE_YIELD_BUDGET,
+        )
+        .await;
+        self.cache_entity_status(ctx.tenant, &response.state);
+
         // Every committed transition is visible through the query plane before
         // the response returns: the caller, a reaction or an integration may
         // read it at once, and queue admission does not establish visibility.
@@ -672,7 +684,7 @@ impl crate::state::ServerState {
             self.apply_query_projection_update(ctx, &response).await;
         }
 
-        // 3. Broadcast SSE + cache
+        // 3. Broadcast SSE
         self.broadcast_state_change(ctx, &response);
 
         // Arm the successor only after visibility, before an inline adapter
@@ -739,12 +751,14 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("WASM integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
                             scheduled_actions: Vec::new(),
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
+                            refused: false,
                         };
                     }
                 }
@@ -773,12 +787,14 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("adapter integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
                             scheduled_actions: Vec::new(),
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
+                            refused: false,
                         };
                     }
                 }
@@ -827,8 +843,13 @@ impl crate::state::ServerState {
         //
         // For system-tenant entities whose specs declare custom effects
         // but have no WASM/adapter integrations (e.g. GovernanceDecision),
-        // the handler routes effects to platform hooks (hooks.rs).
+        // the handler routes effects to platform hooks (hooks.rs). The
+        // platform installs those specs only in the system tenant, and the
+        // hooks act on whatever tenant and entity the record names, so only
+        // system-tenant entities reach them. A hook name in another tenant's
+        // spec is an ordinary custom effect for that tenant's integrations.
         if !response.custom_effects.is_empty()
+            && ctx.tenant.as_str() == PLATFORM_HOOK_TENANT
             && let Some(handler) = &self.custom_effect_handler
         {
             for effect_name in &response.custom_effects {

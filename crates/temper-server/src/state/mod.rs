@@ -21,6 +21,8 @@ mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
+mod start_runtime;
+pub mod status_cache;
 pub(crate) mod storage_caps;
 pub mod trajectory;
 pub mod wasm_invocation_log;
@@ -29,7 +31,10 @@ pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
-pub use dispatch::{DispatchCommand, DispatchError, DispatchExtOptions, StateTimeoutTracker};
+pub use dispatch::{
+    BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
+    StateTimeoutTracker, TimerFollowHold,
+};
 pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
@@ -496,12 +501,10 @@ pub struct ServerState {
     pub cross_invariant_eventual_enforce: bool,
     /// Broadcast channel for design-time events (spec loading, verification progress).
     pub design_time_tx: Arc<tokio::sync::broadcast::Sender<DesignTimeEvent>>,
-    /// LRU cache of entity current state, updated on every state change broadcast.
-    /// Key: "{tenant}:{entity_type}:{entity_id}", Value: (current_state, last_updated).
-    /// Capped at [`state_cache_budget()`] entries; oldest entry evicted automatically.
-    #[allow(clippy::type_complexity)]
-    pub entity_state_cache:
-        Arc<Mutex<lru::LruCache<String, (String, chrono::DateTime<chrono::Utc>)>>>,
+    /// Each record's newest committed status, keyed "{tenant}:{entity_type}:{entity_id}"
+    /// (see [`status_cache`]). Capped at [`state_cache_budget()`] entries; the least
+    /// recently used is evicted.
+    pub entity_state_cache: Arc<Mutex<status_cache::StatusCache>>,
     /// Configurable timeout for actor ask operations (default: 5s).
     pub action_dispatch_timeout: Duration,
     /// Admission control (ADR-0051). Gates concurrent action dispatches per
@@ -512,6 +515,13 @@ pub struct ServerState {
     /// counter used to cancel stale timers when the entity transitions out
     /// of a declared state or reset_on fires.
     pub state_timeout_tracker: Arc<StateTimeoutTracker>,
+    /// Where armed timer rows are kept when the storage stack has no metadata
+    /// store to keep them, as under simulation. None: the metadata store.
+    pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
+    /// Published under the registry lock after durable timer recovery.
+    pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once [`Self::start_runtime`] has run in this process.
+    pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -811,6 +821,9 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
+            state_timer_rows: None,
+            timer_recovery_complete: Arc::default(),
+            runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1088,6 +1101,9 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
+            state_timer_rows: None,
+            timer_recovery_complete: Arc::default(),
+            runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1242,17 +1258,6 @@ impl ServerState {
     pub fn with_secrets_vault(mut self, vault: SecretsVault) -> Self {
         self.secrets_vault = Some(Arc::new(vault));
         self
-    }
-
-    /// Insert/update an entity status cache entry.
-    ///
-    /// The underlying [`lru::LruCache`] automatically evicts the least-recently-used
-    /// entry when the budget (see [`state_cache_budget`]) is exceeded, so no manual
-    /// eviction loop is needed here.
-    pub fn cache_entity_status(&self, cache_key: String, status: String) {
-        if let Ok(mut cache) = self.entity_state_cache.lock() {
-            cache.put(cache_key, (status, sim_now()));
-        }
     }
 
     /// Get a reference to the platform Turso event store.

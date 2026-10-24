@@ -16,6 +16,7 @@ pub mod types;
 pub(crate) mod undeclared_params;
 
 pub use actor::EntityActor;
+pub(crate) use actor::RehydrateHook;
 #[cfg(test)]
 pub(crate) use actor::recover_authoritative_entity_state_from_store;
 pub(crate) use actor::recover_entity_state_from_store;

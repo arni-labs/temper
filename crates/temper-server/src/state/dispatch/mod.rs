@@ -20,6 +20,8 @@ mod generated_callbacks;
 mod projection_barrier;
 pub(crate) mod retry;
 pub(crate) mod state_timeouts;
+mod state_timer_follow;
+mod state_timer_reconcile;
 mod state_timer_rows;
 #[cfg(test)]
 #[path = "strict_support_test.rs"]
@@ -31,6 +33,7 @@ pub(crate) use wasm::internal_http_capability_issuer;
 mod wasm_secrets;
 
 pub use state_timeouts::StateTimeoutTracker;
+pub use state_timer_follow::{BootTimerCounts, BootTimers, TimerFollowHold};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WasmDispatchMode {

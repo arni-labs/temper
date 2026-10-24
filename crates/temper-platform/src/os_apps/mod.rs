@@ -24,6 +24,7 @@ mod agent_bootstrap;
 mod app_catalog;
 mod closure_bootstrap;
 mod entity_aliases;
+mod install_checks;
 mod install_guard;
 mod policy_rows;
 mod reconcile;
@@ -1106,7 +1107,8 @@ pub(super) async fn install_os_app_with_plan(
     app_name: &str,
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
-    let _serialized = install_guard::tenant(tenant).await;
+    install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
+    let mut install = install_guard::tenant(&state.server, tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
         cat.paths.get(app_name).cloned().ok_or_else(|| {
@@ -1178,11 +1180,13 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
+        // Parsed before any write, with the CSDL below (see `install_checks`).
+        install_checks::parse_cross_invariants(bundle.cross_invariants_toml.as_deref(), app_name)?;
         // App installs must preserve existing tenant types.
         let merged_csdl = if let Some(ref csdl) = bundle.csdl {
+            let incoming = parse_csdl(csdl)
+                .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
             if let Some(existing) = registry.get_tenant(&tenant_id) {
-                let incoming = parse_csdl(csdl)
-                    .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
                 Some(emit_csdl_xml(&merge_csdl(&existing.csdl, &incoming)))
             } else {
                 Some(csdl.clone())
@@ -1330,7 +1334,8 @@ pub(super) async fn install_os_app_with_plan(
     }
 
     if plan.policies {
-        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle).await?;
+        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle, &superseded)
+            .await?;
         policy_rows::delete_dropped_rows(state, tenant, &superseded).await?;
     }
 
@@ -1383,7 +1388,7 @@ pub(super) async fn install_os_app_with_plan(
                     cross_invariants_source: bundle.cross_invariants_toml.as_deref(),
                     verification_mode: bootstrap::BootstrapSpecVerificationMode::TrustBundle,
                 },
-            );
+            )?;
 
             if let Some(ps) = state
                 .server
@@ -1402,15 +1407,9 @@ pub(super) async fn install_os_app_with_plan(
                 .await;
             }
         }
-        // App installs can introduce or update inline entity triggers.
-        // Refresh the live dispatcher after the registry mutation so the
-        // newly bootstrapped trigger graph is active for subsequent traffic.
-        state.server.rebuild_reaction_dispatcher();
     }
 
-    // App installs can add or change cross-entity reactions. Refresh the live
-    // dispatcher immediately so the newly registered tenant config takes effect
-    // without requiring a process restart or a separate specs reload.
+    // Installed specs can change triggers and cross-entity reactions: refresh the dispatcher.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
@@ -1567,6 +1566,9 @@ pub(super) async fn install_os_app_with_plan(
             }
         }
     }
+
+    // Overdue timers may fire at once: reconcile only now that policies and modules are in.
+    install.installed(&state.server, plan.specs);
 
     tracing::info!(
         "Installed os-app '{app_name}' for tenant '{tenant}': added={added:?} updated={updated:?} skipped={skipped:?} wasm={wasm_registered:?}"

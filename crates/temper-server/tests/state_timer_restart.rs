@@ -171,7 +171,7 @@ impl Server {
                 .authz
                 .reload_tenant_policies("default", PERMIT_ALL)
                 .unwrap();
-            state.rearm_state_timers().await;
+            state.start_runtime().await;
             state
         });
         Self { runtime, state }

@@ -329,10 +329,12 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
             timestamp: event.timestamp,
             params: serde_json::Value::Null,
             idempotency_key: event.idempotency_key.clone(),
+            kind: temper_runtime::persistence::EventKind::Transition,
         })
         .collect();
     EntityResponse {
         success: response.success,
+        refusal: response.refusal.clone(),
         state: EntityState {
             entity_type: state.entity_type.clone(),
             entity_id: state.entity_id.clone(),
@@ -355,6 +357,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
         scheduled_actions: response.scheduled_actions.clone(),
         spawn_requests: response.spawn_requests.clone(),
         spec_governed: response.spec_governed,
+        refused: response.refused,
     }
 }
 

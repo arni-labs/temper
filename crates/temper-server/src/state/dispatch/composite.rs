@@ -207,11 +207,7 @@ impl crate::state::ServerState {
                         prepared.idx
                     )
                 });
-                return Err(sub_write_failure(
-                    &response,
-                    &prepared.idempotency_key,
-                    error,
-                ));
+                return Err(sub_write_failure(&response, error));
             }
         }
 
@@ -417,10 +413,23 @@ impl crate::state::ServerState {
         }
 
         let append_started_at = timing_enabled.then(std::time::Instant::now);
-        store
-            .append_batch(&appends)
-            .await
-            .map_err(composite_batch_persistence_error)?;
+        if let Err(error) = store.append_batch(&appends).await {
+            // A batch that landed behind a concurrency violation has committed;
+            // everything after the commit still runs.
+            if !(matches!(error, PersistenceError::ConcurrencyViolation { .. })
+                && composite_batch_landed(&store, &appends).await?)
+            {
+                return Err(composite_batch_persistence_error(error));
+            }
+            tracing::warn!(
+                tenant = %tenant,
+                parent_entity_type,
+                parent_entity_id,
+                parent_action,
+                %error,
+                "composite batch landed although its append answered with a concurrency violation"
+            );
+        }
         let append_ms = append_started_at.map(|started| started.elapsed().as_millis() as u64);
         self.invalidate_batch_state_timeouts(tenant, &timed);
 
@@ -522,14 +531,7 @@ impl crate::state::ServerState {
             && expected_sequence == 0
             && state.total_event_count == 0
         {
-            let bootstrap = crate::entity_actor::EntityEvent {
-                action: "Created".to_string(),
-                from_status: String::new(),
-                to_status: state.status.clone(),
-                timestamp: sim_now(),
-                params: serde_json::json!({}),
-                idempotency_key: None,
-            };
+            let bootstrap = crate::entity_actor::EntityEvent::bootstrap(state.status.clone());
             events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
             state.sequence_nr = state.sequence_nr.saturating_add(1);
             state.push_event_bounded(bootstrap);
@@ -859,14 +861,7 @@ impl crate::state::ServerState {
             && (!(write.uses_parent_gate && write.action == "Create")
                 || table.has_input_contracts())
         {
-            let created = crate::entity_actor::EntityEvent {
-                action: "Created".into(),
-                from_status: String::new(),
-                to_status: stream.state.status.clone(),
-                timestamp: sim_now(),
-                params: serde_json::json!({}),
-                idempotency_key: None,
-            };
+            let created = crate::entity_actor::EntityEvent::bootstrap(stream.state.status.clone());
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
         }

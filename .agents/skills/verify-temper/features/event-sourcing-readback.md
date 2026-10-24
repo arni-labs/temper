@@ -25,5 +25,5 @@ cargo test -p temper-server --test dst_lifecycle    # create->crash->respawn->re
 
 ## Gotchas
 - Three replay policies (`actor.rs`): lenient (normal hydration), strict-snapshot, and strict-full-journal. Identity/authority resolution uses strict-full-journal and ignores snapshots on purpose, so a stale snapshot cannot preserve revoked authority.
-- Replay enforces contiguous sequence numbers and `actor_id` binding; a `Deleted` tombstone is terminal (no events after it); PUT/PATCH land as `FieldsReplaced`/`FieldsUpdated` events replayed as replace/merge.
+- Replay enforces contiguous sequence numbers and `actor_id` binding; the kernel's delete tombstone is terminal (no events after it) and is recognised only by `PersistenceEnvelope::is_tombstone` (its payload `kind`, or for events journaled before kinds the old delete's exact shape), never by an action named `Deleted`; PUT/PATCH land as `FieldsReplaced`/`FieldsUpdated` events replayed as replace/merge.
 - A journal tail longer than `MAX_EVENTS_SINCE_SNAPSHOT` (10_000) without a snapshot is rejected on replay - snapshots must keep up.
