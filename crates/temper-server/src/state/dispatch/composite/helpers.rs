@@ -13,6 +13,25 @@ pub(super) fn synthetic_initial_state(
     )
 }
 
+/// The error for a sub-write that answered unsuccessfully. The target records
+/// the sub-write's key only when the write commits. A committed write can still
+/// answer unsuccessfully (its query projection failed afterwards); the target
+/// changed, so that answer is not a refusal.
+pub(super) fn sub_write_failure(
+    response: &crate::entity_actor::EntityResponse,
+    idempotency_key: &str,
+    error: String,
+) -> DispatchError {
+    if response
+        .state
+        .has_processed_idempotency_key(idempotency_key)
+    {
+        DispatchError::Internal(error)
+    } else {
+        DispatchError::Conflict(error)
+    }
+}
+
 pub(super) fn has_sub_writes(params: &Value) -> bool {
     params.get("sub_writes").is_some() || params.get("SubWrites").is_some()
 }
