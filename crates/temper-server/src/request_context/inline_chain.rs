@@ -22,10 +22,16 @@
 //!
 //! A detached task (a background integration, a state timer, a scheduled
 //! action, compensation) starts a new chain: the caller is not waiting for
-//! it, so a loop through it is paced by that work and counted by
-//! [`MAX_CALLBACK_HOPS`](super::MAX_CALLBACK_HOPS) instead. A spawned child's
-//! initial action is the next step of its parent's chain, on an entity the
-//! chain made, so a loop through spawns stops at its first repeat too.
+//! it, so a loop through it holds no request open. Each lap waits on the
+//! work that set it off (an integration call, a timer), and the loop ends
+//! when the app's own data stops it, as any timer loop does. The runtime
+//! does not limit its laps; each callback's events and spans report how many
+//! callbacks deep its lineage is
+//! ([`callback_depth`](super::AgentContext::callback_depth)).
+//!
+//! A spawned child's initial action is the next step of its parent's chain,
+//! on an entity the chain made, so a loop through spawns stops at its first
+//! repeat too.
 //!
 //! So a chain is bounded by its data: every entity it makes is one step per
 //! type and action the tenant's specs declare, and every other step is on an

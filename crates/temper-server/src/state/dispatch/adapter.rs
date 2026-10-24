@@ -244,6 +244,7 @@ impl crate::state::ServerState {
         workflow.root_entity_id = tracing::field::Empty,
         workflow.run_id = tracing::field::Empty,
         temper.action = tracing::field::Empty,
+        temper.callback_depth = tracing::field::Empty,
         session.id = tracing::field::Empty,
     ))]
     pub(crate) async fn dispatch_adapter_integrations_internal(

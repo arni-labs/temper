@@ -6,6 +6,8 @@ AgentContext.callback_depth counts every integration callback. A detached task i
 
 ## Contract
 
+> Superseded: temper #69 replaced the inline depth with a stop at a chain's first repeated step, and D3 in decisions.md removed the hop budget. Detached callbacks are not limited; `callback_depth` reports how deep a lineage is.
+
 The runtime owns two separate counters:
 
 - Inline callback depth: at most 8, retaining the current recursion limit.

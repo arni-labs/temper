@@ -256,6 +256,7 @@ pub(super) fn record_workflow_span_attrs(
     span.record("workflow.root_entity_type", root_type.as_str());
     span.record("workflow.root_entity_id", root_id.as_str());
     span.record("workflow.run_id", run_id.as_str());
+    span.record("temper.callback_depth", agent_ctx.callback_depth);
     if let Some(action) = action {
         span.record("temper.action", action);
     }

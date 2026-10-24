@@ -1,6 +1,6 @@
 //! Real WASM engine → native strict actor callback proof; no external providers.
-#[path = "strict_native_callbacks/budget.rs"]
-mod budget;
+#[path = "strict_native_callbacks/loops.rs"]
+mod loops;
 use serde_json::json;
 use temper_runtime::{ActorSystem, tenant::TenantId};
 use temper_server::{
@@ -10,8 +10,8 @@ use temper_server::{
 use temper_spec::csdl::parse_csdl;
 
 // These independent end-to-end loads have wall-clock deadlines. In particular,
-// the 240-callback workload must not consume the shorter budget tests' CPU
-// headroom. Acquire before starting each case; keep every deadline and callback.
+// the 600-lap loops must not consume the shorter cases' CPU headroom. Acquire
+// before starting each case; keep every deadline and callback.
 static CALLBACK_TEST_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 const SPEC: &str = r#"

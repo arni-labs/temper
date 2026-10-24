@@ -2346,6 +2346,7 @@ async fn test_sse_events_endpoint_delivers_state_changes() {
         session_id: None,
         intent: None,
         observation_metadata: None,
+        callback_depth: 0,
     });
 
     // Read SSE frames until we see the event (stream never closes on its own).
@@ -2380,6 +2381,7 @@ async fn test_sse_events_lagged_receiver_continues() {
             session_id: None,
             intent: None,
             observation_metadata: None,
+            callback_depth: 0,
         });
     }
 
@@ -2408,6 +2410,7 @@ async fn test_sse_events_lagged_receiver_continues() {
         session_id: None,
         intent: None,
         observation_metadata: None,
+        callback_depth: 0,
     });
 
     // Read frames — the stream should recover and deliver the fresh event.

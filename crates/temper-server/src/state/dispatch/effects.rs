@@ -387,6 +387,7 @@ impl crate::state::ServerState {
             intent: ctx.agent_ctx.intent.clone(),
             observation_metadata: (!ctx.agent_ctx.observation_metadata.is_empty())
                 .then(|| ctx.agent_ctx.observation_metadata.clone()),
+            callback_depth: ctx.agent_ctx.callback_depth,
         };
         self.record_entity_observe_event_with_seq(
             ctx.tenant.as_str(),

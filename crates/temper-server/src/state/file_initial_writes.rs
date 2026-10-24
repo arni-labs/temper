@@ -342,6 +342,7 @@ impl ServerState {
             intent: agent_ctx.intent.clone(),
             observation_metadata: (!agent_ctx.observation_metadata.is_empty())
                 .then(|| agent_ctx.observation_metadata.clone()),
+            callback_depth: agent_ctx.callback_depth,
         };
         self.record_entity_observe_event_with_seq(
             tenant.as_str(),
