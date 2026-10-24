@@ -25,7 +25,7 @@ use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 mod effects;
 mod request;
 
-pub use effects::{EffectsClaim, EffectsOwner};
+pub use effects::{EffectsClaim, EffectsOwner, retry_reply};
 pub use request::{RequestFingerprint, derived_idempotency_key};
 
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).

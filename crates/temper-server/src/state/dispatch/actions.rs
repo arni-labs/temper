@@ -869,8 +869,8 @@ impl crate::state::ServerState {
         // A successful reply's effects run once per key: a retry that reaches
         // the actor while another dispatcher runs them waits for it, and a
         // retry after they ran does not run them again. Either way the retry
-        // answers with the reply that dispatcher completed, not the actor's
-        // copy from before the effects ran.
+        // answers at the state that dispatcher completed, never with the
+        // actor's copy from before the effects ran.
         let response = match idempotency_key.as_deref() {
             Some(idem_key) if response.success => {
                 let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
@@ -879,7 +879,9 @@ impl crate::state::ServerState {
                     .claim_effects(&actor_key, idem_key)
                     .await
                 {
-                    crate::idempotency::EffectsClaim::Applied(completed) => *completed,
+                    crate::idempotency::EffectsClaim::Applied(completed) => {
+                        crate::idempotency::retry_reply(response, *completed)
+                    }
                     crate::idempotency::EffectsClaim::Owner(owner) => {
                         let response = self.run_post_dispatch_effects(&ctx, response).await;
                         if response.success {

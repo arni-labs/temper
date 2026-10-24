@@ -76,6 +76,20 @@ impl Drop for EffectsOwner<'_> {
     }
 }
 
+/// What a retry answers once the reply's effects have run: the actor's own
+/// reply while it is already at the state the effects completed, since the
+/// actor answers a retry whose event is still newest with the live state in
+/// full (the cached copy leaves out event parameters and the durable key
+/// set); otherwise the completed reply, which the effects moved past the
+/// actor's copy (an inline callback, for one, adds its own event).
+pub fn retry_reply(actor_reply: EntityResponse, completed: EntityResponse) -> EntityResponse {
+    if actor_reply.state.total_event_count >= completed.state.total_event_count {
+        actor_reply
+    } else {
+        completed
+    }
+}
+
 impl IdempotencyCache {
     /// Claim the post-dispatch effects of the successful reply for
     /// `(actor_key, idem_key)`. Waits while another dispatcher runs them.
