@@ -14,7 +14,9 @@
 //! records does not leave them all resident.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use temper_runtime::tenant::TenantId;
 
@@ -44,7 +46,7 @@ impl ServerState {
             Ok(mut registry) => registry.take_changed_types(),
             Err(_) => return,
         };
-        self.follow_types(changed, &BootCallers::new()).await;
+        self.follow_types(changed, &BootCallers::new(), None).await;
     }
 
     /// [`Self::follow_spec_changes`] in the background, for an install that
@@ -59,7 +61,7 @@ impl ServerState {
 
     /// At boot, after the rows are re-armed: make every record of every type
     /// that declares a timeout follow its state, as an install would.
-    pub(super) async fn follow_timed_types(&self, callers: BootCallers) {
+    pub(super) async fn follow_timed_types(&self, callers: BootCallers, gate: Arc<Semaphore>) {
         let types: Vec<(TenantId, String)> = match self.registry.read() {
             Ok(registry) => registry
                 .tenant_ids()
@@ -79,14 +81,19 @@ impl ServerState {
                 .collect(),
             Err(_) => return,
         };
-        self.follow_types(types, &callers).await;
+        self.follow_types(types, &callers, Some(gate)).await;
     }
 
     /// Reconcile every record of each of `types`. A type whose records the
     /// store cannot list or read is tried again after a wait. Repeating a
     /// successful reconcile is idempotent; an unreadable record may have no
     /// timer at all, so the walk must retain responsibility for retrying it.
-    async fn follow_types(&self, mut types: Vec<(TenantId, String)>, callers: &BootCallers) {
+    async fn follow_types(
+        &self,
+        mut types: Vec<(TenantId, String)>,
+        callers: &BootCallers,
+        gate: Option<Arc<Semaphore>>,
+    ) {
         let mut wait = FOLLOW_RETRY_FIRST;
         loop {
             let mut pending = Vec::new();
@@ -109,6 +116,7 @@ impl ServerState {
                             &entity_type,
                             entity_id,
                             callers.get(&key),
+                            gate.clone(),
                         )
                         .await;
                     waiting += usize::from(followed == TimerFollow::WaitsForCaller);
@@ -146,6 +154,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         armed_by: Option<&AgentContext>,
+        gate: Option<Arc<Semaphore>>,
     ) -> TimerFollow {
         let Some(current) = self
             .current_record_state(tenant, entity_type, entity_id)
@@ -156,7 +165,7 @@ impl ServerState {
         if current.total_event_count == 0 {
             return TimerFollow::Settled;
         }
-        self.reconcile_state_timers(tenant, entity_type, entity_id, &current, armed_by)
+        self.reconcile_state_timers_gated(tenant, entity_type, entity_id, &current, armed_by, gate)
             .await
     }
 

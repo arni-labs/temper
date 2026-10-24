@@ -2,10 +2,11 @@
 //! rows and the records' states.
 
 use super::{Job, Run, World, settle, status, timer_action};
+use temper_runtime::persistence::EventStore;
 use temper_server::ServerState;
 
-/// Invariant: after `jobs` rehydrate, each has exactly the timer row its
-/// current state declares.
+/// Capture rows before any reads can repair them. At restart, derive the
+/// expected state from storage so the timer-only wait keeps untouched records.
 pub(super) async fn check_rows_follow_state(
     state: &ServerState,
     world: &World,
@@ -13,14 +14,38 @@ pub(super) async fn check_rows_follow_state(
     run: &Run,
     when: &str,
 ) -> Result<(), String> {
-    for job in jobs.iter().filter(|job| !run.is_deleted(job)) {
-        status(state, job).await;
-    }
     settle().await;
-    for job in jobs {
-        let row = world.rows.row(job.tenant.as_str(), &job.id);
+    let rows: Vec<_> = jobs
+        .iter()
+        .map(|job| world.rows.row(job.tenant.as_str(), &job.id))
+        .collect();
+    for (job, row) in jobs.iter().zip(rows) {
         let current = if run.is_deleted(job) {
             "<deleted>".to_string()
+        } else if when == "after the restart" {
+            let key = format!("{}:Job:{}", job.tenant, job.id);
+            let (seq, mut expected) = match world.events.load_snapshot(&key).await.unwrap() {
+                Some((seq, bytes)) => {
+                    let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    (seq, snapshot["status"].as_str().unwrap().to_string())
+                }
+                None => (0, "Idle".to_string()),
+            };
+            for event in world.events.read_events(&key, seq).await.unwrap() {
+                match event.event_type.as_str() {
+                    "Start" => {
+                        expected = if job.tenant.as_str() == "alpha" {
+                            "Review"
+                        } else {
+                            "Waiting"
+                        }
+                        .to_string()
+                    }
+                    "Expire" | "Approve" => expected = "Done".to_string(),
+                    _ => {}
+                }
+            }
+            expected
         } else {
             status(state, job).await
         };

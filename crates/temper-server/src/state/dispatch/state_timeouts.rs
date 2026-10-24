@@ -467,13 +467,24 @@ impl crate::state::ServerState {
         self.persist_state_timer(&timer).await;
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         if self.state_timeout_tracker.current(&key) != armed_seq {
-            match self.state_timeout_tracker.armed(&key) {
-                Some(newer) => self.persist_state_timer(&newer).await,
-                None => self.forget_state_timer(&timer).await,
+            let mut written = timer.clone();
+            loop {
+                let seq = self.state_timeout_tracker.current(&key);
+                match self.state_timeout_tracker.armed(&key) {
+                    Some(newer) => {
+                        self.persist_state_timer(&newer).await;
+                        written = newer;
+                    }
+                    None => self.forget_state_timer(&written).await,
+                }
+                if self.state_timeout_tracker.current(&key) == seq {
+                    break;
+                }
             }
             return false;
         }
-        self.spawn_state_timer(timer, delay, None, armed_seq);
+        let gate = timer.boot_gate.clone();
+        self.spawn_state_timer(timer, delay, gate, armed_seq);
         true
     }
 
@@ -724,6 +735,8 @@ pub(super) struct ArmedTimer {
     /// The entity's journal sequence when the timer was armed.
     pub(super) sequence_nr: u64,
     pub(super) started_at: DateTime<Utc>,
+    /// Shared dispatch gate inherited by replacements of boot timers.
+    pub(super) boot_gate: Option<Arc<Semaphore>>,
 }
 
 impl ArmedTimer {
@@ -788,6 +801,7 @@ pub(super) fn declared_timer(
         );
     }
     ArmedTimer {
+        boot_gate: None,
         tenant: tenant.clone(),
         entity_type: entity_type.to_string(),
         entity_id: entity_id.to_string(),
@@ -836,6 +850,153 @@ mod tests {
         EntityKey::new(&TenantId::from("t".to_string()), "E", "e-1")
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn boot_replacements_wait_for_the_shared_fire_gate() {
+        for has_prior_row in [false, true] {
+            let mut registry = SpecRegistry::new();
+            registry.register_tenant(
+                "t",
+                parse_csdl(TICKET_CSDL).unwrap(),
+                TICKET_CSDL.to_string(),
+                &[("Ticket", TICKET_WITH_TIMEOUT_IOA)],
+            );
+            let server = crate::state::ServerState::from_registry(
+                temper_runtime::ActorSystem::new("boot-gate"),
+                registry,
+            );
+            let tenant = TenantId::new("t");
+            let created = server
+                .get_or_create_tenant_entity(&tenant, "Ticket", "e-1", serde_json::json!({}))
+                .await
+                .unwrap();
+            let gate = Arc::new(Semaphore::new(0));
+            if has_prior_row {
+                let mut old = timer("Old", created.state.sequence_nr);
+                old.entity_type = "Ticket".to_string();
+                old.boot_gate = Some(gate.clone());
+                server.reserve_state_timer(&old).unwrap();
+            }
+            server
+                .reconcile_state_timers_gated(
+                    &tenant,
+                    "Ticket",
+                    "e-1",
+                    &created.state,
+                    None,
+                    if has_prior_row {
+                        None
+                    } else {
+                        Some(gate.clone())
+                    },
+                )
+                .await;
+            let armed = server.armed_state_timer(&tenant, "Ticket", "e-1").unwrap();
+            assert!(Arc::ptr_eq(armed.boot_gate.as_ref().unwrap(), &gate));
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(2)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                server
+                    .get_tenant_entity_state(&tenant, "Ticket", "e-1")
+                    .await
+                    .unwrap()
+                    .state
+                    .status,
+                "Open"
+            );
+            gate.add_permits(1);
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                server
+                    .get_tenant_entity_state(&tenant, "Ticket", "e-1")
+                    .await
+                    .unwrap()
+                    .state
+                    .status,
+                "InProgress"
+            );
+        }
+    }
+
+    /// Reproduce cancellation landing between a repair's snapshot and write.
+    #[tokio::test]
+    async fn repair_does_not_resurrect_a_cancelled_row() {
+        use crate::storage::StateTimerStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
+
+        struct RacingRows {
+            tracker: Arc<StateTimeoutTracker>,
+            writes: AtomicUsize,
+            row: Mutex<Option<StateTimerRecord>>,
+        }
+        #[async_trait::async_trait]
+        impl StateTimerStore for RacingRows {
+            async fn upsert_state_timer(
+                &self,
+                row: &StateTimerRecord,
+            ) -> Result<(), PersistenceError> {
+                match self.writes.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        self.tracker.reserve(&timer("New", 2), Reservation::Fresh);
+                    }
+                    1 => {
+                        self.tracker.invalidate(&key(), 3);
+                        *self.row.lock().unwrap() = None;
+                    }
+                    _ => {}
+                }
+                *self.row.lock().unwrap() = Some(row.clone());
+                Ok(())
+            }
+            async fn delete_state_timer(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                arm: &str,
+            ) -> Result<(), PersistenceError> {
+                let mut row = self.row.lock().unwrap();
+                if row.as_ref().is_some_and(|row| row.arm_id == arm) {
+                    *row = None;
+                }
+                Ok(())
+            }
+            async fn list_state_timers(
+                &self,
+                _: &str,
+            ) -> Result<Vec<StateTimerRecord>, PersistenceError> {
+                Ok(self.row.lock().unwrap().iter().cloned().collect())
+            }
+        }
+        let mut server = crate::state::ServerState::from_registry(
+            temper_runtime::ActorSystem::new("repair-race"),
+            crate::registry::SpecRegistry::new(),
+        );
+        let rows = Arc::new(RacingRows {
+            tracker: server.state_timeout_tracker.clone(),
+            writes: AtomicUsize::new(0),
+            row: Mutex::new(None),
+        });
+        server.state_timer_rows = Some(rows.clone());
+        assert!(
+            !server
+                .start_armed_timer(timer("Old", 1), Duration::from_secs(60), Reservation::Fresh)
+                .await
+        );
+        assert_eq!(rows.writes.load(Ordering::SeqCst), 2);
+        assert!(
+            rows.row.lock().unwrap().is_none(),
+            "cancelled repair row must be removed"
+        );
+    }
+
     #[test]
     fn bump_returns_monotonically_increasing_seq() {
         let t = StateTimeoutTracker::new();
@@ -850,6 +1011,7 @@ mod tests {
     /// A timer on `E/e-1` in `state`, armed by the transition at `journal`.
     fn timer(state: &str, journal: u64) -> ArmedTimer {
         ArmedTimer {
+            boot_gate: None,
             tenant: TenantId::from("t".to_string()),
             entity_type: "E".to_string(),
             entity_id: "e-1".to_string(),

@@ -191,7 +191,7 @@ impl ServerState {
                         Err("its state no longer declares a timeout".to_string())
                     }
                 };
-                let timer = match timer {
+                let mut timer = match timer {
                     Ok(timer) => timer,
                     Err(reason) => {
                         tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,
@@ -208,6 +208,7 @@ impl ServerState {
                         continue;
                     }
                 };
+                timer.boot_gate = Some(gate.clone());
                 let delay = remaining_budget(timer.started_at, timer.after_seconds, now);
                 let label = if delay.is_zero() {
                     "overdue"
@@ -236,7 +237,7 @@ impl ServerState {
         );
         let server = self.clone();
         // determinism-ok: boot follow-up runs in the background, as boot timers do.
-        tokio::spawn(async move { server.follow_timed_types(callers).await })
+        tokio::spawn(async move { server.follow_timed_types(callers, gate).await })
     }
 
     /// Every tenant's declared timeouts. Tenants without any are left out.
@@ -298,6 +299,7 @@ fn armed_timer(
     let armed_by: ArmedBy =
         serde_json::from_str(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
     Ok(ArmedTimer {
+        boot_gate: None,
         tenant: tenant.clone(),
         entity_type: row.entity_type.clone(),
         entity_id: row.entity_id.clone(),

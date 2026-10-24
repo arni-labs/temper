@@ -68,6 +68,20 @@ impl ServerState {
         current: &EntityState,
         armed_by: Option<&AgentContext>,
     ) -> TimerFollow {
+        self.reconcile_state_timers_gated(tenant, entity_type, entity_id, current, armed_by, None)
+            .await
+    }
+
+    /// Reconcile with the shared boot dispatch gate when called by its walk.
+    pub(super) async fn reconcile_state_timers_gated(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        current: &EntityState,
+        armed_by: Option<&AgentContext>,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> TimerFollow {
         let declared = {
             let Ok(registry) = self.registry.read() else {
                 return TimerFollow::Settled;
@@ -101,7 +115,7 @@ impl ServerState {
             }
             None => AgentContext::for_service(STATE_TIMER_SERVICE),
         };
-        let timer = declared_timer(
+        let mut timer = declared_timer(
             tenant,
             entity_type,
             entity_id,
@@ -110,6 +124,10 @@ impl ServerState {
             &identity,
             started_at,
         );
+        timer.boot_gate = gate.or_else(|| {
+            self.armed_state_timer(tenant, entity_type, entity_id)
+                .and_then(|armed| armed.boot_gate)
+        });
         let delay = remaining_budget(started_at, st.after_seconds, now);
         if self
             .start_armed_timer(timer, delay, Reservation::Missing)

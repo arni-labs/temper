@@ -405,7 +405,13 @@ fn run_seed(seed: u64) -> Result<(), String> {
     let second = Process::start(&world, &v2, JOB_V1, &format!("follow-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
-        let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
+        check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
+        // Keep gamma untouched until its timers alone have finished.
+        let looked: Vec<Job> = jobs
+            .iter()
+            .filter(|job| job.tenant.as_str() != "gamma" && rng.chance(0.4))
+            .cloned()
+            .collect();
         run.note(format!(
             "rehydrated {:?}",
             looked
@@ -417,8 +423,6 @@ fn run_seed(seed: u64) -> Result<(), String> {
             status(state, job).await;
         }
         settle().await;
-        // The boot walk has run: every record follows its state, read or not.
-        check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
         // Nobody touches the records: their timers alone must finish them.
         for _ in 0..360 {
             advance(Duration::from_secs(30)).await;
