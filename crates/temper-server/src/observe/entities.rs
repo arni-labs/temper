@@ -77,7 +77,9 @@ pub(crate) async fn handle_list_entities(
 ///
 /// Each event's `sequence` is its journal sequence, the number a state
 /// timer's `caused_by.sequence_nr` names. A server without a journal keeps
-/// no sequence and numbers its in-memory events from 1.
+/// no sequence and numbers its in-memory events from 1. A loaded record's
+/// history stops at the sequence of the state it is shown with, and a
+/// journal that cannot be read answers 503.
 pub(crate) async fn handle_get_entity_history(
     State(state): State<ServerState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
@@ -108,7 +110,10 @@ pub(crate) async fn handle_get_entity_history(
             .state
             .sequence_nr
             .saturating_sub(response.state.events.len() as u64);
-        let events = match journal_history(&state, &persistence_id, before_recent).await {
+        // Through the state's own sequence: a move committed after `GetState`
+        // answered belongs to a later state than the one this response shows.
+        let through = Some(response.state.sequence_nr);
+        let events = match journal_history(&state, &persistence_id, before_recent, through).await? {
             Some(events) => events,
             None => (1..)
                 .zip(&response.state.events)
@@ -140,7 +145,7 @@ pub(crate) async fn handle_get_entity_history(
 
     // Path 2: Query event store directly (for inactive entities).
     let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-    if let Some(events) = journal_history(&state, &persistence_id, 0).await {
+    if let Some(events) = journal_history(&state, &persistence_id, 0, None).await? {
         return Ok(Json(format_history_response(
             &entity_type,
             &entity_id,
@@ -382,24 +387,43 @@ fn format_history_response(
     })
 }
 
-/// The journal's events after sequence `after`, each numbered by its journal
-/// sequence; None when there is no journal or it cannot be read.
+/// The journal's events after sequence `after` and up to `through`, each
+/// numbered by its journal sequence; `Ok(None)` when the server keeps no
+/// journal.
+///
+/// A journal that cannot be read is 503, never a history numbered some other
+/// way: a state timer's `caused_by.sequence_nr` is a journal sequence, and
+/// numbers made up here would point it at the wrong move.
 async fn journal_history(
     state: &ServerState,
     persistence_id: &str,
     after: u64,
-) -> Option<Vec<serde_json::Value>> {
-    let (store, _backend) = state.event_journal()?;
-    let envelopes = store.read_events(persistence_id, after).await.ok()?;
-    Some(
+    through: Option<u64>,
+) -> Result<Option<Vec<serde_json::Value>>, StatusCode> {
+    let Some((store, _backend)) = state.event_journal() else {
+        return Ok(None);
+    };
+    let envelopes = store
+        .read_events(persistence_id, after)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                persistence_id,
+                %error,
+                "entity history could not read the event journal"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+    Ok(Some(
         envelopes
             .iter()
+            .filter(|env| through.is_none_or(|through| env.sequence_nr <= through))
             .filter_map(|env| {
                 let event = serde_json::from_value::<EntityEvent>(env.payload.clone()).ok()?;
                 Some(history_event(env.sequence_nr, &event))
             })
             .collect(),
-    )
+    ))
 }
 
 /// One event of the history API. `actor` and `caused_by` are present when the
