@@ -96,9 +96,9 @@ fn bfs_checker_proves_joint_invariant_holds() {
 }
 
 #[test]
-fn self_loop_cascade_bounded_by_max_depth() {
+fn self_triggering_cascade_runs_once() {
     // Self-triggering entity (Assign → Start on same entity) should
-    // not blow up the state space; cascade bound stops it.
+    // not blow up the state space; the cascade ends after Start.
     let spec = r#"
 [automaton]
 name = "Agent"

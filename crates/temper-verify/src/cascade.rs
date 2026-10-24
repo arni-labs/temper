@@ -133,8 +133,8 @@ pub struct CompositeCascadeReport {
     /// Number of trigger edges within the scope.
     pub edge_count: usize,
     /// Whether the trigger graph contains a cycle reachable from the
-    /// seed. Legal (cascade depth bounds cycles at runtime) but surfaced
-    /// for visibility.
+    /// seed. Legal (at runtime a chain round a cycle stops at its first
+    /// repeated step) but surfaced for visibility.
     pub has_cycle: bool,
     /// Conservative upper bound on joint state-space size — product of
     /// per-entity reachable-status counts. Useful for budgeting whether
