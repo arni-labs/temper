@@ -301,3 +301,71 @@ async fn entity_wait_history_and_events_of_a_missing_entity_are_not_found() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
     }
 }
+
+async fn submit(state: &ServerState, id: &str) {
+    let result = state
+        .dispatch_tenant_action(
+            &TenantId::default(),
+            "Order",
+            id,
+            "SubmitOrder",
+            serde_json::json!({}),
+            &AgentContext::default(),
+        )
+        .await;
+    assert!(result.is_ok_and(|r| r.success), "{id} SubmitOrder failed");
+}
+
+#[tokio::test]
+async fn entity_wait_answers_not_found_when_the_entity_is_deleted_while_waiting() {
+    let state = state_with_entity_read_policy().await;
+    let uri = "/observe/entities/Order/order-a/wait?statuses=Shipped&timeout_ms=3000&poll_ms=10";
+    let wait = tokio::spawn(app(state.clone()).oneshot(agent_in("default", uri)));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    state
+        .delete_tenant_entity(&TenantId::default(), "Order", "order-a")
+        .await
+        .expect("delete succeeds");
+
+    let response = wait.await.expect("wait task").unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !state.entity_exists(&TenantId::default(), "Order", "order-a"),
+        "the wait does not start the deleted entity again"
+    );
+}
+
+#[tokio::test]
+async fn entity_events_end_once_the_caller_may_no_longer_read_the_entity() {
+    let state = state_with_entity_read_policy().await;
+    let replayed = state
+        .entity_observe_replay("default", "Order", "order-a", 0)
+        .events
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    let response = app(state.clone())
+        .oneshot(agent_in(
+            "default",
+            "/observe/entities/Order/order-a/events",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Submitted orders are not readable under the policy.
+    submit(&state, "order-a").await;
+
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024),
+    )
+    .await
+    .expect("the stream ends once the entity is no longer readable")
+    .expect("body should read");
+    let body = String::from_utf8(body.to_vec()).expect("SSE is text");
+    for id in body.lines().filter_map(|line| line.strip_prefix("id:")) {
+        let seq: u64 = id.trim().parse().expect("event ids are sequences");
+        assert!(seq <= replayed, "no event after submission is sent: {body}");
+    }
+}
