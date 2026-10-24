@@ -1,24 +1,27 @@
 //! DST: a scheduled action outlives a restart and fires once.
 //!
 //! Workload, per seed: records arm `schedule(...)` and `schedule_at(...)`
-//! actions, once (`Fire`) or repeating (`Tick`, which schedules the next
-//! one). Some `Fire`s meet a store that fails their write, or writes it and
-//! loses the answer. The process stops before some are due and after others,
-//! sometimes right after a fire, before any removal that is not part of its
-//! commit. The next process boots with `start_runtime` and nobody touches the
-//! records.
+//! actions, once (`Fire`), repeating (`Tick`, which schedules the next one),
+//! or as a cron (`Plan` stores the next run time and `schedule_at`s `Run` at
+//! it; the cron's callback, played by the test as CronJob's integration does,
+//! plans the next run a period after each `Run`). Some records meet a store
+//! that fails their next write, or writes it and loses the answer. The process
+//! stops before some are due and after others, sometimes right after a fire,
+//! before any removal that is not part of its commit. The next process boots
+//! with `start_runtime` and nobody but the cron callback touches the records.
 //!
 //! Invariants:
-//! - every armed `Fire` fires exactly once, never before it is due, and at its
-//!   due time when that falls after the boot, or soon after the boot when the
-//!   process was down at that time; a write that failed or may have landed is
-//!   retried on the same row, so it is late by its retries, never lost and
-//!   never run twice;
-//! - a repeating `Tick` keeps going after the restart, never twice within one
-//!   period;
+//! - every armed action fires exactly once per arm, never before it is due,
+//!   and at its due time when that falls after the boot or while the first
+//!   process ran, or soon after the boot when it fell due while the process
+//!   was down; a write that failed or may have landed is retried on the same
+//!   row, so it is late by its retries, never lost and never run twice;
+//! - a repeating action and a cron keep going after the restart, each fire a
+//!   period after the one before;
 //! - a fire's event and the removal of its row commit together: no stop
 //!   leaves a row behind a written fire;
-//! - no row is left for a fired action, and a repeating record keeps one.
+//! - no row is left for a fired action, a repeating record keeps one, a cron
+//!   at most one, and every row is armed exactly once in the process.
 //!
 //! Each server runs in its own single-threaded, paused-clock Tokio runtime;
 //! dropping the runtime is the process exit. Scheduled-action rows are kept
@@ -28,7 +31,7 @@
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +44,7 @@ use temper_runtime::scheduler::{
 };
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
-use temper_server::request_context::AgentContext;
+use temper_server::request_context::{AgentContext, ScheduledFire};
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -49,23 +52,28 @@ use world::{ProcessClock, SimTimerRows};
 
 const SEEDS: u64 = 48;
 
-/// How long `Start` and every `Tick` wait before their action fires.
+/// How long `Start` and every `Tick` wait before their action fires, and how
+/// far apart a cron's runs are.
 const PERIOD: i64 = 600;
 
 /// A fire after the boot must come at its due time; one that fell due while
 /// the process was down, within this long of the boot (eight fire at once).
 const BOOT_FIRE_WINDOW: i64 = 5;
 
-/// How late a `Fire` whose writes fail may land: its retries (the store
-/// fails up to three writes).
+/// How late a fire whose writes fail may land: its retries (the store fails
+/// up to three writes).
 const RETRY_WINDOW: i64 = 15;
+
+/// How often the cron callback looks for a `Run` to answer, so how late it may
+/// plan the next one.
+const CALLBACK_LAG: i64 = 30;
 
 const JOB: &str = r#"
 [automaton]
 name = "Job"
-states = ["Idle", "Waiting", "Active", "Done"]
+states = ["Idle", "Waiting", "Active", "Planned", "Done"]
 initial = "Idle"
-allow_indefinite_states = ["Idle", "Waiting", "Active", "Done"]
+allow_indefinite_states = ["Idle", "Waiting", "Active", "Planned", "Done"]
 
 [[action]]
 name = "Start"
@@ -95,6 +103,17 @@ effect = ["schedule('Tick', 600)"]
 name = "Fire"
 from = ["Waiting", "Done"]
 to = "Done"
+
+[[action]]
+name = "Plan"
+from = ["Idle", "Planned"]
+to = "Planned"
+params = ["next_run_at"]
+effect = ["schedule_at('Run', next_run_at)"]
+
+[[action]]
+name = "Run"
+from = ["Planned"]
 "#;
 
 const CSDL: &str = r#"<?xml version="1.0"?>
@@ -103,24 +122,81 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 <EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key>
 <Property Name="Id" Type="Edm.String" Nullable="false"/>
 <Property Name="due" Type="Edm.String"/>
+<Property Name="next_run_at" Type="Edm.String"/>
 </EntityType>
 <Action Name="Start" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
 <Action Name="StartAt" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/><Parameter Name="due" Type="Edm.String"/></Action>
 <Action Name="Activate" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
 <Action Name="Tick" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
 <Action Name="Fire" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
+<Action Name="Plan" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/><Parameter Name="next_run_at" Type="Edm.String"/></Action>
+<Action Name="Run" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
 <EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/></EntityContainer>
 </Schema></edmx:DataServices></edmx:Edmx>"#;
 
 const TENANT: &str = "alpha";
 
+/// How a record of the workload fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// `Fire`, once.
+    Once,
+    /// `Tick`, every [`PERIOD`], each scheduling the next.
+    Repeat,
+    /// `Run`, at the time `Plan` stored; the callback plans the next.
+    Cron,
+}
+
+impl Kind {
+    fn action(self) -> &'static str {
+        match self {
+            Kind::Once => "Fire",
+            Kind::Repeat => "Tick",
+            Kind::Cron => "Run",
+        }
+    }
+}
+
 /// What a record of the workload armed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Arm {
-    /// `Fire`, due at this time; whether the store faults its write.
-    Once(DateTime<Utc>, bool),
-    /// `Tick` every [`PERIOD`].
-    Repeat,
+struct Arm {
+    kind: Kind,
+    /// When its first fire is due.
+    due: DateTime<Utc>,
+    /// Whether the store faults its first fire's write.
+    faulted: bool,
+}
+
+impl Arm {
+    /// How late after its due time a fire of this record may land.
+    fn late(&self) -> i64 {
+        let retries = if self.faulted { RETRY_WINDOW } else { 1 };
+        match self.kind {
+            Kind::Cron => retries + CALLBACK_LAG,
+            Kind::Once | Kind::Repeat => retries,
+        }
+    }
+}
+
+/// When the first process stopped and the second booted.
+struct Restart {
+    stop: DateTime<Utc>,
+    boot: DateTime<Utc>,
+}
+
+impl Restart {
+    /// A fire due at `due` came at `fire` on time: at its due time when that
+    /// fell while a process ran, or soon after the boot when it fell while
+    /// none did. A due time well before the stop that fired only after the
+    /// boot was missed while the first process ran.
+    fn on_time(&self, due: DateTime<Utc>, fire: DateTime<Utc>, late: i64) -> bool {
+        if fire < self.boot || due > self.boot {
+            (-1..=late).contains(&(fire - due).num_seconds())
+        } else {
+            (due - self.stop).num_seconds() >= -late
+                && (fire - self.boot).num_seconds() <= BOOT_FIRE_WINDOW + late
+        }
+    }
 }
 
 /// What outlives a process: the journal, the timer rows and the clock.
@@ -138,7 +214,7 @@ struct Process {
 
 impl Process {
     /// Boot the way every embedder does: specs, storage, then
-    /// `start_runtime`.
+    /// `start_runtime`. The cron callback runs beside it.
     fn start(world: &World, name: &str) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -155,6 +231,8 @@ impl Process {
             state.state_timer_rows = Some(world.rows.clone());
             let walk = state.start_runtime().await.expect("the first start");
             walk.await.unwrap();
+            let callback = cron_callback(state.clone(), world.events.clone());
+            tokio::spawn(callback); // determinism-ok: the cron's integration, inside this process
             state
         });
         Self { runtime, state }
@@ -166,6 +244,34 @@ impl Process {
         let Self { runtime, state } = self;
         drop(state);
         drop(runtime);
+    }
+}
+
+/// The cron's callback, as CronJob's integration answers each run: once a
+/// record's newest event is a `Run`, plan the next run a period after it.
+async fn cron_callback(state: ServerState, events: SimEventStore) {
+    let prefix = format!("{TENANT}:Job:");
+    loop {
+        tokio::time::sleep(Duration::from_secs(CALLBACK_LAG as u64)).await;
+        for persistence_id in events.list_all_persistence_ids() {
+            let Some(id) = persistence_id.strip_prefix(&prefix) else {
+                continue;
+            };
+            let journal = events.read_events(&persistence_id, 0).await;
+            let Some(last) = journal.as_deref().ok().and_then(<[_]>::last) else {
+                continue;
+            };
+            if last.event_type == "Run" {
+                let next = last.metadata.timestamp + chrono::Duration::seconds(PERIOD);
+                act(
+                    &state,
+                    id,
+                    "Plan",
+                    json!({ "next_run_at": next.to_rfc3339() }),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -218,26 +324,17 @@ async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Va
         .is_ok_and(|response| response.success)
 }
 
-/// Whether the journal `persistence_id` holds an event of `action`.
-async fn journal_has(events: &SimEventStore, persistence_id: &str, action: &str) -> bool {
+/// When each of the record's events of `action` was written, from its
+/// journal.
+async fn fired_at(events: &SimEventStore, id: &str, action: &str) -> Vec<DateTime<Utc>> {
     events
-        .read_events(persistence_id, 0)
+        .read_events(&format!("{TENANT}:Job:{id}"), 0)
         .await
-        .is_ok_and(|events| events.iter().any(|event| event.event_type == action))
-}
-
-/// When each of the record's events of `action` was applied.
-async fn fired_at(state: &ServerState, id: &str, action: &str) -> Vec<DateTime<Utc>> {
-    state
-        .get_tenant_entity_state(&TenantId::new(TENANT), "Job", id)
-        .await
-        .map(|response| {
-            response
-                .state
-                .events
+        .map(|journal| {
+            journal
                 .iter()
-                .filter(|event| event.action == action)
-                .map(|event| event.timestamp)
+                .filter(|event| event.event_type == action)
+                .map(|event| event.metadata.timestamp)
                 .collect()
         })
         .unwrap_or_default()
@@ -261,7 +358,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
     let mut arms: BTreeMap<String, Arm> = BTreeMap::new();
 
     let first = Process::start(&world, &format!("sched-{seed}-a"));
-    let held_fires = first.runtime.block_on(async {
+    let (held_fires, stop) = first.runtime.block_on(async {
         let state = &first.state;
         for i in 0..2 + rng.next_bound(5) {
             let id = format!("job-{i}");
@@ -271,64 +368,59 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 .await
                 .map_err(|error| run.fail("records are created", error))?;
             let now = sim_now();
-            let (action, params, arm) = match rng.next_bound(3) {
-                0 => (
-                    "Start",
-                    json!({}),
-                    Arm::Once(now + chrono::Duration::seconds(PERIOD), false),
-                ),
+            let in_a_period = now + chrono::Duration::seconds(PERIOD);
+            let (action, params, kind, due) = match rng.next_bound(4) {
+                0 => ("Start", json!({}), Kind::Once, in_a_period),
                 1 => {
                     let due = now + chrono::Duration::seconds(rng.next_bound(7200) as i64);
-                    (
-                        "StartAt",
-                        json!({ "due": due.to_rfc3339() }),
-                        Arm::Once(due, false),
-                    )
+                    let params = json!({ "due": due.to_rfc3339() });
+                    ("StartAt", params, Kind::Once, due)
                 }
-                _ => ("Activate", json!({}), Arm::Repeat),
+                2 => ("Activate", json!({}), Kind::Repeat, in_a_period),
+                _ => {
+                    let params = json!({ "next_run_at": in_a_period.to_rfc3339() });
+                    ("Plan", params, Kind::Cron, in_a_period)
+                }
             };
             if !act(state, &id, action, params).await {
                 return Err(run.fail("records arm their actions", format!("{id} {action}")));
             }
-            // The record's next write is its fire's: the store may fail it,
-            // or write it and lose the answer.
-            let arm = match (arm, rng.next_bound(3)) {
-                (Arm::Once(due, _), 1) => {
+            // The record's next write is its first fire's: the store may
+            // fail it, or write it and lose the answer.
+            let journal = format!("{TENANT}:Job:{id}");
+            let faulted = match rng.next_bound(3) {
+                1 => {
                     let failures = 1 + rng.next_bound(3);
-                    world
-                        .events
-                        .fail_next_appends(&format!("{TENANT}:Job:{id}"), failures);
+                    world.events.fail_next_appends(&journal, failures);
                     run.trace
                         .push(format!("{id}: its next {failures} writes fail"));
-                    Arm::Once(due, true)
+                    true
                 }
-                (Arm::Once(due, _), 2) => {
-                    world
-                        .events
-                        .lose_next_append_answers(&format!("{TENANT}:Job:{id}"), 1);
+                2 => {
+                    world.events.lose_next_append_answers(&journal, 1);
                     run.trace
                         .push(format!("{id}: its next write's answer is lost"));
-                    Arm::Once(due, true)
+                    true
                 }
-                (arm, _) => arm,
+                _ => false,
             };
+            let arm = Arm { kind, due, faulted };
             run.trace.push(format!("{id}: {action} at {now}, {arm:?}"));
             arms.insert(id, arm);
         }
         settle().await;
-        // Stop at a seeded time. Half the time, stop at an armed action's due
-        // instant instead: either at once, or right after its fire, with
+        // Stop at a seeded time. Half the time, stop at a one-shot action's
+        // due instant instead: either at once, or right after its fire, with
         // every removal outside the fire's commit held, as when the process
         // stops before one. A row removed only after the fire is left behind
         // and the next boot would fire it again.
         let now = sim_now();
         let dues: Vec<(&String, DateTime<Utc>)> = arms
             .iter()
-            .filter_map(|(id, arm)| match arm {
-                Arm::Once(due, _) if *due > now => Some((id, *due)),
-                _ => None,
-            })
+            .filter(|(_, arm)| arm.kind == Kind::Once && arm.due > now)
+            .map(|(id, arm)| (id, arm.due))
             .collect();
+        let mut held_fire = false;
         if !dues.is_empty() && rng.next_bound(2) == 0 {
             let (id, due) = dues[rng.next_bound(dues.len())];
             if rng.next_bound(2) == 0 {
@@ -338,12 +430,11 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 world.events.hold_scheduled_action_deletes(true);
                 until(due).await;
                 settle().await;
-                let fired = journal_has(&world.events, &format!("{TENANT}:Job:{id}"), "Fire").await;
+                held_fire = !fired_at(&world.events, id, "Fire").await.is_empty();
                 run.trace.push(format!(
-                    "stop at {} after {id}'s Fire (written: {fired}), removals held",
+                    "stop at {} after {id}'s Fire (written: {held_fire}), removals held",
                     sim_now()
                 ));
-                return Ok(usize::from(fired));
             }
         } else {
             until(now + chrono::Duration::seconds(rng.next_bound(3600) as i64)).await;
@@ -354,7 +445,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             run.trace
                 .push(format!("stop at {} after {turns} turns", sim_now()));
         }
-        Ok::<usize, String>(0)
+        Ok::<_, String>((usize::from(held_fire), sim_now()))
     })?;
     let downtime = Duration::from_secs(rng.next_bound(7200) as u64);
     first.kill(&world, downtime);
@@ -366,8 +457,11 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             let mut left_behind = 0;
             let rows = world.events.list_scheduled_actions(TENANT).await.unwrap();
             for row in rows.iter().filter(|row| row.action == "Fire") {
-                let journal = format!("{TENANT}:Job:{}", row.entity_id);
-                left_behind += usize::from(journal_has(&world.events, &journal, "Fire").await);
+                left_behind += usize::from(
+                    !fired_at(&world.events, &row.entity_id, "Fire")
+                        .await
+                        .is_empty(),
+                );
             }
             left_behind
         });
@@ -381,17 +475,17 @@ fn run_seed(seed: u64) -> Result<usize, String> {
     let second = Process::start(&world, &format!("sched-{seed}-b"));
     let result = second.runtime.block_on(async {
         let state = &second.state;
-        let boot = sim_now();
-        run.trace.push(format!("boot at {boot}"));
+        let restart = Restart {
+            stop,
+            boot: sim_now(),
+        };
+        run.trace.push(format!("boot at {}", restart.boot));
         let last_due = arms
             .values()
-            .filter_map(|arm| match arm {
-                Arm::Once(due, _) => Some(*due),
-                Arm::Repeat => None,
-            })
+            .map(|arm| arm.due)
             .max()
-            .unwrap_or(boot)
-            .max(boot);
+            .unwrap_or(restart.boot)
+            .max(restart.boot);
         until(last_due + chrono::Duration::seconds(3 * PERIOD)).await;
         settle().await;
         let end = sim_now();
@@ -401,65 +495,60 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             if world.rows.row(TENANT, id).is_some() {
                 return Err(run.fail("scheduled actions keep no state timer row", id.clone()));
             }
-            match arm {
-                Arm::Once(due, faulted) => {
-                    let fires = fired_at(state, id, "Fire").await;
-                    let [fire] = fires.as_slice() else {
-                        return Err(run.fail(
-                            "a scheduled action fires exactly once",
-                            format!("{id} due {due}: fired at {fires:?}"),
-                        ));
-                    };
-                    // Due after the boot, or fired before the stop: at its due
-                    // time. Due while the process was down: soon after the boot.
-                    // Either way late by its retries when its writes fail.
-                    let late = if *faulted { RETRY_WINDOW } else { 1 };
-                    let on_time = if *due > boot || *fire < boot {
-                        (-1..=late).contains(&(*fire - *due).num_seconds())
-                    } else {
-                        (*fire - boot).num_seconds() <= BOOT_FIRE_WINDOW + late
-                    };
-                    if !on_time {
-                        return Err(run.fail(
-                            "a scheduled action fires when it is due",
-                            format!("{id} due {due}, boot {boot}: fired at {fire}"),
-                        ));
-                    }
-                    if rows != 0 {
-                        return Err(
-                            run.fail("a fired action keeps no row", format!("{id}: {rows} rows"))
-                        );
-                    }
+            let fires = fired_at(&world.events, id, arm.kind.action()).await;
+            // Each fire is due when the arm said, then (for a chain) a period
+            // after the fire before it.
+            let mut due = arm.due;
+            for fire in &fires {
+                if !restart.on_time(due, *fire, arm.late()) {
+                    return Err(run.fail(
+                        "a scheduled action fires once, when it is due",
+                        format!(
+                            "{id} {:?} due {due}, stop {}, boot {}: fired at {fires:?}",
+                            arm.kind, restart.stop, restart.boot
+                        ),
+                    ));
                 }
-                Arm::Repeat => {
-                    let ticks = fired_at(state, id, "Tick").await;
-                    let after_boot = ticks.iter().filter(|tick| **tick >= boot).count();
-                    let last = ticks.last().copied();
-                    let close = ticks
-                        .windows(2)
-                        .find(|pair| (pair[1] - pair[0]).num_seconds() < PERIOD - 1);
-                    if after_boot == 0
-                        || last.is_none_or(|last| (end - last).num_seconds() > PERIOD + 10)
-                    {
-                        return Err(run.fail(
-                            "a repeating action keeps going after a restart",
-                            format!("{id}: ticks {ticks:?}, boot {boot}, end {end}"),
-                        ));
-                    }
-                    if let Some(pair) = close {
-                        return Err(run.fail(
-                            "a repeating action fires once per period",
-                            format!("{id}: ticks {} and {}", pair[0], pair[1]),
-                        ));
-                    }
-                    if rows != 1 {
-                        return Err(run.fail(
-                            "a repeating action keeps one row",
-                            format!("{id}: {rows} rows"),
-                        ));
-                    }
-                }
+                due = *fire + chrono::Duration::seconds(PERIOD);
             }
+            let (fired, rows_ok) = match arm.kind {
+                Kind::Once => (fires.len() == 1, rows == 0),
+                // A chain is alive: its next fire is not overdue.
+                Kind::Repeat => ((end - due).num_seconds() < arm.late(), rows == 1),
+                Kind::Cron => ((end - due).num_seconds() < arm.late(), rows <= 1),
+            };
+            if !fired || fires.is_empty() {
+                return Err(run.fail(
+                    "a scheduled action fires exactly once per arm, and a chain keeps going",
+                    format!(
+                        "{id} {:?} due {}, stop {}, boot {}, end {end}: fired at {fires:?}",
+                        arm.kind, arm.due, restart.stop, restart.boot
+                    ),
+                ));
+            }
+            if !rows_ok {
+                return Err(run.fail(
+                    "a fired action keeps no row, a chain one",
+                    format!("{id} {:?}: {rows} rows", arm.kind),
+                ));
+            }
+        }
+        // Every waiting row is armed exactly once in this process.
+        let rows: BTreeSet<ScheduledFire> = pending
+            .iter()
+            .map(|row| ScheduledFire {
+                tenant: row.tenant.clone(),
+                entity_type: row.entity_type.clone(),
+                entity_id: row.entity_id.clone(),
+                arm_id: row.arm_id.clone(),
+            })
+            .collect();
+        let armed = state.armed_scheduled_actions();
+        if armed != rows {
+            return Err(run.fail(
+                "every waiting row is armed once in the process",
+                format!("rows {rows:?}, armed {armed:?}"),
+            ));
         }
         Ok(())
     });

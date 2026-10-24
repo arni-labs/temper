@@ -97,8 +97,8 @@ pub struct AgentContext {
     pub observation_metadata: BTreeMap<String, String>,
 }
 
-/// A scheduled action's row, named for the dispatch that fires it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A scheduled action's row, by its record and arm id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScheduledFire {
     /// The record's tenant.
     pub tenant: String,

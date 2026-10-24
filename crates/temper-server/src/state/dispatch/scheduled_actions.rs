@@ -9,6 +9,7 @@
 //! [`ServerState::rearm_scheduled_actions`] arms every row again, through the
 //! boot gate, for the rest of its wait or at once if it fell due while the
 //! server was down. Replay never arms one: the rows are the source of truth.
+//! A process arms each row at most once, however many replies hand it back.
 //!
 //! A fire runs as whoever armed it. The event it writes removes its row in the
 //! same commit, so a row is removed only once its action has committed, and a
@@ -18,6 +19,7 @@
 //! refused fire is final: it is logged here, its dispatch records it in the
 //! record's trajectory like any refused action, and then its row is removed.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +58,27 @@ struct ScheduledTimer {
     agent_ctx: AgentContext,
 }
 
+impl ScheduledTimer {
+    /// The row this timer fires.
+    fn row(&self) -> ScheduledFire {
+        ScheduledFire {
+            tenant: self.tenant.as_str().to_string(),
+            entity_type: self.entity_type.clone(),
+            entity_id: self.entity_id.clone(),
+            arm_id: self.arm_id.clone(),
+        }
+    }
+}
+
 impl ServerState {
+    /// The scheduled actions armed in this process, by row.
+    pub fn armed_scheduled_actions(&self) -> BTreeSet<ScheduledFire> {
+        self.scheduled_armed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Arm the scheduled actions a committed transition armed. Their rows
     /// were written with its event.
     pub(super) fn arm_scheduled_actions(
@@ -134,12 +156,51 @@ impl ServerState {
         }
     }
 
+    /// Arm the waiting rows of `timer`'s record that this process has not
+    /// armed. A fire whose answer was lost commits its successors' rows, but
+    /// the duplicate that answers its retry hands back no schedules.
+    async fn arm_waiting_rows(&self, timer: &ScheduledTimer) {
+        let Some((store, _)) = self.event_journal() else {
+            return;
+        };
+        let rows = match store.list_scheduled_actions(timer.tenant.as_str()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(tenant = %timer.tenant, entity_type = %timer.entity_type,
+                    entity_id = %timer.entity_id, %error,
+                    "scheduled action rows not readable after a retried fire; they wait for the next boot");
+                return;
+            }
+        };
+        let now = sim_now();
+        let record = rows
+            .iter()
+            .filter(|row| row.entity_type == timer.entity_type && row.entity_id == timer.entity_id);
+        for row in record {
+            if let Ok((waiting, due_at)) = scheduled_timer(&timer.tenant, row) {
+                let delay = (due_at - now).to_std().unwrap_or(Duration::ZERO);
+                self.spawn_scheduled_action(waiting, delay, None);
+            }
+        }
+    }
+
+    /// Arm `timer` to fire after `delay`, unless this process has armed its
+    /// row already.
     fn spawn_scheduled_action(
         &self,
         timer: ScheduledTimer,
         delay: Duration,
         gate: Option<Arc<Semaphore>>,
     ) {
+        let row = timer.row();
+        let newly_armed = self
+            .scheduled_armed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(row.clone());
+        if !newly_armed {
+            return;
+        }
         let agent = &timer.agent_ctx;
         let span = tracing::info_span!(
             "dispatch.scheduled_actions",
@@ -155,6 +216,11 @@ impl ServerState {
         let fire = async move {
             tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
             server.fire_scheduled_action(&timer, gate).await;
+            server
+                .scheduled_armed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&row);
         };
         tokio::spawn(fire.instrument(span)); // determinism-ok: timer delivery is a background side-effect
     }
@@ -165,13 +231,9 @@ impl ServerState {
     async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
         let mut agent = timer.agent_ctx.clone();
         agent.idempotency_key = Some(format!("schedule:{}", timer.arm_id));
-        agent.fires_scheduled_action = Some(ScheduledFire {
-            tenant: timer.tenant.as_str().to_string(),
-            entity_type: timer.entity_type.clone(),
-            entity_id: timer.entity_id.clone(),
-            arm_id: timer.arm_id.clone(),
-        });
+        agent.fires_scheduled_action = Some(timer.row());
         let mut wait = FIRST_RETRY_WAIT;
+        let mut retried = false;
         loop {
             let outcome = {
                 let _permit = match &gate {
@@ -189,7 +251,12 @@ impl ServerState {
                 .await
             };
             let error = match outcome {
-                Ok(response) if response.success => return,
+                Ok(response) if response.success => {
+                    if retried {
+                        self.arm_waiting_rows(timer).await;
+                    }
+                    return;
+                }
                 Ok(response) if response.refused => {
                     let error = response
                         .error
@@ -215,6 +282,7 @@ impl ServerState {
                 "scheduled action did not commit when it fired; retrying on its row");
             tokio::time::sleep(wait).await; // determinism-ok: retry backoff
             wait = (wait * 2).min(LAST_RETRY_WAIT);
+            retried = true;
         }
     }
 
