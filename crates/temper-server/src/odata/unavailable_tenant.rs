@@ -34,7 +34,11 @@ impl ServerState {
 /// credential up: an unavailable tenant has no credential records loaded, so
 /// a lookup would report a valid credential as invalid.
 pub fn unavailable_tenant_response(state: &ServerState, tenant: &TenantId) -> Option<Response> {
-    state.tenant_unavailable_reason(tenant)?;
+    // A poisoned registry is not this tenant's state: the credential lookup
+    // after this reports it as the dependency failure it is (503).
+    let registry = state.registry.read().ok()?;
+    registry.tenant_unavailable_reason(tenant)?;
+    drop(registry);
     Some(
         odata_error(
             StatusCode::SERVICE_UNAVAILABLE,
