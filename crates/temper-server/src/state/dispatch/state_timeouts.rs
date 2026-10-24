@@ -638,13 +638,14 @@ impl crate::state::ServerState {
         let budget = chrono::Duration::seconds(
             i64::try_from(timer.after_seconds).unwrap_or(i64::MAX / 1000),
         );
+        let due_at = timer.started_at + budget;
         let due = self.due_times.arm(
             TimerRef::State {
                 tenant: timer.tenant.as_str().to_string(),
                 entity_type: timer.entity_type.clone(),
                 entity_id: timer.entity_id.clone(),
             },
-            timer.started_at + budget,
+            due_at,
         );
         let state = self.clone();
         let armed_by = crate::trace_context::cause();
@@ -652,7 +653,7 @@ impl crate::state::ServerState {
             // determinism-ok: wall-clock timer fires a side-effect action;
             // the action itself is deterministic under DST via sim_now().
             // A wake ends the wait early once the timer is due.
-            due.wait(delay).await;
+            due.wait_until(due_at).await;
             let _permit = match gate {
                 Some(gate) => gate.acquire_owned().await.ok(),
                 None => None,

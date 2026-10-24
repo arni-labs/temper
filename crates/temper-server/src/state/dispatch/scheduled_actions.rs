@@ -276,9 +276,6 @@ impl ServerState {
             }
             *live += 1;
         }
-        let delay = (timer.due_at - sim_now())
-            .to_std()
-            .unwrap_or(Duration::ZERO);
         let due = self
             .due_times
             .arm(TimerRef::Scheduled(row.clone()), timer.due_at);
@@ -287,7 +284,7 @@ impl ServerState {
         let armed_by = crate::trace_context::cause();
         let server = self.clone();
         let fire = async move {
-            due.wait(delay).await;
+            due.wait_until(timer.due_at).await;
             let agent = &timer.agent_ctx;
             let span = crate::trace_context::runtime_work_span!(
                 armed_by,
@@ -384,8 +381,9 @@ impl ServerState {
                 %error, retry_in_ms = wait.as_millis() as u64,
                 "scheduled action did not commit when it fired; retrying on its row");
             let next = chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX);
-            self.due_times.retry_at(due, sim_now() + next);
-            due.wait(wait).await;
+            let again = sim_now() + next;
+            self.due_times.retry_at(due, again);
+            due.wait_until(again).await;
             wait = (wait * 2).min(LAST_RETRY_WAIT);
             retried = true;
         }

@@ -335,6 +335,21 @@ pub async fn run(
             "wake reports off: TEMPER_WAKE_REPORT_URL and TEMPER_WAKE_REPORT_TOKEN are needed together"
         ),
     }
+    // How long the sandbox stays awake after an inbound request, in seconds:
+    // a timer due before then fires on its own and is not reported. The
+    // control plane sets it below the time its sandboxes really stay awake,
+    // for margin. Unset, every due time from now is reported.
+    if let Ok(awake) = std::env::var("TEMPER_WAKE_AWAKE_SECS") {
+        // determinism-ok: startup config
+        match awake.parse::<u64>() {
+            Ok(secs) => state
+                .server
+                .set_wake_awake(std::time::Duration::from_secs(secs)),
+            Err(error) => {
+                tracing::error!(%error, "TEMPER_WAKE_AWAKE_SECS is not a number of seconds; every due time is reported")
+            }
+        }
+    }
 
     // The kernel runtime: state timers re-armed from their rows (ADR-0056)
     // before the first request can act on their records, and runtime metrics.

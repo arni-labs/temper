@@ -4,17 +4,23 @@
 //! A sandbox that holds this process may be suspended while nothing calls it,
 //! and its timers wait on the process's monotonic clock, which may not
 //! advance while it sleeps. So the process tells the control plane when it
-//! next has work: each time a commit changes the earliest due time of its
-//! timers (state timers and scheduled actions), it sends a [`WakeReport`] to
-//! its [`WakeSink`]. At that time the control plane calls
-//! `POST /api/runtime/wake`, and [`ServerState::wake_runtime`] fires every
-//! timer of the caller's tenant due by the wall clock, in the task that would
-//! have fired it, waits for those fires, and answers with a [`WakeOutcome`]. A wake with nothing
-//! due fires nothing, so an early or repeated wake changes nothing.
+//! next has work it could sleep through: the earliest due time of its timers
+//! (state timers and scheduled actions) at or after the time it is surely
+//! awake until, which is [`ServerState::set_wake_awake`] after its newest
+//! inbound request. It sends a [`WakeReport`] to its [`WakeSink`] when that
+//! time comes earlier than what the control plane holds. At that time the
+//! control plane calls `POST /api/runtime/wake`, and
+//! [`ServerState::wake_runtime`] fires every timer of the caller's tenant due
+//! by the wall clock, in the task that would have fired it, waits for those
+//! fires, and answers with a [`WakeOutcome`]. A wake with nothing due fires
+//! nothing, so an early or repeated wake changes nothing.
 
 mod due;
 mod http;
 
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use temper_runtime::scheduler::sim_now;
@@ -64,7 +70,8 @@ pub enum SendError {
 pub struct WakeOutcome {
     /// How many due timers fired and committed.
     pub fired: usize,
-    /// The earliest due time left.
+    /// The earliest due time left that the process could sleep through, by
+    /// the same rule as a report.
     pub next_due_at: Option<DateTime<Utc>>,
 }
 
@@ -75,14 +82,32 @@ impl ServerState {
         self.due_times.set_sink(sink);
     }
 
-    /// The earliest due time of a live timer in this process.
+    /// The sandbox stays awake for `awake` after each inbound request, so a
+    /// timer due before then fires on its own and is not reported. Unset, the
+    /// process may be suspended at any moment and reports its earliest due
+    /// time from now. Set it below the time the sandbox really stays awake,
+    /// or a timer due in between is slept through.
+    pub fn set_wake_awake(&self, awake: std::time::Duration) {
+        self.due_times.set_awake(awake);
+    }
+
+    /// An inbound request came: the sandbox stays awake from now. Every
+    /// request through the kernel's routes notes this; one that came after a
+    /// suspension makes the timers wait again by the wall clock.
+    pub fn note_inbound(&self) {
+        self.due_times.note_inbound();
+    }
+
+    /// The due time a report names now: the earliest one this process could
+    /// sleep through.
     pub fn next_due_at(&self) -> Option<DateTime<Utc>> {
-        self.due_times.earliest()
+        self.due_times.reportable(None)
     }
 
     /// Fire every timer of `tenant` due by the wall clock now, wait for those
-    /// fires, and answer the earliest due time of `tenant`'s timers left. The
-    /// process's earliest due time is reported too. A timer that is firing
+    /// fires, and answer the earliest due time left of `tenant`'s timers that
+    /// the process could sleep through. The process reports too when what the
+    /// control plane holds differs, so an early wake brings the fresh value. A timer that is firing
     /// already is waited for, not fired again; one whose fire does not commit
     /// keeps its row, tries again on its own and is not counted.
     ///
@@ -94,8 +119,19 @@ impl ServerState {
         for answer in answers {
             fired += usize::from(answer.await.unwrap_or(false));
         }
-        let next_due_at = self.due_times.earliest_of(tenant.as_str());
-        self.due_times.report(true);
+        let next_due_at = self.due_times.reportable(Some(tenant.as_str()));
+        self.due_times.sync();
         WakeOutcome { fired, next_due_at }
     }
+}
+
+/// Note every request that reaches the kernel's routes as inbound, whatever it
+/// asks and however it is answered: any request keeps the sandbox awake.
+pub(crate) async fn note_inbound(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.note_inbound();
+    next.run(request).await
 }

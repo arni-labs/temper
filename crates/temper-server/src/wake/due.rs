@@ -3,10 +3,16 @@
 //!
 //! Every state timer and scheduled action registers here when its task starts
 //! waiting ([`DueTimes::arm`]) and leaves when its task ends
-//! ([`DueTimes::end`]). A timer waits for its delay or for a wake
-//! ([`Armed::wait`]), whichever comes first, so a wake fires an overdue timer in the
-//! task that would have fired it anyway: nothing fires twice, and a timer that
-//! is already firing when a wake comes is waited for, not fired again.
+//! ([`DueTimes::end`]). A timer waits until its wall-clock due time
+//! ([`Armed::wait_until`]), checked again whenever a wake or a resume comes,
+//! so a wake fires an overdue timer in the task that would have fired it
+//! anyway: nothing fires twice, and a timer that is already firing when a wake
+//! comes is waited for, not fired again.
+//!
+//! The process reports only the due times it could sleep through. Its sandbox
+//! stays awake for a while after each inbound request ([`DueTimes::note_inbound`]),
+//! and a timer due before then fires while it is awake, so the report names
+//! the earliest due time at or after that horizon.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -27,6 +33,12 @@ const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
 /// tried about once an hour, not hammered.
 const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
+/// How far the wall clock may run ahead of the process's monotonic clock
+/// between two inbound requests before the process counts itself resumed
+/// from a suspension. It sits above scheduler jitter between two requests, so
+/// a process that kept running never re-times its timers.
+const RESUME_GAP: Duration = Duration::from_secs(1);
+
 /// One live timer: a record's state timer (a record has at most one), or one
 /// scheduled-action row.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +52,16 @@ pub(crate) enum TimerRef {
 }
 
 impl TimerRef {
+    /// The least key, which sorts before every real one: a state timer with
+    /// empty names, as the derived order puts `State` first.
+    fn least() -> Self {
+        Self::State {
+            tenant: String::new(),
+            entity_type: String::new(),
+            entity_id: String::new(),
+        }
+    }
+
     fn tenant(&self) -> &str {
         match self {
             Self::State { tenant, .. } => tenant,
@@ -53,6 +75,7 @@ pub(crate) struct Armed {
     key: TimerRef,
     id: u64,
     wake: Arc<Notify>,
+    retime: Arc<Notify>,
 }
 
 struct Entry {
@@ -75,8 +98,8 @@ impl Entry {
 #[derive(Default)]
 struct Reported {
     seq: u64,
-    /// The earliest due time the control plane acknowledged last; None until
-    /// it acknowledges one.
+    /// The due time the control plane acknowledged last; None until it
+    /// acknowledges one.
     acked: Option<Option<DateTime<Utc>>>,
     /// The report being sent, or sent again until delivered, by seq.
     in_flight: Option<(u64, Option<DateTime<Utc>>)>,
@@ -88,11 +111,33 @@ struct Inner {
     by_due: BTreeSet<(DateTime<Utc>, TimerRef)>,
     next_id: u64,
     reported: Reported,
+    /// How long the sandbox stays awake after an inbound request; None: it
+    /// may be suspended at any moment.
+    awake: Option<chrono::Duration>,
+    /// When the newest inbound request came.
+    last_inbound: Option<DateTime<Utc>>,
+    /// The wall clock and the monotonic clock at the last inbound request
+    /// (or the start), to tell a resume from a process that kept running.
+    clocks: Option<(DateTime<Utc>, tokio::time::Instant)>,
 }
 
 impl Inner {
-    fn earliest(&self) -> Option<DateTime<Utc>> {
-        self.by_due.first().map(|(at, _)| *at)
+    /// Until when the process is surely awake: a timer due before it fires on
+    /// its own. Now, unless the sandbox is known to stay awake longer.
+    fn horizon(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        match (self.awake, self.last_inbound) {
+            (Some(awake), Some(last)) => (last + awake).max(now),
+            _ => now,
+        }
+    }
+
+    /// The earliest due time at or after `horizon`, of `tenant`'s timers or of
+    /// every timer: the one the process could sleep through.
+    fn reportable(&self, horizon: DateTime<Utc>, tenant: Option<&str>) -> Option<DateTime<Utc>> {
+        self.by_due
+            .range((horizon, TimerRef::least())..)
+            .find(|(_, key)| tenant.is_none_or(|tenant| key.tenant() == tenant))
+            .map(|(at, _)| *at)
     }
 
     fn remove(&mut self, key: &TimerRef) -> Option<Entry> {
@@ -107,6 +152,9 @@ impl Inner {
 pub(crate) struct DueTimes {
     inner: Mutex<Inner>,
     sink: Mutex<Option<Arc<dyn WakeSink>>>,
+    /// Tells every waiting timer to compute its wait again from the wall
+    /// clock, after a resume.
+    retime: Arc<Notify>,
 }
 
 impl DueTimes {
@@ -122,6 +170,45 @@ impl DueTimes {
             .sink
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    /// The sandbox stays awake for `awake` after each inbound request.
+    pub(crate) fn set_awake(&self, awake: Duration) {
+        self.lock().awake = chrono::Duration::from_std(awake).ok();
+    }
+
+    /// The runtime started: note its clocks, and report.
+    pub(crate) fn start(self: &Arc<Self>) {
+        let wall = sim_now();
+        let clock = tokio::time::Instant::now(); // determinism-ok: the process's own clock
+        self.lock().clocks = Some((wall, clock));
+        self.report();
+    }
+
+    /// An inbound request came, which keeps the sandbox awake. If the wall
+    /// clock ran ahead of the monotonic clock since the last one, the process
+    /// was suspended and its timers' waits ran on the stopped clock: every
+    /// waiting timer computes its wait again, and an overdue one fires now.
+    pub(crate) fn note_inbound(self: &Arc<Self>) {
+        let wall = sim_now();
+        let clock = tokio::time::Instant::now(); // determinism-ok: the process's own clock
+        let resumed = {
+            let mut inner = self.lock();
+            let resumed = inner.clocks.is_some_and(|(last_wall, last_clock)| {
+                let walked = (wall - last_wall).to_std().unwrap_or_default();
+                walked.saturating_sub(clock.saturating_duration_since(last_clock)) > RESUME_GAP
+            });
+            inner.clocks = Some((wall, clock));
+            inner.last_inbound = Some(inner.last_inbound.map_or(wall, |last| last.max(wall)));
+            resumed
+        };
+        if resumed {
+            tracing::info!(
+                "process resumed from a suspension; timers wait again by the wall clock"
+            );
+            self.retime.notify_waiters();
+        }
+        self.report();
     }
 
     /// Register `key`'s timer, due `at`, replacing the one it had: a newer
@@ -147,8 +234,13 @@ impl DueTimes {
             );
             id
         };
-        self.report(false);
-        Armed { key, id, wake }
+        self.report();
+        Armed {
+            key,
+            id,
+            wake,
+            retime: self.retime.clone(),
+        }
     }
 
     /// `armed`'s timer did not commit and waits until `at` to try again:
@@ -173,7 +265,7 @@ impl DueTimes {
             inner.by_due.insert((at, armed.key.clone()));
             inner.timers.insert(armed.key.clone(), entry);
         }
-        self.report(false);
+        self.report();
     }
 
     /// `armed`'s task ended; `fired` says whether its action committed.
@@ -192,7 +284,7 @@ impl DueTimes {
         if let Some(entry) = ended {
             entry.answer(fired);
         }
-        self.report(false);
+        self.report();
     }
 
     /// Wake every timer of `tenant` due by `now`, and hand back one answer
@@ -222,30 +314,37 @@ impl DueTimes {
         answers
     }
 
-    /// The earliest due time of a live timer.
-    pub(crate) fn earliest(&self) -> Option<DateTime<Utc>> {
-        self.lock().earliest()
+    /// The earliest due time at or after the horizon, of `tenant`'s timers
+    /// or of every timer: what a report or a wake's answer names.
+    pub(crate) fn reportable(&self, tenant: Option<&str>) -> Option<DateTime<Utc>> {
+        let inner = self.lock();
+        inner.reportable(inner.horizon(sim_now()), tenant)
     }
 
-    /// The earliest due time of a live timer of `tenant`.
-    pub(crate) fn earliest_of(&self, tenant: &str) -> Option<DateTime<Utc>> {
-        self.lock()
-            .by_due
-            .iter()
-            .find(|(_, key)| key.tenant() == tenant)
-            .map(|(at, _)| *at)
+    /// Report when the due time the process could sleep through is earlier
+    /// than what the control plane holds, or it holds nothing yet. A later
+    /// one is not reported: the control plane wakes the process early, for
+    /// nothing, and that wake brings the fresh value.
+    pub(crate) fn report(self: &Arc<Self>) {
+        self.send_when(false);
     }
 
-    /// Send the earliest due time to the sink when the control plane has not
-    /// acknowledged it and it is not on its way already, or always when
-    /// `force`. A report that is not delivered is sent again, waiting longer
+    /// Report when the due time differs at all from what the control plane
+    /// holds: at a wake, so what it holds is fresh again.
+    pub(crate) fn sync(self: &Arc<Self>) {
+        self.send_when(true);
+    }
+
+    /// Send the due time the process could sleep through to the sink when it
+    /// is earlier than what the control plane will hold once what is on its
+    /// way lands, or, when `differs`, when it is not the same. A report that is not delivered is sent again, waiting longer
     /// after each failure, until it is delivered or a newer report replaces
     /// it: without it the control plane would not wake the process for that
     /// due time. A report the control plane refuses on purpose
     /// ([`SendError::Refused`]) is not sent again: its pass would be refused
     /// on every retry. The report carries the current span's trace: the move that
     /// changed the earliest due time.
-    pub(crate) fn report(self: &Arc<Self>, force: bool) {
+    fn send_when(self: &Arc<Self>, differs: bool) {
         let Some(sink) = self
             .sink
             .lock()
@@ -256,14 +355,23 @@ impl DueTimes {
         };
         let report = {
             let mut inner = self.lock();
-            let earliest = inner.earliest();
-            // What the control plane will believe once what is on its way
-            // lands: the report in flight, or the last one acknowledged.
+            let earliest = inner.reportable(inner.horizon(sim_now()), None);
+            // What the control plane will hold once what is on its way lands:
+            // the report in flight, or the last one acknowledged.
             let known = match inner.reported.in_flight {
-                Some((_, at)) => at == earliest,
-                None => inner.reported.acked == Some(earliest),
+                Some((_, at)) => Some(at),
+                None => inner.reported.acked,
             };
-            if known && !force {
+            let send = match known {
+                None => true,
+                Some(known) if differs => known != earliest,
+                Some(known) => match (earliest, known) {
+                    (Some(earliest), Some(known)) => earliest < known,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            };
+            if !send {
                 return;
             }
             inner.reported.seq += 1;
@@ -323,11 +431,23 @@ impl DueTimes {
 }
 
 impl Armed {
-    /// Wait `delay`, or less if a wake comes first.
-    pub(crate) async fn wait(&self, delay: Duration) {
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {} // determinism-ok: timer delay
-            _ = self.wake.notified() => {}
+    /// Wait until the wall clock reaches `at`. The wait runs on the
+    /// process's monotonic clock, which stands still while the sandbox is
+    /// suspended, so it is computed again when a wake or a resume comes: a
+    /// timer that fell due meanwhile fires then.
+    pub(crate) async fn wait_until(&self, at: DateTime<Utc>) {
+        loop {
+            let Ok(left) = (at - sim_now()).to_std() else {
+                return;
+            };
+            if left.is_zero() {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(left) => {} // determinism-ok: timer delay
+                _ = self.wake.notified() => {}
+                _ = self.retime.notified() => {}
+            }
         }
     }
 }

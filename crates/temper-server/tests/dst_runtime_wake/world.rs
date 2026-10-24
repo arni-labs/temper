@@ -121,6 +121,8 @@ pub(crate) const MOST_REFUSED: u64 = 3;
 pub(crate) struct Reports {
     pub(crate) sent: Mutex<Vec<WakeReport>>,
     pub(crate) delivered: Mutex<Vec<WakeReport>>,
+    /// Signalled when a report is delivered.
+    pub(crate) changed: tokio::sync::Notify,
     rng: Mutex<DeterministicRng>,
     refusing: Mutex<u64>,
 }
@@ -130,6 +132,7 @@ impl Reports {
         Self {
             sent: Mutex::new(Vec::new()),
             delivered: Mutex::new(Vec::new()),
+            changed: tokio::sync::Notify::new(),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x3a7e)),
             refusing: Mutex::new(0),
         }
@@ -161,6 +164,7 @@ impl WakeSink for Reports {
             *refusing = rng.next_bound(MOST_REFUSED as usize) as u64 + 1;
         }
         self.delivered.lock().unwrap().push(report.clone());
+        self.changed.notify_one();
         Ok(())
     }
 }
