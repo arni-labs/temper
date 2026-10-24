@@ -209,6 +209,14 @@ async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Va
         .is_ok_and(|response| response.success)
 }
 
+/// Whether the journal `persistence_id` holds an event of `action`.
+async fn journal_has(events: &SimEventStore, persistence_id: &str, action: &str) -> bool {
+    events
+        .read_events(persistence_id, 0)
+        .await
+        .is_ok_and(|events| events.iter().any(|event| event.event_type == action))
+}
+
 /// When each of the record's events of `action` was applied.
 async fn fired_at(state: &ServerState, id: &str, action: &str) -> Vec<DateTime<Utc>> {
     state
@@ -275,29 +283,44 @@ fn run_seed(seed: u64) -> Result<(), String> {
             arms.insert(id, arm);
         }
         settle().await;
-        // Stop at a seeded time; half the time at an armed action's due
-        // instant, a few turns into its fire: its event may be written and
-        // its row not yet removed.
+        // Stop at a seeded time. Half the time, stop at an armed action's due
+        // instant instead, a seeded few turns after its fire's event is
+        // written: its row may not be removed yet, so the next boot fires it
+        // again and only its idempotency key keeps that from running twice.
         let now = sim_now();
-        let dues: Vec<DateTime<Utc>> = arms
-            .values()
-            .filter_map(|arm| match arm {
-                Arm::Once(due) if *due > now => Some(*due),
+        let dues: Vec<(&String, DateTime<Utc>)> = arms
+            .iter()
+            .filter_map(|(id, arm)| match arm {
+                Arm::Once(due) if *due > now => Some((id, *due)),
                 _ => None,
             })
             .collect();
-        let stop_at = if !dues.is_empty() && rng.next_bound(2) == 0 {
-            dues[rng.next_bound(dues.len())]
+        if !dues.is_empty() && rng.next_bound(2) == 0 {
+            let (id, due) = dues[rng.next_bound(dues.len())];
+            until(due).await;
+            let journal = format!("{TENANT}:Job:{id}");
+            let mut waited = 0;
+            while waited < 20_000 && !journal_has(&world.events, &journal, "Fire").await {
+                tokio::task::yield_now().await;
+                waited += 1;
+            }
+            let turns = rng.next_bound(8);
+            for _ in 0..turns {
+                tokio::task::yield_now().await;
+            }
+            run.trace.push(format!(
+                "stop at {} with {id}'s Fire written, {turns} turns later",
+                sim_now()
+            ));
         } else {
-            now + chrono::Duration::seconds(rng.next_bound(3600) as i64)
-        };
-        until(stop_at).await;
-        let turns = rng.next_bound(200);
-        for _ in 0..turns {
-            tokio::task::yield_now().await;
+            until(now + chrono::Duration::seconds(rng.next_bound(3600) as i64)).await;
+            let turns = rng.next_bound(200);
+            for _ in 0..turns {
+                tokio::task::yield_now().await;
+            }
+            run.trace
+                .push(format!("stop at {} after {turns} turns", sim_now()));
         }
-        run.trace
-            .push(format!("stop at {} after {turns} turns", sim_now()));
         Ok::<(), String>(())
     })?;
     let downtime = Duration::from_secs(rng.next_bound(7200) as u64);
