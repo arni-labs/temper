@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 [dependencies]
 temper-wasm-sdk = { path = "../../crates/temper-wasm-sdk" }
 
-# Its own workspace, so it builds the same wherever the checkout sits.
+# Its own workspace, apart from the server's; scripts/build-http-fetch-wasm.sh builds the embedded binary.
 [workspace]
