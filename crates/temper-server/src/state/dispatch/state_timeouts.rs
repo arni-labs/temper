@@ -147,7 +147,8 @@ struct ArmSeq {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Reservation {
     /// A transition entered or reset the state: the new timer replaces the
-    /// armed one, unless that is the same timer armed for this transition.
+    /// armed one, even one a reconcile armed for the same transition, since
+    /// the transition knows who entered the state and when.
     Fresh,
     /// Arm the timer the state declares only when it is not armed already.
     Missing,
@@ -209,15 +210,12 @@ impl StateTimeoutTracker {
         if journal < entry.journal {
             return None;
         }
-        let same_armed = entry
-            .armed
-            .as_ref()
-            .is_some_and(|armed| armed.is_declared_as(timer));
-        let keep = match reservation {
-            Reservation::Fresh => same_armed && journal == entry.journal,
-            Reservation::Missing => same_armed,
-        };
-        if keep {
+        let keep_armed = reservation == Reservation::Missing
+            && entry
+                .armed
+                .as_ref()
+                .is_some_and(|armed| armed.is_declared_as(timer));
+        if keep_armed {
             return None;
         }
         entry.seq += 1;
@@ -481,7 +479,9 @@ impl crate::state::ServerState {
 
     /// Cancel the entity's armed timer as of journal sequence `journal`, and
     /// remove its row. A cancellation older than the entity's last arm
-    /// cancels nothing.
+    /// cancels nothing. With no timer armed, a type that declares timeouts
+    /// still records `journal`, so a reconcile of an older state that finishes
+    /// late (a rehydration overtaken by a delete) arms nothing.
     pub(super) async fn cancel_state_timer(
         &self,
         tenant: &TenantId,
@@ -490,7 +490,9 @@ impl crate::state::ServerState {
         journal: u64,
     ) {
         let key = EntityKey::new(tenant, entity_type, entity_id);
-        if !self.state_timeout_tracker.has_armed(&key) {
+        if !self.state_timeout_tracker.has_armed(&key)
+            && !self.declares_state_timeouts(tenant, entity_type)
+        {
             return;
         }
         if let Some(cancelled) = self.state_timeout_tracker.invalidate(&key, journal) {
@@ -907,12 +909,12 @@ mod tests {
         );
         assert_eq!(
             t.reserve(&timer("A", 5), Reservation::Fresh),
-            None,
-            "the same timer for the same transition is not armed twice"
+            Some(2),
+            "the transition's own arm replaces the one a reconcile armed for it"
         );
         assert_eq!(
             t.reserve(&timer("B", 6), Reservation::Missing),
-            Some(2),
+            Some(3),
             "a record found in another state gets that state's timer"
         );
         assert_eq!(t.armed(&k).map(|armed| armed.state), Some("B".to_string()));

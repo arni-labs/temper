@@ -19,6 +19,7 @@
 //! restart or a rehydration waits only the rest of its budget, or fires at once.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
@@ -36,6 +37,12 @@ use crate::state::ServerState;
 /// a timed state by a rehydration or a spec install, with no timer armed and
 /// no dispatch to take an identity from.
 const STATE_TIMER_SERVICE: &str = "state-timer";
+
+/// The wait before listing a changed type's records again after the store
+/// failed to list them. It doubles up to [`FOLLOW_RETRY_MAX`], so a store
+/// that stays down is asked about once a minute, not in a tight loop.
+const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
+const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
 
 impl ServerState {
     /// Make `entity_id`'s armed timer the one `current`'s state declares, or
@@ -142,6 +149,15 @@ impl ServerState {
         }
     }
 
+    /// Whether `entity_type`'s spec declares any state timeout.
+    pub(super) fn declares_state_timeouts(&self, tenant: &TenantId, entity_type: &str) -> bool {
+        self.registry.read().ok().is_some_and(|registry| {
+            registry
+                .get_spec(tenant, entity_type)
+                .is_some_and(|spec| !spec.automaton.state_timeouts.is_empty())
+        })
+    }
+
     /// The hook an entity actor runs when it starts from stored events: it
     /// makes the record's timer follow the state it rehydrated into. None for
     /// a type that declares no timeout and a record with no timer armed.
@@ -151,12 +167,9 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
     ) -> Option<RehydrateHook> {
-        let declares_timeouts = self.registry.read().ok().is_some_and(|registry| {
-            registry
-                .get_spec(tenant, entity_type)
-                .is_some_and(|spec| !spec.automaton.state_timeouts.is_empty())
-        });
-        if !declares_timeouts && !self.has_armed_state_timer(tenant, entity_type, entity_id) {
+        if !self.declares_state_timeouts(tenant, entity_type)
+            && !self.has_armed_state_timer(tenant, entity_type, entity_id)
+        {
             return None;
         }
         let server = self.clone();
@@ -203,20 +216,39 @@ impl ServerState {
     /// Make the timers of every record of each type whose spec an install
     /// changed follow the state the record is in now. Records not in memory
     /// are read, so each lands in the state replay under the new spec gives
-    /// it. Each changed type is followed once.
+    /// it. Each changed type is followed once; a type whose records cannot be
+    /// listed is tried again after a wait, since its records not in memory
+    /// would otherwise keep the timers of their old state.
     pub async fn follow_spec_changes(&self) {
-        let changed = match self.registry.write() {
+        let mut changed = match self.registry.write() {
             Ok(mut registry) => registry.take_changed_types(),
             Err(_) => return,
         };
-        for (tenant, entity_type) in changed {
-            let ids = self.list_entity_ids_lazy(&tenant, &entity_type).await;
-            tracing::info!(tenant = %tenant, entity_type, records = ids.len(),
-                "spec changed; reconciling its records' state timers");
-            for entity_id in ids {
-                self.reconcile_record_state_timers(&tenant, &entity_type, &entity_id, None)
-                    .await;
+        let mut wait = FOLLOW_RETRY_FIRST;
+        loop {
+            let mut unlisted = Vec::new();
+            for (tenant, entity_type) in changed {
+                if let Err(error) = self.ensure_type_indexed(&tenant, &entity_type).await {
+                    tracing::warn!(tenant = %tenant, entity_type, %error,
+                        retry_in_secs = wait.as_secs(),
+                        "records of a changed spec could not be listed; trying again");
+                    unlisted.push((tenant, entity_type));
+                    continue;
+                }
+                let ids = self.list_entity_ids(&tenant, &entity_type);
+                tracing::info!(tenant = %tenant, entity_type, records = ids.len(),
+                    "spec changed; reconciling its records' state timers");
+                for entity_id in ids {
+                    self.reconcile_record_state_timers(&tenant, &entity_type, &entity_id, None)
+                        .await;
+                }
             }
+            if unlisted.is_empty() {
+                return;
+            }
+            tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
+            wait = (wait * 2).min(FOLLOW_RETRY_MAX);
+            changed = unlisted;
         }
     }
 
