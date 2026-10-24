@@ -269,7 +269,7 @@ async fn check_wake(
 /// One seed's run. Ok: how many rows its wakes fired.
 fn run_seed(seed: u64) -> Result<usize, String> {
     let clock = Arc::new(Clock::new());
-    install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
     let mut rng = DeterministicRng::new(seed);
     let events = SimEventStore::no_faults(seed);
     let rows = Arc::new(TimerRows::default());
@@ -349,7 +349,14 @@ fn run_seed(seed: u64) -> Result<usize, String> {
         // again when its old timer's wait ends, and the rest fires when due.
         let left = waiting(&events, &rows).await;
         let fired_before = fires(&events, &ids).await;
-        let end = sim_now() + chrono::Duration::seconds(TIMEOUT + 2 * PERIOD);
+        // Long enough for every row left to fall due.
+        let end = left
+            .iter()
+            .map(|d| d.at)
+            .max()
+            .unwrap_or_else(sim_now)
+            .max(sim_now())
+            + chrono::Duration::seconds(PERIOD);
         tokio::time::sleep((end - sim_now()).to_std().unwrap()).await;
         settle().await;
         for ((id, action), after) in fires(&events, &ids).await {
