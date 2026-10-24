@@ -437,8 +437,7 @@ impl crate::state::ServerState {
                 }),
             );
         }
-        let cache_key = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
-        self.cache_entity_status(cache_key, response.state.status.clone());
+        self.cache_entity_status(ctx.tenant, &response.state);
         let _ = self
             .observe_refresh_tx
             .send(crate::state::ObserveRefreshHint::Entities);
@@ -674,7 +673,10 @@ impl crate::state::ServerState {
 
         // Simulation runs other requests between the commit and its status
         // cache write, as a slow projection write above would.
-        temper_runtime::buggify::buggify_yield(crate::state::STATUS_WRITE_YIELD_BUDGET).await;
+        temper_runtime::buggify::buggify_yield(
+            crate::state::status_cache::STATUS_WRITE_YIELD_BUDGET,
+        )
+        .await;
 
         // 3. Broadcast SSE + cache
         self.broadcast_state_change(ctx, &response);

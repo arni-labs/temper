@@ -94,8 +94,22 @@ const MEMBER: &str = "m-1";
 const POST: &str = "p-1";
 const MEMBER_ACTIONS: [&str; 3] = ["Touch", "Suspend", "Reinstate"];
 
-/// Seeds explored on every run.
+/// Seeds explored on every run besides the regression cases.
 const EXPLORED_SEEDS: u64 = 64;
+
+/// The first seed of each scenario that broke the invariant before status
+/// writes were ordered by the record's event sequence (CI run 40082463981):
+/// racing writes left Suspended cached after Reinstate committed Active
+/// (seed 3), a delete left Active cached (seed 0), and a write that landed
+/// after passivation dropped the newer entry left Active cached (seed 0).
+const RACING_WRITES_REGRESSION_SEEDS: &[u64] = &[3];
+const DELETE_REGRESSION_SEEDS: &[u64] = &[0];
+const PASSIVATION_REGRESSION_SEEDS: &[u64] = &[0];
+
+fn seeds(regressions: &'static [u64]) -> impl Iterator<Item = u64> {
+    let explored = (0..EXPLORED_SEEDS).filter(|seed| !regressions.contains(seed));
+    regressions.iter().copied().chain(explored)
+}
 
 /// The workload's own choices, drawn from the seed (xorshift64), apart from
 /// the yields the buggify context draws.
@@ -298,7 +312,7 @@ async fn passivation_racing_status_writes(seed: u64) -> Result<(), String> {
 
 #[tokio::test]
 async fn dst_status_cache_guard_decides_on_the_newest_of_racing_writes() {
-    for seed in 0..EXPLORED_SEEDS {
+    for seed in seeds(RACING_WRITES_REGRESSION_SEEDS) {
         if let Err(violation) = racing_status_writes(seed).await {
             panic!("seed {seed}: {violation}");
         }
@@ -307,7 +321,7 @@ async fn dst_status_cache_guard_decides_on_the_newest_of_racing_writes() {
 
 #[tokio::test]
 async fn dst_status_cache_guard_does_not_trust_a_deleted_record() {
-    for seed in 0..EXPLORED_SEEDS {
+    for seed in seeds(DELETE_REGRESSION_SEEDS) {
         if let Err(violation) = delete_racing_status_writes(seed).await {
             panic!("seed {seed}: {violation}");
         }
@@ -316,7 +330,7 @@ async fn dst_status_cache_guard_does_not_trust_a_deleted_record() {
 
 #[tokio::test]
 async fn dst_status_cache_guard_decides_on_the_newest_across_passivation() {
-    for seed in 0..EXPLORED_SEEDS {
+    for seed in seeds(PASSIVATION_REGRESSION_SEEDS) {
         if let Err(violation) = passivation_racing_status_writes(seed).await {
             panic!("seed {seed}: {violation}");
         }
