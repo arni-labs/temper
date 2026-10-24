@@ -34,3 +34,46 @@ pub(crate) fn on_growable_stack<'a, T: 'a>(
         .boxed()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Waker};
+
+    use futures_util::FutureExt;
+    use futures_util::future::BoxFuture;
+
+    use super::on_growable_stack;
+
+    /// A chain of `levels` levels, each awaiting the next on a growable stack,
+    /// whose last level never finishes: a reaction chain cancelled part way.
+    fn pending_chain(levels: usize) -> BoxFuture<'static, ()> {
+        on_growable_stack(move || {
+            async move {
+                if levels == 0 {
+                    std::future::pending::<()>().await;
+                } else {
+                    pending_chain(levels - 1).await;
+                }
+            }
+            .boxed()
+        })
+    }
+
+    /// Dropping a chain drops every level it holds, one inside another, so
+    /// dropping a deep one needs as much stack as polling it. A thread that
+    /// overflows its stack aborts the process, so this fails by crashing.
+    #[test]
+    fn a_deep_pending_chain_is_dropped_on_a_small_thread() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut chain = pending_chain(20_000);
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(chain.as_mut().poll(&mut context).is_pending());
+                drop(chain);
+            })
+            .expect("spawn the test thread")
+            .join()
+            .expect("the chain was polled and dropped");
+    }
+}

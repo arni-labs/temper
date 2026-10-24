@@ -141,3 +141,62 @@ to = "Working"
     // The inline cascade fires Start automatically once — Agent lands in Working.
     assert_eq!(after.entities.get("Agent").unwrap().status, "Working");
 }
+
+/// A `Steps` spec whose action `A{i}` moves it from `S{i}` to `S{i+1}` and
+/// triggers the next action on itself, so firing `A0` sets off a cascade of
+/// `actions` distinct steps.
+fn stepping_ioa(actions: usize) -> String {
+    let states = (0..=actions)
+        .map(|index| format!("\"S{index}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut ioa = format!(
+        "[automaton]\nname = \"Steps\"\nstates = [{states}]\ninitial = \"S0\"\nallow_indefinite_states = [{states}]\n"
+    );
+    for index in 0..actions {
+        let next = index + 1;
+        ioa.push_str(&format!(
+            "\n[[action]]\nname = \"A{index}\"\nfrom = [\"S{index}\"]\nto = \"S{next}\"\n"
+        ));
+        if next < actions {
+            ioa.push_str(&format!(
+                "\n[[action.triggers]]\nname = \"then_a{next}\"\nkind = \"entity\"\ntarget_entity = \"Steps\"\ntarget_action = \"A{next}\"\n\n[action.triggers.resolve_target]\nkind = \"same_id\"\n"
+            ));
+        }
+    }
+    ioa
+}
+
+#[test]
+fn a_long_cascade_of_distinct_steps_runs_to_its_end_on_a_small_thread() {
+    // A cascade stops only at a repeated step, so one of distinct steps runs
+    // as far as the spec goes, however small the checking thread's stack. A
+    // thread that overflows its stack aborts the process, so this fails by
+    // crashing.
+    const ACTIONS: usize = 2_000;
+    let steps = parse_automaton(&stepping_ioa(ACTIONS)).unwrap();
+    let plan = CompositeVerificationPlan::new(&[&steps], "Steps").unwrap();
+    let model = CompositeTemperModel::from_plan(plan);
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn_scoped(scope, || {
+                let init = &model.init_states()[0];
+                let mut actions = Vec::new();
+                model.actions(init, &mut actions);
+                let first = actions
+                    .iter()
+                    .find(|a| a.action.name == "A0")
+                    .cloned()
+                    .unwrap();
+                let after = model.next_state(init, first).unwrap();
+                assert_eq!(
+                    after.entities.get("Steps").unwrap().status,
+                    format!("S{ACTIONS}")
+                );
+            })
+            .expect("spawn the test thread")
+            .join()
+            .expect("the cascade ran to its end");
+    });
+}

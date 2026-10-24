@@ -344,11 +344,12 @@ async fn a_spawn_loop_stops_at_its_first_repeat() {
     assert_eq!(cells.len(), 2, "c0 and the one Cell it made: {cells:?}");
 }
 
-/// A reaction's idempotency key is the same length at every depth of its
-/// chain. It used to grow by a suffix at each reaction, so the keys a chain
-/// stored cost the square of its length.
+/// The first eight reactions of a chain keep the keys a server stopping chains
+/// at eight reactions wrote, so a retry across the upgrade finds them done.
+/// Past them a key stays one length: a key that grew by a suffix at every
+/// reaction would make the keys a chain stores cost the square of its length.
 #[tokio::test]
-async fn reaction_keys_stay_one_length_along_a_chain() {
+async fn reaction_keys_match_earlier_ones_then_stop_growing() {
     const NODES: usize = 40;
     let state = chain_state();
     seed_nodes(&state, NODES).await;
@@ -373,8 +374,13 @@ async fn reaction_keys_stay_one_length_along_a_chain() {
             .unwrap_or_else(|| panic!("node n{index} did not pass"));
         keys.push(pass.idempotency_key.clone().expect("a reaction key"));
     }
+    let mut earlier = "caller-key".to_string();
+    for key in &keys[..8] {
+        earlier = format!("{earlier}:reaction:Node:Pass:pass_on");
+        assert_eq!(key, &earlier);
+    }
     assert!(
-        keys.iter().all(|key| key.len() == keys[0].len()),
+        keys[8..].iter().all(|key| key.len() == keys[8].len()),
         "{keys:?}"
     );
     let distinct: std::collections::BTreeSet<_> = keys.iter().collect();
