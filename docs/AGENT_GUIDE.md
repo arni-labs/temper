@@ -268,10 +268,16 @@ from = ["Draft", "Submitted"]
 to = "Cancelled"
 params = ["Reason"]
 hint = "Cancel an order. Only from Draft or Submitted."
+says = "call it off"
 
 [[invariant]]
 name = "SubmitRequiresItems"
 assert = "status in ['Submitted'] => items > 0"
+
+[[group]]
+name = "Open"
+says = "still being put together"
+states = ["Draft", "Submitted"]
 ```
 
 **Rules for I/O Automaton specs:**
@@ -284,6 +290,7 @@ assert = "status in ['Submitted'] => items > 0"
 6. `effect` is a list of statements in the same grammar: `items += 1`, `retries -= 1`, `quota = params.quota`, `ready = true`, `append(tags, params.tag)`, `remove_at(tags, params.i)`, `schedule('Expire', 3600)`, `schedule_at('Expire', expires_at)`, `spawn('Task', 'Create', last_task_id)`. Statements are type-checked at load, and effects reading `params.p` are verified with `p` unknown. An action's name implies nothing: `AddItem` without an `effect` changes only `status`. See [predicates.md#effects](predicates.md#effects).
 7. `[[action.triggers]]`: the only way an action causes work elsewhere — `kind = "entity"` (another entity's action), `"wasm"`, `"adapter"`, or `"hook"` (a platform hook registered by the host). `kind = "webhook"` is refused at load: make the call with `kind = "wasm"`, `module = "http_fetch"` (ADR-0182). See [Section 9](#9-integration-engine).
 8. Action kinds: `input` = from environment (HTTP), always enabled in from-states; `output` = emitted events; `internal` = private state transitions.
+9. Statechart labels, which change nothing the spec does: an action's optional `says` is its arrow's label, one non-empty line. A `[[group]]` has a `name`, an optional `says` and `states`, a list of declared states and other groups' names, so groups nest. Group names differ from each other and from every state; every state and group sits in at most one group; groups never contain themselves. A group name is not a state: `from` and `to` cannot name one. `GET /observe/specs/{entity}` returns each action's `says` and the spec's `groups`.
 
 ### 3.3 Cedar (Access Control)
 

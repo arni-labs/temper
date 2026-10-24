@@ -75,6 +75,9 @@ pub struct SpecDetail {
     pub invariants: Vec<InvariantDetail>,
     /// State variable declarations.
     pub state_variables: Vec<StateVarDetail>,
+    /// The spec's `[[group]]` boxes, in spec order, for drawing a statechart.
+    #[serde(default)]
+    pub groups: Vec<temper_spec::automaton::StateGroup>,
 }
 
 /// Detail of a single action.
@@ -98,6 +101,10 @@ pub struct ActionDetail {
     /// Agent-facing hint from the spec (empty when the spec has none).
     #[serde(default)]
     pub hint: String,
+    /// The action's plain-words label for a statechart arrow; absent when
+    /// the spec gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub says: Option<String>,
 }
 
 /// A single action parameter: name plus its declared type ("string" default).
