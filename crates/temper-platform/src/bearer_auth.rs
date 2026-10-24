@@ -59,6 +59,14 @@ pub async fn bearer_auth_check(
         return Ok(next.run(req).await);
     }
 
+    // A tenant startup could not restore has no credential records loaded, so
+    // a lookup would answer 401 for a valid credential. Name its state instead.
+    if let Some(response) =
+        temper_server::odata::unavailable_tenant_response(&state.server, &tenant)
+    {
+        return Ok(response);
+    }
+
     let matched_endpoint = match state.server.http_endpoint_tables.get(&tenant).await {
         Some(table) => {
             table
