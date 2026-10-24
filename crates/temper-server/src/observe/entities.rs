@@ -43,7 +43,12 @@ pub(crate) async fn handle_list_entities(
             // Use peek() to avoid updating LRU order during a bulk listing.
             let (current_state, last_updated) = cache
                 .peek(key.as_str())
-                .map(|(s, t)| (Some(s.clone()), Some(t.to_rfc3339())))
+                .map(|held| {
+                    (
+                        Some(held.status.clone()),
+                        Some(held.updated_at.to_rfc3339()),
+                    )
+                })
                 .unwrap_or((None, None));
             Some(EntityInstanceSummary {
                 tenant: parts.first().unwrap_or(&"default").to_string(),

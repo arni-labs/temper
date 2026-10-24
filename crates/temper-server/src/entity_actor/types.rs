@@ -171,12 +171,19 @@ impl EntityState {
         }
     }
 
+    /// Where this state is in the record's history. With a journal that is the
+    /// journal sequence; without one the sequence stays put, and the count of
+    /// events applied moves instead. Both only grow while the record lives.
+    pub fn event_sequence(&self) -> u64 {
+        self.sequence_nr.max(self.total_event_count as u64)
+    }
+
     pub fn has_processed_idempotency_key(&self, key: &str) -> bool {
         self.processed_idempotency_keys.contains_key(key)
     }
 
     fn record_processed_idempotency_key(&mut self, key: &str) {
-        let sequence = self.sequence_nr.max(self.total_event_count as u64);
+        let sequence = self.event_sequence();
         self.processed_idempotency_keys
             .insert(key.to_string(), sequence);
 
@@ -215,6 +222,26 @@ pub struct EntityEvent {
     /// move that armed it. Absent when the dispatch's caller made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<super::MoveOrigin>,
+    /// Which kind of event the kernel wrote. Only the kernel's delete writes a
+    /// tombstone, whatever a spec names its actions.
+    #[serde(default)]
+    pub kind: temper_runtime::persistence::EventKind,
+}
+
+impl EntityEvent {
+    /// The `Created` event that starts a journal, carrying no params.
+    pub(crate) fn bootstrap(to_status: String) -> Self {
+        Self {
+            action: "Created".to_string(),
+            from_status: String::new(),
+            to_status,
+            timestamp: temper_runtime::scheduler::sim_now(),
+            params: serde_json::json!({}),
+            idempotency_key: None,
+            origin: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
+        }
+    }
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.

@@ -184,6 +184,7 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         params: fields.clone(),
         idempotency_key: None,
         origin: None,
+        kind: temper_runtime::persistence::EventKind::Transition,
     }
 }
 

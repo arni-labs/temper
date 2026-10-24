@@ -201,14 +201,17 @@ impl crate::state::ServerState {
                 .await?;
 
             if !response.success {
-                return Err(DispatchError::Internal(response.error.unwrap_or_else(
-                    || {
-                        format!(
-                            "composite {entity_type}.{action} sub-write {} failed",
-                            prepared.idx
-                        )
-                    },
-                )));
+                let error = response.error.clone().unwrap_or_else(|| {
+                    format!(
+                        "composite {entity_type}.{action} sub-write {} failed",
+                        prepared.idx
+                    )
+                });
+                return Err(sub_write_failure(
+                    &response,
+                    &prepared.idempotency_key,
+                    error,
+                ));
             }
         }
 
@@ -519,15 +522,7 @@ impl crate::state::ServerState {
             && expected_sequence == 0
             && state.total_event_count == 0
         {
-            let bootstrap = crate::entity_actor::EntityEvent {
-                action: "Created".to_string(),
-                from_status: String::new(),
-                to_status: state.status.clone(),
-                timestamp: sim_now(),
-                params: serde_json::json!({}),
-                idempotency_key: None,
-                origin: None,
-            };
+            let bootstrap = crate::entity_actor::EntityEvent::bootstrap(state.status.clone());
             events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
             state.sequence_nr = state.sequence_nr.saturating_add(1);
             state.push_event_bounded(bootstrap);
@@ -857,15 +852,7 @@ impl crate::state::ServerState {
             && (!(write.uses_parent_gate && write.action == "Create")
                 || table.has_input_contracts())
         {
-            let created = crate::entity_actor::EntityEvent {
-                action: "Created".into(),
-                from_status: String::new(),
-                to_status: stream.state.status.clone(),
-                timestamp: sim_now(),
-                params: serde_json::json!({}),
-                idempotency_key: None,
-                origin: None,
-            };
+            let created = crate::entity_actor::EntityEvent::bootstrap(stream.state.status.clone());
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
         }

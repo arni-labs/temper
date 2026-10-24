@@ -378,7 +378,7 @@ impl crate::state::ServerState {
         self.persist_trajectory_entry_background(entry);
     }
 
-    /// Broadcast state change to SSE subscribers and update entity cache.
+    /// Broadcast state change to SSE subscribers.
     pub(crate) fn broadcast_state_change(
         &self,
         ctx: &PostDispatchContext<'_>,
@@ -449,8 +449,6 @@ impl crate::state::ServerState {
                 }),
             );
         }
-        let cache_key = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
-        self.cache_entity_status(cache_key, response.state.status.clone());
         let _ = self
             .observe_refresh_tx
             .send(crate::state::ObserveRefreshHint::Entities);
@@ -661,6 +659,16 @@ impl crate::state::ServerState {
         // dependent launch. An old reset timer must not fire during the wait.
         self.invalidate_state_timeouts_if_needed(ctx, &response);
 
+        // The status is committed, so guards decide on it from here on, even
+        // when the projection below fails and the action answers with an
+        // error. Simulation runs other requests between the commit and this
+        // write, as a slow writer would.
+        temper_runtime::buggify::buggify_yield(
+            crate::state::status_cache::STATUS_WRITE_YIELD_BUDGET,
+        )
+        .await;
+        self.cache_entity_status(ctx.tenant, &response.state);
+
         // Every committed transition is visible through the query plane before
         // the response returns: the caller, a reaction or an integration may
         // read it at once, and queue admission does not establish visibility.
@@ -685,7 +693,7 @@ impl crate::state::ServerState {
             self.apply_query_projection_update(ctx, &response).await;
         }
 
-        // 3. Broadcast SSE + cache
+        // 3. Broadcast SSE
         self.broadcast_state_change(ctx, &response);
 
         // Arm the successor only after visibility, before an inline adapter

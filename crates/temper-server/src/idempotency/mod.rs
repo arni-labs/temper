@@ -330,6 +330,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
             params: serde_json::Value::Null,
             idempotency_key: event.idempotency_key.clone(),
             origin: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
         })
         .collect();
     EntityResponse {
