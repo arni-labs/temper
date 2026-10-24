@@ -19,7 +19,7 @@
 //! refused fire is final: it is logged here, its dispatch records it in the
 //! record's trajectory like any refused action, and then its row is removed.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,8 +71,8 @@ impl ScheduledTimer {
 }
 
 impl ServerState {
-    /// The scheduled actions armed in this process, by row.
-    pub fn armed_scheduled_actions(&self) -> BTreeSet<ScheduledFire> {
+    /// The scheduled actions armed in this process: each row's live timers.
+    pub fn armed_scheduled_actions(&self) -> BTreeMap<ScheduledFire, usize> {
         self.scheduled_armed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -193,13 +193,16 @@ impl ServerState {
         gate: Option<Arc<Semaphore>>,
     ) {
         let row = timer.row();
-        let newly_armed = self
-            .scheduled_armed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(row.clone());
-        if !newly_armed {
-            return;
+        {
+            let mut armed = self
+                .scheduled_armed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let live = armed.entry(row.clone()).or_insert(0);
+            if *live > 0 {
+                return;
+            }
+            *live += 1;
         }
         let agent = &timer.agent_ctx;
         let span = tracing::info_span!(
@@ -216,11 +219,16 @@ impl ServerState {
         let fire = async move {
             tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
             server.fire_scheduled_action(&timer, gate).await;
-            server
+            let mut armed = server
                 .scheduled_armed
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&row);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(live) = armed.get_mut(&row) {
+                *live -= 1;
+                if *live == 0 {
+                    armed.remove(&row);
+                }
+            }
         };
         tokio::spawn(fire.instrument(span)); // determinism-ok: timer delivery is a background side-effect
     }

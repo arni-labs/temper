@@ -518,12 +518,12 @@ pub struct ServerState {
     /// Where armed timer rows are kept when the storage stack has no metadata
     /// store to keep them, as under simulation. None: the metadata store.
     pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
-    /// The scheduled actions armed in this process, by row. A row is armed
-    /// at most once however many replies hand it back (a cached reply to a
-    /// retried fire carries the schedules it armed), and leaves the set when
-    /// its fire ends.
+    /// The scheduled actions armed in this process: how many live timers
+    /// each row has. A row is armed only while it has none, however many
+    /// replies hand it back (a cached reply to a retried fire carries the
+    /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
-        Arc<std::sync::Mutex<BTreeSet<crate::request_context::ScheduledFire>>>,
+        Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.

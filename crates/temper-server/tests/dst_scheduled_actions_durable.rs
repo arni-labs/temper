@@ -31,7 +31,7 @@
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -533,14 +533,17 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 ));
             }
         }
-        // Every waiting row is armed exactly once in this process.
-        let rows: BTreeSet<ScheduledFire> = pending
+        // Every waiting row has exactly one live timer in this process.
+        let rows: BTreeMap<ScheduledFire, usize> = pending
             .iter()
-            .map(|row| ScheduledFire {
-                tenant: row.tenant.clone(),
-                entity_type: row.entity_type.clone(),
-                entity_id: row.entity_id.clone(),
-                arm_id: row.arm_id.clone(),
+            .map(|row| {
+                let fire = ScheduledFire {
+                    tenant: row.tenant.clone(),
+                    entity_type: row.entity_type.clone(),
+                    entity_id: row.entity_id.clone(),
+                    arm_id: row.arm_id.clone(),
+                };
+                (fire, 1)
             })
             .collect();
         let armed = state.armed_scheduled_actions();
