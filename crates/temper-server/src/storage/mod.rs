@@ -56,8 +56,8 @@ pub use published_artifacts::{
 pub use state_timers::StateTimerStore;
 mod query_plane;
 pub use query_plane::{
-    EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
+    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 pub(crate) use query_plane_read::{
     CatalogRowsLoad, load_catalog_rows_by_id, load_selected_catalog_rows_by_id,

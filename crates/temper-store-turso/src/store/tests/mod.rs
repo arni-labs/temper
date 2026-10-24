@@ -2430,3 +2430,79 @@ async fn deleted_probes_use_the_tombstone_index() {
         }
     }
 }
+
+#[tokio::test]
+async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
+    let store = make_store("catalog-freshness").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let created = || test_envelope("Created", serde_json::json!({}));
+    let updated = || test_envelope("FieldsUpdated", serde_json::json!({}));
+    let project = |id: &'static str, sequence_nr: u64| {
+        let store = store.clone();
+        let tenant = tenant.clone();
+        async move {
+            store
+                .upsert_query_projection_with_state(
+                    &tenant,
+                    "Payment",
+                    id,
+                    "Pending",
+                    &serde_json::json!({ "OrderId": "ord-1" }),
+                    &serde_json::json!({}),
+                    sequence_nr,
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    // Projected at its newest event.
+    store
+        .append(&format!("{tenant}:Payment:pay-current"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-current", 1).await;
+    // A change committed after the projection, which never landed.
+    store
+        .append(&format!("{tenant}:Payment:pay-stale"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-stale", 1).await;
+    store
+        .append(&format!("{tenant}:Payment:pay-stale"), 1, &[updated()])
+        .await
+        .unwrap();
+    // Deleted, with its projection row left behind.
+    store
+        .append(&format!("{tenant}:Payment:pay-deleted"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-deleted", 1).await;
+    store
+        .append(
+            &format!("{tenant}:Payment:pay-deleted"),
+            1,
+            &[tombstone_envelope()],
+        )
+        .await
+        .unwrap();
+    // Journaled but never projected: not a catalog row at all.
+    store
+        .append(&format!("{tenant}:Payment:pay-unprojected"), 0, &[created()])
+        .await
+        .unwrap();
+
+    let mut rows = store
+        .projection_catalog_freshness(&tenant, "Payment")
+        .await
+        .expect("read catalog freshness");
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("pay-current".to_string(), true),
+            ("pay-deleted".to_string(), false),
+            ("pay-stale".to_string(), false),
+        ]
+    );
+}

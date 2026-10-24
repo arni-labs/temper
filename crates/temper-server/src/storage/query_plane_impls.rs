@@ -5,9 +5,15 @@ use temper_store_turso::{
 };
 
 use super::{
-    EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
+    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
+
+fn catalog_freshness(rows: Vec<(String, bool)>) -> Vec<CatalogRowFreshness> {
+    rows.into_iter()
+        .map(|(entity_id, current)| CatalogRowFreshness { entity_id, current })
+        .collect()
+}
 
 fn storage_order_by(order_by: &[QueryFieldIndexOrder]) -> Vec<(String, bool)> {
     order_by
@@ -173,6 +179,16 @@ impl QueryPlaneStore for PostgresEventStore {
             .await
             .map(Some)
     }
+
+    async fn projection_catalog_freshness(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        self.projection_catalog_freshness_pg(tenant, entity_type)
+            .await
+            .map(|rows| Some(catalog_freshness(rows)))
+    }
 }
 
 #[async_trait::async_trait]
@@ -315,6 +331,16 @@ impl QueryPlaneStore for TursoEventStore {
         TursoEventStore::projected_entity_counts_by_tenant(self)
             .await
             .map(Some)
+    }
+
+    async fn projection_catalog_freshness(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        TursoEventStore::projection_catalog_freshness(self, tenant, entity_type)
+            .await
+            .map(|rows| Some(catalog_freshness(rows)))
     }
 }
 
@@ -478,6 +504,18 @@ impl QueryPlaneStore for TenantStoreRouter {
             }
         }
         Ok(Some(counts))
+    }
+
+    async fn projection_catalog_freshness(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .projection_catalog_freshness(tenant, entity_type)
+            .await
+            .map(|rows| Some(catalog_freshness(rows)))
     }
 }
 

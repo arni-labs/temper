@@ -9,13 +9,21 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{CSDL_XML, ORDER_IOA};
 use temper_runtime::ActorSystem;
+use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::{
     EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
+};
+use temper_server::storage::{
+    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
+    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
@@ -110,6 +118,159 @@ async fn journal_only_server(name: &str, store: &Store) -> ServerState {
     let mut stack = StorageStack::from_turso(store.open().await);
     stack.query_plane = None;
     server(name, stack)
+}
+
+/// The store's query plane, except that projection writes fail while
+/// `failing` is set: reads still answer from what was projected before.
+struct ProjectionWritesFail {
+    store: TursoEventStore,
+    failing: Arc<AtomicBool>,
+}
+
+impl ProjectionWritesFail {
+    fn refuse(&self) -> Result<(), PersistenceError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(PersistenceError::Storage(
+                "injected projection write failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryPlaneStore for ProjectionWritesFail {
+    async fn upsert_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        status: &str,
+        fields: &serde_json::Value,
+        state: &serde_json::Value,
+        sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        self.refuse()?;
+        QueryPlaneStore::upsert_projection(
+            &self.store,
+            tenant,
+            entity_type,
+            entity_id,
+            status,
+            fields,
+            state,
+            sequence_nr,
+        )
+        .await
+    }
+
+    async fn upsert_projections(
+        &self,
+        tenant: &str,
+        projections: &[QueryProjectionUpsert],
+    ) -> Result<(), PersistenceError> {
+        self.refuse()?;
+        QueryPlaneStore::upsert_projections(&self.store, tenant, projections).await
+    }
+
+    async fn remove_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<(), PersistenceError> {
+        self.refuse()?;
+        QueryPlaneStore::remove_projection(&self.store, tenant, entity_type, entity_id).await
+    }
+
+    async fn query_field_index(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        where_clause: &str,
+        params: Vec<String>,
+    ) -> Result<Option<Vec<String>>, PersistenceError> {
+        QueryPlaneStore::query_field_index(&self.store, tenant, entity_type, where_clause, params)
+            .await
+    }
+
+    async fn query_field_index_page(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        where_clause: &str,
+        params: Vec<String>,
+        order_by: &[QueryFieldIndexOrder],
+        skip: usize,
+        top: usize,
+        include_count: bool,
+    ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
+        QueryPlaneStore::query_field_index_page(
+            &self.store,
+            tenant,
+            entity_type,
+            where_clause,
+            params,
+            order_by,
+            skip,
+            top,
+            include_count,
+        )
+        .await
+    }
+
+    async fn load_projection_fields_many(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+        field_names: &[&str],
+    ) -> Result<Option<Vec<QueryProjectionFieldsRow>>, PersistenceError> {
+        QueryPlaneStore::load_projection_fields_many(
+            &self.store,
+            tenant,
+            entity_type,
+            entity_ids,
+            field_names,
+        )
+        .await
+    }
+
+    async fn load_entity_catalog_rows(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_ids: &[String],
+    ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
+        QueryPlaneStore::load_entity_catalog_rows(&self.store, tenant, entity_type, entity_ids)
+            .await
+    }
+
+    async fn projected_entity_counts_by_tenant(
+        &self,
+    ) -> Result<Option<Vec<(String, u64)>>, PersistenceError> {
+        QueryPlaneStore::projected_entity_counts_by_tenant(&self.store).await
+    }
+
+    async fn projection_catalog_freshness(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        QueryPlaneStore::projection_catalog_freshness(&self.store, tenant, entity_type).await
+    }
+}
+
+/// A server whose projection writes fail while the returned switch is on.
+async fn projection_failing_server(name: &str, store: &Store) -> (ServerState, Arc<AtomicBool>) {
+    let turso = store.open().await;
+    let failing = Arc::new(AtomicBool::new(false));
+    let mut stack = StorageStack::from_turso(turso.clone());
+    stack.query_plane = Some(Arc::new(ProjectionWritesFail {
+        store: turso,
+        failing: failing.clone(),
+    }));
+    (server(name, stack), failing)
 }
 
 /// The same store opened by a fresh process: ids indexed at boot, no actor resident.
@@ -272,4 +433,96 @@ async fn restrict_delete_refuses_when_the_index_cannot_vouch_for_the_rows() {
         "the refused delete started {actors_started} actors; it should read no Payment"
     );
     assert_eq!(get_order(&state, "ord-target").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn restrict_delete_reads_a_projected_row_whose_later_change_was_not_projected() {
+    let store = Store::new("stale");
+    let (state, projection_fails) =
+        projection_failing_server("delete-reference-stale", &store).await;
+    create(&state, "Order", "ord-target", serde_json::json!({})).await;
+    create_payments(&state, "pay", REFERENCING_PAYMENTS, "ord-elsewhere").await;
+
+    // pay-7 is projected pointing elsewhere. Its move to ord-target commits,
+    // but the projection write fails, so the index still has the old value.
+    projection_fails.store(true, Ordering::SeqCst);
+    let moved = state
+        .update_tenant_entity_fields(
+            &TenantId::default(),
+            "Payment",
+            "pay-7",
+            serde_json::json!({ "OrderId": "ord-target" }),
+            false,
+        )
+        .await;
+    assert!(
+        moved
+            .as_ref()
+            .is_err_and(|error| error.contains("query projection write failed")),
+        "the move commits and reports its failed projection: {moved:?}"
+    );
+    let committed = state
+        .get_tenant_entity_state(&TenantId::default(), "Payment", "pay-7")
+        .await
+        .expect("read pay-7");
+    assert_eq!(committed.state.fields["OrderId"], "ord-target");
+
+    let (status, body) = delete_order(&state, "ord-target").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a reference the index missed refuses the delete: {body}"
+    );
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("referenced by Payment('pay-7')"),
+        "refusal names the moved Payment: {message}"
+    );
+    assert_eq!(get_order(&state, "ord-target").await, StatusCode::OK);
+
+    // A restarted process sees the same journal and the same stale row.
+    projection_fails.store(false, Ordering::SeqCst);
+    let restarted = restarted_server("delete-reference-stale-restarted", &store).await;
+    let (status, body) = delete_order(&restarted, "ord-target").await;
+    assert_eq!(status, StatusCode::CONFLICT, "after restart: {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("referenced by Payment('pay-7')"),
+        "after restart the refusal names the moved Payment: {body}"
+    );
+}
+
+#[tokio::test]
+async fn restrict_delete_ignores_a_stale_row_that_no_longer_references_it() {
+    let store = Store::new("stale-away");
+    let (state, projection_fails) =
+        projection_failing_server("delete-reference-stale-away", &store).await;
+    create(&state, "Order", "ord-target", serde_json::json!({})).await;
+    create_payments(&state, "pay", 3, "ord-target").await;
+
+    // Every Payment moves away; the moves commit but none is projected, so
+    // the index still says all three reference ord-target.
+    projection_fails.store(true, Ordering::SeqCst);
+    for n in 0..3 {
+        let _ = state
+            .update_tenant_entity_fields(
+                &TenantId::default(),
+                "Payment",
+                &format!("pay-{n}"),
+                serde_json::json!({ "OrderId": "ord-elsewhere" }),
+                false,
+            )
+            .await;
+    }
+    projection_fails.store(false, Ordering::SeqCst);
+
+    let (status, body) = delete_order(&state, "ord-target").await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "stale index entries do not hold a delete the rows no longer block: {body}"
+    );
+    assert_eq!(get_order(&state, "ord-target").await, StatusCode::NOT_FOUND);
 }
