@@ -217,17 +217,43 @@ fn commands_run_by_the_sandbox_do_not_see_its_token() {
     );
 }
 
-#[test]
-fn the_sandbox_stops_when_its_starter_closes_the_pipe() {
-    let dir = tempfile::tempdir().expect("temporary directory");
+/// Start the sandbox as serve does: its stdin is a pipe the caller holds.
+fn start_sandbox_on_a_pipe(workdir: &Path) -> (Process, SocketAddr) {
     let port = free_port();
-    let mut command = sandbox_command(port, dir.path());
+    let mut command = sandbox_command(port, workdir);
     command
         .arg("--exit-with-stdin")
         .env("TEMPER_SANDBOX_TOKEN", TOKEN)
         .stdin(Stdio::piped());
     let mut process = Process(command.spawn().expect("start python3 sandbox"));
     let address = wait_until_listening(&mut process, port);
+    (process, address)
+}
+
+#[test]
+fn commands_get_a_closed_stdin_while_the_sandbox_holds_its_pipe() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (_sandbox, address) = start_sandbox_on_a_pipe(dir.path());
+    let auth = format!("Bearer {TOKEN}");
+    let command = serde_json::json!({ "command": "cat && echo stdin-closed" });
+
+    let (status, body) = request(
+        address,
+        "POST",
+        "/v1/processes/run",
+        Some(&auth),
+        &command.to_string(),
+    );
+    assert_eq!(status, 200, "{body}");
+    let result: serde_json::Value = serde_json::from_str(&body).expect("JSON result");
+    assert_eq!(result["exit_code"], 0, "{body}");
+    assert_eq!(result["stdout"], "stdin-closed\n", "{body}");
+}
+
+#[test]
+fn the_sandbox_stops_when_its_starter_closes_the_pipe() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (mut process, address) = start_sandbox_on_a_pipe(dir.path());
 
     drop(process.0.stdin.take());
 

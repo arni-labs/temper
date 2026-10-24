@@ -194,7 +194,7 @@ pub async fn run(
             } else {
                 let sandbox_port = port + 10; // e.g., 3000 → 3010
                 let sandbox_url = format!("http://127.0.0.1:{sandbox_port}");
-                local_sandbox::start(&state.server, sandbox_port, &sandbox_url).await;
+                local_sandbox::start(&state.server, sandbox_port, &sandbox_url);
 
                 sandbox_url
             };

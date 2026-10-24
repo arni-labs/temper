@@ -24,9 +24,9 @@ const SANDBOX_TOKEN_ENV: &str = "TEMPER_SANDBOX_TOKEN";
 ///
 /// The sandbox lives exactly as long as this process: it reads a pipe this
 /// process holds open and exits at its end of input, so it stops however
-/// the server stops, and the next start finds the port free. Success is
-/// reported only once the sandbox answers `/health` with this start's token.
-pub(super) async fn start(server: &ServerState, sandbox_port: u16, sandbox_url: &str) {
+/// the server stops, and the next start finds the port free. Startup does
+/// not wait for it; [`supervise`] says when it is ready or that it exited.
+pub(super) fn start(server: &ServerState, sandbox_port: u16, sandbox_url: &str) {
     let sandbox_script = Path::new(SANDBOX_SCRIPT);
     if !sandbox_script.exists() {
         eprintln!("  Warning: local sandbox script not found at {sandbox_script:?}");
@@ -57,15 +57,14 @@ pub(super) async fn start(server: &ServerState, sandbox_port: u16, sandbox_url: 
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let started = match server.set_local_sandbox(sandbox_url, token.clone()) {
-        Ok(()) => match sandbox_cmd.spawn() {
-            Ok(child) => wait_until_ready(child, sandbox_url, &token).await,
-            Err(e) => Err(e.to_string()),
-        },
-        Err(e) => Err(e),
-    };
+    let started = server
+        .set_local_sandbox(sandbox_url, token.clone())
+        .and_then(|()| sandbox_cmd.spawn().map_err(|e| e.to_string()));
     match started {
-        Ok(()) => println!("  Local sandbox: {sandbox_url} (auto-started)"),
+        Ok(child) => {
+            println!("  Local sandbox: {sandbox_url} (auto-started, not ready yet)");
+            tokio::spawn(supervise(child, sandbox_url.to_string(), token));
+        }
         Err(e) => {
             eprintln!("  Warning: failed to start local sandbox: {e}");
             eprintln!(
@@ -75,50 +74,51 @@ pub(super) async fn start(server: &ServerState, sandbox_port: u16, sandbox_url: 
     }
 }
 
-/// How long a starting sandbox has to answer `/health`: python3 starts the
-/// script in well under a second, so this only bounds a sandbox that hangs.
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Wait until the sandbox answers `/health` with `token`, then keep it
-/// running for the life of this process. An error if it exits first (its
-/// port is taken, for example) or does not answer in time.
-async fn wait_until_ready(
-    mut child: tokio::process::Child,
-    sandbox_url: &str,
-    token: &str,
-) -> Result<(), String> {
-    // Straight to loopback: a configured HTTP proxy must not see the token.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-    let health = format!("{sandbox_url}/health");
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT; // determinism-ok: local dev sandbox start
-    loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!(
-                "the sandbox exited with {status}; is {sandbox_url} already in use?"
-            ));
+/// Hold the sandbox for the life of this process and say when it is ready.
+///
+/// Its stdin pipe is held here (`wait` would close it, and the sandbox exits
+/// when it closes). Readiness ends at whichever comes first: `/health`
+/// answers with this start's token, or the sandbox exits, for example
+/// because its port is taken. The exit also cancels a health request that
+/// is still waiting for an answer.
+async fn supervise(mut child: tokio::process::Child, sandbox_url: String, token: String) {
+    let _stdin = child.stdin.take();
+    tokio::select! {
+        status = child.wait() => {
+            tracing::warn!(
+                status = ?status,
+                sandbox_url,
+                "local sandbox exited before it was ready; is its port already in use?"
+            );
+            return;
         }
+        () = wait_for_health(&sandbox_url, &token) => {
+            tracing::info!(sandbox_url, "local sandbox ready");
+        }
+    }
+    let status = child.wait().await;
+    tracing::warn!(status = ?status, sandbox_url, "local sandbox exited");
+}
+
+/// Return once the sandbox answers `/health` with `token`.
+async fn wait_for_health(sandbox_url: &str, token: &str) {
+    // Straight to loopback: a configured HTTP proxy must not see the token.
+    let client = match reqwest::Client::builder().no_proxy().build() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "cannot check the local sandbox; not reporting it ready");
+            return std::future::pending().await;
+        }
+    };
+    let health = format!("{sandbox_url}/health");
+    loop {
         let answered = client.get(&health).bearer_auth(token).send().await;
         if answered.is_ok_and(|response| response.status().is_success()) {
-            break;
+            return;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("the sandbox did not answer {health} in time"));
-        }
+        // Not listening yet: python3 is still starting the script.
         tokio::time::sleep(Duration::from_millis(100)).await; // determinism-ok: local dev sandbox start
     }
-    // `wait` closes the child's stdin, which would stop the sandbox, so the
-    // pipe is held here until the sandbox exits or this process does.
-    let stdin = child.stdin.take();
-    tokio::spawn(async move {
-        let _stdin = stdin;
-        if let Ok(status) = child.wait().await {
-            tracing::warn!(%status, "local sandbox exited");
-        }
-    });
-    Ok(())
 }
 
 /// A fresh 256-bit token, hex encoded.

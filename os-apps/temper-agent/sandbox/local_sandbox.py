@@ -117,9 +117,11 @@ class SandboxHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "missing command"})
                 return
             try:
+                # Commands get a closed stdin: the sandbox's own stdin may be
+                # the pipe that keeps it alive, which never ends while serve runs.
                 r = subprocess.run(
                     cmd, shell=True, capture_output=True, text=True,
-                    timeout=60, cwd=cwd
+                    timeout=60, cwd=cwd, stdin=subprocess.DEVNULL
                 )
                 self._json(200, {
                     "stdout": r.stdout,
