@@ -6,7 +6,9 @@
 //! proof the child exists (ADR-0156). When the create is refused, the kernel
 //! journals a `SpawnRefused` event on the parent: it names the child and the
 //! reason, and puts the field back to its initial value if it still names the
-//! refused child. A later spawn that already replaced the id keeps its own.
+//! refused child and that child is known not to exist. A later spawn that
+//! already replaced the id keeps its own, and so does a child that exists
+//! anyway or could not be looked up.
 //!
 //! The event is the kernel's, like `FieldsUpdated`: it changes no status, runs
 //! no spec effects and is replayed by [`apply`], the same function the live
@@ -29,20 +31,31 @@ const MAX_RETRIES: u32 = 2;
 /// Why a spawn's child was not created, as the spawn dispatcher saw it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRefusal {
-    /// Stable repair identity, retained across recovery retries.
-    #[serde(default)]
-    pub recovery_id: Option<String>,
     /// The child's entity type.
     pub child_type: String,
     /// The id the parent's transition reserved for the child.
     pub child_id: String,
     /// The parent field the spawn stored the id in, if any.
     pub field: Option<String>,
-    /// Whether a child with that id exists anyway (created by an earlier
-    /// spawn or write). Its id is then kept.
-    pub child_exists: bool,
+    /// What the kernel found when it looked the child up.
+    pub child: ChildLookup,
     /// The refusal, as the step that refused it reported it.
     pub error: String,
+}
+
+/// Whether the refused child exists, as the kernel's durable lookup found it.
+/// Only [`ChildLookup::Absent`] lets the refusal clear the parent's field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildLookup {
+    /// No child with that id, resident or in the journal.
+    Absent,
+    /// A child with that id exists anyway, created by an earlier spawn or
+    /// write. Its id is kept.
+    Exists,
+    /// The lookup failed. The child may exist, so its id is kept: clearing it
+    /// on a guess could cut the parent off from a real child.
+    Unreadable,
 }
 
 /// The event's params: the refusal, plus the field it cleared and the value it
@@ -51,7 +64,7 @@ fn event_params(refusal: &SpawnRefusal, state: &EntityState, initial: &Value) ->
     let holds_child = refusal.field.as_ref().is_some_and(|field| {
         state.fields.get(field).and_then(Value::as_str) == Some(refusal.child_id.as_str())
     });
-    let cleared = (!refusal.child_exists && holds_child)
+    let cleared = (refusal.child == ChildLookup::Absent && holds_child)
         .then(|| refusal.field.clone())
         .flatten();
     let restored = cleared
@@ -61,6 +74,7 @@ fn event_params(refusal: &SpawnRefusal, state: &EntityState, initial: &Value) ->
         "child_type": refusal.child_type,
         "child_id": refusal.child_id,
         "error": refusal.error,
+        "child": refusal.child,
         "cleared_field": cleared,
         "restored_value": restored,
     })
@@ -90,33 +104,6 @@ fn refusal_event(state: &EntityState, params: Value) -> EntityEvent {
     }
 }
 
-/// Pending work can outlive the bounded idempotency cache, including across
-/// snapshots and restarts. A cache miss must consult the complete parent journal
-/// before appending; a failed read leaves the repair pending rather than guessing.
-async fn already_committed(
-    actor: &EntityActor,
-    state: &EntityState,
-    refusal: &SpawnRefusal,
-) -> Result<bool, String> {
-    let Some(key) = refusal.recovery_id.as_deref() else {
-        return Ok(false);
-    };
-    if state.has_processed_idempotency_key(key) {
-        return Ok(true);
-    }
-    let Some(store) = actor.event_journal.as_ref() else {
-        return Ok(false);
-    };
-    let events = store
-        .read_events(&actor.persistence_id(), 0)
-        .await
-        .map_err(|error| format!("spawn refusal history lookup failed: {error}"))?;
-    Ok(events.iter().any(|event| {
-        event.event_type == SPAWN_REFUSED_EVENT
-            && event.payload.get("idempotency_key").and_then(Value::as_str) == Some(key)
-    }))
-}
-
 /// Journal the refusal on the parent and apply it, or say why it was not.
 ///
 /// `Ok(())` means the event is durable. On `Err` the parent is unchanged.
@@ -129,9 +116,6 @@ pub(super) async fn commit(
         !refusal.child_id.is_empty(),
         "PRECONDITION: a refused spawn names the child id it reserved"
     );
-    if already_committed(actor, state, refusal).await? {
-        return Ok(());
-    }
     if state.status == "Deleted" {
         return Err("the parent was deleted before its spawn was refused".to_owned());
     }
@@ -144,7 +128,6 @@ pub(super) async fn commit(
     let initial = initial_fields(actor, state);
     let mut previous_fields = state.fields.clone();
     let mut event = refusal_event(state, event_params(refusal, state, &initial));
-    event.idempotency_key = refusal.recovery_id.clone();
     apply(state, &event.params);
 
     let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend) else {
@@ -166,14 +149,10 @@ pub(super) async fn commit(
                 if state.status == "Deleted" {
                     return Err("the parent was deleted before its spawn was refused".to_owned());
                 }
-                if already_committed(actor, state, refusal).await? {
-                    return Ok(());
-                }
                 // Decide again on the caught-up parent: a newer spawn may have
                 // replaced the id in between.
                 previous_fields = state.fields.clone();
                 event = refusal_event(state, event_params(refusal, state, &initial));
-                event.idempotency_key = refusal.recovery_id.clone();
                 apply(state, &event.params);
             }
             Err(e) => {

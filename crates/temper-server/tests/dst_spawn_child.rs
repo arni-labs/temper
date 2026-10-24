@@ -8,12 +8,18 @@
 //! a CronJob spawning Sessions: each fire spawns a `Run` whose `Configure`
 //! requires a nonempty `user_message`. Seeded choices give some fires a
 //! message, some an empty one, and some a store that fails reads of the new
-//! child.
+//! child. Some jobs let each fire settle before the next, as a schedule does;
+//! others fire back to back, so a refusal can reach the parent after a newer
+//! spawn replaced the id.
 //!
 //! Invariants, checked once every spawn has settled:
-//! 1. a parent's spawn field names a child that exists, or is empty;
+//! 1. a parent's spawn field names a child that exists, is empty, or names a
+//!    child whose refusal says the kernel could not look it up (the id is kept
+//!    on uncertainty, never cleared on a guess);
 //! 2. every child that was not created is named by a `SpawnRefused` event in
-//!    its parent's journal, so the refusal is visible after the fact.
+//!    its parent's journal, so the refusal is visible after the fact;
+//! 3. when a job's newest run was created, the job's field names it: a late
+//!    refusal of an older run does not clear a newer spawn's id.
 
 use std::time::Duration;
 
@@ -143,18 +149,30 @@ fn run_exists(store: &SimEventStore, run_id: &str) -> bool {
         .is_empty()
 }
 
-/// The run ids a job's journal records as refused spawns.
-fn refused_runs(store: &SimEventStore, job_id: &str) -> Vec<String> {
+/// The `SpawnRefused` params a job's journal records, in order.
+fn refusals(store: &SimEventStore, job_id: &str) -> Vec<serde_json::Value> {
     store
         .dump_journal(&format!("default:Job:{job_id}"))
         .into_iter()
         .filter(|envelope| envelope.event_type == "SpawnRefused")
-        .filter_map(|envelope| {
-            envelope.payload["params"]["child_id"]
-                .as_str()
-                .map(str::to_owned)
-        })
+        .map(|envelope| envelope.payload["params"].clone())
         .collect()
+}
+
+/// The run ids a job's journal records as refused spawns.
+fn refused_runs(store: &SimEventStore, job_id: &str) -> Vec<String> {
+    refusals(store, job_id)
+        .iter()
+        .filter_map(|params| params["child_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Whether the job's journal records that the kernel could not look `run_id`
+/// up when it refused it, so the job kept the id.
+fn refused_unreadable(store: &SimEventStore, job_id: &str, run_id: &str) -> bool {
+    refusals(store, job_id)
+        .iter()
+        .any(|params| params["child_id"] == run_id && params["child"] == "unreadable")
 }
 
 async fn wait_until_settled(store: &SimEventStore, job_id: &str, run_id: &str) {
@@ -177,8 +195,10 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
 
         let jobs = 3 + (rng.next_u64() % 3) as usize;
         let mut fired: Vec<(String, String, Fire)> = Vec::new();
+        let mut newest: Vec<(String, String)> = Vec::new();
         for job in 0..jobs {
             let job_id = format!("job-{seed}-{job}");
+            let settle_each = rng.next_u64().is_multiple_of(2);
             state
                 .get_or_create_tenant_entity(&tenant, "Job", &job_id, serde_json::json!({}))
                 .await
@@ -214,16 +234,20 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
                     "seed {seed}: Fire refused: {:?}",
                     response.error
                 );
-                // One fire settles before the next, as a schedule fires them.
-                wait_until_settled(&store, &job_id, &run_id).await;
+                if settle_each {
+                    wait_until_settled(&store, &job_id, &run_id).await;
+                }
                 fired.push((job_id.clone(), run_id, kind));
             }
+            newest.push((job_id.clone(), fired.last().expect("a job fires").1.clone()));
+        }
+        for (job_id, run_id, _) in &fired {
+            wait_until_settled(&store, job_id, run_id).await;
         }
 
-        for job in 0..jobs {
-            let job_id = format!("job-{seed}-{job}");
+        for (job_id, newest_run) in &newest {
             let stored = state
-                .get_tenant_entity_state(&tenant, "Job", &job_id)
+                .get_tenant_entity_state(&tenant, "Job", job_id)
                 .await
                 .expect("read Job")
                 .state
@@ -232,9 +256,17 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
                 .unwrap_or_default()
                 .to_owned();
             assert!(
-                stored.is_empty() || run_exists(&store, &stored),
+                stored.is_empty()
+                    || run_exists(&store, &stored)
+                    || refused_unreadable(&store, job_id, &stored),
                 "seed {seed}: {job_id}.last_run_id names {stored}, which was never created"
             );
+            if run_exists(&store, newest_run) {
+                assert_eq!(
+                    &stored, newest_run,
+                    "seed {seed}: {job_id} lost the id of its newest run, which exists"
+                );
+            }
         }
         for (job_id, run_id, kind) in &fired {
             if run_exists(&store, run_id) {
@@ -300,185 +332,4 @@ async fn dst_existing_child_survives_unreadable_journal() {
             "seed {seed}: unreadability must not clear a durable child"
         );
     }
-}
-
-#[tokio::test]
-async fn dst_failed_parent_refusal_append_eventually_converges() {
-    for seed in 200..208 {
-        let (_guard, _clock, _ids) = install_deterministic_context(seed);
-        let (state, store) = state_with_sim_store(seed);
-        let tenant = TenantId::default();
-        let response = state
-            .dispatch_tenant_action(
-                &tenant,
-                "Job",
-                "job",
-                "Fire",
-                serde_json::json!({"run_id": "absent", "user_message": ""}),
-                &AgentContext::for_service("test"),
-            )
-            .await
-            .expect("fire");
-        assert!(response.success);
-        // Exhaust the actor's refusal-append retries, then restore storage.
-        store.inject_concurrency_violations("default:Job:job", 1000);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(refused_runs(&store, "job").is_empty());
-        assert_eq!(
-            state
-                .get_tenant_entity_state(&tenant, "Job", "job")
-                .await
-                .unwrap()
-                .state
-                .fields["last_run_id"],
-            "absent"
-        );
-        assert!(
-            store
-                .dump_journal("__temper_internal:SpawnRefusal:recovery")
-                .iter()
-                .any(|e| e.event_type == "Pending"),
-            "repair must be durable before attempting the parent append"
-        );
-        store.inject_concurrency_violations("default:Job:job", 0);
-        wait_until_settled(&store, "job", "absent").await;
-        assert_eq!(refused_runs(&store, "job"), vec!["absent"]);
-        assert_eq!(
-            state
-                .get_tenant_entity_state(&tenant, "Job", "job")
-                .await
-                .unwrap()
-                .state
-                .fields["last_run_id"],
-            serde_json::Value::Null
-        );
-    }
-}
-
-#[test]
-fn dst_restart_recovers_pending_refusal_and_retries_idempotently() {
-    use temper_runtime::persistence::{EventMetadata, EventStore, PersistenceEnvelope};
-    use temper_runtime::scheduler::{sim_now, sim_uuid};
-    let runtime = || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    };
-    let store = runtime().block_on(async {
-        let (_guard, _clock, _ids) = install_deterministic_context(300);
-        let (state, store) = state_with_sim_store(300);
-        let tenant = TenantId::default();
-        state
-            .get_or_create_tenant_entity(
-                &tenant,
-                "Job",
-                "job",
-                serde_json::json!({"last_run_id": "absent"}),
-            )
-            .await
-            .unwrap();
-        let journal = "__temper_internal:SpawnRefusal:recovery";
-        store.append(journal, 0, &[PersistenceEnvelope {
-        sequence_nr: 1,
-        event_type: "Pending".to_owned(),
-        payload: serde_json::json!({"id": "restart-work", "work": {
-            "tenant": "default", "parent_type": "Job", "parent_id": "job",
-            "refusal": {"recovery_id": "repair-restart", "child_type": "Run", "child_id": "absent",
-                "field": "last_run_id", "child_exists": false, "error": "initializer refused"}
-        }}),
-        metadata: EventMetadata {
-            event_id: sim_uuid(), causation_id: sim_uuid(), correlation_id: sim_uuid(),
-            timestamp: sim_now(), actor_id: journal.to_owned(),
-        },
-    }]).await.unwrap();
-        store
-    }); // Dropping the runtime cancels the first server's recovery worker.
-    runtime().block_on(async {
-        let (_guard, _clock, _ids) = install_deterministic_context(301);
-        let tenant = TenantId::default();
-        let journal = "__temper_internal:SpawnRefusal:recovery";
-        // The parent commit can succeed while acknowledging the repair fails.
-        store.inject_concurrency_violations(journal, 1000);
-        let restarted = state_with_store(store.clone());
-        wait_until_settled(&store, "job", "absent").await;
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        assert_eq!(
-            refused_runs(&store, "job"),
-            vec!["absent"],
-            "ack retries must not append duplicate parent events"
-        );
-        assert_eq!(
-            restarted
-                .get_tenant_entity_state(&tenant, "Job", "job")
-                .await
-                .unwrap()
-                .state
-                .fields["last_run_id"],
-            serde_json::Value::Null
-        );
-    }); // Simulate another crash after parent commit but before acknowledgement.
-    runtime().block_on(async {
-        let (_guard, _clock, _ids) = install_deterministic_context(303);
-        let parent = "default:Job:job";
-        let history = store.dump_journal(parent);
-        let last = history.last().unwrap();
-        // Model subsequent committed parent activity while completion remains
-        // unavailable. Replaying these keyed writes must evict the repair key
-        // from the 1,000-entry cache before the recovery worker retries it.
-        let events: Vec<_> = (1..=1000)
-            .map(|offset| PersistenceEnvelope {
-                sequence_nr: last.sequence_nr + offset,
-                event_type: "FieldsUpdated".to_owned(),
-                payload: serde_json::json!({
-                    "action": "FieldsUpdated", "from_status": "Active", "to_status": "Active",
-                    "timestamp": sim_now(), "params": {},
-                    "idempotency_key": format!("later-{offset}")
-                }),
-                metadata: EventMetadata {
-                    event_id: sim_uuid(),
-                    causation_id: sim_uuid(),
-                    correlation_id: sim_uuid(),
-                    timestamp: sim_now(),
-                    actor_id: parent.to_owned(),
-                },
-            })
-            .collect();
-        store
-            .append(parent, last.sequence_nr, &events)
-            .await
-            .unwrap();
-    });
-    runtime().block_on(async {
-        let (_guard, _clock, _ids) = install_deterministic_context(302);
-        let journal = "__temper_internal:SpawnRefusal:recovery";
-        store.inject_concurrency_violations(journal, 0);
-        let restarted = state_with_store(store.clone());
-        for _ in 0..SETTLE_POLLS {
-            if store
-                .dump_journal(journal)
-                .iter()
-                .any(|e| e.event_type == "Completed")
-            {
-                assert_eq!(
-                    refused_runs(&store, "job"),
-                    vec!["absent"],
-                    "replay must retain repair idempotency"
-                );
-                let parent = restarted
-                    .get_tenant_entity_state(&TenantId::default(), "Job", "job")
-                    .await
-                    .unwrap()
-                    .state;
-                assert_eq!(parent.fields["last_run_id"], serde_json::Value::Null);
-                assert!(
-                    !parent.has_processed_idempotency_key("repair-restart"),
-                    "the regression must exercise recovery after cache eviction"
-                );
-                return;
-            }
-            tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
-        }
-        panic!("recovered repair was never acknowledged");
-    });
 }

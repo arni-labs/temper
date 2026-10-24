@@ -312,7 +312,8 @@ impl crate::state::ServerState {
     /// A spawn whose child was not created. The refusal goes to the parent's
     /// observe stream, as before, and into its journal as `SpawnRefused`,
     /// which clears the field the transition stored the child's id in. The
-    /// field keeps the id only if the child exists anyway.
+    /// field keeps the id if the child exists anyway or could not be looked
+    /// up.
     async fn refuse_spawn(
         &self,
         tenant: &TenantId,
@@ -331,8 +332,51 @@ impl crate::state::ServerState {
             action,
             error,
         );
-        self.recover_spawn_refusal(tenant, parent_type, parent_id, request, error)
-            .await;
+        use crate::entity_actor::spawn_refusal::{ChildLookup, SpawnRefusal};
+        let child = match self
+            .entity_exists_durably(tenant, &request.entity_type, &request.entity_id)
+            .await
+        {
+            Ok(true) => ChildLookup::Exists,
+            Ok(false) => ChildLookup::Absent,
+            Err(lookup_error) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    parent_type,
+                    parent_id,
+                    child_type = %request.entity_type,
+                    child_id = %request.entity_id,
+                    lookup_error = %lookup_error,
+                    "refused child could not be looked up; the parent keeps its id"
+                );
+                ChildLookup::Unreadable
+            }
+        };
+        let refusal = SpawnRefusal {
+            child_type: request.entity_type.clone(),
+            child_id: request.entity_id.clone(),
+            field: request.store_id_in.clone(),
+            child,
+            error: error.to_owned(),
+        };
+        // Logged once, not retried: the parent was deleted, its event budget
+        // is spent or the store is down, and the observe event above already
+        // holds the refusal.
+        if let Err(record_error) = self
+            .record_spawn_refusal(tenant, parent_type, parent_id, refusal)
+            .await
+        {
+            tracing::error!(
+                tenant = %tenant,
+                parent_type,
+                parent_id,
+                child_type = %request.entity_type,
+                child_id = %request.entity_id,
+                error,
+                record_error = %record_error,
+                "spawn refusal could not be recorded on the parent"
+            );
+        }
     }
 }
 

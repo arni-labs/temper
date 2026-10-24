@@ -708,7 +708,6 @@ impl ServerState {
             }
         }
         self.storage_stack = Some(stack);
-        self.start_spawn_refusal_recovery();
     }
 
     /// Return the durable query-plane capability for projection reads/writes.
