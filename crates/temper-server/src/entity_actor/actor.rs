@@ -1828,6 +1828,7 @@ impl Actor for EntityActor {
                 let outcome = super::spawn_refusal::commit(self, state, &refusal).await;
                 ctx.reply(EntityResponse {
                     success: outcome.is_ok(),
+                    refusal: None,
                     state: state.clone(),
                     error: outcome.err(),
                     custom_effects: vec![],
