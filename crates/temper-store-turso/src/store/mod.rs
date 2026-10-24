@@ -18,6 +18,21 @@ use tracing::instrument;
 
 use crate::schema;
 
+/// SQL form of `PersistenceEnvelope::is_tombstone` over the events row `d`:
+/// the kernel's tombstone, never a spec action that shares its name. The
+/// `idx_events_deleted` partial index still serves the probe. Declared before
+/// the submodules so their queries can use it.
+macro_rules! tombstone_sql {
+    () => {
+        "d.event_type = 'Deleted' \
+            AND (json_extract(d.payload, '$.kind') = 'tombstone' \
+              OR (json_type(d.payload, '$.kind') IS NULL \
+                AND json_extract(d.payload, '$.to_status') = 'Deleted' \
+                AND json_extract(d.payload, '$.params') = '{}' \
+                AND json_extract(d.payload, '$.idempotency_key') IS NULL))"
+    };
+}
+
 mod append_config;
 mod authz;
 mod blobs;

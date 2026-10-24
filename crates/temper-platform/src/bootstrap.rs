@@ -769,12 +769,98 @@ async fn operator_credential_is_current(
         && field("expires_at").is_none_or(str::is_empty)
 }
 
+/// Revoke every Active or Rotated operator credential an earlier boot issued
+/// (`agent_instance_id` "operator", `created_by` "bootstrap") for a key other
+/// than `api_key`. Each boot issues one for the key it was given and keeps the
+/// ones before, so a Temper whose key changed keeps every old key's operator
+/// authority. Only a deployment that is the sole holder of its key asks for
+/// this (`TEMPER_RETIRE_OLD_OPERATOR_KEYS`): another holder of an older key
+/// would lose it. Credentials issued through the API are left alone. Answers
+/// how many it revoked; one it cannot read or revoke is logged and left for
+/// the next boot.
+pub async fn retire_other_operator_credentials(
+    state: &PlatformState,
+    api_key: &str,
+    tenant: &str,
+) -> usize {
+    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let agent_ctx = temper_server::request_context::AgentContext::for_service("platform-bootstrap");
+    let current = temper_server::identity::hash_token(api_key);
+    let (tenant_id, agent_ctx, current) = (&tenant_id, &agent_ctx, current.as_str());
+    let mut retired = 0;
+    for id in state
+        .server
+        .list_entity_ids_lazy(tenant_id, "AgentCredential")
+        .await
+    {
+        if id == current {
+            continue;
+        }
+        if !state
+            .server
+            .ensure_entity_loaded(tenant_id, "AgentCredential", &id)
+            .await
+        {
+            continue;
+        }
+        let credential = match state
+            .server
+            .get_tenant_entity_state(tenant_id, "AgentCredential", &id)
+            .await
+        {
+            Ok(credential) => credential.state,
+            Err(e) => {
+                tracing::warn!("Could not read AgentCredential {id} to retire it: {e}");
+                continue;
+            }
+        };
+        let field = |name: &str| {
+            credential
+                .fields
+                .get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let earlier_boot =
+            field("agent_instance_id") == "operator" && field("created_by") == "bootstrap";
+        if !earlier_boot || !matches!(credential.status.as_str(), "Active" | "Rotated") {
+            continue;
+        }
+        match state
+            .server
+            .dispatch_tenant_action(
+                tenant_id,
+                "AgentCredential",
+                &id,
+                "Revoke",
+                serde_json::json!({}),
+                agent_ctx,
+            )
+            .await
+        {
+            Ok(response) if response.success => retired += 1,
+            Ok(response) => tracing::warn!(
+                "Could not revoke earlier operator credential {id}: {:?}",
+                response.error
+            ),
+            Err(e) => tracing::warn!("Could not revoke earlier operator credential {id}: {e}"),
+        }
+    }
+    tracing::info!(
+        "Retired {retired} operator credential(s) of keys tenant '{tenant}' no longer holds"
+    );
+    retired
+}
+
 /// Outcome of [`bootstrap_trusted_issuer_from_env`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssuerBootstrapOutcome {
     /// No issuer env vars were set — nothing to register (safe no-op).
     Skipped,
-    /// The trusted issuer was registered from the environment.
+    /// The tenant has the trusted issuer: registered or updated from the
+    /// environment, or kept as stored because the record holds its own keys
+    /// (`keys_rotated`) or is no longer Active.
     Registered,
 }
 
@@ -823,10 +909,12 @@ fn resolve_issuer_env_config(
 ///
 /// Returns:
 /// - `Ok(Skipped)` when none of the three env vars are set (safe no-op).
-/// - `Ok(Registered)` when the issuer was registered (idempotent: re-registering
-///   an existing issuer is a self-loop on `Active`).
+/// - `Ok(Registered)` when the tenant has the issuer. The environment registers
+///   it when absent and keeps applying its keys and audience to it at each
+///   start until `RotateIssuerKeys` runs on it (`keys_rotated`); from then on,
+///   and for a Suspended or Revoked issuer, the stored record is left as it is.
 /// - `Err(_)` when the config is *partial* (some but not all three vars set) or
-///   registration fails. A partial config is a misconfiguration, not a no-op —
+///   the stored issuer cannot be read or registration fails. A partial config is a misconfiguration, not a no-op —
 ///   registering half a trusted-issuer config would leave JWT verification
 ///   quietly inert — so the caller can fail readiness rather than log a
 ///   misleading success.
@@ -851,19 +939,58 @@ pub async fn bootstrap_trusted_issuer_from_env(
         None => return Ok(IssuerBootstrapOutcome::Skipped),
     };
 
+    let algorithms =
+        std::env::var("TEMPER_TRUSTED_ISSUER_ALGS").unwrap_or_else(|_| "ES256".to_string());
+    apply_environment_issuer(state, tenant, &issuer, &jwks_json, &audience, &algorithms).await
+}
+
+/// Register `issuer` with the environment's keys, or apply them to the stored
+/// issuer while it still takes its keys from the environment (see
+/// [`bootstrap_trusted_issuer_from_env`]).
+async fn apply_environment_issuer(
+    state: &PlatformState,
+    tenant: &str,
+    issuer: &str,
+    jwks_json: &str,
+    audience: &str,
+    algorithms: &str,
+) -> Result<IssuerBootstrapOutcome, String> {
     let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
     // Registering a trusted issuer is System-only (system-platform Cedar policy);
     // the platform seeding itself acts as System.
     let agent_ctx = temper_server::request_context::AgentContext::system();
-    let algorithms =
-        std::env::var("TEMPER_TRUSTED_ISSUER_ALGS").unwrap_or_else(|_| "ES256".to_string());
+
+    if let Some(stored) = stored_trusted_issuer(state, &tenant_id, issuer).await? {
+        let keys_rotated = stored
+            .booleans
+            .get("keys_rotated")
+            .copied()
+            .unwrap_or(false);
+        if keys_rotated || stored.status != "Active" {
+            let field = |name: &str| stored.fields.get(name).and_then(serde_json::Value::as_str);
+            if field("jwks_json") != Some(jwks_json) || field("audience") != Some(audience) {
+                tracing::warn!(
+                    tenant,
+                    issuer = %issuer,
+                    status = %stored.status,
+                    keys_rotated,
+                    "TEMPER_TRUSTED_ISSUER_* differs from the stored issuer, which no longer takes its keys from the environment; keeping the stored issuer"
+                );
+            }
+            tracing::info!(
+                "Trusted issuer '{issuer}' for tenant '{tenant}' kept as stored ({}, keys_rotated={keys_rotated})",
+                stored.status
+            );
+            return Ok(IssuerBootstrapOutcome::Registered);
+        }
+    }
 
     state
         .server
         .dispatch_tenant_action(
             &tenant_id,
             "TrustedIssuer",
-            &issuer,
+            issuer,
             "RegisterIssuer",
             serde_json::json!({
                 "issuer": issuer,
@@ -883,6 +1010,45 @@ pub async fn bootstrap_trusted_issuer_from_env(
     tracing::info!("Trusted issuer '{issuer}' registered for tenant '{tenant}' from environment");
     Ok(IssuerBootstrapOutcome::Registered)
 }
+
+/// The tenant's stored issuer `issuer`, if it has one. Bootstrap runs before
+/// this server has loaded any issuer, so the store decides. A store that
+/// cannot be read is an error, not an absent issuer: registering over an
+/// issuer that could not be read would replace keys it holds itself.
+async fn stored_trusted_issuer(
+    state: &PlatformState,
+    tenant_id: &temper_runtime::tenant::TenantId,
+    issuer: &str,
+) -> Result<Option<temper_server::entity_actor::EntityState>, String> {
+    let present = if state
+        .server
+        .entity_exists(tenant_id, "TrustedIssuer", issuer)
+    {
+        state
+            .server
+            .ensure_entity_loaded(tenant_id, "TrustedIssuer", issuer)
+            .await
+    } else {
+        state
+            .server
+            .load_entity_from_store(tenant_id, "TrustedIssuer", issuer)
+            .await
+            .map_err(|e| format!("cannot read trusted issuer '{issuer}': {e}"))?
+    };
+    if !present {
+        return Ok(None);
+    }
+    state
+        .server
+        .get_tenant_entity_state(tenant_id, "TrustedIssuer", issuer)
+        .await
+        .map(|response| Some(response.state))
+        .map_err(|e| format!("cannot read trusted issuer '{issuer}': {e}"))
+}
+
+#[cfg(test)]
+#[path = "bootstrap/issuer_tests.rs"]
+mod issuer_tests;
 
 #[cfg(test)]
 mod tests {
