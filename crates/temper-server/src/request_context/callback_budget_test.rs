@@ -147,11 +147,15 @@ fn immediate_scheduled_follow_ons_keep_the_parent_lineage_and_clocked_ones_start
     let context = AgentContext {
         callback_depth: 8,
         callback_hops: MAX_CALLBACK_HOPS - 1,
+        idempotency_key: Some("press-once".into()),
         ..AgentContext::for_service("invoker")
     };
     let immediate = context.for_scheduled_follow_on(0);
     assert_eq!(immediate.callback_depth, context.callback_depth);
     assert_eq!(immediate.callback_hops, context.callback_hops);
+    // The parent's key is the scheduling transition's; reusing it would
+    // answer the follow-on with that transition's reply.
+    assert_eq!(immediate.idempotency_key, None);
 
     let clocked = immediate.for_scheduled_follow_on(1);
     assert_eq!(clocked.callback_depth, 0);

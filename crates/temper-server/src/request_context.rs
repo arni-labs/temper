@@ -127,9 +127,17 @@ impl AgentContext {
     /// wait is what bounds a periodic schedule, so it starts a fresh callback
     /// lineage and a recurring schedule keeps running however many cycles it
     /// has completed. A follow-on with no delay, including a `schedule_at`
-    /// whose time has already passed, keeps the parent's context unchanged.
+    /// whose time has already passed, keeps the parent's callback lineage.
+    ///
+    /// Either way the follow-on is a new action and does not carry the
+    /// parent's idempotency key: the record has already recorded that key for
+    /// the scheduling transition, so the follow-on would be answered with that
+    /// transition's reply and never run (state timers drop it the same way).
+    /// A retried parent is kept from starting a second copy by the follow-on's
+    /// own name (`state::follow_ons`).
     pub(crate) fn for_scheduled_follow_on(&self, delay_seconds: u64) -> Self {
         let mut next = self.clone();
+        next.idempotency_key = None;
         if delay_seconds > 0 {
             next.callback_depth = 0;
             next.callback_hops = 0;
