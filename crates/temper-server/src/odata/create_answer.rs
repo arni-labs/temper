@@ -5,8 +5,11 @@
 //! decision on that entity decides the answer: the same decision a GET of the
 //! key makes, on the entity's stored attributes. A caller who may read it gets
 //! the existing entity, so a retried create converges on the same answer; any
-//! other caller gets `409 Conflict` with no entity body. A create that makes a
-//! new entity answers with it as before: it holds what the caller sent.
+//! other caller gets `409 Conflict` with no entity body. A key that names a
+//! deleted entity stays taken, because deletion is terminal: every caller gets
+//! `409 Conflict` with no body, and the deleted record is not revived. A create
+//! that makes a new entity answers with it as before: it holds what the caller
+//! sent.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -38,7 +41,8 @@ pub(super) struct CreateTarget<'a> {
 
 /// The answer to a create whose key another entity holds, including one a
 /// concurrent create took after this create's own check: the entity when the
-/// caller may read it, `409 Conflict` otherwise.
+/// caller may read it, `409 Conflict` otherwise. A deleted entity is never
+/// answered with.
 ///
 /// The entity's query projection is written again first. A create stores the
 /// entity before its projection, so a create that failed between the two
@@ -65,6 +69,11 @@ pub(super) async fn taken_key_answer(
         .map_err(|error| {
             odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &error).into_response()
         })?;
+    // Reading the key started an actor on the deleted entity's journal.
+    if existing.state.status == "Deleted" {
+        state.stop_and_remove_entity(target.tenant, target.entity_type, target.entity_id);
+        return Err(existing_key_conflict());
+    }
     let body = serde_json::to_value(&existing.state).unwrap_or_default();
     if !may_read(state, target, &body) {
         return Err(existing_key_conflict());

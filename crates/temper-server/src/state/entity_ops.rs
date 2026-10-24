@@ -1335,13 +1335,17 @@ impl ServerState {
             initial_fields,
         )?;
         self.finish_tenant_entity_create(tenant, entity_type, entity_id, &actor_ref)
-            .await
+            .await?
+            .ok_or_else(|| {
+                format!("{entity_type} '{entity_id}' was deleted; its id cannot be created again")
+            })
     }
 
     /// Create a new entity with initial fields, only when this call starts it.
     ///
-    /// `Ok(None)`: the key's actor was already live, so another create holds
-    /// the key; nothing was written and no create effect ran.
+    /// `Ok(None)`: the key is taken, so nothing was written and no create
+    /// effect ran. Either the key's actor was already live, because another
+    /// create holds the key, or the key names a deleted entity.
     #[instrument(skip_all, fields(otel.name = "entity.create_new_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn create_new_tenant_entity(
         &self,
@@ -1363,18 +1367,21 @@ impl ServerState {
         }
         self.finish_tenant_entity_create(tenant, entity_type, entity_id, &actor_ref)
             .await
-            .map(Some)
     }
 
     /// Read a created entity's state, announce the create and write its
     /// query projection.
+    ///
+    /// `Ok(None)`: the actor replayed a deleted entity's journal. Deletion is
+    /// terminal, so that is no create: the actor is stopped, nothing is
+    /// announced or written, and the id stays deleted.
     async fn finish_tenant_entity_create(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         actor_ref: &ActorRef<EntityMsg>,
-    ) -> Result<EntityResponse, String> {
+    ) -> Result<Option<EntityResponse>, String> {
         let policy = self.dispatch_retry_policy();
         let response = retry::ask_with_backoff::<_, EntityResponse, _>(
             actor_ref,
@@ -1384,6 +1391,10 @@ impl ServerState {
         .await
         .result
         .map_err(|e| format!("Actor query failed: {e}"))?;
+        if response.state.status == "Deleted" {
+            self.stop_and_remove_entity(tenant, entity_type, entity_id);
+            return Ok(None);
+        }
 
         // Broadcast entity creation event for SSE subscribers
         let seq = self.next_entity_event_sequence(tenant.as_str(), entity_type, entity_id);
@@ -1411,7 +1422,7 @@ impl ServerState {
 
         self.upsert_entity_query_projection(tenant, entity_type, entity_id, &response, "create")
             .await?;
-        Ok(response)
+        Ok(Some(response))
     }
 
     /// Write an entity's state, as its actor answered earlier, to the query

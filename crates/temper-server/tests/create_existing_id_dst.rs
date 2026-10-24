@@ -41,6 +41,11 @@ const RACE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 4, 5, 7, 8, 10];
 /// these are the first eight).
 const DELETE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
 
+/// Seeds whose schedule revived a deleted order on a create of its key,
+/// before such a create answered 409 (all of seeds 0..64 did; these are the
+/// first eight).
+const DELETED_KEY_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
+
 /// Seeds explored on every run besides the regression cases.
 const EXPLORED_SEEDS: u64 = 64;
 
@@ -244,6 +249,64 @@ async fn repeated_create_racing_delete(seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// An order is created and deleted, then its owner and another caller create
+/// its key at once. Deletion is terminal: both get 409 with no body, neither
+/// sees the deleted order's fields, and the order stays out of reads, the
+/// entity index and the query projection. `Err` names the broken invariant.
+async fn creates_of_a_deleted_key(seed: u64) -> Result<(), String> {
+    let _sim = install_deterministic_context(seed);
+    let (state, projection) = order_state(seed, &format!("create-deleted-{seed}"));
+    let tenant = TenantId::default();
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/tdata/Orders",
+        "alice",
+        Some(order("alice")),
+    )
+    .await;
+    if status != StatusCode::CREATED {
+        return Err(format!("the first create got {status} {body}"));
+    }
+    match state
+        .delete_tenant_entity(&tenant, "Order", "raced-key")
+        .await
+    {
+        Ok(response) if response.success => {}
+        other => return Err(format!("the delete failed: {other:?}")),
+    }
+
+    let _faults = install_buggify_context(seed);
+    let (alice, bob) = tokio::join!(
+        send(
+            &state,
+            "POST",
+            "/tdata/Orders",
+            "alice",
+            Some(order("alice"))
+        ),
+        send(&state, "POST", "/tdata/Orders", "bob", Some(order("bob"))),
+    );
+    for (who, (status, body)) in [("alice", alice), ("bob", bob)] {
+        if status != StatusCode::CONFLICT || body.contains("private words") {
+            return Err(format!(
+                "{who}'s create of the deleted key got {status} {body}"
+            ));
+        }
+    }
+    let (status, body) = send(&state, "GET", "/tdata/Orders('raced-key')", "alice", None).await;
+    if status != StatusCode::NOT_FOUND {
+        return Err(format!("a read of the deleted order got {status} {body}"));
+    }
+    if projection.holds("Order", "raced-key") {
+        return Err("the deleted order is back in the query projection".to_string());
+    }
+    if state.entity_exists(&tenant, "Order", "raced-key") {
+        return Err("the deleted order is back in the entity index".to_string());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn racing_creates_of_one_key_answer_each_caller_only_with_its_own_record() {
     for seed in seeds(RACE_REGRESSION_SEEDS) {
@@ -257,6 +320,15 @@ async fn racing_creates_of_one_key_answer_each_caller_only_with_its_own_record()
 async fn a_repeated_create_racing_a_delete_leaves_the_deleted_record_out_of_queries() {
     for seed in seeds(DELETE_REGRESSION_SEEDS) {
         if let Err(violation) = repeated_create_racing_delete(seed).await {
+            panic!("seed {seed}: {violation}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn creates_of_a_deleted_key_answer_409_and_leave_it_deleted() {
+    for seed in seeds(DELETED_KEY_REGRESSION_SEEDS) {
+        if let Err(violation) = creates_of_a_deleted_key(seed).await {
             panic!("seed {seed}: {violation}");
         }
     }

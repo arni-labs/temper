@@ -238,3 +238,37 @@ async fn a_repeated_create_writes_back_a_missing_query_projection() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(owner_query().await.unwrap(), vec!["listed-key".to_string()]);
 }
+
+/// A deleted note's key stays taken: its owner and anyone else get 409 with
+/// no body, and the note stays out of reads and collection queries.
+#[tokio::test]
+async fn a_data_only_create_of_a_deleted_key_answers_409_and_leaves_it_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = note_state(&dir, "create-existing-key-deleted").await;
+    let note = |owner: &str| json!({"Id": "gone-key", "Owner": owner, "Body": "old words"});
+    let (status, body) = send(&state, "POST", "/tdata/Notes", "alice", Some(note("alice"))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let deleted = state
+        .delete_tenant_entity(&TenantId::default(), "Note", "gone-key")
+        .await
+        .unwrap();
+    assert!(deleted.success, "{:?}", deleted.error);
+
+    for who in ["alice", "bob"] {
+        let (status, body) = send(&state, "POST", "/tdata/Notes", who, Some(note(who))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{who}: {body}");
+        assert!(!body.contains("old words"), "{who}: {body}");
+    }
+    let (status, body) = send(&state, "GET", "/tdata/Notes('gone-key')", "alice", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let listed = store
+        .query_field_index(
+            "default",
+            "Note",
+            "field_name = ?3 AND field_value = ?4",
+            vec!["Owner".to_string(), "alice".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+}
