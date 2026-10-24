@@ -168,6 +168,7 @@ fn entity_response_spec_governed_skipped_when_true() {
     };
     let resp = EntityResponse {
         success: true,
+        refusal: None,
         state,
         error: None,
         custom_effects: vec![],

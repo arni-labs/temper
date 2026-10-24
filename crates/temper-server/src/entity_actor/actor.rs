@@ -125,6 +125,7 @@ fn idempotency_key_reused(state: &EntityState, recorded: &str) -> EntityResponse
             "this Idempotency-Key was already used on this entity for a different request \
              (action `{recorded}`); send a new key for a new request"
         )),
+        refusal: None,
         custom_effects: vec![],
         scheduled_actions: vec![],
         spawn_requests: vec![],
@@ -1118,6 +1119,7 @@ impl Actor for EntityActor {
                 {
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some(format!(
                             "action name `{name}` is reserved for journaled field updates"
@@ -1201,6 +1203,7 @@ impl Actor for EntityActor {
                     }
                     ctx.reply(EntityResponse {
                         success: true,
+                        refusal: None,
                         state: response_state,
                         error: None,
                         custom_effects,
@@ -1216,6 +1219,7 @@ impl Actor for EntityActor {
                 {
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some(
                             "action authorization became stale; retry against current state"
@@ -1235,6 +1239,7 @@ impl Actor for EntityActor {
                 if state.status == "Deleted" {
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some("cannot execute actions after entity deletion".to_string()),
                         custom_effects: vec![],
@@ -1275,6 +1280,7 @@ impl Actor for EntityActor {
                     );
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some(format!(
                             "Event budget exhausted ({MAX_EVENTS_SINCE_SNAPSHOT} max since snapshot)"
@@ -1341,6 +1347,7 @@ impl Actor for EntityActor {
                         *state = state_before;
                         ctx.reply(EntityResponse {
                             success: false,
+                            refusal: None,
                             state: state.clone(),
                             error: Some(persistence_failure(&e)),
                             custom_effects: vec![],
@@ -1361,6 +1368,7 @@ impl Actor for EntityActor {
                         *state = state_before;
                         ctx.reply(EntityResponse {
                             success: false,
+                            refusal: None,
                             state: state.clone(),
                             error: Some(format!("field-overflow blob persistence failed: {e}")),
                             custom_effects: vec![],
@@ -1421,6 +1429,8 @@ impl Actor for EntityActor {
                                     crate::runtime_metrics::ConcurrencyRetryOutcome,
                                     Option<String>,
                                 )> = None;
+                                // The typed reason when the replayed action is refused.
+                                let mut retry_refusal = None;
                                 // ADR-0046 Sub-Decision 4: track the most
                                 // recent authoritative sequence across retries
                                 // so the post-replay assertion catches a
@@ -1486,6 +1496,7 @@ impl Actor for EntityActor {
                                     .await;
 
                                     if !retry_result.success {
+                                        retry_refusal = retry_result.refusal;
                                         retry_final = Some((
                                             crate::runtime_metrics::ConcurrencyRetryOutcome::ActionIllegal,
                                             Some(retry_result.error.unwrap_or_else(|| {
@@ -1614,6 +1625,7 @@ impl Actor for EntityActor {
                                         *state = state_before;
                                         ctx.reply(EntityResponse {
                                             success: false,
+                                            refusal: retry_refusal,
                                             state: state.clone(),
                                             error: Some(msg),
                                             custom_effects: vec![],
@@ -1631,6 +1643,7 @@ impl Actor for EntityActor {
                                 *state = state_before;
                                 ctx.reply(EntityResponse {
                                     success: false,
+                                    refusal: None,
                                     state: state.clone(),
                                     error: Some(persistence_failure(&e)),
                                     custom_effects: vec![],
@@ -1723,6 +1736,7 @@ impl Actor for EntityActor {
 
                     let response = EntityResponse {
                         success: true,
+                        refusal: None,
                         state: state.clone(),
                         error: None,
                         custom_effects: result.custom_effects,
@@ -1766,6 +1780,7 @@ impl Actor for EntityActor {
 
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: result.refusal,
                         state: state.clone(),
                         error: result.error,
                         custom_effects: vec![],
@@ -1787,6 +1802,7 @@ impl Actor for EntityActor {
             EntityMsg::GetState => {
                 ctx.reply(EntityResponse {
                     success: true,
+                    refusal: None,
                     state: state.clone(),
                     error: None,
                     custom_effects: vec![],
@@ -1821,6 +1837,7 @@ impl Actor for EntityActor {
                 .await;
                 ctx.reply(EntityResponse {
                     success: outcome.is_ok(),
+                    refusal: None,
                     state: state.clone(),
                     error: outcome.err(),
                     custom_effects: vec![],
@@ -1841,6 +1858,7 @@ impl Actor for EntityActor {
                 {
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some(
                             "Strict entities require a declared action for deletion".to_owned(),
@@ -1857,6 +1875,7 @@ impl Actor for EntityActor {
                 {
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some(
                             "delete authorization became stale; retry against current state"
@@ -1887,6 +1906,7 @@ impl Actor for EntityActor {
                 {
                     ctx.reply(EntityResponse {
                         success: false,
+                        refusal: None,
                         state: state.clone(),
                         error: Some(format!("persistence failed: {e}")),
                         custom_effects: vec![],
@@ -1908,6 +1928,7 @@ impl Actor for EntityActor {
 
                 ctx.reply(EntityResponse {
                     success: true,
+                    refusal: None,
                     state: state.clone(),
                     error: None,
                     custom_effects: vec![],

@@ -305,6 +305,9 @@ pub struct EntityResponse {
     pub state: EntityState,
     /// Error message if the action failed.
     pub error: Option<String>,
+    /// Why the action was refused, as typed data beside `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<temper_jit::table::Refusal>,
     /// Custom effects emitted during this transition (for hook dispatch).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_effects: Vec<String>,

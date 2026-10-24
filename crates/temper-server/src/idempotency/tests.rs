@@ -21,6 +21,7 @@ fn hit(cache: &IdempotencyCache, actor_key: &str, idem_key: &str) -> Option<Enti
 fn make_response(status: &str) -> EntityResponse {
     EntityResponse {
         success: true,
+        refusal: None,
         state: EntityState {
             entity_type: String::new(),
             entity_id: String::new(),
