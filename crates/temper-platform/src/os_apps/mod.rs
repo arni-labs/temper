@@ -1412,9 +1412,8 @@ pub(super) async fn install_os_app_with_plan(
         state.server.rebuild_reaction_dispatcher();
     }
 
-    // Refresh cross-entity reactions immediately after installing specs.
-    // Replay can move records to other states; reconcile their timers too,
-    // without requiring a restart or a separate specs reload.
+    // Refresh cross-entity reactions after installing specs, and reconcile the
+    // timers of records that replay into other states, with no restart.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
         state.server.spawn_follow_spec_changes();
