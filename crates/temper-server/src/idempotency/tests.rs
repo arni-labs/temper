@@ -59,6 +59,7 @@ fn busy_response(field_bytes: usize) -> EntityResponse {
             timestamp: sim_now(),
             params: serde_json::json!({ "queue": "q".repeat(field_bytes) }),
             idempotency_key: Some(format!("dispatch:{index}")),
+            kind: temper_runtime::persistence::EventKind::Transition,
         });
         response.state.processed_idempotency_keys.insert(
             format!("dispatch:{index}"),
@@ -394,6 +395,7 @@ fn keyed_events(state: &mut EntityState, keys: &[&str]) {
             timestamp: sim_now(),
             params: serde_json::Value::Null,
             idempotency_key: Some((*key).to_string()),
+            kind: temper_runtime::persistence::EventKind::Transition,
         });
         state.total_event_count += 1;
     }

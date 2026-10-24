@@ -704,8 +704,9 @@ impl crate::state::ServerState {
 
         // Credential issuance is a separate authority from permission to run
         // the source entity action. Re-evaluate the exact invoking principal
-        // against the credential resource so a low-privilege action cannot use
-        // the platform as a deputy to mint a more privileged AgentType token.
+        // for Delegate on an authorization-only resource. Permission to write
+        // identity records stays platform-only; a low-privilege action cannot
+        // use the platform as a deputy to mint a more privileged AgentType token.
         let security_ctx = agent_ctx.security_ctx.as_ref().ok_or_else(|| {
             "adapter credential mint requires an explicit security context".to_string()
         })?;
@@ -729,8 +730,8 @@ impl crate::state::ServerState {
         ]);
         self.authorize_with_context(
             security_ctx,
-            "Issue",
-            "AgentCredential",
+            "Delegate",
+            "AdapterCredentialDelegation",
             &credential_attrs,
             tenant.as_str(),
         )

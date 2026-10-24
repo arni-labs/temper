@@ -126,9 +126,7 @@ fn build_test_state() -> ServerState {
         ("STRIPE_WEBHOOK_SECRET", STRIPE_SECRET),
         ("GITHUB_WEBHOOK_SECRET", GITHUB_SECRET),
     ] {
-        vault
-            .cache_secret("test-tenant", key, value.to_string())
-            .expect("cache webhook secret");
+        vault.cache_secret("test-tenant", key, value.to_string());
     }
     state = state.with_secrets_vault(vault);
     state

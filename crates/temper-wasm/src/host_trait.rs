@@ -23,11 +23,13 @@ use temper_observe::wide_event::{self, EventKind, WideEvent};
 mod guest_progress;
 mod http_clients;
 mod internal_http;
+mod local_sandbox;
 mod redirects;
 pub(crate) mod span_hints;
 
 pub use http_clients::HttpClientCache;
 pub use internal_http::{InternalHttpCapability, InternalHttpCapabilityIssuerFn};
+pub use local_sandbox::LocalSandboxAccess;
 
 /// Re-exported so every channel that records guest-supplied `gen_ai.*` metadata
 /// bounds it the same way, including the dispatch callback path in
@@ -332,20 +334,6 @@ pub type BinaryHttpInterceptorFn = Arc<
         + Sync,
 >;
 
-/// Optional callback that can short-circuit text HTTP requests.
-///
-/// This lets the server handle specific local transport paths directly
-/// (for example, internal OData `$value` reads/writes) without going back
-/// through loopback HTTP when the guest expects a UTF-8 body.
-pub type TextHttpInterceptorFn = Arc<
-    dyn Fn(String, String, Vec<(String, String)>, String) -> TextHttpInterceptorFuture
-        + Send
-        + Sync,
->;
-
-type TextHttpInterceptorFuture =
-    Pin<Box<dyn Future<Output = Option<Result<(u16, String), String>>> + Send>>;
-
 /// Production host: real HTTP calls via reqwest, real secrets.
 pub struct ProductionWasmHost {
     /// HTTP client for making real requests. It follows no redirects; the host
@@ -367,6 +355,8 @@ pub struct ProductionWasmHost {
     internal_api_base_url: Option<String>,
     /// Trusted callback that issues one request-bound internal capability.
     internal_capability_issuer: Option<InternalHttpCapabilityIssuerFn>,
+    /// The server's local sandbox, whose requests carry its token.
+    local_sandbox: Option<LocalSandboxAccess>,
     /// Optional spec evaluator (provided by temper-server at construction).
     spec_evaluator: Option<SpecEvaluatorFn>,
     /// Optional progress emitter (provided by temper-server at construction).
@@ -375,8 +365,6 @@ pub struct ProductionWasmHost {
     trace_id: Option<String>,
     /// Optional short-circuit for binary HTTP calls.
     binary_http_interceptor: Option<BinaryHttpInterceptorFn>,
-    /// Optional short-circuit for text HTTP calls.
-    text_http_interceptor: Option<TextHttpInterceptorFn>,
     /// Invocation context for auto-enriching guest telemetry.
     invocation_context: Option<WasmInvocationContext>,
     /// Whether this invocation's tenant may export raw LLM content (prompts,
@@ -615,11 +603,11 @@ impl ProductionWasmHost {
             secret_resolver: None,
             internal_api_base_url: None,
             internal_capability_issuer: None,
+            local_sandbox: None,
             spec_evaluator: None,
             progress_emitter: None,
             trace_id: None,
             binary_http_interceptor: None,
-            text_http_interceptor: None,
             invocation_context: None,
             export_llm_content: false,
             http_streams: Arc::new(crate::http_stream::HttpStreamRegistry::new()),
@@ -686,18 +674,23 @@ impl ProductionWasmHost {
         self
     }
 
-    /// Create with a text HTTP interceptor for local fast paths.
-    pub fn with_text_http_interceptor(mut self, interceptor: TextHttpInterceptorFn) -> Self {
-        self.text_http_interceptor = Some(interceptor);
-        self
-    }
-
     fn is_internal_temper_url(&self, url: &str) -> bool {
         // Only the server-owned configuration can classify a target as
         // internal. A tenant secret or guest integration value must never
         // redirect a request-bound capability to an attacker-controlled host.
         let configured = self.internal_api_base_url.iter().map(String::as_str);
         internal_http::is_internal_url(url, configured)
+    }
+
+    /// The connection pool for `url`. Internal Temper calls and requests to
+    /// the local sandbox carry a credential only this server holds, so they
+    /// use the pool that never goes through a configured HTTP proxy.
+    fn client_for(&self, url: &str, is_internal: bool) -> &reqwest::Client {
+        if is_internal || self.goes_to_local_sandbox(url) {
+            &self.internal_client
+        } else {
+            &self.client
+        }
     }
 
     fn add_internal_temper_headers(
@@ -707,6 +700,7 @@ impl ProductionWasmHost {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<reqwest::RequestBuilder, String> {
+        builder = self.add_local_sandbox_token(builder, url);
         if !self.is_internal_temper_url(url) {
             return Ok(builder);
         }
@@ -880,17 +874,6 @@ impl WasmHost for ProductionWasmHost {
         // ARN-243: drop LLM content from span hints unless this tenant opted in.
         redact_llm_content_hints(&mut span_hints, self.export_llm_content);
         let (is_internal, outbound_headers) = self.outbound_headers(url, &filtered_headers);
-        if let Some(interceptor) = &self.text_http_interceptor
-            && let Some(result) = interceptor(
-                method.to_string(),
-                url.to_string(),
-                outbound_headers.clone(),
-                body.to_string(),
-            )
-            .await
-        {
-            return result;
-        }
         let span = tracing::info_span!(
             "wasm.host.http_call",
             otel.name = %span_hint_otel_name(&span_hints, "wasm.host.http_call"),
@@ -945,11 +928,7 @@ impl WasmHost for ProductionWasmHost {
         apply_span_hints(&span, &span_hints);
         let _guard = span.enter();
 
-        let client = if is_internal {
-            &self.internal_client
-        } else {
-            &self.client
-        };
+        let client = self.client_for(url, is_internal);
         let mut builder = match method.to_uppercase().as_str() {
             "GET" => client.get(url),
             "POST" => client.post(url),
@@ -1253,11 +1232,7 @@ impl WasmHost for ProductionWasmHost {
             None
         };
 
-        let client = if is_internal {
-            &self.internal_client
-        } else {
-            &self.client
-        };
+        let client = self.client_for(url, is_internal);
         let mut builder = match method.to_uppercase().as_str() {
             "GET" => client.get(url),
             "POST" => client.post(url),
@@ -1364,11 +1339,7 @@ impl WasmHost for ProductionWasmHost {
         apply_span_hints(&span, &span_hints);
         let _guard = span.enter();
 
-        let client = if is_internal {
-            &self.internal_client
-        } else {
-            &self.client
-        };
+        let client = self.client_for(url, is_internal);
         let mut builder = client.post(url);
 
         // Set Connect protocol headers.
@@ -1744,11 +1715,7 @@ impl WasmHost for ProductionWasmHost {
         redact_llm_content_hints(&mut span_hints, self.export_llm_content);
         let (is_internal, outbound_headers) =
             self.outbound_headers(&request.url, &filtered_headers);
-        let client = if is_internal {
-            self.internal_client.clone()
-        } else {
-            self.client.clone()
-        };
+        let client = self.client_for(&request.url, is_internal).clone();
         let span = tracing::info_span!(
             "wasm.host.http_stream",
             otel.name = %span_hint_otel_name(&span_hints, "wasm.host.http_stream"),
