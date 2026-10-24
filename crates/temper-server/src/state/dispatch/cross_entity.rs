@@ -361,7 +361,10 @@ impl crate::state::ServerState {
         };
         // Logged once, not retried: the parent was deleted, its event budget
         // is spent or the store is down, and the observe event above already
-        // holds the refusal.
+        // holds the refusal. This runs after the parent's transition commits,
+        // so a refusal lost to a crash in that window is not replayed after
+        // restart. Durable recovery of post-commit work belongs with durable
+        // scheduled actions (#104), not a second journal here.
         if let Err(record_error) = self
             .record_spawn_refusal(tenant, parent_type, parent_id, refusal)
             .await
