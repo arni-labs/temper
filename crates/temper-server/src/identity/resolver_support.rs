@@ -120,7 +120,6 @@ async fn replay_from_storage(
         backend,
         &serde_json::json!({}),
         blob_store.as_ref(),
-        true,
     )
     .await
     .map_err(|error| format!("identity replay of {entity_type}('{entity_id}') failed: {error}"))?;

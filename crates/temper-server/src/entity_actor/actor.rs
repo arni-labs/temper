@@ -46,7 +46,6 @@ use super::types::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReplayPolicy {
-    LenientSnapshot,
     StrictSnapshot,
     StrictFullJournal,
 }
@@ -54,10 +53,6 @@ pub(super) enum ReplayPolicy {
 impl ReplayPolicy {
     fn loads_snapshot(self) -> bool {
         self != Self::StrictFullJournal
-    }
-
-    fn strict_journal_read(self) -> bool {
-        self != Self::LenientSnapshot
     }
 
     fn strict_event_validation(self) -> bool {
@@ -923,17 +918,15 @@ impl EntityActor {
                     );
                 }
             }
+            // A journal that could not be read is never replaced by the
+            // snapshot or the initial state: either would answer with state
+            // older than the journal. The caller fails and the next message
+            // reads the journal again.
             Err(e) => {
-                if replay_policy.strict_journal_read() || table.has_input_contracts() {
-                    return Err(ActorError::custom(format!(
-                        "failed to read events for replay of {}:{}: {e}",
-                        state.entity_type, state.entity_id
-                    )));
-                }
-                tracing::error!(
-                    entity = %state.entity_id, error = %e,
-                    "failed to read events for replay — starting fresh"
-                );
+                return Err(ActorError::custom(format!(
+                    "failed to read events for replay of {}:{}: {e}",
+                    state.entity_type, state.entity_id
+                )));
             }
         }
         crate::runtime_metrics::record_event_replay_duration(
@@ -947,11 +940,10 @@ impl EntityActor {
 
 /// Rebuild an entity's current state from its snapshot + event tail.
 ///
-/// `strict_journal_read`: when true, a journal read failure PROPAGATES as an error
-/// instead of being swallowed into a "start fresh"/stale state. The key-index backfill
-/// passes `true` so it can tell "no events" apart from "could not read the journal" —
-/// keying decisions and the per-type watermark depend on that distinction (ADR-0153
-/// soundness gate). Actor hydration passes `false` (keep serving on a transient read).
+/// A journal read failure is returned as an error, never folded into the
+/// snapshot or initial state. Actor hydration then fails its first message
+/// and the next message hydrates again; the backfills can tell "no events"
+/// apart from "could not read the journal" (ADR-0153).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover_entity_state_from_store(
     tenant: &str,
@@ -962,7 +954,6 @@ pub(crate) async fn recover_entity_state_from_store(
     backend: BackendLabel,
     initial_fields: &serde_json::Value,
     blob_store: Option<&crate::blob_store::BlobStore>,
-    strict_journal_read: bool,
 ) -> Result<EntityState, ActorError> {
     let mut state = EntityActor::build_initial_state(entity_type, entity_id, table, initial_fields);
     EntityActor::replay_events(
@@ -972,11 +963,7 @@ pub(crate) async fn recover_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        if strict_journal_read {
-            ReplayPolicy::StrictSnapshot
-        } else {
-            ReplayPolicy::LenientSnapshot
-        },
+        ReplayPolicy::StrictSnapshot,
     )
     .await?;
     Ok(state)
@@ -1042,7 +1029,6 @@ impl Actor for EntityActor {
                 backend,
                 &self.initial_fields,
                 self.blob_store.as_ref(),
-                false, // hydration: keep serving on a transient journal read failure
             )
             .await?;
         }
@@ -1410,9 +1396,7 @@ impl Actor for EntityActor {
                                         state,
                                         &self.tenant,
                                         self.blob_store.as_ref(),
-                                        // Actor hydration keeps the lenient "start
-                                        // fresh on read error" behavior (unchanged).
-                                        ReplayPolicy::LenientSnapshot,
+                                        ReplayPolicy::StrictSnapshot,
                                     )
                                     .await?;
 
@@ -1913,3 +1897,7 @@ mod event_size_tests;
 #[cfg(test)]
 #[path = "contract_state_test.rs"]
 pub(super) mod contract_state_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "hydration_test.rs"]
+mod hydration_tests;
