@@ -204,21 +204,28 @@ impl ServerState {
             }
             *live += 1;
         }
-        let agent = &timer.agent_ctx;
-        let span = tracing::info_span!(
-            "dispatch.scheduled_actions",
-            workflow.root_entity_type = %agent.workflow_root_entity_type.as_deref().unwrap_or(&timer.entity_type),
-            workflow.root_entity_id = %agent.workflow_root_entity_id.as_deref().unwrap_or(&timer.entity_id),
-            workflow.run_id = %agent.workflow_run_id.clone()
-                .unwrap_or_else(|| format!("{}:{}", timer.entity_type, timer.entity_id)),
-            temper.action = %timer.action,
-            entity_type = %timer.entity_type,
-            entity_id = %timer.entity_id,
-        );
+        // The fire's own trace starts when it fires, linked to the move that
+        // armed it (none for a row armed at boot).
+        let armed_by = crate::trace_context::cause();
         let server = self.clone();
         let fire = async move {
             tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
-            server.fire_scheduled_action(&timer, gate).await;
+            let agent = &timer.agent_ctx;
+            let span = crate::trace_context::runtime_work_span!(
+                armed_by,
+                "dispatch.scheduled_actions",
+                workflow.root_entity_type = %agent.workflow_root_entity_type.as_deref().unwrap_or(&timer.entity_type),
+                workflow.root_entity_id = %agent.workflow_root_entity_id.as_deref().unwrap_or(&timer.entity_id),
+                workflow.run_id = %agent.workflow_run_id.clone()
+                    .unwrap_or_else(|| format!("{}:{}", timer.entity_type, timer.entity_id)),
+                temper.action = %timer.action,
+                entity_type = %timer.entity_type,
+                entity_id = %timer.entity_id,
+            );
+            server
+                .fire_scheduled_action(&timer, gate)
+                .instrument(span)
+                .await;
             let mut armed = server
                 .scheduled_armed
                 .lock()
@@ -230,7 +237,7 @@ impl ServerState {
                 }
             }
         };
-        tokio::spawn(fire.instrument(span)); // determinism-ok: timer delivery is a background side-effect
+        tokio::spawn(fire); // determinism-ok: timer delivery is a background side-effect
     }
 
     /// Fire `timer` until its action commits or is refused, each attempt

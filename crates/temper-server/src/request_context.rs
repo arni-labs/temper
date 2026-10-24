@@ -415,22 +415,6 @@ fn remote_parent_from_header(headers: &HeaderMap, name: &str) -> Option<opentele
     remote_parent(trace_id, span_id, flags, state)
 }
 
-pub(crate) fn remote_parent_context(agent_ctx: &AgentContext) -> Option<opentelemetry::Context> {
-    remote_parent_from_ids(
-        agent_ctx.trace_id.as_deref()?,
-        agent_ctx.parent_span_id.as_deref()?,
-    )
-}
-
-fn remote_parent_from_ids(trace_id: &str, span_id: &str) -> Option<opentelemetry::Context> {
-    remote_parent(
-        trace_id,
-        span_id,
-        TraceFlags::SAMPLED,
-        TraceState::default(),
-    )
-}
-
 fn remote_parent(
     trace_id: &str,
     span_id: &str,
