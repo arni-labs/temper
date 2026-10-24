@@ -1901,10 +1901,17 @@ impl ServerState {
                 }
             }
 
-            // The tombstone's status replaces the record's cached one, so a
-            // guard no longer finds it in its last live status, and an older
-            // write still in flight cannot bring that status back.
-            self.cache_entity_status(tenant, &response.state);
+            // With a journal the tombstone is the record's last event, so its
+            // status replaces the cached one: a guard no longer finds the
+            // record in its last live status, and an older write still in
+            // flight cannot bring that status back. Without one nothing keeps
+            // the tombstone, and a record created later under the same id
+            // starts its count again, so the entry goes with the record.
+            if self.event_journal().is_some() {
+                self.cache_entity_status(tenant, &response.state);
+            } else if let Ok(mut cache) = self.entity_state_cache.lock() {
+                cache.pop(&format!("{tenant}:{entity_type}:{entity_id}"));
+            }
 
             // Tombstone persisted successfully; now it is safe to remove actor
             // and in-memory index entries.

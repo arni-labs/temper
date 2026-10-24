@@ -2,19 +2,20 @@
 //! without asking the record's actor: cross-entity guards, Cedar context
 //! entities, triggers, compensation and the Workspace check before file writes.
 //!
-//! The writers (a dispatch, a composite batch, a delete, the backfill of a
-//! read) run after awaiting the actor, so they can land in any order. Each
-//! entry carries the record's event sequence at the status it holds, and a
-//! write replaces it only when it is not older: a slow write that lands after
-//! a newer one keeps the newer status.
+//! The writers (a dispatch once its transition is committed, a composite
+//! batch, a delete, the backfill of a read) run after awaiting the actor, so
+//! they can land in any order. Each entry carries the record's event sequence
+//! at the status it holds, and a write replaces it only when it is not older:
+//! a slow write that lands after a newer one keeps the newer status.
 //!
-//! A delete writes the tombstone's status, which is newer than any write of
-//! the live record. Passivation keeps the entry when the record has a journal
-//! (the next actor continues its sequence) and drops it when it has none (the
-//! record's state ends with its actor). An entry the cache evicts or drops is
-//! gone, so a late write can fill its place with an older status; for that,
-//! the cache's whole budget of other records must be written while that one
-//! write is in flight.
+//! With a journal, a delete writes the tombstone's status, which is newer than
+//! any write of the live record, and passivation keeps the entry (the next
+//! actor continues the journal's sequence). Without one, a delete and
+//! passivation drop the entry: the record's state ends with its actor, and a
+//! record created later under the same id counts its events from zero again.
+//! An entry the cache evicts or drops is gone, so a late write can fill its
+//! place with an older status; with a journal that needs the cache's whole
+//! budget of other records written while that one write is in flight.
 
 use chrono::{DateTime, Utc};
 use temper_runtime::scheduler::sim_now;
