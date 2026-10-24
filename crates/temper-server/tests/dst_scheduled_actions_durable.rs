@@ -8,7 +8,9 @@
 //! that fails their next write, or writes it and loses the answer. The process
 //! stops before some are due and after others, sometimes right after a fire,
 //! before any removal that is not part of its commit. The next process boots
-//! with `start_runtime` and nobody but the cron callback touches the records.
+//! with `start_runtime` and nobody but the cron callback touches the records;
+//! on some seeds the store cannot list its rows at that boot, and they are
+//! listed again a second later.
 //!
 //! Invariants:
 //! - every armed action fires exactly once per arm, never before it is due,
@@ -37,308 +39,24 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use temper_runtime::ActorSystem;
 use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::{
     DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
 };
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::SpecRegistry;
-use temper_server::request_context::{AgentContext, ScheduledFire};
-use temper_server::{ServerState, StorageStack};
-use temper_spec::csdl::parse_csdl;
+use temper_server::request_context::ScheduledFire;
 use temper_store_sim::SimEventStore;
 use world::{ProcessClock, SimTimerRows};
 
+#[path = "dst_scheduled_actions_durable/process.rs"]
+mod process;
+#[path = "dst_scheduled_actions_durable/workload.rs"]
+mod workload;
+
+use process::*;
+use workload::*;
+
 const SEEDS: u64 = 48;
-
-/// How long `Start` and every `Tick` wait before their action fires, and how
-/// far apart a cron's runs are.
-const PERIOD: i64 = 600;
-
-/// A fire after the boot must come at its due time; one that fell due while
-/// the process was down, within this long of the boot (eight fire at once).
-const BOOT_FIRE_WINDOW: i64 = 5;
-
-/// How late a fire whose writes fail may land: its retries (the store fails
-/// up to three writes).
-const RETRY_WINDOW: i64 = 15;
-
-/// How often the cron callback looks for a `Run` to answer, so how late it may
-/// plan the next one.
-const CALLBACK_LAG: i64 = 30;
-
-const JOB: &str = r#"
-[automaton]
-name = "Job"
-states = ["Idle", "Waiting", "Active", "Planned", "Done"]
-initial = "Idle"
-allow_indefinite_states = ["Idle", "Waiting", "Active", "Planned", "Done"]
-
-[[action]]
-name = "Start"
-from = ["Idle"]
-to = "Waiting"
-effect = ["schedule('Fire', 600)"]
-
-[[action]]
-name = "StartAt"
-from = ["Idle"]
-to = "Waiting"
-params = ["due"]
-effect = ["schedule_at('Fire', due)"]
-
-[[action]]
-name = "Activate"
-from = ["Idle"]
-to = "Active"
-effect = ["schedule('Tick', 600)"]
-
-[[action]]
-name = "Tick"
-from = ["Active"]
-effect = ["schedule('Tick', 600)"]
-
-[[action]]
-name = "Fire"
-from = ["Waiting", "Done"]
-to = "Done"
-
-[[action]]
-name = "Plan"
-from = ["Idle", "Planned"]
-to = "Planned"
-params = ["next_run_at"]
-effect = ["schedule_at('Run', next_run_at)"]
-
-[[action]]
-name = "Run"
-from = ["Planned"]
-"#;
-
-const CSDL: &str = r#"<?xml version="1.0"?>
-<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
-<edmx:DataServices><Schema Namespace="Jobs" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-<EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key>
-<Property Name="Id" Type="Edm.String" Nullable="false"/>
-<Property Name="due" Type="Edm.String"/>
-<Property Name="next_run_at" Type="Edm.String"/>
-</EntityType>
-<Action Name="Start" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="StartAt" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/><Parameter Name="due" Type="Edm.String"/></Action>
-<Action Name="Activate" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Tick" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Fire" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Plan" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/><Parameter Name="next_run_at" Type="Edm.String"/></Action>
-<Action Name="Run" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/></EntityContainer>
-</Schema></edmx:DataServices></edmx:Edmx>"#;
-
-const TENANT: &str = "alpha";
-
-/// How a record of the workload fires.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    /// `Fire`, once.
-    Once,
-    /// `Tick`, every [`PERIOD`], each scheduling the next.
-    Repeat,
-    /// `Run`, at the time `Plan` stored; the callback plans the next.
-    Cron,
-}
-
-impl Kind {
-    fn action(self) -> &'static str {
-        match self {
-            Kind::Once => "Fire",
-            Kind::Repeat => "Tick",
-            Kind::Cron => "Run",
-        }
-    }
-}
-
-/// What a record of the workload armed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Arm {
-    kind: Kind,
-    /// When its first fire is due.
-    due: DateTime<Utc>,
-    /// Whether the store faults its first fire's write.
-    faulted: bool,
-}
-
-impl Arm {
-    /// How late after its due time a fire of this record may land.
-    fn late(&self) -> i64 {
-        let retries = if self.faulted { RETRY_WINDOW } else { 1 };
-        match self.kind {
-            Kind::Cron => retries + CALLBACK_LAG,
-            Kind::Once | Kind::Repeat => retries,
-        }
-    }
-}
-
-/// When the first process stopped and the second booted.
-struct Restart {
-    stop: DateTime<Utc>,
-    boot: DateTime<Utc>,
-}
-
-impl Restart {
-    /// A fire due at `due` came at `fire` on time: at its due time when that
-    /// fell while a process ran, or soon after the boot when it fell while
-    /// none did. A due time well before the stop that fired only after the
-    /// boot was missed while the first process ran.
-    fn on_time(&self, due: DateTime<Utc>, fire: DateTime<Utc>, late: i64) -> bool {
-        if fire < self.boot || due > self.boot {
-            (-1..=late).contains(&(fire - due).num_seconds())
-        } else {
-            (due - self.stop).num_seconds() >= -late
-                && (fire - self.boot).num_seconds() <= BOOT_FIRE_WINDOW + late
-        }
-    }
-}
-
-/// What outlives a process: the journal, the timer rows and the clock.
-struct World {
-    events: SimEventStore,
-    rows: Arc<SimTimerRows>,
-    clock: Arc<ProcessClock>,
-}
-
-/// One server process.
-struct Process {
-    runtime: tokio::runtime::Runtime,
-    state: ServerState,
-}
-
-impl Process {
-    /// Boot the way every embedder does: specs, storage, then
-    /// `start_runtime`. The cron callback runs beside it.
-    fn start(world: &World, name: &str) -> Self {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .unwrap();
-        let state = runtime.block_on(async {
-            world.clock.begin();
-            let mut registry = SpecRegistry::new();
-            let csdl = parse_csdl(CSDL).unwrap();
-            registry.register_tenant(TENANT, csdl, CSDL.to_string(), &[("Job", JOB)]);
-            let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
-            state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
-            state.state_timer_rows = Some(world.rows.clone());
-            let walk = state.start_runtime().await.expect("the first start");
-            walk.await.unwrap();
-            let callback = cron_callback(state.clone(), world.events.clone());
-            tokio::spawn(callback); // determinism-ok: the cron's integration, inside this process
-            state
-        });
-        Self { runtime, state }
-    }
-
-    /// Exit: every task of this process stops.
-    fn kill(self, world: &World, downtime: Duration) {
-        self.runtime.block_on(async { world.clock.end(downtime) });
-        let Self { runtime, state } = self;
-        drop(state);
-        drop(runtime);
-    }
-}
-
-/// The cron's callback, as CronJob's integration answers each run: once a
-/// record's newest event is a `Run`, plan the next run a period after it.
-async fn cron_callback(state: ServerState, events: SimEventStore) {
-    let prefix = format!("{TENANT}:Job:");
-    loop {
-        tokio::time::sleep(Duration::from_secs(CALLBACK_LAG as u64)).await;
-        for persistence_id in events.list_all_persistence_ids() {
-            let Some(id) = persistence_id.strip_prefix(&prefix) else {
-                continue;
-            };
-            let journal = events.read_events(&persistence_id, 0).await;
-            let Some(last) = journal.as_deref().ok().and_then(<[_]>::last) else {
-                continue;
-            };
-            if last.event_type == "Run" {
-                let next = last.metadata.timestamp + chrono::Duration::seconds(PERIOD);
-                act(
-                    &state,
-                    id,
-                    "Plan",
-                    json!({ "next_run_at": next.to_rfc3339() }),
-                )
-                .await;
-            }
-        }
-    }
-}
-
-/// One seed's run: its trace, for the report of a broken invariant.
-struct Run {
-    seed: u64,
-    trace: Vec<String>,
-}
-
-impl Run {
-    fn fail(&self, invariant: &str, detail: String) -> String {
-        format!(
-            "seed {}: {invariant}: {detail}\ntrace:\n  {}",
-            self.seed,
-            self.trace.join("\n  ")
-        )
-    }
-}
-
-/// Let every task that can run, run.
-async fn settle() {
-    for _ in 0..600 {
-        tokio::task::yield_now().await;
-    }
-}
-
-/// Let `by` pass. The paused clock jumps from one timer to the next, so each
-/// fires at its own instant.
-async fn pass(by: Duration) {
-    tokio::time::sleep(by).await;
-    settle().await;
-}
-
-/// Let time pass until `at`, waking exactly then.
-async fn until(at: DateTime<Utc>) {
-    tokio::time::sleep((at - sim_now()).to_std().unwrap_or_default()).await;
-}
-
-async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Value) -> bool {
-    state
-        .dispatch_tenant_action(
-            &TenantId::new(TENANT),
-            "Job",
-            id,
-            action,
-            params,
-            &AgentContext::default(),
-        )
-        .await
-        .is_ok_and(|response| response.success)
-}
-
-/// When each of the record's events of `action` was written, from its
-/// journal.
-async fn fired_at(events: &SimEventStore, id: &str, action: &str) -> Vec<DateTime<Utc>> {
-    events
-        .read_events(&format!("{TENANT}:Job:{id}"), 0)
-        .await
-        .map(|journal| {
-            journal
-                .iter()
-                .filter(|event| event.event_type == action)
-                .map(|event| event.metadata.timestamp)
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// One seed's run. Ok: whether it stopped right after a fire whose event was
 /// written, with removals outside the fire's commit held.
@@ -472,14 +190,25 @@ fn run_seed(seed: u64) -> Result<usize, String> {
         ));
     }
 
+    // On some seeds the store cannot list rows when the second process boots,
+    // so its rows are armed only when it lists them again.
+    let scan_failed = rng.next_bound(4) == 0;
+    if scan_failed {
+        world.events.fail_next_scheduled_lists(TENANT, 1);
+    }
     let second = Process::start(&world, &format!("sched-{seed}-b"));
     let result = second.runtime.block_on(async {
         let state = &second.state;
+        let scan_wait = if scan_failed { SCAN_RETRY_WAIT } else { 0 };
         let restart = Restart {
             stop,
-            boot: sim_now(),
+            boot: sim_now() + chrono::Duration::seconds(scan_wait),
         };
-        run.trace.push(format!("boot at {}", restart.boot));
+        run.trace.push(format!(
+            "boot at {}, rows listed {}",
+            sim_now(),
+            restart.boot
+        ));
         let last_due = arms
             .values()
             .map(|arm| arm.due)

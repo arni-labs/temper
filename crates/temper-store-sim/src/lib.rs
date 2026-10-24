@@ -178,6 +178,9 @@ struct SimEventStoreInner {
     /// While set, `delete_scheduled_action` never completes, as when the
     /// process stops before it. See `hold_scheduled_action_deletes`.
     scheduled_deletes_held: bool,
+    /// Each entry makes `list_scheduled_actions` for that tenant fail with a
+    /// storage error on the next N calls. See `fail_next_scheduled_lists`.
+    pending_scheduled_list_failures: BTreeMap<String, usize>,
     /// ADR-0155 backfill watermark: `(tenant, entity_type) -> vector_set` — each
     /// completed type mapped to the sorted comma-joined declared vector-path names the
     /// backfill covered. Mirrors `key_index_watermark`.
@@ -215,6 +218,7 @@ impl SimEventStore {
                 vector_index: BTreeMap::new(),
                 scheduled_actions: BTreeMap::new(),
                 scheduled_deletes_held: false,
+                pending_scheduled_list_failures: BTreeMap::new(),
                 vector_index_watermark: BTreeMap::new(),
             })),
         }
@@ -247,6 +251,20 @@ impl SimEventStore {
     pub fn hold_scheduled_action_deletes(&self, held: bool) {
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         inner.scheduled_deletes_held = held;
+    }
+
+    /// Make the next `count` `list_scheduled_actions` calls for `tenant` fail
+    /// with a storage error, then behave normally, as when the store is
+    /// briefly unreachable at boot. `count == 0` clears the injection.
+    pub fn fail_next_scheduled_lists(&self, tenant: &str, count: usize) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if count == 0 {
+            inner.pending_scheduled_list_failures.remove(tenant);
+        } else {
+            inner
+                .pending_scheduled_list_failures
+                .insert(tenant.to_string(), count);
+        }
     }
 
     /// Make the next `count` `read_events` calls for `persistence_id` fail with a
@@ -746,7 +764,16 @@ impl EventStore for SimEventStore {
         &self,
         tenant: &str,
     ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
-        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if let Some(left) = inner.pending_scheduled_list_failures.get_mut(tenant) {
+            *left -= 1;
+            if *left == 0 {
+                inner.pending_scheduled_list_failures.remove(tenant);
+            }
+            return Err(PersistenceError::Storage(
+                "simulated scheduled-action list failure".to_string(),
+            ));
+        }
         Ok(inner
             .scheduled_actions
             .values()
