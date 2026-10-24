@@ -400,6 +400,13 @@ fn normalize_old_config_for_expected_evolution(
     config: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut normalized = config.clone();
+    // Legacy sandbox addresses move to the managed sandbox, whose token the
+    // WASM host attaches when resolving the platform secret.
+    if let Some(sandbox_url) = normalized.get_mut("sandbox_url") {
+        if sandbox_url == "http://127.0.0.1:9999" {
+            *sandbox_url = "{secret:sandbox_url}".to_string();
+        }
+    }
     match (path, trigger_name) {
         ("os-apps/paw-agent/specs/session.ioa.toml", "call_provider") => {
             normalized.remove("api_key");
@@ -409,15 +416,6 @@ fn normalize_old_config_for_expected_evolution(
         }
         ("os-apps/paw-agent/specs/session.ioa.toml", "compact_context") => {
             normalized.remove("api_key");
-        }
-        // These triggers moved from a hand-started sandbox at 127.0.0.1:9999 to
-        // the one `temper serve` starts, the only one the WASM host sends the
-        // sandbox token to.
-        ("os-apps/evolution/evolution_run.ioa.toml", "propose_mutation")
-        | ("os-apps/intent-discovery/specs/intent_discovery.ioa.toml", "spawn_analyst") => {
-            if let Some(sandbox_url) = normalized.get_mut("sandbox_url") {
-                *sandbox_url = "{secret:sandbox_url}".to_string();
-            }
         }
         _ => {}
     }
