@@ -150,13 +150,9 @@ async fn dst_p16_checks_deleted_state_without_tombstone() {
 
     for seed in 0..NUM_SEEDS {
         let (_guard, _clock, _id_gen) = install_deterministic_context(seed);
-        for action in [
-            "Archive",
-            "Deleted",
-            "Created",
-            "FieldsUpdated",
-            "FieldsReplaced",
-        ] {
+        // FieldsUpdated and FieldsReplaced are reserved by EntityActor;
+        // reserved_field_update_event_names_are_refused_as_actions covers them.
+        for action in ["Archive", "Deleted", "Created"] {
             let harness = SimPlatformHarness::no_faults(seed);
             let tenant = "replay-deleted";
             harness
