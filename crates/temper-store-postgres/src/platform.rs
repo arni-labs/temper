@@ -18,6 +18,7 @@ use crate::schema::tombstone_sql;
 mod evolution;
 mod inputs;
 mod policy_approval;
+mod policy_replace;
 mod rows;
 mod specs;
 mod state_timers;
