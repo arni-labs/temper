@@ -1,5 +1,5 @@
 use serde_json::Value;
-use temper_authz::{PrincipalKind, SecurityContext};
+use temper_authz::SecurityContext;
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
@@ -21,17 +21,6 @@ pub(crate) fn commons_subject(security_ctx: &SecurityContext) -> String {
         .filter(|account| !account.is_empty())
         .unwrap_or(principal.id.as_str())
         .to_string()
-}
-
-/// Whether the caller acts with platform authority rather than as a commons
-/// account: System, Admin, or a verified operator, the same principals the
-/// built-in `system-platform` Cedar policy names. Such a caller has no Owner
-/// row of its own to verify.
-fn acts_with_platform_authority(security_ctx: &SecurityContext) -> bool {
-    let principal = &security_ctx.principal;
-    matches!(principal.kind, PrincipalKind::System | PrincipalKind::Admin)
-        || (principal.agent_type.as_deref() == Some("operator")
-            && principal.attributes.get("agentTypeVerified") == Some(&Value::Bool(true)))
 }
 
 #[derive(Debug, Clone)]
@@ -113,8 +102,9 @@ impl ServerState {
     ///
     /// A write is owner-scoped when the record (`fields`) or the action's
     /// `params` name an owner; which owner they name does not choose whose
-    /// status is checked. Callers with platform authority are not commons
-    /// accounts and are not checked here.
+    /// status is checked. Callers with platform authority (as Cedar decides
+    /// it, [`temper_authz::AuthzEngine::has_platform_authority`]) are not
+    /// commons accounts and have no Owner row to verify.
     pub(crate) async fn enforce_commons_verified_subject(
         &self,
         tenant: &TenantId,
@@ -124,7 +114,7 @@ impl ServerState {
         security_ctx: &SecurityContext,
     ) -> Result<(), CommonsAccountVerificationError> {
         if !self.commons_account_verification_applies(tenant, entity_type)?
-            || acts_with_platform_authority(security_ctx)
+            || self.authz.has_platform_authority(security_ctx)
         {
             return Ok(());
         }
