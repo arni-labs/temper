@@ -108,10 +108,51 @@ fn a_blank_says_is_refused() {
 }
 
 #[test]
-fn a_says_of_more_than_one_line_is_refused() {
-    let error = rejection(&trip_with_plan_line("says = \"start\\nplanning\""));
-    assert!(error.contains("action 'Plan'"), "{error}");
-    assert!(error.contains("says must be one line"), "{error}");
+fn a_long_says_over_several_lines_is_kept_as_written() {
+    // The reader wraps labels, so a label has no length or line limit.
+    let long = "start planning: pick dates, ask who comes, and find a place to stay\\nthen wait for answers";
+    let trip = parse_automaton(&trip_with_plan_line(&format!("says = \"{long}\"")))
+        .expect("says has no length or line limit");
+    let plan = trip.actions.iter().find(|a| a.name == "Plan").unwrap();
+    assert_eq!(
+        plan.says.as_deref(),
+        Some(long.replace("\\n", "\n").as_str())
+    );
+}
+
+#[test]
+fn each_block_of_an_action_keeps_its_own_says() {
+    let trip = parse_automaton(&trip_with(
+        r#"
+[[action]]
+name = "Rethink"
+kind = "input"
+from = ["Booked"]
+to = "Planning"
+says = "change the plan"
+
+[[action]]
+name = "Rethink"
+kind = "input"
+from = ["Away"]
+to = "Booked"
+says = "come back early"
+"#,
+    ))
+    .expect("an action may be written as several blocks");
+    let says: Vec<(Vec<String>, Option<&str>)> = trip
+        .actions
+        .iter()
+        .filter(|a| a.name == "Rethink")
+        .map(|a| (a.from.clone(), a.says.as_deref()))
+        .collect();
+    assert_eq!(
+        says,
+        vec![
+            (vec!["Booked".to_string()], Some("change the plan")),
+            (vec!["Away".to_string()], Some("come back early")),
+        ]
+    );
 }
 
 #[test]
@@ -320,10 +361,18 @@ fn a_group_says_follows_the_action_rule() {
     ));
     assert!(empty.contains("group 'Getting ready'"), "{empty}");
     assert!(empty.contains("says must not be empty"), "{empty}");
-    let two_lines = rejection(&trip_with(
-        "[[group]]\nname = \"Getting ready\"\nsays = \"a\\nb\"\nstates = [\"Planning\"]\n",
-    ));
-    assert!(two_lines.contains("says must be one line"), "{two_lines}");
+}
+
+#[test]
+fn a_group_with_no_states_is_refused() {
+    for spec in [
+        trip_with("[[group]]\nname = \"Getting ready\"\nstates = []\n"),
+        trip_with("[[group]]\nname = \"Getting ready\"\n"),
+    ] {
+        let error = rejection(&spec);
+        assert!(error.contains("group 'Getting ready'"), "{error}");
+        assert!(error.contains("lists no states"), "{error}");
+    }
 }
 
 #[test]

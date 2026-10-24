@@ -64,10 +64,10 @@ async fn spec_detail_carries_what_actions_say_and_the_groups() {
     };
     assert_eq!(action("SubmitOrder")["says"], "send it in");
     assert_eq!(action("CancelOrder")["says"], "call it off");
-    assert!(
-        action("ConfirmOrder")["says"].is_null(),
-        "an action that says nothing has no label: {}",
-        action("ConfirmOrder")
+    assert_eq!(
+        action("ConfirmOrder").get("says"),
+        Some(&serde_json::Value::Null),
+        "an action that says nothing reads says: null"
     );
 
     assert_eq!(
@@ -80,6 +80,7 @@ async fn spec_detail_carries_what_actions_say_and_the_groups() {
             },
             {
                 "name": "Open",
+                "says": null,
                 "states": ["Draft", "Submitted", "Confirmed"]
             },
             {
@@ -94,7 +95,47 @@ async fn spec_detail_carries_what_actions_say_and_the_groups() {
 }
 
 #[tokio::test]
-async fn spec_detail_of_a_spec_without_groups_lists_none() {
+async fn a_spec_without_the_keys_reads_says_null_and_no_groups() {
     let raw = observe_json(build_test_app(), "/observe/specs/Order").await;
     assert_eq!(raw["groups"], serde_json::json!([]));
+    let keys = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+    // The only additions to the response are `groups` and each `says`.
+    assert_eq!(
+        keys(&raw),
+        [
+            "actions",
+            "entity_type",
+            "groups",
+            "initial_state",
+            "invariants",
+            "spec_version",
+            "state_variables",
+            "states",
+            "terminal_states",
+        ]
+    );
+    let actions = raw["actions"].as_array().expect("actions is a list");
+    assert!(!actions.is_empty());
+    for action in actions {
+        assert_eq!(
+            keys(action),
+            [
+                "effects", "from", "guards", "hint", "kind", "name", "params", "says", "to"
+            ]
+        );
+        assert_eq!(
+            action.get("says"),
+            Some(&serde_json::Value::Null),
+            "every action reads says: null: {action}"
+        );
+    }
 }
