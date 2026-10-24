@@ -149,6 +149,13 @@ pub(super) async fn commit(
                 if state.status == "Deleted" {
                     return Err("the parent was deleted before its spawn was refused".to_owned());
                 }
+                // Another writer may have spent the replay budget while this
+                // append conflicted. Refuse before rebuilding or applying it.
+                if state.events_since_snapshot >= MAX_EVENTS_SINCE_SNAPSHOT {
+                    return Err(format!(
+                        "Event budget exhausted ({MAX_EVENTS_SINCE_SNAPSHOT} max since snapshot)"
+                    ));
+                }
                 // Decide again on the caught-up parent: a newer spawn may have
                 // replaced the id in between.
                 previous_fields = state.fields.clone();
