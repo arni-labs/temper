@@ -128,7 +128,7 @@ impl EntityActor {
                 .persist_event(store, backend, &self.persistence_id(), state, &deleted)
                 .await
         {
-            return reply(state, Err(format!("persistence failed: {e}")));
+            return super::actor::persistence_failure_reply(state.clone(), &e);
         }
         state.record_tombstone(deleted);
         reply(state, Ok(()))
@@ -147,16 +147,21 @@ impl EntityActor {
 
 const STRICT_DELETE: &str = "Strict entities require a declared action for deletion";
 
-/// The reply to a delete-side message, with the entity's state after it.
-pub(super) fn reply(state: &EntityState, outcome: Result<(), String>) -> EntityResponse {
-    EntityResponse {
-        success: outcome.is_ok(),
-        refusal: None,
-        state: state.clone(),
-        error: outcome.err(),
-        custom_effects: vec![],
-        scheduled_actions: vec![],
-        spawn_requests: vec![],
-        spec_governed: true,
+/// The reply to a delete-side message, with the entity's state after it. An
+/// `Err` is a refusal: nothing was written.
+fn reply(state: &EntityState, outcome: Result<(), String>) -> EntityResponse {
+    match outcome {
+        Ok(()) => EntityResponse {
+            success: true,
+            refusal: None,
+            state: state.clone(),
+            error: None,
+            custom_effects: vec![],
+            scheduled_actions: vec![],
+            spawn_requests: vec![],
+            spec_governed: true,
+            refused: false,
+        },
+        Err(error) => EntityResponse::refused(state.clone(), error),
     }
 }
