@@ -30,6 +30,7 @@ impl TimedTransition<'_> {
             entity_id: &self.write.entity_id,
             action: &self.write.action,
             agent_ctx: &self.agent_ctx,
+            origin: None,
             dispatch_idempotency_key: Some(&self.write.idempotency_key),
             action_params: &self.write.params,
             await_integration: false,

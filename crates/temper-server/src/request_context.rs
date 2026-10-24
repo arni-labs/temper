@@ -90,9 +90,11 @@ pub struct AgentContext {
     /// Temper core treats these keys as opaque correlation metadata.
     pub observation_metadata: BTreeMap<String, String>,
     /// Set when the runtime makes this dispatch's move itself rather than a
-    /// caller (a state timer): the record's history names the runtime part as
-    /// the move's actor and keeps the move that led to it as its cause.
-    /// Attribution only; Cedar and bound parameters read `security_ctx`.
+    /// caller (a state timer): the move's records name the runtime part as
+    /// its actor and keep the move that led to it as its cause. Attribution
+    /// only: Cedar, integrations and adapters still see `agent_id` and
+    /// `security_ctx`. The dispatch it is set on takes it, so it names that
+    /// one move and never the follow-ons the move starts.
     pub origin: Option<crate::entity_actor::MoveOrigin>,
 }
 

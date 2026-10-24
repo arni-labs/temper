@@ -507,7 +507,10 @@ impl crate::state::ServerState {
             expected_authorization_precondition,
             workflow_root_active,
         } = steps;
-        let enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
+        let mut enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
+        // The origin names this move only: the context its follow-ons inherit
+        // goes on without it.
+        let origin = enriched_agent_ctx.origin.take();
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();
@@ -564,6 +567,7 @@ impl crate::state::ServerState {
                         entity_id,
                         action,
                         agent_ctx,
+                        origin: origin.as_ref(),
                         dispatch_idempotency_key: agent_ctx.idempotency_key.as_deref(),
                         action_params: &params,
                         await_integration,
@@ -714,7 +718,7 @@ impl crate::state::ServerState {
                     idempotency_key: idempotency_key.clone(),
                     expected_authorization_precondition: authorization_precondition_for_retry
                         .clone(),
-                    origin: agent_ctx.origin.clone(),
+                    origin: origin.clone(),
                 },
                 &policy,
             )
@@ -782,6 +786,8 @@ impl crate::state::ServerState {
         let response = match outcome.result {
             Ok(response) => response,
             Err(e) => {
+                let (agent_id, agent_type) =
+                    crate::entity_actor::recorded_agent(origin.as_ref(), agent_ctx);
                 let entry = TrajectoryEntry {
                     timestamp: sim_now().to_rfc3339(),
                     tenant: tenant.to_string(),
@@ -792,14 +798,14 @@ impl crate::state::ServerState {
                     from_status: None,
                     to_status: None,
                     error: Some(format!("Actor dispatch failed: {e}")),
-                    agent_id: agent_ctx.agent_id.clone(),
+                    agent_id,
                     session_id: agent_ctx.session_id.clone(),
                     authz_denied: None,
                     denied_resource: None,
                     denied_module: None,
                     source: Some(TrajectorySource::Entity),
                     spec_governed: None,
-                    agent_type: agent_ctx.agent_type.clone(),
+                    agent_type,
                     request_body: Some(action_params.clone()),
                     intent: agent_ctx.intent.clone(),
                     matched_policy_ids: None,
@@ -863,6 +869,7 @@ impl crate::state::ServerState {
             entity_id,
             action,
             agent_ctx,
+            origin: origin.as_ref(),
             dispatch_idempotency_key: idempotency_key.as_deref(),
             action_params: &action_params,
             await_integration,

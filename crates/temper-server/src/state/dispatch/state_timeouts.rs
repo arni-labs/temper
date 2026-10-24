@@ -55,7 +55,6 @@ use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{
     EntityEvent, EntityResponse, EntityState, MoveCause, MoveOrigin, STATE_TIMER_ACTOR,
-    STATE_TIMER_AGENT_TYPE,
 };
 use crate::request_context::AgentContext;
 
@@ -665,11 +664,12 @@ pub(super) struct ArmedTimer {
 
 impl ArmedTimer {
     /// The context the timer's move is dispatched with. It keeps the arming
-    /// dispatch's authority (`security_ctx`), so bound parameters and the
-    /// checks the move's own calls make see what they saw when the move was
-    /// armed. It is recorded as the state timer's move, with the arming move
-    /// as its cause, because the spec's follow-on is the app's rule rather
-    /// than a move the arming person asked for.
+    /// dispatch's identity and authority (`agent_id`, `security_ctx`), so
+    /// bound parameters, Cedar checks on the move's integrations and its
+    /// adapters see what they saw when the move was armed. Its `origin`
+    /// records it as the state timer's move, with the arming move as its
+    /// cause, because the spec's follow-on is the app's rule rather than a
+    /// move the arming person asked for.
     pub(super) fn fire_agent(&self) -> AgentContext {
         let mut agent = self.armed_by.clone();
         agent.origin = Some(MoveOrigin {
@@ -680,8 +680,6 @@ impl ArmedTimer {
                 sequence_nr: self.sequence_nr,
             },
         });
-        agent.agent_id = Some(STATE_TIMER_ACTOR.to_string());
-        agent.agent_type = Some(STATE_TIMER_AGENT_TYPE.to_string());
         agent
     }
 }
@@ -1551,6 +1549,7 @@ queue_timeout_seconds = 30
             entity_id: "t-1",
             action: "__Created",
             agent_ctx: &agent_ctx,
+            origin: None,
             dispatch_idempotency_key: None,
             action_params: &serde_json::json!({}),
             await_integration: false,

@@ -13,9 +13,6 @@ use serde::{Deserialize, Serialize};
 /// runtime services (`service:<name>`, see `AgentContext::for_service`).
 pub const STATE_TIMER_ACTOR: &str = "service:state-timer";
 
-/// The agent type a state timer's move is recorded under.
-pub const STATE_TIMER_AGENT_TYPE: &str = "state-timer";
-
 /// The move that led the runtime to make another one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveCause {
@@ -37,4 +34,30 @@ pub struct MoveOrigin {
     pub actor: String,
     /// The move that led to it.
     pub caused_by: MoveCause,
+}
+
+impl MoveOrigin {
+    /// The agent type the move is recorded under: the service name in
+    /// `service:<name>`, as `AgentContext::for_service` names it.
+    pub fn actor_type(&self) -> &str {
+        self.actor.strip_prefix("service:").unwrap_or(&self.actor)
+    }
+}
+
+/// The agent id and type a move's own records (trajectory, change
+/// notification, outbound webhook) name: the runtime part that made the move
+/// when `origin` is set, else the dispatch's agent. Authority-bearing uses
+/// (Cedar, integrations, adapters) read `agent` itself, so a state timer's
+/// move keeps the identity of whoever armed it there.
+pub(crate) fn recorded_agent(
+    origin: Option<&MoveOrigin>,
+    agent: &crate::request_context::AgentContext,
+) -> (Option<String>, Option<String>) {
+    match origin {
+        Some(origin) => (
+            Some(origin.actor.clone()),
+            Some(origin.actor_type().to_string()),
+        ),
+        None => (agent.agent_id.clone(), agent.agent_type.clone()),
+    }
 }

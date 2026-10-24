@@ -10,7 +10,7 @@ use std::time::Instant;
 use tokio::spawn as spawn_post_dispatch_effect; // determinism-ok: post-dispatch side effects are outside transition semantics
 use tracing::Instrument;
 
-use crate::entity_actor::{EntityResponse, effects::ScheduledAction};
+use crate::entity_actor::{EntityResponse, MoveOrigin, effects::ScheduledAction};
 use crate::events::EntityStateChange;
 use crate::request_context::AgentContext;
 use crate::state::ProjectionEnqueueOutcome;
@@ -25,9 +25,19 @@ pub(crate) struct PostDispatchContext<'a> {
     pub entity_id: &'a str,
     pub action: &'a str,
     pub agent_ctx: &'a AgentContext,
+    /// Who made this move when the runtime made it itself (a state timer).
+    /// `agent_ctx` no longer carries it, so the follow-ons it starts do not.
+    pub origin: Option<&'a MoveOrigin>,
     pub dispatch_idempotency_key: Option<&'a str>,
     pub action_params: &'a serde_json::Value,
     pub await_integration: bool,
+}
+
+impl PostDispatchContext<'_> {
+    /// The agent id and type this move's own records name.
+    fn recorded_agent(&self) -> (Option<String>, Option<String>) {
+        crate::entity_actor::recorded_agent(self.origin, self.agent_ctx)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +294,7 @@ impl crate::state::ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
+        let (agent_id, agent_type) = ctx.recorded_agent();
         let entry = TrajectoryEntry {
             timestamp: sim_now().to_rfc3339(),
             tenant: ctx.tenant.to_string(),
@@ -303,14 +314,14 @@ impl crate::state::ServerState {
                         .unwrap_or_else(|| "guard not met".to_string()),
                 )
             },
-            agent_id: ctx.agent_ctx.agent_id.clone(),
+            agent_id,
             session_id: ctx.agent_ctx.session_id.clone(),
             authz_denied: None,
             denied_resource: None,
             denied_module: None,
             source: Some(TrajectorySource::Entity),
             spec_governed: None,
-            agent_type: ctx.agent_ctx.agent_type.clone(),
+            agent_type,
             // Captured on success as well as failure. A trajectory that
             // records only what failed cannot be replayed or learned from:
             // the successful action and the arguments that produced it are
@@ -375,6 +386,7 @@ impl crate::state::ServerState {
     ) {
         let seq =
             self.next_entity_event_sequence(ctx.tenant.as_str(), ctx.entity_type, ctx.entity_id);
+        let (agent_id, _) = ctx.recorded_agent();
         let change = EntityStateChange {
             seq,
             entity_type: ctx.entity_type.to_string(),
@@ -382,7 +394,7 @@ impl crate::state::ServerState {
             action: ctx.action.to_string(),
             status: response.state.status.clone(),
             tenant: ctx.tenant.to_string(),
-            agent_id: ctx.agent_ctx.agent_id.clone(),
+            agent_id: agent_id.clone(),
             session_id: ctx.agent_ctx.session_id.clone(),
             intent: ctx.agent_ctx.intent.clone(),
             observation_metadata: (!ctx.agent_ctx.observation_metadata.is_empty())
@@ -431,7 +443,7 @@ impl crate::state::ServerState {
                     "action": ctx.action,
                     "result": result,
                     "error_message": error_message,
-                    "agent_id": ctx.agent_ctx.agent_id,
+                    "agent_id": agent_id,
                     "session_id": ctx.agent_ctx.session_id,
                     "observation_metadata": ctx.agent_ctx.observation_metadata.clone(),
                 }),
@@ -454,6 +466,7 @@ impl crate::state::ServerState {
     pub(crate) fn fire_webhooks(&self, ctx: &PostDispatchContext<'_>, response: &EntityResponse) {
         if let Some(ref dispatcher) = self.webhook_dispatcher {
             let dispatcher = Arc::clone(dispatcher);
+            let (agent_id, agent_type) = ctx.recorded_agent();
             let entry = TrajectoryEntry {
                 timestamp: sim_now().to_rfc3339(),
                 tenant: ctx.tenant.to_string(),
@@ -464,14 +477,14 @@ impl crate::state::ServerState {
                 from_status: source_status(response),
                 to_status: Some(response.state.status.clone()),
                 error: response.error.clone(),
-                agent_id: ctx.agent_ctx.agent_id.clone(),
+                agent_id,
                 session_id: ctx.agent_ctx.session_id.clone(),
                 authz_denied: None,
                 denied_resource: None,
                 denied_module: None,
                 source: Some(TrajectorySource::Entity),
                 spec_governed: None,
-                agent_type: ctx.agent_ctx.agent_type.clone(),
+                agent_type,
                 // Deliberately absent, unlike the persisted trajectory entry:
                 // webhook payloads leave the deployment, so action arguments
                 // are not egressed to third-party endpoints.
