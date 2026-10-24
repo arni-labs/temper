@@ -419,6 +419,37 @@ fn dst_restart_recovers_pending_refusal_and_retries_idempotently() {
         );
     }); // Simulate another crash after parent commit but before acknowledgement.
     runtime().block_on(async {
+        let (_guard, _clock, _ids) = install_deterministic_context(303);
+        let parent = "default:Job:job";
+        let history = store.dump_journal(parent);
+        let last = history.last().unwrap();
+        // Model subsequent committed parent activity while completion remains
+        // unavailable. Replaying these keyed writes must evict the repair key
+        // from the 1,000-entry cache before the recovery worker retries it.
+        let events: Vec<_> = (1..=1000)
+            .map(|offset| PersistenceEnvelope {
+                sequence_nr: last.sequence_nr + offset,
+                event_type: "FieldsUpdated".to_owned(),
+                payload: serde_json::json!({
+                    "action": "FieldsUpdated", "from_status": "Active", "to_status": "Active",
+                    "timestamp": sim_now(), "params": {},
+                    "idempotency_key": format!("later-{offset}")
+                }),
+                metadata: EventMetadata {
+                    event_id: sim_uuid(),
+                    causation_id: sim_uuid(),
+                    correlation_id: sim_uuid(),
+                    timestamp: sim_now(),
+                    actor_id: parent.to_owned(),
+                },
+            })
+            .collect();
+        store
+            .append(parent, last.sequence_nr, &events)
+            .await
+            .unwrap();
+    });
+    runtime().block_on(async {
         let (_guard, _clock, _ids) = install_deterministic_context(302);
         let journal = "__temper_internal:SpawnRefusal:recovery";
         store.inject_concurrency_violations(journal, 0);
@@ -434,14 +465,15 @@ fn dst_restart_recovers_pending_refusal_and_retries_idempotently() {
                     vec!["absent"],
                     "replay must retain repair idempotency"
                 );
-                assert_eq!(
-                    restarted
-                        .get_tenant_entity_state(&TenantId::default(), "Job", "job")
-                        .await
-                        .unwrap()
-                        .state
-                        .fields["last_run_id"],
-                    serde_json::Value::Null
+                let parent = restarted
+                    .get_tenant_entity_state(&TenantId::default(), "Job", "job")
+                    .await
+                    .unwrap()
+                    .state;
+                assert_eq!(parent.fields["last_run_id"], serde_json::Value::Null);
+                assert!(
+                    !parent.has_processed_idempotency_key("repair-restart"),
+                    "the regression must exercise recovery after cache eviction"
                 );
                 return;
             }

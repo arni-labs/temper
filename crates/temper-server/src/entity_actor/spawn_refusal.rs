@@ -90,6 +90,33 @@ fn refusal_event(state: &EntityState, params: Value) -> EntityEvent {
     }
 }
 
+/// Pending work can outlive the bounded idempotency cache, including across
+/// snapshots and restarts. A cache miss must consult the complete parent journal
+/// before appending; a failed read leaves the repair pending rather than guessing.
+async fn already_committed(
+    actor: &EntityActor,
+    state: &EntityState,
+    refusal: &SpawnRefusal,
+) -> Result<bool, String> {
+    let Some(key) = refusal.recovery_id.as_deref() else {
+        return Ok(false);
+    };
+    if state.has_processed_idempotency_key(key) {
+        return Ok(true);
+    }
+    let Some(store) = actor.event_journal.as_ref() else {
+        return Ok(false);
+    };
+    let events = store
+        .read_events(&actor.persistence_id(), 0)
+        .await
+        .map_err(|error| format!("spawn refusal history lookup failed: {error}"))?;
+    Ok(events.iter().any(|event| {
+        event.event_type == SPAWN_REFUSED_EVENT
+            && event.payload.get("idempotency_key").and_then(Value::as_str) == Some(key)
+    }))
+}
+
 /// Journal the refusal on the parent and apply it, or say why it was not.
 ///
 /// `Ok(())` means the event is durable. On `Err` the parent is unchanged.
@@ -102,11 +129,7 @@ pub(super) async fn commit(
         !refusal.child_id.is_empty(),
         "PRECONDITION: a refused spawn names the child id it reserved"
     );
-    if refusal
-        .recovery_id
-        .as_deref()
-        .is_some_and(|key| state.has_processed_idempotency_key(key))
-    {
+    if already_committed(actor, state, refusal).await? {
         return Ok(());
     }
     if state.status == "Deleted" {
@@ -143,11 +166,7 @@ pub(super) async fn commit(
                 if state.status == "Deleted" {
                     return Err("the parent was deleted before its spawn was refused".to_owned());
                 }
-                if refusal
-                    .recovery_id
-                    .as_deref()
-                    .is_some_and(|key| state.has_processed_idempotency_key(key))
-                {
+                if already_committed(actor, state, refusal).await? {
                     return Ok(());
                 }
                 // Decide again on the caught-up parent: a newer spawn may have
