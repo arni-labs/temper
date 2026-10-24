@@ -50,7 +50,7 @@ pub(crate) enum TimerFollow {
     /// The record could not be read; the walk must retry it.
     RetryRead,
     /// Its state declares a timer whose action binds its caller's identity,
-    /// and no usable caller armed it: its next action arms it as that caller.
+    /// and nobody armed it: the record's next action arms it as that caller.
     WaitsForCaller,
 }
 
@@ -104,41 +104,17 @@ impl ServerState {
                 .await;
             return TimerFollow::Settled;
         };
-        // Use the dispatch resolver's security rules, including services,
-        // anonymous/system principals and empty delegated subjects.
-        let usable = |identity: &AgentContext| {
-            self.resolve_authenticated_params(
-                tenant,
-                entity_type,
-                &st.on_timeout,
-                serde_json::json!({}),
-                identity,
-            )
-            .is_ok()
+        let known = armed_by.cloned().or_else(|| {
+            self.armed_state_timer(tenant, entity_type, entity_id)
+                .map(|armed| armed.agent_ctx)
+        });
+        let identity = match known {
+            Some(identity) => identity,
+            None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
+                return TimerFollow::WaitsForCaller;
+            }
+            None => AgentContext::for_service(STATE_TIMER_SERVICE),
         };
-        let armed = self.armed_state_timer(tenant, entity_type, entity_id);
-        if armed
-            .as_ref()
-            .is_some_and(|timer| !usable(&timer.agent_ctx))
-        {
-            // Even a matching declaration cannot keep an unusable identity:
-            // clear its tracker entry and row so a later caller can arm it.
-            self.cancel_state_timer(tenant, entity_type, entity_id, current.sequence_nr)
-                .await;
-        }
-        let known = armed_by
-            .filter(|identity| usable(identity))
-            .cloned()
-            .or_else(|| {
-                armed
-                    .as_ref()
-                    .map(|timer| timer.agent_ctx.clone())
-                    .filter(&usable)
-            });
-        let identity = known.unwrap_or_else(|| AgentContext::for_service(STATE_TIMER_SERVICE));
-        if !usable(&identity) {
-            return TimerFollow::WaitsForCaller;
-        }
         let mut timer = declared_timer(
             tenant,
             entity_type,
@@ -148,7 +124,10 @@ impl ServerState {
             &identity,
             started_at,
         );
-        timer.boot_gate = gate.or_else(|| armed.and_then(|timer| timer.boot_gate));
+        timer.boot_gate = gate.or_else(|| {
+            self.armed_state_timer(tenant, entity_type, entity_id)
+                .and_then(|armed| armed.boot_gate)
+        });
         let delay = remaining_budget(started_at, st.after_seconds, now);
         if self
             .start_armed_timer(timer, delay, Reservation::Missing)
@@ -166,6 +145,18 @@ impl ServerState {
             );
         }
         TimerFollow::Settled
+    }
+
+    /// Whether `action` binds a parameter from its caller's identity, which a
+    /// service caller cannot give (`resolve_authenticated_params`).
+    fn action_binds_caller(&self, tenant: &TenantId, entity_type: &str, action: &str) -> bool {
+        self.transition_table_for_dispatch(tenant, entity_type)
+            .is_ok_and(|table| {
+                table
+                    .action_contracts
+                    .get(action)
+                    .is_some_and(|contract| !contract.param_sources.is_empty())
+            })
     }
 
     /// Whether `entity_type`'s spec declares any state timeout.

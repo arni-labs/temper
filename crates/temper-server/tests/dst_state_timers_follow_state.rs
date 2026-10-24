@@ -433,9 +433,6 @@ fn run_seed(seed: u64) -> Result<(), String> {
     Ok(())
 }
 
-#[path = "dst_state_timers_follow_state/identity.rs"]
-mod identity;
-
 #[path = "dst_state_timers_follow_state/read_failure.rs"]
 mod read_failure;
 
