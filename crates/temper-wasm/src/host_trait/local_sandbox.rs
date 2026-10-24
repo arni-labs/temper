@@ -58,6 +58,13 @@ impl ProductionWasmHost {
         self
     }
 
+    /// Whether `url` goes to the server's local sandbox.
+    pub(super) fn goes_to_local_sandbox(&self, url: &str) -> bool {
+        self.local_sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.serves(url))
+    }
+
     /// Add the sandbox token when `url` goes to the server's local sandbox.
     pub(super) fn add_local_sandbox_token(
         &self,
