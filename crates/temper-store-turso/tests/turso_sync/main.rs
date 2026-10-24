@@ -5,6 +5,7 @@
 //! `tursodb` binary of the version the `turso` crate pins (0.7.2). Without it
 //! the tests are skipped locally and fail in CI.
 
+mod change_log;
 mod startup;
 mod support;
 

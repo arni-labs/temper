@@ -164,8 +164,21 @@ impl SyncCopy {
         Ok(info["last_pushed_change_id_hint"].as_i64().unwrap_or(0))
     }
 
+    /// How many rows the local change log holds.
+    pub async fn change_log_rows(&self) -> Result<i64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM turso_cdc", ())
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(0);
+        };
+        row.get::<i64>(0).map_err(storage_error)
+    }
+
     /// The number of the newest committed change in the local change log.
-    pub(super) async fn last_change(&self) -> Result<i64, PersistenceError> {
+    pub async fn last_change(&self) -> Result<i64, PersistenceError> {
         let conn = self.connect().await.map_err(storage_error)?;
         let mut rows = conn
             .query("SELECT MAX(change_id) FROM turso_cdc", ())
