@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use temper_runtime::persistence::{EventMetadata, PersistenceEnvelope, PersistenceError};
-use temper_runtime::scheduler::{sim_now, sim_uuid};
+use temper_runtime::scheduler::sim_uuid;
 use tracing::Instrument;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState, process_action_with_xref};
@@ -134,14 +134,7 @@ impl ServerState {
         let initial = state.clone();
         let mut events = Vec::with_capacity(3);
 
-        let created = EntityEvent {
-            action: "Created".to_string(),
-            from_status: String::new(),
-            to_status: state.status.clone(),
-            timestamp: sim_now(),
-            params: serde_json::json!({}),
-            idempotency_key: None,
-        };
+        let created = EntityEvent::bootstrap(state.status.clone());
         push_synthetic_event(&mut state, &mut events, created);
 
         let no_xref = std::collections::BTreeMap::new();

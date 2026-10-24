@@ -851,6 +851,7 @@ mod tests {
             timestamp: ts,
             params: serde_json::json!({}),
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
         }
     }
 

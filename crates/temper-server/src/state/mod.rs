@@ -576,6 +576,9 @@ pub struct ServerState {
     pub observe_refresh_tx: Arc<tokio::sync::broadcast::Sender<ObserveRefreshHint>>,
     /// Listening port for HTTP REPL self-referencing calls.
     pub listen_port: Arc<std::sync::OnceLock<u16>>,
+    /// The local sandbox `temper serve` started, if any: WASM requests to its
+    /// origin carry its token. Set once by [`ServerState::set_local_sandbox`].
+    pub(crate) local_sandbox: Arc<std::sync::OnceLock<temper_wasm::LocalSandboxAccess>>,
     /// When true, missing `X-Tenant-Id` headers fall back to the first
     /// registered tenant (legacy single-tenant compat).  When false
     /// (multi-tenant mode), a missing header is rejected with 400.
@@ -653,6 +656,16 @@ impl ServerState {
     /// `*`). Every other tenant is redacted. See ADR-0166.
     pub fn export_llm_content(&self, tenant: &str) -> bool {
         tenant_exports_llm_content(&self.llm_content_export_tenants, tenant)
+    }
+
+    /// Record the local sandbox this process started at `base_url` and the
+    /// token it requires. WASM requests to that origin carry the token; guests
+    /// never see it. A process starts at most one, so a second call is refused.
+    pub fn set_local_sandbox(&self, base_url: &str, token: String) -> Result<(), String> {
+        let sandbox = temper_wasm::LocalSandboxAccess::new(base_url, token)?;
+        self.local_sandbox
+            .set(sandbox)
+            .map_err(|_| "a local sandbox is already set for this server".to_string())
     }
 
     /// Whether commons-mode write guardrails are active for a tenant.
@@ -828,6 +841,7 @@ impl ServerState {
             entity_observe_log: Arc::new(Mutex::new(BTreeMap::new())),
             observe_refresh_tx: Arc::new(observe_refresh_tx), // determinism-ok: broadcast for external observation
             listen_port: Arc::new(std::sync::OnceLock::new()),
+            local_sandbox: Arc::new(std::sync::OnceLock::new()),
             single_tenant_mode: true,
             suggestion_engine: Arc::new(RwLock::new(PolicySuggestionEngine::new())),
             verify_subprocess_bin: None,
@@ -1105,6 +1119,7 @@ impl ServerState {
             entity_observe_log: Arc::new(Mutex::new(BTreeMap::new())),
             observe_refresh_tx: Arc::new(observe_refresh_tx), // determinism-ok: broadcast for external observation
             listen_port: Arc::new(std::sync::OnceLock::new()),
+            local_sandbox: Arc::new(std::sync::OnceLock::new()),
             single_tenant_mode: false,
             suggestion_engine: Arc::new(RwLock::new(PolicySuggestionEngine::new())),
             verify_subprocess_bin: None,
