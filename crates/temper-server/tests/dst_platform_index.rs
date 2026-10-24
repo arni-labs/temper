@@ -150,7 +150,13 @@ async fn dst_p16_checks_deleted_state_without_tombstone() {
 
     for seed in 0..NUM_SEEDS {
         let (_guard, _clock, _id_gen) = install_deterministic_context(seed);
-        for action in ["Archive", "Deleted"] {
+        for action in [
+            "Archive",
+            "Deleted",
+            "Created",
+            "FieldsUpdated",
+            "FieldsReplaced",
+        ] {
             let harness = SimPlatformHarness::no_faults(seed);
             let tenant = "replay-deleted";
             harness
@@ -229,6 +235,36 @@ to = "Active"
                 .await
                 .unwrap();
             assert_p16_event_replay_fidelity(&harness).await.unwrap();
+
+            // The served and journaled statuses agree, but this spec action
+            // only permits Active -> Deleted. Structure must still be checked
+            // even when the action shares a kernel event's name.
+            let response = harness
+                .dispatch(tenant, "Issue", "invalid", "Touch", serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(response.success);
+            assert_eq!(response.state.status, "Active");
+            let invalid_id = format!("{tenant}:Issue:invalid");
+            let mut event = harness
+                .sim_event_store
+                .dump_journal(&ordinary_id)
+                .last()
+                .unwrap()
+                .clone();
+            event.payload["to_status"] = serde_json::json!("Active");
+            let sequence = harness.sim_event_store.dump_journal(&invalid_id).len() as u64;
+            harness
+                .sim_event_store
+                .append(&invalid_id, sequence, &[event])
+                .await
+                .unwrap();
+            let error = assert_p16_event_replay_fidelity(&harness)
+                .await
+                .expect_err("invalid spec transition must fail despite matching served state");
+            assert!(error.contains("has invalid transition"), "{error}");
+            assert!(error.contains(&format!("action='{action}'")), "{error}");
+            assert!(error.contains("from='Active', to='Active'"), "{error}");
         }
     }
 }

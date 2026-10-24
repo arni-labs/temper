@@ -659,10 +659,6 @@ pub async fn assert_p15_initial_state_correctness(
 
 // ── P16: Event Replay Through TransitionTable ───────────────────────────
 
-/// Journal actions that are not spec transitions: the bootstrap `Created`
-/// event, PATCH/PUT field updates and the terminal tombstone.
-const NON_SPEC_ACTIONS: &[&str] = &["Created", "FieldsUpdated", "FieldsReplaced", "Deleted"];
-
 /// For each indexed entity, walks its durable journal and checks the replay
 /// contract: an event's stored `to_status` is a fact.
 ///
@@ -725,7 +721,14 @@ pub async fn assert_p16_event_replay_fidelity(harness: &SimPlatformHarness) -> R
                         }
                     }
 
-                    if !NON_SPEC_ACTIONS.contains(&action) {
+                    // Only kernel events are exempt from spec structure checks.
+                    // A spec action can share any of these names; in particular,
+                    // `Deleted` alone does not identify the kernel tombstone.
+                    let field_update = matches!(action, "FieldsUpdated" | "FieldsReplaced")
+                        && event.event_type == action
+                        && from == to
+                        && !table.rules.iter().any(|rule| rule.name == action);
+                    if !bootstrap && !event.is_tombstone() && !field_update {
                         let valid = table.rules.iter().any(|rule| {
                             rule.name == action
                                 && (rule.from_states.is_empty()
