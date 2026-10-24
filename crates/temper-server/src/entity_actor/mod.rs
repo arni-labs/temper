@@ -25,4 +25,6 @@ pub use effects::{
 };
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
-pub use types::{EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};
+pub use types::{
+    EntityEvent, EntityMsg, EntityResponse, EntityState, ProcessedIdempotencyKey, StatusClock,
+};

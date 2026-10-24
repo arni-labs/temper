@@ -246,7 +246,9 @@ fn agent_ctx_for_composite_wasm_result(
     if composite_agent_ctx.idempotency_key.is_none()
         && let Some(idempotency_key) = dispatch_idempotency_key
     {
-        composite_agent_ctx.idempotency_key = Some(idempotency_key.to_string());
+        composite_agent_ctx.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+            idempotency_key.to_string(),
+        ));
     }
     composite_agent_ctx
 }
@@ -1069,7 +1071,14 @@ impl crate::state::ServerState {
                 "integration": integration.name.clone(),
             });
             return self
-                .dispatch_wasm_callback(ctx.entity_ref, cb, params, ctx.agent_ctx, ctx.mode)
+                .dispatch_wasm_callback(
+                    ctx.entity_ref,
+                    &integration.name,
+                    cb,
+                    params,
+                    ctx.agent_ctx,
+                    ctx.mode,
+                )
                 .await;
         }
         Ok(None)
@@ -1353,6 +1362,7 @@ impl crate::state::ServerState {
                         WASM_DISPATCH_PHASE_DISPATCH_CALLBACK,
                         self.dispatch_wasm_callback(
                             ctx.entity_ref,
+                            &integration.name,
                             callback_action,
                             callback_params,
                             ctx.agent_ctx,

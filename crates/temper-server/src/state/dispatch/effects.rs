@@ -544,13 +544,25 @@ impl crate::state::ServerState {
         scheduled_actions: &[ScheduledAction],
         agent_ctx: &AgentContext,
     ) {
-        for sched in scheduled_actions {
+        for (index, sched) in scheduled_actions.iter().enumerate() {
             let state = self.clone();
             let t = tenant.clone();
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = agent_ctx.clone();
+            let mut ctx = agent_ctx.clone();
+            // A scheduled action is a new request on this entity: it gets a
+            // key of its own, derived from the caller's so a retry of the
+            // scheduling request derives the same one.
+            ctx.idempotency_key = agent_ctx.idempotency_key.as_ref().map(|key| {
+                crate::idempotency::IdempotencyKey::FollowUp(
+                    crate::idempotency::derived_idempotency_key(
+                        key.as_str(),
+                        &format!("scheduled:{action}"),
+                        &index.to_string(),
+                    ),
+                )
+            });
             let delay = std::time::Duration::from_secs(sched.delay_seconds);
             let workflow_root_entity_type = ctx
                 .workflow_root_entity_type

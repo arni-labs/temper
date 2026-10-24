@@ -12,6 +12,8 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::idempotency::IdempotencyKey;
+
 mod observation_metadata;
 
 /// Maximum callbacks along one server-owned internal context lineage.
@@ -80,9 +82,10 @@ pub struct AgentContext {
     /// Stable workflow run identifier used as a queryable APM/log attribute.
     pub workflow_run_id: Option<String>,
     /// ADR-0048 sub-decision 5: idempotency key extracted from the
-    /// `Idempotency-Key` header. Threaded into `EntityMsg::Action` so the
-    /// actor can dedupe duplicate asks produced by dispatch-layer retries.
-    pub idempotency_key: Option<String>,
+    /// `Idempotency-Key` header, or derived for a follow-up. Threaded into
+    /// `EntityMsg::Action` so the actor can dedupe duplicate asks produced by
+    /// dispatch-layer retries.
+    pub idempotency_key: Option<IdempotencyKey>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -93,7 +96,18 @@ pub struct AgentContext {
 
 impl AgentContext {
     /// Admit a callback only within both the inline and cumulative budgets.
-    pub(crate) fn for_callback(&self) -> Result<Self, CallbackBudgetExceeded> {
+    ///
+    /// The callback is a new request, so it gets a follow-up key of its own,
+    /// derived from this context's key, the integration that sent it
+    /// (`source`) and the callback action. Its parameters are left out: a
+    /// retry of the parent runs the integration again, and the answer or its
+    /// measured duration may differ, yet it is the same callback. Sibling
+    /// callbacks differ by `source`.
+    pub(crate) fn for_callback(
+        &self,
+        source: &str,
+        callback_action: &str,
+    ) -> Result<Self, CallbackBudgetExceeded> {
         if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
             return Err(CallbackBudgetExceeded::InlineDepth);
         }
@@ -103,6 +117,13 @@ impl AgentContext {
         let mut next = self.clone();
         next.callback_depth += 1;
         next.callback_hops += 1;
+        next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
+            IdempotencyKey::FollowUp(crate::idempotency::derived_idempotency_key(
+                key.as_str(),
+                &format!("callback:{callback_action}"),
+                source,
+            ))
+        });
         Ok(next)
     }
 
@@ -290,7 +311,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(String::from);
+        .map(|key| IdempotencyKey::Request(key.to_string()));
     let workflow_root_entity_type = header_string(headers, "x-temper-workflow-root-entity-type");
     let workflow_root_entity_id = header_string(headers, "x-temper-workflow-root-entity-id");
     let workflow_run_id = header_string(headers, "x-temper-workflow-run-id");

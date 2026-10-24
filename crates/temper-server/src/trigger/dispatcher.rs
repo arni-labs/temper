@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use crate::idempotency::IdempotencyKey;
 use crate::request_context::AgentContext;
 use temper_authz::SecurityContext;
 use temper_runtime::tenant::TenantId;
@@ -457,11 +458,20 @@ fn resolve_trigger_principal(
 /// source's own record (`same_id`) a duplicate of the source action, which
 /// that record has just recorded under the key, and the reaction would be
 /// answered as done without running.
-fn reaction_idempotency_key(invoking_ctx: &AgentContext, rule_name: &str) -> Option<String> {
+///
+/// The key stays `{caller}:reaction:{rule}`, the form target entities have
+/// recorded in their durable key sets, so a retry still matches the reaction
+/// it already ran. It needs no hashing to stay short: a reaction chain stops
+/// at [`MAX_REACTION_DEPTH`], and every follow-up that can repeat without
+/// bound (a scheduled action, a callback) hashes its key.
+fn reaction_idempotency_key(
+    invoking_ctx: &AgentContext,
+    rule_name: &str,
+) -> Option<IdempotencyKey> {
     invoking_ctx
         .idempotency_key
         .as_ref()
-        .map(|key| format!("{key}:reaction:{rule_name}"))
+        .map(|key| IdempotencyKey::FollowUp(format!("{}:reaction:{rule_name}", key.as_str())))
 }
 
 fn effective_trigger_security_context(agent_ctx: &AgentContext) -> SecurityContext {

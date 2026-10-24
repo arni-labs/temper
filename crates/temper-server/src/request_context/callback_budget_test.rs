@@ -26,7 +26,7 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
             coverage[operation] += 1;
             if context.callback_depth == temper_runtime::reaction::MAX_REACTION_DEPTH {
                 assert_eq!(
-                    context.for_callback().unwrap_err(),
+                    context.for_callback("test", "Callback").unwrap_err(),
                     CallbackBudgetExceeded::InlineDepth,
                     "seed={seed}, admitted={admitted}"
                 );
@@ -47,9 +47,11 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
                 assert_eq!(context.agent_type.as_deref(), Some(service), "seed={seed}");
             }
             let previous_depth = context.callback_depth;
-            context = context.for_callback().unwrap_or_else(|error| {
-                panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
-            });
+            context = context
+                .for_callback("test", "Callback")
+                .unwrap_or_else(|error| {
+                    panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
+                });
             assert_eq!(context.callback_hops, admitted, "seed={seed}");
             assert_eq!(context.callback_depth, previous_depth + 1, "seed={seed}");
             assert_eq!(context.session_id.as_deref(), Some("session"));
@@ -82,7 +84,7 @@ fn assert_total_hops_exhausted(mut context: AgentContext, seed: u64) {
         context = service_identity(service).inherit_observability_from(&context);
         assert_eq!(context.callback_hops, 512, "seed={seed}");
         assert_eq!(
-            context.for_callback().unwrap_err(),
+            context.for_callback("test", "Callback").unwrap_err(),
             CallbackBudgetExceeded::TotalHops,
             "seed={seed}, service={service}"
         );
@@ -93,13 +95,13 @@ fn assert_total_hops_exhausted(mut context: AgentContext, seed: u64) {
 fn inline_callbacks_exhaust_without_a_detached_boundary() {
     let mut context = AgentContext::default();
     for admitted in 1..=8 {
-        context = context.for_callback().unwrap();
+        context = context.for_callback("test", "Callback").unwrap();
         assert_eq!(context.callback_depth, admitted);
         assert_eq!(context.callback_hops, admitted);
     }
     let inherited = AgentContext::for_service_inheriting("wasm-runtime", &context);
     assert_eq!(
-        inherited.for_callback().unwrap_err(),
+        inherited.for_callback("test", "Callback").unwrap_err(),
         CallbackBudgetExceeded::InlineDepth
     );
     assert_eq!(inherited.callback_hops, context.callback_hops);
@@ -127,7 +129,9 @@ fn detached_boundary_preserves_authority_and_idempotency() {
     let context = AgentContext {
         callback_depth: 8,
         callback_hops: 40,
-        idempotency_key: Some("request-key".into()),
+        idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+            "request-key".into(),
+        )),
         ..AgentContext::for_service("invoker")
     };
     let detached = context.for_background_task();

@@ -114,7 +114,9 @@ fn timer_armed_by_a_request_with_an_idempotency_key_fires() {
     let (_dir, backend) = turso();
     let server = Server::start(&backend, "keyed-arm");
     let keyed = AgentContext {
-        idempotency_key: Some("request-1".to_string()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            "request-1".to_string(),
+        )),
         ..person("alice")
     };
     server.act("Probe", "keyed", "Arm", &keyed);

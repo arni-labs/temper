@@ -279,8 +279,8 @@ pub(super) fn composite_parent_idempotency(
     agent_ctx: &AgentContext,
     callback_params: &Value,
 ) -> String {
-    if let Some(key) = agent_ctx.idempotency_key.as_deref() {
-        return key.to_string();
+    if let Some(key) = agent_ctx.idempotency_key.as_ref() {
+        return key.as_str().to_string();
     }
 
     let mut hasher = Sha256::new();

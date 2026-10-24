@@ -565,7 +565,10 @@ impl crate::state::ServerState {
                         entity_id,
                         action,
                         agent_ctx,
-                        dispatch_idempotency_key: agent_ctx.idempotency_key.as_deref(),
+                        dispatch_idempotency_key: agent_ctx
+                            .idempotency_key
+                            .as_ref()
+                            .map(crate::idempotency::IdempotencyKey::as_str),
                         action_params: &params,
                         await_integration,
                     };
@@ -691,10 +694,10 @@ impl crate::state::ServerState {
         let cross_for_retry = related;
         let authorization_precondition_for_retry = expected_authorization_precondition;
         let idempotency_key = Some(agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
-            format!(
+            crate::idempotency::IdempotencyKey::Request(format!(
                 "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
                 sim_uuid()
-            )
+            ))
         }));
         // W2 phase: ask_reply — round-trip through the retry layer to the
         // actor and back. Aggregates with other phase spans by prefix.
@@ -863,18 +866,39 @@ impl crate::state::ServerState {
             entity_id,
             action,
             agent_ctx,
-            dispatch_idempotency_key: idempotency_key.as_deref(),
+            dispatch_idempotency_key: idempotency_key
+                .as_ref()
+                .map(crate::idempotency::IdempotencyKey::as_str),
             action_params: &action_params,
             await_integration,
         };
-        let response = self.run_post_dispatch_effects(&ctx, response).await;
-        if response.success
-            && let Some(ref idem_key) = idempotency_key
-        {
-            let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-            self.idempotency_cache
-                .mark_effects_applied(&actor_key, idem_key);
-        }
+        // A successful reply's effects run once per key: a retry that reaches
+        // the actor while another dispatcher runs them waits for it, and a
+        // retry after they ran does not run them again. Either way the retry
+        // answers at the state that dispatcher completed, never with the
+        // actor's copy from before the effects ran.
+        let response = match idempotency_key.as_ref() {
+            Some(idem_key) if response.success => {
+                let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+                match self
+                    .idempotency_cache
+                    .claim_effects(&actor_key, idem_key.as_str())
+                    .await
+                {
+                    crate::idempotency::EffectsClaim::Applied(completed) => {
+                        crate::idempotency::retry_reply(response, *completed)
+                    }
+                    crate::idempotency::EffectsClaim::Owner(owner) => {
+                        let response = self.run_post_dispatch_effects(&ctx, response).await;
+                        if response.success {
+                            owner.complete(&idem_key.request(action, &action_params), &response);
+                        }
+                        response
+                    }
+                }
+            }
+            _ => self.run_post_dispatch_effects(&ctx, response).await,
+        };
         if response.success {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }

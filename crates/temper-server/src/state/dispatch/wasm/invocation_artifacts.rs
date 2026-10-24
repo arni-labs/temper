@@ -133,6 +133,7 @@ impl crate::state::ServerState {
             return super::dispatch_wasm_callback_boxed(
                 self,
                 ctx.entity_ref,
+                integration_name,
                 cb,
                 params,
                 ctx.agent_ctx,
@@ -152,12 +153,13 @@ impl crate::state::ServerState {
     pub(super) async fn dispatch_wasm_callback(
         &self,
         entity_ref: WasmEntityRef<'_>,
+        integration: &str,
         callback_action: &str,
         callback_params: serde_json::Value,
         agent_ctx: &AgentContext,
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
-        let callback_ctx = match agent_ctx.for_callback() {
+        let callback_ctx = match agent_ctx.for_callback(integration, callback_action) {
             Ok(context) => context,
             Err(error) => {
                 return self

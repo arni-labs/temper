@@ -124,7 +124,9 @@ fn build_state(tenant: &str) -> ServerState {
 
 fn caller(key: &str) -> AgentContext {
     AgentContext {
-        idempotency_key: Some(key.to_string()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            key.to_string(),
+        )),
         ..AgentContext::for_service(SERVICE)
     }
 }
@@ -176,4 +178,44 @@ async fn a_same_record_reaction_runs_when_the_request_carries_an_idempotency_key
     assert_eq!(read(&state, &tenant, "Room", "audiences").await.1, 1);
     assert_eq!(read(&state, &tenant, "Room", "guests").await.1, 1);
     assert_eq!(read(&state, &tenant, "Door", "opened").await.1, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_matches_the_reaction_key_its_target_already_recorded() {
+    // Target records keep reaction keys in their durable key sets in the form
+    // `{caller}:reaction:{rule}`, with the rule named `{entity}:{action}:{trigger}`,
+    // across restarts and upgrades. A retry of the source request must derive
+    // that same key, or the reaction runs twice.
+    let tenant = TenantId::new("rooms");
+    let state = build_state("rooms");
+    let recorded = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Door",
+            "r1",
+            "Open",
+            serde_json::json!({}),
+            &caller("request-1:reaction:Room:SetAudience:audience_opens_the_door"),
+        )
+        .await
+        .expect("Open");
+    assert!(recorded.success, "{:?}", recorded.error);
+
+    let retry = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Room",
+            "r1",
+            "SetAudience",
+            serde_json::json!({}),
+            &caller("request-1"),
+        )
+        .await
+        .expect("SetAudience");
+    assert!(retry.success, "{:?}", retry.error);
+    assert_eq!(
+        read(&state, &tenant, "Door", "opened").await.1,
+        1,
+        "the door already recorded this reaction and did not open again"
+    );
 }
