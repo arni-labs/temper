@@ -260,7 +260,6 @@ impl ServerState {
             backend,
             &serde_json::json!({}),
             blob_store.as_ref(),
-            true,
         )
         .await
         {
