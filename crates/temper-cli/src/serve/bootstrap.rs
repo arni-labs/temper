@@ -644,8 +644,18 @@ pub(super) async fn bootstrap_installed_apps(
         // Replay through the real installer every startup. Presence-only checks
         // are not sufficient because an installed app's bundle can drift:
         // updated IOA/Cedar/WASM/ADR assets must refresh even when the tenant
-        // already has entity tables from an older install.
-        match temper_platform::install_os_app(state, &tenant, &app_name).await {
+        // already has entity tables from an older install. A replay of a stored
+        // install keeps its recorded origin; only an `--app` request is a new
+        // install.
+        let install = match source {
+            AppBootstrapSource::Persisted => {
+                temper_platform::restore_os_app(state, &tenant, &app_name).await
+            }
+            AppBootstrapSource::Cli => {
+                temper_platform::install_os_app(state, &tenant, &app_name).await
+            }
+        };
+        match install {
             Ok(result) => match source {
                 AppBootstrapSource::Persisted => {
                     let all: Vec<String> = result

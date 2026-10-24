@@ -176,7 +176,8 @@ fn push_unique_cedar_text(
 ///
 /// Reads the durable `tenant_installed_apps` table and reinstalls any
 /// apps whose specs are not already present in the SpecRegistry.
-/// Uses the production [`os_apps::install_os_app`] code path — no shortcuts.
+/// Uses the production installer through [`os_apps::restore_os_app`], which
+/// keeps each stored record's origin. It takes no shortcuts.
 ///
 /// This is the **production code path** — identical logic runs at CLI boot
 /// (Phase 8b) and during DST restart simulation.
@@ -216,7 +217,7 @@ pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStor
             continue;
         }
 
-        match os_apps::install_os_app(state, &tenant, &app_name).await {
+        match os_apps::restore_os_app(state, &tenant, &app_name).await {
             Ok(result) => {
                 let all: Vec<String> = result
                     .added

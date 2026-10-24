@@ -47,12 +47,12 @@ use entity_aliases::{
 };
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
+pub(crate) use reconcile::{
+    InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
+};
 pub use reconcile::{
     os_app_bundle_digest, os_app_dir_bundle_digest, os_app_dir_bundle_digests, reconcile_os_app,
     resolve_os_app_install_order, resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
-};
-pub(crate) use reconcile::{
-    tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
 };
 pub(crate) use runtime_heal::{
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
@@ -1059,11 +1059,34 @@ pub async fn install_os_app(
     tenant: &str,
     app_name: &str,
 ) -> Result<InstallResult, String> {
+    install_os_app_and_dependencies(state, tenant, app_name, InstallOrigin::Request).await
+}
+
+/// Replay a stored install of `app_name` and its dependencies at boot.
+///
+/// It runs the same installer as [`install_os_app`], but a replay is not a new
+/// install: it leaves the stored record's origin (Genesis registry and version,
+/// or local) as recorded, so any number of restarts converge on the same record.
+pub async fn restore_os_app(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Result<InstallResult, String> {
+    install_os_app_and_dependencies(state, tenant, app_name, InstallOrigin::Replay).await
+}
+
+async fn install_os_app_and_dependencies(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    origin: InstallOrigin,
+) -> Result<InstallResult, String> {
     let order = resolve_tenant_os_app_install_order(tenant, &[app_name.to_string()])?;
 
     let mut final_result = None;
     for app in order {
-        let result = install_os_app_without_dependencies(state, tenant, &app).await?;
+        let result =
+            install_os_app_with_plan(state, tenant, &app, OsAppInstallPlan::all(), origin).await?;
         if app == app_name {
             final_result = Some(result);
         }
@@ -1071,19 +1094,12 @@ pub async fn install_os_app(
     final_result.ok_or_else(|| format!("OS app '{app_name}' produced no install result"))
 }
 
-async fn install_os_app_without_dependencies(
-    state: &PlatformState,
-    tenant: &str,
-    app_name: &str,
-) -> Result<InstallResult, String> {
-    install_os_app_with_plan(state, tenant, app_name, OsAppInstallPlan::all()).await
-}
-
 pub(super) async fn install_os_app_with_plan(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     plan: OsAppInstallPlan,
+    origin: InstallOrigin,
 ) -> Result<InstallResult, String> {
     let _serialized = install_guard::tenant(tenant).await;
     let app_dir = {
@@ -1594,7 +1610,8 @@ pub(super) async fn install_os_app_with_plan(
         Vec::new()
     };
 
-    reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle).await;
+    reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle, origin)
+        .await;
 
     Ok(InstallResult {
         added,

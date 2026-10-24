@@ -396,11 +396,22 @@ pub(crate) async fn tenant_has_durable_wasm_for_bundle(
     })
 }
 
+/// Whose word an install carries out, which decides the origin it records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallOrigin {
+    /// An install request for the app files this server holds: the record's
+    /// origin becomes `local`. A Genesis install writes its own origin after it.
+    Request,
+    /// A boot replay of a stored install, which restores it as recorded.
+    Replay,
+}
+
 async fn record_app_install_metadata(
     state: &PlatformState,
     tenant: &str,
     digest: &OsAppBundleDigest,
     status: &str,
+    origin: InstallOrigin,
 ) {
     let Some(ps) = state
         .server
@@ -410,6 +421,28 @@ async fn record_app_install_metadata(
     else {
         return;
     };
+
+    let stored = match origin {
+        InstallOrigin::Request => None,
+        InstallOrigin::Replay => match ps.get_installed_app(tenant, &digest.app_name).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(
+                    tenant,
+                    app = %digest.app_name,
+                    error = %error,
+                    "Failed to read the stored install record; a replay leaves it as it is"
+                );
+                return;
+            }
+        },
+    };
+    // A replay never changes the origin. A Genesis record names a registry
+    // version, so it stays exactly as recorded. A local record's version is the
+    // local files, so its digests follow what the replay installed.
+    if stored.is_some_and(|stored| stored.source_kind != "local") {
+        return;
+    }
 
     let record = InstalledAppRecord {
         tenant: tenant.to_string(),
@@ -450,9 +483,10 @@ pub(super) async fn record_app_install_metadata_for_bundle(
     tenant: &str,
     app_name: &str,
     bundle: &AppBundle,
+    origin: InstallOrigin,
 ) {
     let bundle_digest = digest_app_bundle(Some(tenant), app_name, bundle);
-    record_app_install_metadata(state, tenant, &bundle_digest, "installed").await;
+    record_app_install_metadata(state, tenant, &bundle_digest, "installed", origin).await;
 }
 
 /// Reconcile one app without recursively processing dependencies.
@@ -540,7 +574,9 @@ pub async fn reconcile_os_app(
                     seed = plan.seed,
                     "OS app changed; running delta reconcile"
                 );
-                let install = install_os_app_with_plan(state, tenant, app_name, plan).await?;
+                let install =
+                    install_os_app_with_plan(state, tenant, app_name, plan, InstallOrigin::Request)
+                        .await?;
                 return Ok(OsAppReconcileResult::Installed {
                     app_name: app_name.to_string(),
                     bundle_digest: digest.bundle_digest,
@@ -559,8 +595,14 @@ pub async fn reconcile_os_app(
         }
     }
 
-    let install =
-        install_os_app_with_plan(state, tenant, app_name, OsAppInstallPlan::all()).await?;
+    let install = install_os_app_with_plan(
+        state,
+        tenant,
+        app_name,
+        OsAppInstallPlan::all(),
+        InstallOrigin::Request,
+    )
+    .await?;
     Ok(OsAppReconcileResult::Installed {
         app_name: app_name.to_string(),
         bundle_digest: digest.bundle_digest,
