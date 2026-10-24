@@ -1317,6 +1317,7 @@ impl ServerState {
             session_id: None,
             intent: None,
             observation_metadata: None,
+            callback_depth: 0,
         };
         self.record_entity_observe_event_with_seq(
             tenant.as_str(),
@@ -1632,6 +1633,7 @@ impl ServerState {
             session_id: None,
             intent: None,
             observation_metadata: None,
+            callback_depth: 0,
         };
         self.record_entity_observe_event_with_seq(
             tenant.as_str(),

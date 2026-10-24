@@ -2,44 +2,50 @@
 //!
 //! A seed chooses inline callbacks, detached successes and compensation
 //! identities. Identity provisioning is a deterministic fixture: the production
-//! service constructor generates an unrelated correlation UUID. The budget,
-//! task boundary and context inheritance methods run unmodified. Real WASM and
+//! service constructor generates an unrelated correlation UUID. The chain, task
+//! boundary and context inheritance methods run unmodified. Real WASM and
 //! compensation wiring is exercised separately by strict_native_callbacks.
 use super::*;
 use temper_runtime::scheduler::DeterministicRng;
 
+/// A loop through detached tasks takes the same step lap after lap, far past
+/// the 512 laps the removed hop budget allowed, and its callback depth keeps
+/// counting them; inline, the step a context is inside of is still refused on
+/// every lap.
 #[test]
-fn dst_detached_schedules_preserve_both_callback_bounds() {
+fn detached_laps_run_on_while_inline_repeats_stop() {
+    // Four times the removed 512-hop budget.
+    const LAPS: u32 = 2048;
     let mut coverage = [0_u32; 4];
-    for seed in 1..=1024 {
+    for seed in 1..=256 {
         let mut rng = DeterministicRng::new(seed);
         let mut context = AgentContext {
             session_id: Some("session".into()),
             workflow_run_id: Some("workflow".into()),
-            intent: Some("bounded workflow".into()),
+            intent: Some("long workflow".into()),
             observation_metadata: BTreeMap::from([("test.seed".into(), seed.to_string())]),
             ..AgentContext::default()
         };
-        // The oracle is the approved 512-hop contract, independent of the implementation constant.
-        for admitted in 1..=512 {
+        for lap in 1..=LAPS {
             let operation = rng.next_bound(4);
             coverage[operation] += 1;
-            // Inline, the step the context is inside of cannot run again,
-            // however few steps the chain has.
-            if let Some(inside) = context.inline_chain.steps().last() {
-                assert!(
-                    matches!(
-                        context.for_callback("Job", "job", &inside.action),
-                        Err(CallbackBudgetExceeded::RepeatedStep(_))
-                    ),
-                    "seed={seed}, admitted={admitted}"
+            if operation == 0 {
+                // Inline, every lap is a new step of the same chain.
+                let previous_steps = context.inline_chain.steps().len();
+                context = context
+                    .for_callback("Job", "job", &format!("Step{lap}"))
+                    .unwrap_or_else(|error| panic!("seed={seed}, lap={lap}: {error}"));
+                assert_eq!(
+                    context.inline_chain.steps().len(),
+                    previous_steps + 1,
+                    "seed={seed}"
                 );
-            }
-            if operation != 0 {
-                let previous_hops = context.callback_hops;
+            } else {
+                // Across a detached boundary the loop takes the same step again.
+                let depth = context.callback_depth;
                 context = context.for_background_task();
                 assert!(context.inline_chain.is_empty(), "seed={seed}");
-                assert_eq!(context.callback_hops, previous_hops, "seed={seed}");
+                assert_eq!(context.callback_depth, depth, "seed={seed}");
                 let service = match operation {
                     1 => "wasm-runtime",
                     2 => "platform-dispatch",
@@ -48,53 +54,39 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
                 };
                 context = service_identity(service).inherit_observability_from(&context);
                 assert_eq!(context.agent_type.as_deref(), Some(service), "seed={seed}");
+                context = context
+                    .for_callback("Job", "job", "Tick")
+                    .unwrap_or_else(|error| {
+                        panic!("seed={seed}, lap={lap}, operation={operation}: {error}")
+                    });
             }
-            let previous_steps = context.inline_chain.steps().len();
-            context = context
-                .for_callback("Job", "job", &format!("Step{admitted}"))
-                .unwrap_or_else(|error| {
-                    panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
-                });
-            assert_eq!(context.callback_hops, admitted, "seed={seed}");
-            assert_eq!(
-                context.inline_chain.steps().len(),
-                previous_steps + 1,
-                "seed={seed}"
+            // Every lap is one callback deeper, whichever boundary it crossed.
+            assert_eq!(context.callback_depth, u64::from(lap), "seed={seed}");
+            // Inline, the step the context is inside of cannot run again.
+            let inside = context.inline_chain.steps().last().cloned().unwrap();
+            assert!(
+                matches!(
+                    context.for_callback("Job", "job", &inside.action),
+                    Err(RepeatedCallback(_))
+                ),
+                "seed={seed}, lap={lap}"
             );
             assert_eq!(context.session_id.as_deref(), Some("session"));
             assert_eq!(context.workflow_run_id.as_deref(), Some("workflow"));
-            assert_eq!(context.intent.as_deref(), Some("bounded workflow"));
+            assert_eq!(context.intent.as_deref(), Some("long workflow"));
             assert_eq!(context.observation_metadata["test.seed"], seed.to_string());
         }
-        assert_total_hops_exhausted(context, seed);
     }
     assert!(coverage.iter().all(|count| *count > 0), "{coverage:?}");
 }
 
-// Provisioning identity is outside the callback-budget state machine. The
+// Provisioning identity is outside the callback chain's state machine. The
 // production preservation method below is the one used by for_service_inheriting.
 fn service_identity(service: &str) -> AgentContext {
     AgentContext {
         agent_id: Some(format!("service:{service}")),
         agent_type: Some(service.into()),
         ..AgentContext::default()
-    }
-}
-
-fn assert_total_hops_exhausted(mut context: AgentContext, seed: u64) {
-    for service in [
-        "wasm-runtime",
-        "platform-dispatch",
-        "integration-compensation",
-    ] {
-        context = context.for_background_task();
-        context = service_identity(service).inherit_observability_from(&context);
-        assert_eq!(context.callback_hops, 512, "seed={seed}");
-        assert_eq!(
-            context.for_callback("Job", "job", "Next").unwrap_err(),
-            CallbackBudgetExceeded::TotalHops,
-            "seed={seed}, service={service}"
-        );
     }
 }
 
@@ -107,12 +99,10 @@ fn inline_callbacks_stop_at_their_first_repeated_step() {
         context = context
             .for_callback("Job", "job", &format!("Step{admitted}"))
             .unwrap();
-        assert_eq!(context.callback_hops, admitted);
+        assert_eq!(context.callback_depth, admitted);
     }
     let inherited = AgentContext::for_service_inheriting("wasm-runtime", &context);
-    let Err(CallbackBudgetExceeded::RepeatedStep(repeat)) =
-        inherited.for_callback("Job", "job", "Step60")
-    else {
+    let Err(RepeatedCallback(repeat)) = inherited.for_callback("Job", "job", "Step60") else {
         panic!("a repeated step must be refused");
     };
     assert_eq!(
@@ -122,11 +112,11 @@ fn inline_callbacks_stop_at_their_first_repeated_step() {
     );
     // The same action on another entity is a different step.
     assert!(inherited.for_callback("Job", "other", "Step60").is_ok());
-    assert_eq!(inherited.callback_hops, context.callback_hops);
+    assert_eq!(inherited.callback_depth, context.callback_depth);
 }
 
 #[test]
-fn request_headers_cannot_supply_callback_budgets() {
+fn request_headers_cannot_supply_runtime_owned_context() {
     let mut headers = HeaderMap::new();
     for name in [
         "x-callback-depth",
@@ -138,14 +128,14 @@ fn request_headers_cannot_supply_callback_budgets() {
     }
     let context = extract_agent_context(&headers);
     assert!(context.inline_chain.is_empty());
-    assert_eq!(context.callback_hops, 0);
+    assert_eq!(context.callback_depth, 0);
     assert!(context.security_ctx.is_none());
 }
 
 #[test]
 fn detached_boundary_preserves_authority_and_idempotency() {
     let context = AgentContext {
-        callback_hops: 40,
+        callback_depth: 40,
         idempotency_key: Some("request-key".into()),
         ..AgentContext::for_service("invoker")
     }
@@ -153,7 +143,7 @@ fn detached_boundary_preserves_authority_and_idempotency() {
     let detached = context.for_background_task();
     assert!(!context.inline_chain.is_empty());
     assert!(detached.inline_chain.is_empty());
-    assert_eq!(detached.callback_hops, 40);
+    assert_eq!(detached.callback_depth, 40);
     assert_eq!(detached.agent_id, context.agent_id);
     assert_eq!(detached.agent_type, context.agent_type);
     assert_eq!(detached.idempotency_key, context.idempotency_key);
@@ -161,4 +151,9 @@ fn detached_boundary_preserves_authority_and_idempotency() {
         serde_json::to_value(&detached.security_ctx).unwrap(),
         serde_json::to_value(&context.security_ctx).unwrap()
     );
+    // The detached task's first step may be the one its parent is inside of,
+    // one callback deeper.
+    let next = detached.for_callback("Job", "job", "Start").unwrap();
+    assert_eq!(next.callback_depth, 41);
+    assert!(context.for_callback("Job", "job", "Start").is_err());
 }

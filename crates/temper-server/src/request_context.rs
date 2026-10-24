@@ -17,21 +17,11 @@ mod observation_metadata;
 
 pub use inline_chain::{ChainStep, InlineChain, RepeatedStep, StepEntity};
 
-/// Maximum callbacks along one server-owned internal context lineage.
-///
-/// This is not a global fanout quota and is not persisted across restarts or
-/// propagated through external HTTP requests.
-pub const MAX_CALLBACK_HOPS: u32 = 512;
-
+/// A callback that is a step its inline chain has already taken. See
+/// [`InlineChain`] for why a repeat, and not a count, is where a chain stops.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum CallbackBudgetExceeded {
-    /// The callback is a step its inline chain has already taken; see
-    /// [`InlineChain`] for why that, and not a depth, is where a chain stops.
-    #[error("integration callback not run: it would repeat a step its chain is already in ({0})")]
-    RepeatedStep(RepeatedStep),
-    #[error("integration callback hop budget exhausted")]
-    TotalHops,
-}
+#[error("integration callback not run: it would repeat a step its chain is already in ({0})")]
+pub(crate) struct RepeatedCallback(pub(crate) RepeatedStep);
 
 /// Agent identity context extracted from HTTP headers and credential resolution.
 ///
@@ -50,8 +40,13 @@ pub struct AgentContext {
     /// Runtime-owned steps of the inline execution this context runs inside;
     /// never populated from request headers. See [`InlineChain`].
     pub inline_chain: InlineChain,
-    /// Runtime-owned cumulative callback count; never populated from request headers.
-    pub callback_hops: u32,
+    /// How many integration callbacks deep this context's lineage is: one more
+    /// at each callback, carried across detached tasks (background
+    /// integrations, compensation, state timers, scheduled actions).
+    /// Runtime-owned, never populated from request headers. It is plain data
+    /// that events and spans report, so a long lineage is visible; nothing
+    /// refuses on it.
+    pub callback_depth: u64,
     /// Full Cedar security context when known at the request boundary.
     ///
     /// External HTTP entrypoints populate this after credential resolution so
@@ -99,24 +94,17 @@ pub struct AgentContext {
 
 impl AgentContext {
     /// Admit a callback running `action` on an entity, unless its inline
-    /// chain has already taken that step or the lineage has used its hops.
+    /// chain has already taken that step.
     pub(crate) fn for_callback(
         &self,
         entity_type: &str,
         entity_id: &str,
         action: &str,
-    ) -> Result<Self, CallbackBudgetExceeded> {
+    ) -> Result<Self, RepeatedCallback> {
         let step = self.inline_chain.step(entity_type, entity_id, action);
-        let inline_chain = self
-            .inline_chain
-            .then(step)
-            .map_err(CallbackBudgetExceeded::RepeatedStep)?;
-        if self.callback_hops >= MAX_CALLBACK_HOPS {
-            return Err(CallbackBudgetExceeded::TotalHops);
-        }
         let mut next = self.clone();
-        next.inline_chain = inline_chain;
-        next.callback_hops += 1;
+        next.inline_chain = self.inline_chain.then(step).map_err(RepeatedCallback)?;
+        next.callback_depth += 1;
         Ok(next)
     }
 
@@ -141,10 +129,12 @@ impl AgentContext {
         self
     }
 
-    /// Begin a detached task without replenishing its causal callback budget.
+    /// Begin a detached task: nobody waits for it, so it starts a new inline
+    /// chain. Identity, authority, idempotency, callback depth and
+    /// observability carry over.
     ///
-    /// Call only at a runtime-owned spawn boundary: the parent inline chain
-    /// ends there, but its callback lineage continues in the detached task.
+    /// Call only at a runtime-owned spawn boundary. See [`InlineChain`] for
+    /// what ends a loop through detached tasks.
     pub(crate) fn for_background_task(&self) -> Self {
         let mut next = self.clone();
         next.inline_chain = InlineChain::default();
@@ -159,7 +149,7 @@ impl AgentContext {
     pub fn system() -> Self {
         Self {
             inline_chain: InlineChain::default(),
-            callback_hops: 0,
+            callback_depth: 0,
             security_ctx: Some(SecurityContext::system()),
             agent_id: Some("system".to_string()),
             session_id: None,
@@ -196,7 +186,7 @@ impl AgentContext {
 
         Self {
             inline_chain: InlineChain::default(),
-            callback_hops: 0,
+            callback_depth: 0,
             security_ctx: Some(security_ctx),
             agent_id: Some(service_id),
             session_id: None,
@@ -229,10 +219,11 @@ impl AgentContext {
         Self::for_service(service_name).inherit_observability_from(parent)
     }
 
-    /// Copy the execution budget and non-authority observability fields from a parent.
+    /// Copy the inline chain, callback depth and non-authority observability
+    /// fields from a parent.
     pub fn inherit_observability_from(mut self, parent: &AgentContext) -> Self {
         self.inline_chain = parent.inline_chain.clone();
-        self.callback_hops = parent.callback_hops;
+        self.callback_depth = parent.callback_depth;
         self.session_id = parent.session_id.clone();
         self.intent = parent.intent.clone();
         self.trace_id = parent.trace_id.clone();
@@ -332,7 +323,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
 
     AgentContext {
         inline_chain: InlineChain::default(),
-        callback_hops: 0,
+        callback_depth: 0,
         security_ctx: None,
         agent_id: None,
         session_id,
@@ -464,5 +455,5 @@ fn remote_parent(
 mod tests;
 
 #[cfg(test)]
-#[path = "request_context/callback_budget_test.rs"]
-mod callback_budget_tests;
+#[path = "request_context/callback_chain_test.rs"]
+mod callback_chain_tests;

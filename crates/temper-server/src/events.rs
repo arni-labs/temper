@@ -46,6 +46,14 @@ pub struct EntityStateChange {
     /// Generic metadata for correlating runtime events with producer-specific context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_metadata: Option<BTreeMap<String, String>>,
+    /// How many integration callbacks deep the action's lineage is
+    /// (`AgentContext::callback_depth`); omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub callback_depth: u64,
+}
+
+fn is_zero(depth: &u64) -> bool {
+    *depth == 0
 }
 
 /// SSE endpoint handler: streams entity state changes to connected clients.
@@ -96,11 +104,19 @@ mod tests {
             session_id: None,
             intent: None,
             observation_metadata: None,
+            callback_depth: 0,
         };
         let json = serde_json::to_string(&change).unwrap();
         assert!(json.contains("\"entity_type\":\"Order\""));
         assert!(json.contains("\"action\":\"SubmitOrder\""));
         assert!(json.contains("\"agent_id\":\"agent-1\""));
         assert!(!json.contains("session_id"));
+        assert!(!json.contains("callback_depth"));
+        let deep = EntityStateChange {
+            callback_depth: 600,
+            ..change
+        };
+        let json = serde_json::to_value(&deep).unwrap();
+        assert_eq!(json["callback_depth"], 600);
     }
 }

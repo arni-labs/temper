@@ -145,7 +145,7 @@ impl crate::state::ServerState {
             };
         let callback_ctx = match parent_ctx.for_callback(entity_type, entity_id, &action) {
             Ok(context) => context,
-            Err(budget_error) => {
+            Err(repeat) => {
                 self.record_generated_callback_refusal(
                     WasmEntityRef {
                         tenant,
@@ -153,7 +153,7 @@ impl crate::state::ServerState {
                         entity_id,
                     },
                     &action,
-                    &budget_error.to_string(),
+                    &repeat.to_string(),
                 );
                 self.surface_dropped_integration_failure(
                     tenant,
@@ -162,7 +162,7 @@ impl crate::state::ServerState {
                     triggering_action,
                     status.as_str(),
                     error,
-                    &budget_error.to_string(),
+                    &repeat.to_string(),
                 );
                 return;
             }
