@@ -142,6 +142,7 @@ impl EntityActor {
 pub(super) fn reply(state: &EntityState, outcome: Result<(), String>) -> EntityResponse {
     EntityResponse {
         success: outcome.is_ok(),
+        refusal: None,
         state: state.clone(),
         error: outcome.err(),
         custom_effects: vec![],
