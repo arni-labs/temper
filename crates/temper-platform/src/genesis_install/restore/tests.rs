@@ -101,10 +101,8 @@ async fn rollback_uses_the_cache_an_app_install_made() {
     assert!(guide.contains("prior local version"), "{guide}");
 }
 
-/// One boot of a fresh server over `ps` and `data_dir`, restoring the stored
-/// installs the way `temper serve` does: cache roots first, then a replay of
-/// each stored install. Returns how many Genesis installs it restored.
-async fn boot(data_dir: &Path, ps: &Arc<SimPlatformStore>) -> usize {
+/// A fresh server over `ps` and `data_dir`.
+fn server_on(data_dir: &Path, ps: &Arc<SimPlatformStore>) -> PlatformState {
     let mut platform = PlatformState::new(None);
     platform.server.data_dir = data_dir.to_path_buf();
     platform
@@ -113,6 +111,14 @@ async fn boot(data_dir: &Path, ps: &Arc<SimPlatformStore>) -> usize {
             temper_store_sim::SimEventStore::no_faults(0),
             Some(ps.clone()),
         ));
+    platform
+}
+
+/// One boot of a fresh server over `ps` and `data_dir`, restoring the stored
+/// installs the way `temper serve` does: cache roots first, then a replay of
+/// each stored install. Returns how many Genesis installs it restored.
+async fn boot(data_dir: &Path, ps: &Arc<SimPlatformStore>) -> usize {
+    let platform = server_on(data_dir, ps);
     let restored = restore_genesis_registry_cache_roots(&platform).await;
     for (tenant, app_name) in ps.list_all_installed_apps().await.expect("installed apps") {
         crate::os_apps::restore_os_app(&platform, &tenant, &app_name)
@@ -180,4 +186,48 @@ async fn a_genesis_install_is_restored_as_recorded_after_every_restart() {
             "restart {restart}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_replay_installs_nothing_when_only_another_bundle_of_the_name_is_here() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let tenant = format!("{TENANT}-stand-in");
+    let app_name = "restore-stand-in-notes";
+    let version = "3".repeat(40);
+    // The recorded Genesis version, whose files this server no longer has.
+    let registry_files = tempfile::tempdir().expect("registry files");
+    write_app(registry_files.path(), app_name, "registry version");
+    let installed = InstalledAppRecord {
+        tenant: tenant.clone(),
+        app_ref: format!("acme/{app_name}@{version}"),
+        version_hash: version.clone(),
+        registry_url: "http://127.0.0.1:9".to_string(),
+        registry_tenant: "default".to_string(),
+        status: "installed".to_string(),
+        ..recorded(registry_files.path(), app_name)
+    };
+    // Another bundle of the same name, in the catalog every tenant shares.
+    let shared = tempfile::tempdir().expect("shared apps");
+    write_app(shared.path(), app_name, "shared version");
+    crate::os_apps::add_os_apps_dir(shared.path().to_path_buf());
+    let ps = Arc::new(store());
+    ps.record_installed_app_metadata(&installed)
+        .await
+        .expect("record the Genesis install");
+
+    let platform = server_on(data_dir.path(), &ps);
+    let error = crate::os_apps::restore_os_app(&platform, &tenant, app_name)
+        .await
+        .expect_err("the replay refuses the shared bundle");
+    assert!(error.contains("unavailable"), "{error}");
+    assert!(error.contains(&installed.bundle_digest), "{error}");
+
+    let stored = ps
+        .get_installed_app(&tenant, app_name)
+        .await
+        .expect("read the install record")
+        .expect("the install record is kept");
+    assert_eq!(stored.source_kind, "genesis");
+    assert_eq!(stored.app_ref, installed.app_ref);
+    assert_eq!(stored.bundle_digest, installed.bundle_digest);
 }

@@ -406,6 +406,52 @@ pub(crate) enum InstallOrigin {
     Replay,
 }
 
+/// Refuse a boot replay whose bundle is not the version its record names.
+///
+/// A Genesis record names a registry version by its bundle digest. When that
+/// version's files are gone and cannot be fetched, the app name can still
+/// resolve to another bundle, such as a shared app of the same name. A replay
+/// then installs nothing: the app is unavailable until a later boot finds the
+/// recorded version, and the record stays as it is. A local record's version
+/// is whatever local files the server holds, so any bundle matches it.
+pub(super) async fn ensure_replay_bundle_is_recorded(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    bundle: &AppBundle,
+) -> Result<(), String> {
+    let Some(ps) = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+    else {
+        return Ok(());
+    };
+    let stored = ps
+        .get_installed_app(tenant, app_name)
+        .await
+        .map_err(|error| {
+            format!(
+                "os-app '{app_name}' for tenant '{tenant}' is unavailable: its install record \
+             cannot be read ({error}), so its version cannot be checked; nothing was installed"
+            )
+        })?;
+    let Some(stored) = stored.filter(|stored| stored.source_kind != "local") else {
+        return Ok(());
+    };
+    let resolved = digest_app_bundle(Some(tenant), app_name, bundle);
+    if resolved.bundle_digest == stored.bundle_digest {
+        return Ok(());
+    }
+    Err(format!(
+        "os-app '{app_name}' for tenant '{tenant}' is unavailable: its {} install '{}' \
+         records bundle {}, but the only bundle of that name here is {}; nothing was \
+         installed, and the record is kept for the next boot",
+        stored.source_kind, stored.app_ref, stored.bundle_digest, resolved.bundle_digest
+    ))
+}
+
 async fn record_app_install_metadata(
     state: &PlatformState,
     tenant: &str,

@@ -232,7 +232,7 @@ pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStor
                 );
             }
             Err(e) => {
-                tracing::warn!("Failed to restore app '{app_name}' for '{tenant}': {e}");
+                tracing::error!("Stored app '{app_name}' for '{tenant}' was not restored: {e}");
             }
         }
     }

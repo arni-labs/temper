@@ -1116,6 +1116,9 @@ pub(super) async fn install_os_app_with_plan(
             app_dir.display()
         )
     })?;
+    if origin == InstallOrigin::Replay {
+        reconcile::ensure_replay_bundle_is_recorded(state, tenant, app_name, &bundle).await?;
+    }
     // A bundle without the binary of a required module is refused before any
     // spec, policy or install row is written, rather than installing an app
     // that answers 503 at request time (ARN-61/ARN-273).

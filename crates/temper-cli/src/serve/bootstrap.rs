@@ -685,7 +685,23 @@ pub(super) async fn bootstrap_installed_apps(
                 }
             },
             Err(e) => {
-                eprintln!("  Warning: failed to install app '{app_name}' for '{tenant}': {e}");
+                // A stored install that does not come back is an outage of that
+                // app, so it is logged as an error; a `--app` request only warns.
+                let message = match source {
+                    AppBootstrapSource::Persisted => {
+                        tracing::error!(
+                            tenant = %tenant,
+                            app = %app_name,
+                            error = %e,
+                            "Stored app install was not restored"
+                        );
+                        format!("Error: stored app '{app_name}' for '{tenant}' was not restored")
+                    }
+                    AppBootstrapSource::Cli => {
+                        format!("Warning: failed to install app '{app_name}' for '{tenant}'")
+                    }
+                };
+                eprintln!("  {message}: {e}");
             }
         }
     }
