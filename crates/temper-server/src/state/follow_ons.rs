@@ -49,6 +49,15 @@ impl PendingFollowOns {
             .remove(key);
         debug_assert!(removed, "a firing follow-on was claimed when scheduled");
     }
+
+    /// Number of follow-ons waiting to fire.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0
+            .lock()
+            .expect("pending follow-ons lock poisoned")
+            .len()
+    }
 }
 
 #[cfg(test)]

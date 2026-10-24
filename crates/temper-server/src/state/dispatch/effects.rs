@@ -542,6 +542,9 @@ impl crate::state::ServerState {
         scheduled_actions: &[ScheduledAction],
         agent_ctx: &AgentContext,
     ) {
+        // One transition's follow-ons are scheduled at one moment, so the same
+        // action with the same delay always lands in the same due second.
+        let scheduled_at = sim_now().timestamp();
         for sched in scheduled_actions {
             let state = self.clone();
             let t = tenant.clone();
@@ -567,9 +570,7 @@ impl crate::state::ServerState {
                 entity_type: et.clone(),
                 entity_id: eid.clone(),
                 action: action.clone(),
-                due_second: sim_now()
-                    .timestamp()
-                    .saturating_add_unsigned(sched.delay_seconds),
+                due_second: scheduled_at.saturating_add_unsigned(sched.delay_seconds),
             };
             if !self.pending_follow_ons.claim(pending.clone()) {
                 tracing::debug!(
@@ -963,3 +964,7 @@ mod strict_timer_tests {
 #[cfg(test)]
 #[path = "causal_projection_test.rs"]
 mod causal_projection_tests;
+
+#[cfg(test)]
+#[path = "scheduled_follow_on_test.rs"]
+mod scheduled_follow_on_tests;
