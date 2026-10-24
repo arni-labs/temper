@@ -270,3 +270,59 @@ async fn a_batch_of_unchanged_projections_leaves_the_catalog_rows_untouched() {
     assert_eq!(stored(&store, &tenant, "run-a").await, a);
     assert_eq!(stored(&store, &tenant, "run-b").await, b);
 }
+
+#[tokio::test]
+async fn a_catalog_read_reports_the_newest_unchanged_projection() {
+    // The row is not rewritten, but what a read serves (the sequence and the
+    // event counters in the state) is what the skipped write would have
+    // stored, so a client comparing or ordering by them sees the actor's.
+    let store = make_store("projection-unchanged-read").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let run = "run-read";
+    let content = fields("Waiting", &["started"]);
+    project(&store, &tenant, run, "Waiting", &content, 7).await;
+    for seq in 8..=20 {
+        project(&store, &tenant, run, "Waiting", &content, seq).await;
+    }
+    let batched = "run-read-batch";
+    for seq in 3..=9 {
+        store
+            .upsert_query_projections(&tenant, &[batch_entry(batched, "Waiting", &content, seq)])
+            .await
+            .expect("batch upsert");
+    }
+
+    let rows = store
+        .load_entity_catalog_rows(
+            &tenant,
+            ENTITY_TYPE,
+            &[run.to_string(), batched.to_string()],
+        )
+        .await
+        .expect("catalog rows");
+    assert_eq!(rows.len(), 2);
+    // Ordered by entity id.
+    let (row, batched_row) = (&rows[0], &rows[1]);
+    assert_eq!(row.entity_id, run);
+    assert_eq!(row.sequence_nr, 20);
+    assert_eq!(row.fields, content);
+    assert_eq!(
+        row.state.as_ref().expect("state"),
+        &actor_state(run, "Waiting", &content, 20)
+    );
+    assert_eq!(batched_row.sequence_nr, 9);
+    assert_eq!(
+        batched_row.state.as_ref().expect("state"),
+        &actor_state(batched, "Waiting", &content, 9)
+    );
+
+    let exported = store
+        .export_query_projections(Some(&tenant))
+        .await
+        .expect("export");
+    let sequences = exported
+        .iter()
+        .map(|row| (row.entity_id.as_str(), row.sequence_nr))
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, [(run, 20), (batched, 9)]);
+}
