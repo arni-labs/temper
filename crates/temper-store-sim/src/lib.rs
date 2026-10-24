@@ -168,6 +168,10 @@ struct SimEventStoreInner {
     /// Pending scheduled actions, committed with the event that armed them
     /// under the same lock. `(tenant, entity_type, entity_id, arm_id) -> row`.
     scheduled_actions: BTreeMap<(String, String, String, String), ScheduledActionRecord>,
+    /// While set, `delete_scheduled_action` never completes: the process stops
+    /// after a fire's event is written and before its row is removed. See
+    /// `hold_scheduled_action_deletes`.
+    scheduled_deletes_held: bool,
     /// ADR-0155 backfill watermark: `(tenant, entity_type) -> vector_set` — each
     /// completed type mapped to the sorted comma-joined declared vector-path names the
     /// backfill covered. Mirrors `key_index_watermark`.
@@ -202,6 +206,7 @@ impl SimEventStore {
                 key_index_watermark: BTreeMap::new(),
                 vector_index: BTreeMap::new(),
                 scheduled_actions: BTreeMap::new(),
+                scheduled_deletes_held: false,
                 vector_index_watermark: BTreeMap::new(),
             })),
         }
@@ -225,6 +230,15 @@ impl SimEventStore {
                 .pending_concurrency_violations
                 .insert(persistence_id.to_string(), count);
         }
+    }
+
+    /// While `held`, every `delete_scheduled_action` call waits forever and
+    /// removes nothing, as when the process stops between a fire's event and
+    /// the removal of its row. A test sets it, lets a fire run, stops the
+    /// process, and clears it before the next boot.
+    pub fn hold_scheduled_action_deletes(&self, held: bool) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner.scheduled_deletes_held = held;
     }
 
     /// Make the next `count` `read_events` calls for `persistence_id` fail with a
@@ -632,6 +646,14 @@ impl EventStore for SimEventStore {
         entity_id: &str,
         arm_id: &str,
     ) -> Result<(), PersistenceError> {
+        let held = self
+            .inner
+            .lock()
+            .expect("SimEventStore lock poisoned") // ci-ok: infallible lock
+            .scheduled_deletes_held;
+        if held {
+            std::future::pending::<()>().await;
+        }
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         inner.scheduled_actions.remove(&(
             tenant.to_string(),

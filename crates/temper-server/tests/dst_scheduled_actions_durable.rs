@@ -235,8 +235,8 @@ async fn fired_at(state: &ServerState, id: &str, action: &str) -> Vec<DateTime<U
 }
 
 /// One seed's run. Ok: how many rows the stop left behind a fire whose event
-/// was already written, which the boot fires again, and how it stopped.
-fn run_seed(seed: u64) -> Result<(usize, String), String> {
+/// was already written, which the boot fires again.
+fn run_seed(seed: u64) -> Result<usize, String> {
     let clock = Arc::new(ProcessClock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
     let world = World {
@@ -286,9 +286,10 @@ fn run_seed(seed: u64) -> Result<(usize, String), String> {
         }
         settle().await;
         // Stop at a seeded time. Half the time, stop at an armed action's due
-        // instant instead, a seeded few turns after its fire's event is
-        // written: its row may not be removed yet, so the next boot fires it
-        // again and only its idempotency key keeps that from running twice.
+        // instant instead: either at once, or after its fire's event is
+        // written but before its row is removed (the store holds the
+        // removal), so the next boot fires it again and only its idempotency
+        // key keeps that from running twice.
         let now = sim_now();
         let dues: Vec<(&String, DateTime<Utc>)> = arms
             .iter()
@@ -299,30 +300,18 @@ fn run_seed(seed: u64) -> Result<(usize, String), String> {
             .collect();
         if !dues.is_empty() && rng.next_bound(2) == 0 {
             let (id, due) = dues[rng.next_bound(dues.len())];
-            until(due).await;
-            let journal = format!("{TENANT}:Job:{id}");
-            let mut waited = 0;
-            while waited < 20_000 && !journal_has(&world.events, &journal, "Fire").await {
-                tokio::task::yield_now().await;
-                waited += 1;
+            if rng.next_bound(2) == 0 {
+                until(due).await;
+                run.trace.push(format!("stop at {id}'s due {}", sim_now()));
+            } else {
+                world.events.hold_scheduled_action_deletes(true);
+                until(due).await;
+                settle().await;
+                run.trace.push(format!(
+                    "stop at {} after {id}'s Fire, its row not yet removed",
+                    sim_now()
+                ));
             }
-            let written = waited < 20_000;
-            let row_then = world
-                .events
-                .list_scheduled_actions(TENANT)
-                .await
-                .unwrap()
-                .iter()
-                .any(|row| &row.entity_id == id);
-            let turns = rng.next_bound(8);
-            for _ in 0..turns {
-                tokio::task::yield_now().await;
-            }
-            run.trace.push(format!(
-                "stop at {} at {id}'s due: Fire written {written} after {waited} turns, \
-                 row then {row_then}, stopped {turns} turns later",
-                sim_now()
-            ));
         } else {
             until(now + chrono::Duration::seconds(rng.next_bound(3600) as i64)).await;
             let turns = rng.next_bound(200);
@@ -336,6 +325,7 @@ fn run_seed(seed: u64) -> Result<(usize, String), String> {
     })?;
     let downtime = Duration::from_secs(rng.next_bound(7200) as u64);
     first.kill(&world, downtime);
+    world.events.hold_scheduled_action_deletes(false);
     let left_behind = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -435,13 +425,7 @@ fn run_seed(seed: u64) -> Result<(usize, String), String> {
         Ok(())
     });
     second.kill(&world, Duration::ZERO);
-    let stop = run
-        .trace
-        .iter()
-        .find(|line| line.starts_with("stop at"))
-        .cloned()
-        .unwrap_or_default();
-    result.map(|()| (left_behind, stop))
+    result.map(|()| left_behind)
 }
 
 #[test]
@@ -449,13 +433,9 @@ fn dst_scheduled_actions_outlive_a_restart() {
     // Seeds that broke each invariant, and the first such seed's report.
     let mut broken: BTreeMap<String, (Vec<u64>, String)> = BTreeMap::new();
     let mut left_behind = 0;
-    let mut stops = Vec::new();
     for seed in 0..SEEDS {
         match run_seed(seed) {
-            Ok((rows, stop)) => {
-                left_behind += rows;
-                stops.push(format!("seed {seed}: {stop}"));
-            }
+            Ok(rows) => left_behind += rows,
             Err(report) => {
                 let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
                 let entry = broken
@@ -479,7 +459,6 @@ fn dst_scheduled_actions_outlive_a_restart() {
     // cannot catch it.
     assert!(
         left_behind > 0,
-        "no stop over {SEEDS} seeds left a row behind a written fire:\n{}",
-        stops.join("\n")
+        "no stop over {SEEDS} seeds left a row behind a written fire"
     );
 }
