@@ -563,6 +563,10 @@ async fn a_sub_write_refused_after_another_server_moved_the_release_runs_on_fail
             error.contains(refusal),
             "{path}: Missed should carry the refusal {refusal:?}, got {error:?}"
         );
+        assert!(
+            !error.contains("would fail"),
+            "{path}: the refusal should come from the write, not the composite's preflight, got {error:?}"
+        );
     }
 }
 
@@ -570,31 +574,41 @@ async fn a_sub_write_refused_after_another_server_moved_the_release_runs_on_fail
 /// reports a concurrency violation, as the Turso store does when it retries a
 /// write whose first answer was lost. Read again, the journal holds the
 /// `Approve`: the sub-write landed, so it is not a refusal, `on_failure` does
-/// not run, and the Release is approved once.
+/// not run, and the Release is approved once. With the atomic batch the whole
+/// batch landed behind the violation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sub_write_that_landed_behind_a_concurrency_violation_does_not_run_on_failure() {
-    let store = SimEventStore::no_faults(43);
-    let stack = StorageStack::from_sim(store.clone(), None);
-    let state = notice_server(&release_with_own_effect(), Some(stack), PERMIT_ALL);
-    act(&state, "Release", RELEASE, "Hold").await;
-    store.lose_next_append_answers(RELEASE_JOURNAL, 1);
+    for (path, release_ioa) in [
+        ("atomic batch", RELEASE_IOA.to_string()),
+        ("per-write", release_with_own_effect()),
+    ] {
+        let store = SimEventStore::no_faults(43);
+        let stack = StorageStack::from_sim(store.clone(), None);
+        let state = notice_server(&release_ioa, Some(stack), PERMIT_ALL);
+        act(&state, "Release", RELEASE, "Hold").await;
+        store.lose_next_append_answers(RELEASE_JOURNAL, 1);
 
-    act(&state, "Notice", NOTICE, "PutItLive").await;
+        act(&state, "Notice", NOTICE, "PutItLive").await;
 
-    let (release, _) = settle(&state, "Release", RELEASE, &["Live"]).await;
-    assert_eq!(release, "Live", "the Approve landed");
-    assert_eq!(
-        store.pending_lost_append_answers(RELEASE_JOURNAL),
-        0,
-        "the Approve's answer was lost"
-    );
-    notice_stays_answered(&state, "a sub-write that landed does not run on_failure").await;
-    let approvals = store
-        .read_events(RELEASE_JOURNAL, 0)
-        .await
-        .expect("read the Release journal")
-        .into_iter()
-        .filter(|event| event.event_type == "Approve")
-        .count();
-    assert_eq!(approvals, 1, "the Approve is written once");
+        let (release, _) = settle(&state, "Release", RELEASE, &["Live"]).await;
+        assert_eq!(release, "Live", "{path}: the Approve landed");
+        assert_eq!(
+            store.pending_lost_append_answers(RELEASE_JOURNAL),
+            0,
+            "{path}: the Approve's answer was lost"
+        );
+        notice_stays_answered(
+            &state,
+            &format!("{path}: a sub-write that landed does not run on_failure"),
+        )
+        .await;
+        let approvals = store
+            .read_events(RELEASE_JOURNAL, 0)
+            .await
+            .expect("read the Release journal")
+            .into_iter()
+            .filter(|event| event.event_type == "Approve")
+            .count();
+        assert_eq!(approvals, 1, "{path}: the Approve is written once");
+    }
 }

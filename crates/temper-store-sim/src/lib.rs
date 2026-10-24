@@ -274,12 +274,13 @@ impl SimEventStore {
             .unwrap_or(0)
     }
 
-    /// Make the next `count` single-journal appends to `persistence_id` write
-    /// their events and then answer with a concurrency violation, then behave
-    /// normally. This is what a store that retries a write whose answer was
-    /// lost reports (the Turso store does): the write landed, and the retry
-    /// finds the journal already past its expected sequence. `count == 0`
-    /// clears the injection.
+    /// Make the next `count` appends to `persistence_id`, alone or in a batch,
+    /// write their events and then answer with a concurrency violation, then
+    /// behave normally. This is what a store that retries a write whose answer
+    /// was lost reports (the Turso store does): the write landed, and the
+    /// retry finds the journal already past its expected sequence. A batch
+    /// that holds such a journal lands whole and answers with the violation.
+    /// `count == 0` clears the injection.
     pub fn lose_next_append_answers(&self, persistence_id: &str, count: usize) {
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         if count == 0 {
@@ -985,6 +986,22 @@ impl EventStore for SimEventStore {
                 persistence_id: append.persistence_id.clone(),
                 sequence_nr: new_seq,
             });
+        }
+
+        // The batch landed; a lost answer for any of its journals reaches the
+        // caller as the retry's concurrency violation (see
+        // `lose_next_append_answers`).
+        let mut lost = None;
+        for (append, result) in appends.iter().zip(&results) {
+            if inner.take_lost_append_answer(&append.persistence_id) {
+                lost = lost.or(Some(PersistenceError::ConcurrencyViolation {
+                    expected: append.expected_sequence,
+                    actual: result.sequence_nr,
+                }));
+            }
+        }
+        if let Some(error) = lost {
+            return Err(error);
         }
 
         Ok(results)
