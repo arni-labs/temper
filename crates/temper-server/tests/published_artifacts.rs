@@ -15,23 +15,17 @@ const FILE_ID: &str = "file-published-artifact-test";
 
 fn secrets_vault(blob_endpoint: &str) -> SecretsVault {
     let vault = SecretsVault::new(&[9u8; 32]);
-    vault
-        .cache_secret(
-            TENANT,
-            "published_blob_public_base_url",
-            format!("{blob_endpoint}/public"),
-        )
-        .expect("cache public base URL");
-    vault
-        .cache_secret(TENANT, "published_blob_endpoint", blob_endpoint.to_string())
-        .expect("cache public blob endpoint");
-    vault
-        .cache_secret(
-            TENANT,
-            "published_blob_bucket",
-            "published-bucket".to_string(),
-        )
-        .expect("cache public blob bucket");
+    vault.cache_secret(
+        TENANT,
+        "published_blob_public_base_url",
+        format!("{blob_endpoint}/public"),
+    );
+    vault.cache_secret(TENANT, "published_blob_endpoint", blob_endpoint.to_string());
+    vault.cache_secret(
+        TENANT,
+        "published_blob_bucket",
+        "published-bucket".to_string(),
+    );
     vault
 }
 
@@ -131,23 +125,17 @@ async fn publish_file_artifact_persists_metadata_through_postgres_metadata_store
     let tenant = format!("published-artifacts-{}", uuid::Uuid::new_v4());
 
     let vault = SecretsVault::new(&[10u8; 32]);
-    vault
-        .cache_secret(
-            &tenant,
-            "published_blob_public_base_url",
-            format!("{}/public", mock_blob.uri()),
-        )
-        .expect("cache public base URL");
-    vault
-        .cache_secret(&tenant, "published_blob_endpoint", mock_blob.uri())
-        .expect("cache public blob endpoint");
-    vault
-        .cache_secret(
-            &tenant,
-            "published_blob_bucket",
-            "published-bucket".to_string(),
-        )
-        .expect("cache public blob bucket");
+    vault.cache_secret(
+        &tenant,
+        "published_blob_public_base_url",
+        format!("{}/public", mock_blob.uri()),
+    );
+    vault.cache_secret(&tenant, "published_blob_endpoint", mock_blob.uri());
+    vault.cache_secret(
+        &tenant,
+        "published_blob_bucket",
+        "published-bucket".to_string(),
+    );
 
     let mut state = ServerState::from_registry(
         ActorSystem::new("published-artifacts-postgres-test"),

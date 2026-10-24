@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod tombstone;
+pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
+
 /// Event type used for the parent-journal record of a Composite action.
 ///
 /// Concrete sub-write events remain the state-changing events on their target
