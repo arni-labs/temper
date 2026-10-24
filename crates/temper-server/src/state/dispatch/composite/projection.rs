@@ -22,10 +22,7 @@ impl ServerState {
         let mut projection_upserts = Vec::new();
 
         for stream in streams.values().filter(|stream| !stream.events.is_empty()) {
-            self.cache_entity_status(
-                format!("{tenant}:{}:{}", stream.entity_type, stream.entity_id),
-                stream.state.status.clone(),
-            );
+            self.cache_entity_status(tenant, &stream.state);
             self.index_composite_stream(tenant, stream)?;
             self.clear_commons_storage_projection_cache_for_entity(&stream.entity_type);
 
