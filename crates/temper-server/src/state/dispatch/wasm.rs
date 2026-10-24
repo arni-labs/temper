@@ -261,8 +261,9 @@ fn agent_ctx_for_composite_wasm_result(
 /// per-write path (no journal, or a sub-write with its own effects), a write
 /// refused after an earlier one applied leaves that earlier write in place.
 ///
-/// Other errors, such as storage failures or a reload after the batch
-/// committed, are not refusals: the writes may have landed, so the declared
+/// Other errors, such as storage failures, a reload after the batch
+/// committed, or a sub-write that committed before its query projection
+/// failed, are not refusals: the writes may have landed, so the declared
 /// `on_failure` does not run for them and the error propagates.
 fn composite_sub_writes_refused(error: &DispatchError) -> bool {
     matches!(

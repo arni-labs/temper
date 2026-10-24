@@ -7,15 +7,22 @@
 //! declared `on_failure` (`Missed`) runs with the refusal as its `error`.
 //! Before, the refusal left the Notice in `Answered` as if the answer had moved
 //! the Release. Each case runs with an event journal (the atomic batch) and
-//! without one (the per-write path).
+//! without one (the per-write path). A sub-write that commits is not a
+//! refusal, even when a later step of its write reports a failure.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
 use temper_runtime::ActorSystem;
+use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
+use temper_server::storage::{
+    BackendLabel, BoxedEventStore, QueryPlaneStore, QueryProjectionFieldsRow,
+};
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -113,6 +120,28 @@ to = "Out"
 params = []
 "#;
 
+/// The Release with an `Approve` that schedules a later action, so the
+/// composite writes it on the per-write path even with an event journal.
+fn release_with_own_effect() -> String {
+    let approve = "from = [\"Held\"]\nto = \"Live\"\nparams = []\n";
+    assert_eq!(
+        RELEASE_IOA.matches(approve).count(),
+        1,
+        "Approve is declared once"
+    );
+    RELEASE_IOA.replace(
+        approve,
+        &format!("{approve}effect = [\"schedule('Retire', 3600)\"]\n"),
+    ) + r#"
+[[action]]
+name = "Retire"
+kind = "internal"
+from = ["Live"]
+to = "Out"
+params = []
+"#
+}
+
 const PERMIT_ALL: &str = "permit(principal, action, resource);";
 
 /// Cedar refuses the Release's `Approve`, and allows everything else.
@@ -164,16 +193,24 @@ fn answer_module() -> String {
 }
 
 fn notice_state(journal: Journal, policy: &str) -> ServerState {
+    let stack = match journal {
+        Journal::Atomic => Some(StorageStack::from_sim(SimEventStore::no_faults(29), None)),
+        Journal::PerWrite => None,
+    };
+    notice_server(RELEASE_IOA, stack, policy)
+}
+
+fn notice_server(release_ioa: &str, stack: Option<StorageStack>, policy: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
         parse_csdl(CSDL).expect("test CSDL should parse"),
         CSDL.to_string(),
-        &[("Notice", NOTICE_IOA), ("Release", RELEASE_IOA)],
+        &[("Notice", NOTICE_IOA), ("Release", release_ioa)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new("composite-refusal"), registry);
-    if let Journal::Atomic = journal {
-        state.set_storage_stack(StorageStack::from_sim(SimEventStore::no_faults(29), None));
+    if let Some(stack) = stack {
+        state.set_storage_stack(stack);
     }
     let tenant = TenantId::default();
     state
@@ -320,5 +357,103 @@ async fn a_sub_write_refused_by_cedar_runs_the_composites_on_failure() {
             "Held",
             "{journal:?}: the denied sub-write leaves the Release as it was"
         );
+    }
+}
+
+/// A query plane whose Release projections fail while `fail_release` is set.
+#[derive(Default)]
+struct ReleaseProjectionFails {
+    fail_release: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl QueryPlaneStore for ReleaseProjectionFails {
+    async fn upsert_projection(
+        &self,
+        _tenant: &str,
+        entity_type: &str,
+        _entity_id: &str,
+        _status: &str,
+        _fields: &serde_json::Value,
+        _state: &serde_json::Value,
+        _sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        if entity_type == "Release" && self.fail_release.load(Ordering::SeqCst) {
+            return Err(PersistenceError::Storage(
+                "release projection unavailable".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn remove_projection(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _entity_id: &str,
+    ) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+
+    async fn query_field_index(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _where_clause: &str,
+        _params: Vec<String>,
+    ) -> Result<Option<Vec<String>>, PersistenceError> {
+        Ok(None)
+    }
+
+    async fn load_projection_fields_many(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _entity_ids: &[String],
+        _field_names: &[&str],
+    ) -> Result<Option<Vec<QueryProjectionFieldsRow>>, PersistenceError> {
+        Ok(None)
+    }
+
+    async fn projected_entity_counts_by_tenant(
+        &self,
+    ) -> Result<Option<Vec<(String, u64)>>, PersistenceError> {
+        Ok(None)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_write_that_committed_does_not_run_the_composites_on_failure() {
+    let plane = Arc::new(ReleaseProjectionFails::default());
+    let stack = StorageStack::new(
+        BackendLabel::Sim,
+        BoxedEventStore::new(SimEventStore::no_faults(31)),
+        None,
+        None,
+        None,
+        None,
+        Some(plane.clone() as Arc<dyn QueryPlaneStore>),
+        None,
+        None,
+        None,
+    );
+    let state = notice_server(&release_with_own_effect(), Some(stack), PERMIT_ALL);
+    act(&state, "Release", RELEASE, "Hold").await;
+    // The Release's `Approve` commits, then its query projection fails, so its
+    // write answers unsuccessfully although the Release moved.
+    plane.fail_release.store(true, Ordering::SeqCst);
+
+    act(&state, "Notice", NOTICE, "PutItLive").await;
+
+    let (release, _) = settle(&state, "Release", RELEASE, &["Live"]).await;
+    assert_eq!(release, "Live", "the sub-write committed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            status_of(&state, "Notice", NOTICE).await,
+            "Answered",
+            "a committed sub-write does not run on_failure"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

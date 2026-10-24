@@ -201,14 +201,17 @@ impl crate::state::ServerState {
                 .await?;
 
             if !response.success {
-                return Err(DispatchError::Conflict(response.error.unwrap_or_else(
-                    || {
-                        format!(
-                            "composite {entity_type}.{action} sub-write {} failed",
-                            prepared.idx
-                        )
-                    },
-                )));
+                let error = response.error.clone().unwrap_or_else(|| {
+                    format!(
+                        "composite {entity_type}.{action} sub-write {} failed",
+                        prepared.idx
+                    )
+                });
+                return Err(sub_write_failure(
+                    &response,
+                    &prepared.idempotency_key,
+                    error,
+                ));
             }
         }
 
