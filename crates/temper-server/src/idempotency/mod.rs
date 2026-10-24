@@ -401,7 +401,7 @@ fn estimated_entry_bytes(actor_key: &str, idem_key: &str, response: &EntityRespo
         + response
             .scheduled_actions
             .iter()
-            .map(|scheduled| named(&scheduled.action))
+            .map(|scheduled| named(&scheduled.action) + scheduled.arm_id.len())
             .sum::<usize>();
     ENTRY_OVERHEAD_BYTES
         + 2 * (actor_key.len() + idem_key.len())

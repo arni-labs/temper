@@ -12,6 +12,7 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+pub(crate) mod armed_by;
 mod observation_metadata;
 
 /// Maximum callbacks along one server-owned internal context lineage.

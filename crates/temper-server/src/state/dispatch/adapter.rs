@@ -484,6 +484,7 @@ impl crate::state::ServerState {
             let outcome = retry::ask_with_backoff::<_, EntityResponse, _>(
                 &actor,
                 || EntityMsg::Action {
+                    caller: None,
                     name: "Revoke".to_string(),
                     params: serde_json::json!({}),
                     related: BTreeMap::new(),

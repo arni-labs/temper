@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use temper_runtime::persistence::{
-    EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend, PersistenceAppendResult,
-    PersistenceEnvelope, PersistenceError,
+    CommitRows, EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend,
+    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -165,6 +165,9 @@ struct SimEventStoreInner {
     /// exact-scan kNN access path. Unlike the key index this has no uniqueness
     /// constraint; it is derived, rebuildable ranking state.
     vector_index: BTreeMap<(String, String, String, String, String), Vec<f32>>,
+    /// Pending scheduled actions, committed with the event that armed them
+    /// under the same lock. `(tenant, entity_type, entity_id, arm_id) -> row`.
+    scheduled_actions: BTreeMap<(String, String, String, String), ScheduledActionRecord>,
     /// ADR-0155 backfill watermark: `(tenant, entity_type) -> vector_set` — each
     /// completed type mapped to the sorted comma-joined declared vector-path names the
     /// backfill covered. Mirrors `key_index_watermark`.
@@ -198,6 +201,7 @@ impl SimEventStore {
                 key_index: BTreeMap::new(),
                 key_index_watermark: BTreeMap::new(),
                 vector_index: BTreeMap::new(),
+                scheduled_actions: BTreeMap::new(),
                 vector_index_watermark: BTreeMap::new(),
             })),
         }
@@ -354,19 +358,28 @@ impl EventStore for SimEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        self.append_with_index_rows(persistence_id, expected_sequence, events, &[], &[], false)
-            .await
+        self.append_with_rows(
+            persistence_id,
+            expected_sequence,
+            events,
+            CommitRows::default(),
+        )
+        .await
     }
 
-    async fn append_with_index_rows(
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
+        let CommitRows {
+            key_rows,
+            vector_rows,
+            reconcile_vectors,
+            scheduled_actions,
+        } = rows;
         let append_delay = {
             let mut inner = self
                 .inner
@@ -582,7 +595,51 @@ impl EventStore for SimEventStore {
             }
         }
 
+        // The scheduled actions the transition armed, under the SAME lock: they
+        // exist exactly when the event does. A repeated arm keeps its row.
+        for action in scheduled_actions {
+            inner
+                .scheduled_actions
+                .entry((
+                    action.tenant.clone(),
+                    action.entity_type.clone(),
+                    action.entity_id.clone(),
+                    action.arm_id.clone(),
+                ))
+                .or_insert_with(|| action.clone());
+        }
+
         Ok(new_seq)
+    }
+
+    async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        Ok(inner
+            .scheduled_actions
+            .values()
+            .filter(|action| action.tenant == tenant)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner.scheduled_actions.remove(&(
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+            arm_id.to_string(),
+        ));
+        Ok(())
     }
 
     async fn backfill_entity_keys(

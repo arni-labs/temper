@@ -291,6 +291,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
     let cancelled: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "test"}),
                 related: BTreeMap::new(),
@@ -388,6 +389,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
     let stale: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "stale"}),
                 related: BTreeMap::new(),
@@ -406,6 +408,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
     let applied: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "fresh"}),
                 related: BTreeMap::new(),
@@ -422,6 +425,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
     let retry: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "fresh"}),
                 related: BTreeMap::new(),
@@ -530,6 +534,7 @@ async fn dst_add_item_then_submit() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "AddItem".into(),
                 params: serde_json::json!({"ProductId": "prod-1"}),
                 related: std::collections::BTreeMap::new(),
@@ -548,6 +553,7 @@ async fn dst_add_item_then_submit() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "SubmitOrder".into(),
                 params: serde_json::json!({"ShippingAddressId": "addr-1"}),
                 related: std::collections::BTreeMap::new(),
@@ -582,6 +588,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
     let first: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "IngestPack".into(),
                 params: params.clone(),
                 related: std::collections::BTreeMap::new(),
@@ -600,6 +607,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
     let duplicate: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "IngestPack".into(),
                 params,
                 related: std::collections::BTreeMap::new(),
@@ -636,6 +644,7 @@ async fn dst_cannot_submit_without_items() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "SubmitOrder".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -680,6 +689,7 @@ async fn dst_full_order_lifecycle() {
         let r: EntityResponse = actor_ref
             .ask(
                 EntityMsg::Action {
+                    caller: None,
                     name: action.into(),
                     params,
                     related: std::collections::BTreeMap::new(),
@@ -716,6 +726,7 @@ async fn dst_cancel_from_draft() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".into(),
                 params: serde_json::json!({"Reason": "changed mind"}),
                 related: std::collections::BTreeMap::new(),
@@ -748,6 +759,7 @@ async fn dst_cannot_cancel_shipped_order() {
         let _: EntityResponse = actor_ref
             .ask(
                 EntityMsg::Action {
+                    caller: None,
                     name: action.to_string(),
                     params: serde_json::json!({}),
                     related: std::collections::BTreeMap::new(),
@@ -764,6 +776,7 @@ async fn dst_cannot_cancel_shipped_order() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -797,6 +810,7 @@ async fn dst_multiple_actors_independent() {
     let _: EntityResponse = a1
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "CancelOrder".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -812,6 +826,7 @@ async fn dst_multiple_actors_independent() {
     let _: EntityResponse = a2
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "AddItem".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -1132,27 +1147,18 @@ impl temper_runtime::persistence::EventStore for AppendFuseStore {
             .await
     }
 
-    async fn append_with_index_rows(
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'_>,
     ) -> Result<u64, temper_runtime::persistence::PersistenceError> {
         if let Some(e) = self.fuse_err() {
             return Err(e);
         }
         self.inner
-            .append_with_index_rows(
-                persistence_id,
-                expected_sequence,
-                events,
-                key_rows,
-                vector_rows,
-                reconcile_vectors,
-            )
+            .append_with_rows(persistence_id, expected_sequence, events, rows)
             .await
     }
 
@@ -1683,6 +1689,7 @@ async fn reserved_field_update_event_names_are_refused_as_actions() {
         let response: EntityResponse = actor_ref
             .ask(
                 EntityMsg::Action {
+                    caller: None,
                     name: reserved.to_string(),
                     params: serde_json::json!({"Customer": "Mallory"}),
                     related: BTreeMap::new(),

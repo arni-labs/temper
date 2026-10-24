@@ -690,6 +690,9 @@ impl crate::state::ServerState {
         let params_for_retry = params;
         let cross_for_retry = related;
         let authorization_precondition_for_retry = expected_authorization_precondition;
+        // The actor keeps the caller's identity on any scheduled action the
+        // transition arms, so the action fires as them after a restart too.
+        let caller = Arc::new(agent_ctx.clone());
         let idempotency_key = Some(agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
             format!(
                 "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
@@ -709,6 +712,7 @@ impl crate::state::ServerState {
             retry::ask_with_backoff::<_, EntityResponse, _>(
                 &actor_ref,
                 || EntityMsg::Action {
+                    caller: Some(caller.clone()),
                     name: action_name.clone(),
                     params: params_for_retry.clone(),
                     related: cross_for_retry.clone(),

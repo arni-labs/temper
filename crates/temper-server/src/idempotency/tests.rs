@@ -244,6 +244,7 @@ fn estimate_counts_every_collection_a_reply_keeps() {
             .push(crate::entity_actor::ScheduledAction {
                 action: format!("Timer{index:03}"),
                 delay_seconds: 5,
+                arm_id: String::new(),
             });
     }
     let populated = estimated_entry_bytes("Feed:f", "k", &response);

@@ -199,36 +199,42 @@ async fn vector_index_write_behind_candidates_and_partitioning() {
     };
 
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-b",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![0.0, 1.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![0.0, 1.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     // A different model tag — must not appear in an m1 scan.
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-c",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m2", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m2", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -286,13 +292,15 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
 
     // Write-behind reconcile with a row, then a delete transition (empty rows).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            std::slice::from_ref(&row(vec![1.0, 0.0])),
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: std::slice::from_ref(&row(vec![1.0, 0.0])),
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -306,13 +314,14 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
     );
     // A Deleted transition emits no vector rows but still reconciles (purge).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             1,
             &[test_envelope("Delete", serde_json::json!({}))],
-            &[],
-            &[],
-            true,
+            temper_runtime::persistence::CommitRows {
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
