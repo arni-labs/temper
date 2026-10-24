@@ -89,25 +89,27 @@ impl LocalTDataWasmHost {
             local_tdata = true,
         );
 
+        // The OData handlers' futures are among the largest in the kernel;
+        // boxed, they are not carried inline by the WASM invocation above.
         let response = async {
             match method_upper.as_str() {
-                "GET" => crate::odata::handle_odata_get(
+                "GET" => Box::pin(crate::odata::handle_odata_get(
                     State(self.state.clone()),
                     Some(Extension(authenticated.clone())),
                     headers,
                     Path(request.path),
                     Query(request.query),
-                )
+                ))
                 .await
                 .into_response(),
-                "POST" => crate::odata::handle_odata_post(
+                "POST" => Box::pin(crate::odata::handle_odata_post(
                     State(self.state.clone()),
                     Some(Extension(authenticated)),
                     headers,
                     Path(request.path),
                     Query(request.query),
                     Bytes::copy_from_slice(body.as_bytes()),
-                )
+                ))
                 .await
                 .into_response(),
                 "PUT" => crate::odata::handle_odata_put(

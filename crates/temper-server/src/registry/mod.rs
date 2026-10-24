@@ -8,6 +8,7 @@
 mod relations;
 mod server_derived_names;
 pub mod types;
+mod unavailable;
 
 use server_derived_names::warn_on_server_derived_csdl_properties;
 
@@ -41,6 +42,8 @@ pub struct SpecRegistry {
     /// declares state timeouts, or did before: their records' timers must be
     /// made to follow the state each record is in under the new spec.
     changed_types: BTreeSet<(TenantId, String)>,
+    /// Tenants whose stored specs could not be restored, with the reason.
+    unavailable: BTreeMap<TenantId, String>,
 }
 
 impl SpecRegistry {
