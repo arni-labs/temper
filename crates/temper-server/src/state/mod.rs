@@ -30,7 +30,9 @@ pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
-pub use dispatch::{DispatchCommand, DispatchError, DispatchExtOptions, StateTimeoutTracker};
+pub use dispatch::{
+    DispatchCommand, DispatchError, DispatchExtOptions, StaleWrite, StateTimeoutTracker,
+};
 pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};

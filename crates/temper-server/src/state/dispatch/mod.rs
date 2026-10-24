@@ -17,7 +17,9 @@ mod composite;
 mod cross_entity;
 mod effects;
 mod generated_callbacks;
+mod outside_write;
 mod projection_barrier;
+pub use outside_write::StaleWrite;
 pub(crate) mod retry;
 pub(crate) mod state_timeouts;
 mod state_timer_rows;
@@ -121,6 +123,11 @@ pub enum DispatchError {
     /// The request conflicts with an existing governed row.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The record changed after a write from outside the kernel read it, and
+    /// nothing was applied. The caller re-reads the record and retries.
+    #[error("{0}")]
+    StaleWrite(StaleWrite),
 
     /// The entity type has no registered spec — all actions are denied by default.
     #[error("entity type '{0}' is not governed by any registered spec")]

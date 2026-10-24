@@ -151,9 +151,11 @@ impl ServerState {
 
     /// Check the record `action` will store when applied to `current`.
     ///
-    /// Runs before the action is sent to the actor. Kernel follow-ons and
-    /// entity types with no relation, field invariant or matching
-    /// cross-invariant skip the work.
+    /// Runs before the action is sent to the actor, which the caller then
+    /// holds to `current`: the actor applies the action only while the record
+    /// is still `current`, so the record checked here is the record stored.
+    /// Kernel follow-ons and entity types with no relation, field invariant
+    /// or matching cross-invariant skip the work.
     pub(crate) async fn check_action_record(
         &self,
         caller: WriteCaller,
@@ -170,9 +172,14 @@ impl ServerState {
         if !self.action_record_checked(caller, tenant, &current.entity_type, action) {
             return Ok(());
         }
-        let (record, links) = self
+        let Some((record, links)) = self
             .action_record(tenant, table, current, action, params, related)
-            .await;
+            .await
+        else {
+            // The interpreter refused on `current`, so the action stores
+            // nothing there, and the actor applies it to no other state.
+            return Ok(());
+        };
         self.check_record_and_links(
             RecordWrite {
                 caller,
@@ -222,7 +229,8 @@ impl ServerState {
     }
 
     /// The fields `action` stores when applied to `current`: the actor's own
-    /// action interpreter run on a copy of the state. When the action spawns
+    /// action interpreter run on a copy of the state, or `None` when the
+    /// interpreter refuses the action on that state. When the action spawns
     /// children, the second value is the same record with each field that
     /// stores a child's id as it stood before the action, for the checks
     /// that look related records up: the kernel creates those children only
@@ -235,7 +243,7 @@ impl ServerState {
         action: &str,
         params: &Value,
         related: &RelatedMap,
-    ) -> (Value, Option<Value>) {
+    ) -> Option<(Value, Option<Value>)> {
         let mut preview = current.clone();
         // The preview repeats the interpreter's own log lines; only the real
         // application of the action should appear in the logs.
@@ -254,11 +262,7 @@ impl ServerState {
         .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await;
         if !result.success {
-            // The interpreter refused on this state. The actor normally refuses
-            // too and stores nothing; if the state moved on in between, the
-            // action's params written over the current fields is what it can
-            // store.
-            return (params_written_over(current, params), None);
+            return None;
         }
         let record = preview.fields;
         let mut child_fields = result
@@ -267,7 +271,7 @@ impl ServerState {
             .filter_map(|spawn| spawn.store_id_in.as_deref())
             .peekable();
         if child_fields.peek().is_none() {
-            return (record, None);
+            return Some((record, None));
         }
         let mut links = record.clone();
         if let Some(links) = links.as_object_mut() {
@@ -282,7 +286,7 @@ impl ServerState {
                 }
             }
         }
-        (record, Some(links))
+        Some((record, Some(links)))
     }
 }
 
@@ -308,10 +312,4 @@ pub(crate) fn field_update_record(current: &EntityState, body: &Value, replace: 
     } else {
         current.fields.clone()
     }
-}
-
-/// `current`'s fields with the action's params written over them, as the
-/// actor projects params into fields.
-fn params_written_over(current: &EntityState, params: &Value) -> Value {
-    field_update_record(current, params, false)
 }

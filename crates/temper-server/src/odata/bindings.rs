@@ -394,6 +394,10 @@ pub(super) async fn dispatch_bound_action(
             action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::CONFLICT, "Conflict", &reason).into_response()
         }
+        Err(DispatchError::StaleWrite(stale)) => {
+            action_span.set_status(Status::error(stale.to_string()));
+            (StatusCode::CONFLICT, axum::Json(stale.body())).into_response()
+        }
         // ADR-0048: transient exhaustion → 503 Retry-After so clients and
         // proxies back off instead of paging someone.
         Err(e @ DispatchError::Transient { .. }) => {

@@ -98,6 +98,15 @@ pub(super) async fn dispatch_action_bridge_result(
                 .as_deref()
                 .unwrap_or("configured action failed"),
         ),
+        Err(crate::state::DispatchError::StaleWrite(stale))
+            if bridge.response != "git-receive-pack" =>
+        {
+            axum::http::Response::builder()
+                .status(axum::http::StatusCode::CONFLICT)
+                .header("content-type", "application/json")
+                .body(Body::from(stale.body().to_string()))
+                .expect("response builder")
+        }
         Err(e) => action_bridge_error_response(&bridge.response, &refs, sideband, &e.to_string()),
     }
 }

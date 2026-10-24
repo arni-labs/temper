@@ -14,7 +14,7 @@ use super::effects::PostDispatchContext;
 use super::retry;
 use super::{DispatchCommand, DispatchError, DispatchExtOptions, record_workflow_span_attrs};
 use crate::state::admission::AdmissionOutcome;
-use crate::state::write_record::{ActionPreview, WriteCaller};
+use crate::state::write_record::WriteCaller;
 
 const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
 
@@ -524,7 +524,7 @@ impl crate::state::ServerState {
             agent_ctx: enriched_agent_ctx,
             await_integration,
             caller,
-            expected_authorization_precondition,
+            mut expected_authorization_precondition,
             workflow_root_active,
         } = steps;
         let enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
@@ -633,46 +633,29 @@ impl crate::state::ServerState {
             .await;
 
         // Relation integrity, field invariants and cross-invariants hold for the
-        // record an outside call's action stores.
-        if self.action_record_checked(caller, tenant, entity_type, action) {
-            let current = self
-                .get_tenant_entity_state(tenant, entity_type, entity_id)
-                .await
-                .map_err(DispatchError::Internal)?;
-            // A retry of an action already applied returns its first result.
-            let already_applied = agent_ctx
-                .idempotency_key
-                .as_deref()
-                .is_some_and(|key| current.state.has_processed_idempotency_key(key));
-            if !already_applied
-                // Boxed so the preview's future does not deepen every caller's.
-                && let Err(violation) = Box::pin(self.check_action_record(
-                    caller,
-                    tenant,
-                    ActionPreview {
-                        table: &table,
-                        current: &current.state,
-                        action,
-                        params: &params,
-                        related: &related,
-                    },
-                ))
-                .await
-            {
-                let ctx = PostDispatchContext {
-                    tenant,
-                    entity_type,
-                    entity_id,
-                    action,
-                    agent_ctx,
-                    dispatch_idempotency_key: agent_ctx.idempotency_key.as_deref(),
-                    action_params: &params,
-                    await_integration,
-                };
-                return Ok(self
-                    .refuse_before_actor(&ctx, current, violation.message)
-                    .await);
-            }
+        // record an outside call's action stores, and the actor is held to the
+        // state that record was built from.
+        let ctx = PostDispatchContext {
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            agent_ctx,
+            dispatch_idempotency_key: agent_ctx.idempotency_key.as_deref(),
+            action_params: &params,
+            await_integration,
+        };
+        // Boxed so the preview's future does not deepen every caller's.
+        if let Some(refused) = Box::pin(self.check_outside_action(
+            &ctx,
+            caller,
+            &table,
+            &related,
+            &mut expected_authorization_precondition,
+        ))
+        .await?
+        {
+            return Ok(refused);
         }
 
         let action_params = params.clone();
@@ -911,6 +894,13 @@ impl crate::state::ServerState {
             }
         };
 
+        let stale = super::outside_write::stale_refusal(
+            caller,
+            authorization_precondition_for_retry.as_deref(),
+            entity_type,
+            entity_id,
+            &response,
+        );
         // Run all post-dispatch effects through the dedicated pipeline.
         let ctx = PostDispatchContext {
             tenant,
@@ -923,6 +913,10 @@ impl crate::state::ServerState {
             await_integration,
         };
         let response = self.run_post_dispatch_effects(&ctx, response).await;
+        if let Some(stale) = stale {
+            tracing::Span::current().record("success", false);
+            return Err(stale);
+        }
         if response.success
             && let Some(ref idem_key) = idempotency_key
         {
@@ -954,7 +948,7 @@ impl crate::state::ServerState {
     /// Answer a dispatch refused before it reached the actor. The refusal runs
     /// the post-dispatch pipeline like a refusal from the actor, so it is
     /// recorded the same way.
-    async fn refuse_before_actor(
+    pub(super) async fn refuse_before_actor(
         &self,
         ctx: &PostDispatchContext<'_>,
         mut response: EntityResponse,

@@ -145,6 +145,10 @@ pub async fn handle_webhook(
             let body = serde_json::to_string(&response).unwrap_or_default();
             (StatusCode::OK, body)
         }
+        Err(crate::state::DispatchError::StaleWrite(stale)) => {
+            tracing::warn!(error = %stale, webhook = %webhook.name, "webhook action refused as stale");
+            (StatusCode::CONFLICT, stale.body().to_string())
+        }
         Err(e) => {
             tracing::error!(error = %e, "webhook action dispatch failed");
             (

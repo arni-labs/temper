@@ -65,6 +65,10 @@ impl ReplayPolicy {
     }
 }
 
+/// The refusal an action gets when it is held to a state the record has
+/// moved past, at the entry check or on a journal conflict: re-read and retry.
+const STALE_ACTION: &str = "action authorization became stale; retry against current state";
+
 /// What the caller of a refused write is told. An oversized change is refused
 /// with its own words (what to keep elsewhere); anything else failed to persist.
 pub(super) fn persistence_failure(error: &PersistenceError) -> String {
@@ -1173,16 +1177,16 @@ impl Actor for EntityActor {
                     return Ok(());
                 }
 
+                // The caller read or authorized this exact state; the action
+                // applies to no other.
+                let held_to_read_state = expected_authorization_precondition.is_some();
                 if let Some(expected) = expected_authorization_precondition
                     && super::effects::entity_authorization_precondition(state) != expected
                 {
                     ctx.reply(EntityResponse {
                         success: false,
                         state: state.clone(),
-                        error: Some(
-                            "action authorization became stale; retry against current state"
-                                .to_string(),
-                        ),
+                        error: Some(STALE_ACTION.to_string()),
                         custom_effects: vec![],
                         scheduled_actions: vec![],
                         spawn_requests: vec![],
@@ -1428,6 +1432,17 @@ impl Actor for EntityActor {
                                     // pre-race snapshot.
                                     state_before = state.clone();
                                     event_count_before = state.total_event_count;
+
+                                    // The journal held a state the caller never
+                                    // read: refuse as stale with the caught-up
+                                    // state instead of applying the action to it.
+                                    if held_to_read_state {
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::Stale,
+                                            Some(STALE_ACTION.to_string()),
+                                        ));
+                                        break;
+                                    }
 
                                     // Re-evaluate the action against the caught-up
                                     // state. It may now fail (entity reached a
@@ -1907,3 +1922,7 @@ mod event_size_tests;
 #[cfg(test)]
 #[path = "contract_state_test.rs"]
 pub(super) mod contract_state_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "held_action_test.rs"]
+mod held_action_tests;
