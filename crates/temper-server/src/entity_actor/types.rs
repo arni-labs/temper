@@ -68,6 +68,19 @@ pub enum EntityMsg {
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
     },
+    /// Hold this entity for `holder`, a delete that removes it with others:
+    /// until `DeleteHeld` or `Release`, its writes are refused. Refused itself
+    /// when the entity's state no longer has this digest (the state the delete
+    /// checked), it is deleted, or another delete holds it.
+    Hold {
+        expected_authorization_precondition: String,
+        holder: uuid::Uuid,
+    },
+    /// Delete this entity, which `holder` holds, ending the hold.
+    DeleteHeld { holder: uuid::Uuid },
+    /// End `holder`'s hold without deleting. A no-op when `holder` does not
+    /// hold the entity.
+    Release { holder: uuid::Uuid },
 }
 
 impl Message for EntityMsg {}

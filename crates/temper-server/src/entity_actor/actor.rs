@@ -21,7 +21,7 @@
 //! - **Deterministic**: Same input -> same output. No randomness in transition logic.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use temper_jit::table::{Effect, TransitionTable};
@@ -142,6 +142,9 @@ pub struct EntityActor {
     /// Object store for field-overflow blob bytes. SQL stores only refs.
     pub(super) blob_store: Option<crate::blob_store::BlobStore>,
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
+    /// The delete that holds this entity, removing it with others
+    /// (`delete_hold`); its writes are refused while one does.
+    pub(super) held_by: Mutex<Option<uuid::Uuid>>,
 }
 
 impl EntityActor {
@@ -278,6 +281,7 @@ impl EntityActor {
             idempotency_cache: None,
             blob_store: None,
             legacy_blob_store: None,
+            held_by: Mutex::new(None),
         }
     }
 
@@ -303,6 +307,7 @@ impl EntityActor {
             idempotency_cache: None,
             blob_store: None,
             legacy_blob_store: None,
+            held_by: Mutex::new(None),
         }
     }
 
@@ -1063,6 +1068,10 @@ impl Actor for EntityActor {
         state: &mut Self::State,
         ctx: &mut ActorContext<Self>,
     ) -> Result<(), ActorError> {
+        if let Some(refusal) = self.refusal_while_held(&msg, state) {
+            ctx.reply(refusal);
+            return Ok(());
+        }
         match msg {
             EntityMsg::Action {
                 name,
@@ -1776,73 +1785,23 @@ impl Actor for EntityActor {
             EntityMsg::Delete {
                 expected_authorization_precondition,
             } => {
-                if self
-                    .table
-                    .read()
-                    .expect("table lock poisoned")
-                    .strict_action_params
-                {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        state: state.clone(),
-                        error: Some(
-                            "Strict entities require a declared action for deletion".to_owned(),
-                        ),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
-                    return Ok(());
-                }
-                if let Some(expected) = expected_authorization_precondition
-                    && super::effects::entity_authorization_precondition(state) != expected
-                {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        state: state.clone(),
-                        error: Some(
-                            "delete authorization became stale; retry against current state"
-                                .to_string(),
-                        ),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
-                    return Ok(());
-                }
-                let deleted = EntityEvent::tombstone(state.status.clone());
-
-                if let (Some(store), Some(backend)) =
-                    (self.event_journal.as_ref(), self.event_backend)
-                    && let Err(e) = self
-                        .persist_event(store, backend, &self.persistence_id(), state, &deleted)
-                        .await
-                {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        state: state.clone(),
-                        error: Some(format!("persistence failed: {e}")),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
-                    return Ok(());
-                }
-
-                state.record_tombstone(deleted);
-
-                ctx.reply(EntityResponse {
-                    success: true,
-                    state: state.clone(),
-                    error: None,
-                    custom_effects: vec![],
-                    scheduled_actions: vec![],
-                    spawn_requests: vec![],
-                    spec_governed: true,
-                });
+                let response = self
+                    .delete_now(state, expected_authorization_precondition.as_deref())
+                    .await;
+                ctx.reply(response);
+            }
+            EntityMsg::Hold {
+                expected_authorization_precondition,
+                holder,
+            } => {
+                ctx.reply(self.hold(state, &expected_authorization_precondition, holder));
+            }
+            EntityMsg::DeleteHeld { holder } => {
+                let response = self.delete_held(state, holder).await;
+                ctx.reply(response);
+            }
+            EntityMsg::Release { holder } => {
+                ctx.reply(self.release(state, holder));
             }
         }
         Ok(())

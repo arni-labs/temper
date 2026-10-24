@@ -1606,10 +1606,11 @@ pub async fn handle_odata_delete(
     }
 }
 
-/// Delete `entity_type('entity_id')` and the dependents `plan` found, in one
-/// journal write conditional on the state each was checked in: the requested
-/// entity's as it was authorized, each dependent's as the plan read it. When
-/// any of them has changed since, nothing is deleted.
+/// Delete `entity_type('entity_id')` and the dependents `plan` found, all
+/// together and only while each is in the state it was checked in: the
+/// requested entity's as it was authorized, each dependent's as the plan read
+/// it (`ServerState::delete_entities_together`). When any of them has changed
+/// since, nothing is deleted.
 async fn delete_with_dependents(
     state: &ServerState,
     tenant: &TenantId,
@@ -1661,16 +1662,6 @@ async fn delete_with_dependents(
             StatusCode::CONFLICT,
             "ConcurrentModification",
             &format!("nothing was deleted: {reason}; retry against current state"),
-        )
-        .into_response(),
-        Err(BatchDeleteError::NoJournal) => odata_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "DeleteError",
-            &format!(
-                "deleting {entity_type}('{entity_id}') also deletes {count} entities that \
-                 belong to it, which takes one write to an event journal, and this server \
-                 keeps none; nothing was deleted"
-            ),
         )
         .into_response(),
         Err(BatchDeleteError::Storage(error)) => odata_error(
