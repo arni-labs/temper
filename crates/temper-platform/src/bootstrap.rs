@@ -914,7 +914,7 @@ fn resolve_issuer_env_config(
 ///   start until `RotateIssuerKeys` runs on it (`keys_rotated`); from then on,
 ///   and for a Suspended or Revoked issuer, the stored record is left as it is.
 /// - `Err(_)` when the config is *partial* (some but not all three vars set) or
-///   registration fails. A partial config is a misconfiguration, not a no-op —
+///   the stored issuer cannot be read or registration fails. A partial config is a misconfiguration, not a no-op —
 ///   registering half a trusted-issuer config would leave JWT verification
 ///   quietly inert — so the caller can fail readiness rather than log a
 ///   misleading success.
@@ -960,7 +960,7 @@ async fn apply_environment_issuer(
     // the platform seeding itself acts as System.
     let agent_ctx = temper_server::request_context::AgentContext::system();
 
-    if let Some(stored) = stored_trusted_issuer(state, &tenant_id, issuer).await {
+    if let Some(stored) = stored_trusted_issuer(state, &tenant_id, issuer).await? {
         let keys_rotated = stored
             .booleans
             .get("keys_rotated")
@@ -1012,25 +1012,38 @@ async fn apply_environment_issuer(
 }
 
 /// The tenant's stored issuer `issuer`, if it has one. Bootstrap runs before
-/// this server has loaded any issuer, so the store decides.
+/// this server has loaded any issuer, so the store decides. A store that
+/// cannot be read is an error, not an absent issuer: registering over an
+/// issuer that could not be read would replace keys it holds itself.
 async fn stored_trusted_issuer(
     state: &PlatformState,
     tenant_id: &temper_runtime::tenant::TenantId,
     issuer: &str,
-) -> Option<temper_server::entity_actor::EntityState> {
-    if !state
+) -> Result<Option<temper_server::entity_actor::EntityState>, String> {
+    let present = if state
         .server
-        .ensure_entity_loaded(tenant_id, "TrustedIssuer", issuer)
-        .await
+        .entity_exists(tenant_id, "TrustedIssuer", issuer)
     {
-        return None;
+        state
+            .server
+            .ensure_entity_loaded(tenant_id, "TrustedIssuer", issuer)
+            .await
+    } else {
+        state
+            .server
+            .load_entity_from_store(tenant_id, "TrustedIssuer", issuer)
+            .await
+            .map_err(|e| format!("cannot read trusted issuer '{issuer}': {e}"))?
+    };
+    if !present {
+        return Ok(None);
     }
     state
         .server
         .get_tenant_entity_state(tenant_id, "TrustedIssuer", issuer)
         .await
-        .ok()
-        .map(|response| response.state)
+        .map(|response| Some(response.state))
+        .map_err(|e| format!("cannot read trusted issuer '{issuer}': {e}"))
 }
 
 #[cfg(test)]
