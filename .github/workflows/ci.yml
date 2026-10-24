@@ -561,7 +561,7 @@ jobs:
         # four full-mode seed shards on push/schedule/dispatch.
         run: |
           SUITES='[
-            {"suite":"core","command":"cargo nextest run -p temper-server --test dst_concurrency_retry --test dst_hotswap --test dst_lifecycle --test dst_multi_tenant --test dst_persistence"},
+            {"suite":"core","command":"cargo nextest run -p temper-server --test dst_concurrency_retry --test dst_hotswap --test dst_lifecycle --test dst_multi_tenant --test dst_persistence --test dst_status_cache"},
             {"suite":"platform-boot","command":"cargo nextest run -p temper-server --test dst_platform_boot"},
             {"suite":"platform-consistency","command":"cargo nextest run -p temper-server --test dst_platform_cedar --test dst_platform_index --test dst_platform_rollback"}
           ]'

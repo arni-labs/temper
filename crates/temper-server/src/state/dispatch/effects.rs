@@ -672,6 +672,10 @@ impl crate::state::ServerState {
             self.apply_query_projection_update(ctx, &response).await;
         }
 
+        // Simulation runs other requests between the commit and its status
+        // cache write, as a slow projection write above would.
+        temper_runtime::buggify::buggify_yield(crate::state::STATUS_WRITE_YIELD_BUDGET).await;
+
         // 3. Broadcast SSE + cache
         self.broadcast_state_change(ctx, &response);
 

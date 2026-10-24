@@ -332,6 +332,10 @@ fn tenant_exports_llm_content(opted_in: &BTreeSet<String>, tenant: &str) -> bool
     opted_in.contains("*") || opted_in.contains(tenant)
 }
 
+/// How many turns a simulation may give other requests between a status read or
+/// commit and its status cache write (see `buggify_yield`).
+pub(crate) const STATUS_WRITE_YIELD_BUDGET: u32 = 8;
+
 fn state_cache_budget() -> usize {
     static STATE_CACHE_BUDGET: OnceLock<usize> = OnceLock::new();
     *STATE_CACHE_BUDGET.get_or_init(|| env_usize("TEMPER_STATE_CACHE_BUDGET", 10_000))

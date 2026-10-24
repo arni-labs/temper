@@ -2328,6 +2328,8 @@ impl ServerState {
             .get_tenant_entity_state(tenant, entity_type, entity_id)
             .await
         {
+            // Simulation runs other requests between this read and its backfill.
+            temper_runtime::buggify::buggify_yield(crate::state::STATUS_WRITE_YIELD_BUDGET).await;
             let status = response.state.status.clone();
             self.cache_entity_status(cache_key, status.clone());
             Some(status)
