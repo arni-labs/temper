@@ -197,7 +197,6 @@ async fn authoritative_replay_ignores_ahead_stale_snapshot() {
         BackendLabel::Turso,
         &initial_fields,
         None,
-        false,
     )
     .await
     .expect("ordinary recovery accepts the snapshot");
