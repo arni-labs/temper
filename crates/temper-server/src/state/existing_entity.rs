@@ -86,3 +86,7 @@ impl ServerState {
             .cloned()
     }
 }
+
+#[cfg(test)]
+#[path = "existing_entity_test.rs"]
+mod tests;
