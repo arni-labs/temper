@@ -35,17 +35,6 @@ fn actor_idle_timeout_secs() -> i64 {
     })
 }
 
-fn is_deleted_envelope(event: &PersistenceEnvelope) -> bool {
-    if event.event_type == "Deleted" {
-        return true;
-    }
-    event
-        .payload
-        .get("action")
-        .and_then(serde_json::Value::as_str)
-        == Some("Deleted")
-}
-
 fn record_projection_update_started(
     tenant: &TenantId,
     entity_type: &str,
@@ -1264,6 +1253,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: fields,
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
@@ -1449,6 +1439,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: initial_fields,
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;
@@ -1910,6 +1901,18 @@ impl ServerState {
                 }
             }
 
+            // With a journal the tombstone is the record's last event, so its
+            // status replaces the cached one: a guard no longer finds the
+            // record in its last live status, and an older write still in
+            // flight cannot bring that status back. Without one nothing keeps
+            // the tombstone, and a record created later under the same id
+            // starts its count again, so the entry goes with the record.
+            if self.event_journal().is_some() {
+                self.cache_entity_status(tenant, &response.state);
+            } else if let Ok(mut cache) = self.entity_state_cache.lock() {
+                cache.pop(&format!("{tenant}:{entity_type}:{entity_id}"));
+            }
+
             // Tombstone persisted successfully; now it is safe to remove actor
             // and in-memory index entries.
             let _ = actor_ref.stop();
@@ -1950,7 +1953,7 @@ impl ServerState {
                 _ => return true,
             };
 
-            if events.last().is_some_and(is_deleted_envelope) {
+            if temper_runtime::persistence::journal_is_deleted(&events) {
                 self.remove_entity(tenant, entity_type, entity_id);
                 return false;
             }
@@ -1988,7 +1991,7 @@ impl ServerState {
             return Ok(false);
         }
 
-        if events.last().is_some_and(is_deleted_envelope) {
+        if temper_runtime::persistence::journal_is_deleted(&events) {
             self.remove_entity(tenant, entity_type, entity_id);
             return Ok(false);
         }
@@ -2187,8 +2190,14 @@ impl ServerState {
                 if let Ok(mut last_accessed) = self.last_accessed.write() {
                     last_accessed.remove(&actor_key);
                 }
-                // Evict the state cache entry so stale status doesn't linger.
-                if let Ok(mut cache) = self.entity_state_cache.lock() {
+                // With a journal the record's cached status stays: it is still
+                // its newest, and the next actor continues the journal's
+                // sequence, so a write of this actor that lands late is older
+                // and cannot replace it. Without one the record's state ends
+                // with its actor, and its status goes with it.
+                if journal.is_none()
+                    && let Ok(mut cache) = self.entity_state_cache.lock()
+                {
                     cache.pop(&actor_key);
                 }
                 // The replay buffer is for clients following a live entity;
@@ -2308,40 +2317,6 @@ impl ServerState {
                     })
                 }
             }
-        }
-    }
-}
-
-/// Resolve the current status of an entity.
-///
-/// Fast path: check the `entity_state_cache` (populated on every successful dispatch).
-/// Slow path: fall back to `get_tenant_entity_state()` (async actor ask) and backfill cache.
-impl ServerState {
-    #[instrument(skip_all, fields(otel.name = "entity.resolve_entity_status", tenant = %tenant, entity_type, entity_id))]
-    pub async fn resolve_entity_status(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Option<String> {
-        // Fast path: check cache (LruCache::get requires &mut, so use Mutex).
-        let cache_key = format!("{tenant}:{entity_type}:{entity_id}");
-        if let Ok(mut cache) = self.entity_state_cache.lock()
-            && let Some((status, _timestamp)) = cache.get(&cache_key)
-        {
-            return Some(status.clone());
-        }
-
-        // Slow path: actor ask + backfill
-        if let Ok(response) = self
-            .get_tenant_entity_state(tenant, entity_type, entity_id)
-            .await
-        {
-            let status = response.state.status.clone();
-            self.cache_entity_status(cache_key, status.clone());
-            Some(status)
-        } else {
-            None
         }
     }
 }

@@ -76,7 +76,6 @@ pub(super) async fn load_entity_current_fields(
         backend,
         &serde_json::json!({}),
         blob_store,
-        true, // strict: a journal read failure → Err → LoadFailed (don't watermark)
     )
     .await
     {
@@ -192,7 +191,6 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
             backend,
             &serde_json::json!({}),
             tenant_blob_store.as_ref(),
-            true, // Never publish a snapshot when its journal tail could not be read.
         )
         .await;
         let replayed = match replayed {

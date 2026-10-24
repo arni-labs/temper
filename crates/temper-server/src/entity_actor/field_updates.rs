@@ -183,6 +183,7 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         timestamp: sim_now(),
         params: fields.clone(),
         idempotency_key: None,
+        kind: temper_runtime::persistence::EventKind::Transition,
     }
 }
 
@@ -268,7 +269,7 @@ async fn catch_up(
         &mut caught_up,
         &actor.tenant,
         actor.blob_store.as_ref(),
-        ReplayPolicy::LenientSnapshot,
+        ReplayPolicy::StrictSnapshot,
     )
     .await
     .map_err(|e| format!("conflict recovery replay failed: {e}"))?;
