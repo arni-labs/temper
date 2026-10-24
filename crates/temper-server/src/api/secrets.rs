@@ -156,16 +156,7 @@ pub(super) async fn handle_put_secret(
     }
 
     // Cache in memory after successful persistence.
-    if let Err(e) = vault.cache_secret(tenant, &key_name, value.to_string()) {
-        // Best-effort rollback to keep storage/cache aligned.
-        let _ = state.delete_secret(tenant, &key_name).await;
-        tracing::error!(error = %e, "cache update failed after persistence write");
-        return (
-            StatusCode::CONFLICT,
-            format!("Cache update failed after persistence write: {e}"),
-        )
-            .into_response();
-    }
+    vault.cache_secret(tenant, &key_name, value.to_string());
 
     StatusCode::NO_CONTENT.into_response()
 }

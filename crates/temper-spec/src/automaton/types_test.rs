@@ -155,7 +155,9 @@ entity_id = "query.state"
     let automaton: Automaton = toml::from_str(toml_src).unwrap();
     assert_eq!(automaton.webhooks.len(), 1);
     assert_eq!(automaton.webhooks[0].name, "oauth_cb");
-    assert_eq!(automaton.webhooks[0].method, "POST");
+    // No declared method: the webhook answers any method (ADR-0182).
+    assert_eq!(automaton.webhooks[0].method, None);
+    assert_eq!(automaton.webhooks[0].signature, WebhookSignature::Kernel);
     assert_eq!(automaton.webhooks[0].entity_id, "query.state");
 }
 

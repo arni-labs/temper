@@ -768,6 +768,90 @@ async fn operator_credential_is_current(
         && field("expires_at").is_none_or(str::is_empty)
 }
 
+/// Revoke every Active or Rotated operator credential an earlier boot issued
+/// (`agent_instance_id` "operator", `created_by` "bootstrap") for a key other
+/// than `api_key`. Each boot issues one for the key it was given and keeps the
+/// ones before, so a Temper whose key changed keeps every old key's operator
+/// authority. Only a deployment that is the sole holder of its key asks for
+/// this (`TEMPER_RETIRE_OLD_OPERATOR_KEYS`): another holder of an older key
+/// would lose it. Credentials issued through the API are left alone. Answers
+/// how many it revoked; one it cannot read or revoke is logged and left for
+/// the next boot.
+pub async fn retire_other_operator_credentials(
+    state: &PlatformState,
+    api_key: &str,
+    tenant: &str,
+) -> usize {
+    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let agent_ctx = temper_server::request_context::AgentContext::for_service("platform-bootstrap");
+    let current = temper_server::identity::hash_token(api_key);
+    let (tenant_id, agent_ctx, current) = (&tenant_id, &agent_ctx, current.as_str());
+    let mut retired = 0;
+    for id in state
+        .server
+        .list_entity_ids_lazy(tenant_id, "AgentCredential")
+        .await
+    {
+        if id == current {
+            continue;
+        }
+        if !state
+            .server
+            .ensure_entity_loaded(tenant_id, "AgentCredential", &id)
+            .await
+        {
+            continue;
+        }
+        let credential = match state
+            .server
+            .get_tenant_entity_state(tenant_id, "AgentCredential", &id)
+            .await
+        {
+            Ok(credential) => credential.state,
+            Err(e) => {
+                tracing::warn!("Could not read AgentCredential {id} to retire it: {e}");
+                continue;
+            }
+        };
+        let field = |name: &str| {
+            credential
+                .fields
+                .get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let earlier_boot =
+            field("agent_instance_id") == "operator" && field("created_by") == "bootstrap";
+        if !earlier_boot || !matches!(credential.status.as_str(), "Active" | "Rotated") {
+            continue;
+        }
+        match state
+            .server
+            .dispatch_tenant_action(
+                tenant_id,
+                "AgentCredential",
+                &id,
+                "Revoke",
+                serde_json::json!({}),
+                agent_ctx,
+            )
+            .await
+        {
+            Ok(response) if response.success => retired += 1,
+            Ok(response) => tracing::warn!(
+                "Could not revoke earlier operator credential {id}: {:?}",
+                response.error
+            ),
+            Err(e) => tracing::warn!("Could not revoke earlier operator credential {id}: {e}"),
+        }
+    }
+    tracing::info!(
+        "Retired {retired} operator credential(s) of keys tenant '{tenant}' no longer holds"
+    );
+    retired
+}
+
 /// Outcome of [`bootstrap_trusted_issuer_from_env`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssuerBootstrapOutcome {

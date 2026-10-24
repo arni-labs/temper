@@ -97,6 +97,19 @@ pub fn lint_automaton(automaton: &Automaton) -> Vec<LintFinding> {
         }
     }
 
+    for timeout in &automaton.state_timeouts {
+        if let Some(count) = timeout.max_occurrences {
+            findings.push(LintFinding::warning(
+                "state_timeout_max_occurrences_ignored",
+                format!(
+                    "state_timeout for '{}' sets max_occurrences = {count}, which has no effect: \
+                     the timer is armed on every entry into the state",
+                    timeout.state
+                ),
+            ));
+        }
+    }
+
     lint_field_invariants(automaton, &mut findings);
     absorbing::lint(automaton, &mut findings);
 

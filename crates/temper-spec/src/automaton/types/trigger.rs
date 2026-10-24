@@ -6,13 +6,6 @@ use std::collections::BTreeMap;
 
 use crate::predicate::{Arg, Expr, Literal};
 
-/// Maximum cascade depth for recursive trigger dispatch (TigerStyle budget).
-pub const MAX_TRIGGER_DEPTH: u32 = 8;
-
-/// Maximum number of triggers a tenant can register across all entities
-/// (TigerStyle budget).
-pub const MAX_TRIGGERS_PER_TENANT: usize = 1024;
-
 /// Kind of trigger: what kind of outgoing effect this trigger produces.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
