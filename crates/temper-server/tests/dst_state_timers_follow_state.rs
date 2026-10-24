@@ -3,12 +3,13 @@
 //! Workload, per seed: records in three tenants enter `Waiting`, timed in
 //! `alpha` and `beta` and untimed in `gamma`; some are poked, deleted,
 //! passivated and rehydrated. An install then changes two specs: `alpha`'s,
-//! under which replay lands its records in another timed state (`Start` now
-//! goes to `Review`, not `Waiting`), and `gamma`'s, which gains the timeouts.
-//! In some seeds the process stops before the install's walk reaches `gamma`.
-//! The server restarts, so records that were never snapshotted replay into
-//! the new state while their timer rows still name the old one, and `gamma`'s
-//! records may have no row at all.
+//! whose `Start` now goes to `Review` and whose `Waiting` timer has another
+//! budget, and `gamma`'s, which gains the timeouts. Records that already
+//! started keep their stored `Waiting` on replay, so their timers must follow
+//! `Waiting`'s new declaration and never `Review`'s. In some seeds the process
+//! stops before the install's walk reaches `gamma`. The server restarts, so
+//! records that were never snapshotted replay under the new specs, and
+//! `gamma`'s records may have no row at all.
 //!
 //! Invariants:
 //! - after a record rehydrates, it has exactly one armed timer row, for its
@@ -38,6 +39,8 @@ mod delete_race;
 mod embedder;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
+#[path = "dst_state_timers_follow_state/specs.rs"]
+mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
@@ -47,6 +50,7 @@ use std::time::Duration;
 
 use invariants::{check_all_done, check_boot_counts, check_rows_follow_state, check_seeds};
 use serde_json::json;
+use specs::{CSDL, JOB_V1, install, job_untimed, job_v2, timer_action};
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_sim_context};
 use temper_runtime::tenant::TenantId;
@@ -60,96 +64,8 @@ use world::{ProcessClock, SimTimerRows};
 
 const SEEDS: u64 = 48;
 
-/// The first spec: `Start` enters `Waiting`. `Expire` and `Approve` are
-/// accepted from every live state, so a timer that fired outside its state
-/// would leave an event saying so instead of being refused.
-const JOB_V1: &str = r#"
-[automaton]
-name = "Job"
-states = ["Idle", "Waiting", "Review", "Done"]
-initial = "Idle"
-allow_indefinite_states = ["Idle", "Done"]
-
-[[action]]
-name = "Start"
-from = ["Idle"]
-to = "Waiting"
-
-[[action]]
-name = "Poke"
-from = ["Waiting", "Review"]
-
-[[action]]
-name = "Expire"
-from = ["Waiting", "Review", "Done"]
-to = "Done"
-
-[[action]]
-name = "Approve"
-from = ["Waiting", "Review", "Done"]
-to = "Done"
-
-[[state_timeout]]
-state = "Waiting"
-after_seconds = 3600
-on_timeout = "Expire"
-
-[[state_timeout]]
-state = "Review"
-after_seconds = 1800
-on_timeout = "Approve"
-"#;
-
-const CSDL: &str = r#"<?xml version="1.0"?>
-<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
-<edmx:DataServices><Schema Namespace="Jobs" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-<EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key>
-<Property Name="Id" Type="Edm.String" Nullable="false"/>
-</EntityType>
-<Action Name="Start" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Poke" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Expire" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Approve" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/></EntityContainer>
-</Schema></edmx:DataServices></edmx:Edmx>"#;
-
-/// `Job` with no timeout: records wait in `Waiting` and `Review` for good.
-fn job_untimed() -> String {
-    let untimed = JOB_V1[..JOB_V1.find("[[state_timeout]]").unwrap()].to_string();
-    untimed.replacen(
-        "allow_indefinite_states = [\"Idle\", \"Done\"]",
-        "allow_indefinite_states = [\"Idle\", \"Waiting\", \"Review\", \"Done\"]",
-        1,
-    )
-}
-
-/// The second spec: replay of a stored `Start` now lands in `Review`.
-fn job_v2() -> String {
-    JOB_V1.replacen(
-        "from = [\"Idle\"]\nto = \"Waiting\"",
-        "from = [\"Idle\"]\nto = \"Review\"",
-        1,
-    )
-}
-
 /// The tenants of the workload: `gamma` starts with [`job_untimed`].
 const TENANTS: [&str; 3] = ["alpha", "beta", "gamma"];
-
-/// Install `spec` as `tenant`'s `Job`, replacing the one it had.
-fn install(state: &ServerState, tenant: &str, spec: &str) {
-    let mut registry = state.registry.write().unwrap();
-    let csdl = parse_csdl(CSDL).unwrap();
-    registry.register_tenant(tenant, csdl, CSDL.to_string(), &[("Job", spec)]);
-}
-
-/// The declared timer of each state: the action it fires.
-fn timer_action(state: &str) -> Option<&'static str> {
-    match state {
-        "Waiting" => Some("Expire"),
-        "Review" => Some("Approve"),
-        _ => None,
-    }
-}
 
 /// What outlives a process: the journal, the timer rows and the clock.
 struct World {

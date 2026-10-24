@@ -6,8 +6,8 @@
 //! arming or cancelling its timer:
 //!
 //! - after the record rehydrates (its actor starts from stored events), since
-//!   replay under a newer spec can land it in another state than the one its
-//!   timer was armed for;
+//!   a newer spec can declare another timer, or none, for the state it
+//!   replays into than the one its timer was armed for;
 //! - after a spec install, for every record of each type whose spec changed;
 //! - when a timer fires on a record that is no longer in its state;
 //! - after a dispatch that neither entered nor reset a timed state, after a
