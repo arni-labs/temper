@@ -135,7 +135,7 @@ enum Commands {
         /// IP address to bind the API to. The default, all interfaces, is
         /// unchanged; `--bind 127.0.0.1` keeps Temper loopback-only, for a
         /// server reached through an SSH tunnel or a local proxy. The Observe
-        /// UI and the local sandbox follow it.
+        /// UI follows it; the local sandbox always listens on 127.0.0.1 only.
         ///
         /// Only `0.0.0.0` and `127.0.0.1` are accepted: Temper's own
         /// components reach the API at 127.0.0.1, so any other address would
