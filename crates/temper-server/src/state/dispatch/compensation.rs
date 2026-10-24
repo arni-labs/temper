@@ -147,7 +147,7 @@ impl crate::state::ServerState {
                     return;
                 }
             };
-        let callback_ctx = match parent_ctx.for_callback(COMPENSATION_SOURCE, &action, &params) {
+        let callback_ctx = match parent_ctx.for_callback(COMPENSATION_SOURCE, &action) {
             Ok(context) => context,
             Err(budget_error) => {
                 self.record_generated_callback_refusal(

@@ -198,7 +198,9 @@ fn build_state(tenant: &str, job_ioa: &str, cache: Option<IdempotencyCache>) -> 
 
 fn caller(key: &str) -> AgentContext {
     AgentContext {
-        idempotency_key: Some(key.to_string()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            key.to_string(),
+        )),
         ..AgentContext::for_service(SERVICE)
     }
 }

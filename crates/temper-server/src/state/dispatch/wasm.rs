@@ -246,7 +246,9 @@ fn agent_ctx_for_composite_wasm_result(
     if composite_agent_ctx.idempotency_key.is_none()
         && let Some(idempotency_key) = dispatch_idempotency_key
     {
-        composite_agent_ctx.idempotency_key = Some(idempotency_key.to_string());
+        composite_agent_ctx.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+            idempotency_key.to_string(),
+        ));
     }
     composite_agent_ctx
 }

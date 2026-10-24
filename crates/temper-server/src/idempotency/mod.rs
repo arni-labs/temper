@@ -3,7 +3,9 @@
 //! Recent `Idempotency-Key` → `EntityResponse` replies, kept per entity actor.
 //! Entries expire after `IDEMPOTENCY_TTL_SECS`. Each reply remembers the
 //! request it answered ([`RequestFingerprint`]): a key answers only a retry of
-//! that request, never a different action or body sent with the same key.
+//! that request, never a different action or body sent with the same key. A
+//! follow-up's key ([`IdempotencyKey::FollowUp`]) already names its cause, so
+//! its retry repeats the action and may carry new parameters.
 //!
 //! Every dispatched action carries a key, so every write adds a reply. The
 //! cache is therefore bounded by the bytes it holds across all actors
@@ -26,7 +28,7 @@ mod effects;
 mod request;
 
 pub use effects::{EffectsClaim, EffectsOwner, retry_reply};
-pub use request::{RequestFingerprint, derived_idempotency_key};
+pub use request::{IdempotencyKey, RequestFingerprint, derived_idempotency_key};
 
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).
 pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;

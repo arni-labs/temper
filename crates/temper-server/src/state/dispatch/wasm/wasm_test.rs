@@ -95,7 +95,10 @@ fn composite_wasm_result_inherits_generated_dispatch_idempotency() {
     );
 
     assert_eq!(
-        composite_agent.idempotency_key.as_deref(),
+        composite_agent
+            .idempotency_key
+            .as_ref()
+            .map(crate::idempotency::IdempotencyKey::as_str),
         Some("dispatch:default:App:app:PublishNewVersion:one"),
         "composite sub-writes need the parent dispatch idempotency so repeated app version updates get distinct sub-write keys"
     );
@@ -104,12 +107,17 @@ fn composite_wasm_result_inherits_generated_dispatch_idempotency() {
 #[test]
 fn composite_wasm_result_preserves_caller_supplied_idempotency() {
     let mut agent = AgentContext::for_service("version-publisher");
-    agent.idempotency_key = Some("caller-key".to_string());
+    agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+        "caller-key".to_string(),
+    ));
 
     let composite_agent = agent_ctx_for_composite_wasm_result(&agent, Some("generated-key"));
 
     assert_eq!(
-        composite_agent.idempotency_key.as_deref(),
+        composite_agent
+            .idempotency_key
+            .as_ref()
+            .map(crate::idempotency::IdempotencyKey::as_str),
         Some("caller-key"),
         "caller idempotency remains authoritative for retries"
     );

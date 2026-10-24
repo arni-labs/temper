@@ -553,10 +553,12 @@ impl crate::state::ServerState {
             // key of its own, derived from the caller's so a retry of the
             // scheduling request derives the same one.
             ctx.idempotency_key = agent_ctx.idempotency_key.as_ref().map(|key| {
-                crate::idempotency::derived_idempotency_key(
-                    key,
-                    &format!("scheduled:{action}"),
-                    &index.to_string(),
+                crate::idempotency::IdempotencyKey::FollowUp(
+                    crate::idempotency::derived_idempotency_key(
+                        key.as_str(),
+                        &format!("scheduled:{action}"),
+                        &index.to_string(),
+                    ),
                 )
             });
             let delay = std::time::Duration::from_secs(sched.delay_seconds);

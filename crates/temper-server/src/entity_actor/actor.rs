@@ -1106,9 +1106,12 @@ impl Actor for EntityActor {
                 name,
                 params,
                 related,
-                idempotency_key,
+                idempotency_key: keyed,
                 expected_authorization_precondition,
             } => {
+                // What a retry under the key must repeat to be answered by it.
+                let request = keyed.as_ref().map(|key| key.request(&name, &params));
+                let idempotency_key = keyed.map(crate::idempotency::IdempotencyKey::into_string);
                 // Capture start time for span duration (DST-safe: sim_now()
                 // returns logical clock in simulation, wall clock in production).
                 let action_start = sim_now();
@@ -1154,14 +1157,11 @@ impl Actor for EntityActor {
                 // previously-computed response is returned as the reply.
                 //
                 // A key answers only a retry of the request it was first used
-                // for: the cache compares the whole request (action and
-                // parameters), the durable key set the action. Anything else
-                // sent with the key is refused, so it can never report another
-                // request's success as its own.
+                // for: the cache compares what the key names (the action and
+                // parameters, or a follow-up's action), the durable key set the
+                // action. Anything else sent with the key is refused, so it can
+                // never report another request's success as its own.
                 let actor_key = self.persistence_id();
-                let request = idempotency_key
-                    .as_ref()
-                    .map(|_| crate::idempotency::RequestFingerprint::new(&name, &params));
                 if let (Some(key), Some(request), Some(cache)) = (
                     idempotency_key.as_ref(),
                     request.as_ref(),

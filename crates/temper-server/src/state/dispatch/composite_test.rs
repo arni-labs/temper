@@ -1028,7 +1028,9 @@ async fn parent_gated_pack_object_create_repairs_partial_existing_object() {
     let state = composite_test_state_with_store(store.clone());
     let tenant = TenantId::default();
     let mut agent = AgentContext::for_service("composite-test");
-    agent.idempotency_key = Some("legacy-partial-pack".to_string());
+    agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+        "legacy-partial-pack".to_string(),
+    ));
     let blob_id = "rp-test-abc123";
     let blob_pid = format!("default:Blob:{blob_id}");
 
@@ -1116,7 +1118,9 @@ async fn parent_gated_pack_object_create_skips_complete_existing_object() {
         }]
     });
 
-    agent.idempotency_key = Some("first-pack".to_string());
+    agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+        "first-pack".to_string(),
+    ));
     state
         .apply_composite_integration_result(
             &tenant,
@@ -1130,7 +1134,9 @@ async fn parent_gated_pack_object_create_skips_complete_existing_object() {
         .expect("first complete object write should append");
     let first_len = store.dump_journal(&blob_pid).len();
 
-    agent.idempotency_key = Some("second-pack".to_string());
+    agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+        "second-pack".to_string(),
+    ));
     state
         .apply_composite_integration_result(
             &tenant,

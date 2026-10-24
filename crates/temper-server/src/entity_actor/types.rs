@@ -44,7 +44,7 @@ pub enum EntityMsg {
         /// actor can dedupe against `IdempotencyCache` before executing.
         /// Covers the race where a dispatch-layer retry produces a second
         /// in-flight ask after the first one already processed.
-        idempotency_key: Option<String>,
+        idempotency_key: Option<crate::idempotency::IdempotencyKey>,
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,

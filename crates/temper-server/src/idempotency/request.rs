@@ -3,6 +3,45 @@
 
 use sha2::{Digest, Sha256};
 
+/// An `Idempotency-Key`, and what a retry under it must repeat to be answered
+/// by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyKey {
+    /// Names one request: a retry must send the same action and parameters.
+    /// A caller's key is one.
+    Request(String),
+    /// Names a follow-up by its cause (a callback, scheduled action or
+    /// reaction), derived from the key of the request that started it. A
+    /// retry of that request starts the follow-up again with parameters made
+    /// again, which may differ (an outside service's answer, a measured
+    /// duration), so a retry must send the same action only.
+    FollowUp(String),
+}
+
+impl IdempotencyKey {
+    /// The key's text.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Request(key) | Self::FollowUp(key) => key,
+        }
+    }
+
+    /// The key's text, owned.
+    pub fn into_string(self) -> String {
+        match self {
+            Self::Request(key) | Self::FollowUp(key) => key,
+        }
+    }
+
+    /// What a retry of `action` called with `params` under this key repeats.
+    pub fn request(&self, action: &str, params: &serde_json::Value) -> RequestFingerprint {
+        match self {
+            Self::Request(_) => RequestFingerprint::new(action, params),
+            Self::FollowUp(_) => RequestFingerprint::new(action, &serde_json::Value::Null),
+        }
+    }
+}
+
 /// The action a request named and a digest of its parameters.
 ///
 /// Object keys are hashed in sorted order, so a retry that sends the same body
@@ -27,18 +66,6 @@ impl RequestFingerprint {
     /// The action the request named.
     pub fn action(&self) -> &str {
         &self.action
-    }
-
-    /// A short hex name for this request, for keys derived from it.
-    pub fn short_hex(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.action.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.params_digest);
-        hasher.finalize()[..8]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
     }
 }
 
@@ -118,7 +145,6 @@ mod tests {
         let first = RequestFingerprint::new("Note", &json!({"a": 1, "b": {"c": [1, "x"]}}));
         let second = RequestFingerprint::new("Note", &json!({"b": {"c": [1, "x"]}, "a": 1}));
         assert_eq!(first, second);
-        assert_eq!(first.short_hex(), second.short_hex());
     }
 
     #[test]
@@ -131,7 +157,26 @@ mod tests {
             RequestFingerprint::new("Note", &json!(["ab", "c"])),
             RequestFingerprint::new("Note", &json!(["a", "bc"]))
         );
-        assert_eq!(note.short_hex().len(), 16);
+    }
+
+    #[test]
+    fn a_follow_up_retry_repeats_its_action_and_a_request_retry_its_body_too() {
+        use super::IdempotencyKey;
+
+        let request = IdempotencyKey::Request("k".to_string());
+        assert_ne!(
+            request.request("Answered", &json!({"duration_ms": 17})),
+            request.request("Answered", &json!({"duration_ms": 42}))
+        );
+        let follow_up = IdempotencyKey::FollowUp("k".to_string());
+        assert_eq!(
+            follow_up.request("Answered", &json!({"duration_ms": 17})),
+            follow_up.request("Answered", &json!({"duration_ms": 42}))
+        );
+        assert_ne!(
+            follow_up.request("Answered", &json!({})),
+            follow_up.request("Unanswered", &json!({}))
+        );
     }
 
     #[test]
