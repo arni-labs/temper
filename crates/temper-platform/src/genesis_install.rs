@@ -254,8 +254,9 @@ async fn rollback_to_prior(
     ps: &dyn temper_server::platform_store::PlatformStore,
     tenant: &str,
     prior: &InstalledAppRecord,
+    prior_records: &[InstalledAppRecord],
 ) -> Result<(), String> {
-    restore::ensure_prior_bundle_available(platform, prior).await?;
+    restore::ensure_prior_bundle_available(platform, ps, prior, prior_records).await?;
     restore_prior_install(platform, ps, tenant, prior).await
 }
 
@@ -512,8 +513,14 @@ pub async fn install_genesis_app_from_registry(
             let prior =
                 prior_root_record.expect("RollBackToPrevious implies a prior installed record");
             let ps = ps.expect("RollBackToPrevious implies a platform store");
-            let rollback =
-                rollback_to_prior(&install_platform, ps.as_ref(), &request.tenant, &prior).await;
+            let rollback = rollback_to_prior(
+                &install_platform,
+                ps.as_ref(),
+                &request.tenant,
+                &prior,
+                &prior_records,
+            )
+            .await;
             // Reconcile overwrote every dependency app's record with a local-provenance row too;
             // restore each captured prior record so dependency provenance survives the rollback.
             for record in &prior_records {

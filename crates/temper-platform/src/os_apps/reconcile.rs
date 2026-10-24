@@ -126,6 +126,23 @@ pub fn os_app_dir_bundle_digest(dir: &Path, app_name: &str) -> Option<OsAppBundl
     ))
 }
 
+/// The bundle digest of every app in `dir`, as [`os_app_dir_bundle_digest`]
+/// reads each one; `None` when `dir` is missing or any app in it does not load.
+pub fn os_app_dir_bundle_digests(dir: &Path) -> Option<Vec<OsAppBundleDigest>> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let installed = AppCatalog::from_dir(dir.to_path_buf());
+    installed
+        .app_entries(None)
+        .iter()
+        .map(|entry| {
+            let bundle = load_app_bundle(installed.app_dir(None, &entry.name)?)?;
+            Some(digest_entry_bundle(&entry.name, Some(entry), &bundle))
+        })
+        .collect()
+}
+
 fn digest_entry_bundle(
     app_name: &str,
     entry: Option<&AppEntry>,

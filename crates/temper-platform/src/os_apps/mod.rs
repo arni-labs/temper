@@ -48,8 +48,8 @@ use entity_aliases::{
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
 pub use reconcile::{
-    os_app_bundle_digest, os_app_dir_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
-    resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
+    os_app_bundle_digest, os_app_dir_bundle_digest, os_app_dir_bundle_digests, reconcile_os_app,
+    resolve_os_app_install_order, resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
 };
 pub(crate) use reconcile::{
     tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,

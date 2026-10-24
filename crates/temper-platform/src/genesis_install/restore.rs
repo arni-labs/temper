@@ -8,11 +8,11 @@
 use std::collections::BTreeSet;
 
 use temper_runtime::tenant::TenantId;
-use temper_server::platform_store::InstalledAppRecord;
+use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 
 use super::registry::recorded_registry;
 use super::*;
-use crate::os_apps::os_app_dir_bundle_digest;
+use crate::os_apps::os_app_dir_bundle_digests;
 
 /// Rebuild Genesis app materialization cache roots from durable Genesis rows.
 ///
@@ -177,21 +177,23 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         } else {
             record.registry_tenant.trim()
         };
-        let cache_root = genesis_cache_root(
-            &platform.server,
-            CacheOwner::Install {
-                tenant: &tenant,
-                source: InstallSource::Registry(registry_tenant),
-            },
-            &record.app_ref,
-        );
+        let candidates =
+            install_cache_candidates(platform, &tenant, registry_tenant, &record.app_ref);
+        let cache_root = candidates[0].clone();
         // Each tenant's install has its own directory, so records restore it
         // once per directory, from that install's own registry tenant.
         if !seen.insert(cache_root.clone()) {
             continue;
         }
-        if stored_install_matches(&cache_root, &record) {
-            register_install_cache(&tenant, cache_root);
+        if let Some(stored) = first_matching_install(
+            ps.as_ref(),
+            &candidates,
+            &record,
+            std::slice::from_ref(&record),
+        )
+        .await
+        {
+            register_install_cache(&tenant, stored);
             restored += 1;
             continue;
         }
@@ -253,12 +255,16 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
 
 /// Make sure the prior version's bundle is resolvable from the app catalog before rollback.
 ///
-/// Prefers the prior ref's on-disk cache; if it was evicted, re-materializes the closure from the
-/// prior record's registry coordinates. Best-effort when the prior ref is unpinned or carries no
+/// Prefers the prior install's on-disk cache, whether a registry install or an `App.Install`
+/// made it; if it was evicted, re-materializes the closure from the prior record's registry
+/// coordinates. `prior_records` are the closure's records from before the failed install, which
+/// has since overwritten the stored ones. Best-effort when the prior ref is unpinned or carries no
 /// registry URL — rollback then relies on whatever bundle the catalog already resolves for the app.
 pub(super) async fn ensure_prior_bundle_available(
     platform: &PlatformState,
+    ps: &dyn PlatformStore,
     prior: &InstalledAppRecord,
+    prior_records: &[InstalledAppRecord],
 ) -> Result<(), String> {
     let prior_ref = parse_registry_app_ref(&prior.app_ref)?;
     let Some(prior_hash) = prior_ref.version_hash.clone() else {
@@ -275,18 +281,13 @@ pub(super) async fn ensure_prior_bundle_available(
     } else {
         prior.registry_tenant.trim().to_string()
     };
-    let cache_root = genesis_cache_root(
-        &platform.server,
-        CacheOwner::Install {
-            tenant: &prior.tenant,
-            source: InstallSource::Registry(&registry_tenant),
-        },
-        &cache_key,
-    );
-    if stored_install_matches(&cache_root, prior) {
-        register_install_cache(&prior.tenant, cache_root);
+    let candidates =
+        install_cache_candidates(platform, &prior.tenant, &registry_tenant, &cache_key);
+    if let Some(stored) = first_matching_install(ps, &candidates, prior, prior_records).await {
+        register_install_cache(&prior.tenant, stored);
         return Ok(());
     }
+    let cache_root = candidates[0].clone();
     if cache_root.is_dir() {
         tracing::warn!(
             app = %prior.app_name,
@@ -321,52 +322,96 @@ pub(super) async fn ensure_prior_bundle_available(
     Ok(())
 }
 
-/// Whether an install's cache directory still holds the version its record names.
+/// The cache directories an install of `cache_key` into `tenant` may have, the registry's first.
+///
+/// A registry install caches under its registry tenant. An `App.Install` from a Genesis service
+/// on this server caches under the service's tenant, which its record names as the registry
+/// tenant unless the request named another one, so every Genesis source tenant is a candidate too.
+/// A candidate is used only when it holds the recorded versions.
+fn install_cache_candidates(
+    platform: &PlatformState,
+    tenant: &str,
+    registry_tenant: &str,
+    cache_key: &str,
+) -> Vec<PathBuf> {
+    let mut sources = vec![
+        InstallSource::Registry(registry_tenant),
+        InstallSource::Local(registry_tenant),
+    ];
+    let source_tenants = genesis_source_tenants();
+    sources.extend(
+        source_tenants
+            .iter()
+            .filter(|source| source.as_str() != registry_tenant)
+            .map(|source| InstallSource::Local(source.as_str())),
+    );
+    sources
+        .into_iter()
+        .map(|source| {
+            genesis_cache_root(
+                &platform.server,
+                CacheOwner::Install { tenant, source },
+                cache_key,
+            )
+        })
+        .collect()
+}
+
+/// The first of `candidates` that still holds the versions `record`'s install recorded.
+async fn first_matching_install(
+    ps: &dyn PlatformStore,
+    candidates: &[PathBuf],
+    record: &InstalledAppRecord,
+    recorded: &[InstalledAppRecord],
+) -> Option<PathBuf> {
+    for candidate in candidates {
+        if stored_install_matches(ps, candidate, record, recorded).await {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+/// Whether an install's cache directory still holds the versions its records name.
 ///
 /// A directory on disk is not proof on its own: an install could have stopped
-/// partway. It counts only when the recorded app reads back from it at the
-/// recorded digest, or, for a record without a digest, at least reads back.
-/// It is checked before it is registered, so a directory that does not match
-/// never becomes what the tenant resolves.
-fn stored_install_matches(cache_root: &Path, record: &InstalledAppRecord) -> bool {
-    match os_app_dir_bundle_digest(cache_root, &record.app_name) {
-        Some(digest) => {
-            record.bundle_digest.is_empty() || digest.bundle_digest == record.bundle_digest
-        }
-        None => false,
+/// partway, and a file in it could have changed since. Registering the
+/// directory makes every app in it what the tenant resolves, so every app in
+/// it must read back at its recorded digest: from `recorded` when that names
+/// the app, otherwise from the tenant's stored record. A record without a
+/// digest needs the app to read back. The installed app itself must be in the
+/// directory. It is checked before it is registered, so a directory that does
+/// not match never becomes what the tenant resolves.
+async fn stored_install_matches(
+    ps: &dyn PlatformStore,
+    cache_root: &Path,
+    record: &InstalledAppRecord,
+    recorded: &[InstalledAppRecord],
+) -> bool {
+    let Some(digests) = os_app_dir_bundle_digests(cache_root) else {
+        return false;
+    };
+    if !digests
+        .iter()
+        .any(|digest| digest.app_name == record.app_name)
+    {
+        return false;
     }
+    for digest in &digests {
+        let expected = match recorded.iter().find(|r| r.app_name == digest.app_name) {
+            Some(known) => known.bundle_digest.clone(),
+            None => match ps.get_installed_app(&record.tenant, &digest.app_name).await {
+                Ok(Some(stored)) => stored.bundle_digest,
+                _ => return false,
+            },
+        };
+        if !expected.is_empty() && expected != digest.bundle_digest {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_app(root: &Path, app_name: &str, marker: &str) {
-        let app_dir = root.join(app_name);
-        std::fs::create_dir_all(&app_dir).expect("app dir");
-        std::fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n"))
-            .expect("app.toml");
-        std::fs::write(
-            app_dir.join("APP.md"),
-            format!("# {app_name}\n\n{marker}\n"),
-        )
-        .expect("APP.md");
-    }
-
-    #[test]
-    fn a_cache_directory_is_reused_only_while_it_holds_the_recorded_version() {
-        let root = tempfile::tempdir().expect("cache root");
-        write_app(root.path(), "notes", "first version");
-        let recorded = os_app_dir_bundle_digest(root.path(), "notes").expect("digest");
-        let record = InstalledAppRecord {
-            app_name: "notes".to_string(),
-            bundle_digest: recorded.bundle_digest,
-            ..Default::default()
-        };
-        assert!(stored_install_matches(root.path(), &record));
-
-        write_app(root.path(), "notes", "another version");
-        assert!(!stored_install_matches(root.path(), &record));
-        assert!(!stored_install_matches(&root.path().join("gone"), &record));
-    }
-}
+#[path = "restore/tests.rs"]
+mod tests;
