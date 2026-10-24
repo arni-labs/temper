@@ -12,6 +12,7 @@ mod field_updates;
 mod replay_validation;
 pub mod sim_handler;
 mod snapshot_queue;
+pub(crate) mod spawn_refusal;
 pub mod types;
 pub(crate) mod undeclared_params;
 

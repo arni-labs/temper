@@ -62,6 +62,12 @@ pub enum EntityMsg {
         /// this message reached its mailbox.
         expected_precondition: Option<String>,
     },
+    /// Record that a spawn this entity's transition made could not create its
+    /// child: journal it, and clear the field that names the child.
+    RecordSpawnRefusal {
+        /// The refused spawn.
+        refusal: super::spawn_refusal::SpawnRefusal,
+    },
     /// Delete this entity.
     Delete {
         /// Digest of the exact local state used for an external Cedar

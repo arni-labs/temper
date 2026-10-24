@@ -1679,6 +1679,7 @@ async fn reserved_field_update_event_names_are_refused_as_actions() {
     for reserved in [
         crate::entity_actor::effects::FIELDS_UPDATED_EVENT,
         crate::entity_actor::effects::FIELDS_REPLACED_EVENT,
+        crate::entity_actor::spawn_refusal::SPAWN_REFUSED_EVENT,
     ] {
         let response: EntityResponse = actor_ref
             .ask(
