@@ -90,11 +90,23 @@ impl ServerState {
     /// Check the record a write will store against the tenant's relation
     /// integrity, field invariants and hard cross-invariants. A kernel
     /// follow-on is not checked (see the module docs).
-    ///
     pub(crate) async fn check_record_to_store(
         &self,
         write: RecordWrite<'_>,
         record: &Value,
+    ) -> Result<(), ConstraintViolation> {
+        self.check_record_and_links(write, record, record).await
+    }
+
+    /// [`Self::check_record_to_store`], with relation integrity and
+    /// cross-invariants reading the related ids from `links`, which differs
+    /// from `record` only when the write names a record the kernel creates
+    /// after it commits.
+    async fn check_record_and_links(
+        &self,
+        write: RecordWrite<'_>,
+        record: &Value,
+        links: &Value,
     ) -> Result<(), ConstraintViolation> {
         let RecordWrite {
             caller,
@@ -113,7 +125,7 @@ impl ServerState {
             entity_type,
             entity_id,
             operation,
-            record,
+            links,
         )
         .await?;
         constraints::pre_upsert_field_invariant_checks(
@@ -131,7 +143,7 @@ impl ServerState {
             entity_type,
             entity_id,
             action,
-            record,
+            links,
             operation,
         )
         .await
@@ -158,10 +170,10 @@ impl ServerState {
         if !self.action_record_checked(caller, tenant, &current.entity_type, action) {
             return Ok(());
         }
-        let record = self
+        let (record, links) = self
             .action_record(tenant, table, current, action, params, related)
             .await;
-        self.check_record_to_store(
+        self.check_record_and_links(
             RecordWrite {
                 caller,
                 tenant,
@@ -171,6 +183,7 @@ impl ServerState {
                 operation: "action",
             },
             &record,
+            links.as_ref().unwrap_or(&record),
         )
         .await
     }
@@ -209,7 +222,11 @@ impl ServerState {
     }
 
     /// The fields `action` stores when applied to `current`: the actor's own
-    /// action interpreter run on a copy of the state.
+    /// action interpreter run on a copy of the state. When the action spawns
+    /// children, the second value is the same record with each field that
+    /// stores a child's id as it stood before the action, for the checks
+    /// that look related records up: the kernel creates those children only
+    /// after this commit.
     async fn action_record(
         &self,
         tenant: &TenantId,
@@ -218,7 +235,7 @@ impl ServerState {
         action: &str,
         params: &Value,
         related: &RelatedMap,
-    ) -> Value {
+    ) -> (Value, Option<Value>) {
         let mut preview = current.clone();
         // The preview repeats the interpreter's own log lines; only the real
         // application of the action should appear in the logs.
@@ -241,28 +258,31 @@ impl ServerState {
             // too and stores nothing; if the state moved on in between, the
             // action's params written over the current fields is what it can
             // store.
-            return params_written_over(current, params);
+            return (params_written_over(current, params), None);
         }
-        let mut fields = preview.fields;
-        if let Some(fields) = fields.as_object_mut() {
-            // A spawn writes the id of a child the kernel creates after this
-            // commit; that field is checked as it stood before the action.
-            for field in result
-                .spawn_requests
-                .iter()
-                .filter_map(|spawn| spawn.store_id_in.as_deref())
-            {
+        let record = preview.fields;
+        let mut child_fields = result
+            .spawn_requests
+            .iter()
+            .filter_map(|spawn| spawn.store_id_in.as_deref())
+            .peekable();
+        if child_fields.peek().is_none() {
+            return (record, None);
+        }
+        let mut links = record.clone();
+        if let Some(links) = links.as_object_mut() {
+            for field in child_fields {
                 match current.fields.get(field) {
                     Some(previous) => {
-                        fields.insert(field.to_string(), previous.clone());
+                        links.insert(field.to_string(), previous.clone());
                     }
                     None => {
-                        fields.remove(field);
+                        links.remove(field);
                     }
                 }
             }
         }
-        fields
+        (record, Some(links))
     }
 }
 
