@@ -7,6 +7,7 @@ pub mod custom_effects;
 mod dispatch;
 mod entity_ops;
 mod evolution;
+mod existing_entity;
 mod file_initial_writes;
 mod file_read_blobs;
 mod file_read_projection;

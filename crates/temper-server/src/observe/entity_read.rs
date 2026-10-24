@@ -28,28 +28,22 @@ pub(super) async fn require_existing_entity_read(
 /// Read an existing entity's current state and authorize returning it.
 ///
 /// Answers `404` for an id that does not exist or was deleted, and never
-/// starts an entity for one: the id must be in the tenant's index or in the
-/// store first. Routes that answer more than once (a wait that wakes, a
-/// stream that sends later events) call this for each answer, so every
-/// decision is made on a state no older than what is sent.
+/// starts an entity for one (see [`ServerState::get_existing_entity_state`]).
+/// Routes that answer more than once (a wait that wakes, a stream that sends
+/// later events) call this for each answer, so every decision is made on a
+/// state no older than what is sent.
 pub(super) async fn load_authorized_entity_state(
     state: &ServerState,
     authenticated: &AuthenticatedRequestContext,
     entity_type: &str,
     entity_id: &str,
 ) -> Result<EntityResponse, StatusCode> {
-    let tenant = authenticated.tenant();
-    if !state.entity_exists(tenant, entity_type, entity_id)
-        && !state
-            .ensure_entity_loaded(tenant, entity_type, entity_id)
-            .await
-    {
-        return Err(StatusCode::NOT_FOUND);
-    }
     let entity = state
-        .get_tenant_entity_state(tenant, entity_type, entity_id)
+        .get_existing_entity_state(authenticated.tenant(), entity_type, entity_id)
         .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .ok()
+        .flatten()
+        .ok_or(StatusCode::NOT_FOUND)?;
     authorize_entity_state(state, authenticated, entity_type, entity_id, &entity)?;
     Ok(entity)
 }

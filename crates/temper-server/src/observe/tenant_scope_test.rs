@@ -369,3 +369,66 @@ async fn entity_events_end_once_the_caller_may_no_longer_read_the_entity() {
         assert!(seq <= replayed, "no event after submission is sent: {body}");
     }
 }
+
+/// Whether an actor for this entity is live in memory.
+fn has_live_actor(state: &ServerState, tenant: &str, id: &str) -> bool {
+    let key = format!("{tenant}:Order:{id}");
+    state
+        .actor_registry
+        .read()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|actor| !actor.is_closed())
+}
+
+#[tokio::test]
+async fn reading_an_entity_deleted_during_its_load_does_not_start_it_again() {
+    let state = state_with_shared_store().await;
+    let tenant = TenantId::new("tenant-a");
+    let result = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o-del",
+            "AddItem",
+            serde_json::json!({"ProductId": "p1"}),
+            &AgentContext::default(),
+        )
+        .await;
+    assert!(result.is_ok_and(|r| r.success), "AddItem failed");
+    state
+        .delete_tenant_entity(&tenant, "Order", "o-del")
+        .await
+        .expect("delete succeeds");
+
+    for route in [
+        "history",
+        "wait?statuses=Shipped&timeout_ms=50&poll_ms=10",
+        "events",
+    ] {
+        // The id is still indexed, as when the read's existence check passed
+        // just before the delete finished.
+        state
+            .entity_index
+            .write()
+            .unwrap()
+            .entry("tenant-a:Order".to_string())
+            .or_default()
+            .insert("o-del".to_string());
+
+        let uri = format!("/observe/entities/Order/o-del/{route}");
+        let response = app(state.clone())
+            .oneshot(system_in("tenant-a", "GET", &uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert!(
+            !has_live_actor(&state, "tenant-a", "o-del"),
+            "{uri} started the deleted entity again"
+        );
+        assert!(
+            !state.entity_exists(&tenant, "Order", "o-del"),
+            "{uri} left the deleted entity indexed"
+        );
+    }
+}
