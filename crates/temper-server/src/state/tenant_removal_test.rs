@@ -87,10 +87,13 @@ async fn a_tenants_storage_is_removed_only_after_its_busy_actor_has_ended() {
     let ended_at_removal = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&ended_at_removal);
     let existed = state
-        .remove_tenant(&TenantId::new("acme"), || {
-            seen.store(ended.load(Ordering::SeqCst), Ordering::SeqCst);
-            async { Ok(true) }
-        })
+        .remove_tenant(
+            &state.tenant_generations.stamp(&TenantId::new("acme")),
+            || {
+                seen.store(ended.load(Ordering::SeqCst), Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
         .await
         .expect("removal finishes");
 
@@ -118,7 +121,7 @@ async fn an_actor_that_does_not_end_in_time_fails_the_removal_and_a_retry_finish
     let storage_removed = Arc::new(AtomicBool::new(false));
     let removed = Arc::clone(&storage_removed);
     let error = state
-        .remove_tenant(&acme, || {
+        .remove_tenant(&state.tenant_generations.stamp(&acme), || {
             removed.store(true, Ordering::SeqCst);
             async { Ok(true) }
         })
@@ -140,7 +143,7 @@ async fn an_actor_that_does_not_end_in_time_fails_the_removal_and_a_retry_finish
     actor.stopped().await;
     assert!(ended.load(Ordering::SeqCst));
     let existed = state
-        .remove_tenant(&acme, || {
+        .remove_tenant(&state.tenant_generations.stamp(&acme), || {
             removed.store(true, Ordering::SeqCst);
             async { Ok(true) }
         })
@@ -160,9 +163,10 @@ async fn a_failed_storage_removal_keeps_what_the_tenant_needs_to_retry() {
         .expect("policy");
 
     let error = state
-        .remove_tenant(&TenantId::new("acme"), || async {
-            Err(PersistenceError::Storage("store unavailable".to_string()))
-        })
+        .remove_tenant(
+            &state.tenant_generations.stamp(&TenantId::new("acme")),
+            || async { Err(PersistenceError::Storage("store unavailable".to_string())) },
+        )
         .await
         .expect_err("storage removal failed");
     assert!(matches!(error, TenantRemovalError::Storage(_)), "{error}");
@@ -191,7 +195,10 @@ async fn a_deleted_tenants_policies_secrets_and_routes_are_forgotten_and_other_t
     }
 
     let existed = state
-        .remove_tenant(&TenantId::new("acme"), || async { Ok(true) })
+        .remove_tenant(
+            &state.tenant_generations.stamp(&TenantId::new("acme")),
+            || async { Ok(true) },
+        )
         .await
         .expect("removal finishes");
     assert!(existed);

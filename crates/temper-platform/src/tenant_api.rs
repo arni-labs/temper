@@ -159,13 +159,14 @@ async fn create_tenant(
     }
 
     // An id whose removal has not finished is not created again until it has: the old tenant's storage and specs are
-    // still there, and deleting it again finishes the removal.
-    if state.server.tenant_generations.live(&tenant).is_none() {
+    // still there, and deleting it again finishes the removal. The create is work of the id's live generation, so a
+    // delete that starts meanwhile waits for it instead of removing storage the create is still writing.
+    let Some(_lease) = state.server.tenant_generations.lease_live(&tenant) else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": format!("tenant '{tenant}' is being deleted")})),
         );
-    }
+    };
     match provider.register_tenant(&tenant).await {
         Ok(_store) => {
             // Bootstrap agent specs for the new tenant.
@@ -253,6 +254,7 @@ async fn list_tenants(
 pub(crate) async fn delete_tenant(
     State(state): State<PlatformState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
+    admitted: Option<Extension<temper_server::state::TenantStamp>>,
     axum::extract::Path(tenant_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let authenticated = match require_authenticated(authenticated.as_deref()) {
@@ -290,11 +292,19 @@ pub(crate) async fn delete_tenant(
     // Refuse the tenant's new work, stop its actors and wait for each to end, and only then remove its database,
     // registry row and users, then what this process holds in memory for it, so an id created again starts empty.
     // A removal that fails part way keeps the tenant refused; deleting it again finishes it.
-    // `require_same_tenant` checked that the path names the request's own tenant.
+    // `require_same_tenant` checked that the path names the request's own tenant. The delete removes the generation
+    // `bearer_auth` admitted the request under: a delete still under way when another one finished, and the tenant
+    // was created again, finds that generation gone and leaves the new tenant alone.
     let tid = authenticated.tenant();
+    let Some(Extension(stamp)) = admitted.filter(|Extension(stamp)| stamp.tenant() == tid) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "the delete was not admitted for its tenant"})),
+        );
+    };
     match state
         .server
-        .remove_tenant(tid, || provider.remove_tenant(tid))
+        .remove_tenant(&stamp, || provider.remove_tenant(tid))
         .await
     {
         Ok(true) => (

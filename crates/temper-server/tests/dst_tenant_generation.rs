@@ -52,7 +52,8 @@ async fn dst_tenant_generation_delete_racing_actor_creation() {
         let storage_after = pick(seed, 2, 6);
         let live_at_removal = std::cell::Cell::new(None);
         let tenant = acme();
-        let removal = harness.state.remove_tenant(&tenant, || async {
+        let stamp = harness.state.tenant_generations.stamp(&tenant);
+        let removal = harness.state.remove_tenant(&stamp, || async {
             yields(storage_after).await;
             live_at_removal.set(Some(live_actors(&harness.state)));
             Ok(harness.remove_storage())
@@ -197,16 +198,19 @@ async fn dst_tenant_generation_second_delete_after_recreate() {
         let tenant = acme();
         let second_started = std::cell::Cell::new(false);
         let created_while_second_ran = std::cell::Cell::new(false);
-        let first = harness.state.remove_tenant(&tenant, || async {
+        let first_stamp = harness.state.tenant_generations.stamp(&tenant);
+        let first = harness.state.remove_tenant(&first_stamp, || async {
             yields(first_storage).await;
             Ok(harness.remove_storage())
         });
         let second = async {
             yields(second_after).await;
             second_started.set(true);
+            // `DELETE /api/tenants/acme` is admitted under the generation live when it arrives.
+            let stamp = harness.state.tenant_generations.stamp(&tenant);
             harness
                 .state
-                .remove_tenant(&tenant, || async {
+                .remove_tenant(&stamp, || async {
                     yields(second_storage).await;
                     Ok(harness.remove_storage())
                 })

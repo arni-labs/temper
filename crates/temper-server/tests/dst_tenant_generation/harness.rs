@@ -154,7 +154,9 @@ impl Harness {
     /// Delete the tenant as `DELETE /api/tenants/acme` does.
     pub async fn delete(&self) {
         self.state
-            .remove_tenant(&acme(), || async { Ok(self.remove_storage()) })
+            .remove_tenant(&self.state.tenant_generations.stamp(&acme()), || async {
+                Ok(self.remove_storage())
+            })
             .await
             .expect("the removal finishes");
     }

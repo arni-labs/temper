@@ -2,7 +2,8 @@
 //! it: close the tenant's generation so no new work or actor is admitted, stop its actors and wait for them and for
 //! the work still running to end, remove its storage, then forget what this process holds for it. Work of the closed
 //! generation that acts later (a timer, a follow-on, a queued projection write) is refused, so the id created again
-//! starts a new generation that nothing of the old one reaches.
+//! starts a new generation that nothing of the old one reaches. A removal acts on the generation it was admitted for,
+//! so one still under way when another finished does not remove the tenant created again under the id.
 
 use std::future::Future;
 
@@ -11,7 +12,7 @@ use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
-use super::tenant_generation::{Generation, TenantGenerations};
+use super::tenant_generation::{Generation, TenantGenerations, TenantStamp};
 
 /// Why a tenant removal did not finish. The tenant's generation stays closed (no new actors and no new work), its
 /// specs, credentials and policies are kept, and running the removal again picks up where this one stopped.
@@ -57,30 +58,40 @@ fn poisoned<T>(what: &'static str) -> impl FnOnce(T) -> TenantRemovalError {
 }
 
 impl ServerState {
-    /// Remove a tenant: refuse its new work, stop its actors and wait until each has ended, then run `remove_storage`,
-    /// then forget everything this process holds for it. Returns what `remove_storage` returned: whether the tenant
-    /// existed.
+    /// Remove the tenant generation `stamp` names: refuse its new work, stop its actors and wait until each has ended,
+    /// then run `remove_storage`, then forget everything this process holds for the tenant. Returns what
+    /// `remove_storage` returned, whether the tenant existed, or false when that generation was already removed.
     ///
     /// Storage is removed only once no actor of the tenant is running, so none can write into it afterwards (or into
     /// a database created again under the same id). Each step converges when repeated, so a removal that failed is
     /// finished by running it again.
     pub async fn remove_tenant<F, Fut>(
         &self,
-        tenant: &TenantId,
+        stamp: &TenantStamp,
         remove_storage: F,
     ) -> Result<bool, TenantRemovalError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<bool, PersistenceError>>,
     {
+        let tenant = stamp.tenant();
         // A closed generation admits no new work and no new actor. Its specs, credentials and policies stay until its
         // storage is gone, so a removal that stops part way can be retried by the caller who started it.
-        let closing = self.tenant_generations.close(tenant);
+        let Some(closing) = self.tenant_generations.close(stamp) else {
+            return Ok(false);
+        };
+        // Storage and memory are keyed by the tenant id, which a tenant created again reuses. They are removed only
+        // while `closing` is still the tenant's generation, by one removal at a time: one that waited behind a removal
+        // that finished finds the generation gone and leaves the id to its new tenant.
+        let _removing = closing.removing().await;
+        if !self.tenant_generations.is_current(&closing) {
+            return Ok(false);
+        }
         self.stop_tenant_actors(tenant, &closing).await?;
         let existed = remove_storage()
             .await
             .map_err(TenantRemovalError::Storage)?;
-        self.forget_tenant(tenant).await?;
+        self.forget_tenant(tenant, &closing).await?;
         Ok(existed)
     }
 
@@ -138,11 +149,16 @@ impl ServerState {
     }
 
     /// Drop everything this process holds in memory for a deleted tenant: its entity caches and indexes, its cached
-    /// replies, its timer sequences, its pending eventual invariants and queued snapshots, its HTTP routes, its Cedar policies, its cached secrets, its WASM modules and
+    /// replies, its capture losses and markers, its timer sequences, its pending eventual invariants and queued snapshots,
+    /// its HTTP routes, its Cedar policies, its cached secrets, its WASM modules and
     /// its specs. A tenant created again with the same id then starts from its own (empty) database, not from what
     /// the deleted tenant left in memory. [`Self::remove_tenant`] runs this once the tenant's actors have ended and
-    /// its storage is gone.
-    async fn forget_tenant(&self, tenant: &TenantId) -> Result<(), TenantRemovalError> {
+    /// its storage is gone, while `generation` is still the tenant's.
+    async fn forget_tenant(
+        &self,
+        tenant: &TenantId,
+        generation: &std::sync::Arc<Generation>,
+    ) -> Result<(), TenantRemovalError> {
         let prefix = format!("{tenant}:");
         let owned = |key: &String| key.starts_with(&prefix);
 
@@ -191,6 +207,8 @@ impl ServerState {
             .retain(|key, _| !owned(key));
 
         self.idempotency_cache.forget_tenant(tenant);
+        crate::trajectory_outbox::forget_tenant_capture_loss_markers(tenant.as_str());
+        self.capture_health.forget_generation(generation.stamp());
         self.state_timeout_tracker.forget_tenant(tenant);
         self.eventual_tracker
             .write()
@@ -223,7 +241,7 @@ impl ServerState {
             .map_err(poisoned("spec registry"))?
             .remove_tenant(tenant);
         // Last: the id's next use starts a new generation only once nothing of this one is left in memory.
-        self.tenant_generations.forget(tenant);
+        self.tenant_generations.forget(generation);
         crate::runtime_metrics::record_server_state_metrics(self);
         Ok(())
     }

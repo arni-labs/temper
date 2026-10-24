@@ -11,12 +11,12 @@ fn a_tenant_created_again_starts_a_new_generation_and_the_old_stamp_is_refused()
     let first = generations.live(&acme).expect("a new id starts live");
     assert!(generations.lease(&first).is_some());
 
-    generations.close(&acme);
+    let closed = generations.close(&first).expect("the live generation");
     assert!(generations.live(&acme).is_none(), "closed while removed");
     assert!(generations.lease(&first).is_none());
     assert!(generations.lease_live(&acme).is_none());
 
-    generations.forget(&acme);
+    generations.forget(&closed);
     let second = generations
         .live(&acme)
         .expect("the id's next use starts again");
@@ -29,12 +29,21 @@ fn a_tenant_created_again_starts_a_new_generation_and_the_old_stamp_is_refused()
 }
 
 #[test]
-fn forgetting_a_live_generation_keeps_it() {
+fn a_removed_generation_is_not_closed_or_forgotten_again_once_the_tenant_is_created_again() {
     let generations = TenantGenerations::default();
     let acme = TenantId::new("acme");
-    let live = generations.live(&acme).expect("live");
-    generations.forget(&acme);
-    assert_eq!(generations.live(&acme), Some(live));
+    let first = generations.live(&acme).expect("live");
+    let closed = generations.close(&first).expect("the live generation");
+    generations.forget(&closed);
+    let second = generations.live(&acme).expect("created again");
+
+    assert!(
+        generations.close(&first).is_none(),
+        "a delete of the removed generation does not close the new one"
+    );
+    assert!(!generations.is_current(&closed));
+    generations.forget(&closed);
+    assert_eq!(generations.live(&acme), Some(second));
 }
 
 #[tokio::test(start_paused = true)]
@@ -43,7 +52,9 @@ async fn a_closed_generation_drains_when_its_last_lease_ends() {
     let acme = TenantId::new("acme");
     let first = generations.lease_live(&acme).expect("live");
     let second = generations.lease_live(&acme).expect("live");
-    let closed = generations.close(&acme);
+    let closed = generations
+        .close(first.stamp())
+        .expect("the live generation");
     assert_eq!(
         closed.leases(),
         2,
@@ -73,12 +84,14 @@ fn queued_work_gets_no_lease_once_its_generation_is_deleted() {
         "written while its generation is live"
     );
 
-    generations.close(&acme);
+    let closed = generations
+        .close(&queued.stamp)
+        .expect("the live generation");
     assert!(
         queued.lease().is_none(),
         "dropped while the tenant is removed"
     );
-    generations.forget(&acme);
+    generations.forget(&closed);
     assert!(generations.live(&acme).is_some());
     assert!(
         queued.lease().is_none(),

@@ -403,8 +403,11 @@ mod tests {
         );
         // The tenant is deleted while the write waits, and created again under its id.
         let acme = TenantId::new("acme");
-        queue.generations.close(&acme);
-        queue.generations.forget(&acme);
+        let closed = queue
+            .generations
+            .close(&queue.generations.stamp(&acme))
+            .expect("the live generation");
+        queue.generations.forget(&closed);
         assert!(queue.generations.live(&acme).is_some());
 
         for write in queue.take_batch() {

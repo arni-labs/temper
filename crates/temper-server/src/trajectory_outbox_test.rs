@@ -108,7 +108,7 @@ async fn a_loss_interrupted_before_its_marker_lands_leaves_the_server_degraded()
     let health = CaptureHealth::default();
     assert!(!health.is_degraded());
 
-    health.record_unconfirmed_loss();
+    health.record_unconfirmed_loss(None);
 
     assert!(
         health.is_degraded(),
@@ -126,7 +126,7 @@ async fn a_marker_that_never_lands_leaves_the_loss_unconfirmed() {
     // session has a hole in it.
     release_capture_loss_marker("tenant", "doomed-session");
     let health = CaptureHealth::default();
-    health.record_unconfirmed_loss();
+    health.record_unconfirmed_loss(None);
 
     persist_capture_loss_marker(
         queued_marker_for_test(
@@ -161,7 +161,7 @@ async fn only_a_confirmed_write_clears_the_loss() {
         .await
         .expect("create local turso store");
     let health = CaptureHealth::default();
-    health.record_unconfirmed_loss();
+    health.record_unconfirmed_loss(None);
     assert!(health.is_degraded());
 
     persist_capture_loss_marker(
@@ -321,9 +321,10 @@ impl crate::storage::TrajectorySink for RecordingSink {
 
 #[tokio::test]
 async fn a_loss_of_a_deleted_tenant_is_cleared_and_the_tenant_created_again_starts_unmarked() {
-    // The session a marker of a deleted tenant would mark went with the tenant's storage, so no stored record is left
-    // incomplete: the loss is accounted for, and the server does not read degraded for a tenant that is gone. The
-    // tenant created again under the id starts with no session marked, so a loss in it is marked.
+    // The sessions a deleted tenant's markers would mark went with its storage, so no stored record is left
+    // incomplete: its losses are accounted for, whether their marker was still queued or had exhausted its retries,
+    // and the server does not read degraded for a tenant that is gone. Another tenant's loss still counts. The tenant
+    // created again under the id starts with no session marked, so a loss in it is marked.
     let state = crate::state::ServerState::new(
         temper_runtime::ActorSystem::new("capture-loss-deleted-tenant"),
         temper_spec::csdl::CsdlDocument {
@@ -332,21 +333,41 @@ async fn a_loss_of_a_deleted_tenant_is_cleared_and_the_tenant_created_again_star
         },
         String::new(),
     );
+    let health = state.capture_health.clone();
     let tenant = temper_runtime::tenant::TenantId::new("capture-loss-gone");
+    let other = temper_runtime::tenant::TenantId::new("capture-loss-kept");
     let generation = state.generation_ref(&tenant);
-    for session in ["lost-session", "marked-session"] {
+    let sessions = ["lost-session", "exhausted-session", "marked-session"];
+    for session in sessions {
         release_capture_loss_marker(tenant.as_str(), session);
         assert_eq!(
             claim_capture_loss_marker(tenant.as_str(), session),
             MarkerClaim::Claimed
         );
     }
-    // `marked-session`'s marker was stored before the delete; `lost-session`'s is still queued.
-    let health = CaptureHealth::default();
-    health.record_unconfirmed_loss();
+    // `marked-session`'s marker was stored before the delete, `exhausted-session`'s ran out of retries, and
+    // `lost-session`'s is still queued when the delete runs.
+    health.record_unconfirmed_loss(Some(generation.stamp()));
+    health.record_unconfirmed_loss(Some(generation.stamp()));
+    persist_capture_loss_marker(
+        queued_marker_for_test(
+            Arc::new(FailingSink),
+            tenant.as_str(),
+            "exhausted-session",
+            Some(generation.clone()),
+            health.clone(),
+        ),
+        Duration::ZERO,
+    )
+    .await;
+    let other_generation = state.generation_ref(&other);
+    health.record_unconfirmed_loss(Some(other_generation.stamp()));
+    assert_eq!(health.unconfirmed_losses(), 3);
 
     state
-        .remove_tenant(&tenant, || async { Ok(true) })
+        .remove_tenant(&state.tenant_generations.stamp(&tenant), || async {
+            Ok(true)
+        })
         .await
         .expect("removal finishes");
     let sink = Arc::new(RecordingSink::default());
@@ -366,11 +387,12 @@ async fn a_loss_of_a_deleted_tenant_is_cleared_and_the_tenant_created_again_star
         sink.written.lock().expect("recording sink").is_empty(),
         "nothing is written into the tenant created again under the id"
     );
-    assert!(
-        !health.is_degraded(),
-        "the loss of a deleted tenant leaves no stored session incomplete"
+    assert_eq!(
+        health.unconfirmed_losses(),
+        1,
+        "the deleted tenant's losses leave no stored session incomplete; the other tenant's loss still counts"
     );
-    for session in ["lost-session", "marked-session"] {
+    for session in sessions {
         assert_eq!(
             claim_capture_loss_marker(tenant.as_str(), session),
             MarkerClaim::Claimed,

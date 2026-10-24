@@ -24,8 +24,8 @@ use crate::storage::TrajectorySink;
 
 mod capture_loss;
 
-pub(crate) use capture_loss::CaptureHealth;
 use capture_loss::record_capture_loss;
+pub(crate) use capture_loss::{CaptureHealth, forget_tenant_capture_loss_markers};
 #[cfg(test)]
 use capture_loss::{
     MAX_MARKED_SESSIONS, MarkerClaim, claim_capture_loss_marker, claim_in,

@@ -30,11 +30,8 @@
 //! different interleaving on every run, and a hashed set gives it a different
 //! iteration order.
 
-use std::collections::BTreeSet;
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
@@ -43,8 +40,8 @@ use tokio::sync::mpsc;
 
 use super::{metrics, next_capture_seq, record_dropped};
 use crate::conformance::{CAPTURE_LOSS_ACTION, CAPTURE_LOSS_ENTITY_TYPE};
-use crate::state::GenerationRef;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{GenerationRef, TenantStamp};
 use crate::storage::TrajectorySink;
 
 /// Cap on sessions this process remembers having marked.
@@ -82,16 +79,30 @@ const CAPTURE_MARKER_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Carried on [`crate::state::ServerState`] rather than in a global, so it
 /// belongs to one server's capture path and a check can ask its own server
 /// whether the record it is about to read can be trusted.
+///
+/// Losses are counted per tenant generation (none for an entry whose tenant id
+/// is not one), because a deleted generation's sessions go with its storage:
+/// deleting it retires its losses, and no other tenant's.
 #[derive(Clone, Default)]
 pub(crate) struct CaptureHealth {
-    unconfirmed_losses: Arc<AtomicU64>,
+    unconfirmed: Arc<Mutex<BTreeMap<Option<TenantStamp>, u64>>>,
 }
 
 impl CaptureHealth {
+    /// The counts. A panic elsewhere cannot leave them half updated (each
+    /// change is one map operation), so a poisoned lock still holds them.
+    fn counts(&self) -> std::sync::MutexGuard<'_, BTreeMap<Option<TenantStamp>, u64>> {
+        self.unconfirmed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Losses whose marker this server has not seen stored.
     #[allow(dead_code)] // False positive: read by api/trajectory_analysis.rs under the observe feature
     pub(crate) fn unconfirmed_losses(&self) -> u64 {
-        self.unconfirmed_losses.load(Ordering::Relaxed)
+        self.counts()
+            .values()
+            .fold(0, |total, count| total.saturating_add(*count))
     }
 
     /// Whether any loss is still unaccounted for.
@@ -100,20 +111,33 @@ impl CaptureHealth {
         self.unconfirmed_losses() > 0
     }
 
-    /// Count a loss, before anything is attempted on its behalf.
-    pub(super) fn record_unconfirmed_loss(&self) {
-        self.unconfirmed_losses.fetch_add(1, Ordering::Relaxed);
+    /// Count a loss of `generation`, before anything is attempted on its behalf.
+    pub(super) fn record_unconfirmed_loss(&self, generation: Option<&TenantStamp>) {
+        let mut counts = self.counts();
+        let count = counts.entry(generation.cloned()).or_default();
+        *count = count.saturating_add(1);
     }
 
-    /// Clear one loss, once its marker is durably stored.
-    fn confirm_loss_recorded(&self) {
-        // Saturating: a decrement that ran without a matching increment would
-        // wrap to a permanently degraded server.
-        let _ =
-            self.unconfirmed_losses
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                    Some(count.saturating_sub(1))
-                });
+    /// Clear one loss of `generation`, once its marker is durably stored, or
+    /// once the session it would mark was deleted with its tenant and no stored
+    /// record is left incomplete.
+    fn clear_loss(&self, generation: Option<&TenantStamp>) {
+        let key = generation.cloned();
+        let mut counts = self.counts();
+        // A clear with no matching count (its generation was already retired)
+        // changes nothing, rather than clearing a loss of another generation.
+        if let Some(count) = counts.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&key);
+            }
+        }
+    }
+
+    /// Retire every loss of a deleted generation: the sessions they would mark
+    /// went with its storage, so none of them leaves a stored record incomplete.
+    pub(crate) fn forget_generation(&self, generation: &TenantStamp) {
+        self.counts().remove(&Some(generation.clone()));
     }
 }
 
@@ -233,6 +257,15 @@ pub(super) fn release_capture_loss_marker(tenant: &str, session_id: &str) {
     }
 }
 
+/// Forget which sessions of a deleted tenant were marked: their markers went with its storage, so a tenant created
+/// again under the id starts with none, and a loss in one of its sessions is marked. A poisoned set dedupes nothing,
+/// so there is nothing to forget in it.
+pub(crate) fn forget_tenant_capture_loss_markers(tenant: &str) {
+    if let Ok(mut marked) = marked_sessions().lock() {
+        marked.retain(|(owner, _)| owner != tenant);
+    }
+}
+
 /// Record that a captured entry never reached storage.
 ///
 /// The loss is counted first — on the metric and on [`CaptureHealth`] — and the
@@ -278,7 +311,7 @@ pub(super) fn record_capture_loss(
         return;
     }
 
-    health.record_unconfirmed_loss();
+    health.record_unconfirmed_loss(generation.as_ref().map(GenerationRef::stamp));
     let queued = QueuedMarker {
         sink,
         tenant: lost.tenant.clone(),
@@ -321,13 +354,20 @@ pub(super) async fn persist_capture_loss_marker(queued: QueuedMarker, retry_dela
         health,
     } = queued;
     let marker = capture_loss_marker(&tenant, &session_id, reason);
+    let stamp = generation.as_ref().map(GenerationRef::stamp);
     let mut delay = retry_delay;
     let mut last_error = String::new();
     for attempt in 1..=CAPTURE_MARKER_ATTEMPTS {
-        // Each attempt holds a lease of the lost entry's generation; once that one is deleted the marker would only
-        // land in the tenant created again under its id, so it is dropped.
+        // Each attempt holds a lease of the lost entry's generation. Once that one is deleted, the session the marker
+        // would mark went with its storage, so no stored record is left incomplete and the loss is cleared; the marker
+        // would only land in the tenant created again under the id.
         let lease = match generation.as_ref().map(GenerationRef::lease) {
-            Some(None) => return,
+            Some(None) => {
+                record_capture_loss_marker(&tenant, "tenant_deleted");
+                release_capture_loss_marker(&tenant, &session_id);
+                health.clear_loss(stamp);
+                return;
+            }
             Some(lease) => lease,
             None => None,
         };
@@ -336,7 +376,7 @@ pub(super) async fn persist_capture_loss_marker(queued: QueuedMarker, retry_dela
         match written {
             Ok(()) => {
                 record_capture_loss_marker(&tenant, "stored");
-                health.confirm_loss_recorded();
+                health.clear_loss(stamp);
                 return;
             }
             Err(error) => {

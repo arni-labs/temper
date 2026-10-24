@@ -8,6 +8,10 @@
 //! generation that made it and asks for a lease of that stamp when it acts: [`TenantGenerations::lease`] is the one
 //! check. While a lease of generation N is held, the tenant's live generation is N or none, never a later one: the
 //! next generation starts only after every lease of N has ended and N's storage is gone.
+//!
+//! A removal also acts on one generation: the one its request was admitted under. Removals of one generation run one
+//! at a time, and one that finds its generation already removed leaves the id alone, so a delete that was still under
+//! way never removes the tenant created again under the id.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -56,6 +60,8 @@ pub(crate) struct Generation {
     stamp: TenantStamp,
     work: Mutex<Work>,
     drained: Notify,
+    /// Held by a removal of this generation while it runs, so removals of it run one after the other.
+    removal: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +71,11 @@ struct Work {
 }
 
 impl Generation {
+    /// The tenant and number of this generation.
+    pub(crate) fn stamp(&self) -> &TenantStamp {
+        &self.stamp
+    }
+
     /// How many leases of this generation are held.
     pub(crate) fn leases(&self) -> usize {
         self.work().leases
@@ -86,6 +97,11 @@ impl Generation {
         Some(GenerationLease {
             generation: Arc::clone(self),
         })
+    }
+
+    /// Wait until no other removal of this generation runs, and hold that until the guard is dropped.
+    pub(crate) async fn removing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.removal.lock().await
     }
 }
 
@@ -133,6 +149,7 @@ impl TenantGenerations {
             },
             work: Mutex::new(Work::default()),
             drained: Notify::new(),
+            removal: tokio::sync::Mutex::new(()),
         });
         inner
             .current
@@ -141,7 +158,7 @@ impl TenantGenerations {
     }
 
     /// The tenant's current generation, live or being removed, starting one when its id has none.
-    pub(crate) fn stamp(&self, tenant: &TenantId) -> TenantStamp {
+    pub fn stamp(&self, tenant: &TenantId) -> TenantStamp {
         self.current(tenant).stamp.clone()
     }
 
@@ -166,12 +183,25 @@ impl TenantGenerations {
         generation.admit()
     }
 
-    /// Close the tenant's current generation: no new lease, and no new actor, is admitted for it. Returns the closed
-    /// generation, to wait on. Closing a closed generation again returns it as it is.
-    pub(crate) fn close(&self, tenant: &TenantId) -> Arc<Generation> {
-        let generation = self.current(tenant);
+    /// Close the generation `stamp` names: no new lease, and no new actor, is admitted for it. Returns the closed
+    /// generation, to wait on; closing a closed generation again returns it as it is. None when that generation is no
+    /// longer its tenant's: it was removed, and the id may already belong to a tenant created again.
+    pub(crate) fn close(&self, stamp: &TenantStamp) -> Option<Arc<Generation>> {
+        let inner = self.inner();
+        let generation = inner
+            .current
+            .get(&stamp.tenant)
+            .filter(|generation| generation.stamp == *stamp)?;
         generation.work().closed = true;
-        generation
+        Some(Arc::clone(generation))
+    }
+
+    /// Whether `generation` is still its tenant's, that is, not yet removed.
+    pub(crate) fn is_current(&self, generation: &Arc<Generation>) -> bool {
+        self.inner()
+            .current
+            .get(&generation.stamp.tenant)
+            .is_some_and(|current| Arc::ptr_eq(current, generation))
     }
 
     /// Wait until every lease of the closed `generation` has ended.
@@ -188,16 +218,15 @@ impl TenantGenerations {
         }
     }
 
-    /// Forget the tenant's closed generation once its storage is gone, so the id's next use starts a new one. A live
-    /// generation is kept.
-    pub(crate) fn forget(&self, tenant: &TenantId) {
-        let mut inner = self.inner();
-        let closed = inner
-            .current
-            .get(tenant)
-            .is_some_and(|generation| generation.work().closed);
-        if closed {
-            inner.current.remove(tenant);
+    /// Forget the closed `generation` once its storage is gone, so the id's next use starts a new one. A generation
+    /// that is no longer its tenant's is already forgotten, and the tenant's current one is kept.
+    pub(crate) fn forget(&self, generation: &Arc<Generation>) {
+        debug_assert!(
+            generation.work().closed,
+            "only a closed generation is forgotten"
+        );
+        if self.is_current(generation) {
+            self.inner().current.remove(&generation.stamp.tenant);
         }
     }
 }
@@ -212,6 +241,11 @@ pub struct GenerationRef {
 }
 
 impl GenerationRef {
+    /// The generation this queued work belongs to.
+    pub fn stamp(&self) -> &TenantStamp {
+        &self.stamp
+    }
+
     /// A lease of the generation, while it is live.
     pub fn lease(&self) -> Option<GenerationLease> {
         self.generations.lease(&self.stamp)
