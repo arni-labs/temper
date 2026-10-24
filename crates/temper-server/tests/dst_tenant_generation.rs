@@ -35,8 +35,8 @@ async fn yields(count: u64) {
     }
 }
 
-/// Invariant: when a tenant's storage is removed, no actor of the tenant is running, including one admitted after
-/// the removal began.
+/// Invariant: the removal finishes, and when the tenant's storage is removed no actor of the tenant is running,
+/// including one admitted after the removal began.
 #[tokio::test(start_paused = true)]
 async fn dst_tenant_generation_delete_racing_actor_creation() {
     let mut violations = Vec::new();
@@ -62,13 +62,18 @@ async fn dst_tenant_generation_delete_racing_actor_creation() {
             let _ = harness.dispatch("b2", "Ring").await;
         };
         let (removed, ()) = tokio::join!(removal, creator);
-        assert!(removed.is_ok(), "seed {seed}: {removed:?}");
-        let live = live_at_removal.get().expect("storage was removed");
-        if live != 0 {
-            violations.push(format!(
-                "seed {seed} (creator after {creator_after} yields, storage after {storage_after}): {live} actor(s) \
-                 of the tenant were running when its storage was removed"
-            ));
+        let schedule =
+            format!("creator after {creator_after} yields, storage after {storage_after}");
+        match (removed, live_at_removal.get()) {
+            (Ok(_), Some(0)) => {}
+            (Ok(_), live) => violations.push(format!(
+                "seed {seed} ({schedule}): {live:?} actor(s) of the tenant were running when its storage was removed"
+            )),
+            // An actor admitted during the removal was neither refused nor halted with the others: the removal
+            // waited for it and gave up.
+            (Err(error), _) => violations.push(format!(
+                "seed {seed} ({schedule}): the removal did not finish: {error}"
+            )),
         }
     }
     assert!(violations.is_empty(), "{violations:#?}");
