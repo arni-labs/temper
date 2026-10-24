@@ -32,7 +32,8 @@ impl crate::state::ServerState {
             Ok(resp) => resp.state.fields,
             Err(_) => return RelatedMap::new(),
         };
-        self.resolve_guard_refs(tenant, refs, &current_fields).await
+        self.resolve_guard_refs(tenant, refs, &current_fields, None)
+            .await
     }
 
     /// The `(related type, id field)` pairs the guards of `action` read.
@@ -50,12 +51,14 @@ impl crate::state::ServerState {
     }
 
     /// Resolve each related entity `refs` names through the ids in
-    /// `current_fields`.
+    /// `current_fields`. A related entity that is `committed` is read as that
+    /// state instead of the store.
     pub(super) async fn resolve_guard_refs(
         &self,
         tenant: &TenantId,
         refs: Vec<(String, String)>,
         current_fields: &serde_json::Value,
+        committed: Option<&crate::entity_actor::EntityState>,
     ) -> RelatedMap {
         let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
@@ -70,7 +73,13 @@ impl crate::state::ServerState {
             };
             let mut statuses = Vec::with_capacity(ids.len());
             for id in ids {
-                statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
+                let status = match committed {
+                    Some(record) if record.entity_type == target_type && record.entity_id == id => {
+                        Some(record.status.clone())
+                    }
+                    _ => self.resolve_entity_status(tenant, &target_type, id).await,
+                };
+                statuses.push(status);
             }
             result.insert((target_type, id_field), Related::Statuses(statuses));
         }

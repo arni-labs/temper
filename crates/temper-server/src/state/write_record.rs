@@ -242,7 +242,7 @@ impl ServerState {
             .await?;
         let mut pending = PendingRecords::default();
         for spawn in &spawns {
-            if let Some(child) = self.pending_child(tenant, current, spawn, params).await {
+            if let Some(child) = self.pending_child(tenant, &record, spawn, params).await {
                 pending.insert(child);
             }
         }
@@ -280,10 +280,11 @@ impl ServerState {
         result.success.then_some((state, result.spawn_requests))
     }
 
-    /// The child `spawn` creates once `parent`'s action (with `params`)
+    /// The child `spawn` creates once the parent's action (with `params`)
     /// commits, as it will stand after its initial action, from the same plan
-    /// the kernel creates it by. `None` when the kernel creates no child for
-    /// the spawn.
+    /// the kernel creates it by. `parent` is the parent as the action leaves
+    /// it, which is how the child's initial action finds it. `None` when the
+    /// kernel creates no child for the spawn.
     async fn pending_child(
         &self,
         tenant: &TenantId,
@@ -321,7 +322,7 @@ impl ServerState {
             return Some(child);
         };
         let related = self
-            .resolve_guards_from_fields(tenant, &spawn.entity_type, action, &child.fields)
+            .resolve_guards_from_fields(tenant, &spawn.entity_type, action, &child.fields, parent)
             .await;
         let initialized = self
             .preview_action(

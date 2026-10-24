@@ -63,6 +63,13 @@ name = "Archive"
 kind = "input"
 from = ["New", "Initialized"]
 to = "Archived"
+
+[[action]]
+name = "Join"
+kind = "input"
+from = ["New"]
+to = "Initialized"
+guard = "Run[run_id].status in ['Running']"
 "#;
 
 const RUN_IOA: &str = r#"
@@ -87,6 +94,14 @@ to = "Running"
 params = ["child_id"]
 effect = ["spawn('Child', 'InitArchived', ChildRef, params.child_id)"]
 
+[[action]]
+name = "Launch"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = ["child_id"]
+effect = ["spawn('Child', 'Join', ChildRef, params.child_id)"]
+
 [[field_invariant]]
 name = "RunningRunsHaveAChild"
 message = "a running run names its child"
@@ -107,6 +122,12 @@ name = "StartedArchivedRunChildNotArchived"
 kind = "hard"
 on = "Run.StartArchived"
 assert = 'related(Child, ChildRef).status not in ["Archived"]'
+
+[[invariant]]
+name = "LaunchedRunChildInitialized"
+kind = "hard"
+on = "Run.Launch"
+assert = 'related(Child, ChildRef).status in ["Initialized"]'
 "#;
 
 fn verified() -> VerificationStatus {
@@ -320,4 +341,26 @@ async fn a_spawn_is_refused_when_the_child_it_leaves_breaks_the_invariant() {
         "{body}"
     );
     assert_eq!(stored_run(&state, "r2").await.0, "Idle");
+}
+
+/// The child's initial action runs after the parent commits, so a guard on
+/// the parent reads the parent as the spawning action leaves it.
+#[tokio::test]
+async fn a_childs_initial_action_reads_the_parent_after_the_spawning_action() {
+    let state = build_state();
+    let (status, body) = send(&state, Method::POST, "/tdata/Runs", json!({"Id": "r1"})).await;
+    assert_eq!(status, StatusCode::CREATED, "seed r1: {body}");
+
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Runs('r1')/Temper.Spawn.Launch",
+        json!({"child_id": "c1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stored_run(&state, "r1").await,
+        ("Running".to_string(), json!("c1"))
+    );
 }

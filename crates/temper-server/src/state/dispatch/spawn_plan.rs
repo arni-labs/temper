@@ -12,8 +12,8 @@ use serde_json::Value;
 use temper_jit::table::{RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 
-use crate::entity_actor::EntityActor;
 use crate::entity_actor::effects::SpawnRequest;
+use crate::entity_actor::{EntityActor, EntityState};
 use crate::state::ServerState;
 
 /// How the kernel creates one spawned child.
@@ -134,16 +134,20 @@ impl ServerState {
     }
 
     /// The related records the guards of `action` on `entity_type` read,
-    /// resolved from `fields`, for a record that is not stored yet.
+    /// resolved from `fields`, for a record that is not stored yet. A related
+    /// record that is `committed` (the spawning parent, which commits before
+    /// its child's initial action runs) is read as that state.
     pub(crate) async fn resolve_guards_from_fields(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         action: &str,
         fields: &Value,
+        committed: &EntityState,
     ) -> RelatedMap {
         let refs = self.guard_related_refs(tenant, entity_type, action);
-        self.resolve_guard_refs(tenant, refs, fields).await
+        self.resolve_guard_refs(tenant, refs, fields, Some(committed))
+            .await
     }
 }
 
