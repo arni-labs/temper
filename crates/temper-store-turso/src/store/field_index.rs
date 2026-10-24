@@ -5,13 +5,14 @@
 //! clauses. This avoids materializing every actor in a collection query
 //! just to evaluate filters in memory.
 
-use crate::driver::{Transaction, Value, params, params_from_iter};
+use crate::driver::{Value, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
+use super::projection_guard::journal_leaves_deleted;
 use super::write_gate::WritePriority;
 use super::{TursoEventStore, TursoQueryProjectionRow};
 
@@ -80,51 +81,6 @@ pub struct QueryProjectionUpsert {
     pub indexed_fields: serde_json::Value,
     pub sequence_nr: u64,
     pub known_new: bool,
-}
-
-/// Whether the entity's journal leaves it without a projection row: it holds
-/// the kernel's tombstone (`tombstone_sql`, served by `idx_events_deleted`),
-/// or its newest event moves it to the `Deleted` status, whose row the
-/// projection drops whichever action got it there. Every projection write
-/// checks this inside its write transaction. The journal commits the event
-/// before the projection row is removed, and SQLite runs one write
-/// transaction at a time. So a write of older state either lands before that
-/// event, and the removal then deletes it, or sees the event and writes
-/// nothing. A deleted entity's row cannot come back.
-async fn journal_leaves_deleted(
-    tx: &Transaction<'_>,
-    tenant: &str,
-    entity_type: &str,
-    entity_id: &str,
-) -> Result<bool, PersistenceError> {
-    let mut tombstones = tx
-        .query(
-            concat!(
-                "SELECT 1 FROM events d \
-                 WHERE d.tenant = ?1 AND d.entity_type = ?2 AND d.entity_id = ?3 AND ",
-                tombstone_sql!(),
-                " LIMIT 1"
-            ),
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-    if tombstones.next().await.map_err(storage_error)?.is_some() {
-        return Ok(true);
-    }
-    let mut newest = tx
-        .query(
-            "SELECT json_extract(payload, '$.to_status') = 'Deleted' FROM events \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 \
-             ORDER BY sequence_nr DESC LIMIT 1",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-    let Some(row) = newest.next().await.map_err(storage_error)? else {
-        return Ok(false);
-    };
-    Ok(row.get::<Option<i64>>(0).map_err(storage_error)? == Some(1))
 }
 
 impl TursoEventStore {
