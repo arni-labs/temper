@@ -1,5 +1,9 @@
 //! Cross-entity relation and invariant enforcement.
 
+mod delete_references;
+
+pub use delete_references::pre_delete_relation_checks;
+
 use std::time::Instant; // determinism-ok: scoped duration measurement only
 
 use tracing::instrument;
@@ -7,7 +11,7 @@ use tracing::instrument;
 use temper_runtime::tenant::TenantId;
 use temper_spec::FieldInvariant;
 use temper_spec::cross_invariant::{
-    CrossInvariant, CrossInvariantOperator, DeletePolicy, InvariantKind, parse_related_field_assert,
+    CrossInvariant, CrossInvariantOperator, InvariantKind, parse_related_field_assert,
 };
 
 use crate::registry::RelationEdge;
@@ -17,6 +21,8 @@ use crate::state::ServerState;
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintViolationType {
     RelationIntegrity,
+    /// A Restrict delete whose references could not all be checked.
+    RelationUnverified,
     CrossInvariant,
     FieldInvariant,
 }
@@ -40,6 +46,22 @@ impl ConstraintViolation {
     ) -> Self {
         Self {
             violation_type: ConstraintViolationType::RelationIntegrity,
+            invariant: None,
+            message: message.into(),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            operation: operation.to_string(),
+        }
+    }
+
+    fn relation_unverified(
+        message: impl Into<String>,
+        entity_type: &str,
+        entity_id: &str,
+        operation: &str,
+    ) -> Self {
+        Self {
+            violation_type: ConstraintViolationType::RelationUnverified,
             invariant: None,
             message: message.into(),
             entity_type: entity_type.to_string(),
@@ -178,75 +200,6 @@ pub async fn pre_upsert_relation_checks(
                 entity_id,
                 operation,
             ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Check incoming relation policy before deleting an entity.
-#[instrument(skip_all, fields(otel.name = "constraint.pre_delete_relation_checks", tenant = %tenant, entity_type, entity_id, operation))]
-pub async fn pre_delete_relation_checks(
-    state: &ServerState,
-    tenant: &TenantId,
-    entity_type: &str,
-    entity_id: &str,
-    operation: &str,
-) -> Result<(), ConstraintViolation> {
-    if !state.cross_invariant_enforce {
-        state.metrics.record_cross_bypass();
-        return Ok(());
-    }
-
-    let (tenant_name, edges): (String, Vec<RelationEdge>) = {
-        let registry = state.registry.read().unwrap();
-        let Some(tc) = registry.get_tenant(tenant) else {
-            return Ok(());
-        };
-        (
-            tenant.to_string(),
-            tc.relation_graph
-                .incoming
-                .get(entity_type)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    };
-
-    for edge in edges {
-        if edge.delete_policy != DeletePolicy::Restrict {
-            continue;
-        }
-        let source_ids = state.list_entity_ids_lazy(tenant, &edge.from_entity).await;
-        for source_id in source_ids {
-            if let Ok(source_state) = state
-                .get_tenant_entity_state(tenant, &edge.from_entity, &source_id)
-                .await
-            {
-                let source_fields =
-                    serde_json::to_value(&source_state.state.fields).unwrap_or_default();
-                if extract_field_as_str(&source_fields, &edge.source_field) == Some(entity_id) {
-                    tracing::warn!(
-                        tenant = %tenant_name, entity_type, entity_id, operation,
-                        from_entity = %edge.from_entity, source_id = %source_id,
-                        "constraint violation: cannot delete entity referenced by another"
-                    );
-                    state.metrics.record_relation_integrity_violation(
-                        &tenant_name,
-                        entity_type,
-                        operation,
-                    );
-                    return Err(ConstraintViolation::relation(
-                        format!(
-                            "cannot delete {}('{}'): referenced by {}('{}') via {}",
-                            entity_type, entity_id, edge.from_entity, source_id, edge.source_field
-                        ),
-                        entity_type,
-                        entity_id,
-                        operation,
-                    ));
-                }
-            }
         }
     }
 

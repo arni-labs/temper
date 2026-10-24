@@ -146,10 +146,21 @@ pub(super) fn verification_gate_response(err: VerificationGateError) -> axum::re
 }
 
 pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::response::Response {
-    let violation_type = match err.violation_type {
-        super::constraints::ConstraintViolationType::RelationIntegrity => "relation_integrity",
-        super::constraints::ConstraintViolationType::CrossInvariant => "cross_invariant",
-        super::constraints::ConstraintViolationType::FieldInvariant => "field_invariant",
+    // An unverified relation is a check the server could not finish, not a
+    // conflict with the entity's data, so the caller is told to retry.
+    let (violation_type, status) = match err.violation_type {
+        super::constraints::ConstraintViolationType::RelationIntegrity => {
+            ("relation_integrity", StatusCode::CONFLICT)
+        }
+        super::constraints::ConstraintViolationType::RelationUnverified => {
+            ("relation_unverified", StatusCode::SERVICE_UNAVAILABLE)
+        }
+        super::constraints::ConstraintViolationType::CrossInvariant => {
+            ("cross_invariant", StatusCode::CONFLICT)
+        }
+        super::constraints::ConstraintViolationType::FieldInvariant => {
+            ("field_invariant", StatusCode::CONFLICT)
+        }
     };
     let body = serde_json::json!({
         "error": {
@@ -164,7 +175,7 @@ pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::r
             }
         }
     });
-    (StatusCode::CONFLICT, axum::Json(body)).into_response()
+    (status, axum::Json(body)).into_response()
 }
 
 /// Run pre-upsert relation checks and post-write invariant checks.
