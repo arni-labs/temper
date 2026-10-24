@@ -58,19 +58,12 @@ fn is_deleted_envelope(event: &PersistenceEnvelope) -> bool {
         == Some("Deleted")
 }
 
-/// Whether an event leaves its entity deleted: the delete tombstone, or a
-/// transition into the terminal `Deleted` status.
-fn ends_in_deletion(event: &PersistenceEnvelope) -> bool {
-    is_deleted_envelope(event)
-        || event
-            .payload
-            .get("to_status")
-            .and_then(serde_json::Value::as_str)
-            == Some("Deleted")
-}
-
 /// Most cooperative yields a simulation takes before a projection write.
 const PROJECTION_WRITE_YIELD_BUDGET: u32 = 32;
+
+/// Most cooperative yields a simulation takes between finding an entity's
+/// actor and asking it for its state.
+const ACTOR_READ_YIELD_BUDGET: u32 = 8;
 
 fn record_projection_update_started(
     tenant: &TenantId,
@@ -1251,6 +1244,10 @@ impl ServerState {
                 format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
             })?;
 
+        // Simulation runs other requests for this entity while this read holds
+        // its actor.
+        temper_runtime::buggify::buggify_yield(ACTOR_READ_YIELD_BUDGET).await;
+
         // ADR-0048: retry transient ask failures (AskTimeout, MailboxFull)
         // so a single slow actor reply does not surface as HTTP 500.
         let policy = self.dispatch_retry_policy();
@@ -1373,8 +1370,8 @@ impl ServerState {
     /// query projection.
     ///
     /// `Ok(None)`: the actor replayed a deleted entity's journal. Deletion is
-    /// terminal, so that is no create: the actor is stopped, nothing is
-    /// announced or written, and the id stays deleted.
+    /// terminal, so that is no create: nothing is announced or written, and
+    /// the id stays deleted.
     async fn finish_tenant_entity_create(
         &self,
         tenant: &TenantId,
@@ -1391,8 +1388,11 @@ impl ServerState {
         .await
         .result
         .map_err(|e| format!("Actor query failed: {e}"))?;
-        if response.state.status == "Deleted" {
-            self.stop_and_remove_entity(tenant, entity_type, entity_id);
+        if response.state.is_deleted() {
+            // Unregister without stopping: a concurrent create of the key may
+            // hold this actor and is answered from its replayed state. The
+            // actor ends when its last holder drops it.
+            self.remove_entity(tenant, entity_type, entity_id);
             return Ok(None);
         }
 
@@ -1433,13 +1433,10 @@ impl ServerState {
     /// this too, so the repeat leaves the entity visible to collection
     /// queries.
     ///
-    /// The state can be older than the journal when it is written. The
-    /// projection's sequence guard keeps a newer write; it cannot keep a
-    /// delete, which removes the row and leaves nothing to compare against.
-    /// Deletion is terminal and in the journal before the delete removes the
-    /// row, so after writing, the journal past this state is read: when it
-    /// holds the deletion, the row is removed again. Whichever order the
-    /// delete and this write land in, a deleted entity keeps no row.
+    /// The state can be older than the journal when it is written. The store
+    /// refuses it atomically when a newer write holds the row (the sequence
+    /// guard) or when the journal holds the entity's deletion, so a stale
+    /// write never brings back a row a delete removed.
     pub(crate) async fn upsert_entity_query_projection(
         &self,
         tenant: &TenantId,
@@ -1453,48 +1450,15 @@ impl ServerState {
         };
         // Simulation runs a concurrent delete of this entity here.
         temper_runtime::buggify::buggify_yield(PROJECTION_WRITE_YIELD_BUDGET).await;
-        let deleted = response.state.status == "Deleted";
-        if !deleted {
-            self.write_entity_query_projection(
-                &query_plane,
-                tenant,
-                entity_type,
-                entity_id,
-                response,
-                source,
-            )
-            .await?;
-        }
-        if deleted
-            || self
-                .deleted_after(tenant, entity_type, entity_id, response.state.sequence_nr)
-                .await?
-        {
-            query_plane
-                .remove_projection(tenant.as_str(), entity_type, entity_id)
-                .await
-                .map_err(|e| format!("query projection removal failed after delete: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Whether the entity's journal records its deletion after `sequence_nr`.
-    async fn deleted_after(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        sequence_nr: u64,
-    ) -> Result<bool, String> {
-        let Some((store, _backend)) = self.event_journal() else {
-            return Ok(false);
-        };
-        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-        let later = store
-            .read_events(&persistence_id, sequence_nr)
-            .await
-            .map_err(|e| format!("event store read failed for {persistence_id}: {e}"))?;
-        Ok(later.last().is_some_and(ends_in_deletion))
+        self.write_entity_query_projection(
+            &query_plane,
+            tenant,
+            entity_type,
+            entity_id,
+            response,
+            source,
+        )
+        .await
     }
 
     /// The sequence-guarded projection write, with its metrics.
@@ -2174,8 +2138,9 @@ impl ServerState {
         )
         .await;
         match outcome.result {
-            Ok(response) if response.state.status == "Deleted" => {
-                let _ = actor_ref.stop();
+            Ok(response) if response.state.is_deleted() => {
+                // Unregister without stopping: a concurrent create or read
+                // may hold this actor. It ends when its last holder drops it.
                 self.remove_entity(tenant, entity_type, entity_id);
                 Ok(false)
             }

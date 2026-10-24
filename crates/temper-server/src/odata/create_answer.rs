@@ -57,6 +57,13 @@ pub(super) async fn taken_key_answer(
         .map_err(|error| {
             odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error).into_response()
         })?;
+    // Reading the key started an actor on a deleted entity's journal: the key
+    // stays taken, and the deleted record is neither answered nor written. The
+    // actor is unregistered, not stopped, because another create may hold it.
+    if existing.state.is_deleted() {
+        state.remove_entity(target.tenant, target.entity_type, target.entity_id);
+        return Err(existing_key_conflict());
+    }
     state
         .upsert_entity_query_projection(
             target.tenant,
@@ -69,11 +76,6 @@ pub(super) async fn taken_key_answer(
         .map_err(|error| {
             odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &error).into_response()
         })?;
-    // Reading the key started an actor on the deleted entity's journal.
-    if existing.state.status == "Deleted" {
-        state.stop_and_remove_entity(target.tenant, target.entity_type, target.entity_id);
-        return Err(existing_key_conflict());
-    }
     let body = serde_json::to_value(&existing.state).unwrap_or_default();
     if !may_read(state, target, &body) {
         return Err(existing_key_conflict());

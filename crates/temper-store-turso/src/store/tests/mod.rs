@@ -2355,3 +2355,75 @@ async fn deleted_probes_use_the_tombstone_index() {
         }
     }
 }
+
+/// A projection write of an entity whose journal holds its tombstone writes
+/// nothing: state read before a delete cannot bring back the row the delete
+/// removed, in the catalog or the field index. Both single and batch writes.
+#[tokio::test]
+async fn projection_writes_after_a_tombstone_write_nothing() {
+    let store = make_store("projection-after-tombstone").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let fields = serde_json::json!({"Owner": "alice"});
+    let persistence_id = format!("{tenant}:Order:ord-gone");
+    store
+        .append(
+            &persistence_id,
+            0,
+            &[test_envelope("Created", serde_json::json!({}))],
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_query_projection(&tenant, "Order", "ord-gone", "Draft", &fields, 1)
+        .await
+        .unwrap();
+    store
+        .append(
+            &persistence_id,
+            1,
+            &[test_envelope("Deleted", serde_json::json!({}))],
+        )
+        .await
+        .unwrap();
+    store
+        .remove_query_projection(&tenant, "Order", "ord-gone")
+        .await
+        .unwrap();
+
+    store
+        .upsert_query_projection(&tenant, "Order", "ord-gone", "Draft", &fields, 1)
+        .await
+        .unwrap();
+    store
+        .upsert_query_projections(
+            &tenant,
+            &[QueryProjectionUpsert {
+                entity_type: "Order".to_string(),
+                entity_id: "ord-gone".to_string(),
+                status: "Draft".to_string(),
+                fields: fields.clone(),
+                state: serde_json::json!({}),
+                indexed_fields: fields.clone(),
+                sequence_nr: 1,
+                known_new: false,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let catalog = store
+        .load_entity_catalog_rows(&tenant, "Order", &["ord-gone".to_string()])
+        .await
+        .unwrap();
+    assert!(catalog.is_empty(), "{catalog:?}");
+    let listed = store
+        .query_field_index(
+            &tenant,
+            "Order",
+            "field_name = ?3 AND field_value = ?4",
+            vec!["Owner".to_string(), "alice".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+}

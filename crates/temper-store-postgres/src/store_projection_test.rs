@@ -1249,3 +1249,77 @@ fn migrations_create_the_tombstone_index() {
         );
     });
 }
+
+/// A projection write of an entity whose journal holds its tombstone writes
+/// nothing: state read before a delete cannot bring back the row the delete
+/// removed, in the catalog or the field index.
+#[test]
+fn projection_write_after_a_tombstone_writes_nothing() {
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+
+    sqlx::test_block_on(async {
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let store = PostgresEventStore::new(pool.clone());
+        let tenant = format!("tenant-projection-tombstone-{}", uuid::Uuid::new_v4());
+        let fields = serde_json::json!({"owner": "alice"});
+        let persistence_id = format!("{tenant}:Order:ord-gone");
+        store
+            .append(
+                &persistence_id,
+                0,
+                &[test_envelope("Created", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_query_projection(&tenant, "Order", "ord-gone", "Draft", &fields, 1)
+            .await
+            .unwrap();
+        store
+            .append(
+                &persistence_id,
+                1,
+                &[test_envelope("Deleted", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        store
+            .remove_query_projection(&tenant, "Order", "ord-gone")
+            .await
+            .unwrap();
+
+        store
+            .upsert_query_projection(&tenant, "Order", "ord-gone", "Draft", &fields, 1)
+            .await
+            .unwrap();
+
+        let catalog_rows: i64 = crate::dbm::postgres_query_scalar!(
+            "SELECT COUNT(*) FROM entity_catalog WHERE tenant = $1",
+        )
+        .bind(&tenant)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(catalog_rows, 0);
+        let listed = store
+            .query_field_index(
+                &tenant,
+                "Order",
+                "field_name = ?3 AND field_value = ?4",
+                vec!["owner".to_string(), "alice".to_string()],
+            )
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "{listed:?}");
+
+        crate::dbm::postgres_query!("DELETE FROM events WHERE tenant = $1")
+            .bind(&tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+}

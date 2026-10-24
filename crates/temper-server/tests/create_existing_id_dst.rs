@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use temper_runtime::buggify::install_buggify_context;
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{EventStore, PersistenceError};
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
 use temper_server::storage::{
@@ -41,10 +41,11 @@ const RACE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 4, 5, 7, 8, 10];
 /// these are the first eight).
 const DELETE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
 
-/// Seeds whose schedule revived a deleted order on a create of its key,
-/// before such a create answered 409 (all of seeds 0..64 did; these are the
-/// first eight).
-const DELETED_KEY_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
+/// Seeds whose schedule broke a create of a deleted key: before such a create
+/// answered 409, every seed revived the order (0-7 kept); once it answered
+/// 409 but stopped the shared actor, 13 of 64 gave the other create a 500
+/// (0, 1, 7, 12, 22, 23, 27, 29 kept).
+const DELETED_KEY_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 12, 22, 23, 27, 29];
 
 /// Seeds explored on every run besides the regression cases.
 const EXPLORED_SEEDS: u64 = 64;
@@ -62,14 +63,22 @@ fn order(owner: &str) -> Value {
     })
 }
 
-/// The query projection as rows keyed by entity, with the stores' sequence
-/// guard: a write older than the row it would replace is refused.
-#[derive(Default)]
+/// The query projection as rows keyed by entity, with the stores' guards: a
+/// write older than the row it would replace is refused, and so is any write
+/// of an entity whose journal holds its tombstone.
 struct ProjectionModel {
     rows: Mutex<BTreeMap<(String, String, String), u64>>,
+    journal: SimEventStore,
 }
 
 impl ProjectionModel {
+    fn new(journal: SimEventStore) -> Self {
+        Self {
+            rows: Mutex::default(),
+            journal,
+        }
+    }
+
     fn holds(&self, entity_type: &str, entity_id: &str) -> bool {
         let key = (
             "default".to_string(),
@@ -92,6 +101,13 @@ impl QueryPlaneStore for ProjectionModel {
         _state: &Value,
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
+        let journal = self
+            .journal
+            .read_events(&format!("{tenant}:{entity_type}:{entity_id}"), 0)
+            .await?;
+        if journal.iter().any(|event| event.event_type == "Deleted") {
+            return Ok(());
+        }
         let key = (
             tenant.to_string(),
             entity_type.to_string(),
@@ -150,7 +166,7 @@ impl QueryPlaneStore for ProjectionModel {
 /// modelled query projection it writes to.
 fn order_state(seed: u64, system: &str) -> (ServerState, Arc<ProjectionModel>) {
     let journal = SimEventStore::no_faults(seed);
-    let projection = Arc::new(ProjectionModel::default());
+    let projection = Arc::new(ProjectionModel::new(journal.clone()));
     let mut state = common::build_default_state_with_store(journal.clone(), system);
     state.set_storage_stack(StorageStack::new(
         BackendLabel::Sim,
@@ -250,8 +266,9 @@ async fn repeated_create_racing_delete(seed: u64) -> Result<(), String> {
 }
 
 /// An order is created and deleted, then its owner and another caller create
-/// its key at once. Deletion is terminal: both get 409 with no body, neither
-/// sees the deleted order's fields, and the order stays out of reads, the
+/// its key at once. Deletion is terminal: both get 409 with no body (never a
+/// 500 from an actor the other create stopped), neither sees the deleted
+/// order's fields, and the order stays out of reads, the
 /// entity index and the query projection. `Err` names the broken invariant.
 async fn creates_of_a_deleted_key(seed: u64) -> Result<(), String> {
     let _sim = install_deterministic_context(seed);

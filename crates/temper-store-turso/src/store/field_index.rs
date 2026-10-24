@@ -5,7 +5,7 @@
 //! clauses. This avoids materializing every actor in a collection query
 //! just to evaluate filters in memory.
 
-use crate::driver::{Value, params, params_from_iter};
+use crate::driver::{Transaction, Value, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use temper_runtime::persistence::{PersistenceError, storage_error};
@@ -80,6 +80,31 @@ pub struct QueryProjectionUpsert {
     pub indexed_fields: serde_json::Value,
     pub sequence_nr: u64,
     pub known_new: bool,
+}
+
+/// Whether the entity's journal holds its deletion tombstone; served by
+/// `idx_events_deleted`. Every projection write checks it inside its write
+/// transaction. Deletion is terminal and in the journal before the delete
+/// removes the projection row, and SQLite runs one write transaction at a
+/// time, so a write of older state either lands before the tombstone, and the
+/// delete then removes it, or sees the tombstone and writes nothing. A deleted
+/// entity's row cannot come back.
+async fn journal_has_tombstone(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<bool, PersistenceError> {
+    let mut rows = tx
+        .query(
+            "SELECT 1 FROM events \
+             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND event_type = 'Deleted' \
+             LIMIT 1",
+            params![tenant, entity_type, entity_id],
+        )
+        .await
+        .map_err(storage_error)?;
+    Ok(rows.next().await.map_err(storage_error)?.is_some())
 }
 
 impl TursoEventStore {
@@ -192,7 +217,9 @@ impl TursoEventStore {
                 None
             }
         };
-        if existing_sequence.is_some_and(|existing| existing > sequence_nr) {
+        if existing_sequence.is_some_and(|existing| existing > sequence_nr)
+            || journal_has_tombstone(&tx, tenant, entity_type, entity_id).await?
+        {
             tx.commit().await.map_err(storage_error)?;
             return Ok(());
         }
@@ -347,7 +374,15 @@ impl TursoEventStore {
             let sequence_nr = i64::try_from(projection.sequence_nr).unwrap_or(i64::MAX);
             let key = (projection.entity_type.clone(), projection.entity_id.clone());
             let existing_row = existing.get(&key);
-            if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr) {
+            if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr)
+                || journal_has_tombstone(
+                    &tx,
+                    tenant,
+                    &projection.entity_type,
+                    &projection.entity_id,
+                )
+                .await?
+            {
                 continue;
             }
             if existing_row.is_none_or(|(_, existing_hash)| existing_hash != &new_projection_hash) {

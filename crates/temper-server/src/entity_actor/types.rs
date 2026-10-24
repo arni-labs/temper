@@ -147,6 +147,13 @@ impl StatusClock {
 }
 
 impl EntityState {
+    /// Whether the entity is deleted: its replayed journal ends in deletion.
+    /// Deletion is terminal, so a deleted entity never takes another action
+    /// and its id is never created again.
+    pub fn is_deleted(&self) -> bool {
+        self.status == "Deleted"
+    }
+
     /// Return true if this entity can accept one more event under budget.
     pub fn can_accept_event(&self) -> bool {
         self.events_since_snapshot < MAX_EVENTS_SINCE_SNAPSHOT
