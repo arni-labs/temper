@@ -175,7 +175,7 @@ pub fn parse_query_options(query_string: &str) -> Result<QueryOptions, ODataErro
                 opts.select = Some(parse_select(&value));
             }
             "$expand" => {
-                opts.expand = Some(parse_expand(&value)?);
+                opts.expand = Some(parse_expand(&value, 1)?);
             }
             "$orderby" => {
                 opts.orderby = Some(parse_orderby(&value)?);
@@ -315,11 +315,58 @@ fn parse_orderby(value: &str) -> Result<Vec<OrderByClause>, ODataError> {
 // $expand parser
 // ---------------------------------------------------------------------------
 
-fn parse_expand(value: &str) -> Result<Vec<ExpandItem>, ODataError> {
+/// The most levels one `$expand` may nest (`A($expand=B($expand=C))` is three).
+///
+/// Forced by the memory one read may take. Each level copies every related
+/// entity into the response, so a level can multiply the copies by its
+/// relation's fan-out, and it is the query string, not the data, that picks
+/// how many times. A relation that leads back
+/// (`Orders($expand=Customer($expand=Orders(...)))`) can be multiplied as
+/// often as the caller likes, so without a bound one short query from any
+/// reader could build more copies than the server has memory for and take it
+/// down for every tenant.
+///
+/// Measured 23 Oct 2026 through the server's router (release build), reading
+/// `Customers?$expand=Orders($expand=Customer($expand=Orders(...)))`:
+///
+/// | customers x orders each | depth | entity copies | peak heap | response |
+/// |---|---|---|---|---|
+/// | 10 x 10  | 3 | 1,210  | 8.9 MB  | 0.5 MB |
+/// | 10 x 10  | 4 | 2,210  | 15.2 MB | 0.9 MB |
+/// | 10 x 10  | 5 | 12,210 | 86 MB   | 5.0 MB |
+/// | 10 x 10  | 6 | 22,210 | 158 MB  | 9.2 MB |
+/// | 10 x 30  | 4 | 18,610 | 127 MB  | 7.8 MB |
+/// | 100 x 10 | 3 | 12,100 | 85 MB   | 5.0 MB |
+///
+/// Every run cost 6.7 to 7.2 KiB of heap and about 415 bytes of response per
+/// copy, and the copies matched `page x (1 + fan-out + ...)` exactly. So
+/// over the default page of 100 entities, with every level a fan-out of 10,
+/// three levels build 111,100 copies, about 760 MiB, near all the memory a
+/// production Temper process holds at rest (about 0.9 GB). A fourth level
+/// would multiply that by ten, to about 7.4 GiB. Three is the deepest level
+/// that read fits in.
+///
+/// The bound limits what the query adds, not what the data holds: one
+/// relation with 10,000 targets still costs about 70 MB per parent at depth 1.
+///
+/// A deeper `$expand` is rejected with a 400 that names this bound; nothing is
+/// cut off silently.
+pub const MAX_EXPAND_DEPTH: usize = 3;
+
+/// Parse the `$expand` at nesting `level` (the top-level `$expand` is 1).
+fn parse_expand(value: &str, level: usize) -> Result<Vec<ExpandItem>, ODataError> {
+    if level > MAX_EXPAND_DEPTH {
+        return Err(ODataError::InvalidQueryOption {
+            option: "$expand".into(),
+            message: format!(
+                "$expand nests more than {MAX_EXPAND_DEPTH} levels, the most one read may follow"
+            ),
+        });
+    }
     let items = split_expand_items(value);
     let mut result = Vec::new();
     for item in items {
-        result.push(parse_expand_item(item.trim())?);
+        result.push(parse_expand_item(item.trim(), level)?);
     }
     Ok(result)
 }
@@ -354,7 +401,7 @@ fn split_expand_items(s: &str) -> Vec<String> {
     items
 }
 
-fn parse_expand_item(item: &str) -> Result<ExpandItem, ODataError> {
+fn parse_expand_item(item: &str, level: usize) -> Result<ExpandItem, ODataError> {
     if let Some(paren_start) = item.find('(') {
         if !item.ends_with(')') {
             return Err(ODataError::InvalidQueryOption {
@@ -364,7 +411,7 @@ fn parse_expand_item(item: &str) -> Result<ExpandItem, ODataError> {
         }
         let property = item[..paren_start].trim().to_string();
         let nested_str = &item[paren_start + 1..item.len() - 1];
-        let options = parse_expand_options(nested_str)?;
+        let options = parse_expand_options(nested_str, level)?;
         Ok(ExpandItem {
             property,
             options: Some(options),
@@ -380,7 +427,7 @@ fn parse_expand_item(item: &str) -> Result<ExpandItem, ODataError> {
 /// Parse the options inside an expand item's parentheses.
 ///
 /// These are semicolon-separated, e.g. `$select=Id,Quantity;$orderby=Quantity desc`.
-fn parse_expand_options(s: &str) -> Result<ExpandOptions, ODataError> {
+fn parse_expand_options(s: &str, level: usize) -> Result<ExpandOptions, ODataError> {
     let mut opts = ExpandOptions::default();
 
     // Split by semicolons, respecting parentheses.
@@ -409,7 +456,7 @@ fn parse_expand_options(s: &str) -> Result<ExpandOptions, ODataError> {
                 opts.skip = Some(parse_usize("$skip", &value)?);
             }
             "$expand" => {
-                opts.expand = Some(parse_expand(&value)?);
+                opts.expand = Some(parse_expand(&value, level + 1)?);
             }
             _ => {
                 // Ignore unknown nested options
@@ -475,6 +522,10 @@ fn parse_bool(option: &str, value: &str) -> Result<bool, ODataError> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "expand_depth_test.rs"]
+mod expand_depth_tests;
 
 #[cfg(test)]
 mod tests {

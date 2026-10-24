@@ -136,11 +136,13 @@ async fn an_ordinary_transition_is_projected_before_dispatch_returns() {
     );
 }
 
-/// Fails the first projection write, then behaves like `SimQueryPlane`.
+/// Fails one projection write (the first by default, else the `fail_write`th,
+/// counting from 0), and otherwise behaves like `SimQueryPlane`.
 #[derive(Default)]
 struct FlakyQueryPlane {
     inner: SimQueryPlane,
-    failed_once: std::sync::atomic::AtomicBool,
+    writes: std::sync::atomic::AtomicUsize,
+    fail_write: usize,
 }
 
 #[async_trait::async_trait]
@@ -155,9 +157,10 @@ impl QueryPlaneStore for FlakyQueryPlane {
         state: &serde_json::Value,
         sequence_nr: u64,
     ) -> Result<(), temper_runtime::persistence::PersistenceError> {
-        if !self
-            .failed_once
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        if self
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == self.fail_write
         {
             return Err(temper_runtime::persistence::PersistenceError::Storage(
                 "injected projection outage".to_string(),
@@ -263,14 +266,11 @@ impl QueryPlaneStore for FlakyQueryPlane {
     }
 }
 
-/// A failed projection write is reported, and the committed state is handed to
-/// the retrying queue, so reads catch up once the store recovers.
-#[tokio::test]
-async fn a_failed_projection_write_is_retried_through_the_queue() {
-    let qp = Arc::new(FlakyQueryPlane::default());
+/// An Order server on the simulated journal whose query plane is `qp`.
+fn flaky_order_state(system_name: &str, seed: u64, qp: Arc<FlakyQueryPlane>) -> ServerState {
     let events =
-        crate::storage::BoxedEventStore::new(temper_store_sim::SimEventStore::no_faults(14));
-    let mut state = build_order_state("flaky-projection");
+        crate::storage::BoxedEventStore::new(temper_store_sim::SimEventStore::no_faults(seed));
+    let mut state = build_order_state(system_name);
     state.set_storage_stack(crate::storage::StorageStack::new(
         crate::storage::BackendLabel::Sim,
         events,
@@ -278,7 +278,7 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         None,
         None,
         None,
-        Some(qp.clone()),
+        Some(qp),
         None,
         None,
         None,
@@ -293,6 +293,15 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         .into_iter()
         .collect(),
     );
+    state
+}
+
+/// A failed projection write is reported, and the committed state is handed to
+/// the retrying queue, so reads catch up once the store recovers.
+#[tokio::test]
+async fn a_failed_projection_write_is_retried_through_the_queue() {
+    let qp = Arc::new(FlakyQueryPlane::default());
+    let state = flaky_order_state("flaky-projection", 14, qp.clone());
     let tenant = TenantId::default();
     let agent_ctx = AgentContext::for_service("flaky-projection");
     let created = state
@@ -329,4 +338,62 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     panic!("the queued retry never projected the committed state");
+}
+
+/// A transition whose projection write fails is still committed, so a guard
+/// that reads the record's status afterwards decides on the committed status,
+/// not on the one cached before it.
+#[tokio::test]
+async fn a_status_committed_behind_a_failed_projection_reaches_the_status_cache() {
+    let qp = Arc::new(FlakyQueryPlane {
+        fail_write: 1,
+        ..FlakyQueryPlane::default()
+    });
+    let state = flaky_order_state("flaky-projection-status", 15, qp);
+    let tenant = TenantId::default();
+    let agent_ctx = AgentContext::for_service("flaky-projection-status");
+    let added = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o4",
+            "AddItem",
+            serde_json::json!({ "ProductId": "p1", "Quantity": 1 }),
+            &agent_ctx,
+        )
+        .await
+        .expect("add item");
+    assert!(added.success, "add item: {:?}", added.error);
+    assert_eq!(
+        state.resolve_entity_status(&tenant, "Order", "o4").await,
+        Some("Draft".to_string())
+    );
+
+    let submitted = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o4",
+            "SubmitOrder",
+            serde_json::json!({}),
+            &agent_ctx,
+        )
+        .await
+        .expect("submit");
+    assert!(
+        !submitted.success
+            && submitted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("query projection failed"))
+            && submitted.state.status == "Submitted",
+        "the submit commits and reports the projection outage: {:?} {}",
+        submitted.error,
+        submitted.state.status
+    );
+    assert_eq!(
+        state.resolve_entity_status(&tenant, "Order", "o4").await,
+        Some("Submitted".to_string()),
+        "a guard reads the committed status"
+    );
 }

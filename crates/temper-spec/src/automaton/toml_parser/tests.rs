@@ -260,7 +260,7 @@ fn state_timeout_parses_all_fields() {
     assert_eq!(provisioning.state, "Provisioning");
     assert_eq!(provisioning.after_seconds, 180);
     assert_eq!(provisioning.on_timeout, "TimeoutFail");
-    assert_eq!(provisioning.max_occurrences, 1, "default should be 1");
+    assert_eq!(provisioning.max_occurrences, None);
     assert_eq!(provisioning.reset_on, vec!["Heartbeat".to_string()]);
     assert_eq!(
         provisioning.args["error_message"].to_string(),
@@ -269,11 +269,11 @@ fn state_timeout_parses_all_fields() {
 }
 
 #[test]
-fn state_timeout_max_occurrences_override() {
+fn state_timeout_max_occurrences_still_loads() {
     let auto = parse_toml_to_automaton(SESSION_SPEC_WITH_TIMEOUTS).unwrap();
     let running = &auto.state_timeouts[1];
     assert_eq!(running.state, "Running");
-    assert_eq!(running.max_occurrences, 3);
+    assert_eq!(running.max_occurrences, Some(3));
     assert!(
         running.reset_on.is_empty(),
         "reset_on omitted should default to empty"

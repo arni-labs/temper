@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 mod action;
 mod state;
 mod trigger;
+mod webhook;
 
 pub use action::*;
 pub use state::*;
 pub use trigger::*;
+pub use webhook::*;
 
 use super::field_invariant::FieldInvariant;
 use crate::predicate::{Arg, Expr};
@@ -220,53 +222,6 @@ fn default_webhook() -> String {
     "webhook".to_string()
 }
 
-/// Default method for webhooks.
-fn default_post() -> String {
-    "POST".to_string()
-}
-
-/// An inbound webhook declaration.
-///
-/// Webhooks allow external systems (OAuth providers, payment gateways) to
-/// call back into Temper, triggering entity actions. They are metadata-only
-/// — they do not affect verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Webhook {
-    /// Webhook name (e.g., "oauth_callback").
-    pub name: String,
-    /// URL path suffix (e.g., "oauth/callback").
-    pub path: String,
-    /// HTTP method (default: POST).
-    #[serde(default = "default_post")]
-    pub method: String,
-    /// Action to dispatch when webhook is called.
-    pub action: String,
-    /// Where the request carries the target entity's id, as
-    /// `query.<name>`: a query-string parameter (the only source today).
-    pub entity_id: String,
-    /// Action parameters read from the request: parameter name → source, in
-    /// the same `query.<name>` form as `entity_id`.
-    #[serde(default)]
-    pub extract: BTreeMap<String, String>,
-    /// Optional HMAC secret for transport-layer validation (supports {secret:key} templates).
-    #[serde(default)]
-    pub hmac_secret: Option<String>,
-    /// Header containing the HMAC signature from the external system.
-    #[serde(default)]
-    pub hmac_header: Option<String>,
-}
-
-impl Webhook {
-    /// The query-string parameter a `query.<name>` source reads; `None` for
-    /// any other spelling.
-    pub fn query_param(source: &str) -> Option<&str> {
-        source
-            .strip_prefix("query.")
-            .filter(|name| !name.is_empty())
-    }
-}
-
 /// A context entity declaration for Cedar authorization.
 ///
 /// Declares that another entity's status should be available in the Cedar
@@ -310,12 +265,12 @@ pub struct StateTimeout {
     pub after_seconds: u64,
     /// Action to dispatch when the timer fires. Must be a declared action.
     pub on_timeout: String,
-    /// Maximum times the timer can fire across repeated entries into `state`.
-    /// Defaults to 1. Set higher for states entered multiple times where
-    /// each entry should receive its own budget (e.g., `Recovering` with
-    /// `max_occurrences = 3`).
-    #[serde(default = "default_one")]
-    pub max_occurrences: u32,
+    /// Has no effect. The timer is armed on every entry into `state` and
+    /// nothing counts how often it fired. The key is still accepted so specs
+    /// that set it keep loading; spec lint warns
+    /// `state_timeout_max_occurrences_ignored` when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_occurrences: Option<u32>,
     /// Actions that, when fired while in `state`, re-arm the timer from
     /// the current moment. Progress signals such as `Heartbeat` go here.
     #[serde(default)]
@@ -326,10 +281,6 @@ pub struct StateTimeout {
     /// Typically includes an `error_message` for observability.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub args: BTreeMap<String, Arg>,
-}
-
-fn default_one() -> u32 {
-    1
 }
 
 /// Admission control declaration (ADR-0051).

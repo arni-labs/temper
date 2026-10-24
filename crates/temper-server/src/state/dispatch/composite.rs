@@ -26,6 +26,7 @@ use super::DispatchError;
 
 mod helpers;
 mod projection;
+mod timers;
 use helpers::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,6 +61,7 @@ struct AtomicCompositeParent<'a> {
     action: &'a str,
     idempotency: &'a str,
     record_event: bool,
+    agent_ctx: &'a AgentContext,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +175,7 @@ impl crate::state::ServerState {
                     action,
                     idempotency: &parent_idempotency,
                     record_event: metadata.record_parent_event,
+                    agent_ctx: &composite_agent_ctx,
                 },
                 &prepared_sub_writes,
             )
@@ -182,8 +185,7 @@ impl crate::state::ServerState {
         }
 
         for prepared in prepared_sub_writes {
-            let mut sub_agent_ctx = composite_agent_ctx.clone();
-            sub_agent_ctx.idempotency_key = Some(prepared.idempotency_key);
+            let sub_agent_ctx = timers::composite_sub_write_agent(&composite_agent_ctx, &prepared);
 
             let response = self
                 .dispatch_tenant_action_core(
@@ -199,14 +201,17 @@ impl crate::state::ServerState {
                 .await?;
 
             if !response.success {
-                return Err(DispatchError::Internal(response.error.unwrap_or_else(
-                    || {
-                        format!(
-                            "composite {entity_type}.{action} sub-write {} failed",
-                            prepared.idx
-                        )
-                    },
-                )));
+                let error = response.error.clone().unwrap_or_else(|| {
+                    format!(
+                        "composite {entity_type}.{action} sub-write {} failed",
+                        prepared.idx
+                    )
+                });
+                return Err(sub_write_failure(
+                    &response,
+                    &prepared.idempotency_key,
+                    error,
+                ));
             }
         }
 
@@ -240,6 +245,7 @@ impl crate::state::ServerState {
         };
         let mut overflow_blobs = Vec::new();
         let mut streams: BTreeMap<String, AtomicCompositeStream> = BTreeMap::new();
+        let mut timed = Vec::new();
         let parent_persistence_id = format!("{tenant}:{parent_entity_type}:{parent_entity_id}");
         let timing_enabled = prepared_sub_writes.len() >= 10;
         let total_started_at = timing_enabled.then(std::time::Instant::now);
@@ -373,6 +379,7 @@ impl crate::state::ServerState {
                 .push(composite_envelope(&persistence_id, &event, &stream.state)?);
             stream.state.sequence_nr = stream.state.sequence_nr.saturating_add(1);
             stream.state.push_event_bounded(event);
+            timed.extend(self.timed_transition(&parent, write, &stream.state));
         }
         let stage_ms = stage_started_at.map(|started| started.elapsed().as_millis() as u64);
 
@@ -415,6 +422,7 @@ impl crate::state::ServerState {
             .await
             .map_err(composite_batch_persistence_error)?;
         let append_ms = append_started_at.map(|started| started.elapsed().as_millis() as u64);
+        self.invalidate_batch_state_timeouts(tenant, &timed);
 
         let projection_collect_started_at = timing_enabled.then(std::time::Instant::now);
         self.update_composite_query_projections(tenant, &streams)
@@ -449,6 +457,7 @@ impl crate::state::ServerState {
             }
         }
         let reload_ms = reload_started_at.map(|started| started.elapsed().as_millis() as u64);
+        self.arm_batch_state_timeouts(tenant, &timed).await;
         if let Some(started) = total_started_at {
             tracing::info!(
                 tenant = %tenant,
@@ -513,14 +522,7 @@ impl crate::state::ServerState {
             && expected_sequence == 0
             && state.total_event_count == 0
         {
-            let bootstrap = crate::entity_actor::EntityEvent {
-                action: "Created".to_string(),
-                from_status: String::new(),
-                to_status: state.status.clone(),
-                timestamp: sim_now(),
-                params: serde_json::json!({}),
-                idempotency_key: None,
-            };
+            let bootstrap = crate::entity_actor::EntityEvent::bootstrap(state.status.clone());
             events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
             state.sequence_nr = state.sequence_nr.saturating_add(1);
             state.push_event_bounded(bootstrap);
@@ -650,6 +652,7 @@ impl crate::state::ServerState {
             action,
             idempotency: parent_idempotency,
             record_event: metadata.record_parent_event,
+            agent_ctx: composite_agent_ctx,
         };
         let mut virtual_targets = BTreeMap::new();
         let mut pending_overflow_blobs = Vec::new();
@@ -849,14 +852,7 @@ impl crate::state::ServerState {
             && (!(write.uses_parent_gate && write.action == "Create")
                 || table.has_input_contracts())
         {
-            let created = crate::entity_actor::EntityEvent {
-                action: "Created".into(),
-                from_status: String::new(),
-                to_status: stream.state.status.clone(),
-                timestamp: sim_now(),
-                params: serde_json::json!({}),
-                idempotency_key: None,
-            };
+            let created = crate::entity_actor::EntityEvent::bootstrap(stream.state.status.clone());
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
         }

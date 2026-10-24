@@ -24,6 +24,7 @@ mod agent_bootstrap;
 mod app_catalog;
 mod closure_bootstrap;
 mod entity_aliases;
+mod install_checks;
 mod install_guard;
 mod policy_rows;
 mod reconcile;
@@ -1101,6 +1102,7 @@ pub(super) async fn install_os_app_with_plan(
     plan: OsAppInstallPlan,
     origin: InstallOrigin,
 ) -> Result<InstallResult, String> {
+    install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
     let _serialized = install_guard::tenant(tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
@@ -1177,11 +1179,13 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
+        // Parsed before any write, with the CSDL below (see `install_checks`).
+        install_checks::parse_cross_invariants(bundle.cross_invariants_toml.as_deref(), app_name)?;
         // App installs must preserve existing tenant types.
         let merged_csdl = if let Some(ref csdl) = bundle.csdl {
+            let incoming = parse_csdl(csdl)
+                .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
             if let Some(existing) = registry.get_tenant(&tenant_id) {
-                let incoming = parse_csdl(csdl)
-                    .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
                 Some(emit_csdl_xml(&merge_csdl(&existing.csdl, &incoming)))
             } else {
                 Some(csdl.clone())
@@ -1329,7 +1333,8 @@ pub(super) async fn install_os_app_with_plan(
     }
 
     if plan.policies {
-        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle).await?;
+        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle, &superseded)
+            .await?;
         policy_rows::delete_dropped_rows(state, tenant, &superseded).await?;
     }
 
@@ -1382,7 +1387,7 @@ pub(super) async fn install_os_app_with_plan(
                     cross_invariants_source: bundle.cross_invariants_toml.as_deref(),
                     verification_mode: bootstrap::BootstrapSpecVerificationMode::TrustBundle,
                 },
-            );
+            )?;
 
             if let Some(ps) = state
                 .server

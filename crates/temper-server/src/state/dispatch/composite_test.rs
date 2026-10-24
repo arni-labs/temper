@@ -4,6 +4,9 @@ mod authenticated_params_test;
 #[cfg(feature = "sim")]
 #[path = "composite/defaults_test.rs"]
 mod defaults_test;
+#[cfg(feature = "sim")]
+#[path = "composite/state_timers_test.rs"]
+mod state_timers_test;
 use std::collections::BTreeMap;
 
 use serde_json::json;
@@ -1985,7 +1988,6 @@ async fn strict_composite_preflight_uses_defaults_and_sequential_target_state() 
         BackendLabel::Sim,
         &json!({}),
         None,
-        false,
     )
     .await
     .unwrap();
