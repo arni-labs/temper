@@ -13,22 +13,18 @@ pub(super) fn synthetic_initial_state(
     )
 }
 
-/// The error for a sub-write that answered unsuccessfully. The target records
-/// the sub-write's key only when the write commits. A committed write can still
-/// answer unsuccessfully (its query projection failed afterwards); the target
-/// changed, so that answer is not a refusal.
+/// The error for a sub-write that answered unsuccessfully. Only a refusal
+/// (nothing was written) is a conflict. A write whose storage failed may have
+/// landed, and a committed write can still answer unsuccessfully (its query
+/// projection failed afterwards), so neither is a refusal.
 pub(super) fn sub_write_failure(
     response: &crate::entity_actor::EntityResponse,
-    idempotency_key: &str,
     error: String,
 ) -> DispatchError {
-    if response
-        .state
-        .has_processed_idempotency_key(idempotency_key)
-    {
-        DispatchError::Internal(error)
-    } else {
+    if response.refused {
         DispatchError::Conflict(error)
+    } else {
+        DispatchError::Internal(error)
     }
 }
 

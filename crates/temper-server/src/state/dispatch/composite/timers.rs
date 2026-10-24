@@ -83,6 +83,7 @@ impl crate::state::ServerState {
                 scheduled_actions: Vec::new(),
                 spawn_requests: Vec::new(),
                 spec_governed: true,
+                refused: false,
             },
         })
     }

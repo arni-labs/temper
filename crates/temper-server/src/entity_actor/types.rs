@@ -265,6 +265,36 @@ pub struct EntityResponse {
     /// Whether the action was governed by a state-machine spec. Defaults to `true`.
     #[serde(default = "default_spec_governed", skip_serializing_if = "is_true")]
     pub spec_governed: bool,
+    /// Whether the action was refused before anything was written: its guard,
+    /// its state or its inputs did not allow it, the record had moved on, or
+    /// the event was too large. A failed answer that is not a refusal (storage
+    /// failed, or a step after the commit failed) may have landed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+}
+
+impl EntityResponse {
+    /// The answer to an action refused before anything was written.
+    pub(crate) fn refused(state: EntityState, error: String) -> Self {
+        Self {
+            refused: true,
+            ..Self::write_failed(state, error)
+        }
+    }
+
+    /// The answer to an action whose write failed, so it may have landed.
+    pub(crate) fn write_failed(state: EntityState, error: String) -> Self {
+        Self {
+            success: false,
+            state,
+            error: Some(error),
+            custom_effects: vec![],
+            scheduled_actions: vec![],
+            spawn_requests: vec![],
+            spec_governed: true,
+            refused: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +441,7 @@ mod tests {
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         assert!(!serialized.contains("spec_governed"));

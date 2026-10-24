@@ -207,11 +207,7 @@ impl crate::state::ServerState {
                         prepared.idx
                     )
                 });
-                return Err(sub_write_failure(
-                    &response,
-                    &prepared.idempotency_key,
-                    error,
-                ));
+                return Err(sub_write_failure(&response, error));
             }
         }
 
