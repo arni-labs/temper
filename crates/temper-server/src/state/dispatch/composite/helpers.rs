@@ -354,6 +354,35 @@ pub(super) fn composite_envelope(
     })
 }
 
+/// Whether an atomic batch that answered with a concurrency violation was
+/// written anyway. A store that retries a write whose answer was lost reports
+/// the landed write as a concurrency violation (the Turso store does). A batch
+/// lands whole or not at all, so its first journal settles it: it holds the
+/// batch's first event exactly when the batch landed.
+pub(super) async fn composite_batch_landed(
+    store: &crate::storage::BoxedEventStore,
+    appends: &[PersistenceAppend],
+) -> Result<bool, DispatchError> {
+    let Some((first, event)) = appends
+        .first()
+        .and_then(|append| append.events.first().map(|event| (append, event)))
+    else {
+        return Ok(false);
+    };
+    let stored = store
+        .read_events(&first.persistence_id, first.expected_sequence)
+        .await
+        .map_err(|e| {
+            DispatchError::Internal(format!(
+                "failed to read {} after a composite batch concurrency violation: {e}",
+                first.persistence_id
+            ))
+        })?;
+    Ok(stored
+        .iter()
+        .any(|stored| stored.metadata.event_id == event.metadata.event_id))
+}
+
 pub(super) fn composite_batch_persistence_error(error: PersistenceError) -> DispatchError {
     match error {
         PersistenceError::ConcurrencyViolation { .. } => {
