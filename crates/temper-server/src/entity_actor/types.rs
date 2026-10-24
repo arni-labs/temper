@@ -178,12 +178,19 @@ impl EntityState {
         }
     }
 
+    /// Where this state is in the record's history. With a journal that is the
+    /// journal sequence; without one the sequence stays put, and the count of
+    /// events applied moves instead. Both only grow while the record lives.
+    pub fn event_sequence(&self) -> u64 {
+        self.sequence_nr.max(self.total_event_count as u64)
+    }
+
     pub fn has_processed_idempotency_key(&self, key: &str) -> bool {
         self.processed_idempotency_keys.contains_key(key)
     }
 
     fn record_processed_idempotency_key(&mut self, key: &str) {
-        let sequence = self.sequence_nr.max(self.total_event_count as u64);
+        let sequence = self.event_sequence();
         self.processed_idempotency_keys
             .insert(key.to_string(), sequence);
 
