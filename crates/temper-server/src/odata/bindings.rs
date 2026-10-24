@@ -202,10 +202,8 @@ pub(super) async fn dispatch_bound_action(
 
     // Relation integrity, field invariants and cross-invariants are checked by
     // dispatch on the record the action stores, as on every other action path.
-    if let Some(resp) =
-        refuse_caller_content(state, tenant, entity_type, action, &resolved_body).await
-    {
-        action_span.set_status(Status::error("FileBytesNotStored"));
+    if let Some(resp) = refuse_caller_content(entity_type, action, &resolved_body) {
+        action_span.set_status(Status::error("FileContentFields"));
         return resp;
     }
 

@@ -262,6 +262,13 @@ jobs:
       - name: Additive migrations
         run: bash scripts/check-additive-migrations.sh
 
+      # The server embeds a build of wasm-modules/http-fetch; a change to that source or to
+      # temper-wasm-sdk that was not rebuilt into the embedded binary fails here.
+      - name: Embedded http_fetch module matches its source
+        run: |
+          rustup target add wasm32-unknown-unknown
+          bash scripts/build-http-fetch-wasm.sh --check
+
       # DST pattern scan DISABLED (2026-02-17)
       # Reason: Grep-based pattern matching is too brittle and caused 5+ consecutive
       # CI failures from false positives. The DST reviewer agent (.claude/agents/dst-reviewer.md)
