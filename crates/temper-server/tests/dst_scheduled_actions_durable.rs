@@ -234,7 +234,9 @@ async fn fired_at(state: &ServerState, id: &str, action: &str) -> Vec<DateTime<U
         .unwrap_or_default()
 }
 
-fn run_seed(seed: u64) -> Result<(), String> {
+/// One seed's run. Ok: how many rows the stop left behind a fire whose event
+/// was already written, which the boot fires again.
+fn run_seed(seed: u64) -> Result<usize, String> {
     let clock = Arc::new(ProcessClock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
     let world = World {
@@ -325,6 +327,20 @@ fn run_seed(seed: u64) -> Result<(), String> {
     })?;
     let downtime = Duration::from_secs(rng.next_bound(7200) as u64);
     first.kill(&world, downtime);
+    let left_behind = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut left_behind = 0;
+            let rows = world.events.list_scheduled_actions(TENANT).await.unwrap();
+            for row in rows.iter().filter(|row| row.action == "Fire") {
+                let journal = format!("{TENANT}:Job:{}", row.entity_id);
+                left_behind += usize::from(journal_has(&world.events, &journal, "Fire").await);
+            }
+            left_behind
+        });
+    run.trace
+        .push(format!("{left_behind} rows left behind a written fire"));
 
     let second = Process::start(&world, &format!("sched-{seed}-b"));
     let result = second.runtime.block_on(async {
@@ -410,20 +426,24 @@ fn run_seed(seed: u64) -> Result<(), String> {
         Ok(())
     });
     second.kill(&world, Duration::ZERO);
-    result
+    result.map(|()| left_behind)
 }
 
 #[test]
 fn dst_scheduled_actions_outlive_a_restart() {
     // Seeds that broke each invariant, and the first such seed's report.
     let mut broken: BTreeMap<String, (Vec<u64>, String)> = BTreeMap::new();
+    let mut left_behind = 0;
     for seed in 0..SEEDS {
-        if let Err(report) = run_seed(seed) {
-            let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
-            let entry = broken
-                .entry(invariant)
-                .or_insert_with(|| (Vec::new(), report));
-            entry.0.push(seed);
+        match run_seed(seed) {
+            Ok(rows) => left_behind += rows,
+            Err(report) => {
+                let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
+                let entry = broken
+                    .entry(invariant)
+                    .or_insert_with(|| (Vec::new(), report));
+                entry.0.push(seed);
+            }
         }
     }
     let summary: Vec<String> = broken
@@ -434,5 +454,12 @@ fn dst_scheduled_actions_outlive_a_restart() {
         broken.is_empty(),
         "invariants broken over {SEEDS} seeds:\n\n{}",
         summary.join("\n\n")
+    );
+    // The duplicate a boot could fire exists only if some stop fell between
+    // a fire's event and its row's removal; a harness that never stops there
+    // cannot catch it.
+    assert!(
+        left_behind > 0,
+        "no stop over {SEEDS} seeds left a row behind a written fire"
     );
 }
