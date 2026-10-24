@@ -233,7 +233,7 @@ pub async fn run(
     }
 
     // Phase 8: Bootstrap system + agent tenants
-    bootstrap::bootstrap_tenants(&state, &apps).await;
+    bootstrap::bootstrap_tenants(&state, &apps, bootstrap::EarlierOperatorKeys::from_env()).await;
     // Phase 8b: Restore persisted apps + apply CLI `--app` requests.
     bootstrap::bootstrap_installed_apps(&state, &os_app_installs).await?;
     if actor_runtime == ActorRuntimeBackend::Postgres {

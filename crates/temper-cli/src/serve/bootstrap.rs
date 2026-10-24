@@ -492,12 +492,35 @@ async fn load_verified_cache(
     }
 }
 
+/// What a boot does with the operator credentials earlier boots issued for other keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EarlierOperatorKeys {
+    /// Keep them: another holder may still use an older key.
+    Keep,
+    /// Revoke them: this deployment is the only holder of its key (a Katagami
+    /// app's Temper, keyed by its control plane), so a key it no longer holds
+    /// stops working. Set by `TEMPER_RETIRE_OLD_OPERATOR_KEYS=1`.
+    Retire,
+}
+
+impl EarlierOperatorKeys {
+    /// The policy `TEMPER_RETIRE_OLD_OPERATOR_KEYS` sets for this boot.
+    pub(super) fn from_env() -> Self {
+        let retire = std::env::var("TEMPER_RETIRE_OLD_OPERATOR_KEYS").is_ok_and(|v| v == "1"); // determinism-ok: read once at startup
+        if retire { Self::Retire } else { Self::Keep }
+    }
+}
+
 /// Phase 8: Bootstrap system tenant and agent specs.
 ///
 /// After verifying (or skipping via cache), persists spec hashes and
 /// verification status to the per-tenant Turso store so subsequent boots
 /// skip the cascade.
-pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, String)]) {
+pub(super) async fn bootstrap_tenants(
+    state: &PlatformState,
+    apps: &[(String, String)],
+    earlier_operator_keys: EarlierOperatorKeys,
+) {
     let sys_cache = load_verified_cache(state, "temper-system").await;
     let sys_hashes = temper_platform::bootstrap_system_tenant(state, &sys_cache);
     if let Some(turso) = state.server.turso_store_for_tenant("temper-system").await {
@@ -546,8 +569,9 @@ pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, St
     // A deployment that is the only holder of its key (a Katagami app's Temper,
     // keyed by its control plane) retires the credentials earlier boots issued
     // for other keys, so a key it no longer holds stops working.
-    let retire = std::env::var("TEMPER_RETIRE_OLD_OPERATOR_KEYS").is_ok_and(|v| v == "1"); // determinism-ok: read once at startup
-    if retire && let Some(ref api_key) = state.api_token {
+    if earlier_operator_keys == EarlierOperatorKeys::Retire
+        && let Some(ref api_key) = state.api_token
+    {
         temper_platform::retire_other_operator_credentials(state, api_key, "default").await;
     }
 
@@ -740,11 +764,12 @@ mod tests {
     use temper_platform::os_apps::get_os_app;
     use temper_platform::state::PlatformState;
     use temper_runtime::tenant::TenantId;
+    use temper_server::identity::{IdentityResolver, hash_token};
     use temper_server::storage::StorageStack;
     use temper_spec::csdl::parse_csdl;
     use temper_store_turso::TursoEventStore;
 
-    use super::{bootstrap_installed_apps, bootstrap_tenants};
+    use super::{EarlierOperatorKeys, bootstrap_installed_apps, bootstrap_tenants};
 
     #[tokio::test]
     async fn agent_bootstrap_keeps_specs_restored_into_default() {
@@ -774,7 +799,7 @@ mod tests {
             &[("Note", NOTE_IOA)],
         );
 
-        bootstrap_tenants(&state, &[]).await;
+        bootstrap_tenants(&state, &[], EarlierOperatorKeys::Keep).await;
 
         let registry = state.registry.read().unwrap();
         let config = registry
@@ -793,7 +818,12 @@ mod tests {
     #[tokio::test]
     async fn every_booted_tenant_has_the_http_endpoint_type() {
         let state = PlatformState::new(None);
-        bootstrap_tenants(&state, &[("app-tenant".to_string(), String::new())]).await;
+        bootstrap_tenants(
+            &state,
+            &[("app-tenant".to_string(), String::new())],
+            EarlierOperatorKeys::Keep,
+        )
+        .await;
 
         let registry = state.registry.read().unwrap();
         for tenant in ["default", "app-tenant"] {
@@ -815,6 +845,44 @@ mod tests {
                 "tenant {tenant} has no HttpEndpoint table"
             );
         }
+    }
+
+    /// A boot with a new operator key, set to retire earlier keys
+    /// (`TEMPER_RETIRE_OLD_OPERATOR_KEYS=1`), revokes the credential the
+    /// previous boot issued for its key, and the new key keeps working.
+    #[tokio::test]
+    async fn a_boot_that_retires_earlier_operator_keys_revokes_the_previous_key() {
+        const OLD_KEY: &str = "tmpr_operator-key-of-the-previous-boot";
+        const NEW_KEY: &str = "tmpr_operator-key-of-this-boot";
+        let tenant = TenantId::new("default");
+        let mut state = PlatformState::new(None);
+        state.api_token = Some(OLD_KEY.to_string());
+        bootstrap_tenants(&state, &[], EarlierOperatorKeys::Keep).await;
+
+        state.api_token = Some(NEW_KEY.to_string());
+        bootstrap_tenants(&state, &[], EarlierOperatorKeys::Retire).await;
+
+        let resolver = IdentityResolver::new();
+        assert!(
+            resolver
+                .resolve(&state.server, &tenant, NEW_KEY)
+                .await
+                .is_ok(),
+            "the current key is the operator"
+        );
+        assert!(
+            resolver
+                .resolve(&state.server, &tenant, OLD_KEY)
+                .await
+                .is_err(),
+            "the previous boot's key no longer works"
+        );
+        let old = state
+            .server
+            .get_tenant_entity_state(&tenant, "AgentCredential", &hash_token(OLD_KEY))
+            .await
+            .expect("the previous boot's credential");
+        assert_eq!(old.state.status, "Revoked");
     }
 
     #[tokio::test]
