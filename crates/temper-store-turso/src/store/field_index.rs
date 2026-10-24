@@ -6,42 +6,18 @@
 //! just to evaluate filters in memory.
 
 use crate::driver::{Value, params, params_from_iter};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
+use super::unchanged_projections::{ProjectionKey, projection_hash};
 use super::write_gate::WritePriority;
 use super::{TursoEventStore, TursoQueryProjectionRow};
 
 /// Match the Postgres query-plane limit: large scalar values stay in
 /// `entity_catalog.fields` but are not copied into the filter index.
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
-
-fn projection_hash(status: &str, fields: &serde_json::Value) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(status.as_bytes());
-    hasher.update(b"\n");
-
-    if let Some(obj) = fields.as_object() {
-        for (field_name, value) in obj {
-            let field_value = scalar_to_text(value);
-            if field_value.is_none() && !value.is_null() {
-                continue;
-            }
-            hasher.update(field_name.as_bytes());
-            hasher.update(b"=");
-            match field_value {
-                Some(field_value) => hasher.update(field_value.as_bytes()),
-                None => hasher.update(b"<null>"),
-            }
-            hasher.update(b"\n");
-        }
-    }
-
-    format!("{:x}", hasher.finalize())
-}
 
 fn canonical_projection_status<'a>(fallback: &'a str, state: &'a serde_json::Value) -> &'a str {
     state
@@ -142,57 +118,58 @@ impl TursoEventStore {
             .acquire_write_permit("turso.upsert_query_projection", WritePriority::Low)
             .await?;
         let conn = self.configured_connection().await?;
-        let new_projection_hash = projection_hash(status, fields);
         let fields_json = serde_json::to_string(fields)
             .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
+        let new_projection_hash = projection_hash(status, &fields_json, state);
         let updated_at = sim_now().to_rfc3339();
+        let key: ProjectionKey = (
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        );
+        let incoming_sequence = sequence_nr;
         let sequence_nr = i64::try_from(sequence_nr).unwrap_or(i64::MAX);
 
-        let unchanged_rows = conn
-            .execute(
-                "UPDATE entity_catalog \
-                 SET status = ?4, updated_at = ?5, sequence_nr = ?6, projection_version = 2, fields = ?8, state = ?9 \
-                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND projection_hash = ?7 \
-                   AND sequence_nr <= ?6",
-                params![
-                    tenant,
-                    entity_type,
-                    entity_id,
-                    status,
-                    updated_at.as_str(),
-                    sequence_nr,
-                    new_projection_hash.as_str(),
-                    fields_json.as_str(),
-                    state_json.as_str(),
-                ],
-            )
-            .await
-            .map_err(storage_error)?;
-
-        if unchanged_rows > 0 {
-            return Ok(());
-        }
-
+        // Deciding and writing under one write transaction keeps a concurrent
+        // projection of the same entity from landing between them. A
+        // transaction that writes nothing commits without a change log row.
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
-
-        let existing_sequence = {
+        let existing = {
             let mut existing_rows = tx
                 .query(
-                    "SELECT sequence_nr FROM entity_catalog \
+                    "SELECT sequence_nr, projection_hash FROM entity_catalog \
                      WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
                     params![tenant, entity_type, entity_id],
                 )
                 .await
                 .map_err(storage_error)?;
-            if let Some(row) = existing_rows.next().await.map_err(storage_error)? {
-                Some(row.get::<i64>(0).map_err(storage_error)?)
-            } else {
-                None
+            match existing_rows.next().await.map_err(storage_error)? {
+                Some(row) => Some((
+                    row.get::<i64>(0).map_err(storage_error)?,
+                    row.get::<String>(1).map_err(storage_error)?,
+                )),
+                None => None,
             }
         };
-        if existing_sequence.is_some_and(|existing| existing > sequence_nr) {
+        let older = existing
+            .as_ref()
+            .is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr)
+            || self
+                .unchanged_projections
+                .has_newer(&key, incoming_sequence);
+        if older {
+            tx.commit().await.map_err(storage_error)?;
+            return Ok(());
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|(_, existing_hash)| *existing_hash == new_projection_hash)
+        {
+            // Noted before the commit, while this transaction still holds the
+            // write lock, so no older projection is accepted in between.
+            self.unchanged_projections.note(key, incoming_sequence);
             tx.commit().await.map_err(storage_error)?;
             return Ok(());
         }
@@ -266,6 +243,7 @@ impl TursoEventStore {
         }
 
         tx.commit().await.map_err(storage_error)?;
+        self.unchanged_projections.written(&key, incoming_sequence);
         Ok(())
     }
 
@@ -338,27 +316,40 @@ impl TursoEventStore {
 
         let mut catalog_upserts = Vec::new();
         let mut changed_indexes = Vec::new();
+        let mut unchanged = Vec::new();
         for projection in projections {
-            let new_projection_hash = projection_hash(&projection.status, &projection.fields);
             let fields_json = serde_json::to_string(&projection.fields)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
             let state_json = serde_json::to_string(&projection.state)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
+            let new_projection_hash =
+                projection_hash(&projection.status, &fields_json, &projection.state);
             let sequence_nr = i64::try_from(projection.sequence_nr).unwrap_or(i64::MAX);
-            let key = (projection.entity_type.clone(), projection.entity_id.clone());
-            let existing_row = existing.get(&key);
-            if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr) {
+            let key: ProjectionKey = (
+                tenant.to_string(),
+                projection.entity_type.clone(),
+                projection.entity_id.clone(),
+            );
+            let existing_row = existing.get(&(key.1.clone(), key.2.clone()));
+            if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr)
+                || self
+                    .unchanged_projections
+                    .has_newer(&key, projection.sequence_nr)
+            {
                 continue;
             }
-            if existing_row.is_none_or(|(_, existing_hash)| existing_hash != &new_projection_hash) {
-                changed_indexes.push((
-                    projection.entity_type.clone(),
-                    projection.entity_id.clone(),
-                    projection.status.clone(),
-                    indexed_projection_fields(&projection.status, &projection.indexed_fields),
-                    projection.known_new,
-                ));
+            if existing_row.is_some_and(|(_, existing_hash)| *existing_hash == new_projection_hash)
+            {
+                unchanged.push((key, projection.sequence_nr));
+                continue;
             }
+            changed_indexes.push((
+                projection.entity_type.clone(),
+                projection.entity_id.clone(),
+                projection.status.clone(),
+                indexed_projection_fields(&projection.status, &projection.indexed_fields),
+                projection.known_new,
+            ));
             catalog_upserts.push(PreparedProjection {
                 entity_type: projection.entity_type.clone(),
                 entity_id: projection.entity_id.clone(),
@@ -368,6 +359,11 @@ impl TursoEventStore {
                 sequence_nr,
                 projection_hash: new_projection_hash,
             });
+        }
+        // Noted before the commit, while this transaction holds the write
+        // lock, so no older projection is accepted in between.
+        for (key, sequence_nr) in unchanged {
+            self.unchanged_projections.note(key, sequence_nr);
         }
 
         if !catalog_upserts.is_empty() {
@@ -472,6 +468,15 @@ impl TursoEventStore {
         }
 
         tx.commit().await.map_err(storage_error)?;
+        for projection in &catalog_upserts {
+            let key = (
+                tenant.to_string(),
+                projection.entity_type.clone(),
+                projection.entity_id.clone(),
+            );
+            let written = u64::try_from(projection.sequence_nr).unwrap_or(u64::MAX);
+            self.unchanged_projections.written(&key, written);
+        }
         Ok(())
     }
 
@@ -542,6 +547,11 @@ impl TursoEventStore {
         .await
         .map_err(storage_error)?;
         tx.commit().await.map_err(storage_error)?;
+        self.unchanged_projections.removed(&(
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        ));
         Ok(())
     }
 
