@@ -1,31 +1,29 @@
-//! The lookup behind a `DeletePolicy::Restrict` delete: is there a row of the
-//! referencing type whose foreign-key field holds the id being deleted?
+//! Finding the rows that reference an entity being deleted: the rows of a
+//! relation's referencing type whose foreign-key field holds the entity's id.
 //!
 //! The query projection's field index answers that the way it answers
-//! `$filter=<field> eq '<id>'`: one indexed probe, stopping at the first match,
-//! with no referencing entity read from its actor. A type with thousands of
-//! referencing rows costs the same as one with none.
+//! `$filter=<field> eq '<id>'`: one indexed probe, with no referencing entity
+//! read from its actor. A type with thousands of rows costs the same as one
+//! with none.
 //!
-//! The index is written after the journal (ADR-0148), so a miss is only proof
-//! for rows it has projected. Live rows it has no projection for yet are read
-//! from their actors, which covers projection lag. When the index cannot answer
-//! at all (no query plane, a field declared `query_indexed = false`, an id too
-//! long to index, a failed probe), every live row is in that set. The set is read
-//! only while it fits [`UNINDEXED_REFERENCE_READ_BUDGET`]; past it the delete is
-//! refused as unverified rather than reading the whole type.
+//! The index is written after the journal (ADR-0148), so it can only vouch for
+//! rows it has projected. Live rows it has no projection for yet are read from
+//! their actors, which covers projection lag. When the index cannot answer at
+//! all (no query plane, a field declared `query_indexed = false`, an id too
+//! long to index, a failed probe), every live row of the type is in that set.
+//! The set is read once per type per delete, and only while it fits
+//! [`UNINDEXED_REFERENCE_READ_BUDGET`]; past it the lookup reports that it
+//! could not check the rows instead of reading the whole type.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_odata::query::types::{BinaryOperator, FilterExpr, ODataValue};
 use temper_runtime::tenant::TenantId;
-use temper_spec::cross_invariant::DeletePolicy;
-use tracing::instrument;
 
-use super::ConstraintViolation;
 use crate::registry::RelationEdge;
 use crate::state::ServerState;
 
-/// Most referencing rows one delete reads from their actors.
+/// Most referencing rows one delete reads from their actors, per type.
 ///
 /// Reading a row the index has not projected can restore its actor from
 /// storage, and production restores about 40 actors a second, so this keeps a
@@ -37,287 +35,241 @@ const UNINDEXED_REFERENCE_READ_BUDGET: usize = 100;
 /// A clause every projected row passes: lists the type's projection catalog.
 const EVERY_PROJECTED_ROW: &str = "entity_id IS NOT NULL";
 
-/// What one Restrict relation says about deleting an entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReferenceLookup {
-    /// `source_id` holds the entity's id in the relation's field.
-    Referenced { source_id: String },
-    /// No live row of the referencing type holds the entity's id.
-    Unreferenced,
-    /// Some rows could not be checked; `reason` says which and why.
-    Unverified { reason: String },
+/// Which live rows of a type the field index cannot vouch for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Unvouched {
+    /// The index answered: only rows with no projection yet.
+    Unprojected,
+    /// The index could not answer: every live row.
+    Every,
 }
 
-/// The field index's answer, before any unprojected rows are read.
-enum IndexAnswer {
-    /// A projected row holds the id.
-    Referenced(String),
-    /// No projected row holds the id.
-    NoProjectedReference,
-    /// The index cannot answer for this relation.
-    Unavailable,
+/// Rows read from their actors because the index could not vouch for them.
+type ReadRows = Vec<(String, serde_json::Value)>;
+
+/// Answers "which rows reference this id" for every relation one delete
+/// looks at, reading each type's unvouched rows at most once.
+pub(super) struct ReferenceFinder<'a> {
+    state: &'a ServerState,
+    tenant: &'a TenantId,
+    read_rows: BTreeMap<(String, Unvouched), Result<ReadRows, String>>,
 }
 
-/// Check incoming relation policy before deleting an entity.
-///
-/// Each `Restrict` relation is answered by [`find_restricting_reference`], so
-/// the check does not read every referencing entity. Returns a
-/// `RelationUnverified` violation when the index cannot answer and there are
-/// too many unprojected rows to read one by one.
-#[instrument(skip_all, fields(otel.name = "constraint.pre_delete_relation_checks", tenant = %tenant, entity_type, entity_id, operation))]
-pub async fn pre_delete_relation_checks(
-    state: &ServerState,
-    tenant: &TenantId,
-    entity_type: &str,
-    entity_id: &str,
-    operation: &str,
-) -> Result<(), ConstraintViolation> {
-    if !state.cross_invariant_enforce {
-        state.metrics.record_cross_bypass();
-        return Ok(());
+impl<'a> ReferenceFinder<'a> {
+    pub(super) fn new(state: &'a ServerState, tenant: &'a TenantId) -> Self {
+        Self {
+            state,
+            tenant,
+            read_rows: BTreeMap::new(),
+        }
     }
 
-    let (tenant_name, edges): (String, Vec<RelationEdge>) = {
-        let registry = state.registry.read().unwrap();
-        let Some(tc) = registry.get_tenant(tenant) else {
-            return Ok(());
+    /// Ids of `edge.from_entity` rows whose `edge.source_field` holds
+    /// `entity_id`, leaving out the ids in `skip`, at most `limit` of them.
+    /// `Err` says which rows could not be checked and why.
+    pub(super) async fn referencing_ids(
+        &mut self,
+        edge: &RelationEdge,
+        entity_id: &str,
+        skip: &BTreeSet<String>,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        debug_assert!(!edge.from_entity.is_empty());
+        debug_assert!(!edge.source_field.is_empty());
+        // Skipped ids can fill the first page; ask for enough to see past them.
+        let top = limit.saturating_add(skip.len());
+        let (mut found, unvouched) = match self.probe_field_index(edge, entity_id, top).await {
+            Some(ids) => (ids, Unvouched::Unprojected),
+            None => (Vec::new(), Unvouched::Every),
         };
-        (
-            tenant.to_string(),
-            tc.relation_graph
-                .incoming
-                .get(entity_type)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    };
-
-    for edge in edges {
-        if edge.delete_policy != DeletePolicy::Restrict {
-            continue;
+        found.retain(|id| !skip.contains(id));
+        if found.len() >= limit {
+            found.truncate(limit);
+            return Ok(found);
         }
-        match find_restricting_reference(state, tenant, &edge, entity_id).await {
-            ReferenceLookup::Unreferenced => {}
-            ReferenceLookup::Referenced { source_id } => {
-                tracing::warn!(
-                    tenant = %tenant_name, entity_type, entity_id, operation,
-                    from_entity = %edge.from_entity, source_id = %source_id,
-                    "constraint violation: cannot delete entity referenced by another"
-                );
-                state.metrics.record_relation_integrity_violation(
-                    &tenant_name,
-                    entity_type,
-                    operation,
-                );
-                return Err(ConstraintViolation::relation(
-                    format!(
-                        "cannot delete {}('{}'): referenced by {}('{}') via {}",
-                        entity_type, entity_id, edge.from_entity, source_id, edge.source_field
-                    ),
-                    entity_type,
-                    entity_id,
-                    operation,
-                ));
+
+        let rows = self.unvouched_rows(&edge.from_entity, unvouched).await?;
+        for (source_id, fields) in rows {
+            if found.len() >= limit {
+                break;
             }
-            ReferenceLookup::Unverified { reason } => {
-                tracing::warn!(
-                    tenant = %tenant_name, entity_type, entity_id, operation,
-                    from_entity = %edge.from_entity, reason = %reason,
-                    "constraint check unavailable: cannot confirm entity is unreferenced"
-                );
-                return Err(ConstraintViolation::relation_unverified(
-                    format!(
-                        "cannot delete {}('{}'): could not confirm that no {} references it via {}: {}",
-                        entity_type, entity_id, edge.from_entity, edge.source_field, reason
-                    ),
-                    entity_type,
-                    entity_id,
-                    operation,
-                ));
+            if holds_id(fields, &edge.source_field, entity_id)
+                && !skip.contains(source_id)
+                && !found.contains(source_id)
+            {
+                found.push(source_id.clone());
             }
         }
+        Ok(found)
     }
 
-    Ok(())
-}
-
-/// Find a row that keeps `entity_id` from being deleted through `edge`.
-#[instrument(skip_all, fields(
-    otel.name = "constraint.delete_reference_lookup",
-    tenant = %tenant,
-    from_entity = %edge.from_entity,
-    source_field = %edge.source_field,
-    unindexed = tracing::field::Empty,
-))]
-async fn find_restricting_reference(
-    state: &ServerState,
-    tenant: &TenantId,
-    edge: &RelationEdge,
-    entity_id: &str,
-) -> ReferenceLookup {
-    debug_assert!(!edge.from_entity.is_empty());
-    debug_assert!(!edge.source_field.is_empty());
-
-    let unindexed = match probe_field_index(state, tenant, edge, entity_id).await {
-        IndexAnswer::Referenced(source_id) => return ReferenceLookup::Referenced { source_id },
-        IndexAnswer::NoProjectedReference => {
-            unprojected_live_ids(state, tenant, &edge.from_entity).await
-        }
-        IndexAnswer::Unavailable => state.list_entity_ids_lazy(tenant, &edge.from_entity).await,
-    };
-    tracing::Span::current().record("unindexed", unindexed.len());
-    read_unindexed_rows(state, tenant, edge, entity_id, &unindexed).await
-}
-
-/// Ask the field index for the first projected row whose `source_field` is
-/// `entity_id`, using the same predicate an OData `$filter` equality pushes down.
-async fn probe_field_index(
-    state: &ServerState,
-    tenant: &TenantId,
-    edge: &RelationEdge,
-    entity_id: &str,
-) -> IndexAnswer {
-    let Some(query_plane) = state.query_plane_store() else {
-        return IndexAnswer::Unavailable;
-    };
-    if !state.query_projection_indexes_field(tenant, &edge.from_entity, &edge.source_field) {
-        return IndexAnswer::Unavailable;
-    }
-    let equality = FilterExpr::BinaryOp {
-        left: Box::new(FilterExpr::Property(edge.source_field.clone())),
-        op: BinaryOperator::Eq,
-        right: Box::new(FilterExpr::Literal(ODataValue::String(
-            entity_id.to_string(),
-        ))),
-    };
-    // `None` when the id is longer than the index stores a value.
-    let Some(predicate) = crate::odata::filter_sql::try_translate_candidate_filter(&equality)
-    else {
-        return IndexAnswer::Unavailable;
-    };
-    match query_plane
-        .query_field_index_page(
-            tenant.as_str(),
+    /// Ask the field index for the first `top` projected rows whose
+    /// `source_field` is `entity_id`, using the same predicate an OData
+    /// `$filter` equality pushes down. `None` when the index cannot answer.
+    async fn probe_field_index(
+        &self,
+        edge: &RelationEdge,
+        entity_id: &str,
+        top: usize,
+    ) -> Option<Vec<String>> {
+        let query_plane = self.state.query_plane_store()?;
+        if !self.state.query_projection_indexes_field(
+            self.tenant,
             &edge.from_entity,
-            &predicate.where_clause,
-            predicate.params,
-            &[],
-            0,
-            1,
-            false,
-        )
-        .await
-    {
-        Ok(Some(page)) => {
-            debug_assert!(page.entity_ids.len() <= 1);
-            match page.entity_ids.into_iter().next() {
-                Some(source_id) => IndexAnswer::Referenced(source_id),
-                None => IndexAnswer::NoProjectedReference,
-            }
+            &edge.source_field,
+        ) {
+            return None;
         }
-        Ok(None) => IndexAnswer::Unavailable,
-        Err(error) => {
-            tracing::warn!(
-                tenant = %tenant, from_entity = %edge.from_entity, error = %error,
-                "delete reference probe failed; checking unindexed rows instead"
-            );
-            IndexAnswer::Unavailable
-        }
-    }
-}
-
-/// Live ids of `entity_type` that have no row in the projection catalog.
-///
-/// A projected row's field index rows are written in the same transaction as
-/// its catalog row, so a projected row the probe did not return does not hold
-/// the id. Only the ids returned here are unknown to the index.
-async fn unprojected_live_ids(
-    state: &ServerState,
-    tenant: &TenantId,
-    entity_type: &str,
-) -> Vec<String> {
-    let live_ids = state.list_entity_ids_lazy(tenant, entity_type).await;
-    if live_ids.is_empty() {
-        return live_ids;
-    }
-    let Some(query_plane) = state.query_plane_store() else {
-        return live_ids;
-    };
-    // The catalog lists the type's projected rows: about as many ids as the
-    // live listing above already holds in memory.
-    let catalog = query_plane
-        .query_field_index_page(
-            tenant.as_str(),
-            entity_type,
-            EVERY_PROJECTED_ROW,
-            Vec::new(),
-            &[],
-            0,
-            usize::MAX,
-            false,
-        )
-        .await;
-    let projected: BTreeSet<String> = match catalog {
-        Ok(Some(page)) => page.entity_ids.into_iter().collect(),
-        Ok(None) => return live_ids,
-        Err(error) => {
-            tracing::warn!(
-                tenant = %tenant, entity_type, error = %error,
-                "projection catalog listing failed; treating every live row as unindexed"
-            );
-            return live_ids;
-        }
-    };
-    live_ids
-        .into_iter()
-        .filter(|id| !projected.contains(id))
-        .collect()
-}
-
-/// Read the rows the index could not vouch for, while they fit the budget.
-async fn read_unindexed_rows(
-    state: &ServerState,
-    tenant: &TenantId,
-    edge: &RelationEdge,
-    entity_id: &str,
-    unindexed: &[String],
-) -> ReferenceLookup {
-    if unindexed.len() > UNINDEXED_REFERENCE_READ_BUDGET {
-        return ReferenceLookup::Unverified {
-            reason: format!(
-                "{} {} rows are not in the query index, more than the {} a delete reads \
-                 one by one; retry once the index has caught up",
-                unindexed.len(),
-                edge.from_entity,
-                UNINDEXED_REFERENCE_READ_BUDGET
-            ),
+        let equality = FilterExpr::BinaryOp {
+            left: Box::new(FilterExpr::Property(edge.source_field.clone())),
+            op: BinaryOperator::Eq,
+            right: Box::new(FilterExpr::Literal(ODataValue::String(
+                entity_id.to_string(),
+            ))),
         };
-    }
-    debug_assert!(unindexed.len() <= UNINDEXED_REFERENCE_READ_BUDGET);
-
-    for source_id in unindexed {
-        match state
-            .get_tenant_entity_state(tenant, &edge.from_entity, source_id)
+        // `None` when the id is longer than the index stores a value.
+        let predicate = crate::odata::filter_sql::try_translate_candidate_filter(&equality)?;
+        match query_plane
+            .query_field_index_page(
+                self.tenant.as_str(),
+                &edge.from_entity,
+                &predicate.where_clause,
+                predicate.params,
+                &[],
+                0,
+                top,
+                false,
+            )
             .await
         {
-            Ok(response) => {
-                if holds_id(&response.state.fields, &edge.source_field, entity_id) {
-                    return ReferenceLookup::Referenced {
-                        source_id: source_id.clone(),
-                    };
-                }
+            Ok(Some(page)) => {
+                debug_assert!(page.entity_ids.len() <= top);
+                Some(page.entity_ids)
             }
+            Ok(None) => None,
             Err(error) => {
-                return ReferenceLookup::Unverified {
-                    reason: format!(
-                        "{}('{}') is not in the query index and could not be read: {error}",
-                        edge.from_entity, source_id
-                    ),
-                };
+                tracing::warn!(
+                    tenant = %self.tenant, from_entity = %edge.from_entity, error = %error,
+                    "delete reference probe failed; checking unindexed rows instead"
+                );
+                None
             }
         }
     }
-    ReferenceLookup::Unreferenced
+
+    /// The rows of `entity_type` the index cannot vouch for, read from their
+    /// actors once per delete while they fit the budget.
+    async fn unvouched_rows(
+        &mut self,
+        entity_type: &str,
+        unvouched: Unvouched,
+    ) -> Result<&ReadRows, String> {
+        let key = (entity_type.to_string(), unvouched);
+        if !self.read_rows.contains_key(&key) {
+            let ids = match unvouched {
+                Unvouched::Unprojected => self.unprojected_live_ids(entity_type).await,
+                Unvouched::Every => {
+                    self.state
+                        .list_entity_ids_lazy(self.tenant, entity_type)
+                        .await
+                }
+            };
+            let rows = self.read_within_budget(entity_type, &ids).await;
+            self.read_rows.insert(key.clone(), rows);
+        }
+        match &self.read_rows[&key] {
+            Ok(rows) => Ok(rows),
+            Err(reason) => Err(reason.clone()),
+        }
+    }
+
+    /// Live ids of `entity_type` that have no row in the projection catalog.
+    ///
+    /// A projected row's field index rows are written in the same transaction
+    /// as its catalog row, so a projected row the probe did not return does not
+    /// hold the id. Only the ids returned here are unknown to the index.
+    async fn unprojected_live_ids(&self, entity_type: &str) -> Vec<String> {
+        let live_ids = self
+            .state
+            .list_entity_ids_lazy(self.tenant, entity_type)
+            .await;
+        if live_ids.is_empty() {
+            return live_ids;
+        }
+        let Some(query_plane) = self.state.query_plane_store() else {
+            return live_ids;
+        };
+        // The catalog lists the type's projected rows: about as many ids as the
+        // live listing above already holds in memory.
+        let catalog = query_plane
+            .query_field_index_page(
+                self.tenant.as_str(),
+                entity_type,
+                EVERY_PROJECTED_ROW,
+                Vec::new(),
+                &[],
+                0,
+                usize::MAX,
+                false,
+            )
+            .await;
+        let projected: BTreeSet<String> = match catalog {
+            Ok(Some(page)) => page.entity_ids.into_iter().collect(),
+            Ok(None) => return live_ids,
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %self.tenant, entity_type, error = %error,
+                    "projection catalog listing failed; treating every live row as unindexed"
+                );
+                return live_ids;
+            }
+        };
+        live_ids
+            .into_iter()
+            .filter(|id| !projected.contains(id))
+            .collect()
+    }
+
+    /// Read the rows the index could not vouch for, while they fit the budget.
+    async fn read_within_budget(
+        &self,
+        entity_type: &str,
+        ids: &[String],
+    ) -> Result<ReadRows, String> {
+        tracing::debug!(
+            entity_type,
+            unindexed = ids.len(),
+            "delete reference rows to read"
+        );
+        if ids.len() > UNINDEXED_REFERENCE_READ_BUDGET {
+            return Err(format!(
+                "{} {} rows are not in the query index, more than the {} a delete reads \
+                 one by one; retry once the index has caught up",
+                ids.len(),
+                entity_type,
+                UNINDEXED_REFERENCE_READ_BUDGET
+            ));
+        }
+        debug_assert!(ids.len() <= UNINDEXED_REFERENCE_READ_BUDGET);
+
+        let mut rows = Vec::with_capacity(ids.len());
+        for source_id in ids {
+            match self
+                .state
+                .get_tenant_entity_state(self.tenant, entity_type, source_id)
+                .await
+            {
+                Ok(response) => rows.push((source_id.clone(), response.state.fields)),
+                Err(error) => {
+                    return Err(format!(
+                        "{entity_type}('{source_id}') is not in the query index and could not \
+                         be read: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(rows)
+    }
 }
 
 /// Whether `fields[field]` holds `entity_id`, compared as the field index

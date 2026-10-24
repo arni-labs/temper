@@ -24,7 +24,7 @@ use super::common::{
     constraint_violation_response, extract_key, resolve_entity_type, run_write_prechecks,
     verification_gate_response,
 };
-use super::constraints::pre_delete_relation_checks;
+use super::constraints::plan_delete;
 use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
 use super::response::annotate_entity;
@@ -1525,11 +1525,10 @@ pub async fn handle_odata_delete(
             if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type) {
                 return response;
             }
-            if let Err(v) =
-                pre_delete_relation_checks(&state, &tenant, &entity_type, &key_str, "delete").await
-            {
-                return constraint_violation_response(v);
-            }
+            let plan = match plan_delete(&state, &tenant, &entity_type, &key_str, "delete").await {
+                Ok(plan) => plan,
+                Err(v) => return constraint_violation_response(v),
+            };
             if let Err(resp) = run_write_prechecks(
                 &state,
                 &tenant,
@@ -1567,6 +1566,26 @@ pub async fn handle_odata_delete(
                 return resp;
             }
 
+            // Dependents go first, so a delete that stops part way leaves none
+            // pointing at a removed entity; a retry plans what is left.
+            for dependent in plan.dependents() {
+                if let Err(error) = state
+                    .delete_tenant_entity(&tenant, &dependent.entity_type, &dependent.entity_id)
+                    .await
+                {
+                    return odata_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DeleteError",
+                        &format!(
+                            "could not delete {}('{}'), which deleting {}('{}') removes: {error}",
+                            dependent.entity_type, dependent.entity_id, entity_type, key_str
+                        ),
+                    )
+                    .into_response();
+                }
+                forget_deleted_entity(&state, &dependent.entity_type);
+            }
+
             match state
                 .delete_tenant_entity_if_current(
                     &tenant,
@@ -1577,10 +1596,7 @@ pub async fn handle_odata_delete(
                 .await
             {
                 Ok(response) if response.success => {
-                    if entity_type == "RateLimit" {
-                        state.clear_commons_rate_limit_cache();
-                    }
-                    state.clear_commons_storage_projection_cache_for_entity(&entity_type);
+                    forget_deleted_entity(&state, &entity_type);
                     (StatusCode::NO_CONTENT, "").into_response()
                 }
                 Ok(response) => odata_error(
@@ -1602,6 +1618,14 @@ pub async fn handle_odata_delete(
         )
         .into_response(),
     }
+}
+
+/// Drop the caches that hold rows of `entity_type` after one is deleted.
+fn forget_deleted_entity(state: &ServerState, entity_type: &str) {
+    if entity_type == "RateLimit" {
+        state.clear_commons_rate_limit_cache();
+    }
+    state.clear_commons_storage_projection_cache_for_entity(entity_type);
 }
 
 /// Map an entity type name to a short lowercase prefix for auto-generated IDs.
