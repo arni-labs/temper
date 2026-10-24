@@ -36,9 +36,7 @@ use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error};
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
-use crate::state::write_record::{
-    ActionPreview, RecordWrite, WriteCaller, created_record, field_update_record,
-};
+use crate::state::write_record::{RecordWrite, WriteCaller, created_record, field_update_record};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -386,6 +384,50 @@ async fn authorize_pg_mutation(
         return Err(Box::new(response));
     }
     Ok((actor_state, version))
+}
+
+/// The record a Postgres-runtime action stores: its actor's own handler run
+/// on a copy of `current`, with the status beside the fields as field
+/// invariants read it. `None` when the actor refuses the action and stores
+/// nothing.
+async fn pg_action_record(
+    actor_sys: &temper_actor_runtime::ActorSystem,
+    handle: &temper_actor_runtime::ActorHandle,
+    current: &temper_actor_runtime::spec_actor::SpecActorState,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, ODataWriteError> {
+    let internal = |message: String| {
+        Box::new(
+            odata_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ActorPreviewError",
+                &message,
+            )
+            .into_response(),
+        )
+    };
+    let state = serde_json::to_vec(current).map_err(|error| internal(error.to_string()))?;
+    let message =
+        temper_actor_runtime::spec_actor::SpecMessage::with_params(action, params.clone());
+    let next = match actor_sys.preview(handle, &state, message).await {
+        Ok(next) => next,
+        Err(temper_actor_runtime::ActorError::Rejected(_)) => return Ok(None),
+        Err(error) => return Err(internal(error.to_string())),
+    };
+    let next: temper_actor_runtime::spec_actor::SpecActorState =
+        serde_json::from_slice(&next).map_err(|error| internal(error.to_string()))?;
+    let mut record = match next.fields {
+        serde_json::Value::Object(fields) => fields,
+        _ => serde_json::Map::new(),
+    };
+    for key in ["status", "Status"] {
+        record.insert(
+            key.to_string(),
+            serde_json::Value::String(next.status.clone()),
+        );
+    }
+    Ok(Some(serde_json::Value::Object(record)))
 }
 
 async fn authorize_existing_mutation(
@@ -917,19 +959,17 @@ pub async fn handle_odata_post(
                 if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
                     return *resp;
                 }
-                let table = state
-                    .registry
-                    .read()
-                    .expect("registry lock poisoned")
-                    .get_table(&tenant, &entity_type);
-                if let Some(table) = table {
-                    if let Err(error) = table.validate_action_params(
-                        action_name,
-                        &body_json,
-                        &actor_state.fields,
-                        &actor_state.counters,
-                        &actor_state.booleans,
-                    ) {
+                {
+                    let registry = state.registry.read().expect("registry lock poisoned");
+                    if let Some(table) = registry.get_table(&tenant, &entity_type)
+                        && let Err(error) = table.validate_action_params(
+                            action_name,
+                            &body_json,
+                            &actor_state.fields,
+                            &actor_state.counters,
+                            &actor_state.booleans,
+                        )
+                    {
                         return odata_error(
                             StatusCode::BAD_REQUEST,
                             "StrictActionContract",
@@ -937,31 +977,36 @@ pub async fn handle_odata_post(
                         )
                         .into_response();
                     }
-                    // The actor applies this table's action: check the record it stores.
-                    let mut current = crate::entity_actor::EntityActor::build_initial_state(
-                        &entity_type,
-                        &key_str,
-                        &table,
-                        &serde_json::json!({}),
-                    );
-                    current.status = actor_state.status.clone();
-                    current.counters = actor_state.counters.clone();
-                    current.booleans = actor_state.booleans.clone();
-                    current.lists = actor_state.lists.clone();
-                    current.fields = actor_state.fields.clone();
-                    if let Err(violation) = state
-                        .check_action_record(
-                            WriteCaller::of_request(&security_ctx),
-                            &tenant,
-                            ActionPreview {
-                                table: &table,
-                                current: &current,
-                                action: action_name,
-                                params: &body_json,
-                                related: &Default::default(),
-                            },
-                        )
-                        .await
+                }
+                let caller = WriteCaller::of_request(&security_ctx);
+                if state.action_record_checked(caller, &tenant, &entity_type, action_name) {
+                    // The record checked is the one this runtime's own actor stores.
+                    let record = match pg_action_record(
+                        actor_sys,
+                        &handle,
+                        &actor_state,
+                        action_name,
+                        &body_json,
+                    )
+                    .await
+                    {
+                        Ok(record) => record,
+                        Err(response) => return *response,
+                    };
+                    if let Some(record) = record
+                        && let Err(violation) = state
+                            .check_record_to_store(
+                                RecordWrite {
+                                    caller,
+                                    tenant: &tenant,
+                                    entity_type: &entity_type,
+                                    entity_id: &key_str,
+                                    action: action_name,
+                                    operation: "action",
+                                },
+                                &record,
+                            )
+                            .await
                     {
                         return constraint_violation_response(violation);
                     }
