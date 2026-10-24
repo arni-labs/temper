@@ -22,6 +22,7 @@ mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
 mod start_runtime;
+pub mod status_cache;
 pub(crate) mod storage_caps;
 pub mod trajectory;
 pub mod wasm_invocation_log;
@@ -500,12 +501,10 @@ pub struct ServerState {
     pub cross_invariant_eventual_enforce: bool,
     /// Broadcast channel for design-time events (spec loading, verification progress).
     pub design_time_tx: Arc<tokio::sync::broadcast::Sender<DesignTimeEvent>>,
-    /// LRU cache of entity current state, updated on every state change broadcast.
-    /// Key: "{tenant}:{entity_type}:{entity_id}", Value: (current_state, last_updated).
-    /// Capped at [`state_cache_budget()`] entries; oldest entry evicted automatically.
-    #[allow(clippy::type_complexity)]
-    pub entity_state_cache:
-        Arc<Mutex<lru::LruCache<String, (String, chrono::DateTime<chrono::Utc>)>>>,
+    /// Each record's newest committed status, keyed "{tenant}:{entity_type}:{entity_id}"
+    /// (see [`status_cache`]). Capped at [`state_cache_budget()`] entries; the least
+    /// recently used is evicted.
+    pub entity_state_cache: Arc<Mutex<status_cache::StatusCache>>,
     /// Configurable timeout for actor ask operations (default: 5s).
     pub action_dispatch_timeout: Duration,
     /// Admission control (ADR-0051). Gates concurrent action dispatches per
@@ -1255,17 +1254,6 @@ impl ServerState {
     pub fn with_secrets_vault(mut self, vault: SecretsVault) -> Self {
         self.secrets_vault = Some(Arc::new(vault));
         self
-    }
-
-    /// Insert/update an entity status cache entry.
-    ///
-    /// The underlying [`lru::LruCache`] automatically evicts the least-recently-used
-    /// entry when the budget (see [`state_cache_budget`]) is exceeded, so no manual
-    /// eviction loop is needed here.
-    pub fn cache_entity_status(&self, cache_key: String, status: String) {
-        if let Ok(mut cache) = self.entity_state_cache.lock() {
-            cache.put(cache_key, (status, sim_now()));
-        }
     }
 
     /// Get a reference to the platform Turso event store.
