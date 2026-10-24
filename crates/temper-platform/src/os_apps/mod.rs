@@ -1407,13 +1407,9 @@ pub(super) async fn install_os_app_with_plan(
                 .await;
             }
         }
-        // App installs can introduce or update inline entity triggers.
-        // Refresh the live dispatcher after the registry mutation so the
-        // newly bootstrapped trigger graph is active for subsequent traffic.
-        state.server.rebuild_reaction_dispatcher();
     }
 
-    // Refresh cross-entity reactions after installing specs.
+    // Installed specs can change triggers and cross-entity reactions: refresh the dispatcher.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
