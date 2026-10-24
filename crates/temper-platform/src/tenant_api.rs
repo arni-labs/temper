@@ -285,7 +285,7 @@ pub(crate) async fn delete_tenant(
     let tid = authenticated.tenant();
     match provider.remove_tenant(tid).await {
         Ok(true) => {
-            state.server.forget_tenant(tid);
+            state.server.forget_tenant(tid).await;
             {
                 let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
                 registry.remove_tenant(tid);

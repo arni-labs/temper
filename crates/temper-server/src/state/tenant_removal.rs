@@ -6,11 +6,12 @@ use super::ServerState;
 
 impl ServerState {
     /// Drop everything this process holds in memory for a deleted tenant: its live entity actors and their caches,
-    /// its Cedar policies, its cached secrets, its WASM modules and its specs. A tenant created again with the same
-    /// id then starts from its own (empty) database, not from what the deleted tenant left in memory.
+    /// its cached replies, its timer sequences, its HTTP routes, its Cedar policies, its cached secrets, its WASM
+    /// modules and its specs. A tenant created again with the same id then starts from its own (empty) database, not
+    /// from what the deleted tenant left in memory.
     ///
     /// Actors are stopped without the passivation snapshot, so nothing of the deleted tenant is written back.
-    pub fn forget_tenant(&self, tenant: &TenantId) {
+    pub async fn forget_tenant(&self, tenant: &TenantId) {
         let prefix = format!("{tenant}:");
         let owned = |key: &String| key.starts_with(&prefix);
 
@@ -55,6 +56,10 @@ impl ServerState {
             sequences.retain(|key, _| !owned(key));
         }
 
+        self.idempotency_cache.forget_tenant(tenant);
+        self.state_timeout_tracker.forget_tenant(tenant);
+        self.http_endpoint_tables.remove(tenant).await;
+
         self.authz.remove_tenant(tenant.as_str());
         if let Ok(mut policies) = self.tenant_policies.write() {
             policies.remove(tenant.as_str());
@@ -80,8 +85,9 @@ mod tests {
     use super::*;
     use crate::secrets::vault::SecretsVault;
 
-    #[test]
-    fn a_deleted_tenants_policies_and_secrets_are_forgotten_and_other_tenants_keep_theirs() {
+    #[tokio::test]
+    async fn a_deleted_tenants_policies_secrets_and_routes_are_forgotten_and_other_tenants_keep_theirs()
+     {
         let state = ServerState::new(
             ActorSystem::new("forget-tenant"),
             CsdlDocument {
@@ -99,13 +105,32 @@ mod tests {
                 .reload_tenant_policies(tenant, policy)
                 .expect("policy");
             vault.cache_secret(tenant, "api_key", format!("{tenant}-value"));
+            state
+                .http_endpoint_tables
+                .table_for(&TenantId::new(tenant))
+                .await;
         }
 
-        state.forget_tenant(&TenantId::new("acme"));
+        state.forget_tenant(&TenantId::new("acme")).await;
 
         assert_eq!(state.authz.get_tenant_policy_text("acme"), None);
         assert_eq!(vault.get_secret("acme", "api_key"), None);
+        assert!(
+            state
+                .http_endpoint_tables
+                .get(&TenantId::new("acme"))
+                .await
+                .is_none(),
+            "the deleted tenant's routes are gone"
+        );
         assert!(state.authz.get_tenant_policy_text("other").is_some());
+        assert!(
+            state
+                .http_endpoint_tables
+                .get(&TenantId::new("other"))
+                .await
+                .is_some()
+        );
         assert_eq!(
             vault.get_secret("other", "api_key").as_deref(),
             Some("other-value")

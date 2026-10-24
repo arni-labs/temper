@@ -437,5 +437,7 @@ fn json_bytes(value: &serde_json::Value) -> usize {
     total
 }
 
+mod tenant;
+
 #[cfg(test)]
 mod tests;
