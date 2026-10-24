@@ -113,6 +113,10 @@ async fn authenticate_named_principal(
 ) -> axum::response::Response {
     let id = header_text(request.headers(), "x-temper-principal-id");
     let kind = header_text(request.headers(), "x-temper-principal-kind");
+    let tenant = header_text(request.headers(), "x-tenant-id")
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| TenantId::try_new(value.trim()).expect("test tenant header should be valid"))
+        .unwrap_or_default();
     if let Some(id) = id {
         let mut security_ctx = test_security_context();
         security_ctx.principal.id = id;
@@ -125,7 +129,7 @@ async fn authenticate_named_principal(
         request
             .extensions_mut()
             .insert(temper_authz::AuthenticatedRequestContext::new(
-                TenantId::default(),
+                tenant,
                 security_ctx,
             ));
     }
@@ -1054,7 +1058,7 @@ async fn commons_rate_limit_returns_429_per_owner_bucket() {
         .expect("beta functional test policy should parse");
     state.enable_commons_guardrails("default");
     state.enable_commons_guardrails("beta");
-    let app = authenticated_router(state.clone());
+    let app = named_principal_router(state.clone());
 
     let alice_bucket = ServerState::commons_rate_limit_entity_id("alice", "write");
     let response = app
@@ -1334,7 +1338,7 @@ async fn test_blob_ingest_raw_applies_cedar_create_policy() {
 async fn commons_storage_cap_blocks_raw_blob_ingest_per_owner() {
     let state = test_state_with_storage_cap_ioa();
     state.enable_commons_guardrails("default");
-    let app = authenticated_router(state.clone());
+    let app = named_principal_router(state.clone());
 
     let alice_owner = app
         .clone()
@@ -1480,7 +1484,7 @@ async fn commons_storage_cap_blocks_raw_blob_ingest_per_owner() {
 async fn commons_storage_projection_cache_invalidates_after_blob_write() {
     let state = test_state_with_storage_cap_ioa();
     state.enable_commons_guardrails("default");
-    let app = authenticated_router(state.clone());
+    let app = named_principal_router(state.clone());
 
     let owner = app
         .clone()
