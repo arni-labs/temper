@@ -132,14 +132,13 @@ impl AgentContext {
     /// This context after its step made these entities (`(type, id)`), so its
     /// chain knows them as made rather than found.
     pub(crate) fn having_made<'a>(
-        &self,
+        mut self,
         made: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Self {
-        let mut next = self.clone();
         for (entity_type, entity_id) in made {
-            next.inline_chain = next.inline_chain.making(entity_type, entity_id);
+            self.inline_chain = self.inline_chain.making(entity_type, entity_id);
         }
-        next
+        self
     }
 
     /// Begin a detached task without replenishing its causal callback budget.

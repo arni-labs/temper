@@ -235,7 +235,7 @@ impl crate::state::ServerState {
         // Dispatch cross-entity reactions (fire-and-forget, depth 0 = top-level)
         if response.success {
             // The children this action spawned are entities its chain made.
-            let reaction_ctx = agent_ctx.having_made(
+            let reaction_ctx = entered_ctx.having_made(
                 response
                     .spawn_requests
                     .iter()

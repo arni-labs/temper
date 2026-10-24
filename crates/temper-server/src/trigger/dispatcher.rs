@@ -30,9 +30,8 @@ pub struct ReactionDispatcher {
     registry: Arc<ReactionRegistry>,
 }
 
-/// The action a reaction just ran, whose own reactions are the next level of
-/// the chain.
-struct NextLevel<'a> {
+/// The action whose reactions one level of a chain runs, `depth` levels in.
+struct Level<'a> {
     entity_type: &'a str,
     entity_id: &'a str,
     action: &'a str,
@@ -47,45 +46,52 @@ impl ReactionDispatcher {
         Self { registry }
     }
 
-    /// [`dispatch_reactions`](Self::dispatch_reactions) for the next level of
-    /// a chain, boxed and polled on a stack that grows. The named return type
-    /// is what lets the recursive future be `Send`.
-    fn dispatch_next_level<'a>(
-        &'a self,
-        state: &'a crate::ServerState,
-        tenant: &'a TenantId,
-        level: NextLevel<'a>,
-        invoking_ctx: &'a AgentContext,
-    ) -> BoxFuture<'a, Vec<ReactionResult>> {
-        crate::growable_stack::on_growable_stack(move || {
-            self.dispatch_reactions(
-                state,
-                tenant,
-                level.entity_type,
-                level.entity_id,
-                level.action,
-                level.to_state,
-                level.fields,
-                level.depth,
-                invoking_ctx,
-            )
-            .boxed()
-        })
-    }
-
     /// Dispatch reactions triggered by a successful entity action.
     ///
     /// This is called after the source action has been committed and the SSE
     /// broadcast sent. Reactions are fire-and-forget: failures are logged but
     /// do not roll back the source transition.
+    ///
+    /// A chain is as deep as its data, so every level, the first included, is
+    /// boxed and polled on a stack that grows: a caller's future holds a
+    /// pointer, not the level, and a deep chain gets more stack instead of
+    /// overflowing its thread. The named return type is what lets the
+    /// recursive future be `Send`.
     #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_reactions<'a>(
+        &'a self,
+        state: &'a crate::ServerState,
+        tenant: &'a TenantId,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        action: &'a str,
+        to_state: &'a str,
+        fields: &'a serde_json::Value,
+        depth: u32,
+        invoking_ctx: &'a AgentContext,
+    ) -> BoxFuture<'a, Vec<ReactionResult>> {
+        crate::growable_stack::on_growable_stack(move || {
+            let level = Level {
+                entity_type,
+                entity_id,
+                action,
+                to_state,
+                fields,
+                depth,
+            };
+            self.dispatch_level(state, tenant, level, invoking_ctx)
+                .boxed()
+        })
+    }
+
+    /// One level of a chain: the reactions of one action.
     #[instrument(skip_all, fields(
         otel.name = "reaction.dispatch",
         tenant = %tenant,
-        entity_type,
-        entity_id,
-        action_name = action,
-        depth,
+        entity_type = level.entity_type,
+        entity_id = level.entity_id,
+        action_name = level.action,
+        depth = level.depth,
         reaction.rule_count = tracing::field::Empty,
         reaction.fired_count = tracing::field::Empty,
         reaction.guard_skipped_count = tracing::field::Empty,
@@ -96,18 +102,21 @@ impl ReactionDispatcher {
         reaction.success_count = tracing::field::Empty,
         reaction.result_count = tracing::field::Empty,
     ))]
-    pub async fn dispatch_reactions(
+    async fn dispatch_level(
         &self,
         state: &crate::ServerState,
         tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        to_state: &str,
-        fields: &serde_json::Value,
-        depth: u32,
+        level: Level<'_>,
         invoking_ctx: &AgentContext,
     ) -> Vec<ReactionResult> {
+        let Level {
+            entity_type,
+            entity_id,
+            action,
+            to_state,
+            fields,
+            depth,
+        } = level;
         // The source action is the step these reactions continue from.
         let source_ctx = invoking_ctx.entering(entity_type, entity_id, action);
         let invoking_ctx = &source_ctx;
@@ -334,17 +343,15 @@ impl ReactionDispatcher {
                         let target_fields =
                             serde_json::to_value(&response.state.fields).unwrap_or_default();
                         let cascade_results = self
-                            .dispatch_next_level(
+                            .dispatch_reactions(
                                 state,
                                 tenant,
-                                NextLevel {
-                                    entity_type: &rule.then.entity_type,
-                                    entity_id: &target_entity_id,
-                                    action: &rule.then.action,
-                                    to_state: &target_status,
-                                    fields: &target_fields,
-                                    depth: depth + 1,
-                                },
+                                &rule.then.entity_type,
+                                &target_entity_id,
+                                &rule.then.action,
+                                &target_status,
+                                &target_fields,
+                                depth + 1,
                                 &cascade_ctx,
                             )
                             .await;
