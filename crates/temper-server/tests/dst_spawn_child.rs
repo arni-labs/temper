@@ -120,6 +120,10 @@ enum Fire {
 
 fn state_with_sim_store(seed: u64) -> (ServerState, SimEventStore) {
     let sim_store = SimEventStore::no_faults(seed);
+    (state_with_store(sim_store.clone()), sim_store)
+}
+
+fn state_with_store(sim_store: SimEventStore) -> ServerState {
     let csdl = parse_csdl(CSDL).expect("CSDL parses");
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
@@ -130,7 +134,7 @@ fn state_with_sim_store(seed: u64) -> (ServerState, SimEventStore) {
     );
     let mut state = ServerState::from_registry(ActorSystem::new("dst-spawn-child"), registry);
     state.set_storage_stack(StorageStack::from_sim(sim_store.clone(), None));
-    (state, sim_store)
+    state
 }
 
 fn run_exists(store: &SimEventStore, run_id: &str) -> bool {
@@ -243,4 +247,206 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn dst_existing_child_survives_unreadable_journal() {
+    for seed in 100..108 {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let (state, store) = state_with_sim_store(seed);
+        let tenant = TenantId::default();
+        state
+            .dispatch_tenant_action(
+                &tenant,
+                "Run",
+                "existing",
+                "Configure",
+                serde_json::json!({"user_message": "hello"}),
+                &AgentContext::for_service("test"),
+            )
+            .await
+            .expect("create existing child");
+        // A fresh server has no resident child. Its existence must come from
+        // storage, whose first reads fail while a refused initializer settles.
+        let fresh = state_with_store(store.clone());
+        store.fail_next_reads("default:Run:existing", 5);
+        let response = fresh
+            .dispatch_tenant_action(
+                &tenant,
+                "Job",
+                "job",
+                "Fire",
+                serde_json::json!({"run_id": "existing", "user_message": ""}),
+                &AgentContext::for_service("test"),
+            )
+            .await
+            .expect("fire");
+        assert!(response.success);
+        for _ in 0..SETTLE_POLLS {
+            if !refused_runs(&store, "job").is_empty() {
+                break;
+            }
+            tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+        }
+        assert_eq!(refused_runs(&store, "job"), vec!["existing"]);
+        let fields = fresh
+            .get_tenant_entity_state(&tenant, "Job", "job")
+            .await
+            .unwrap()
+            .state
+            .fields;
+        assert_eq!(
+            fields["last_run_id"], "existing",
+            "seed {seed}: unreadability must not clear a durable child"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dst_failed_parent_refusal_append_eventually_converges() {
+    for seed in 200..208 {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let (state, store) = state_with_sim_store(seed);
+        let tenant = TenantId::default();
+        let response = state
+            .dispatch_tenant_action(
+                &tenant,
+                "Job",
+                "job",
+                "Fire",
+                serde_json::json!({"run_id": "absent", "user_message": ""}),
+                &AgentContext::for_service("test"),
+            )
+            .await
+            .expect("fire");
+        assert!(response.success);
+        // Exhaust the actor's refusal-append retries, then restore storage.
+        store.inject_concurrency_violations("default:Job:job", 1000);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(refused_runs(&store, "job").is_empty());
+        assert_eq!(
+            state
+                .get_tenant_entity_state(&tenant, "Job", "job")
+                .await
+                .unwrap()
+                .state
+                .fields["last_run_id"],
+            "absent"
+        );
+        assert!(
+            store
+                .dump_journal("__temper_internal:SpawnRefusal:recovery")
+                .iter()
+                .any(|e| e.event_type == "Pending"),
+            "repair must be durable before attempting the parent append"
+        );
+        store.inject_concurrency_violations("default:Job:job", 0);
+        wait_until_settled(&store, "job", "absent").await;
+        assert_eq!(refused_runs(&store, "job"), vec!["absent"]);
+        assert_eq!(
+            state
+                .get_tenant_entity_state(&tenant, "Job", "job")
+                .await
+                .unwrap()
+                .state
+                .fields["last_run_id"],
+            serde_json::Value::Null
+        );
+    }
+}
+
+#[test]
+fn dst_restart_recovers_pending_refusal_and_retries_idempotently() {
+    use temper_runtime::persistence::{EventMetadata, EventStore, PersistenceEnvelope};
+    use temper_runtime::scheduler::{sim_now, sim_uuid};
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let store = runtime().block_on(async {
+        let (_guard, _clock, _ids) = install_deterministic_context(300);
+        let (state, store) = state_with_sim_store(300);
+        let tenant = TenantId::default();
+        state
+            .get_or_create_tenant_entity(
+                &tenant,
+                "Job",
+                "job",
+                serde_json::json!({"last_run_id": "absent"}),
+            )
+            .await
+            .unwrap();
+        let journal = "__temper_internal:SpawnRefusal:recovery";
+        store.append(journal, 0, &[PersistenceEnvelope {
+        sequence_nr: 1,
+        event_type: "Pending".to_owned(),
+        payload: serde_json::json!({"id": "restart-work", "work": {
+            "tenant": "default", "parent_type": "Job", "parent_id": "job",
+            "refusal": {"recovery_id": "repair-restart", "child_type": "Run", "child_id": "absent",
+                "field": "last_run_id", "child_exists": false, "error": "initializer refused"}
+        }}),
+        metadata: EventMetadata {
+            event_id: sim_uuid(), causation_id: sim_uuid(), correlation_id: sim_uuid(),
+            timestamp: sim_now(), actor_id: journal.to_owned(),
+        },
+    }]).await.unwrap();
+        store
+    }); // Dropping the runtime cancels the first server's recovery worker.
+    runtime().block_on(async {
+        let (_guard, _clock, _ids) = install_deterministic_context(301);
+        let tenant = TenantId::default();
+        let journal = "__temper_internal:SpawnRefusal:recovery";
+        // The parent commit can succeed while acknowledging the repair fails.
+        store.inject_concurrency_violations(journal, 1000);
+        let restarted = state_with_store(store.clone());
+        wait_until_settled(&store, "job", "absent").await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            refused_runs(&store, "job"),
+            vec!["absent"],
+            "ack retries must not append duplicate parent events"
+        );
+        assert_eq!(
+            restarted
+                .get_tenant_entity_state(&tenant, "Job", "job")
+                .await
+                .unwrap()
+                .state
+                .fields["last_run_id"],
+            serde_json::Value::Null
+        );
+    }); // Simulate another crash after parent commit but before acknowledgement.
+    runtime().block_on(async {
+        let (_guard, _clock, _ids) = install_deterministic_context(302);
+        let journal = "__temper_internal:SpawnRefusal:recovery";
+        store.inject_concurrency_violations(journal, 0);
+        let restarted = state_with_store(store.clone());
+        for _ in 0..SETTLE_POLLS {
+            if store
+                .dump_journal(journal)
+                .iter()
+                .any(|e| e.event_type == "Completed")
+            {
+                assert_eq!(
+                    refused_runs(&store, "job"),
+                    vec!["absent"],
+                    "replay must retain repair idempotency"
+                );
+                assert_eq!(
+                    restarted
+                        .get_tenant_entity_state(&TenantId::default(), "Job", "job")
+                        .await
+                        .unwrap()
+                        .state
+                        .fields["last_run_id"],
+                    serde_json::Value::Null
+                );
+                return;
+            }
+            tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+        }
+        panic!("recovered repair was never acknowledged");
+    });
 }

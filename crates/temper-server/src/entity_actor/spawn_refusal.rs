@@ -29,6 +29,9 @@ const MAX_RETRIES: u32 = 2;
 /// Why a spawn's child was not created, as the spawn dispatcher saw it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRefusal {
+    /// Stable repair identity, retained across recovery retries.
+    #[serde(default)]
+    pub recovery_id: Option<String>,
     /// The child's entity type.
     pub child_type: String,
     /// The id the parent's transition reserved for the child.
@@ -99,6 +102,13 @@ pub(super) async fn commit(
         !refusal.child_id.is_empty(),
         "PRECONDITION: a refused spawn names the child id it reserved"
     );
+    if refusal
+        .recovery_id
+        .as_deref()
+        .is_some_and(|key| state.has_processed_idempotency_key(key))
+    {
+        return Ok(());
+    }
     if state.status == "Deleted" {
         return Err("the parent was deleted before its spawn was refused".to_owned());
     }
@@ -111,6 +121,7 @@ pub(super) async fn commit(
     let initial = initial_fields(actor, state);
     let mut previous_fields = state.fields.clone();
     let mut event = refusal_event(state, event_params(refusal, state, &initial));
+    event.idempotency_key = refusal.recovery_id.clone();
     apply(state, &event.params);
 
     let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend) else {
@@ -132,10 +143,18 @@ pub(super) async fn commit(
                 if state.status == "Deleted" {
                     return Err("the parent was deleted before its spawn was refused".to_owned());
                 }
+                if refusal
+                    .recovery_id
+                    .as_deref()
+                    .is_some_and(|key| state.has_processed_idempotency_key(key))
+                {
+                    return Ok(());
+                }
                 // Decide again on the caught-up parent: a newer spawn may have
                 // replaced the id in between.
                 previous_fields = state.fields.clone();
                 event = refusal_event(state, event_params(refusal, state, &initial));
+                event.idempotency_key = refusal.recovery_id.clone();
                 apply(state, &event.params);
             }
             Err(e) => {

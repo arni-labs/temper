@@ -329,35 +329,8 @@ impl crate::state::ServerState {
             action,
             error,
         );
-        // A child that cannot be read counts as absent: this spawn did not
-        // create it, and a parent naming a child nobody can read is the state
-        // this refusal exists to end.
-        let child_exists = self
-            .entity_exists_durably(tenant, &request.entity_type, &request.entity_id)
-            .await
-            .unwrap_or(false);
-        let refusal = crate::entity_actor::spawn_refusal::SpawnRefusal {
-            child_type: request.entity_type.clone(),
-            child_id: request.entity_id.clone(),
-            field: request.store_id_in.clone(),
-            child_exists,
-            error: error.to_owned(),
-        };
-        if let Err(record_error) = self
-            .record_spawn_refusal(tenant, parent_type, parent_id, refusal)
-            .await
-        {
-            tracing::error!(
-                tenant = %tenant,
-                parent_type,
-                parent_id,
-                child_type = %request.entity_type,
-                child_id = %request.entity_id,
-                error,
-                record_error = %record_error,
-                "spawn refusal could not be recorded on the parent"
-            );
-        }
+        self.recover_spawn_refusal(tenant, parent_type, parent_id, request, error)
+            .await;
     }
 }
 

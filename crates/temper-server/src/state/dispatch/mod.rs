@@ -19,6 +19,7 @@ mod effects;
 mod generated_callbacks;
 mod projection_barrier;
 pub(crate) mod retry;
+mod spawn_refusal_recovery;
 pub(crate) mod state_timeouts;
 mod state_timer_rows;
 #[cfg(test)]
