@@ -21,6 +21,7 @@ use temper_runtime::tenant::TenantId;
 use tokio::sync::Semaphore;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
+use super::state_timer_follow::BootCallers;
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 use crate::storage::{MetadataTimerRows, StateTimerStore};
@@ -148,13 +149,16 @@ impl ServerState {
     ///
     /// Call once at boot, after specs, policies and modules are loaded and
     /// before the server takes requests. Reads one row per waiting timer and
-    /// loads no entity until its timer fires; a row whose state declares no
-    /// timeout now is removed and its record read to arm what its state
-    /// declares. At most [`BOOT_FIRES_AT_ONCE`] of these run at once. Returns
-    /// how many timers were armed.
-    pub async fn rearm_state_timers(&self) -> usize {
+    /// loads no entity until its timer fires, at most [`BOOT_FIRES_AT_ONCE`]
+    /// firing at once; a row whose state declares no timeout now is removed.
+    /// Then, in the background, every record of a timed type is made to
+    /// follow its state, so one in a timed state with no row gets its timer
+    /// (as whoever armed its removed row, if it had one). Returns that
+    /// background walk, which a caller may await.
+    pub async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<()> {
         let started = Instant::now();
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
+        let mut callers = BootCallers::new();
         let mut armed = 0usize;
         let mut overdue = 0usize;
         for (tenant, timeouts) in self.declared_state_timeouts() {
@@ -176,7 +180,14 @@ impl ServerState {
                         armed_timer(&tenant, &row, action, *after_seconds)
                     }
                     None => {
-                        self.spawn_boot_reconcile(&tenant, &row, gate.clone());
+                        if let Some(armed_by) = row_armed_by(&row) {
+                            let key = (
+                                tenant.clone(),
+                                row.entity_type.clone(),
+                                row.entity_id.clone(),
+                            );
+                            callers.insert(key, armed_by);
+                        }
                         Err("its state no longer declares a timeout".to_string())
                     }
                 };
@@ -223,7 +234,9 @@ impl ServerState {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "re-armed state timers from the store"
         );
-        armed
+        let server = self.clone();
+        // determinism-ok: boot follow-up runs in the background, as boot timers do.
+        tokio::spawn(async move { server.follow_timed_types(callers).await })
     }
 
     /// Every tenant's declared timeouts. Tenants without any are left out.
@@ -252,7 +265,7 @@ impl ServerState {
 }
 
 /// The identity a row's timer fires as, if the row keeps a readable one.
-pub(super) fn row_armed_by(row: &StateTimerRecord) -> Option<AgentContext> {
+fn row_armed_by(row: &StateTimerRecord) -> Option<AgentContext> {
     serde_json::from_str::<ArmedBy>(&row.armed_by)
         .ok()
         .map(AgentContext::from)

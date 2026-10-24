@@ -19,38 +19,45 @@
 //! restart or a rehydration waits only the rest of its budget, or fires at once.
 //!
 //! A timer fires as someone: the caller of the dispatch that reconciles, else
-//! whoever armed the timer it replaces. A record with neither (no timer armed,
-//! no row, as for a timeout an install adds to a type) gets its timer on its
-//! next action, as before: a timer's action may read its caller's identity
-//! (`authenticated_subject`), and nobody is there to give it one.
+//! whoever armed the timer it replaces, else (a record nobody armed a timer
+//! for, as when an install adds a timeout to its type) the kernel's
+//! [`STATE_TIMER_SERVICE`]. A timeout action that binds its caller's identity
+//! (`authenticated_subject`) refuses a service caller by design, so such a
+//! record waits for its next action, whose caller arms it.
+//!
+//! The walks that reconcile every record of a type, after an install and at
+//! boot, are in `state_timer_follow`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
-use tokio::sync::Semaphore;
-
 use super::state_timeouts::{Reservation, declared_timer, rearm_clock_start, remaining_budget};
-use super::state_timer_rows::row_armed_by;
 use crate::entity_actor::{EntityState, RehydrateHook};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
-/// The wait before listing a changed type's records again after the store
-/// failed to list them. It doubles up to [`FOLLOW_RETRY_MAX`], so a store
-/// that stays down is asked about once a minute, not in a tight loop.
-const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
-const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
+/// The service a timer fires as when nobody armed it: a record found in a
+/// timed state by an install or a boot with no timer armed and no row.
+const STATE_TIMER_SERVICE: &str = "state-timer";
+
+/// What a reconcile left a record with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimerFollow {
+    /// The timer its state declares, or none.
+    Settled,
+    /// Its state declares a timer whose action binds its caller's identity,
+    /// and nobody armed it: the record's next action arms it as that caller.
+    WaitsForCaller,
+}
 
 impl ServerState {
     /// Make `entity_id`'s armed timer the one `current`'s state declares, or
     /// none. A timer already armed for that declaration is kept; any other is
     /// cancelled and its row removed. A timer armed here fires as `armed_by`,
-    /// else as whoever armed the timer it replaces; with neither, nothing is
-    /// armed until the record's next action.
+    /// else as whoever armed the timer it replaces, else as the
+    /// [`STATE_TIMER_SERVICE`] when its action does not bind a caller.
     pub(crate) async fn reconcile_state_timers(
         &self,
         tenant: &TenantId,
@@ -58,10 +65,10 @@ impl ServerState {
         entity_id: &str,
         current: &EntityState,
         armed_by: Option<&AgentContext>,
-    ) {
+    ) -> TimerFollow {
         let declared = {
             let Ok(registry) = self.registry.read() else {
-                return;
+                return TimerFollow::Settled;
             };
             registry.get_spec(tenant, entity_type).and_then(|spec| {
                 spec.automaton
@@ -79,13 +86,18 @@ impl ServerState {
         let Some((st, started_at)) = wanted else {
             self.cancel_state_timer(tenant, entity_type, entity_id, current.sequence_nr)
                 .await;
-            return;
+            return TimerFollow::Settled;
         };
-        let Some(identity) = armed_by.cloned().or_else(|| {
+        let known = armed_by.cloned().or_else(|| {
             self.armed_state_timer(tenant, entity_type, entity_id)
                 .map(|armed| armed.agent_ctx)
-        }) else {
-            return;
+        });
+        let identity = match known {
+            Some(identity) => identity,
+            None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
+                return TimerFollow::WaitsForCaller;
+            }
+            None => AgentContext::for_service(STATE_TIMER_SERVICE),
         };
         let timer = declared_timer(
             tenant,
@@ -112,41 +124,19 @@ impl ServerState {
                 },
             );
         }
+        TimerFollow::Settled
     }
 
-    /// Read `entity_id` and make its armed timer follow its state. A deleted
-    /// record is not brought back to read it, and one that cannot be read
-    /// keeps its timer: both are checked again when the timer fires.
-    pub(crate) async fn reconcile_record_state_timers(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        armed_by: Option<&AgentContext>,
-    ) {
-        if !self
-            .ensure_entity_loaded(tenant, entity_type, entity_id)
-            .await
-        {
-            return;
-        }
-        match self
-            .get_tenant_entity_state(tenant, entity_type, entity_id)
-            .await
-        {
-            Ok(current) => {
-                self.reconcile_state_timers(
-                    tenant,
-                    entity_type,
-                    entity_id,
-                    &current.state,
-                    armed_by,
-                )
-                .await;
-            }
-            Err(error) => tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
-                "record not readable; its timer is not reconciled"),
-        }
+    /// Whether `action` binds a parameter from its caller's identity, which a
+    /// service caller cannot give (`resolve_authenticated_params`).
+    fn action_binds_caller(&self, tenant: &TenantId, entity_type: &str, action: &str) -> bool {
+        self.transition_table_for_dispatch(tenant, entity_type)
+            .is_ok_and(|table| {
+                table
+                    .action_contracts
+                    .get(action)
+                    .is_some_and(|contract| !contract.param_sources.is_empty())
+            })
     }
 
     /// Whether `entity_type`'s spec declares any state timeout.
@@ -159,16 +149,17 @@ impl ServerState {
     }
 
     /// The hook an entity actor runs when it starts from stored events: it
-    /// makes the record's armed timer follow the state it rehydrated into.
-    /// None for a record with no timer armed: there is nothing to move, and
-    /// nobody to arm a new one as.
+    /// makes the record's timer follow the state it rehydrated into. None for
+    /// a type that declares no timeout and a record with no timer armed.
     pub(crate) fn state_timer_rehydrate_hook(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
     ) -> Option<RehydrateHook> {
-        if !self.has_armed_state_timer(tenant, entity_type, entity_id) {
+        if !self.declares_state_timeouts(tenant, entity_type)
+            && !self.has_armed_state_timer(tenant, entity_type, entity_id)
+        {
             return None;
         }
         let server = self.clone();
@@ -189,75 +180,5 @@ impl ServerState {
                     .await;
             });
         }))
-    }
-
-    /// Read the record of a row whose state no longer declares a timeout, and
-    /// arm what its current state declares, as whoever armed the row. Waits
-    /// its turn on the boot `gate`.
-    pub(super) fn spawn_boot_reconcile(
-        &self,
-        tenant: &TenantId,
-        row: &StateTimerRecord,
-        gate: Arc<Semaphore>,
-    ) {
-        let armed_by = row_armed_by(row);
-        let (server, tenant) = (self.clone(), tenant.clone());
-        let (entity_type, entity_id) = (row.entity_type.clone(), row.entity_id.clone());
-        // determinism-ok: boot follow-up, as boot timers are spawned.
-        tokio::spawn(async move {
-            let _permit = gate.acquire_owned().await.ok();
-            server
-                .reconcile_record_state_timers(&tenant, &entity_type, &entity_id, armed_by.as_ref())
-                .await;
-        });
-    }
-
-    /// Make the timers of every record of each type whose spec an install
-    /// changed follow the state the record is in now. Records not in memory
-    /// are read, so each lands in the state replay under the new spec gives
-    /// it. Each changed type is followed once; a type whose records cannot be
-    /// listed is tried again after a wait, since its records not in memory
-    /// would otherwise keep the timers of their old state.
-    pub async fn follow_spec_changes(&self) {
-        let mut changed = match self.registry.write() {
-            Ok(mut registry) => registry.take_changed_types(),
-            Err(_) => return,
-        };
-        let mut wait = FOLLOW_RETRY_FIRST;
-        loop {
-            let mut unlisted = Vec::new();
-            for (tenant, entity_type) in changed {
-                if let Err(error) = self.ensure_type_indexed(&tenant, &entity_type).await {
-                    tracing::warn!(tenant = %tenant, entity_type, %error,
-                        retry_in_secs = wait.as_secs(),
-                        "records of a changed spec could not be listed; trying again");
-                    unlisted.push((tenant, entity_type));
-                    continue;
-                }
-                let ids = self.list_entity_ids(&tenant, &entity_type);
-                tracing::info!(tenant = %tenant, entity_type, records = ids.len(),
-                    "spec changed; reconciling its records' state timers");
-                for entity_id in ids {
-                    self.reconcile_record_state_timers(&tenant, &entity_type, &entity_id, None)
-                        .await;
-                }
-            }
-            if unlisted.is_empty() {
-                return;
-            }
-            tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
-            wait = (wait * 2).min(FOLLOW_RETRY_MAX);
-            changed = unlisted;
-        }
-    }
-
-    /// [`Self::follow_spec_changes`] in the background, for an install that
-    /// answers before every record is read.
-    pub fn spawn_follow_spec_changes(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let server = self.clone();
-        runtime.spawn(async move { server.follow_spec_changes().await }); // determinism-ok: install follow-up runs in the background
     }
 }
