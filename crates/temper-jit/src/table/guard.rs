@@ -180,12 +180,12 @@ pub fn check_detailed(
 /// `len` or `empty`, a comparison of two fields, a cross-entity status) has no
 /// single field and wanted value, so it adds nothing.
 fn split_conditions(expr: &Expr, env: &GuardEnv<'_>, out: &mut Vec<GuardCondition>) {
-    let mut push = |field: &str, op: &str, wants: serde_json::Value, value: Val<'_>| {
+    let mut push = |field: &str, op: &str, wants: serde_json::Value, value: serde_json::Value| {
         out.push(GuardCondition {
             field: field.to_string(),
             op: op.to_string(),
             wants,
-            value: to_json(value),
+            value,
         });
     };
     match expr {
@@ -194,10 +194,10 @@ fn split_conditions(expr: &Expr, env: &GuardEnv<'_>, out: &mut Vec<GuardConditio
                 split_conditions(part, env, out);
             }
         }
-        Expr::Var(name) => push(name, "==", true.into(), env.var(name)),
+        Expr::Var(name) => push(name, "==", true.into(), condition_var(name, env)),
         Expr::Not(inner) => {
             if let Expr::Var(name) = inner.as_ref() {
-                push(name, "==", false.into(), env.var(name));
+                push(name, "==", false.into(), condition_var(name, env));
             }
         }
         Expr::Compare { lhs, op, rhs } => match (lhs, rhs) {
@@ -229,12 +229,33 @@ fn split_conditions(expr: &Expr, env: &GuardEnv<'_>, out: &mut Vec<GuardConditio
 }
 
 /// The name and value of an operand that reads one field of this entity.
-fn field_operand<'e>(operand: &'e Operand, env: &'e GuardEnv<'_>) -> Option<(&'e str, Val<'e>)> {
+fn field_operand<'e>(
+    operand: &'e Operand,
+    env: &'e GuardEnv<'_>,
+) -> Option<(&'e str, serde_json::Value)> {
     match operand {
-        Operand::Status => Some(("status", env.status())),
-        Operand::Var(name) => Some((name, env.var(name))),
+        Operand::Status => Some(("status", env.status.into())),
+        Operand::Var(name) => Some((name, condition_var(name, env))),
         _ => None,
     }
+}
+
+/// Read stored values without the evaluator's floating-point conversion.
+fn condition_var(name: &str, env: &GuardEnv<'_>) -> serde_json::Value {
+    let ctx = env.ctx;
+    if let Some(value) = ctx.counters.get(name) {
+        return (*value).into();
+    }
+    if let Some(value) = ctx.booleans.get(name) {
+        return (*value).into();
+    }
+    if let Some(value) = ctx.lists.get(name) {
+        return value.clone().into();
+    }
+    if let Some(value) = ctx.fields.get(name) {
+        return value.clone();
+    }
+    to_json(env.var(name))
 }
 
 /// `lit op x` read as `x op' lit`.

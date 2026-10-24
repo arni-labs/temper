@@ -217,3 +217,26 @@ fn failure_does_not_split_what_has_no_single_field_and_wanted_value() {
         "holders <= 1 || !waiting"
     );
 }
+
+#[test]
+fn failure_conditions_preserve_stored_numbers() {
+    let mut ctx = EvalContext::default();
+    for value in [
+        json!(9_007_199_254_740_993_u64),
+        json!(-9_007_199_254_740_993_i64),
+        json!(u64::MAX),
+        json!(1.5),
+    ] {
+        ctx.fields.insert("revision".into(), value.clone());
+        for source in ["revision == 0", "0 == revision", "revision in [0]"] {
+            assert_eq!(conditions(source, "Open", &ctx).1[0].value, value);
+        }
+    }
+    // Counters take precedence over fields with the same name.
+    let counter = usize::MAX;
+    ctx.counters.insert("revision".into(), counter);
+    assert_eq!(
+        conditions("revision == 0", "Open", &ctx).1[0].value,
+        json!(counter)
+    );
+}
