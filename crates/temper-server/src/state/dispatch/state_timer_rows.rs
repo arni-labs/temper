@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
+use crate::storage::{MetadataTimerRows, StateTimerStore};
 
 /// How many timers armed at boot fire at once. Every timer that fell due while
 /// the server was down is due at boot; firing them all together is a burst of
@@ -92,10 +93,23 @@ impl From<ArmedBy> for AgentContext {
 }
 
 impl ServerState {
+    /// Where `tenant`'s timer rows are kept: [`Self::state_timer_rows`] when
+    /// set, else the tenant's metadata store. None: rows are not kept.
+    async fn timer_rows_for_tenant(&self, tenant: &str) -> Option<Arc<dyn StateTimerStore>> {
+        if let Some(rows) = self.state_timer_rows.clone() {
+            return Some(rows);
+        }
+        let store = self.metadata_store_for_tenant(tenant).await?;
+        Some(Arc::new(MetadataTimerRows(store)))
+    }
+
+    /// Harness seam for the before run: main has no install follow-up.
+    pub async fn follow_spec_changes(&self) {}
+
     /// Write a newly armed timer's row. A failed write leaves the timer armed
     /// in this process; only a restart before it fires would lose it.
     pub(super) async fn persist_state_timer(&self, timer: &ArmedTimer) {
-        let Some(store) = self.metadata_store_for_tenant(timer.tenant.as_str()).await else {
+        let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return;
         };
         let record = match timer_record(timer) {
@@ -115,7 +129,7 @@ impl ServerState {
 
     /// Remove an ended timer's row, unless a newer arm has replaced it.
     pub(super) async fn forget_state_timer(&self, timer: &ArmedTimer) {
-        let Some(store) = self.metadata_store_for_tenant(timer.tenant.as_str()).await else {
+        let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return;
         };
         if let Err(error) = store
@@ -146,7 +160,7 @@ impl ServerState {
         let mut armed = 0usize;
         let mut overdue = 0usize;
         for (tenant, timeouts) in self.declared_state_timeouts() {
-            let Some(store) = self.metadata_store_for_tenant(tenant.as_str()).await else {
+            let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
                 continue;
             };
             let rows = match store.list_state_timers(tenant.as_str()).await {

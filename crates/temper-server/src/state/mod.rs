@@ -512,6 +512,9 @@ pub struct ServerState {
     /// counter used to cancel stale timers when the entity transitions out
     /// of a declared state or reset_on fires.
     pub state_timeout_tracker: Arc<StateTimeoutTracker>,
+    /// Where armed timer rows are kept when the storage stack has no metadata
+    /// store to keep them, as under simulation. None: the metadata store.
+    pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -811,6 +814,7 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
+            state_timer_rows: None,
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1088,6 +1092,7 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
+            state_timer_rows: None,
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),

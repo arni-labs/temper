@@ -52,7 +52,7 @@ pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
-pub use state_timers::StateTimerStore;
+pub use state_timers::{MetadataTimerRows, StateTimerStore};
 mod query_plane;
 pub use query_plane::{
     EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPage,
