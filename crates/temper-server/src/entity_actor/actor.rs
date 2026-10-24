@@ -69,6 +69,31 @@ pub(super) fn persistence_failure(error: &PersistenceError) -> String {
     }
 }
 
+/// The answer to an action whose event the store did not take. Only an event
+/// too large to write is a refusal: nothing was written. After any other
+/// failure the write may have landed. That includes a concurrency violation,
+/// which a store that retries a write whose answer was lost reports for a
+/// write that landed (the Turso store does).
+fn persistence_failure_reply(state: EntityState, error: &PersistenceError) -> EntityResponse {
+    let said = persistence_failure(error);
+    match error {
+        PersistenceError::EventTooLarge { .. } => EntityResponse::refused(state, said),
+        PersistenceError::ConcurrencyViolation { .. }
+        | PersistenceError::Storage(_)
+        | PersistenceError::Serialization(_) => EntityResponse::write_failed(state, said),
+    }
+}
+
+/// Why a concurrency retry (ADR-0046) gave up without writing the action.
+enum RetryGaveUp {
+    /// The journal, read again, does not hold the action and it no longer
+    /// applies, or its event is too large: nothing was written.
+    Refused(String),
+    /// Writing failed, the journal kept moving, or it already holds the
+    /// action: the action may have landed.
+    WriteFailed(String),
+}
+
 pub(super) fn event_budget_workspace_id(state: &EntityState) -> String {
     if state.entity_type == "Workspace" {
         return state.entity_id.clone();
@@ -1096,18 +1121,10 @@ impl Actor for EntityActor {
                 if name == super::effects::FIELDS_UPDATED_EVENT
                     || name == super::effects::FIELDS_REPLACED_EVENT
                 {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some(format!(
-                            "action name `{name}` is reserved for journaled field updates"
-                        )),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        format!("action name `{name}` is reserved for journaled field updates"),
+                    ));
                     return Ok(());
                 }
 
@@ -1161,6 +1178,7 @@ impl Actor for EntityActor {
                         scheduled_actions: vec![],
                         spawn_requests: vec![],
                         spec_governed: true,
+                        refused: false,
                     });
                     return Ok(());
                 }
@@ -1168,19 +1186,11 @@ impl Actor for EntityActor {
                 if let Some(expected) = expected_authorization_precondition
                     && super::effects::entity_authorization_precondition(state) != expected
                 {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some(
-                            "action authorization became stale; retry against current state"
-                                .to_string(),
-                        ),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        "action authorization became stale; retry against current state"
+                            .to_string(),
+                    ));
                     return Ok(());
                 }
 
@@ -1188,16 +1198,10 @@ impl Actor for EntityActor {
                 // source. Reject new actions without turning a normal caller
                 // error into an actor-stopping debug assertion.
                 if state.status == "Deleted" {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some("cannot execute actions after entity deletion".to_string()),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        "cannot execute actions after entity deletion".to_string(),
+                    ));
                     return Ok(());
                 }
 
@@ -1229,18 +1233,12 @@ impl Actor for EntityActor {
                         max_events_since_snapshot = MAX_EVENTS_SINCE_SNAPSHOT,
                         "Event budget exhausted (10000 max since snapshot)"
                     );
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some(format!(
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        format!(
                             "Event budget exhausted ({MAX_EVENTS_SINCE_SNAPSHOT} max since snapshot)"
-                        )),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                        ),
+                    ));
                     return Ok(());
                 }
 
@@ -1296,16 +1294,7 @@ impl Actor for EntityActor {
                             })
                     {
                         *state = state_before;
-                        ctx.reply(EntityResponse {
-                            success: false,
-                            refusal: None,
-                            state: state.clone(),
-                            error: Some(persistence_failure(&e)),
-                            custom_effects: vec![],
-                            scheduled_actions: vec![],
-                            spawn_requests: vec![],
-                            spec_governed: true,
-                        });
+                        ctx.reply(persistence_failure_reply(state.clone(), &e));
                         return Ok(());
                     }
 
@@ -1317,16 +1306,10 @@ impl Actor for EntityActor {
                         .await
                     {
                         *state = state_before;
-                        ctx.reply(EntityResponse {
-                            success: false,
-                            refusal: None,
-                            state: state.clone(),
-                            error: Some(format!("field-overflow blob persistence failed: {e}")),
-                            custom_effects: vec![],
-                            scheduled_actions: vec![],
-                            spawn_requests: vec![],
-                            spec_governed: true,
-                        });
+                        ctx.reply(EntityResponse::write_failed(
+                            state.clone(),
+                            format!("field-overflow blob persistence failed: {e}"),
+                        ));
                         return Ok(());
                     }
 
@@ -1378,7 +1361,7 @@ impl Actor for EntityActor {
                                 let mut retry_idx: u32 = 0;
                                 let mut retry_final: Option<(
                                     crate::runtime_metrics::ConcurrencyRetryOutcome,
-                                    Option<String>,
+                                    Option<RetryGaveUp>,
                                 )> = None;
                                 // The typed reason when the replayed action is refused.
                                 let mut retry_refusal = None;
@@ -1426,6 +1409,25 @@ impl Actor for EntityActor {
                                     state_before = state.clone();
                                     event_count_before = state.total_event_count;
 
+                                    // A store that retries a write whose answer
+                                    // was lost reports that write as a
+                                    // concurrency violation. If the journal now
+                                    // holds this action's key, an earlier attempt
+                                    // landed: writing it again would apply it
+                                    // twice, and its guard refusing it now is
+                                    // not a refusal.
+                                    if let Some(key) = idempotency_key.as_deref()
+                                        && state.has_processed_idempotency_key(key)
+                                    {
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::AlreadyWritten,
+                                            Some(RetryGaveUp::WriteFailed(format!(
+                                                "action {name} may have been written: the journal holds its key after a concurrency violation"
+                                            ))),
+                                        ));
+                                        break;
+                                    }
+
                                     // Re-evaluate the action against the caught-up
                                     // state. It may now fail (entity reached a
                                     // terminal state during the race) — if so,
@@ -1448,13 +1450,21 @@ impl Actor for EntityActor {
 
                                     if !retry_result.success {
                                         retry_refusal = retry_result.refusal;
+                                        let error = retry_result.error.unwrap_or_else(|| {
+                                            format!(
+                                                "action {name} no longer legal after concurrency replay"
+                                            )
+                                        });
+                                        // Without a key the journal cannot show
+                                        // whether an earlier attempt landed.
+                                        let gave_up = if idempotency_key.is_some() {
+                                            RetryGaveUp::Refused(error)
+                                        } else {
+                                            RetryGaveUp::WriteFailed(error)
+                                        };
                                         retry_final = Some((
                                             crate::runtime_metrics::ConcurrencyRetryOutcome::ActionIllegal,
-                                            Some(retry_result.error.unwrap_or_else(|| {
-                                                format!(
-                                                    "action {name} no longer legal after concurrency replay"
-                                                )
-                                            })),
+                                            Some(gave_up),
                                         ));
                                         break;
                                     }
@@ -1476,9 +1486,9 @@ impl Actor for EntityActor {
                                     {
                                         retry_final = Some((
                                             crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                            Some(format!(
+                                            Some(RetryGaveUp::WriteFailed(format!(
                                                 "field-overflow blob persistence failed during retry: {e}"
-                                            )),
+                                            ))),
                                         ));
                                         break;
                                     }
@@ -1531,27 +1541,29 @@ impl Actor for EntityActor {
                                             continue;
                                         }
                                         Err(PersistenceError::ConcurrencyViolation { .. }) => {
+                                            // The last attempt is not replayed,
+                                            // so it may have landed.
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                                Some(
+                                                Some(RetryGaveUp::WriteFailed(
                                                     "persistence failed: optimistic concurrency retry exhausted"
                                                         .to_string(),
-                                                ),
+                                                )),
                                             ));
                                             break;
                                         }
                                         Err(e) => {
-                                            let said = match &e {
+                                            let gave_up = match &e {
                                                 PersistenceError::EventTooLarge { .. } => {
-                                                    e.to_string()
+                                                    RetryGaveUp::Refused(e.to_string())
                                                 }
-                                                _ => {
-                                                    format!("persistence failed during retry: {e}")
-                                                }
+                                                _ => RetryGaveUp::WriteFailed(format!(
+                                                    "persistence failed during retry: {e}"
+                                                )),
                                             };
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                                Some(said),
+                                                Some(gave_up),
                                             ));
                                             break;
                                         }
@@ -1561,7 +1573,7 @@ impl Actor for EntityActor {
                                 // Record the retry outcome. `total_attempts` is
                                 // 1-based; `retry_idx` counts completed retries.
                                 let total_attempts = u64::from(1 + retry_idx);
-                                if let Some((outcome, err_msg)) = retry_final {
+                                if let Some((outcome, gave_up)) = retry_final {
                                     // Close the ADR-0046 APM span with the
                                     // final attempt count + outcome so APM
                                     // views can filter by either.
@@ -1572,36 +1584,28 @@ impl Actor for EntityActor {
                                         outcome,
                                         total_attempts,
                                     );
-                                    if let Some(msg) = err_msg {
+                                    if let Some(gave_up) = gave_up {
                                         *state = state_before;
+                                        let reply = match gave_up {
+                                            RetryGaveUp::Refused(error) => {
+                                                EntityResponse::refused(state.clone(), error)
+                                            }
+                                            RetryGaveUp::WriteFailed(error) => {
+                                                EntityResponse::write_failed(state.clone(), error)
+                                            }
+                                        };
                                         ctx.reply(EntityResponse {
-                                            success: false,
                                             refusal: retry_refusal,
-                                            state: state.clone(),
-                                            error: Some(msg),
-                                            custom_effects: vec![],
-                                            scheduled_actions: vec![],
-                                            spawn_requests: vec![],
-                                            spec_governed: true,
+                                            ..reply
                                         });
                                         return Ok(());
                                     }
                                 }
                             }
                             Err(e) => {
-                                // Non-concurrency persistence error — unchanged:
-                                // roll back and fail.
+                                // Non-concurrency persistence error: roll back and fail.
                                 *state = state_before;
-                                ctx.reply(EntityResponse {
-                                    success: false,
-                                    refusal: None,
-                                    state: state.clone(),
-                                    error: Some(persistence_failure(&e)),
-                                    custom_effects: vec![],
-                                    scheduled_actions: vec![],
-                                    spawn_requests: vec![],
-                                    spec_governed: true,
-                                });
+                                ctx.reply(persistence_failure_reply(state.clone(), &e));
                                 return Ok(());
                             }
                         }
@@ -1694,6 +1698,7 @@ impl Actor for EntityActor {
                         scheduled_actions: result.scheduled_actions,
                         spawn_requests: result.spawn_requests,
                         spec_governed: true,
+                        refused: false,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
@@ -1728,14 +1733,13 @@ impl Actor for EntityActor {
                     wide_event::emit_metrics(&wide);
 
                     ctx.reply(EntityResponse {
-                        success: false,
                         refusal: result.refusal,
-                        state: state.clone(),
-                        error: result.error,
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
+                        ..EntityResponse::refused(
+                            state.clone(),
+                            result
+                                .error
+                                .unwrap_or_else(|| format!("action {name} refused")),
+                        )
                     });
                 }
                 // Inside-actor ask reply latency (excludes dispatch and retry
@@ -1758,6 +1762,7 @@ impl Actor for EntityActor {
                     scheduled_actions: vec![],
                     spawn_requests: vec![],
                     spec_governed: true,
+                    refused: false,
                 });
             }
             EntityMsg::GetField { field } => {
@@ -1793,6 +1798,7 @@ impl Actor for EntityActor {
                     scheduled_actions: vec![],
                     spawn_requests: vec![],
                     spec_governed: true,
+                    refused: false,
                 });
             }
 
@@ -1805,36 +1811,20 @@ impl Actor for EntityActor {
                     .expect("table lock poisoned")
                     .strict_action_params
                 {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some(
-                            "Strict entities require a declared action for deletion".to_owned(),
-                        ),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        "Strict entities require a declared action for deletion".to_owned(),
+                    ));
                     return Ok(());
                 }
                 if let Some(expected) = expected_authorization_precondition
                     && super::effects::entity_authorization_precondition(state) != expected
                 {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some(
-                            "delete authorization became stale; retry against current state"
-                                .to_string(),
-                        ),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        "delete authorization became stale; retry against current state"
+                            .to_string(),
+                    ));
                     return Ok(());
                 }
                 let deleted = EntityEvent {
@@ -1853,16 +1843,7 @@ impl Actor for EntityActor {
                         .persist_event(store, backend, &self.persistence_id(), state, &deleted)
                         .await
                 {
-                    ctx.reply(EntityResponse {
-                        success: false,
-                        refusal: None,
-                        state: state.clone(),
-                        error: Some(format!("persistence failed: {e}")),
-                        custom_effects: vec![],
-                        scheduled_actions: vec![],
-                        spawn_requests: vec![],
-                        spec_governed: true,
-                    });
+                    ctx.reply(persistence_failure_reply(state.clone(), &e));
                     return Ok(());
                 }
 
@@ -1884,6 +1865,7 @@ impl Actor for EntityActor {
                     scheduled_actions: vec![],
                     spawn_requests: vec![],
                     spec_governed: true,
+                    refused: false,
                 });
             }
         }
