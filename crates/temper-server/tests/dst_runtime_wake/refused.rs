@@ -10,8 +10,8 @@
 //! arms one more.
 //!
 //! Invariants:
-//! - each change, and each wake, sends exactly one report, naming the
-//!   earliest due time;
+//! - each change sends exactly one report, naming the earliest due time, and
+//!   a wake, whose answer names it, sends none;
 //! - in the quiet after a refused report, nothing is sent: it is not retried;
 //! - once the pass comes back, the next change's report is delivered.
 
@@ -141,15 +141,13 @@ fn run_seed(seed: u64) -> Result<(), String> {
         plan(&state, &format!("job-{seed}-near"), near).await?;
         let sent = one_report(&gate, sent, Some(near), false, "second arm")?;
 
+        // The wake's answer tells the control plane the due time, so nothing
+        // is reported for it.
         let outcome = state.wake_runtime(&TenantId::new(TENANT)).await;
         settle().await;
-        if outcome.fired != 0 {
-            return Err(format!(
-                "a wake before any due time fired {}",
-                outcome.fired
-            ));
+        if outcome.fired != 0 || outcome.next_due_at != Some(near) {
+            return Err(format!("a wake before any due time answered {outcome:?}"));
         }
-        let sent = one_report(&gate, sent, Some(near), false, "wake")?;
         quiet(&gate, sent, "after the wake").await?;
 
         // The pass comes back.

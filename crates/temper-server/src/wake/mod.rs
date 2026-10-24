@@ -106,8 +106,10 @@ impl ServerState {
 
     /// Fire every timer of `tenant` due by the wall clock now, wait for those
     /// fires, and answer the earliest due time left of `tenant`'s timers that
-    /// the process could sleep through. The process reports too when what the
-    /// control plane holds differs, so an early wake brings the fresh value. A timer that is firing
+    /// the process could sleep through, by the same rule as a report. The
+    /// control plane takes the answer as it takes a report, so an early wake
+    /// brings the fresh value; the process reports besides only when another
+    /// tenant's timer is earlier and what the control plane holds differs. A timer that is firing
     /// already is waited for, not fired again; one whose fire does not commit
     /// keeps its row, tries again on its own and is not counted.
     ///
@@ -119,8 +121,7 @@ impl ServerState {
         for answer in answers {
             fired += usize::from(answer.await.unwrap_or(false));
         }
-        let next_due_at = self.due_times.reportable(Some(tenant.as_str()));
-        self.due_times.sync();
+        let next_due_at = self.due_times.answer(tenant.as_str());
         WakeOutcome { fired, next_due_at }
     }
 }
