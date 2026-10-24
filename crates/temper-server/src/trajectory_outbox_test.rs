@@ -133,6 +133,7 @@ async fn a_marker_that_never_lands_leaves_the_loss_unconfirmed() {
             Arc::new(FailingSink),
             "tenant",
             "doomed-session",
+            None,
             health.clone(),
         ),
         Duration::ZERO,
@@ -164,7 +165,13 @@ async fn only_a_confirmed_write_clears_the_loss() {
     assert!(health.is_degraded());
 
     persist_capture_loss_marker(
-        queued_marker_for_test(Arc::new(store), "tenant", "healthy-session", health.clone()),
+        queued_marker_for_test(
+            Arc::new(store),
+            "tenant",
+            "healthy-session",
+            None,
+            health.clone(),
+        ),
         Duration::ZERO,
     )
     .await;
@@ -259,6 +266,7 @@ async fn a_lost_entry_leaves_a_marker_the_checker_reads_as_missing_evidence() {
             Arc::new(store.clone()),
             "tenant",
             session,
+            None,
             CaptureHealth::default(),
         ),
         Duration::ZERO,
@@ -292,4 +300,82 @@ async fn a_lost_entry_leaves_a_marker_the_checker_reads_as_missing_evidence() {
         report.evidence_gaps
     );
     assert!(!report.evidence_complete);
+}
+
+/// A sink that keeps what it is given, so a test can see whether a marker was written.
+#[derive(Default)]
+struct RecordingSink {
+    written: std::sync::Mutex<Vec<TrajectoryEntry>>,
+}
+
+#[async_trait::async_trait]
+impl crate::storage::TrajectorySink for RecordingSink {
+    async fn persist_trajectory_entry(&self, entry: &TrajectoryEntry) -> Result<(), String> {
+        self.written
+            .lock()
+            .expect("recording sink")
+            .push(entry.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_loss_of_a_deleted_tenant_is_cleared_and_the_tenant_created_again_starts_unmarked() {
+    // The session a marker of a deleted tenant would mark went with the tenant's storage, so no stored record is left
+    // incomplete: the loss is accounted for, and the server does not read degraded for a tenant that is gone. The
+    // tenant created again under the id starts with no session marked, so a loss in it is marked.
+    let state = crate::state::ServerState::new(
+        temper_runtime::ActorSystem::new("capture-loss-deleted-tenant"),
+        temper_spec::csdl::CsdlDocument {
+            version: "4.0".to_string(),
+            schemas: Vec::new(),
+        },
+        String::new(),
+    );
+    let tenant = temper_runtime::tenant::TenantId::new("capture-loss-gone");
+    let generation = state.generation_ref(&tenant);
+    for session in ["lost-session", "marked-session"] {
+        release_capture_loss_marker(tenant.as_str(), session);
+        assert_eq!(
+            claim_capture_loss_marker(tenant.as_str(), session),
+            MarkerClaim::Claimed
+        );
+    }
+    // `marked-session`'s marker was stored before the delete; `lost-session`'s is still queued.
+    let health = CaptureHealth::default();
+    health.record_unconfirmed_loss();
+
+    state
+        .remove_tenant(&tenant, || async { Ok(true) })
+        .await
+        .expect("removal finishes");
+    let sink = Arc::new(RecordingSink::default());
+    persist_capture_loss_marker(
+        queued_marker_for_test(
+            sink.clone(),
+            tenant.as_str(),
+            "lost-session",
+            Some(generation),
+            health.clone(),
+        ),
+        Duration::ZERO,
+    )
+    .await;
+
+    assert!(
+        sink.written.lock().expect("recording sink").is_empty(),
+        "nothing is written into the tenant created again under the id"
+    );
+    assert!(
+        !health.is_degraded(),
+        "the loss of a deleted tenant leaves no stored session incomplete"
+    );
+    for session in ["lost-session", "marked-session"] {
+        assert_eq!(
+            claim_capture_loss_marker(tenant.as_str(), session),
+            MarkerClaim::Claimed,
+            "a loss in session {session} of the tenant created again is marked"
+        );
+        release_capture_loss_marker(tenant.as_str(), session);
+    }
 }

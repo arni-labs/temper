@@ -6,7 +6,9 @@
 //! - a projection write queued before the delete does not land in the tenant created again;
 //! - a state timer armed before the delete does not fire into the record created again;
 //! - a scheduled follow-on of the deleted record does not fire into the record created again with the same id,
-//!   although both records reach the same event count, so (tenant, type, id, event count, effect index) repeats.
+//!   although both records reach the same event count, so (tenant, type, id, event count, effect index) repeats;
+//! - a second delete that was under way when the first finished and the tenant was created again leaves the new
+//!   tenant's specs and records in place.
 //!
 //! One task drives every schedule (`tokio::join!`, no spawned test tasks) on a paused clock; the seed picks where the
 //! competing step lands and how long the store is slow.
@@ -174,5 +176,92 @@ async fn dst_tenant_generation_follow_on_after_record_recreate() {
             ));
         }
     }
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// Invariant: a delete already under way when another delete of the same tenant finishes, and the tenant is created
+/// again, leaves the tenant created again as it is: its specs and its records stay.
+#[tokio::test(start_paused = true)]
+async fn dst_tenant_generation_second_delete_after_recreate() {
+    let mut violations = Vec::new();
+    let mut raced = 0;
+    for seed in 0..SEEDS {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let harness = Harness::new(seed);
+        // A live actor, so both removals wait for it to end and the second is under way when the first finishes.
+        assert!(harness.dispatch("b1", "Ring").await.is_ok(), "seed {seed}");
+
+        let second_after = pick(seed, 7, 3);
+        let first_storage = pick(seed, 8, 4);
+        let second_storage = pick(seed, 9, 12);
+        let tenant = acme();
+        let second_started = std::cell::Cell::new(false);
+        let created_while_second_ran = std::cell::Cell::new(false);
+        let first = harness.state.remove_tenant(&tenant, || async {
+            yields(first_storage).await;
+            Ok(harness.remove_storage())
+        });
+        let second = async {
+            yields(second_after).await;
+            second_started.set(true);
+            harness
+                .state
+                .remove_tenant(&tenant, || async {
+                    yields(second_storage).await;
+                    Ok(harness.remove_storage())
+                })
+                .await
+        };
+        let creator = async {
+            // `POST /api/tenants`, retried while the id is still being deleted.
+            for _ in 0..64 {
+                yields(1).await;
+                if let Some(_lease) = harness.state.tenant_generations.lease_live(&tenant) {
+                    harness.register();
+                    created_while_second_ran.set(second_started.get());
+                    break;
+                }
+            }
+            harness.dispatch("b2", "Ring").await.is_ok()
+        };
+        let (first, second, created) = tokio::join!(first, second, creator);
+
+        let schedule = format!(
+            "second delete after {second_after} yields, storage after {first_storage} and {second_storage}"
+        );
+        if let Err(error) = first.and(second) {
+            violations.push(format!(
+                "seed {seed} ({schedule}): a removal did not finish: {error}"
+            ));
+            continue;
+        }
+        // A second delete that started after the tenant was created again deletes the new tenant, as it should.
+        if !created_while_second_ran.get() {
+            continue;
+        }
+        raced += 1;
+        let specs = harness
+            .state
+            .registry
+            .read()
+            .expect("registry")
+            .get_table(&tenant, "Bell")
+            .is_some();
+        let stored = harness
+            .events
+            .list_all_persistence_ids()
+            .iter()
+            .any(|id| id.starts_with("acme:") && id.ends_with(":b2"));
+        if !(created && specs && stored) {
+            violations.push(format!(
+                "seed {seed} ({schedule}): the delete that was already under way removed the tenant created again \
+                 (record created: {created}, specs kept: {specs}, record stored: {stored})"
+            ));
+        }
+    }
+    assert!(
+        raced > 0,
+        "no seed created the tenant again while the second delete ran"
+    );
     assert!(violations.is_empty(), "{violations:#?}");
 }

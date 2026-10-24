@@ -376,12 +376,13 @@ pub(super) fn queued_marker_for_test(
     sink: Arc<dyn TrajectorySink>,
     tenant: &str,
     session_id: &str,
+    generation: Option<GenerationRef>,
     health: CaptureHealth,
 ) -> QueuedMarker {
     QueuedMarker {
         sink,
         tenant: tenant.to_string(),
-        generation: None,
+        generation,
         session_id: session_id.to_string(),
         reason: "outbox_full",
         health,
