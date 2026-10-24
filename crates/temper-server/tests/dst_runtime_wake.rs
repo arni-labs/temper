@@ -9,7 +9,9 @@
 //! (`Tick` every ten minutes). Time passes normally for a while, then the
 //! process is suspended several times: the wall clock moves on, past some due
 //! times, while the process's timers stand still. Each suspension ends with a
-//! wake (`ServerState::wake_runtime`), sometimes a second one at once. The
+//! wake (`ServerState::wake_runtime`), sometimes a second one at once. While
+//! the process is awake, requests keep arming records due soon, and the
+//! control plane wakes it only at the earliest due time it was told. The
 //! control plane's end of the reports refuses up to three sends in a row.
 //!
 //! Invariants:
@@ -18,11 +20,11 @@
 //! - the wake's answer, and the report the process sent last, name the
 //!   earliest due time of the rows left;
 //! - a wake right after another fires nothing;
-//! - after the suspensions, the process's timers are late by the time it was
-//!   suspended, and requests keep arming records; the control plane wakes it
-//!   only at the earliest due time it was told, and every row left fires at
-//!   such a wake, late by no more than a report's delivery through the
-//!   refusals; when the old waits run out nothing fires twice.
+//! - while the process is awake, its timers late by the time it was
+//!   suspended, the control plane is told of every row that waits, and every
+//!   row fires at a wake for the time it was told, late by no more than a
+//!   report's delivery through the refusals;
+//! - when the old waits run out, nothing fires twice.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -283,6 +285,95 @@ async fn check_wake(
     Ok(due.len())
 }
 
+/// What the process and its control plane share in a run.
+struct World<'a> {
+    state: &'a ServerState,
+    events: &'a SimEventStore,
+    rows: &'a TimerRows,
+    reports: &'a Reports,
+}
+
+/// The process awake, up to `until`, or with none until only repeating
+/// actions are left. Requests sometimes arm a record due sooner than anything
+/// else may be, which only its own report tells the control plane, and the
+/// control plane wakes the process only at the earliest due time it was
+/// delivered. Ok: how many rows those wakes fired.
+async fn awake(
+    w: &World<'_>,
+    ids: &mut Vec<String>,
+    run: &mut Run,
+    rng: &mut DeterministicRng,
+    until: Option<DateTime<Utc>>,
+) -> Result<usize, String> {
+    let late_by = DELIVERY.as_secs() as i64 + 1;
+    let mut woken = 0;
+    for round in 0.. {
+        let arrived = ids.iter().filter(|id| id.contains("-late-")).count();
+        if arrived < 12 && rng.next_bound(3) == 0 {
+            let id = format!("job-{}-late-{arrived}", run.seed);
+            w.state
+                .get_or_create_tenant_entity(&TenantId::new(TENANT), "Job", &id, json!({}))
+                .await
+                .unwrap();
+            let due = sim_now() + chrono::Duration::seconds(30 + rng.next_bound(600) as i64);
+            if !act(w.state, &id, "Plan", json!({ "due": due.to_rfc3339() })).await {
+                return Err(run.fail("the workload arms", format!("{id} Plan refused")));
+            }
+            run.trace
+                .push(format!("{id} Plan at {}, due {due}", sim_now()));
+            ids.push(id);
+        }
+        // Long enough for a report to get through the refusals.
+        let rest = until.map_or(DELIVERY, |u| {
+            (u - sim_now()).to_std().unwrap_or_default().min(DELIVERY)
+        });
+        tokio::time::sleep(rest).await;
+        settle().await;
+        let left = waiting(w.events, w.rows).await;
+        if until.is_some_and(|u| sim_now() >= u)
+            || until.is_none() && left.iter().all(|d| d.action == "Tick")
+        {
+            break;
+        }
+        if round == 1000 {
+            return Err(run.fail("one-shot rows run out", format!("{left:?}")));
+        }
+        if left.is_empty() {
+            continue;
+        }
+        let Some(at) = w.reports.told().and_then(|told| told.next_due_at) else {
+            return Err(run.fail(
+                "the control plane is told of every row that waits",
+                format!("it was told nothing is due; rows {left:?}"),
+            ));
+        };
+        if let Some(u) = until
+            && at > u
+        {
+            tokio::time::sleep((u - sim_now()).to_std().unwrap_or_default()).await;
+            settle().await;
+            break;
+        }
+        if at > sim_now() {
+            tokio::time::sleep((at - sim_now()).to_std().unwrap()).await;
+        }
+        settle().await;
+        run.trace
+            .push(format!("woken at the time it was told {}", sim_now()));
+        woken += check_wake(
+            w.state,
+            w.events,
+            w.rows,
+            w.reports,
+            ids,
+            run,
+            Some(late_by),
+        )
+        .await?;
+    }
+    Ok(woken)
+}
+
 /// One seed's run. Ok: how many rows its wakes fired.
 fn run_seed(seed: u64) -> Result<usize, String> {
     let clock = Arc::new(Clock::new());
@@ -339,6 +430,12 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             tokio::time::sleep(Duration::from_secs(rng.next_bound(300) as u64)).await;
             settle().await;
         }
+        let world = World {
+            state: &state,
+            events: &events,
+            rows: &rows,
+            reports: &reports,
+        };
         let mut woken = 0;
         let mut suspended = Duration::ZERO;
         for _ in 0..1 + rng.next_bound(4) {
@@ -357,61 +454,13 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                     return Err(run.fail("a wake right after another fires nothing", String::new()));
                 }
             }
-            tokio::time::sleep(Duration::from_secs(rng.next_bound(900) as u64)).await;
-            settle().await;
+            let until = sim_now() + chrono::Duration::seconds(rng.next_bound(900) as i64);
+            woken += awake(&world, &mut ids, &mut run, &mut rng, Some(until)).await?;
         }
 
         // The process runs on, its timers late by the time it was suspended,
-        // and the control plane wakes it only at the earliest due time it was
-        // told: every row left fires at such a wake, once, and on time but
-        // for the report's delivery, until only repeating actions are left.
-        for round in 0.. {
-            // A request arrives while the process is awake and arms a record
-            // due sooner than anything else may be: only its own report tells
-            // the control plane.
-            if round < 12 && rng.next_bound(3) == 0 {
-                let id = format!("job-{seed}-late-{round}");
-                state
-                    .get_or_create_tenant_entity(&TenantId::new(TENANT), "Job", &id, json!({}))
-                    .await
-                    .unwrap();
-                let due = sim_now() + chrono::Duration::seconds(30 + rng.next_bound(600) as i64);
-                if !act(&state, &id, "Plan", json!({ "due": due.to_rfc3339() })).await {
-                    return Err(run.fail("the workload arms", format!("{id} Plan refused")));
-                }
-                run.trace
-                    .push(format!("{id} Plan at {}, due {due}", sim_now()));
-                ids.push(id);
-            }
-            // Long enough for a report to get through the refusals.
-            tokio::time::sleep(DELIVERY).await;
-            settle().await;
-            let left = waiting(&events, &rows).await;
-            if left.iter().all(|d| d.action == "Tick") {
-                break;
-            }
-            if round == 1000 {
-                return Err(run.fail(
-                    "woken at each due time, one-shot rows run out",
-                    format!("{left:?}"),
-                ));
-            }
-            let Some(at) = reports.told().and_then(|told| told.next_due_at) else {
-                return Err(run.fail(
-                    "the control plane is told of every row that waits",
-                    format!("it was told nothing is due; rows {left:?}"),
-                ));
-            };
-            if at > sim_now() {
-                tokio::time::sleep((at - sim_now()).to_std().unwrap()).await;
-            }
-            settle().await;
-            run.trace
-                .push(format!("woken at the time it was told {}", sim_now()));
-            let late_by = DELIVERY.as_secs() as i64 + 1;
-            woken +=
-                check_wake(&state, &events, &rows, &reports, &ids, &run, Some(late_by)).await?;
-        }
+        // until only repeating actions are left.
+        woken += awake(&world, &mut ids, &mut run, &mut rng, None).await?;
         // When the old waits of the timers the wakes fired run out, nothing
         // fires again: every record fired its one-shot action at most once.
         tokio::time::sleep(suspended + Duration::from_secs((TIMEOUT + PERIOD) as u64)).await;
