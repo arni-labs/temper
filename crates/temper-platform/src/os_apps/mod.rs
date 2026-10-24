@@ -1108,7 +1108,7 @@ pub(super) async fn install_os_app_with_plan(
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
-    let _serialized = install_guard::tenant(tenant).await;
+    let mut install = install_guard::tenant(&state.server, tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
         cat.paths.get(app_name).cloned().ok_or_else(|| {
@@ -1567,11 +1567,8 @@ pub(super) async fn install_os_app_with_plan(
         }
     }
 
-    // Overdue timers may fire immediately. Their new policies and modules
-    // must be ready before the changed specs reconcile any records.
-    if plan.specs {
-        state.server.spawn_follow_spec_changes();
-    }
+    // Overdue timers may fire at once: reconcile only now that policies and modules are in.
+    install.installed(&state.server, plan.specs);
 
     tracing::info!(
         "Installed os-app '{app_name}' for tenant '{tenant}': added={added:?} updated={updated:?} skipped={skipped:?} wasm={wasm_registered:?}"

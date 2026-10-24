@@ -42,6 +42,9 @@ pub struct SpecRegistry {
     /// declares state timeouts, or did before: their records' timers must be
     /// made to follow the state each record is in under the new spec.
     changed_types: BTreeSet<(TenantId, String)>,
+    /// Tenants with installations in progress, and how many. Their changed
+    /// types stay out of every walk until the last one finishes.
+    installing: BTreeMap<TenantId, usize>,
     /// Tenants whose stored specs could not be restored, with the reason.
     unavailable: BTreeMap<TenantId, String>,
 }
@@ -53,11 +56,35 @@ impl SpecRegistry {
     }
 
     /// Take the types whose spec changed since the last call (see
-    /// `ServerState::follow_spec_changes`).
+    /// `ServerState::follow_spec_changes`), except those of a tenant with an
+    /// installation in progress: they wait for it to finish.
     pub fn take_changed_types(&mut self) -> Vec<(TenantId, String)> {
-        std::mem::take(&mut self.changed_types)
+        let (waiting, ready): (BTreeSet<_>, BTreeSet<_>) = std::mem::take(&mut self.changed_types)
             .into_iter()
-            .collect()
+            .partition(|(tenant, _)| self.installing.contains_key(tenant));
+        self.changed_types = waiting;
+        ready.into_iter().collect()
+    }
+
+    /// An installation into `tenant` starts. It registers its specs before
+    /// its policies and modules, and a record whose timer a walk reconciled
+    /// in between could fire before they exist, so the tenant's changed
+    /// types wait until the matching [`Self::finish_install`].
+    pub fn begin_install(&mut self, tenant: &TenantId) {
+        *self.installing.entry(tenant.clone()).or_default() += 1;
+    }
+
+    /// An installation into `tenant` has finished, or failed: its changed
+    /// types are ready for the next walk once no other one is in progress.
+    pub fn finish_install(&mut self, tenant: &TenantId) {
+        let Some(count) = self.installing.get_mut(tenant) else {
+            debug_assert!(false, "finish_install without begin_install for {tenant}");
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.installing.remove(tenant);
+        }
     }
 
     /// Register a tenant with its CSDL document and IOA specs.

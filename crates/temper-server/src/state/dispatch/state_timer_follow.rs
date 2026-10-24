@@ -56,6 +56,22 @@ pub struct BootTimerCounts {
 /// The boot's [`BootTimerCounts`] by tenant and entity type.
 pub type BootTimers = BTreeMap<(TenantId, String), BootTimerCounts>;
 
+/// While held, one tenant's changed types wait out of every walk (see
+/// [`ServerState::hold_timer_follow`]). Dropping it, on success or failure,
+/// makes them ready for the next walk.
+pub struct TimerFollowHold {
+    server: ServerState,
+    tenant: TenantId,
+}
+
+impl Drop for TimerFollowHold {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.server.registry.write() {
+            registry.finish_install(&self.tenant);
+        }
+    }
+}
+
 impl ServerState {
     /// Make the timers of every record of each type whose spec an install
     /// changed follow the state the record is in now, including a type that
@@ -79,6 +95,20 @@ impl ServerState {
         };
         self.follow_types(changed, &BootCallers::new(), None, Arming::Any)
             .await;
+    }
+
+    /// Hold `tenant`'s changed types back from every walk, any tenant's,
+    /// until the returned hold is dropped: while an installation into it
+    /// registers specs ahead of the policies and modules its timers need.
+    pub fn hold_timer_follow(&self, tenant: &TenantId) -> TimerFollowHold {
+        self.registry
+            .write()
+            .expect("registry lock poisoned")
+            .begin_install(tenant);
+        TimerFollowHold {
+            server: self.clone(),
+            tenant: tenant.clone(),
+        }
     }
 
     /// [`Self::follow_spec_changes`] in the background, for an install that
