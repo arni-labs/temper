@@ -1,0 +1,393 @@
+//! DST: a suspended process woken by wall clock fires what fell due, once.
+//!
+//! A user's Temper sleeps when its sandbox is suspended, and its timers wait
+//! on the process's monotonic clock, which may not advance while it sleeps.
+//! The control plane wakes it at the earliest due time the process reported.
+//!
+//! Workload, per seed: records arm a `schedule_at` action (`Fire`), enter a
+//! state with a timeout (`Expire` after an hour), or start a repeating action
+//! (`Tick` every ten minutes). Time passes normally for a while, then the
+//! process is suspended several times: the wall clock moves on, past some due
+//! times, while the process's timers stand still. Each suspension ends with a
+//! wake (`ServerState::wake_runtime`), sometimes a second one at once. The
+//! store that takes the process's reports refuses some of them.
+//!
+//! Invariants:
+//! - when a wake answers, every row that was due before it has fired, exactly
+//!   once, and nothing that was not due has;
+//! - the wake's answer, and the report the process sent last, name the
+//!   earliest due time of the rows left;
+//! - a wake right after another fires nothing;
+//! - after the suspensions, with time passing normally again, nothing fires
+//!   twice and every remaining row fires when it is due.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde_json::json;
+use temper_runtime::ActorSystem;
+use temper_runtime::persistence::EventStore;
+use temper_runtime::scheduler::{
+    DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
+};
+use temper_runtime::tenant::TenantId;
+use temper_server::registry::SpecRegistry;
+use temper_server::request_context::AgentContext;
+use temper_server::storage::StateTimerStore;
+use temper_server::{ServerState, StorageStack};
+use temper_spec::csdl::parse_csdl;
+use temper_store_sim::SimEventStore;
+
+#[path = "dst_runtime_wake/world.rs"]
+mod world;
+
+use world::{Clock, Reports, TimerRows};
+
+const SEEDS: u64 = 48;
+const TENANT: &str = "alpha";
+/// The `Waiting` state's timeout, and how far apart `Tick`s are.
+const TIMEOUT: i64 = 3600;
+const PERIOD: i64 = 600;
+
+const JOB: &str = r#"
+[automaton]
+name = "Job"
+states = ["Idle", "Planned", "Waiting", "Active", "Done"]
+initial = "Idle"
+allow_indefinite_states = ["Idle", "Planned", "Active", "Done"]
+
+[[action]]
+name = "Plan"
+from = ["Idle"]
+to = "Planned"
+params = ["due"]
+effect = ["schedule_at('Fire', due)"]
+
+[[action]]
+name = "Fire"
+from = ["Planned", "Done"]
+to = "Done"
+
+[[action]]
+name = "Wait"
+from = ["Idle"]
+to = "Waiting"
+
+[[action]]
+name = "Expire"
+from = ["Waiting", "Done"]
+to = "Done"
+
+[[action]]
+name = "Activate"
+from = ["Idle"]
+to = "Active"
+effect = ["schedule('Tick', 600)"]
+
+[[action]]
+name = "Tick"
+from = ["Active"]
+effect = ["schedule('Tick', 600)"]
+
+[[state_timeout]]
+state = "Waiting"
+after_seconds = 3600
+on_timeout = "Expire"
+"#;
+
+const CSDL: &str = r#"<?xml version="1.0"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+<edmx:DataServices><Schema Namespace="Jobs" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+<EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key>
+<Property Name="Id" Type="Edm.String" Nullable="false"/>
+<Property Name="due" Type="Edm.String"/>
+</EntityType>
+<Action Name="Plan" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/><Parameter Name="due" Type="Edm.String"/></Action>
+<Action Name="Fire" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
+<Action Name="Wait" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
+<Action Name="Expire" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
+<Action Name="Activate" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
+<Action Name="Tick" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
+<EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/></EntityContainer>
+</Schema></edmx:DataServices></edmx:Edmx>"#;
+
+/// Let every task that can run, run.
+async fn settle() {
+    for _ in 0..600 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Value) -> bool {
+    state
+        .dispatch_tenant_action(
+            &TenantId::new(TENANT),
+            "Job",
+            id,
+            action,
+            params,
+            &AgentContext::default(),
+        )
+        .await
+        .is_ok_and(|response| response.success)
+}
+
+/// How many of the record's events are `action`.
+async fn count(events: &SimEventStore, id: &str, action: &str) -> usize {
+    events
+        .read_events(&format!("{TENANT}:Job:{id}"), 0)
+        .await
+        .map(|journal| journal.iter().filter(|e| e.event_type == action).count())
+        .unwrap_or_default()
+}
+
+/// One waiting row: whose, which action, and when it is due.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Due {
+    at: DateTime<Utc>,
+    id: String,
+    action: String,
+}
+
+/// Every row waiting now, from the store: the rows are what is due.
+async fn waiting(events: &SimEventStore, rows: &TimerRows) -> Vec<Due> {
+    let mut due = Vec::new();
+    for row in events.list_scheduled_actions(TENANT).await.unwrap() {
+        due.push(Due {
+            at: DateTime::parse_from_rfc3339(&row.due_at).unwrap().to_utc(),
+            id: row.entity_id,
+            action: row.action,
+        });
+    }
+    for row in rows.list_state_timers(TENANT).await.unwrap() {
+        let started = DateTime::parse_from_rfc3339(&row.started_at).unwrap();
+        due.push(Due {
+            at: started.to_utc() + chrono::Duration::seconds(TIMEOUT),
+            id: row.entity_id,
+            action: "Expire".to_string(),
+        });
+    }
+    due.sort();
+    due
+}
+
+struct Run {
+    seed: u64,
+    trace: Vec<String>,
+}
+
+impl Run {
+    fn fail(&self, invariant: &str, detail: String) -> String {
+        format!(
+            "seed {}: {invariant}: {detail}\ntrace:\n  {}",
+            self.seed,
+            self.trace.join("\n  ")
+        )
+    }
+}
+
+/// The fires each record has had so far, by action.
+async fn fires(events: &SimEventStore, ids: &[String]) -> BTreeMap<(String, String), usize> {
+    let mut out = BTreeMap::new();
+    for id in ids {
+        for action in ["Fire", "Expire", "Tick"] {
+            out.insert(
+                (id.clone(), action.to_string()),
+                count(events, id, action).await,
+            );
+        }
+    }
+    out
+}
+
+/// Check one wake: what was due fired once, nothing else did, and the
+/// answer and the last report name the earliest row left.
+async fn check_wake(
+    state: &ServerState,
+    events: &SimEventStore,
+    rows: &TimerRows,
+    reports: &Reports,
+    ids: &[String],
+    run: &Run,
+) -> Result<usize, String> {
+    let before = waiting(events, rows).await;
+    let fired_before = fires(events, ids).await;
+    let woke_at = sim_now();
+    let sent_before = reports.sent.lock().unwrap().len();
+    let outcome = state.wake_runtime(&TenantId::new(TENANT)).await;
+    let answered_at = sim_now();
+    let due: Vec<&Due> = before.iter().filter(|d| d.at <= woke_at).collect();
+    let fired_after = fires(events, ids).await;
+    for ((id, action), after) in &fired_after {
+        let was = fired_before[&(id.clone(), action.clone())];
+        let expected = due
+            .iter()
+            .filter(|d| &d.id == id && &d.action == action)
+            .count();
+        if *after != was + expected {
+            return Err(run.fail(
+                "a wake fires every row due before it, exactly once, and nothing else",
+                format!(
+                    "{id} {action}: {was} fires before the wake at {woke_at}, {after} after, \
+                     {expected} due; rows {before:?}"
+                ),
+            ));
+        }
+    }
+    if outcome.fired != due.len() {
+        return Err(run.fail(
+            "a wake answers how many rows it fired",
+            format!("answered {}, {} were due", outcome.fired, due.len()),
+        ));
+    }
+    let left = waiting(events, rows).await;
+    let earliest = left.first().map(|d| d.at);
+    if outcome.next_due_at != earliest {
+        return Err(run.fail(
+            "a wake answers the earliest due time left",
+            format!("answered {:?}, rows left {left:?}", outcome.next_due_at),
+        ));
+    }
+    settle().await;
+    let sent = reports.sent.lock().unwrap();
+    let last = sent[sent_before..].last().cloned();
+    drop(sent);
+    match last {
+        Some(report) if report.next_due_at == earliest && report.reported_at >= woke_at => {}
+        other => {
+            return Err(run.fail(
+                "the process reports the earliest due time left after a wake",
+                format!("last report {other:?}, earliest {earliest:?}, answered at {answered_at}"),
+            ));
+        }
+    }
+    Ok(due.len())
+}
+
+/// One seed's run. Ok: how many rows its wakes fired.
+fn run_seed(seed: u64) -> Result<usize, String> {
+    let clock = Arc::new(Clock::new());
+    install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+    let mut rng = DeterministicRng::new(seed);
+    let events = SimEventStore::no_faults(seed);
+    let rows = Arc::new(TimerRows::default());
+    let reports = Arc::new(Reports {
+        sent: Mutex::new(Vec::new()),
+        rng: Mutex::new(DeterministicRng::new(seed ^ 0x3a7e)),
+    });
+    let mut run = Run {
+        seed,
+        trace: Vec::new(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        clock.begin();
+        let mut registry = SpecRegistry::new();
+        let csdl = parse_csdl(CSDL).unwrap();
+        registry.register_tenant(TENANT, csdl, CSDL.to_string(), &[("Job", JOB)]);
+        let mut state = ServerState::from_registry(ActorSystem::new("wake"), registry);
+        state.set_storage_stack(StorageStack::from_sim(events.clone(), None));
+        state.state_timer_rows = Some(rows.clone());
+        state.set_wake_sink(reports.clone());
+        state
+            .start_runtime()
+            .await
+            .expect("the first start")
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..3 + rng.next_bound(6) {
+            let id = format!("job-{seed}-{i}");
+            state
+                .get_or_create_tenant_entity(&TenantId::new(TENANT), "Job", &id, json!({}))
+                .await
+                .unwrap();
+            let (action, params) = match rng.next_bound(3) {
+                0 => {
+                    let due = sim_now() + chrono::Duration::seconds(rng.next_bound(7200) as i64);
+                    ("Plan", json!({ "due": due.to_rfc3339() }))
+                }
+                1 => ("Wait", json!({})),
+                _ => ("Activate", json!({})),
+            };
+            if !act(&state, &id, action, params).await {
+                return Err(run.fail("the workload arms", format!("{id} {action} refused")));
+            }
+            run.trace.push(format!("{id} {action} at {}", sim_now()));
+            ids.push(id);
+            tokio::time::sleep(Duration::from_secs(rng.next_bound(300) as u64)).await;
+            settle().await;
+        }
+        let mut woken = 0;
+        for _ in 0..1 + rng.next_bound(4) {
+            let by = Duration::from_secs(rng.next_bound(5400) as u64);
+            clock.suspend(by);
+            run.trace.push(format!(
+                "suspended {}s, wake at {}",
+                by.as_secs(),
+                sim_now()
+            ));
+            woken += check_wake(&state, &events, &rows, &reports, &ids, &run).await?;
+            if rng.next_bound(2) == 0 {
+                run.trace.push(format!("wake again at {}", sim_now()));
+                if check_wake(&state, &events, &rows, &reports, &ids, &run).await? != 0 {
+                    return Err(run.fail("a wake right after another fires nothing", String::new()));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(rng.next_bound(900) as u64)).await;
+            settle().await;
+        }
+
+        // Time passes normally again: what the wakes fired does not fire
+        // again when its old timer's wait ends, and the rest fires when due.
+        let left = waiting(&events, &rows).await;
+        let fired_before = fires(&events, &ids).await;
+        let end = sim_now() + chrono::Duration::seconds(TIMEOUT + 2 * PERIOD);
+        tokio::time::sleep((end - sim_now()).to_std().unwrap()).await;
+        settle().await;
+        for ((id, action), after) in fires(&events, &ids).await {
+            let was = fired_before[&(id.clone(), action.clone())];
+            let once = left
+                .iter()
+                .filter(|d| d.id == id && d.action == action)
+                .count();
+            let ok = match action.as_str() {
+                "Tick" => after > was || once == 0,
+                _ => after == was + once,
+            };
+            if !ok {
+                return Err(run.fail(
+                    "after the wakes nothing fires twice, and what is left fires when due",
+                    format!("{id} {action}: {was} fires, then {after}; rows left {left:?}"),
+                ));
+            }
+        }
+        Ok(woken)
+    });
+    drop(runtime);
+    result
+}
+
+#[test]
+fn dst_a_woken_process_fires_what_fell_due_once() {
+    let mut failures = Vec::new();
+    let mut woken = 0;
+    for seed in 0..SEEDS {
+        match run_seed(seed) {
+            Ok(fired) => woken += fired,
+            Err(failure) => failures.push(failure),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    assert!(
+        woken > 0,
+        "no wake fired anything: the suspensions never passed a due time"
+    );
+}

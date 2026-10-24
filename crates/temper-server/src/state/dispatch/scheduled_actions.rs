@@ -36,6 +36,7 @@ use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
+use crate::wake::{Armed, TimerRef};
 
 /// The wait before a fire that did not commit is tried again; it doubles
 /// with each try, up to [`LAST_RETRY_WAIT`].
@@ -54,6 +55,8 @@ struct ScheduledTimer {
     /// The row's id: the arming event's sequence and the action's index.
     arm_id: String,
     action: String,
+    /// When it is due, as its row says.
+    due_at: DateTime<Utc>,
     /// Who armed it; it fires as them.
     agent_ctx: AgentContext,
 }
@@ -87,15 +90,24 @@ impl ServerState {
         response: &EntityResponse,
     ) {
         for scheduled in &response.scheduled_actions {
+            // A record with no journal keeps no row: its action is due a delay
+            // from now.
+            let due_at = scheduled.due_at.unwrap_or_else(|| {
+                sim_now()
+                    + chrono::Duration::seconds(
+                        i64::try_from(scheduled.delay_seconds).unwrap_or(i64::MAX / 1000),
+                    )
+            });
             let timer = ScheduledTimer {
                 tenant: ctx.tenant.clone(),
                 entity_type: ctx.entity_type.to_string(),
                 entity_id: ctx.entity_id.to_string(),
                 arm_id: scheduled.arm_id.clone(),
                 action: scheduled.action.clone(),
+                due_at,
                 agent_ctx: ctx.agent_ctx.for_background_task(),
             };
-            self.spawn_scheduled_action(timer, Duration::from_secs(scheduled.delay_seconds), None);
+            self.spawn_scheduled_action(timer, None);
         }
     }
 
@@ -163,9 +175,8 @@ impl ServerState {
             .list_scheduled_actions(tenant.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        let now = sim_now();
         for row in rows {
-            let (timer, due_at) = match scheduled_timer(tenant, &row) {
+            let timer = match scheduled_timer(tenant, &row) {
                 Ok(armed) => armed,
                 Err(reason) => {
                     tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,
@@ -185,8 +196,7 @@ impl ServerState {
                 .entry((tenant.clone(), row.entity_type.clone()))
                 .or_default()
                 .scheduled += 1;
-            let delay = (due_at - now).to_std().unwrap_or(Duration::ZERO);
-            self.spawn_scheduled_action(timer, delay, Some(gate.clone()));
+            self.spawn_scheduled_action(timer, Some(gate.clone()));
         }
         Ok(())
     }
@@ -224,16 +234,14 @@ impl ServerState {
             .await
             .map_err(|error| error.to_string())?;
         let prefix = format!("{fire_seq}.");
-        let now = sim_now();
         let fired = rows.iter().filter(|row| {
             row.entity_type == timer.entity_type
                 && row.entity_id == timer.entity_id
                 && row.arm_id.starts_with(&prefix)
         });
         for row in fired {
-            if let Ok((waiting, due_at)) = scheduled_timer(&timer.tenant, row) {
-                let delay = (due_at - now).to_std().unwrap_or(Duration::ZERO);
-                self.spawn_scheduled_action(waiting, delay, None);
+            if let Ok(waiting) = scheduled_timer(&timer.tenant, row) {
+                self.spawn_scheduled_action(waiting, None);
             }
         }
         Ok(())
@@ -253,14 +261,9 @@ impl ServerState {
         }
     }
 
-    /// Arm `timer` to fire after `delay`, unless this process has armed its
-    /// row already.
-    fn spawn_scheduled_action(
-        &self,
-        timer: ScheduledTimer,
-        delay: Duration,
-        gate: Option<Arc<Semaphore>>,
-    ) {
+    /// Arm `timer` to fire when it is due, or at a wake after that, unless
+    /// this process has armed its row already.
+    fn spawn_scheduled_action(&self, timer: ScheduledTimer, gate: Option<Arc<Semaphore>>) {
         let row = timer.row();
         {
             let mut armed = self
@@ -273,12 +276,18 @@ impl ServerState {
             }
             *live += 1;
         }
+        let delay = (timer.due_at - sim_now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        let due = self
+            .due_times
+            .arm(TimerRef::Scheduled(row.clone()), timer.due_at);
         // The fire's own trace starts when it fires, linked to the move that
         // armed it (none for a row armed at boot).
         let armed_by = crate::trace_context::cause();
         let server = self.clone();
         let fire = async move {
-            tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
+            due.wait(delay).await;
             let agent = &timer.agent_ctx;
             let span = crate::trace_context::runtime_work_span!(
                 armed_by,
@@ -291,10 +300,12 @@ impl ServerState {
                 entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id,
             );
-            server
-                .fire_scheduled_action(&timer, gate)
-                .instrument(span)
-                .await;
+            async {
+                let fired = server.fire_scheduled_action(&timer, gate, &due).await;
+                server.due_times.end(&due, fired);
+            }
+            .instrument(span)
+            .await;
             let mut armed = server
                 .scheduled_armed
                 .lock()
@@ -311,8 +322,15 @@ impl ServerState {
 
     /// Fire `timer` until its action commits or is refused, each attempt
     /// through `gate` when one is given. A refusal is logged and its row
-    /// removed; a commit removed the row itself.
-    async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
+    /// removed; a commit removed the row itself. Returns whether it committed.
+    /// Between tries it is due again when it next tries, and a wake tries it
+    /// at once.
+    async fn fire_scheduled_action(
+        &self,
+        timer: &ScheduledTimer,
+        gate: Option<Arc<Semaphore>>,
+        due: &Armed,
+    ) -> bool {
         let key = format!("schedule:{}", timer.arm_id);
         let mut agent = timer.agent_ctx.clone();
         agent.idempotency_key = Some(key.clone());
@@ -340,7 +358,7 @@ impl ServerState {
                     if retried {
                         self.arm_fired_rows_retrying(timer, &key).await;
                     }
-                    return;
+                    return true;
                 }
                 Ok(response) if response.refused => {
                     let error = response
@@ -356,7 +374,7 @@ impl ServerState {
                         &timer.arm_id,
                     )
                     .await;
-                    return;
+                    return false;
                 }
                 Ok(response) => response.error.unwrap_or_else(|| "write failed".to_string()),
                 Err(error) => error,
@@ -365,7 +383,9 @@ impl ServerState {
                 entity_id = %timer.entity_id, action = %timer.action, arm_id = %timer.arm_id,
                 %error, retry_in_ms = wait.as_millis() as u64,
                 "scheduled action did not commit when it fired; retrying on its row");
-            tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+            let next = chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX);
+            self.due_times.retry_at(due, sim_now() + next);
+            due.wait(wait).await;
             wait = (wait * 2).min(LAST_RETRY_WAIT);
             retried = true;
         }
@@ -393,11 +413,11 @@ impl ServerState {
     }
 }
 
-/// The timer a row arms, and when it is due.
+/// The timer a row arms.
 fn scheduled_timer(
     tenant: &TenantId,
     row: &ScheduledActionRecord,
-) -> Result<(ScheduledTimer, DateTime<Utc>), String> {
+) -> Result<ScheduledTimer, String> {
     let due_at = DateTime::parse_from_rfc3339(&row.due_at)
         .map_err(|error| format!("due_at: {error}"))?
         .with_timezone(&Utc);
@@ -408,7 +428,8 @@ fn scheduled_timer(
         entity_id: row.entity_id.clone(),
         arm_id: row.arm_id.clone(),
         action: row.action.clone(),
+        due_at,
         agent_ctx,
     };
-    Ok((timer, due_at))
+    Ok(timer)
 }

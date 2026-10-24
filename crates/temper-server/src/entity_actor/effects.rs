@@ -85,6 +85,10 @@ pub struct ScheduledAction {
     /// that event; empty until then.
     #[serde(default)]
     pub arm_id: String,
+    /// When it is due: the arming event's time plus the delay, as its row
+    /// says. The actor sets it with `arm_id`; None until then.
+    #[serde(default)]
+    pub due_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A request to spawn a child entity (executed post-transition by dispatch pipeline).
@@ -716,6 +720,7 @@ pub fn apply_effects(
                     action: action.clone(),
                     delay_seconds: *delay_seconds,
                     arm_id: String::new(),
+                    due_at: None,
                 });
                 tracing::info!(
                     entity_type = %state.entity_type,
@@ -845,6 +850,7 @@ pub fn resolve_schedule_at_requests(
                 action: req.action.clone(),
                 delay_seconds,
                 arm_id: String::new(),
+                due_at: None,
             })
         })
         .collect()

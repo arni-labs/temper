@@ -11,6 +11,7 @@ mod decisions_get;
 mod files;
 mod policies;
 mod repl;
+mod runtime_wake;
 mod secrets;
 mod spec_pin;
 mod trajectory_analysis;
@@ -47,6 +48,7 @@ use crate::state::ServerState;
 /// - POST   /api/files/publish-artifact                 -> promote a governed file to a public immutable artifact
 /// - GET    /api/ots/trajectories/{id}/atif             -> export an OTS trajectory as ATIF v1.7
 /// - POST   /api/conformance/check                      -> check a session against its actor spec
+/// - POST   /api/runtime/wake                           -> fire timers due by the wall clock
 pub fn build_api_router() -> Router<ServerState> {
     Router::new()
         .route(
@@ -113,6 +115,7 @@ pub fn build_api_router() -> Router<ServerState> {
             "/conformance/check",
             post(trajectory_analysis::handle_conformance_check),
         )
+        .route("/runtime/wake", post(runtime_wake::handle_wake))
         .route(
             "/tenants/{tenant}/secrets/{key_name}",
             put(secrets::handle_put_secret).delete(secrets::handle_delete_secret),

@@ -23,6 +23,9 @@ impl ServerState {
             return None;
         }
         self.spawn_runtime_metrics_loop();
-        Some(self.rearm_state_timers().await)
+        let walk = self.rearm_state_timers().await;
+        // Report once the boot's timers are armed, even when none are.
+        self.due_times.report(false);
+        Some(walk)
     }
 }
