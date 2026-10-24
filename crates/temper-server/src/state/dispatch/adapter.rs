@@ -202,6 +202,12 @@ impl crate::state::ServerState {
         spawn_external_adapter_task(
             async move {
                 // determinism-ok: async integration side-effects run outside simulation core
+                // The run, its minted credential's revocation included, is work of the generation that dispatched it
+                // and holds its lease to the end; once that generation is deleted it does not start.
+                let Some((_lease, agent_ctx)) = state.admit_tenant_work(&tenant, &agent_ctx) else {
+                    return;
+                };
+                let agent_ctx: &AgentContext = &agent_ctx;
                 let req = WasmDispatchRequest {
                     tenant: &tenant,
                     entity_type: &entity_type,
@@ -209,7 +215,7 @@ impl crate::state::ServerState {
                     action: &action,
                     custom_effects: &custom_effects,
                     entity_state: &entity_state,
-                    agent_ctx: &agent_ctx,
+                    agent_ctx,
                     dispatch_idempotency_key: None,
                     action_params: &action_params,
                     mode: WasmDispatchMode::Background,
@@ -225,7 +231,7 @@ impl crate::state::ServerState {
                         &entity_id,
                         &action,
                         &e,
-                        &agent_ctx,
+                        agent_ctx,
                     );
                 }
             }
@@ -473,9 +479,7 @@ impl crate::state::ServerState {
         tenant: &TenantId,
         key_hash: &str,
     ) -> Result<(), String> {
-        let actor = self
-            .get_or_spawn_tenant_actor(tenant, "AgentCredential", key_hash)
-            .ok_or_else(|| "AgentCredential transition table is unavailable".to_string())?;
+        let actor = self.get_or_spawn_tenant_actor(tenant, "AgentCredential", key_hash)?;
         let policy = self.dispatch_retry_policy();
         let idempotency_key = format!("adapter-credential-revoke:{key_hash}");
         let mut last_error = "credential remained Active".to_string();

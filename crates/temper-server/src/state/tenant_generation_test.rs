@@ -59,3 +59,29 @@ async fn a_closed_generation_drains_when_its_last_lease_ends() {
     assert!(drained.is_ok());
     assert_eq!(closed.leases(), 0);
 }
+
+#[test]
+fn queued_work_gets_no_lease_once_its_generation_is_deleted() {
+    let generations = Arc::new(TenantGenerations::default());
+    let acme = TenantId::new("acme");
+    let queued = GenerationRef {
+        generations: Arc::clone(&generations),
+        stamp: generations.stamp(&acme),
+    };
+    assert!(
+        queued.lease().is_some(),
+        "written while its generation is live"
+    );
+
+    generations.close(&acme);
+    assert!(
+        queued.lease().is_none(),
+        "dropped while the tenant is removed"
+    );
+    generations.forget(&acme);
+    assert!(generations.live(&acme).is_some());
+    assert!(
+        queued.lease().is_none(),
+        "dropped in the tenant created again under its id"
+    );
+}

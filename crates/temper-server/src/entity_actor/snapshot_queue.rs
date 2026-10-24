@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use temper_runtime::tenant::TenantId;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
+use crate::state::{TenantGenerations, TenantStamp};
 use crate::storage::BoxedEventStore;
 
 const DEFAULT_SNAPSHOT_QUEUE_CAPACITY: usize = 20_000;
@@ -19,6 +21,8 @@ const DEFAULT_SNAPSHOT_DRAIN_BATCH: usize = 256;
 #[derive(Clone, Debug)]
 struct QueuedSnapshotWrite {
     persistence_id: String,
+    /// The tenant generation of the actor that took the snapshot: the write lands only while that one is live.
+    stamp: TenantStamp,
     sequence_nr: u64,
     snapshot: Vec<u8>,
     enqueued_at: Instant,
@@ -38,11 +42,14 @@ pub(crate) enum SnapshotEnqueueOutcome {
     Coalesced,
     StaleSkipped,
     Full,
+    /// The stream's tenant is being removed: its snapshots are not written.
+    TenantGone,
 }
 
 /// Background snapshot writer shared by all entity actors for one storage stack.
 pub(crate) struct SnapshotWriteQueue {
     store: BoxedEventStore,
+    generations: Arc<TenantGenerations>,
     pending: Arc<Mutex<PendingSnapshotWrites>>,
     applied_sequences: Arc<Mutex<BTreeMap<String, u64>>>,
     notify: Arc<Notify>,
@@ -51,9 +58,10 @@ pub(crate) struct SnapshotWriteQueue {
 }
 
 impl SnapshotWriteQueue {
-    pub(crate) fn start(store: BoxedEventStore) -> Arc<Self> {
+    pub(crate) fn start(store: BoxedEventStore, generations: Arc<TenantGenerations>) -> Arc<Self> {
         let queue = Arc::new(Self {
             store,
+            generations,
             pending: Arc::new(Mutex::new(PendingSnapshotWrites::default())),
             applied_sequences: Arc::new(Mutex::new(BTreeMap::new())),
             notify: Arc::new(Notify::new()),
@@ -68,6 +76,7 @@ impl SnapshotWriteQueue {
     fn new_for_test(store: BoxedEventStore, capacity: usize, drain_batch: usize) -> Self {
         Self {
             store,
+            generations: Arc::default(),
             pending: Arc::new(Mutex::new(PendingSnapshotWrites::default())),
             applied_sequences: Arc::new(Mutex::new(BTreeMap::new())),
             notify: Arc::new(Notify::new()),
@@ -82,6 +91,12 @@ impl SnapshotWriteQueue {
         sequence_nr: u64,
         snapshot: Vec<u8>,
     ) -> SnapshotEnqueueOutcome {
+        // The actor taking the snapshot is running, so its tenant's live generation is its own.
+        let Some(stamp) =
+            tenant_of(&persistence_id).and_then(|tenant| self.generations.live(&tenant))
+        else {
+            return SnapshotEnqueueOutcome::TenantGone;
+        };
         let mut pending = self.pending.lock().expect("snapshot queue mutex poisoned");
         let existing = pending.writes.get(&persistence_id);
         if existing.is_some_and(|existing| existing.sequence_nr >= sequence_nr) {
@@ -107,6 +122,7 @@ impl SnapshotWriteQueue {
             persistence_id.clone(),
             QueuedSnapshotWrite {
                 persistence_id,
+                stamp,
                 sequence_nr,
                 snapshot,
                 enqueued_at: Instant::now(),
@@ -135,6 +151,21 @@ impl SnapshotWriteQueue {
             .writes
             .get(persistence_id)
             .map(|write| write.sequence_nr)
+    }
+
+    /// Drop what the queue holds for a deleted tenant: its pending writes and the sequences it recorded, so a record
+    /// created again under the same id starts with none.
+    pub(crate) fn forget_tenant(&self, tenant: &TenantId) {
+        let owned = |persistence_id: &String| tenant_of(persistence_id).as_ref() == Some(tenant);
+        self.pending
+            .lock()
+            .expect("snapshot queue mutex poisoned")
+            .writes
+            .retain(|persistence_id, _| !owned(persistence_id));
+        self.applied_sequences
+            .lock()
+            .expect("snapshot applied sequence mutex poisoned")
+            .retain(|persistence_id, _| !owned(persistence_id));
     }
 
     fn spawn_worker(self: &Arc<Self>) {
@@ -182,6 +213,12 @@ impl SnapshotWriteQueue {
         crate::trace_context::continue_in(&span, &write.parent);
 
         async move {
+            // Held through the write: a removal of the tenant waits for it, and a snapshot of a deleted generation is
+            // dropped instead of landing in the tenant created again.
+            let Some(_lease) = self.generations.lease(&write.stamp) else {
+                tracing::debug!("snapshot of a deleted tenant generation dropped");
+                return;
+            };
             let started_at = Instant::now();
             crate::runtime_metrics::record_snapshot_write_started();
             crate::runtime_metrics::record_snapshot_write_queue_wait(
@@ -251,6 +288,13 @@ impl SnapshotWriteQueue {
         drop(pending);
         self.notify.notify_one();
     }
+}
+
+/// The tenant a persistence id (`tenant:EntityType:id`) belongs to; a tenant id never contains `:`.
+fn tenant_of(persistence_id: &str) -> Option<TenantId> {
+    persistence_id
+        .split_once(':')
+        .and_then(|(tenant, _)| TenantId::try_new(tenant).ok())
 }
 
 fn snapshot_queue_capacity() -> usize {
@@ -345,6 +389,29 @@ mod tests {
         ) -> Result<Vec<String>, PersistenceError> {
             Ok(Vec::new())
         }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_queued_before_its_tenant_is_deleted_is_not_written_into_the_tenant_created_again()
+     {
+        let store = Arc::new(RecordingEventStore::default());
+        let queue =
+            SnapshotWriteQueue::new_for_test(BoxedEventStore::from_arc(Arc::clone(&store)), 10, 10);
+        assert_eq!(
+            queue.enqueue("acme:Session:s-1".to_string(), 1, vec![1]),
+            SnapshotEnqueueOutcome::Enqueued
+        );
+        // The tenant is deleted while the write waits, and created again under its id.
+        let acme = TenantId::new("acme");
+        queue.generations.close(&acme);
+        queue.generations.forget(&acme);
+        assert!(queue.generations.live(&acme).is_some());
+
+        for write in queue.take_batch() {
+            queue.apply(write).await;
+        }
+        assert_eq!(store.saves.load(Ordering::SeqCst), 0);
+        assert_eq!(queue.applied_sequence("acme:Session:s-1"), None);
     }
 
     #[test]

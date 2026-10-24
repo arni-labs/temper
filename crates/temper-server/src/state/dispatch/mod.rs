@@ -404,6 +404,12 @@ impl crate::state::ServerState {
         spawn_background_wasm_integration(
             async move {
                 // determinism-ok: async integration side-effects run outside simulation core
+                // The run is work of the generation that dispatched it and holds its lease to the end, so whatever
+                // the module writes lands before that tenant's storage goes, and never in a tenant created again.
+                let Some((_lease, agent_ctx)) = state.admit_tenant_work(&tenant, &agent_ctx) else {
+                    return;
+                };
+                let agent_ctx: &AgentContext = &agent_ctx;
                 let req = WasmDispatchRequest {
                     tenant: &tenant,
                     entity_type: &entity_type,
@@ -411,7 +417,7 @@ impl crate::state::ServerState {
                     action: &action,
                     custom_effects: &custom_effects,
                     entity_state: &entity_state,
-                    agent_ctx: &agent_ctx,
+                    agent_ctx,
                     dispatch_idempotency_key: None,
                     action_params: &action_params,
                     mode: WasmDispatchMode::Background,
@@ -430,7 +436,7 @@ impl crate::state::ServerState {
                         &entity_id,
                         &action,
                         &e,
-                        &agent_ctx,
+                        agent_ctx,
                     );
                 }
             }

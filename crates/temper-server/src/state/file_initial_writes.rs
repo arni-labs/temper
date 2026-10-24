@@ -362,13 +362,15 @@ impl ServerState {
             .read()
             .ok()
             .and_then(|slot| slot.clone());
-        if let Some(dispatcher) = dispatcher {
+        // The reactions carry the generation this write was admitted in, so they are refused once it is deleted.
+        if let Some(dispatcher) = dispatcher
+            && let Some(agent_ctx) = self.stamp_tenant_work(tenant, agent_ctx)
+        {
             let state = self.clone();
             let tenant = tenant.clone();
             let file_id = file_id.to_string();
             let to_state = response.state.status.clone();
             let fields = response.state.fields.clone();
-            let agent_ctx = agent_ctx.clone();
             // The reactions are part of the request that wrote the file: their span
             // is a child of the current one, as for every background reaction.
             let span = tracing::info_span!(

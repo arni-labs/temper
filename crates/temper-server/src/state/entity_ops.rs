@@ -923,22 +923,23 @@ impl ServerState {
         entity_id: &str,
     ) -> Option<ActorRef<EntityMsg>> {
         self.get_or_spawn_tenant_actor(&TenantId::default(), entity_type, entity_id)
+            .ok()
     }
 
-    /// Get or spawn an entity actor for a specific tenant.
+    /// Get or spawn an entity actor for a specific tenant. The error says why there is none: no spec for the
+    /// entity type, or the tenant is being deleted.
     pub fn get_or_spawn_tenant_actor(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-    ) -> Option<ActorRef<EntityMsg>> {
+    ) -> Result<ActorRef<EntityMsg>, String> {
         self.get_or_spawn_tenant_actor_with_fields(
             tenant,
             entity_type,
             entity_id,
             serde_json::json!({}),
         )
-        .ok()
     }
 
     /// Get or spawn an entity actor with initial fields for a specific tenant.
@@ -1210,11 +1211,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<EntityResponse, String> {
-        let actor_ref = self
-            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
-            .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
-            })?;
+        let actor_ref = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id)?;
 
         // ADR-0048: retry transient ask failures (AskTimeout, MailboxFull)
         // so a single slow actor reply does not surface as HTTP 500.
@@ -1728,11 +1725,7 @@ impl ServerState {
             return Err("entity field update must be a JSON object".to_string());
         }
         let _lease = self.lease_tenant(tenant)?;
-        let actor_ref = self
-            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
-            .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
-            })?;
+        let actor_ref = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id)?;
 
         let mut policy = self.dispatch_retry_policy();
         if expected_precondition.is_some() {
@@ -1857,11 +1850,7 @@ impl ServerState {
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, String> {
         let _lease = self.lease_tenant(tenant)?;
-        let actor_ref = self
-            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
-            .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
-            })?;
+        let actor_ref = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id)?;
 
         let mut policy = self.dispatch_retry_policy();
         if expected_authorization_precondition.is_some() {
@@ -2003,7 +1992,7 @@ impl ServerState {
             return Ok(false);
         }
 
-        let Some(actor_ref) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
+        let Ok(actor_ref) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
             return Ok(false);
         };
 

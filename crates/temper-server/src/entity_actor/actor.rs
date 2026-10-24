@@ -526,7 +526,8 @@ impl EntityActor {
             match queue.enqueue(persistence_id.to_string(), state.sequence_nr, snapshot) {
                 SnapshotEnqueueOutcome::Enqueued
                 | SnapshotEnqueueOutcome::Coalesced
-                | SnapshotEnqueueOutcome::StaleSkipped => return Ok(()),
+                | SnapshotEnqueueOutcome::StaleSkipped
+                | SnapshotEnqueueOutcome::TenantGone => return Ok(()),
                 SnapshotEnqueueOutcome::Full => {
                     tracing::warn!(
                         entity = %state.entity_id,

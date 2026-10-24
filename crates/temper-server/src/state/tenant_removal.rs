@@ -13,8 +13,8 @@ use temper_runtime::tenant::TenantId;
 use super::ServerState;
 use super::tenant_generation::{Generation, TenantGenerations};
 
-/// Why a tenant removal did not finish. The tenant stays marked gone (no specs, so no new actors and no new work),
-/// and running the removal again picks up where this one stopped.
+/// Why a tenant removal did not finish. The tenant's generation stays closed (no new actors and no new work), its
+/// specs, credentials and policies are kept, and running the removal again picks up where this one stopped.
 #[derive(Debug)]
 pub enum TenantRemovalError {
     /// A lock over the tenant's in-memory state was poisoned by a panic elsewhere.
@@ -73,12 +73,9 @@ impl ServerState {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<bool, PersistenceError>>,
     {
-        // A closed generation admits no new work and no new actor; without specs, no request for it is governed.
+        // A closed generation admits no new work and no new actor. Its specs, credentials and policies stay until its
+        // storage is gone, so a removal that stops part way can be retried by the caller who started it.
         let closing = self.tenant_generations.close(tenant);
-        self.registry
-            .write()
-            .map_err(poisoned("spec registry"))?
-            .remove_tenant(tenant);
         self.stop_tenant_actors(tenant, &closing).await?;
         let existed = remove_storage()
             .await
@@ -141,7 +138,7 @@ impl ServerState {
     }
 
     /// Drop everything this process holds in memory for a deleted tenant: its entity caches and indexes, its cached
-    /// replies, its timer sequences, its HTTP routes, its Cedar policies, its cached secrets, its WASM modules and
+    /// replies, its timer sequences, its pending eventual invariants and queued snapshots, its HTTP routes, its Cedar policies, its cached secrets, its WASM modules and
     /// its specs. A tenant created again with the same id then starts from its own (empty) database, not from what
     /// the deleted tenant left in memory. [`Self::remove_tenant`] runs this once the tenant's actors have ended and
     /// its storage is gone.
@@ -195,6 +192,18 @@ impl ServerState {
 
         self.idempotency_cache.forget_tenant(tenant);
         self.state_timeout_tracker.forget_tenant(tenant);
+        self.eventual_tracker
+            .write()
+            .map_err(poisoned("eventual invariants"))?
+            .forget_tenant(tenant.as_str());
+        if let Some(queue) = self
+            .snapshot_write_queue
+            .lock()
+            .map_err(poisoned("snapshot write queue"))?
+            .as_ref()
+        {
+            queue.forget_tenant(tenant);
+        }
         self.http_endpoint_tables.remove(tenant).await;
 
         self.authz.remove_tenant(tenant.as_str());

@@ -43,6 +43,7 @@ use tokio::sync::mpsc;
 
 use super::{metrics, next_capture_seq, record_dropped};
 use crate::conformance::{CAPTURE_LOSS_ACTION, CAPTURE_LOSS_ENTITY_TYPE};
+use crate::state::GenerationRef;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use crate::storage::TrajectorySink;
 
@@ -130,6 +131,8 @@ fn record_capture_loss_marker(tenant: &str, result: &'static str) {
 pub(super) struct QueuedMarker {
     sink: Arc<dyn TrajectorySink>,
     tenant: String,
+    /// The generation of the tenant whose entry was lost: the marker is written only while that one is live.
+    generation: Option<GenerationRef>,
     session_id: String,
     reason: &'static str,
     health: CaptureHealth,
@@ -241,6 +244,7 @@ pub(super) fn record_capture_loss(
     sink: Option<Arc<dyn TrajectorySink>>,
     backend: &'static str,
     lost: &TrajectoryEntry,
+    generation: Option<GenerationRef>,
     reason: &'static str,
     health: &CaptureHealth,
 ) {
@@ -278,6 +282,7 @@ pub(super) fn record_capture_loss(
     let queued = QueuedMarker {
         sink,
         tenant: lost.tenant.clone(),
+        generation,
         session_id: session_id.to_string(),
         reason,
         health: health.clone(),
@@ -310,6 +315,7 @@ pub(super) async fn persist_capture_loss_marker(queued: QueuedMarker, retry_dela
     let QueuedMarker {
         sink,
         tenant,
+        generation,
         session_id,
         reason,
         health,
@@ -318,7 +324,16 @@ pub(super) async fn persist_capture_loss_marker(queued: QueuedMarker, retry_dela
     let mut delay = retry_delay;
     let mut last_error = String::new();
     for attempt in 1..=CAPTURE_MARKER_ATTEMPTS {
-        match sink.persist_trajectory_entry(&marker).await {
+        // Each attempt holds a lease of the lost entry's generation; once that one is deleted the marker would only
+        // land in the tenant created again under its id, so it is dropped.
+        let lease = match generation.as_ref().map(GenerationRef::lease) {
+            Some(None) => return,
+            Some(lease) => lease,
+            None => None,
+        };
+        let written = sink.persist_trajectory_entry(&marker).await;
+        drop(lease);
+        match written {
             Ok(()) => {
                 record_capture_loss_marker(&tenant, "stored");
                 health.confirm_loss_recorded();
@@ -366,6 +381,7 @@ pub(super) fn queued_marker_for_test(
     QueuedMarker {
         sink,
         tenant: tenant.to_string(),
+        generation: None,
         session_id: session_id.to_string(),
         reason: "outbox_full",
         health,

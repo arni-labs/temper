@@ -140,6 +140,11 @@ impl TenantGenerations {
         generation
     }
 
+    /// The tenant's current generation, live or being removed, starting one when its id has none.
+    pub(crate) fn stamp(&self, tenant: &TenantId) -> TenantStamp {
+        self.current(tenant).stamp.clone()
+    }
+
     /// The tenant's live generation, starting one when its id has none, or None while the tenant is removed.
     pub fn live(&self, tenant: &TenantId) -> Option<TenantStamp> {
         let generation = self.current(tenant);
@@ -197,7 +202,31 @@ impl TenantGenerations {
     }
 }
 
+/// The tenant generation that queued work belongs to, with what it needs to ask for a lease of it when it writes.
+/// Queued work takes one when it is queued and writes only under [`GenerationRef::lease`], so a write of a deleted
+/// generation is dropped instead of landing in the tenant created again under its id.
+#[derive(Debug, Clone)]
+pub struct GenerationRef {
+    generations: Arc<TenantGenerations>,
+    stamp: TenantStamp,
+}
+
+impl GenerationRef {
+    /// A lease of the generation, while it is live.
+    pub fn lease(&self) -> Option<GenerationLease> {
+        self.generations.lease(&self.stamp)
+    }
+}
+
 impl super::ServerState {
+    /// The generation of `tenant` that work queued now belongs to: the current one, live or being removed.
+    pub(crate) fn generation_ref(&self, tenant: &TenantId) -> GenerationRef {
+        GenerationRef {
+            generations: Arc::clone(&self.tenant_generations),
+            stamp: self.tenant_generations.stamp(tenant),
+        }
+    }
+
     /// The one admission check for work of `tenant`. Work whose context carries a stamp of this tenant (a timer, a
     /// follow-on, a reaction or a callback of earlier work) is admitted only while that generation is live; other
     /// work joins the live generation. Returns the lease to hold while the work runs and the context, stamped with

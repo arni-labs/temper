@@ -24,7 +24,7 @@ mod runtime_metrics;
 pub(crate) mod storage_caps;
 mod tenant_generation;
 mod tenant_removal;
-pub use tenant_generation::{GenerationLease, TenantGenerations, TenantStamp};
+pub use tenant_generation::{GenerationLease, GenerationRef, TenantGenerations, TenantStamp};
 pub use tenant_removal::TenantRemovalError;
 pub mod trajectory;
 pub mod wasm_invocation_log;
@@ -666,7 +666,8 @@ impl ServerState {
     /// Attach the composed runtime storage stack.
     pub fn set_storage_stack(&mut self, stack: StorageStack) {
         let stack = Arc::new(stack);
-        let snapshot_queue = SnapshotWriteQueue::start(stack.events.clone());
+        let snapshot_queue =
+            SnapshotWriteQueue::start(stack.events.clone(), Arc::clone(&self.tenant_generations));
         if let Ok(mut slot) = self.snapshot_write_queue.lock() {
             *slot = Some(snapshot_queue);
         }

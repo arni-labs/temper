@@ -303,7 +303,13 @@ pub(super) async fn dispatch_matched_route(
     }
 
     let head_streams = streams.clone();
+    // The module may still write after the response head is sent, so its task holds a lease of the tenant's live
+    // generation to the end, and a removal of the tenant waits for it.
+    let Ok(lease) = state.lease_tenant(&tenant_id) else {
+        return StatusCode::GONE.into_response();
+    };
     let invoke_future = async move {
+        let _lease = lease;
         match engine
             .invoke_with_blobs(
                 &invoke_hash,

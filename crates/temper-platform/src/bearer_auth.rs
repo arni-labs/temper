@@ -48,6 +48,7 @@ pub async fn bearer_auth_check(
         // downstream handlers, logs, or accidental forwarding.
         req.headers_mut().remove("authorization");
         req.extensions_mut().insert(authenticated);
+        let _lease = lease_tenant_request(&state, &req, &tenant)?;
         return Ok(next.run(req).await);
     }
 
@@ -184,6 +185,7 @@ pub async fn bearer_auth_check(
             );
         }
         req.headers_mut().remove("authorization");
+        let _lease = lease_tenant_request(&state, &req, &tenant)?;
         return Ok(next.run(req).await);
     }
 
@@ -224,11 +226,12 @@ pub async fn bearer_auth_check(
             ));
         req.extensions_mut()
             .insert(temper_server::http_endpoint::AdmittedHttpEndpoint::new(
-                tenant,
+                tenant.clone(),
                 &request_method,
                 &request_path,
                 matched,
             ));
+        let _lease = lease_tenant_request(&state, &req, &tenant)?;
         return Ok(next.run(req).await);
     }
 
@@ -244,6 +247,29 @@ pub async fn bearer_auth_check(
     }
 
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// A request that acts with a tenant's authority is work of the tenant's live generation: it holds a lease of it
+/// until its handler returns, so a removal of the tenant waits for it and a request that arrives while the tenant is
+/// being removed is refused with 410. The lease is taken only once a credential or route of the tenant matched, so a
+/// made-up tenant id never starts a generation. The request that deletes its own tenant holds none: it ends the
+/// generation, and could not wait for its own lease.
+fn lease_tenant_request(
+    state: &PlatformState,
+    req: &Request,
+    tenant: &TenantId,
+) -> Result<Option<temper_server::state::GenerationLease>, StatusCode> {
+    if req.method() == Method::DELETE
+        && req.uri().path().strip_prefix("/api/tenants/") == Some(tenant.as_str())
+    {
+        return Ok(None);
+    }
+    state
+        .server
+        .tenant_generations
+        .lease_live(tenant)
+        .map(Some)
+        .ok_or(StatusCode::GONE)
 }
 
 fn authorization_parts(req: &Request) -> Option<(&str, &str)> {

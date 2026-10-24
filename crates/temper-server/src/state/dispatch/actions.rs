@@ -607,11 +607,13 @@ impl crate::state::ServerState {
                 .read()
                 .map(|reg| reg.contains_key(&actor_key))
                 .unwrap_or(false);
-            let Some(ar) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
-                return Err(DispatchError::Internal(format!(
-                    "failed to resolve actor for governed entity type '{entity_type}'"
-                )));
-            };
+            let ar = self
+                .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
+                .map_err(|error| {
+                    DispatchError::Internal(format!(
+                        "failed to resolve actor for governed entity type '{entity_type}': {error}"
+                    ))
+                })?;
             crate::runtime_metrics::record_actor_registry_lock_wait(
                 entity_type,
                 !existed,

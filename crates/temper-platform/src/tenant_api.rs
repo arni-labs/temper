@@ -158,6 +158,14 @@ async fn create_tenant(
         );
     }
 
+    // An id whose removal has not finished is not created again until it has: the old tenant's storage and specs are
+    // still there, and deleting it again finishes the removal.
+    if state.server.tenant_generations.live(&tenant).is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("tenant '{tenant}' is being deleted")})),
+        );
+    }
     match provider.register_tenant(&tenant).await {
         Ok(_store) => {
             // Bootstrap agent specs for the new tenant.
