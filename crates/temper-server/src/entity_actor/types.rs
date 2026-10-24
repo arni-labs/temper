@@ -168,6 +168,22 @@ impl EntityState {
         }
     }
 
+    /// Apply the kernel's deletion tombstone: the record is `Deleted`.
+    pub(crate) fn record_tombstone(&mut self, tombstone: EntityEvent) {
+        debug_assert_eq!(
+            tombstone.kind,
+            temper_runtime::persistence::EventKind::Tombstone
+        );
+        self.status = tombstone.to_status.clone();
+        if let Some(obj) = self.fields.as_object_mut() {
+            obj.insert(
+                "Status".to_string(),
+                serde_json::Value::String(self.status.clone()),
+            );
+        }
+        self.push_event_bounded(tombstone);
+    }
+
     /// Where this state is in the record's history. With a journal that is the
     /// journal sequence; without one the sequence stays put, and the count of
     /// events applied moves instead. Both only grow while the record lives.
@@ -231,6 +247,19 @@ impl EntityEvent {
             params: serde_json::json!({}),
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+        }
+    }
+
+    /// The kernel's deletion tombstone for a record last in `from_status`.
+    pub(crate) fn tombstone(from_status: String) -> Self {
+        Self {
+            action: temper_runtime::persistence::TOMBSTONE_EVENT_TYPE.to_string(),
+            from_status,
+            to_status: "Deleted".to_string(),
+            timestamp: temper_runtime::scheduler::sim_now(),
+            params: serde_json::json!({}),
+            idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Tombstone,
         }
     }
 }

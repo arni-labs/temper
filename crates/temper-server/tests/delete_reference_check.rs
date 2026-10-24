@@ -14,16 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::projection_writes_fail::ProjectionWritesFail;
 use common::{CSDL_XML, ORDER_IOA};
 use temper_runtime::ActorSystem;
-use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::{
     EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
-};
-use temper_server::storage::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
@@ -120,156 +116,9 @@ async fn journal_only_server(name: &str, store: &Store) -> ServerState {
     server(name, stack)
 }
 
-/// The store's query plane, except that projection writes fail while
-/// `failing` is set: reads still answer from what was projected before.
-struct ProjectionWritesFail {
-    store: TursoEventStore,
-    failing: Arc<AtomicBool>,
-}
-
-impl ProjectionWritesFail {
-    fn refuse(&self) -> Result<(), PersistenceError> {
-        if self.failing.load(Ordering::SeqCst) {
-            return Err(PersistenceError::Storage(
-                "injected projection write failure".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl QueryPlaneStore for ProjectionWritesFail {
-    async fn upsert_projection(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_id: &str,
-        status: &str,
-        fields: &serde_json::Value,
-        state: &serde_json::Value,
-        sequence_nr: u64,
-    ) -> Result<(), PersistenceError> {
-        self.refuse()?;
-        QueryPlaneStore::upsert_projection(
-            &self.store,
-            tenant,
-            entity_type,
-            entity_id,
-            status,
-            fields,
-            state,
-            sequence_nr,
-        )
-        .await
-    }
-
-    async fn upsert_projections(
-        &self,
-        tenant: &str,
-        projections: &[QueryProjectionUpsert],
-    ) -> Result<(), PersistenceError> {
-        self.refuse()?;
-        QueryPlaneStore::upsert_projections(&self.store, tenant, projections).await
-    }
-
-    async fn remove_projection(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<(), PersistenceError> {
-        self.refuse()?;
-        QueryPlaneStore::remove_projection(&self.store, tenant, entity_type, entity_id).await
-    }
-
-    async fn query_field_index(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-    ) -> Result<Option<Vec<String>>, PersistenceError> {
-        QueryPlaneStore::query_field_index(&self.store, tenant, entity_type, where_clause, params)
-            .await
-    }
-
-    async fn query_field_index_page(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        where_clause: &str,
-        params: Vec<String>,
-        order_by: &[QueryFieldIndexOrder],
-        skip: usize,
-        top: usize,
-        include_count: bool,
-    ) -> Result<Option<QueryFieldIndexPage>, PersistenceError> {
-        QueryPlaneStore::query_field_index_page(
-            &self.store,
-            tenant,
-            entity_type,
-            where_clause,
-            params,
-            order_by,
-            skip,
-            top,
-            include_count,
-        )
-        .await
-    }
-
-    async fn load_projection_fields_many(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_ids: &[String],
-        field_names: &[&str],
-    ) -> Result<Option<Vec<QueryProjectionFieldsRow>>, PersistenceError> {
-        QueryPlaneStore::load_projection_fields_many(
-            &self.store,
-            tenant,
-            entity_type,
-            entity_ids,
-            field_names,
-        )
-        .await
-    }
-
-    async fn load_entity_catalog_rows(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-        entity_ids: &[String],
-    ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
-        QueryPlaneStore::load_entity_catalog_rows(&self.store, tenant, entity_type, entity_ids)
-            .await
-    }
-
-    async fn projected_entity_counts_by_tenant(
-        &self,
-    ) -> Result<Option<Vec<(String, u64)>>, PersistenceError> {
-        QueryPlaneStore::projected_entity_counts_by_tenant(&self.store).await
-    }
-
-    async fn projection_catalog_freshness(
-        &self,
-        tenant: &str,
-        entity_type: &str,
-    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
-        QueryPlaneStore::projection_catalog_freshness(&self.store, tenant, entity_type).await
-    }
-}
-
 /// A server whose projection writes fail while the returned switch is on.
 async fn projection_failing_server(name: &str, store: &Store) -> (ServerState, Arc<AtomicBool>) {
-    let turso = store.open().await;
-    let failing = Arc::new(AtomicBool::new(false));
-    let mut stack = StorageStack::from_turso(turso.clone());
-    stack.query_plane = Some(Arc::new(ProjectionWritesFail {
-        store: turso,
-        failing: failing.clone(),
-    }));
+    let (stack, failing) = ProjectionWritesFail::stack(store.open().await);
     (server(name, stack), failing)
 }
 

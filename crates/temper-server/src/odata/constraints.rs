@@ -3,7 +3,7 @@
 mod delete_plan;
 mod delete_references;
 
-pub use delete_plan::plan_delete;
+pub use delete_plan::{DeletePlan, plan_delete};
 
 use std::time::Instant; // determinism-ok: scoped duration measurement only
 

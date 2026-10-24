@@ -196,9 +196,7 @@ impl<'a> ReferenceFinder<'a> {
         let predicate = crate::odata::filter_sql::try_translate_candidate_filter(&equality)?;
         // Skipped and stale rows can fill the page; asking for that many more
         // than `limit` reaches `limit` others whenever that many match.
-        let top = limit
-            .saturating_add(skip.len())
-            .saturating_add(stale.len());
+        let top = limit.saturating_add(skip.len()).saturating_add(stale.len());
         match query_plane
             .query_field_index_page(
                 self.tenant.as_str(),

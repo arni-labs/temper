@@ -4,14 +4,23 @@
 //! them: `Track.album_id -> Album` is `cascade` (an album owns its tracks),
 //! `Album.latest_track_id -> Track` is `none` (a pointer, not ownership), and
 //! `PlaylistEntry.track_id -> Track` keeps the default `restrict`.
+//! `Folder.parent_id -> Folder` is `cascade` within one type, so folders can
+//! own each other in a cycle, and `Credit.album_id -> Album` is `cascade` into
+//! a strict type, which only a declared action deletes.
+
+mod common;
+
+use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::projection_writes_fail::ProjectionWritesFail;
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::{
     EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
 };
+use temper_server::request_context::AgentContext;
 use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
@@ -28,6 +37,17 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <NavigationProperty Name="LatestTrack" Type="Test.Music.Track">
           <ReferentialConstraint Property="latest_track_id" ReferencedProperty="Id"/>
           <Annotation Term="Temper.Vocab.Relation.DeletePolicy" String="none"/>
+        </NavigationProperty>
+      </EntityType>
+      <!-- Declared before Track, so an album's credits are found before its
+           tracks. -->
+      <EntityType Name="Credit">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="album_id" Type="Edm.String"/>
+        <NavigationProperty Name="Album" Type="Test.Music.Album">
+          <ReferentialConstraint Property="album_id" ReferencedProperty="Id"/>
+          <Annotation Term="Temper.Vocab.Relation.DeletePolicy" String="cascade"/>
         </NavigationProperty>
       </EntityType>
       <EntityType Name="Track">
@@ -47,10 +67,21 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
           <ReferentialConstraint Property="track_id" ReferencedProperty="Id"/>
         </NavigationProperty>
       </EntityType>
+      <EntityType Name="Folder">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="parent_id" Type="Edm.String"/>
+        <NavigationProperty Name="Parent" Type="Test.Music.Folder">
+          <ReferentialConstraint Property="parent_id" ReferencedProperty="Id"/>
+          <Annotation Term="Temper.Vocab.Relation.DeletePolicy" String="cascade"/>
+        </NavigationProperty>
+      </EntityType>
       <EntityContainer Name="MusicService">
         <EntitySet Name="Albums" EntityType="Test.Music.Album"/>
         <EntitySet Name="Tracks" EntityType="Test.Music.Track"/>
         <EntitySet Name="PlaylistEntries" EntityType="Test.Music.PlaylistEntry"/>
+        <EntitySet Name="Folders" EntityType="Test.Music.Folder"/>
+        <EntitySet Name="Credits" EntityType="Test.Music.Credit"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
@@ -60,6 +91,25 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 fn ioa(name: &str) -> String {
     format!("[automaton]\nname = \"{name}\"\nstates = [\"Active\"]\ninitial = \"Active\"\n")
 }
+
+/// A strict type: its album is set by a declared action, and only a declared
+/// action may delete it.
+const CREDIT_IOA: &str = r#"
+[automaton]
+name = "Credit"
+states = ["Draft", "Attached"]
+initial = "Draft"
+strict_action_params = true
+
+[[action]]
+name = "Attach"
+kind = "input"
+from = ["Draft"]
+to = "Attached"
+params = ["album_id"]
+"#;
+
+const ENTITY_TYPES: [&str; 5] = ["Album", "Track", "PlaylistEntry", "Folder", "Credit"];
 
 struct Store {
     db_path: std::path::PathBuf,
@@ -83,8 +133,23 @@ impl Drop for Store {
     }
 }
 
+async fn open(store: &Store) -> TursoEventStore {
+    TursoEventStore::new(&store.db_url, None)
+        .await
+        .expect("open local turso db")
+}
+
 async fn server(name: &str, store: &Store) -> ServerState {
-    let (album, track, entry) = (ioa("Album"), ioa("Track"), ioa("PlaylistEntry"));
+    server_on(name, StorageStack::from_turso(open(store).await))
+}
+
+fn server_on(name: &str, stack: StorageStack) -> ServerState {
+    let (album, track, entry, folder) = (
+        ioa("Album"),
+        ioa("Track"),
+        ioa("PlaylistEntry"),
+        ioa("Folder"),
+    );
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
@@ -94,16 +159,15 @@ async fn server(name: &str, store: &Store) -> ServerState {
             ("Album", album.as_str()),
             ("Track", track.as_str()),
             ("PlaylistEntry", entry.as_str()),
+            ("Folder", folder.as_str()),
+            ("Credit", CREDIT_IOA),
         ],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
-    let store = TursoEventStore::new(&store.db_url, None)
-        .await
-        .expect("open local turso db");
-    state.set_storage_stack(StorageStack::from_turso(store));
+    state.set_storage_stack(stack);
     {
         let mut registry = state.registry.write().unwrap();
-        for entity_type in ["Album", "Track", "PlaylistEntry"] {
+        for entity_type in ENTITY_TYPES {
             registry.set_verification_status(
                 &TenantId::default(),
                 entity_type,
@@ -125,6 +189,15 @@ async fn server(name: &str, store: &Store) -> ServerState {
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .expect("test policy parses");
     state
+}
+
+/// A server whose projection writes fail while the returned switch is on.
+async fn projection_failing_server(
+    name: &str,
+    store: &Store,
+) -> (ServerState, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let (stack, failing) = ProjectionWritesFail::stack(open(store).await);
+    (server_on(name, stack), failing)
 }
 
 async fn create(state: &ServerState, entity_type: &str, id: &str, fields: serde_json::Value) {
@@ -165,6 +238,45 @@ async fn get(state: &ServerState, set: &str, id: &str) -> StatusCode {
     send(state, Request::get(path).body(Body::empty()).unwrap())
         .await
         .0
+}
+
+/// Commit a change to `entity_type('id')` whose projection write fails, so
+/// the query index keeps the fields it had before.
+async fn change_unprojected(
+    state: &ServerState,
+    projection_fails: &std::sync::atomic::AtomicBool,
+    entity_type: &str,
+    id: &str,
+    fields: serde_json::Value,
+) {
+    projection_fails.store(true, Ordering::SeqCst);
+    let changed = state
+        .update_tenant_entity_fields(&TenantId::default(), entity_type, id, fields.clone(), false)
+        .await;
+    projection_fails.store(false, Ordering::SeqCst);
+    assert!(
+        changed
+            .as_ref()
+            .is_err_and(|error| error.contains("query projection write failed")),
+        "the change commits and reports its failed projection: {changed:?}"
+    );
+    let committed = state
+        .get_tenant_entity_state(&TenantId::default(), entity_type, id)
+        .await
+        .expect("read the changed row");
+    for (field, value) in fields.as_object().expect("fields object") {
+        assert_eq!(&committed.state.fields[field], value, "{id}.{field}");
+    }
+}
+
+async fn field(state: &ServerState, entity_type: &str, id: &str, field: &str) -> serde_json::Value {
+    state
+        .get_tenant_entity_state(&TenantId::default(), entity_type, id)
+        .await
+        .expect("read row")
+        .state
+        .fields[field]
+        .clone()
 }
 
 async fn post(
@@ -302,4 +414,151 @@ async fn an_owned_row_cannot_be_created_for_a_missing_owner() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "owned create: {body}");
+}
+
+#[tokio::test]
+async fn a_track_moved_to_another_album_is_not_deleted_with_its_old_one() {
+    let store = Store::new("moved-away");
+    let (state, projection_fails) =
+        projection_failing_server("delete-cascade-moved-away", &store).await;
+    album_with_tracks(&state, "a-old", &["t-1", "t-2", "t-moved"]).await;
+    album_with_tracks(&state, "a-new", &[]).await;
+
+    // The move commits, but the index still says t-moved is on a-old.
+    change_unprojected(
+        &state,
+        &projection_fails,
+        "Track",
+        "t-moved",
+        serde_json::json!({ "album_id": "a-new" }),
+    )
+    .await;
+
+    let (status, body) = delete(&state, "Albums", "a-old").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "old album delete: {body}");
+    assert_eq!(get(&state, "Albums", "a-old").await, StatusCode::NOT_FOUND);
+    for track in ["t-1", "t-2"] {
+        assert_eq!(
+            get(&state, "Tracks", track).await,
+            StatusCode::NOT_FOUND,
+            "{track} outlived its album"
+        );
+    }
+    assert_eq!(
+        get(&state, "Tracks", "t-moved").await,
+        StatusCode::OK,
+        "a track on another album is not deleted with its old one"
+    );
+    assert_eq!(field(&state, "Track", "t-moved", "album_id").await, "a-new");
+}
+
+#[tokio::test]
+async fn a_track_moved_into_an_album_is_deleted_with_it() {
+    let store = Store::new("moved-in");
+    let (state, projection_fails) =
+        projection_failing_server("delete-cascade-moved-in", &store).await;
+    album_with_tracks(&state, "a-target", &["t-1"]).await;
+    album_with_tracks(&state, "a-other", &["t-other", "t-moved"]).await;
+
+    // The move commits, but the index still says t-moved is on a-other.
+    change_unprojected(
+        &state,
+        &projection_fails,
+        "Track",
+        "t-moved",
+        serde_json::json!({ "album_id": "a-target" }),
+    )
+    .await;
+
+    let (status, body) = delete(&state, "Albums", "a-target").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "target delete: {body}");
+    for track in ["t-1", "t-moved"] {
+        assert_eq!(
+            get(&state, "Tracks", track).await,
+            StatusCode::NOT_FOUND,
+            "{track} outlived its album"
+        );
+    }
+    assert_eq!(get(&state, "Albums", "a-other").await, StatusCode::OK);
+    assert_eq!(get(&state, "Tracks", "t-other").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn folders_that_own_each_other_are_deleted_once_each() {
+    let store = Store::new("cycle");
+    let state = server("delete-cascade-cycle", &store).await;
+    // f-a and f-b own each other; f-c sits in f-b; f-self owns itself.
+    for (folder, parent) in [
+        ("f-a", "f-b"),
+        ("f-b", "f-a"),
+        ("f-c", "f-b"),
+        ("f-self", "f-self"),
+        ("f-kept", "f-elsewhere"),
+    ] {
+        create(
+            &state,
+            "Folder",
+            folder,
+            serde_json::json!({ "parent_id": parent }),
+        )
+        .await;
+    }
+
+    let (status, body) = delete(&state, "Folders", "f-a").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "cycle delete: {body}");
+    for folder in ["f-a", "f-b", "f-c"] {
+        assert_eq!(
+            get(&state, "Folders", folder).await,
+            StatusCode::NOT_FOUND,
+            "{folder} outlived the cycle it belongs to"
+        );
+    }
+
+    let (status, body) = delete(&state, "Folders", "f-self").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "self-owned delete: {body}");
+    assert_eq!(
+        get(&state, "Folders", "f-self").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(&state, "Folders", "f-kept").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_cascade_into_a_strict_type_is_refused_before_anything_is_deleted() {
+    let store = Store::new("strict");
+    let state = server("delete-cascade-strict", &store).await;
+    album_with_tracks(&state, "a-credited", &["t-1", "t-2"]).await;
+    create(&state, "Credit", "c-1", serde_json::json!({})).await;
+    state
+        .dispatch_tenant_action(
+            &TenantId::default(),
+            "Credit",
+            "c-1",
+            "Attach",
+            serde_json::json!({ "album_id": "a-credited" }),
+            &AgentContext::default(),
+        )
+        .await
+        .expect("attach the credit to its album");
+    assert_eq!(
+        field(&state, "Credit", "c-1", "album_id").await,
+        "a-credited"
+    );
+
+    let (status, body) = delete(&state, "Albums", "a-credited").await;
+    assert_eq!(status, StatusCode::CONFLICT, "strict cascade: {body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Credit('c-1')"),
+        "the refusal names the strict row: {message}"
+    );
+    assert_eq!(get(&state, "Albums", "a-credited").await, StatusCode::OK);
+    for track in ["t-1", "t-2"] {
+        assert_eq!(
+            get(&state, "Tracks", track).await,
+            StatusCode::OK,
+            "{track} was deleted by a refused delete"
+        );
+    }
+    assert_eq!(get(&state, "Credits", "c-1").await, StatusCode::OK);
 }
