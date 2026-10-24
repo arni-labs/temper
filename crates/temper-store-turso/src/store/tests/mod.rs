@@ -2488,7 +2488,11 @@ async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
         .unwrap();
     // Journaled but never projected: not a catalog row at all.
     store
-        .append(&format!("{tenant}:Payment:pay-unprojected"), 0, &[created()])
+        .append(
+            &format!("{tenant}:Payment:pay-unprojected"),
+            0,
+            &[created()],
+        )
         .await
         .unwrap();
 
