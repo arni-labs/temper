@@ -206,7 +206,7 @@ impl DueTimes {
             tracing::info!(
                 "process resumed from a suspension; timers wait again by the wall clock"
             );
-            self.retime.notify_waiters();
+            let _ = &self.retime; // variant: a resume re-times nothing
         }
         self.report();
     }
