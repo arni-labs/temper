@@ -1413,11 +1413,9 @@ pub(super) async fn install_os_app_with_plan(
         state.server.rebuild_reaction_dispatcher();
     }
 
-    // Refresh cross-entity reactions after installing specs, and reconcile the
-    // timers of records that replay into other states, with no restart.
+    // Refresh cross-entity reactions after installing specs.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
-        state.server.spawn_follow_spec_changes();
     }
 
     // ── Step 3: Load Cedar policies into memory. ────────────────────
@@ -1571,6 +1569,12 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
+    }
+
+    // Overdue timers may fire immediately. Their new policies and modules
+    // must be ready before the changed specs reconcile any records.
+    if plan.specs {
+        state.server.spawn_follow_spec_changes();
     }
 
     tracing::info!(

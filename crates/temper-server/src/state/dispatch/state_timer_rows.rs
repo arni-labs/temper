@@ -242,6 +242,15 @@ impl ServerState {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "re-armed state timers from the store"
         );
+        {
+            // Serialize with install walks so none can consume startup changes
+            // before saved identities and gates have been restored. The boot
+            // walk covers all timed types, with rows-only arming at startup.
+            let mut registry = self.registry.write().expect("registry lock poisoned");
+            registry.take_changed_types();
+            self.timer_recovery_complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let server = self.clone();
         // determinism-ok: boot follow-up runs in the background, as boot timers do.
         tokio::spawn(async move { server.follow_timed_types(callers, gate, counts).await })

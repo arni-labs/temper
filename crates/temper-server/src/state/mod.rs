@@ -518,6 +518,8 @@ pub struct ServerState {
     /// Where armed timer rows are kept when the storage stack has no metadata
     /// store to keep them, as under simulation. None: the metadata store.
     pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
+    /// Published under the registry lock after durable timer recovery.
+    pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
     pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
     /// Eventual invariant convergence tracker.
@@ -820,6 +822,7 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
@@ -1099,6 +1102,7 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),

@@ -193,6 +193,16 @@ impl Process {
         let (state, walk) = runtime.block_on(async {
             world.clock.begin();
             let mut registry = SpecRegistry::new();
+            // Restore the persisted specs before reinstalling the current app
+            // bundles, as serve does. This must queue real spec changes.
+            for (tenant, spec) in [("alpha", JOB_V1), ("gamma", job_untimed().as_str())] {
+                registry.register_tenant(
+                    tenant,
+                    parse_csdl(CSDL).unwrap(),
+                    CSDL.to_string(),
+                    &[("Job", spec)],
+                );
+            }
             for (tenant, spec) in [
                 ("alpha", alpha_spec),
                 ("beta", JOB_V1),
@@ -204,6 +214,18 @@ impl Process {
             let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
             state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
             state.state_timer_rows = Some(world.rows.clone());
+            // Serve reinstalls apps before runtime recovery. No install walk
+            // may touch the saved rows or fire an overdue timer here.
+            let saved_rows = world.rows.row("alpha", "job-0");
+            state.follow_spec_changes().await;
+            assert_eq!(
+                world
+                    .rows
+                    .row("alpha", "job-0")
+                    .map(|row| (row.state, row.armed_by)),
+                saved_rows.map(|row| (row.state, row.armed_by)),
+                "startup installs must leave saved timer rows untouched",
+            );
             let walk = state.start_runtime().await.expect("the first start");
             (state, walk)
         });

@@ -60,10 +60,21 @@ impl ServerState {
     /// Make the timers of every record of each type whose spec an install
     /// changed follow the state the record is in now, including a type that
     /// had no timeout before. Failed listings and reads remain pending until
-    /// the store recovers.
+    /// the store recovers. Startup installs defer to `start_runtime`'s
+    /// rows-only boot walk, preserving saved callers and its shared fire gate.
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
-            Ok(mut registry) => registry.take_changed_types(),
+            Ok(mut registry) => {
+                // Startup installs precede start_runtime. The boot walk owns
+                // these changes: only it has the saved callers and fire gate.
+                if !self
+                    .timer_recovery_complete
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return;
+                }
+                registry.take_changed_types()
+            }
             Err(_) => return,
         };
         self.follow_types(changed, &BootCallers::new(), None, Arming::Any)
