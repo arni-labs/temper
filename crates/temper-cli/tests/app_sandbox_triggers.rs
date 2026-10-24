@@ -79,9 +79,8 @@ fn start_sandbox(port: u16, token: &str, workdir: &Path) -> Process {
 
 /// Every `.ioa.toml` under `dir` that mentions the sandbox key.
 fn specs_naming_a_sandbox(dir: &Path, found: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("{}: cannot read directory: {err}", dir.display()));
     for entry in entries {
         let path = entry.expect("read directory entry").path();
         if path.is_dir() {
