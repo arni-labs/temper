@@ -522,14 +522,19 @@ async fn notice_stays_answered(state: &ServerState, why: &str) {
 }
 
 /// Another server sharing the event store rejects the Release while this one
-/// still holds it as `Held`. This server's `Approve` meets the moved journal;
-/// read again, the journal does not hold the `Approve` and the Release is
-/// `Out`, so the sub-write is refused and `Missed` runs.
+/// still holds it as `Held`, and this server's `Approve` meets the moved
+/// journal. The atomic batch is refused as a conflict. On the per-write path
+/// the actor reads the journal again, finds the Release `Out` and no
+/// `Approve`, and its guard refuses the sub-write. Either way `Missed` runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sub_write_refused_after_another_server_moved_the_release_runs_on_failure() {
-    for (path, release_ioa) in [
-        ("atomic batch", RELEASE_IOA.to_string()),
-        ("per-write", release_with_own_effect()),
+    for (path, release_ioa, refusal) in [
+        ("atomic batch", RELEASE_IOA.to_string(), "conflict"),
+        (
+            "per-write",
+            release_with_own_effect(),
+            "Action 'Approve' not valid from state 'Out'",
+        ),
     ] {
         let store = SimEventStore::no_faults(41);
         let server = |store: &SimEventStore| {
@@ -555,8 +560,8 @@ async fn a_sub_write_refused_after_another_server_moved_the_release_runs_on_fail
         );
         let error = error_field(&fields);
         assert!(
-            error.contains("Approve"),
-            "{path}: Missed should carry the refusal, got {error:?}"
+            error.contains(refusal),
+            "{path}: Missed should carry the refusal {refusal:?}, got {error:?}"
         );
     }
 }
