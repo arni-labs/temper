@@ -6,7 +6,7 @@ use temper_odata::path::{KeyValue, ODataPath};
 use temper_runtime::tenant::TenantId;
 
 use super::constraints::ConstraintViolation;
-use crate::state::write_record::WriteCaller;
+use crate::state::write_record::RecordWrite;
 use crate::state::{ServerState, VerificationGateError};
 
 /// Extract the tenant ID from request headers.
@@ -173,24 +173,11 @@ pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::r
 /// "Patch", "Put", "Delete").
 pub(super) async fn run_write_prechecks(
     state: &ServerState,
-    caller: WriteCaller,
-    tenant: &TenantId,
-    entity_type: &str,
-    entity_id: &str,
-    action: &str,
-    operation: &str,
+    write: RecordWrite<'_>,
     record: &serde_json::Value,
 ) -> Result<(), axum::response::Response> {
     state
-        .check_record_to_store(
-            caller,
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            operation,
-            record,
-        )
+        .check_record_to_store(write, record)
         .await
         .map_err(constraint_violation_response)
 }

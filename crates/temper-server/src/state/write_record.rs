@@ -52,24 +52,58 @@ impl WriteCaller {
     }
 }
 
+/// One write about to be applied: who makes it and what it stores into.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordWrite<'a> {
+    /// Where the write came from.
+    pub caller: WriteCaller,
+    /// The tenant the record belongs to.
+    pub tenant: &'a TenantId,
+    /// The record's entity type.
+    pub entity_type: &'a str,
+    /// The record's id.
+    pub entity_id: &'a str,
+    /// The action, which selects the cross-invariants that apply (their `on`
+    /// trigger), for example "Create" or "Patch".
+    pub action: &'a str,
+    /// The write's label in violations and metrics, for example "create".
+    pub operation: &'a str,
+}
+
+/// An action about to be sent to the actor, with what it reads to build the
+/// record it will store.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActionPreview<'a> {
+    /// The entity type's transition table.
+    pub table: &'a TransitionTable,
+    /// The record before the action.
+    pub current: &'a EntityState,
+    /// The action's name.
+    pub action: &'a str,
+    /// The action's params.
+    pub params: &'a Value,
+    /// Related records the action's guards read.
+    pub related: &'a RelatedMap,
+}
+
 impl ServerState {
     /// Check the record a write will store against the tenant's relation
     /// integrity, field invariants and hard cross-invariants. A kernel
     /// follow-on is not checked (see the module docs).
     ///
-    /// `action` selects which cross-invariants apply (their `on` trigger);
-    /// `operation` labels the write in violations and metrics.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn check_record_to_store(
         &self,
-        caller: WriteCaller,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        operation: &str,
+        write: RecordWrite<'_>,
         record: &Value,
     ) -> Result<(), ConstraintViolation> {
+        let RecordWrite {
+            caller,
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            operation,
+        } = write;
         if caller == WriteCaller::Kernel {
             return Ok(());
         }
@@ -108,17 +142,19 @@ impl ServerState {
     /// Runs before the action is sent to the actor. Kernel follow-ons and
     /// entity types with no relation, field invariant or matching
     /// cross-invariant skip the work.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn check_action_record(
         &self,
         caller: WriteCaller,
         tenant: &TenantId,
-        table: &TransitionTable,
-        current: &EntityState,
-        action: &str,
-        params: &Value,
-        related: &RelatedMap,
+        preview: ActionPreview<'_>,
     ) -> Result<(), ConstraintViolation> {
+        let ActionPreview {
+            table,
+            current,
+            action,
+            params,
+            related,
+        } = preview;
         if !self.action_record_checked(caller, tenant, &current.entity_type, action) {
             return Ok(());
         }
@@ -126,12 +162,14 @@ impl ServerState {
             .action_record(tenant, table, current, action, params, related)
             .await;
         self.check_record_to_store(
-            caller,
-            tenant,
-            &current.entity_type,
-            &current.entity_id,
-            action,
-            "action",
+            RecordWrite {
+                caller,
+                tenant,
+                entity_type: &current.entity_type,
+                entity_id: &current.entity_id,
+                action,
+                operation: "action",
+            },
             &record,
         )
         .await
@@ -150,7 +188,7 @@ impl ServerState {
         if caller == WriteCaller::Kernel || !self.cross_invariant_enforce {
             return false;
         }
-        let registry = self.registry.read().unwrap(); // ci-ok: RwLock read — poisoned lock = prior panic, fail-fast correct
+        let registry = self.registry.read().expect("registry lock poisoned");
         let Some(tenant_config) = registry.get_tenant(tenant) else {
             return false;
         };
