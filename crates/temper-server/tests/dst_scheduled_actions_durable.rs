@@ -5,7 +5,8 @@
 //! or as a cron (`Plan` stores the next run time and `schedule_at`s `Run` at
 //! it; the cron's callback, played by the test as CronJob's integration does,
 //! plans the next run a period after each `Run`). Some records meet a store
-//! that fails their next write, or writes it and loses the answer. The process
+//! that fails their next write, or writes it and loses the answer, sometimes
+//! failing the row listing the retry after a lost answer reads. The process
 //! stops before some are due and after others, sometimes right after a fire,
 //! before any removal that is not part of its commit. The next process boots
 //! with `start_runtime` and nobody but the cron callback touches the records;
@@ -118,6 +119,12 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                     world.events.lose_next_append_answers(&journal, 1);
                     run.trace
                         .push(format!("{id}: its next write's answer is lost"));
+                    // The retry that follows reads the rows its fire wrote;
+                    // sometimes that read fails too.
+                    if rng.next_bound(2) == 0 {
+                        world.events.fail_next_scheduled_lists(TENANT, 1);
+                        run.trace.push("the next row listing fails".to_string());
+                    }
                     true
                 }
                 _ => false,
@@ -168,6 +175,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
     let downtime = Duration::from_secs(rng.next_bound(7200) as u64);
     first.kill(&world, downtime);
     world.events.hold_scheduled_action_deletes(false);
+    world.events.fail_next_scheduled_lists(TENANT, 0);
     let left_behind = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
