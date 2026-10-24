@@ -666,19 +666,21 @@ impl EntityActor {
 
                     let parsed_event = serde_json::from_value::<EntityEvent>(env.payload.clone());
 
-                    // Tombstone is terminal: once deleted, entity must not replay
-                    // into a live state. Stop at the first Deleted event.
-                    if env.event_type == "Deleted" {
+                    // The kernel's tombstone is terminal: once deleted, an entity
+                    // must not replay into a live state. A spec action that shares
+                    // the tombstone's name replays like any other action.
+                    if env.is_tombstone() {
                         let tombstone = match parsed_event {
                             Ok(mut event) => {
                                 if replay_policy.strict_event_validation() {
-                                    super::replay_validation::validate_strict_entity_event(
-                                        table, state, env, &event,
+                                    super::replay_validation::validate_strict_tombstone(
+                                        state, env, &event,
                                     )?;
                                 }
                                 event.params =
                                     super::effects::sanitize_action_params(&event.params)
                                         .into_owned();
+                                event.kind = temper_runtime::persistence::EventKind::Tombstone;
                                 event
                             }
                             Err(error) if replay_policy.strict_event_validation() => {
@@ -694,6 +696,7 @@ impl EntityActor {
                                 timestamp: env.metadata.timestamp,
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
+                                kind: temper_runtime::persistence::EventKind::Tombstone,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -1074,6 +1077,7 @@ impl Actor for EntityActor {
                 timestamp: sim_now(),
                 params: initial_params,
                 idempotency_key: None,
+                kind: temper_runtime::persistence::EventKind::Transition,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -1857,6 +1861,7 @@ impl Actor for EntityActor {
                     timestamp: sim_now(),
                     params: serde_json::json!({}),
                     idempotency_key: None,
+                    kind: temper_runtime::persistence::EventKind::Tombstone,
                 };
 
                 if let (Some(store), Some(backend)) =

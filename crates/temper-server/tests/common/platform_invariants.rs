@@ -151,17 +151,7 @@ pub async fn assert_p4_store_index_completeness(
             continue; // No events — nothing to index.
         }
 
-        // Check if the last event is a deletion marker.
-        let is_deleted = events.last().is_some_and(|last| {
-            last.event_type == "Deleted"
-                || last
-                    .payload
-                    .get("action")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("Deleted")
-        });
-
-        if is_deleted {
+        if temper_runtime::persistence::journal_is_deleted(&events) {
             continue; // Tombstoned — should NOT be in index (checked by P5).
         }
 
@@ -184,15 +174,14 @@ pub async fn assert_p4_store_index_completeness(
 
 // ── P5: Tombstone Finality ──────────────────────────────────────────────
 
-/// If the last event for an entity is "Deleted", the entity must be absent
-/// from the entity index.
+/// An entity whose journal holds the kernel's tombstone must be absent from
+/// the entity index.
 pub async fn assert_p5_tombstone_finality(harness: &SimPlatformHarness) -> Result<(), String> {
     let index = harness.platform_state.server.entity_index.read().unwrap(); // ci-ok: infallible lock
 
     let store = event_store(harness).ok_or_else(|| "P5: no event store configured".to_string())?;
 
-    // Check every indexed entity: if its last event is a deletion marker,
-    // it should not be in the index.
+    // Check every indexed entity: a tombstoned one must not be in the index.
     for (index_key, entity_ids) in index.iter() {
         let parts: Vec<&str> = index_key.splitn(2, ':').collect();
         if parts.len() != 2 {
@@ -207,18 +196,10 @@ pub async fn assert_p5_tombstone_finality(harness: &SimPlatformHarness) -> Resul
                 .await
                 .map_err(|e| format!("P5: read_events failed for {persistence_id}: {e}"))?;
 
-            if let Some(last) = events.last() {
-                let is_deleted = last.event_type == "Deleted"
-                    || last
-                        .payload
-                        .get("action")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("Deleted");
-                if is_deleted {
-                    return Err(format!(
-                        "P5: entity {persistence_id} is tombstoned but still in index"
-                    ));
-                }
+            if temper_runtime::persistence::journal_is_deleted(&events) {
+                return Err(format!(
+                    "P5: entity {persistence_id} is tombstoned but still in index"
+                ));
             }
         }
     }

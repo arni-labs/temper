@@ -35,17 +35,6 @@ fn actor_idle_timeout_secs() -> i64 {
     })
 }
 
-fn is_deleted_envelope(event: &PersistenceEnvelope) -> bool {
-    if event.event_type == "Deleted" {
-        return true;
-    }
-    event
-        .payload
-        .get("action")
-        .and_then(serde_json::Value::as_str)
-        == Some("Deleted")
-}
-
 fn record_projection_update_started(
     tenant: &TenantId,
     entity_type: &str,
@@ -1265,6 +1254,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: fields,
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
@@ -1450,6 +1440,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: initial_fields,
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;
@@ -1953,7 +1944,7 @@ impl ServerState {
                 _ => return true,
             };
 
-            if events.last().is_some_and(is_deleted_envelope) {
+            if temper_runtime::persistence::journal_is_deleted(&events) {
                 self.remove_entity(tenant, entity_type, entity_id);
                 return false;
             }
@@ -1991,7 +1982,7 @@ impl ServerState {
             return Ok(false);
         }
 
-        if events.last().is_some_and(is_deleted_envelope) {
+        if temper_runtime::persistence::journal_is_deleted(&events) {
             self.remove_entity(tenant, entity_type, entity_id);
             return Ok(false);
         }
