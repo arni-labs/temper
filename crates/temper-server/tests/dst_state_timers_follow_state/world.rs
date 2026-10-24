@@ -18,14 +18,23 @@ use temper_server::storage::StateTimerStore;
 pub(crate) struct SimTimerRows {
     rows: Mutex<BTreeMap<(String, String, String), StateTimerRecord>>,
     rng: Mutex<DeterministicRng>,
+    /// A write takes fewer scheduler turns than this to land.
+    round_trip_turns: usize,
 }
 
 impl SimTimerRows {
-    /// No rows, with write delays drawn from `seed`.
+    /// No rows, with write delays of up to 7 turns drawn from `seed`.
     pub(crate) fn new(seed: u64) -> Self {
+        Self::with_round_trips(seed, 8)
+    }
+
+    /// No rows, with write delays of fewer than `turns` turns drawn from
+    /// `seed`: longer writes overlap more of what runs beside them.
+    pub(crate) fn with_round_trips(seed: u64, turns: usize) -> Self {
         Self {
             rows: Mutex::new(BTreeMap::new()),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x7177_e125)),
+            round_trip_turns: turns,
         }
     }
 
@@ -38,7 +47,7 @@ impl SimTimerRows {
 
     /// Wait the seeded number of scheduler turns a write takes to land.
     async fn round_trip(&self) {
-        let turns = self.rng.lock().unwrap().next_bound(8);
+        let turns = self.rng.lock().unwrap().next_bound(self.round_trip_turns);
         for _ in 0..turns {
             tokio::task::yield_now().await;
         }

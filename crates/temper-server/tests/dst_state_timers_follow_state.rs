@@ -25,7 +25,15 @@
 //! event journal is the simulated store; timer rows live in [`SimTimerRows`],
 //! both shared across restarts. Each row write lands after a seeded delay, so
 //! the writes of overlapping arms and cancellations land in any order.
+//!
+//! Two more workloads share this world: `boot_burst` (the timers a boot finds
+//! due fire a few at a time) and `delete_race` (a delete while timer rows are
+//! still landing leaves no row).
 
+#[path = "dst_state_timers_follow_state/boot_burst.rs"]
+mod boot_burst;
+#[path = "dst_state_timers_follow_state/delete_race.rs"]
+mod delete_race;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
 #[path = "dst_state_timers_follow_state/world.rs"]
@@ -159,12 +167,25 @@ impl Process {
     /// type's records that follows it (awaited here, in the background in
     /// `temper serve`).
     fn start(world: &World, alpha_spec: &str, gamma_spec: &str, name: &str) -> Self {
+        let (process, walk) = Self::boot(world, alpha_spec, gamma_spec, name);
+        process.runtime.block_on(walk).unwrap();
+        process
+    }
+
+    /// Boot as [`Self::start`] does, but return with the walk still running,
+    /// as `temper serve` takes requests while it runs.
+    fn boot(
+        world: &World,
+        alpha_spec: &str,
+        gamma_spec: &str,
+        name: &str,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
             .build()
             .unwrap();
-        let state = runtime.block_on(async {
+        let (state, walk) = runtime.block_on(async {
             world.clock.begin();
             let mut registry = SpecRegistry::new();
             for (tenant, spec) in [
@@ -178,10 +199,10 @@ impl Process {
             let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
             state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
             state.state_timer_rows = Some(world.rows.clone());
-            state.rearm_state_timers().await.await.unwrap();
-            state
+            let walk = state.rearm_state_timers().await;
+            (state, walk)
         });
-        Self { runtime, state }
+        (Self { runtime, state }, walk)
     }
 
     /// Exit: every task of this process stops.
@@ -438,7 +459,12 @@ mod read_failure;
 
 #[test]
 fn dst_state_timers_follow_the_current_state() {
-    // Seeds that broke each invariant, and the first such seed's report.
+    check_seeds(run_seed);
+}
+
+/// Run `run_seed` over every seed and report each invariant it broke, with the
+/// seeds that broke it and the first such seed's report.
+fn check_seeds(run_seed: fn(u64) -> Result<(), String>) {
     let mut broken: BTreeMap<String, (Vec<u64>, String)> = BTreeMap::new();
     for seed in 0..SEEDS {
         if let Err(report) = run_seed(seed) {
