@@ -10,6 +10,7 @@
 mod actor_runtime;
 mod bootstrap;
 mod loader;
+mod local_sandbox;
 mod observe_ui;
 pub(crate) mod options;
 mod storage;
@@ -193,48 +194,7 @@ pub async fn run(
             } else {
                 let sandbox_port = port + 10; // e.g., 3000 → 3010
                 let sandbox_url = format!("http://127.0.0.1:{sandbox_port}");
-
-                // Find the local sandbox script relative to the binary or os-apps.
-                let sandbox_script =
-                    std::path::Path::new("os-apps/temper-agent/sandbox/local_sandbox.py");
-                if sandbox_script.exists() {
-                    // Use /tmp/temper-sandbox as the base; create /workspace for tool_runner
-                    // which sends cwd="/workspace" by default (matching E2B's layout).
-                    let _ = std::fs::create_dir_all("/tmp/temper-sandbox");
-                    let _ = std::fs::create_dir_all("/workspace");
-
-                    // determinism-ok: subprocess spawn at startup for local dev sandbox
-                    let mut sandbox_cmd = std::process::Command::new("python3");
-                    sandbox_cmd
-                        .arg(sandbox_script)
-                        .arg("--port")
-                        .arg(sandbox_port.to_string())
-                        .arg("--workdir")
-                        .arg("/tmp/temper-sandbox")
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null());
-                    if bind != Ipv4Addr::UNSPECIFIED {
-                        // Keep the sandbox no more reachable than the API. Passed
-                        // only when non-default, so older sandbox scripts still start.
-                        sandbox_cmd.arg("--host").arg(bind.to_string());
-                    }
-                    match sandbox_cmd.spawn() {
-                        Ok(_child) => {
-                            println!("  Local sandbox: {sandbox_url} (auto-started)");
-                        }
-                        Err(e) => {
-                            eprintln!("  Warning: failed to start local sandbox: {e}");
-                            eprintln!(
-                                "  Run manually: python3 {sandbox_script:?} --port {sandbox_port}"
-                            );
-                        }
-                    }
-                } else {
-                    eprintln!("  Warning: local sandbox script not found at {sandbox_script:?}");
-                    eprintln!(
-                        "  Set SANDBOX_URL env var or ensure os-apps/temper-agent/sandbox/local_sandbox.py exists"
-                    );
-                }
+                local_sandbox::start(&state.server, sandbox_port, &sandbox_url);
 
                 sandbox_url
             };
