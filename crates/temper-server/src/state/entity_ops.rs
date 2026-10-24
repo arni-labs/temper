@@ -17,7 +17,7 @@ use crate::entity_actor::{EntityActor, EntityEvent, EntityMsg, EntityResponse};
 use crate::events::EntityStateChange;
 use crate::registry::{VerificationDetail, VerificationStatus};
 use crate::runtime_metrics;
-use crate::storage::DataOnlyCreateRecord;
+use crate::storage::{DataOnlyCreateRecord, QueryPlaneStore};
 
 /// Idle actors snapshotted and stopped in one `passivate_idle_actors` tick.
 /// Remainder stay registered for the next tick so snapshot writes cannot
@@ -57,6 +57,20 @@ fn is_deleted_envelope(event: &PersistenceEnvelope) -> bool {
         .and_then(serde_json::Value::as_str)
         == Some("Deleted")
 }
+
+/// Whether an event leaves its entity deleted: the delete tombstone, or a
+/// transition into the terminal `Deleted` status.
+fn ends_in_deletion(event: &PersistenceEnvelope) -> bool {
+    is_deleted_envelope(event)
+        || event
+            .payload
+            .get("to_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("Deleted")
+}
+
+/// Most cooperative yields a simulation takes before a projection write.
+const PROJECTION_WRITE_YIELD_BUDGET: u32 = 32;
 
 fn record_projection_update_started(
     tenant: &TenantId,
@@ -1400,13 +1414,21 @@ impl ServerState {
         Ok(response)
     }
 
-    /// Write an entity's current state to the query projection. The write is
-    /// keyed on the entity's sequence, so repeating it is harmless.
+    /// Write an entity's state, as its actor answered earlier, to the query
+    /// projection.
     ///
     /// A create stores the entity before its projection, and the projection
     /// write can fail on its own. A repeated create of the same key calls
     /// this too, so the repeat leaves the entity visible to collection
     /// queries.
+    ///
+    /// The state can be older than the journal when it is written. The
+    /// projection's sequence guard keeps a newer write; it cannot keep a
+    /// delete, which removes the row and leaves nothing to compare against.
+    /// Deletion is terminal and in the journal before the delete removes the
+    /// row, so after writing, the journal past this state is read: when it
+    /// holds the deletion, the row is removed again. Whichever order the
+    /// delete and this write land in, a deleted entity keeps no row.
     pub(crate) async fn upsert_entity_query_projection(
         &self,
         tenant: &TenantId,
@@ -1418,6 +1440,62 @@ impl ServerState {
         let Some(query_plane) = self.query_plane_store() else {
             return Ok(());
         };
+        // Simulation runs a concurrent delete of this entity here.
+        temper_runtime::buggify::buggify_yield(PROJECTION_WRITE_YIELD_BUDGET).await;
+        let deleted = response.state.status == "Deleted";
+        if !deleted {
+            self.write_entity_query_projection(
+                &query_plane,
+                tenant,
+                entity_type,
+                entity_id,
+                response,
+                source,
+            )
+            .await?;
+        }
+        if deleted
+            || self
+                .deleted_after(tenant, entity_type, entity_id, response.state.sequence_nr)
+                .await?
+        {
+            query_plane
+                .remove_projection(tenant.as_str(), entity_type, entity_id)
+                .await
+                .map_err(|e| format!("query projection removal failed after delete: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Whether the entity's journal records its deletion after `sequence_nr`.
+    async fn deleted_after(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        sequence_nr: u64,
+    ) -> Result<bool, String> {
+        let Some((store, _backend)) = self.event_journal() else {
+            return Ok(false);
+        };
+        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
+        let later = store
+            .read_events(&persistence_id, sequence_nr)
+            .await
+            .map_err(|e| format!("event store read failed for {persistence_id}: {e}"))?;
+        Ok(later.last().is_some_and(ends_in_deletion))
+    }
+
+    /// The sequence-guarded projection write, with its metrics.
+    async fn write_entity_query_projection(
+        &self,
+        query_plane: &Arc<dyn QueryPlaneStore>,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        response: &EntityResponse,
+        source: &str,
+    ) -> Result<(), String> {
         let status = response.state.status.clone();
         let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
         let projected_state = self.query_projection_state(&response.state);

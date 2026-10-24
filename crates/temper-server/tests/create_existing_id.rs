@@ -4,17 +4,15 @@
 
 mod common;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
+use common::odata_requests::{mark_verified, send};
 use serde_json::{Value, json};
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::{EntityVerificationResult, VerificationStatus};
 use temper_server::state::DataOnlyCreate;
-use temper_server::{ServerState, StorageStack, build_router};
+use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
-use tower::ServiceExt;
 
 /// Anyone may create; only the principal an order's number names may read
 /// it. `OrderNumber` is a plain string with no relation, so a create needs no
@@ -57,57 +55,6 @@ name = "Note"
 states = ["Kept"]
 initial = "Kept"
 "#;
-
-fn mark_verified(state: &ServerState, entity_type: &str) {
-    state.registry.write().unwrap().set_verification_status(
-        &TenantId::default(),
-        entity_type,
-        VerificationStatus::Completed(EntityVerificationResult {
-            all_passed: true,
-            levels: vec![],
-            verified_at: "2026-10-23T00:00:00Z".into(),
-        }),
-    );
-}
-
-async fn send(
-    state: &ServerState,
-    method: &str,
-    path: &str,
-    principal_id: &str,
-    body: Option<Value>,
-) -> (StatusCode, String) {
-    let body = body.map_or_else(Body::empty, |value| Body::from(value.to_string()));
-    let mut request = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("content-type", "application/json")
-        .body(body)
-        .unwrap();
-    request
-        .extensions_mut()
-        .insert(temper_authz::AuthenticatedRequestContext::new(
-            TenantId::default(),
-            temper_authz::SecurityContext {
-                principal: temper_authz::Principal {
-                    id: principal_id.to_string(),
-                    kind: temper_authz::PrincipalKind::Customer,
-                    role: None,
-                    acting_for: None,
-                    agent_type: None,
-                    attributes: Default::default(),
-                },
-                context_attrs: Default::default(),
-                correlation_id: "create-existing-id-test".to_string(),
-            },
-        ));
-    let response = build_router(state.clone()).oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
-        .await
-        .unwrap();
-    (status, String::from_utf8_lossy(&bytes).into_owned())
-}
 
 /// Two principals: alice owns a record, bob creates with the same key. Bob
 /// gets 409 and none of alice's data; alice's record is unchanged; alice's
@@ -208,51 +155,6 @@ async fn a_data_only_create_with_an_existing_key_answers_only_what_the_caller_ma
         &state, "Notes", "Owner", "Body",
     )
     .await;
-}
-
-/// Two principals create the same key at the same moment, for many keys.
-/// Exactly one create wins each key. Every 201 carries the caller's own
-/// record; the other caller gets 409 and none of the winner's data.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn racing_creates_of_one_key_answer_each_caller_only_with_its_own_record() {
-    let (state, _store) = common::build_default_state(534, "create-existing-key-race");
-    mark_verified(&state, "Order");
-    state
-        .authz
-        .reload_tenant_policies("default", ORDER_OWNER_READS)
-        .unwrap();
-
-    for round in 0..32 {
-        let key = format!("raced-{round}");
-        let racers = ["alice", "bob"].map(|who| {
-            let state = state.clone();
-            let body = json!({
-                "Id": key,
-                "OrderNumber": who,
-                "Notes": format!("{who} private words"),
-            });
-            tokio::spawn(async move {
-                let answer = send(&state, "POST", "/tdata/Orders", who, Some(body)).await;
-                (who, answer)
-            })
-        });
-        let mut created = 0;
-        for racer in racers {
-            let (who, (status, body)) = racer.await.unwrap();
-            let other = if who == "alice" { "bob" } else { "alice" };
-            assert!(!body.contains(other), "{key}: {who} got {status} {body}");
-            match status {
-                StatusCode::CREATED => {
-                    created += 1;
-                    let answer: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(answer["fields"]["OrderNumber"], who, "{key}: {body}");
-                }
-                StatusCode::CONFLICT => {}
-                other_status => panic!("{key}: {who} got {other_status} {body}"),
-            }
-        }
-        assert_eq!(created, 1, "{key}: exactly one create wins the key");
-    }
 }
 
 /// A create that finds the key's actor already started by another create

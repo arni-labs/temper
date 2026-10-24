@@ -1,0 +1,263 @@
+//! Seeded simulations of a create racing another request for the same key.
+//!
+//! Each seed drives one single-threaded execution against the simulated
+//! journal. The create path's cooperative yield points (`buggify_yield`) take
+//! a seeded number of yields, so the other request runs at a different point
+//! of the create on each seed, and the same seed replays the same execution.
+//! Seeds that broke an invariant on the code before the fix stay listed as
+//! regression cases.
+
+mod common;
+
+use common::odata_requests::{mark_verified, send};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use axum::http::StatusCode;
+use serde_json::{Value, json};
+use temper_runtime::buggify::install_buggify_context;
+use temper_runtime::persistence::PersistenceError;
+use temper_runtime::scheduler::install_deterministic_context;
+use temper_runtime::tenant::TenantId;
+use temper_server::storage::{
+    BackendLabel, BoxedEventStore, QueryPlaneStore, QueryProjectionFieldsRow,
+};
+use temper_server::{ServerState, StorageStack};
+use temper_store_sim::SimEventStore;
+
+/// Anyone may create; only the principal an order's number names may read it.
+const ORDER_OWNER_READS: &str = r#"
+permit(principal, action == Action::"create", resource is Order);
+permit(principal, action == Action::"read", resource is Order)
+when { resource has OrderNumber && resource.OrderNumber == principal.id };
+"#;
+
+/// Seeds whose schedule gave a caller the other caller's order before racing
+/// creates were fixed (50 of seeds 0..64 did; these are the first eight).
+const RACE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 4, 5, 7, 8, 10];
+
+/// Seeds whose schedule put a deleted order back into the query projection
+/// before the projection write checked for deletion (all of seeds 0..64 did;
+/// these are the first eight).
+const DELETE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
+
+/// Seeds explored on every run besides the regression cases.
+const EXPLORED_SEEDS: u64 = 64;
+
+fn seeds(regressions: &'static [u64]) -> impl Iterator<Item = u64> {
+    let explored = (0..EXPLORED_SEEDS).filter(|seed| !regressions.contains(seed));
+    regressions.iter().copied().chain(explored)
+}
+
+fn order(owner: &str) -> Value {
+    json!({
+        "Id": "raced-key",
+        "OrderNumber": owner,
+        "Notes": format!("{owner} private words"),
+    })
+}
+
+/// The query projection as rows keyed by entity, with the stores' sequence
+/// guard: a write older than the row it would replace is refused.
+#[derive(Default)]
+struct ProjectionModel {
+    rows: Mutex<BTreeMap<(String, String, String), u64>>,
+}
+
+impl ProjectionModel {
+    fn holds(&self, entity_type: &str, entity_id: &str) -> bool {
+        let key = (
+            "default".to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        );
+        self.rows.lock().unwrap().contains_key(&key)
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryPlaneStore for ProjectionModel {
+    async fn upsert_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        _status: &str,
+        _fields: &Value,
+        _state: &Value,
+        sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        let key = (
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        );
+        let mut rows = self.rows.lock().unwrap();
+        if rows.get(&key).is_none_or(|stored| *stored <= sequence_nr) {
+            rows.insert(key, sequence_nr);
+        }
+        Ok(())
+    }
+
+    async fn remove_projection(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let key = (
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        );
+        self.rows.lock().unwrap().remove(&key);
+        Ok(())
+    }
+
+    async fn query_field_index(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _where_clause: &str,
+        _params: Vec<String>,
+    ) -> Result<Option<Vec<String>>, PersistenceError> {
+        Ok(None)
+    }
+
+    async fn load_projection_fields_many(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _entity_ids: &[String],
+        _field_names: &[&str],
+    ) -> Result<Option<Vec<QueryProjectionFieldsRow>>, PersistenceError> {
+        Ok(None)
+    }
+
+    async fn projected_entity_counts_by_tenant(
+        &self,
+    ) -> Result<Option<Vec<(String, u64)>>, PersistenceError> {
+        Ok(None)
+    }
+}
+
+/// An Order state on the simulated journal with owner-only reads, and the
+/// modelled query projection it writes to.
+fn order_state(seed: u64, system: &str) -> (ServerState, Arc<ProjectionModel>) {
+    let journal = SimEventStore::no_faults(seed);
+    let projection = Arc::new(ProjectionModel::default());
+    let mut state = common::build_default_state_with_store(journal.clone(), system);
+    state.set_storage_stack(StorageStack::new(
+        BackendLabel::Sim,
+        BoxedEventStore::new(journal),
+        None,
+        None,
+        None,
+        None,
+        Some(projection.clone()),
+        None,
+        None,
+        None,
+    ));
+    mark_verified(&state, "Order");
+    state
+        .authz
+        .reload_tenant_policies("default", ORDER_OWNER_READS)
+        .unwrap();
+    (state, projection)
+}
+
+/// Two principals create the same key at once. Exactly one create wins it,
+/// every 201 carries the caller's own order, and the other caller gets 409
+/// with none of the winner's data. `Err` names the broken invariant.
+async fn racing_creates(seed: u64) -> Result<(), String> {
+    let _sim = install_deterministic_context(seed);
+    let _faults = install_buggify_context(seed);
+    let (state, _projection) = order_state(seed, &format!("create-race-{seed}"));
+
+    let (alice, bob) = tokio::join!(
+        send(
+            &state,
+            "POST",
+            "/tdata/Orders",
+            "alice",
+            Some(order("alice"))
+        ),
+        send(&state, "POST", "/tdata/Orders", "bob", Some(order("bob"))),
+    );
+    let mut created = 0;
+    for (who, other, (status, body)) in [("alice", "bob", alice), ("bob", "alice", bob)] {
+        if body.contains(other) {
+            return Err(format!("{who} got {other}'s order: {status} {body}"));
+        }
+        match status {
+            StatusCode::CREATED => created += 1,
+            StatusCode::CONFLICT => {}
+            other_status => return Err(format!("{who} got {other_status} {body}")),
+        }
+    }
+    if created != 1 {
+        return Err(format!("{created} creates won the key"));
+    }
+    Ok(())
+}
+
+/// The owner repeats a create while the order is deleted. However the two
+/// interleave, the deleted order keeps no query projection row, so collection
+/// queries do not list it again. `Err` names the broken invariant.
+async fn repeated_create_racing_delete(seed: u64) -> Result<(), String> {
+    let _sim = install_deterministic_context(seed);
+    let (state, projection) = order_state(seed, &format!("create-delete-{seed}"));
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/tdata/Orders",
+        "alice",
+        Some(order("alice")),
+    )
+    .await;
+    if status != StatusCode::CREATED || !projection.holds("Order", "raced-key") {
+        return Err(format!("the first create got {status} {body}"));
+    }
+
+    let _faults = install_buggify_context(seed);
+    let tenant = TenantId::default();
+    let (repeat, deleted) = tokio::join!(
+        send(
+            &state,
+            "POST",
+            "/tdata/Orders",
+            "alice",
+            Some(order("alice"))
+        ),
+        state.delete_tenant_entity(&tenant, "Order", "raced-key"),
+    );
+    match deleted {
+        Ok(response) if response.success => {}
+        other => return Err(format!("the delete failed: {other:?}")),
+    }
+    if projection.holds("Order", "raced-key") {
+        return Err(format!(
+            "the deleted order is back in the query projection; the repeat got {repeat:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn racing_creates_of_one_key_answer_each_caller_only_with_its_own_record() {
+    for seed in seeds(RACE_REGRESSION_SEEDS) {
+        if let Err(violation) = racing_creates(seed).await {
+            panic!("seed {seed}: {violation}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_create_racing_a_delete_leaves_the_deleted_record_out_of_queries() {
+    for seed in seeds(DELETE_REGRESSION_SEEDS) {
+        if let Err(violation) = repeated_create_racing_delete(seed).await {
+            panic!("seed {seed}: {violation}");
+        }
+    }
+}

@@ -42,6 +42,10 @@ use crate::state::{DataOnlyCreate, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
 
+/// Most cooperative yields a simulation takes between a create's key check
+/// and its create.
+const CREATE_CHECK_YIELD_BUDGET: u32 = 8;
+
 fn parse_odata_path_or_400(path: &str) -> Result<ODataPath, ODataWriteError> {
     parse_path(&format!("/{path}")).map_err(|e| {
         Box::new(
@@ -797,6 +801,8 @@ pub async fn handle_odata_post(
             {
                 return taken_key_response(&state, &target).await;
             }
+            // Simulation runs a concurrent create of the same key here.
+            temper_runtime::buggify::buggify_yield(CREATE_CHECK_YIELD_BUDGET).await;
 
             // A new entity's first event holds its initial fields: one too large is
             // refused here, before any create path starts.
