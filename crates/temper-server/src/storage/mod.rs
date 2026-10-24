@@ -46,6 +46,7 @@ mod policy_router_impls;
 mod published_artifacts;
 mod query_plane_impls;
 mod query_plane_read;
+mod query_plane_router_impls;
 mod redaction;
 mod state_timers;
 mod trajectory_row;
