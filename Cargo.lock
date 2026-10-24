@@ -7514,6 +7514,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "stacker",
  "stateright",
  "temper-runtime",
  "temper-spec",

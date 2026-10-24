@@ -239,6 +239,7 @@ impl ReactionDispatcher {
                 entity_type,
                 entity_id,
                 action,
+                depth,
             );
             dispatch_ctx.inline_chain = chain;
 

@@ -739,8 +739,7 @@ fn stepping_ioa(actions: usize) -> String {
         .map(|index| format!("\"S{index}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut ioa =
-        format!("[automaton]\nname = \"Steps\"\ninitial = \"S0\"\nstates = [{states}]\n");
+    let mut ioa = format!("[automaton]\nname = \"Steps\"\ninitial = \"S0\"\nstates = [{states}]\n");
     for index in 0..actions {
         ioa.push_str(&format!(
             "\n[[action]]\nname = \"A{index}\"\nfrom = [\"S{index}\"]\nto = \"S{}\"\nkind = \"internal\"\n",

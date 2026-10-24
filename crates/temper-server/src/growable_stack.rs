@@ -2,12 +2,18 @@
 //!
 //! A boxed future keeps its state on the heap, but polling a future that
 //! awaits another boxed future still nests one poll frame per level on the
-//! caller's thread stack. Work that recurses as deep as its data (a reaction
-//! chain, an inline integration callback that runs another action) polls each
-//! level through [`on_growable_stack`], so a deep chain gets more stack instead
-//! of overflowing the thread and taking the process down.
+//! caller's thread stack, and dropping it nests one drop per level. Work that
+//! recurses as deep as its data (a reaction chain, an inline integration
+//! callback that runs another action) builds, polls and drops each level
+//! through [`on_growable_stack`], and synchronous recursion of the same kind
+//! (the simulation dispatcher) runs each level through [`grow`], so a deep
+//! chain gets more stack instead of overflowing the thread and taking the
+//! process down.
 
-use futures_util::FutureExt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use futures_util::future::BoxFuture;
 
 // Both sizes are the ones the inline callback boundary has used since
@@ -21,18 +27,42 @@ const RED_ZONE: usize = 2 * 1024 * 1024;
 /// Size of each new segment.
 const STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Build and poll the future `make` returns on a stack that grows when the
-/// current one runs low, both while building it and on every poll.
+/// Build the future `make` returns, and poll and drop it, on a stack that
+/// grows when the current one runs low.
 pub(crate) fn on_growable_stack<'a, T: 'a>(
     make: impl FnOnce() -> BoxFuture<'a, T>,
 ) -> BoxFuture<'a, T> {
-    stacker::maybe_grow(RED_ZONE, STACK_BYTES, || {
-        let mut future = make();
-        futures_util::future::poll_fn(move |context| {
-            stacker::maybe_grow(RED_ZONE, STACK_BYTES, || future.as_mut().poll(context))
-        })
-        .boxed()
-    })
+    Box::pin(OnGrowableStack { future: grow(make) })
+}
+
+/// Run `level` on a stack that grows when the current one runs low.
+pub(crate) fn grow<R>(level: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(RED_ZONE, STACK_BYTES, level)
+}
+
+/// A level of a chain, polled and dropped through [`grow`].
+struct OnGrowableStack<'a, T: 'a> {
+    future: BoxFuture<'a, T>,
+}
+
+impl<'a, T: 'a> Future for OnGrowableStack<'a, T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<T> {
+        let future = &mut self.future;
+        grow(|| future.as_mut().poll(context))
+    }
+}
+
+impl<'a, T: 'a> Drop for OnGrowableStack<'a, T> {
+    /// A pending level holds the next level, which holds the one after it,
+    /// so dropping a chain drops every level one inside another. The level's
+    /// future is swapped for one that holds nothing and dropped here, where
+    /// the stack can grow.
+    fn drop(&mut self) {
+        let future = std::mem::replace(&mut self.future, Box::pin(std::future::pending()));
+        grow(|| drop(future));
+    }
 }
 
 #[cfg(test)]

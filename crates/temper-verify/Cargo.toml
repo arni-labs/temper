@@ -13,4 +13,5 @@ stateright = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+stacker = "0.1.23"
 z3 = { version = "0.19" }

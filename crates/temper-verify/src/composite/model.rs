@@ -30,6 +30,19 @@ use temper_spec::predicate::{Env, Expr, Val, eval};
 
 use super::CompositeVerificationPlan;
 
+// Sizes for growing the stack a cascade recurses on. They refuse nothing:
+// they say when a level moves to a new segment and how big a new one is. A
+// level evaluates the target's model and guards before it recurses, and
+// 128 KiB is ample room for that, so a checker thread's own stack is used
+// until a cascade is deep and `next_state` allocates nothing for a shallow
+// one.
+
+/// Stack that must be left before a cascade level is entered; with less, it
+/// runs on a new segment.
+const CASCADE_RED_ZONE: usize = 128 * 1024;
+/// Size of each new segment.
+const CASCADE_SEGMENT_BYTES: usize = 1024 * 1024;
+
 /// A step of a cascade: an action on an entity. The joint state holds one
 /// entity per type, so a step is its type and action, and a target a
 /// `create` trigger makes is that type's entity too. The runtime stops a chain
@@ -250,14 +263,18 @@ impl CompositeTemperModel {
             state.entities.insert(edge.to.clone(), new_target_state);
 
             // Recurse: the target action itself may trigger further cascades.
+            // A cascade is as deep as the spec's distinct steps, so each level
+            // runs on a stack that grows.
             chain.push(step);
-            self.cascade(
-                state,
-                &edge.to,
-                &target_action.name,
-                &new_target_status,
-                chain,
-            );
+            stacker::maybe_grow(CASCADE_RED_ZONE, CASCADE_SEGMENT_BYTES, || {
+                self.cascade(
+                    state,
+                    &edge.to,
+                    &target_action.name,
+                    &new_target_status,
+                    chain,
+                );
+            });
             chain.pop();
         }
     }

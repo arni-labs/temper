@@ -16,7 +16,8 @@ use crate::request_context::AgentContext;
 ///   directly — the trigger runs as whoever called the source action.
 ///
 /// Either way the reaction carries its own idempotency key, derived from the
-/// caller's and the rule's name ([`reaction_idempotency_key`]).
+/// caller's, the rule's name and the reaction's `depth` in its chain
+/// ([`reaction_idempotency_key`]).
 pub(super) fn resolve_trigger_principal(
     declared_principal: Option<&str>,
     invoking_ctx: &AgentContext,
@@ -24,6 +25,7 @@ pub(super) fn resolve_trigger_principal(
     source_entity_type: &str,
     source_entity_id: &str,
     source_action: &str,
+    depth: u32,
 ) -> AgentContext {
     let mut ctx = match declared_principal {
         Some(service_name) if !service_name.is_empty() => {
@@ -54,9 +56,15 @@ pub(super) fn resolve_trigger_principal(
         }
         _ => invoking_ctx.clone(),
     };
-    ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name);
+    ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name, depth);
     ctx
 }
+
+/// Reactions a chain ran before chains stopped at their first repeated step:
+/// earlier servers stopped every chain after eight. Their keys are stored,
+/// and a key here is compared by its text, so these levels keep the form
+/// they were written in.
+const LEVELS_KEYED_BY_SUFFIX: u32 = 8;
 
 /// A reaction's idempotency key: the caller's, made the rule's own (ADR-0048).
 /// A retry of the source action carries the same caller key, so its reactions
@@ -65,14 +73,24 @@ pub(super) fn resolve_trigger_principal(
 /// that record has just recorded under the key, and the reaction would be
 /// answered as done without running.
 ///
-/// The key ends in a digest of the caller's key and the rule, so it is the
-/// same length however deep in its chain the reaction is: a chain is as long
-/// as its data, every event it writes stores its key, and a key that grew by
-/// a suffix at each reaction would make a chain's keys cost the square of its
-/// length.
-fn reaction_idempotency_key(invoking_ctx: &AgentContext, rule_name: &str) -> Option<String> {
+/// The first [`LEVELS_KEYED_BY_SUFFIX`] levels append `:reaction:<rule>` to
+/// the caller's key, as earlier servers did: a source action retried after an
+/// upgrade sends its reactions again, and only the key they were stored under
+/// shows them done. Deeper levels, which no earlier server ran, end in a
+/// digest of the caller's key and the rule instead, so a key stops growing: a
+/// chain is as long as its data, every event it writes stores its key, and a
+/// key that grew at every level would make a chain's keys cost the square of
+/// its length.
+fn reaction_idempotency_key(
+    invoking_ctx: &AgentContext,
+    rule_name: &str,
+    depth: u32,
+) -> Option<String> {
     use sha2::{Digest, Sha256};
     invoking_ctx.idempotency_key.as_ref().map(|key| {
+        if depth < LEVELS_KEYED_BY_SUFFIX {
+            return format!("{key}:reaction:{rule_name}");
+        }
         let digest = Sha256::digest(format!("{key}\0{rule_name}").as_bytes());
         format!("reaction:{rule_name}:{digest:x}")
     })
