@@ -716,8 +716,11 @@ pub async fn assert_p16_event_replay_fidelity(harness: &SimPlatformHarness) -> R
                 // The durable journal itself, read without simulated faults.
                 let events = harness.sim_event_store.dump_journal(&persistence_id);
                 let mut status: Option<String> = None;
+                let mut tombstoned = false;
 
                 for event in &events {
+                    // Match replay's tombstone discriminator, not a spec state name.
+                    tombstoned |= event.event_type == "Deleted";
                     let field =
                         |key: &str| event.payload.get(key).and_then(serde_json::Value::as_str);
                     // Events without a stored transition (composite
@@ -762,7 +765,7 @@ pub async fn assert_p16_event_replay_fidelity(harness: &SimPlatformHarness) -> R
                 }
 
                 if let Some(status) = status
-                    && status != "Deleted"
+                    && !tombstoned
                 {
                     expected_status.push((
                         tenant.to_string(),
