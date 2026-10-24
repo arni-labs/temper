@@ -2,9 +2,10 @@
 //!
 //! A `schedule` that waits on the clock starts a fresh callback lineage, so a
 //! periodic schedule (a cron, a token refresh) keeps cycling however many hops
-//! its cycles spend. A scheduled follow-on is named by the transition that
-//! made it: a retried request that replays the same reply starts no second
-//! copy, and two transitions that schedule the same action both run.
+//! its cycles spend. A scheduled follow-on of a keyed request gets a key
+//! derived from the request's: a retry, while the follow-on waits or after it
+//! ran, runs no second copy, and two requests that schedule the same action
+//! both run.
 
 use std::time::Duration;
 

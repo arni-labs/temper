@@ -12,7 +12,6 @@ mod file_read_blobs;
 mod file_read_projection;
 mod file_reads;
 mod file_writes;
-mod follow_ons;
 pub mod metrics;
 pub mod pending_decisions;
 mod persistence;
@@ -513,8 +512,6 @@ pub struct ServerState {
     /// counter used to cancel stale timers when the entity transitions out
     /// of a declared state or reset_on fires.
     pub state_timeout_tracker: Arc<StateTimeoutTracker>,
-    /// Scheduled follow-ons waiting for their due second (see `follow_ons`).
-    pub(crate) pending_follow_ons: follow_ons::PendingFollowOns,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -814,7 +811,6 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
-            pending_follow_ons: follow_ons::PendingFollowOns::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1092,7 +1088,6 @@ impl ServerState {
             action_dispatch_timeout: env_timeout(),
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
-            pending_follow_ons: follow_ons::PendingFollowOns::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),

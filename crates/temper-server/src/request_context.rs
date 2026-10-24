@@ -129,15 +129,27 @@ impl AgentContext {
     /// has completed. A follow-on with no delay, including a `schedule_at`
     /// whose time has already passed, keeps the parent's callback lineage.
     ///
-    /// Either way the follow-on is a new action and does not carry the
-    /// parent's idempotency key: the record has already recorded that key for
-    /// the scheduling transition, so the follow-on would be answered with that
-    /// transition's reply and never run (state timers drop it the same way).
-    /// A retried parent is kept from starting a second copy by the follow-on's
-    /// own name (`state::follow_ons`).
-    pub(crate) fn for_scheduled_follow_on(&self, delay_seconds: u64) -> Self {
+    /// Either way the follow-on is a new request on the record: it gets an
+    /// idempotency key of its own, derived from this context's key, the
+    /// scheduled action and the effect's place in the transition (`index`).
+    /// The parent's key itself would answer the follow-on with the scheduling
+    /// transition's reply, so it would never run. A retry of the parent, in
+    /// flight or long finished, derives the same key, and the record answers
+    /// the second copy with the first one's reply instead of running it again.
+    pub(crate) fn for_scheduled_follow_on(
+        &self,
+        action: &str,
+        index: usize,
+        delay_seconds: u64,
+    ) -> Self {
         let mut next = self.clone();
-        next.idempotency_key = None;
+        next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
+            crate::idempotency::derived_idempotency_key(
+                key,
+                &format!("scheduled:{action}"),
+                &index.to_string(),
+            )
+        });
         if delay_seconds > 0 {
             next.callback_depth = 0;
             next.callback_hops = 0;

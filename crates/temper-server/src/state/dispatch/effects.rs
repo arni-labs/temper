@@ -534,40 +534,21 @@ impl crate::state::ServerState {
     ///
     /// Propagates the originating `AgentContext` so that scheduled actions
     /// retain identity attribution in trajectories and SSE events.
-    /// `parent_event` names the transition that scheduled them (its
-    /// `total_event_count`), so a replayed reply of that transition starts no
-    /// second copy of a follow-on still in flight (see `state::follow_ons`).
     pub(crate) fn dispatch_scheduled_actions(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-        parent_event: usize,
         scheduled_actions: &[ScheduledAction],
         agent_ctx: &AgentContext,
     ) {
-        for (effect_index, sched) in scheduled_actions.iter().enumerate() {
+        for (index, sched) in scheduled_actions.iter().enumerate() {
             let state = self.clone();
             let t = tenant.clone();
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = agent_ctx.for_scheduled_follow_on(sched.delay_seconds);
-            let pending = crate::state::follow_ons::FollowOnKey {
-                tenant: tenant.to_string(),
-                entity_type: et.clone(),
-                entity_id: eid.clone(),
-                parent_event,
-                effect_index,
-            };
-            if !self.pending_follow_ons.claim(pending.clone()) {
-                tracing::debug!(
-                    tenant = %tenant, entity_type, entity_id, action = %action,
-                    parent_event, effect_index,
-                    "scheduled follow-on of a replayed reply is already in flight"
-                );
-                continue;
-            }
+            let ctx = agent_ctx.for_scheduled_follow_on(&action, index, sched.delay_seconds);
             let delay = std::time::Duration::from_secs(sched.delay_seconds);
             let workflow_root_entity_type = ctx
                 .workflow_root_entity_type
@@ -597,7 +578,6 @@ impl crate::state::ServerState {
                     let _ = state
                         .dispatch_tenant_action(&t, &et, &eid, &action, serde_json::json!({}), &ctx)
                         .await;
-                    state.pending_follow_ons.release(&pending);
                 }
                 .instrument(span),
             );
@@ -635,7 +615,6 @@ impl crate::state::ServerState {
                 ctx.tenant,
                 ctx.entity_type,
                 ctx.entity_id,
-                response.state.total_event_count,
                 &response.scheduled_actions,
                 ctx.agent_ctx,
             );
@@ -953,7 +932,3 @@ mod strict_timer_tests {
 #[cfg(test)]
 #[path = "causal_projection_test.rs"]
 mod causal_projection_tests;
-
-#[cfg(test)]
-#[path = "scheduled_follow_on_test.rs"]
-mod scheduled_follow_on_tests;
