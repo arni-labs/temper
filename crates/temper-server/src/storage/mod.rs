@@ -42,6 +42,7 @@ mod event_size;
 mod metadata_impls;
 mod observe_read;
 mod policy_impls;
+mod policy_router_impls;
 mod published_artifacts;
 mod query_plane_impls;
 mod query_plane_read;
@@ -864,6 +865,17 @@ pub trait PolicyStore: Send + Sync {
         cedar_text: &str,
         created_by: &str,
     ) -> Result<bool, String>;
+
+    /// Make `policy_id` the tenant's only enabled entry, holding `cedar_text`, in one
+    /// transaction. Every other entry stays listed, disabled, so a reload activates
+    /// exactly this text.
+    async fn replace_tenant_policies(
+        &self,
+        tenant: &str,
+        policy_id: &str,
+        cedar_text: &str,
+        created_by: &str,
+    ) -> Result<(), String>;
 
     async fn delete_policy(&self, tenant: &str, policy_id: &str) -> Result<(), String>;
 }
