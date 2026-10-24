@@ -204,6 +204,7 @@ impl BlobStore {
         stream: BlobByteStream,
         content_len: u64,
     ) -> Result<(), String> {
+        self.check_key(key)?;
         let queued_at = Instant::now(); // determinism-ok: production blob I/O queue metric only
         let _permit =
             tokio::time::timeout(BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore().acquire_owned())

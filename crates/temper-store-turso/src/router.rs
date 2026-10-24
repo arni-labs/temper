@@ -18,10 +18,12 @@ use temper_runtime::persistence::{
     EventStore, PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
     storage_error,
 };
-use temper_runtime::tenant::parse_persistence_id_parts;
+use temper_runtime::tenant::{TenantId, parse_persistence_id_parts};
 
 use crate::TursoEventStore;
 use crate::schema;
+
+mod tenant_database;
 
 /// Routes storage operations to per-tenant Turso databases.
 ///
@@ -31,6 +33,8 @@ use crate::schema;
 pub struct TenantStoreRouter {
     /// Platform database — tenant registry, user mappings, system integrations.
     platform: TursoEventStore,
+    /// URL the platform database was opened from (a tenant delete never removes it).
+    platform_url: String,
     /// Per-tenant database connections, keyed by tenant ID.
     tenants: Arc<RwLock<BTreeMap<String, TursoEventStore>>>,
     /// Turso Cloud API token for dynamic provisioning (optional).
@@ -96,6 +100,7 @@ impl TenantStoreRouter {
 
         let router = Self {
             platform,
+            platform_url: platform_url.to_string(),
             tenants: Arc::new(RwLock::new(BTreeMap::new())),
             #[cfg(feature = "cloud")]
             turso_api_token: None,
@@ -243,10 +248,15 @@ impl TenantStoreRouter {
 
     /// Remove a tenant entirely.
     ///
-    /// Deletes the tenant from `tenant_registry`, removes associated users,
-    /// and evicts the in-memory store connection.
+    /// Removes the tenant's database first, so an id created again starts
+    /// empty, then deletes the tenant from `tenant_registry`, removes
+    /// associated users, and evicts the in-memory store connection. If the
+    /// database cannot be removed nothing else changes, and the delete can be
+    /// retried.
     #[instrument(skip_all, fields(tenant_id, otel.name = "router.remove_tenant"))]
-    pub async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
+    pub async fn remove_tenant(&self, tenant: &TenantId) -> Result<bool, PersistenceError> {
+        let tenant_id = tenant.as_str();
+        self.drop_tenant_database(tenant).await?;
         let conn = self.platform.connection().await.map_err(storage_error)?;
 
         // Delete associated users and installed apps first.
@@ -304,7 +314,8 @@ impl TenantStoreRouter {
     /// If the tenant is already registered, returns `Ok(true)` (already existed).
     /// If not, provisions a new database and registers it, returning `Ok(false)`.
     #[instrument(skip_all, fields(tenant_id, otel.name = "router.ensure_tenant"))]
-    pub async fn ensure_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
+    pub async fn ensure_tenant(&self, tenant: &TenantId) -> Result<bool, PersistenceError> {
+        let tenant_id = tenant.as_str();
         {
             let tenants = self.tenants.read().await;
             if tenants.contains_key(tenant_id) {
@@ -332,7 +343,7 @@ impl TenantStoreRouter {
             return Ok(true);
         }
         // Not in DB either — provision new.
-        self.register_tenant(tenant_id).await?;
+        self.register_tenant(tenant).await?;
         Ok(false)
     }
 
@@ -343,8 +354,9 @@ impl TenantStoreRouter {
     #[instrument(skip_all, fields(tenant_id, otel.name = "router.register_tenant"))]
     pub async fn register_tenant(
         &self,
-        tenant_id: &str,
+        tenant: &TenantId,
     ) -> Result<TursoEventStore, PersistenceError> {
+        let tenant_id = tenant.as_str();
         // Check if already registered.
         {
             let tenants = self.tenants.read().await;
@@ -355,7 +367,7 @@ impl TenantStoreRouter {
             }
         }
 
-        let (db_url, auth_token) = self.provision_database(tenant_id).await?;
+        let (db_url, auth_token) = self.provision_database(tenant).await?;
 
         // Connect first (before moving values into params).
         let store = TursoEventStore::new(&db_url, auth_token.as_deref()).await?;
@@ -471,15 +483,15 @@ impl TenantStoreRouter {
     ///
     /// In local mode: creates a `file:{base_dir}/{tenant_id}.db` SQLite file.
     /// In cloud mode: calls the Turso Cloud API to create a database.
+    /// A [`TenantId`] is one path-safe segment, so the file stays in `base_dir`.
     async fn provision_database(
         &self,
-        tenant_id: &str,
+        tenant: &TenantId,
     ) -> Result<(String, Option<String>), PersistenceError> {
+        let tenant_id = tenant.as_str();
         #[cfg(feature = "cloud")]
         if let (Some(api_token), Some(org)) = (&self.turso_api_token, &self.turso_org) {
-            return self
-                .provision_cloud_database(tenant_id, api_token, org)
-                .await;
+            return self.provision_cloud_database(tenant, api_token, org).await;
         }
 
         // Local mode: create a file-based database.
@@ -498,13 +510,14 @@ impl TenantStoreRouter {
     #[cfg(feature = "cloud")]
     async fn provision_cloud_database(
         &self,
-        tenant_id: &str,
+        tenant: &TenantId,
         api_token: &str,
         org: &str,
     ) -> Result<(String, Option<String>), PersistenceError> {
+        let tenant_id = tenant.as_str();
         let client = reqwest::Client::new();
 
-        // Sanitize tenant ID for use as a database name (alphanumeric + hyphens).
+        // A TenantId is one path segment; Turso Cloud refuses a name outside its own naming rules.
         let db_name = format!("temper-{tenant_id}");
 
         let mut body = serde_json::json!({
@@ -856,7 +869,10 @@ mod tests {
         assert!(tenants.is_empty());
 
         // Register a tenant.
-        let _store = router.register_tenant("alpha").await.expect("register");
+        let _store = router
+            .register_tenant(&TenantId::new("alpha"))
+            .await
+            .expect("register");
 
         // Verify it's registered.
         let tenants = router.list_tenants().await.expect("list");
@@ -965,7 +981,7 @@ mod tests {
         .expect("insert registry row");
 
         let existed = router
-            .ensure_tenant("preprovisioned")
+            .ensure_tenant(&TenantId::new("preprovisioned"))
             .await
             .expect("ensure existing tenant");
         assert!(existed, "existing tenant should report already existed");
@@ -991,8 +1007,14 @@ mod tests {
         .await
         .expect("router creation");
 
-        let first = router.ensure_tenant("repeat").await.expect("first ensure");
-        let second = router.ensure_tenant("repeat").await.expect("second ensure");
+        let first = router
+            .ensure_tenant(&TenantId::new("repeat"))
+            .await
+            .expect("first ensure");
+        let second = router
+            .ensure_tenant(&TenantId::new("repeat"))
+            .await
+            .expect("second ensure");
 
         assert!(!first, "first ensure should provision the tenant");
         assert!(
@@ -1053,7 +1075,7 @@ mod tests {
         router.turso_api_base_url = server.uri();
 
         let (db_url, auth_token) = router
-            .provision_cloud_database("alpha", "api-token", org)
+            .provision_cloud_database(&TenantId::new("alpha"), "api-token", org)
             .await
             .expect("provision should recover from 409");
 

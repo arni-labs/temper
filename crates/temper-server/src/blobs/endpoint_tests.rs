@@ -199,3 +199,36 @@ async fn internal_blob_http_requires_exact_object_authority() {
         assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{method}");
     }
 }
+
+#[tokio::test]
+async fn a_key_in_the_other_tenants_directory_is_the_default_tenants_request_to_fix() {
+    let data_dir = tempfile::tempdir().expect("blob data directory");
+    let mut state = ServerState::from_registry(
+        ActorSystem::new("default-tenant-reserved-key"),
+        SpecRegistry::new(),
+    );
+    state.data_dir = data_dir.path().to_path_buf();
+    install_blob_policy(&state, "default");
+    let app = crate::build_router(state);
+
+    for method in [Method::GET, Method::PUT] {
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                method.clone(),
+                &format!("/_internal/blobs/Tenants/0a1b/{KEY}"),
+                "default",
+                Body::from("default bytes"),
+            ))
+            .await
+            .expect("default tenant blob request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded refusal");
+        assert!(
+            String::from_utf8_lossy(&body).contains("holds other tenants' objects"),
+            "{method}"
+        );
+    }
+}

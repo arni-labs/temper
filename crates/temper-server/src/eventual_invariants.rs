@@ -155,6 +155,11 @@ impl EventualInvariantTracker {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// Drop a deleted tenant's pending invariants, so none is checked against the tenant created again.
+    pub fn forget_tenant(&mut self, tenant: &str) {
+        self.pending.retain(|_, pending| pending.tenant != tenant);
+    }
 }
 
 /// Spawn a background task that periodically re-checks due eventual invariants.

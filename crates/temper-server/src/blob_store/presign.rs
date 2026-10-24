@@ -26,6 +26,7 @@ impl BlobStore {
         expires_secs: u64,
         response: &PresignedResponse<'_>,
     ) -> Option<String> {
+        self.check_key(key).ok()?;
         match &self.backend {
             BlobStoreBackend::LocalFs { .. } => None,
             BlobStoreBackend::S3(store) => {

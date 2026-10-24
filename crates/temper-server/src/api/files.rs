@@ -9,7 +9,7 @@ use crate::authz::{
     ResourceAuthorization, require_authenticated_context, require_resource_authorization,
 };
 use crate::state::{
-    BatchTextReadError, PUBLISH_ARTIFACT_STALE_AUTHORIZATION, PublishArtifactAuthorization,
+    BatchTextReadError, PublishArtifactAuthorization, PublishArtifactError,
     PublishFileArtifactRequest, ServerState, validate_batch_text_ids,
 };
 
@@ -452,18 +452,23 @@ pub(crate) async fn handle_publish_artifact(
                 .into_response()
         }
         Err(error) => {
-            let (status, code) = if error == PUBLISH_ARTIFACT_STALE_AUTHORIZATION {
-                (axum::http::StatusCode::CONFLICT, "ConcurrentModification")
-            } else {
-                (
+            let (status, code) = match &error {
+                PublishArtifactError::StaleAuthorization => {
+                    (axum::http::StatusCode::CONFLICT, "ConcurrentModification")
+                }
+                PublishArtifactError::Rejected(_) => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "PublishArtifactRejected",
+                ),
+                PublishArtifactError::Failed(_) => (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     "PublishArtifactFailed",
-                )
+                ),
             };
             (
                 status,
                 axum::Json(serde_json::json!({
-                    "error": { "code": code, "message": error }
+                    "error": { "code": code, "message": error.to_string() }
                 })),
             )
                 .into_response()

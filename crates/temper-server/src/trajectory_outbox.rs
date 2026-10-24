@@ -18,13 +18,14 @@ use opentelemetry::{
 };
 use tracing::Instrument;
 
+use crate::state::GenerationRef;
 use crate::state::trajectory::TrajectoryEntry;
 use crate::storage::TrajectorySink;
 
 mod capture_loss;
 
-pub(crate) use capture_loss::CaptureHealth;
 use capture_loss::record_capture_loss;
+pub(crate) use capture_loss::{CaptureHealth, forget_tenant_capture_loss_markers};
 #[cfg(test)]
 use capture_loss::{
     MAX_MARKED_SESSIONS, MarkerClaim, claim_capture_loss_marker, claim_in,
@@ -143,6 +144,8 @@ struct QueuedTrajectory {
     sink: Option<Arc<dyn TrajectorySink>>,
     backend: &'static str,
     entry: TrajectoryEntry,
+    /// The generation of the entry's tenant when it was captured: it is written only while that one is live.
+    generation: Option<GenerationRef>,
     health: CaptureHealth,
     /// The trace of the span that queued this entry: its persist span continues it.
     parent: opentelemetry::Context,
@@ -174,9 +177,10 @@ impl TrajectoryOutbox {
         backend: &'static str,
         sink: Arc<dyn TrajectorySink>,
         entry: TrajectoryEntry,
+        generation: Option<GenerationRef>,
         health: CaptureHealth,
     ) -> bool {
-        self.try_enqueue(Some(sink), backend, entry, health)
+        self.try_enqueue(Some(sink), backend, entry, generation, health)
     }
 
     fn try_enqueue(
@@ -184,6 +188,7 @@ impl TrajectoryOutbox {
         sink: Option<Arc<dyn TrajectorySink>>,
         backend: &'static str,
         entry: TrajectoryEntry,
+        generation: Option<GenerationRef>,
         health: CaptureHealth,
     ) -> bool {
         let metric_entry = entry.clone();
@@ -194,7 +199,14 @@ impl TrajectoryOutbox {
             self.depth.fetch_sub(1, Ordering::Relaxed);
             self.dropped_total.fetch_add(1, Ordering::Relaxed);
             record_depth(self.depth.load(Ordering::Relaxed));
-            record_capture_loss(sink.clone(), backend, &metric_entry, "outbox_full", &health);
+            record_capture_loss(
+                sink.clone(),
+                backend,
+                &metric_entry,
+                generation,
+                "outbox_full",
+                &health,
+            );
             return false;
         }
         record_enqueued(&metric_entry, backend);
@@ -209,6 +221,7 @@ impl TrajectoryOutbox {
             sink,
             backend,
             entry,
+            generation,
             health,
             parent: crate::trace_context::capture(),
         };
@@ -241,7 +254,7 @@ impl TrajectoryOutbox {
     #[cfg(test)]
     fn try_record_for_test(&self, entry: TrajectoryEntry) -> bool {
         debug_assert!(self.inflight.is_some());
-        self.try_enqueue(None, "test", entry, CaptureHealth::default())
+        self.try_enqueue(None, "test", entry, None, CaptureHealth::default())
     }
 
     #[cfg(test)]
@@ -261,6 +274,7 @@ async fn persist_drained(item: QueuedTrajectory) {
     };
     let backend = item.backend;
     let entry = item.entry;
+    let generation = item.generation;
     let health = item.health;
     let span = tracing::info_span!(
         parent: None,
@@ -275,6 +289,13 @@ async fn persist_drained(item: QueuedTrajectory) {
     crate::trace_context::continue_in(&span, &item.parent);
 
     async move {
+        // Held through the write: an entry of a deleted tenant generation is dropped, never written into the tenant
+        // created again under its id.
+        let lease = match generation.as_ref().map(GenerationRef::lease) {
+            Some(None) => return,
+            Some(lease) => lease,
+            None => None,
+        };
         let started_at = Instant::now();
         match sink.persist_trajectory_entry(&entry).await {
             Ok(()) => {
@@ -286,10 +307,12 @@ async fn persist_drained(item: QueuedTrajectory) {
                 // A write that failed loses the entry exactly as surely as a
                 // full queue does. Both go through one place, so neither can
                 // be the one that stays silent.
+                drop(lease);
                 record_capture_loss(
                     Some(Arc::clone(&sink)),
                     backend,
                     &entry,
+                    generation,
                     "persist_failed",
                     &health,
                 );
@@ -309,9 +332,10 @@ pub(crate) fn try_record(
     backend: &'static str,
     sink: Arc<dyn TrajectorySink>,
     entry: TrajectoryEntry,
+    generation: Option<GenerationRef>,
     health: CaptureHealth,
 ) -> bool {
-    global().try_record(backend, sink, entry, health)
+    global().try_record(backend, sink, entry, generation, health)
 }
 
 /// Next position in this process's capture order.
@@ -347,10 +371,23 @@ impl crate::state::ServerState {
             let redacted = crate::storage::redact_secrets(body);
             entry.request_body = Some(crate::storage::bounded_request_body(redacted));
         }
-        try_record(backend, sink, entry, self.capture_health.clone())
+        let generation = temper_runtime::tenant::TenantId::try_new(&entry.tenant)
+            .ok()
+            .map(|tenant| self.generation_ref(&tenant));
+        try_record(
+            backend,
+            sink,
+            entry,
+            generation,
+            self.capture_health.clone(),
+        )
     }
 }
 
 #[cfg(test)]
 #[path = "trajectory_outbox_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "trajectory_outbox/capture_loss_deletion_test.rs"]
+mod capture_loss_deletion_tests;

@@ -57,6 +57,8 @@ fn handle_deploy_specs(
     entity_id: &str,
     state: &PlatformState,
 ) -> Result<(), String> {
+    // The entity id names the tenant to deploy; the pipeline builds a TenantId from it.
+    temper_runtime::tenant::TenantId::try_new(entity_id)?;
     tracing::info!(
         tenant = entity_id,
         "DeploySpecs hook: running verify-and-deploy pipeline"

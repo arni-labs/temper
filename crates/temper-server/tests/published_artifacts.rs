@@ -10,7 +10,9 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TENANT: &str = "default";
-const CONTENT_HASH: &str = "sha256:published-artifact-content";
+/// sha256 of the source bytes, `public artifact body`.
+const CONTENT_HASH: &str =
+    "sha256:dc895eef26d60c0a84344ff3d17d4ba15c248e2b570aceb163dc1cce7dbf669e";
 const FILE_ID: &str = "file-published-artifact-test";
 
 fn secrets_vault(blob_endpoint: &str) -> SecretsVault {

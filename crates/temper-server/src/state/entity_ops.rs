@@ -913,22 +913,23 @@ impl ServerState {
         entity_id: &str,
     ) -> Option<ActorRef<EntityMsg>> {
         self.get_or_spawn_tenant_actor(&TenantId::default(), entity_type, entity_id)
+            .ok()
     }
 
-    /// Get or spawn an entity actor for a specific tenant.
+    /// Get or spawn an entity actor for a specific tenant. The error says why there is none: no spec for the
+    /// entity type, or the tenant is being deleted.
     pub fn get_or_spawn_tenant_actor(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-    ) -> Option<ActorRef<EntityMsg>> {
+    ) -> Result<ActorRef<EntityMsg>, String> {
         self.get_or_spawn_tenant_actor_with_fields(
             tenant,
             entity_type,
             entity_id,
             serde_json::json!({}),
         )
-        .ok()
     }
 
     /// Get or spawn an entity actor with initial fields for a specific tenant.
@@ -1018,6 +1019,11 @@ impl ServerState {
             let mut registry = self.actor_registry.write().unwrap();
             if let Some(existing) = registry.get(&key).filter(|actor| !actor.is_closed()) {
                 return Ok(existing.clone());
+            }
+            // Checked under this lock: a removal closes the tenant's generation before it takes this lock to collect
+            // the actors it halts, so an actor admitted here is either refused or among them.
+            if self.tenant_generations.live(tenant).is_none() {
+                return Err(format!("tenant '{tenant}' is being deleted"));
             }
             let actor_ref = self.actor_system.spawn(actor, &key);
             registry.insert(key.clone(), actor_ref.clone());
@@ -1195,11 +1201,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<EntityResponse, String> {
-        let actor_ref = self
-            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
-            .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
-            })?;
+        let actor_ref = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id)?;
 
         // ADR-0048: retry transient ask failures (AskTimeout, MailboxFull)
         // so a single slow actor reply does not surface as HTTP 500.
@@ -1276,6 +1278,8 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<EntityResponse, String> {
+        // Held until the create's own writes are done, so a removal of the tenant waits for them.
+        let _lease = self.lease_tenant(tenant)?;
         self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
             .map_err(|e| e.to_string())?;
         let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
@@ -1395,6 +1399,7 @@ impl ServerState {
         if !initial_fields.is_object() {
             return Ok(None);
         }
+        let _lease = self.lease_tenant(tenant)?;
         if self.is_pg_actor_backed(tenant, entity_type) {
             return Ok(None);
         }
@@ -1712,11 +1717,8 @@ impl ServerState {
         if !fields.is_object() {
             return Err("entity field update must be a JSON object".to_string());
         }
-        let actor_ref = self
-            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
-            .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
-            })?;
+        let _lease = self.lease_tenant(tenant)?;
+        let actor_ref = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id)?;
 
         let mut policy = self.dispatch_retry_policy();
         if expected_precondition.is_some() {
@@ -1840,11 +1842,8 @@ impl ServerState {
         entity_id: &str,
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, String> {
-        let actor_ref = self
-            .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
-            .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
-            })?;
+        let _lease = self.lease_tenant(tenant)?;
+        let actor_ref = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id)?;
 
         let mut policy = self.dispatch_retry_policy();
         if expected_authorization_precondition.is_some() {
@@ -1998,7 +1997,7 @@ impl ServerState {
             return Ok(false);
         }
 
-        let Some(actor_ref) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
+        let Ok(actor_ref) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
             return Ok(false);
         };
 
@@ -2133,6 +2132,17 @@ impl ServerState {
         let policy = self.dispatch_retry_policy();
         let journal = self.event_journal();
         for (actor_key, actor_ref, _) in candidates {
+            // The snapshot is a write outside the actor: it runs under a lease of the actor's tenant, so a removal
+            // of the tenant waits for it, and an actor of a tenant being removed is left to the removal.
+            let tenant = actor_key
+                .split(':')
+                .next()
+                .and_then(|id| TenantId::try_new(id).ok());
+            let Some(_lease) =
+                tenant.and_then(|tenant| self.tenant_generations.lease_live(&tenant))
+            else {
+                continue;
+            };
             // ADR-0048: retry transient failures so passivation is not skipped
             // by a single AskTimeout under load.
             let snapshot_outcome = retry::ask_with_backoff::<_, EntityResponse, _>(

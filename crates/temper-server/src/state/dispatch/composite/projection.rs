@@ -78,8 +78,13 @@ impl ServerState {
         let fields = stream.state.fields.clone();
         let projected_state = self.query_projection_state(&stream.state);
         if let Some(queue) = projection_queue {
+            // Inside the composite's dispatch lease the live generation is the dispatch's own; a closed one is
+            // being removed with its storage.
+            let Some(stamp) = self.tenant_generations.live(tenant) else {
+                return;
+            };
             let outcome = queue.enqueue_upsert(
-                tenant.to_string(),
+                stamp,
                 stream.entity_type.clone(),
                 stream.entity_id.clone(),
                 stream.state.status.clone(),

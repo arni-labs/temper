@@ -245,6 +245,17 @@ impl StateTimeoutTracker {
             .remove(&key);
     }
 
+    /// Drop the seqs of every entity of a deleted `tenant`, as [`Self::forget`]
+    /// does for one deleted entity. An entity created again under the same id
+    /// starts a new journal, and a kept seq would refuse its arms until that
+    /// journal passed the deleted entity's.
+    pub fn forget_tenant(&self, tenant: &TenantId) {
+        self.seqs
+            .lock()
+            .expect("state_timeout tracker poisoned")
+            .retain(|key, _| key.tenant != tenant.as_str());
+    }
+
     #[cfg(test)]
     fn size(&self) -> usize {
         self.seqs
@@ -518,11 +529,16 @@ impl crate::state::ServerState {
     /// the timer ends.
     pub(super) fn spawn_state_timer(
         &self,
-        timer: ArmedTimer,
+        mut timer: ArmedTimer,
         delay: Duration,
         gate: Option<Arc<Semaphore>>,
         armed_seq: u64,
     ) {
+        // The timer belongs to the tenant generation that armed it, and fires only while that one is live.
+        let Some(armed_by) = self.stamp_tenant_work(&timer.tenant, &timer.agent_ctx) else {
+            return;
+        };
+        timer.agent_ctx = armed_by;
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
@@ -577,6 +593,12 @@ impl crate::state::ServerState {
             );
 
             async move {
+                // A timer of a deleted tenant generation ends without touching the tenant created again.
+                let Some((_lease, _)) = state.admit_tenant_work(&timer.tenant, &timer.agent_ctx)
+                else {
+                    state.state_timeout_tracker.dec_pending(&timer.entity_type);
+                    return;
+                };
                 // Sequence-based cancellation check. A newer arm (or a state
                 // change that bumped the seq on exit) renders this timer a
                 // no-op. The secondary check confirms the entity is still in
@@ -785,6 +807,27 @@ mod tests {
         assert_eq!(t.bump(&b), 1, "b's seq is independent of a's");
         assert_eq!(t.current(&a), 2);
         assert_eq!(t.current(&b), 1);
+    }
+
+    #[test]
+    fn an_entity_of_a_deleted_tenant_arms_again_from_a_new_journal() {
+        let t = StateTimeoutTracker::new();
+        let deleted = TenantId::from("acme".to_string());
+        let other = TenantId::from("other".to_string());
+        let k = EntityKey::new(&deleted, "E", "e-1");
+        let kept = EntityKey::new(&other, "E", "e-1");
+        assert_eq!(t.reserve(&k, 9), Some(1));
+        assert_eq!(t.reserve(&kept, 9), Some(1));
+
+        t.forget_tenant(&deleted);
+
+        assert_eq!(t.current(&k), 0, "no timer of the deleted tenant is live");
+        assert_eq!(
+            t.reserve(&k, 1),
+            Some(1),
+            "the entity created again arms from its own first transition"
+        );
+        assert_eq!(t.reserve(&kept, 1), None, "another tenant keeps its timers");
     }
 
     #[test]

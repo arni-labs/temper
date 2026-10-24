@@ -51,9 +51,15 @@ impl crate::state::ServerState {
             trigger_action = %persist_entry.trigger_action,
             success = persist_entry.success,
         );
+        // The log row belongs to the generation that ran the module: written under its lease, or dropped once it is
+        // deleted, never into the tenant created again.
+        let generation = self.generation_ref(entity_ref.tenant);
         tokio::spawn(
             // determinism-ok: background persist of WASM invocation
             async move {
+                let Some(_lease) = generation.lease() else {
+                    return;
+                };
                 if let Err(e) = state.persist_wasm_invocation(&persist_entry).await {
                     tracing::error!(error = %e, "failed to persist WASM invocation");
                 }
@@ -273,9 +279,15 @@ impl crate::state::ServerState {
             .observe_refresh_tx
             .send(crate::state::ObserveRefreshHint::Decisions);
         let state_c = self.clone();
+        let generation = self.generation_ref(entity_ref.tenant);
         tokio::spawn(
             async move {
                 // determinism-ok: background persist of pending decision
+                // Written under a lease of the generation it was raised in, so it never appears in the tenant created
+                // again under its id.
+                let Some(_lease) = generation.lease() else {
+                    return;
+                };
                 if let Err(e) = state_c.persist_pending_decision(&pd).await {
                     tracing::error!(error = %e, "failed to persist WASM authz decision");
                 }

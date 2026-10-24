@@ -20,6 +20,7 @@ use sqlx::PgPool;
 use temper_runtime::persistence::{
     EventStore, PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
 };
+use temper_runtime::tenant::TenantId;
 use temper_store_postgres::{
     PostgresEventStore, PostgresEvolutionRecordInsert, PostgresPolicyApprovalCommit,
     PostgresPolicyRow, PostgresTrajectoryInsert,
@@ -1278,11 +1279,12 @@ pub trait TursoStoreProvider: Send + Sync {
     async fn tenants_for_user(&self, user_id: &str)
     -> Result<Vec<TenantUserRow>, PersistenceError>;
 
-    async fn register_tenant(&self, tenant_id: &str) -> Result<TursoEventStore, PersistenceError>;
+    async fn register_tenant(&self, tenant: &TenantId)
+    -> Result<TursoEventStore, PersistenceError>;
 
     async fn list_tenants(&self) -> Result<Vec<String>, PersistenceError>;
 
-    async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError>;
+    async fn remove_tenant(&self, tenant: &TenantId) -> Result<bool, PersistenceError>;
 
     async fn add_tenant_user(
         &self,
@@ -1302,7 +1304,7 @@ pub trait TursoStoreProvider: Send + Sync {
         user_id: &str,
     ) -> Result<(), PersistenceError>;
 
-    async fn ensure_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError>;
+    async fn ensure_tenant(&self, tenant: &TenantId) -> Result<bool, PersistenceError>;
 }
 
 /// Composed storage capabilities selected at boot.
@@ -1539,7 +1541,10 @@ impl TursoStoreProvider for SingleTursoStoreProvider {
         Err(tenant_admin_unsupported())
     }
 
-    async fn register_tenant(&self, _tenant_id: &str) -> Result<TursoEventStore, PersistenceError> {
+    async fn register_tenant(
+        &self,
+        _tenant: &TenantId,
+    ) -> Result<TursoEventStore, PersistenceError> {
         Err(tenant_admin_unsupported())
     }
 
@@ -1547,7 +1552,7 @@ impl TursoStoreProvider for SingleTursoStoreProvider {
         Err(tenant_admin_unsupported())
     }
 
-    async fn remove_tenant(&self, _tenant_id: &str) -> Result<bool, PersistenceError> {
+    async fn remove_tenant(&self, _tenant: &TenantId) -> Result<bool, PersistenceError> {
         Err(tenant_admin_unsupported())
     }
 
@@ -1575,7 +1580,7 @@ impl TursoStoreProvider for SingleTursoStoreProvider {
         Err(tenant_admin_unsupported())
     }
 
-    async fn ensure_tenant(&self, _tenant_id: &str) -> Result<bool, PersistenceError> {
+    async fn ensure_tenant(&self, _tenant: &TenantId) -> Result<bool, PersistenceError> {
         Err(tenant_admin_unsupported())
     }
 }
@@ -1661,16 +1666,19 @@ impl TursoStoreProvider for TenantRoutedTursoStoreProvider {
         self.router.tenants_for_user(user_id).await
     }
 
-    async fn register_tenant(&self, tenant_id: &str) -> Result<TursoEventStore, PersistenceError> {
-        self.router.register_tenant(tenant_id).await
+    async fn register_tenant(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<TursoEventStore, PersistenceError> {
+        self.router.register_tenant(tenant).await
     }
 
     async fn list_tenants(&self) -> Result<Vec<String>, PersistenceError> {
         self.router.list_tenants().await
     }
 
-    async fn remove_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
-        self.router.remove_tenant(tenant_id).await
+    async fn remove_tenant(&self, tenant: &TenantId) -> Result<bool, PersistenceError> {
+        self.router.remove_tenant(tenant).await
     }
 
     async fn add_tenant_user(
@@ -1697,8 +1705,8 @@ impl TursoStoreProvider for TenantRoutedTursoStoreProvider {
         self.router.remove_tenant_user(tenant_id, user_id).await
     }
 
-    async fn ensure_tenant(&self, tenant_id: &str) -> Result<bool, PersistenceError> {
-        self.router.ensure_tenant(tenant_id).await
+    async fn ensure_tenant(&self, tenant: &TenantId) -> Result<bool, PersistenceError> {
+        self.router.ensure_tenant(tenant).await
     }
 }
 

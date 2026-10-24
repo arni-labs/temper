@@ -142,6 +142,7 @@ impl BlobStore {
         key: &str,
         max_bytes: usize,
     ) -> Result<BlobReadBounded, String> {
+        self.check_key(key)?;
         let queued_at = Instant::now(); // determinism-ok: production blob I/O queue metric only
         let _permit =
             tokio::time::timeout(BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore().acquire_owned())
@@ -167,6 +168,7 @@ impl BlobStore {
         key: &str,
         max_bytes: u64,
     ) -> Result<BlobStreamRead, String> {
+        self.check_key(key)?;
         let queued_at = Instant::now(); // determinism-ok: production blob I/O queue metric only
         let stream_permit = tokio::time::timeout(
             BLOB_IO_QUEUE_TIMEOUT,

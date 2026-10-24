@@ -48,6 +48,46 @@ async fn tenant_admin_routes_require_typed_authority() {
 }
 
 #[tokio::test]
+async fn a_tenant_id_that_is_not_one_path_segment_is_never_created() {
+    let app = tenant_api_router().with_state(PlatformState::new(None));
+    for tenant_id in ["../x", "a/b", "a\\b", "..", "nul\0byte"] {
+        let response = app
+            .clone()
+            .oneshot(typed_request(
+                Method::POST,
+                "/tenants",
+                serde_json::json!({ "tenant_id": tenant_id }),
+                "default",
+            ))
+            .await
+            .expect("request should run");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tenant_id:?}");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("bounded body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("tenant ID")),
+            "{json}"
+        );
+    }
+
+    // A plain id passes the rule and goes on to authorization, which this server's empty policy set denies.
+    let plain = app
+        .oneshot(typed_request(
+            Method::POST,
+            "/tenants",
+            serde_json::json!({ "tenant_id": "tenant-a" }),
+            "default",
+        ))
+        .await
+        .expect("request should run");
+    assert_eq!(plain.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn typed_admin_kind_does_not_bypass_platform_cedar() {
     let app = tenant_api_router().with_state(PlatformState::new(None));
     let mut request = Request::get("/tenants")

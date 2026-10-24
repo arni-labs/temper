@@ -60,15 +60,20 @@ pub(super) async fn entity_state(
     entity_type: &str,
     entity_id: &str,
 ) -> Result<Option<EntityState>, String> {
-    let governed = {
+    let table = {
         let registry = state
             .registry
             .read()
             .map_err(|_| "spec registry lock poisoned".to_string())?;
-        registry.get_table(tenant, entity_type).is_some()
+        registry.get_table(tenant, entity_type)
     };
-    if !governed {
+    let Some(table) = table else {
         return Ok(None);
+    };
+    // While the tenant is being removed no actor may start for it, so its identity records are replayed from its
+    // storage with no actor and nothing written: a delete that failed part way can still be retried by its caller.
+    if state.tenant_generations.live(tenant).is_none() {
+        return replay_from_storage(state, tenant, entity_type, entity_id, &table).await;
     }
     if !state.entity_exists(tenant, entity_type, entity_id)
         && !state
@@ -91,6 +96,34 @@ pub(super) async fn entity_state(
             );
             error
         })
+}
+
+/// An identity record's state replayed from the tenant's snapshot and journal, without an actor. A journal read
+/// failure is an error, never an absent record.
+async fn replay_from_storage(
+    state: &ServerState,
+    tenant: &TenantId,
+    entity_type: &str,
+    entity_id: &str,
+    table: &temper_jit::TransitionTable,
+) -> Result<Option<EntityState>, String> {
+    let Some((store, backend)) = state.event_journal() else {
+        return Ok(None);
+    };
+    let blob_store = state.blob_store_for_tenant(tenant).ok();
+    let replayed = crate::entity_actor::recover_entity_state_from_store(
+        tenant.as_str(),
+        entity_type,
+        entity_id,
+        table,
+        &store,
+        backend,
+        &serde_json::json!({}),
+        blob_store.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("identity replay of {entity_type}('{entity_id}') failed: {error}"))?;
+    Ok((replayed.total_event_count > 0).then_some(replayed))
 }
 
 pub(super) fn parse_credential_expiry(

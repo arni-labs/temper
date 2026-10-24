@@ -308,6 +308,28 @@ impl SimEventStore {
         inner.faults = faults;
     }
 
+    /// Remove everything stored for `tenant`, as deleting a tenant's database does. Returns whether it had a
+    /// journal. Persistence ids are `{tenant}:{entity_type}:{entity_id}`, and a tenant id has no colon.
+    pub fn remove_tenant(&self, tenant: &str) -> bool {
+        let prefix = format!("{tenant}:");
+        let owned = |id: &String| id.starts_with(&prefix);
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let existed = inner.journals.keys().any(owned);
+        inner.journals.retain(|id, _| !owned(id));
+        inner.snapshots.retain(|id, _| !owned(id));
+        inner.snapshot_history.retain(|id, _| !owned(id));
+        inner.event_segments.retain(|id, _| !owned(id));
+        inner.key_index.retain(|(owner, ..), _| owner != tenant);
+        inner
+            .key_index_watermark
+            .retain(|(owner, _), _| owner != tenant);
+        inner.vector_index.retain(|(owner, ..), _| owner != tenant);
+        inner
+            .vector_index_watermark
+            .retain(|(owner, _), _| owner != tenant);
+        existed
+    }
+
     /// Dump all events for a persistence_id (for test assertions).
     pub fn dump_journal(&self, persistence_id: &str) -> Vec<PersistenceEnvelope> {
         let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock

@@ -52,7 +52,10 @@ pub async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let tenant = TenantId::new(&tenant_str);
+    let tenant = match TenantId::try_new(tenant_str.as_str()) {
+        Ok(tenant) => tenant,
+        Err(error) => return (StatusCode::BAD_REQUEST, error),
+    };
 
     let Some((entity_type, webhook)) = find_webhook(&state, &tenant, &webhook_path) else {
         tracing::warn!(path = %webhook_path, "no webhook registered at path");

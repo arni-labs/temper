@@ -19,15 +19,19 @@ mod http_client;
 mod keys;
 mod limits;
 mod local;
+mod namespace;
 mod presign;
 mod raw_ingest;
 mod s3_buffered_get;
 mod state;
 mod streaming;
+#[cfg(test)]
+mod tenant_namespace_tests;
 pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endpoint};
 pub(crate) use keys::{DEFAULT_BLOB_BUCKET, hex_lower, wasm_artifact_key};
 use limits::{BLOB_BUFFERED_OPERATION_TIMEOUT, BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore};
 use local::{get_local_blob_observed, local_blob_path, put_local_blob_observed};
+pub(crate) use namespace::TENANT_NAMESPACES_DIR;
 pub(crate) use presign::{MAX_PRESIGN_SECS, PresignedResponse};
 pub use raw_ingest::BlobByteStream;
 #[cfg(test)]
@@ -42,6 +46,8 @@ pub use streaming::{BlobObjectStream, BlobStreamRead, decode_json_base64_stream}
 pub(crate) struct BlobStore {
     backend: BlobStoreBackend,
     staging_root: PathBuf,
+    /// The root also holds the other tenants' namespaces (namespace.rs), so no key may begin there.
+    holds_tenant_namespaces: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +85,7 @@ impl BlobStore {
         Self {
             staging_root: root.join(".ingest-staging"),
             backend: BlobStoreBackend::LocalFs { root },
+            holds_tenant_namespaces: false,
         }
     }
 
@@ -92,6 +99,7 @@ impl BlobStore {
     ) -> Self {
         Self {
             staging_root: staging_root.into(),
+            holds_tenant_namespaces: false,
             backend: BlobStoreBackend::S3(S3BlobStore {
                 endpoint: endpoint.into().trim_end_matches('/').to_string(),
                 bucket: bucket.into().trim_matches('/').to_string(),
@@ -133,6 +141,7 @@ impl BlobStore {
         body: &[u8],
         ttl: Option<Duration>,
     ) -> Result<(), String> {
+        self.check_key(key)?;
         let queued_at = Instant::now(); // determinism-ok: production blob I/O queue metric only
         let _permit =
             tokio::time::timeout(BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore().acquire_owned())
@@ -175,6 +184,7 @@ impl BlobStore {
         body: &[u8],
         ttl: Option<Duration>,
     ) -> Result<(), String> {
+        self.check_key(key)?;
         let queued_at = Instant::now(); // determinism-ok: production blob I/O queue metric only
         let _permit =
             tokio::time::timeout(BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore().acquire_owned())
@@ -209,6 +219,7 @@ impl BlobStore {
     }
 
     pub(crate) async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.check_key(key)?;
         let queued_at = Instant::now(); // determinism-ok: production blob I/O queue metric only
         let _permit =
             tokio::time::timeout(BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore().acquire_owned())

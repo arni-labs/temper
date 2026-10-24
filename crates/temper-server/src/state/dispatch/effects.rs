@@ -122,9 +122,14 @@ impl crate::state::ServerState {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(queue) = queue {
+            // This runs inside the dispatch's lease, so the live generation is the dispatch's own; a closed one is
+            // being removed, and so is the storage the write would go to.
+            let Some(stamp) = self.tenant_generations.live(ctx.tenant) else {
+                return;
+            };
             let outcome = if status == "Deleted" {
                 queue.enqueue_remove(
-                    tenant.clone(),
+                    stamp,
                     entity_type.clone(),
                     entity_id.clone(),
                     sequence_nr,
@@ -132,7 +137,7 @@ impl crate::state::ServerState {
                 )
             } else {
                 queue.enqueue_upsert(
-                    tenant.clone(),
+                    stamp,
                     entity_type.clone(),
                     entity_id.clone(),
                     status.clone(),
@@ -544,6 +549,11 @@ impl crate::state::ServerState {
         scheduled_actions: &[ScheduledAction],
         agent_ctx: &AgentContext,
     ) {
+        // A follow-on belongs to the tenant generation that scheduled it: its context carries the stamp, and its
+        // dispatch is refused once that generation is gone, whatever record now has the same id.
+        let Some(agent_ctx) = self.stamp_tenant_work(tenant, agent_ctx) else {
+            return;
+        };
         for sched in scheduled_actions {
             let state = self.clone();
             let t = tenant.clone();

@@ -113,6 +113,12 @@ impl crate::state::ServerState {
             tokio::spawn(
                 async move {
                     // determinism-ok: spawn dispatch is a background side-effect
+                    // Work of the parent's generation, holding its lease: no child is created in a tenant created
+                    // again under its id.
+                    let Some((_lease, agent)) = state.admit_tenant_work(&t, &agent) else {
+                        return;
+                    };
+                    let agent: &AgentContext = &agent;
                     let mut parent_fields = serde_json::Map::new();
                     parent_fields.insert(
                         "parent_type".to_string(),
@@ -258,7 +264,7 @@ impl crate::state::ServerState {
                                         &child_type,
                                         &child_id,
                                         &created,
-                                        &agent,
+                                        agent,
                                     )
                                     .await;
                             }
@@ -270,7 +276,7 @@ impl crate::state::ServerState {
                                         &child_id,
                                         &action,
                                         params,
-                                        &agent,
+                                        agent,
                                     )
                                     .await;
                                 let refusal = match result {
@@ -291,7 +297,7 @@ impl crate::state::ServerState {
                                             &child_type,
                                             &child_id,
                                             &created,
-                                            &agent,
+                                            agent,
                                         )
                                         .await;
                                     state.record_generated_callback_refusal(

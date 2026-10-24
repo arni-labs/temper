@@ -325,8 +325,10 @@ pub(super) async fn materialize_entity_set_entities(
                     .await
                 {
                     Ok(response) => {
+                        // The repair write runs under a lease, so it never lands after the tenant's removal.
                         if response.state.status != "Deleted"
                             && let Some(query_plane) = state.query_plane_store()
+                            && let Some(_lease) = state.tenant_generations.lease_live(&tenant)
                         {
                             let fields = state.query_projection_fields(
                                 &tenant,

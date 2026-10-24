@@ -63,6 +63,11 @@ impl WasmModuleRegistry {
             .remove(&(tenant.to_string(), module_name.to_string()))
     }
 
+    /// Remove every module of a tenant (the tenant was deleted). Builtins stay.
+    pub fn remove_tenant(&mut self, tenant: &TenantId) {
+        self.modules.retain(|(t, _), _| t != tenant.as_str());
+    }
+
     /// List all modules for a tenant.
     pub fn modules_for_tenant(&self, tenant: &TenantId) -> Vec<(&str, &str)> {
         let tenant_str = tenant.to_string();

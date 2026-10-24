@@ -15,11 +15,25 @@ use serde::{Deserialize, Serialize};
 /// A tenant identifier scoping all platform resources.
 ///
 /// Convention: lowercase, alphanumeric + hyphens (e.g., `"alpha"`, `"beta"`, `"my-app"`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Every value is one path-safe segment (see [`TenantId::try_new`]): a tenant ID names files, database names and URL
+/// path segments as it is, so code holding a `TenantId` may put it in a path without checking it again. Deserializing
+/// applies the same rule.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TenantId(String);
+
+impl<'de> Deserialize<'de> for TenantId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl TenantId {
     /// Parse a tenant ID without panicking on caller-controlled input.
+    ///
+    /// A tenant ID is one non-empty segment: no `:` (the persistence ID separator), no `/` or `\`, no `..`, not `.`,
+    /// and no NUL or other control characters. A tenant's local database is `{base}/{id}.db`, so an ID that could
+    /// leave that directory or name another file would open another tenant's database or the platform's.
     pub fn try_new(id: impl Into<String>) -> Result<Self, String> {
         let id = id.into();
         if id.is_empty() {
@@ -28,6 +42,17 @@ impl TenantId {
         if id.contains(':') {
             return Err(format!("tenant ID must not contain colons: {id}"));
         }
+        if id.contains(['/', '\\']) || id == "." || id.contains("..") {
+            return Err(format!(
+                "tenant ID must be one path segment, without '/', '\\' or '..': {id}"
+            ));
+        }
+        if id.chars().any(char::is_control) {
+            return Err(format!(
+                "tenant ID must not contain control characters: {}",
+                id.escape_default()
+            ));
+        }
         Ok(Self(id))
     }
 
@@ -35,8 +60,7 @@ impl TenantId {
     ///
     /// # Panics
     ///
-    /// Panics if the tenant ID is empty or contains colons (which are used as
-    /// separators in persistence IDs).
+    /// Panics if [`TenantId::try_new`] refuses the ID.
     pub fn new(id: impl Into<String>) -> Self {
         Self::try_new(id).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -156,7 +180,7 @@ impl QualifiedEntityId {
     pub fn parse(persistence_id: &str) -> Result<Self, String> {
         let (tenant, entity_type, entity_id) = parse_persistence_id_parts(persistence_id)?;
         Ok(Self {
-            tenant: TenantId::new(tenant),
+            tenant: TenantId::try_new(tenant)?,
             entity_type: entity_type.to_string(),
             entity_id: entity_id.to_string(),
         })
@@ -201,6 +225,45 @@ mod tests {
             TenantId::try_new("a:b").unwrap_err(),
             "tenant ID must not contain colons: a:b"
         );
+    }
+
+    #[test]
+    fn a_tenant_id_is_one_path_safe_segment() {
+        for id in [
+            "../x",
+            "a/b",
+            "/abs",
+            "a\\b",
+            "..",
+            ".",
+            "a..b",
+            "nul\0byte",
+            "line\nbreak",
+            "tab\tbed",
+        ] {
+            assert!(TenantId::try_new(id).is_err(), "{id:?} was accepted");
+        }
+        for id in [
+            "default",
+            "temper-system",
+            "rita-agents",
+            "patrol_smoke",
+            "de-variant-wi-variant-1",
+            "acme.io",
+            "T1",
+        ] {
+            assert_eq!(TenantId::try_new(id).expect(id).as_str(), id);
+        }
+    }
+
+    #[test]
+    fn deserializing_a_tenant_id_applies_the_same_rule() {
+        assert_eq!(
+            serde_json::from_str::<TenantId>("\"tenant-a\"").expect("valid id"),
+            TenantId::new("tenant-a")
+        );
+        assert!(serde_json::from_str::<TenantId>("\"../platform\"").is_err());
+        assert!(QualifiedEntityId::parse("a/b:Order:1").is_err());
     }
 
     #[test]

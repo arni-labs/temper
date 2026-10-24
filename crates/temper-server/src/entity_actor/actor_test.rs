@@ -85,7 +85,7 @@ async fn queued_snapshot_only_advances_replay_boundary_after_write_applies() {
 
     let store = Arc::new(SimEventStore::no_faults(43));
     let boxed_store = crate::storage::BoxedEventStore::from_arc(store);
-    let snapshot_queue = SnapshotWriteQueue::start(boxed_store.clone());
+    let snapshot_queue = SnapshotWriteQueue::start(boxed_store.clone(), Default::default());
     let persistence_id = "default:Order:queued-snapshot-1";
     let mut state = EntityState {
         entity_type: "Order".to_string(),

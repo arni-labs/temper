@@ -69,7 +69,7 @@ async fn causal_submit_reaction_wasm_reads_committed_source_under_projection_lag
         );
         // A delayed older queued write cannot replace the visible commit.
         queue.enqueue_upsert(
-            "default".into(),
+            queue.stamp_for_test("default"),
             "Source".into(),
             "source".into(),
             "Draft".into(),

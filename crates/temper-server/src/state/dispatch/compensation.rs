@@ -74,6 +74,11 @@ impl crate::state::ServerState {
                 // determinism-ok: compensation is a background side-effect that
                 // runs outside the simulation core (matches the spawn boundary
                 // of the integration dispatch it compensates for).
+                // Work of the generation that ran the integration, holding its lease: refused once it is deleted.
+                let Some((_lease, parent_ctx)) = state.admit_tenant_work(&tenant, &parent_ctx)
+                else {
+                    return;
+                };
                 state
                     .run_integration_failure_compensation(
                         &tenant,

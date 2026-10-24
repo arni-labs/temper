@@ -6,10 +6,15 @@
 //! TigerStyle: All mailboxes are BOUNDED. No unbounded queues.
 //! The capacity is set at actor creation time and cannot grow.
 //! When full, sends return MailboxFull immediately — no blocking, no OOM.
+//!
+//! A halt travels beside the queue, not in it: it needs no mailbox space, and
+//! the receiver sees it before any queued message.
 
-use tokio::sync::mpsc;
+use std::sync::Arc;
 
-use crate::actor::actor_ref::Envelope;
+use tokio::sync::{mpsc, watch};
+
+use crate::actor::actor_ref::{Envelope, SystemSignal};
 use crate::actor::errors::ActorError;
 use crate::actor::traits::Message;
 
@@ -21,11 +26,13 @@ pub const DEFAULT_MAILBOX_CAPACITY: usize = 1_000;
 pub struct MailboxSender<M: Message> {
     inner: mpsc::Sender<Envelope<M>>,
     capacity: usize,
+    halt: Arc<watch::Sender<bool>>,
 }
 
 /// The receiver half of a mailbox. Held by ActorCell, not cloneable.
 pub struct MailboxReceiver<M: Message> {
     inner: mpsc::Receiver<Envelope<M>>,
+    halt: watch::Receiver<bool>,
 }
 
 /// Create a new bounded mailbox with the given capacity.
@@ -39,12 +46,17 @@ pub fn mailbox<M: Message>(capacity: usize) -> (MailboxSender<M>, MailboxReceive
     );
 
     let (tx, rx) = mpsc::channel(capacity);
+    let (halt_tx, halt_rx) = watch::channel(false);
     (
         MailboxSender {
             inner: tx,
             capacity,
+            halt: Arc::new(halt_tx),
         },
-        MailboxReceiver { inner: rx },
+        MailboxReceiver {
+            inner: rx,
+            halt: halt_rx,
+        },
     )
 }
 
@@ -61,6 +73,22 @@ impl<M: Message> MailboxSender<M> {
             mpsc::error::TrySendError::Full(_) => ActorError::MailboxFull,
             mpsc::error::TrySendError::Closed(_) => ActorError::SendFailed,
         })
+    }
+
+    /// Ask the receiver to stop before any queued message. Needs no mailbox
+    /// space, so it works on a full mailbox; asking twice is the same as once.
+    pub fn halt(&self) {
+        self.halt.send_replace(true);
+    }
+
+    /// Whether a halt was asked for.
+    pub fn is_halted(&self) -> bool {
+        *self.halt.borrow()
+    }
+
+    /// Wait until the receiver is dropped: the actor's task has ended.
+    pub async fn closed(&self) {
+        self.inner.closed().await;
     }
 
     /// Get the mailbox capacity.
@@ -86,9 +114,22 @@ impl<M: Message> MailboxSender<M> {
 }
 
 impl<M: Message> MailboxReceiver<M> {
-    /// Receive the next message. Returns None if all senders dropped.
+    /// Receive the next message. Returns None if all senders dropped. Once a
+    /// halt is asked for, returns a Stop signal ahead of anything queued.
     pub async fn recv(&mut self) -> Option<Envelope<M>> {
-        self.inner.recv().await
+        tokio::select! {
+            biased;
+            () = halt_requested(&mut self.halt) => Some(Envelope::Signal(SystemSignal::Stop)),
+            envelope = self.inner.recv() => envelope,
+        }
+    }
+}
+
+/// Resolves once a halt is asked for. Never resolves when every sender is gone
+/// without one: the queue then drains and ends as before.
+async fn halt_requested(halt: &mut watch::Receiver<bool>) {
+    if halt.wait_for(|halted| *halted).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -97,6 +138,7 @@ impl<M: Message> Clone for MailboxSender<M> {
         Self {
             inner: self.inner.clone(),
             capacity: self.capacity,
+            halt: Arc::clone(&self.halt),
         }
     }
 }
@@ -171,6 +213,25 @@ mod tests {
         let result = tx.send(Envelope::Tell(TestMsg("orphan".into())));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), ActorError::SendFailed);
+    }
+
+    #[tokio::test]
+    async fn a_halt_on_a_full_mailbox_is_received_before_the_queue() {
+        let (tx, mut rx) = mailbox::<TestMsg>(1);
+        tx.send(Envelope::Tell(TestMsg("queued".into()))).unwrap();
+        assert_eq!(
+            tx.send(Envelope::Tell(TestMsg("no room".into())))
+                .unwrap_err(),
+            ActorError::MailboxFull
+        );
+        tx.halt();
+        assert!(tx.is_halted());
+        assert!(matches!(
+            rx.recv().await,
+            Some(Envelope::Signal(SystemSignal::Stop))
+        ));
+        drop(rx);
+        tx.closed().await;
     }
 
     #[tokio::test]

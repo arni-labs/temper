@@ -253,6 +253,12 @@ impl HttpEndpointTables {
         self.by_tenant.read().await.get(tenant).cloned()
     }
 
+    /// Drop a deleted tenant's routes. The table is built again from the
+    /// tenant's `HttpEndpoint` records when one of them next changes.
+    pub async fn remove(&self, tenant: &TenantId) {
+        self.by_tenant.write().await.remove(tenant);
+    }
+
     pub async fn tenant_count(&self) -> usize {
         self.by_tenant.read().await.len()
     }

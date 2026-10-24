@@ -89,6 +89,10 @@ pub struct AgentContext {
     /// `workflow.run_id`, `producer.work_item_id`, or `support.ticket_id`.
     /// Temper core treats these keys as opaque correlation metadata.
     pub observation_metadata: BTreeMap<String, String>,
+    /// Runtime-owned: the tenant generation of the work this context continues, set when a dispatch is admitted
+    /// and never read from a request. A timer, follow-on, reaction or callback carries it, so work of a deleted
+    /// tenant is refused if the tenant is created again (see `state::tenant_generation`).
+    pub tenant_generation: Option<crate::state::TenantStamp>,
 }
 
 impl AgentContext {
@@ -137,6 +141,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             observation_metadata: BTreeMap::new(),
+            tenant_generation: None,
         }
     }
 
@@ -174,6 +179,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             observation_metadata: BTreeMap::new(),
+            tenant_generation: None,
         }
     }
 
@@ -206,6 +212,7 @@ impl AgentContext {
         self.workflow_root_entity_id = parent.workflow_root_entity_id.clone();
         self.workflow_run_id = parent.workflow_run_id.clone();
         self.observation_metadata = parent.observation_metadata.clone();
+        self.tenant_generation = parent.tenant_generation.clone();
         self
     }
 
@@ -310,6 +317,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_run_id,
         idempotency_key,
         observation_metadata: observation_metadata::extract(headers),
+        tenant_generation: None,
     }
 }
 
