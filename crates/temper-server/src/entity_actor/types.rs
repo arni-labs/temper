@@ -147,11 +147,15 @@ impl StatusClock {
 }
 
 impl EntityState {
-    /// Whether the entity is deleted: its replayed journal ends in deletion.
-    /// Deletion is terminal, so a deleted entity never takes another action
-    /// and its id is never created again.
+    /// Whether the entity is deleted: its newest event is the kernel's
+    /// tombstone, as [`temper_runtime::persistence::journal_is_deleted`] reads
+    /// a journal. A spec action named or leading to `Deleted` does not delete.
+    /// The tombstone is terminal and always the newest event, so a deleted
+    /// entity never takes another action and its id is never created again.
     pub fn is_deleted(&self) -> bool {
-        self.status == "Deleted"
+        self.events
+            .back()
+            .is_some_and(|event| event.kind == temper_runtime::persistence::EventKind::Tombstone)
     }
 
     /// Return true if this entity can accept one more event under budget.

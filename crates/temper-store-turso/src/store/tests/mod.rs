@@ -2432,23 +2432,24 @@ async fn deleted_probes_use_the_tombstone_index() {
 }
 
 /// A projection write of an entity whose journal leaves it deleted writes
-/// nothing. That holds for a tombstone and for a declared action that moves
-/// the entity to `Deleted`. State read before the deletion cannot bring back
-/// the row the deletion removed, in the catalog or the field index, by single
-/// or batch writes. After an action to any other status the write lands.
+/// nothing. That holds for the kernel's tombstone and for a declared action
+/// that moves the entity to `Deleted`. State read before the deletion cannot
+/// bring back the row the deletion removed, in the catalog or the field
+/// index, by single or batch writes. A spec action named `Deleted` that leads elsewhere deletes
+/// nothing, and the write after it lands.
 #[tokio::test]
 async fn projection_writes_after_a_deletion_write_nothing() {
     let store = make_store("projection-after-deletion").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
-    for (entity_id, action, to_status) in [
-        ("ord-tombstoned", "Deleted", "Deleted"),
-        ("ord-discarded", "Discard", "Deleted"),
-        ("ord-submitted", "Submit", "Submitted"),
+    for (entity_id, action, kind, to_status) in [
+        ("ord-tombstoned", "Deleted", "tombstone", "Deleted"),
+        ("ord-discarded", "Discard", "transition", "Deleted"),
+        ("ord-archived", "Deleted", "transition", "Archived"),
     ] {
         let deleted = to_status == "Deleted";
         let fields = serde_json::json!({"Owner": entity_id});
         let persistence_id = format!("{tenant}:Order:{entity_id}");
-        let event = serde_json::json!({"action": action, "to_status": to_status});
+        let event = serde_json::json!({"action": action, "kind": kind, "to_status": to_status, "params": {}});
         store
             .append(
                 &persistence_id,

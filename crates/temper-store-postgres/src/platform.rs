@@ -13,6 +13,7 @@ use crate::metrics::{
     record_postgres_projection_index_fields, record_postgres_projection_index_reconciliation,
     record_postgres_transaction_begin_duration, record_postgres_transaction_commit_duration,
 };
+use crate::schema::tombstone_sql;
 
 mod evolution;
 mod inputs;
@@ -116,14 +117,14 @@ async fn lock_entity_projection(
     Ok(())
 }
 
-/// Whether the entity's journal leaves it deleted, read after
-/// [`lock_entity_projection`]: it holds the entity's tombstone, or its newest
-/// event moves it to the `Deleted` status, as a declared action can. Either
-/// way the projection has dropped, or is about to drop, the entity's row. The
-/// journal commits the event before the removal runs under the same lock, so
-/// a write of older state either commits before that removal, which then
-/// deletes it, or sees the event and writes nothing. A deleted entity's row
-/// cannot come back.
+/// Whether the entity's journal leaves it without a projection row, read after
+/// [`lock_entity_projection`]: it holds the kernel's tombstone
+/// ([`tombstone_sql`]), or its newest event moves it to the `Deleted` status,
+/// whose row the projection drops whichever action got it there. The journal
+/// commits the event before the removal runs under the same lock, so a write
+/// of older state either commits before that removal, which then deletes it,
+/// or sees the event and writes nothing. A deleted entity's row cannot come
+/// back.
 async fn journal_leaves_deleted(
     schema: &crate::PostgresSchema,
     tx: &mut Transaction<'_, Postgres>,
@@ -133,9 +134,12 @@ async fn journal_leaves_deleted(
 ) -> Result<bool, PersistenceError> {
     let tombstone: Option<i32> = crate::dbm::postgres_query_scalar!(
         schema,
-        "SELECT 1 FROM {schema}events \
-         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND event_type = 'Deleted' \
-         LIMIT 1",
+        concat!(
+            "SELECT 1 FROM {schema}events d \
+             WHERE d.tenant = $1 AND d.entity_type = $2 AND d.entity_id = $3 AND ",
+            tombstone_sql!(),
+            " LIMIT 1"
+        ),
     )
     .bind(tenant)
     .bind(entity_type)

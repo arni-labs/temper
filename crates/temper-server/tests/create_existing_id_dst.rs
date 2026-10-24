@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use temper_runtime::buggify::install_buggify_context;
-use temper_runtime::persistence::{EventStore, PersistenceEnvelope, PersistenceError};
+use temper_runtime::persistence::{
+    EventStore, PersistenceEnvelope, PersistenceError, journal_is_deleted,
+};
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
 use temper_server::request_context::AgentContext;
@@ -49,9 +51,11 @@ const DELETE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
 const DELETED_KEY_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 12, 22, 23, 27, 29];
 
 /// Seeds whose schedule put an order back into the query projection after a
-/// declared action moved it to `Deleted`, while the stores checked only for a
-/// tombstone (14 of seeds 0..64 did; these are the first eight).
-const DELETING_ACTION_REGRESSION_SEEDS: &[u64] = &[3, 6, 9, 12, 15, 18, 24, 30];
+/// declared action moved it to `Deleted`, while the stores checked only for the
+/// tombstone: 14 of seeds 0..64 (3, 6, 9, 12, 15, 18, 24, 30 kept), and every
+/// seed once a create read such an order as live rather than deleted (0-7
+/// kept).
+const DELETING_ACTION_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 9, 12, 15, 18, 24, 30];
 
 /// Seeds explored on every run besides the regression cases.
 const EXPLORED_SEEDS: u64 = 64;
@@ -83,10 +87,11 @@ from = ["Draft"]
 to = "Deleted"
 "#;
 
-/// Whether the journal leaves the entity deleted, as the stores read it: it
-/// holds the tombstone, or its newest event moves the entity to `Deleted`.
+/// Whether the journal leaves the entity without a projection row, as the
+/// stores read it: it holds the kernel's tombstone, or its newest event moves
+/// the entity to the `Deleted` status.
 fn journal_leaves_deleted(journal: &[PersistenceEnvelope]) -> bool {
-    journal.iter().any(|event| event.event_type == "Deleted")
+    journal_is_deleted(journal)
         || journal
             .last()
             .is_some_and(|event| event.payload["to_status"] == "Deleted")
@@ -345,7 +350,7 @@ async fn repeated_create_racing_a_deleting_action(seed: u64) -> Result<(), Strin
         state.dispatch_tenant_action(&tenant, "Order", "raced-key", "Discard", json!({}), &system,),
     );
     match discarded {
-        Ok(response) if response.success && response.state.is_deleted() => {}
+        Ok(response) if response.success && response.state.status == "Deleted" => {}
         other => return Err(format!("the discard failed: {other:?}")),
     }
     if projection.holds("Order", "raced-key") {

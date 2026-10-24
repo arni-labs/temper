@@ -82,10 +82,10 @@ pub struct QueryProjectionUpsert {
     pub known_new: bool,
 }
 
-/// Whether the entity's journal leaves it deleted: it holds the entity's
-/// tombstone (served by `idx_events_deleted`), or its newest event moves it to
-/// the `Deleted` status, as a declared action can. Either way the projection
-/// has dropped, or is about to drop, the entity's row. Every projection write
+/// Whether the entity's journal leaves it without a projection row: it holds
+/// the kernel's tombstone (`tombstone_sql`, served by `idx_events_deleted`),
+/// or its newest event moves it to the `Deleted` status, whose row the
+/// projection drops whichever action got it there. Every projection write
 /// checks this inside its write transaction. The journal commits the event
 /// before the projection row is removed, and SQLite runs one write
 /// transaction at a time. So a write of older state either lands before that
@@ -99,9 +99,12 @@ async fn journal_leaves_deleted(
 ) -> Result<bool, PersistenceError> {
     let mut tombstones = tx
         .query(
-            "SELECT 1 FROM events \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND event_type = 'Deleted' \
-             LIMIT 1",
+            concat!(
+                "SELECT 1 FROM events d \
+                 WHERE d.tenant = ?1 AND d.entity_type = ?2 AND d.entity_id = ?3 AND ",
+                tombstone_sql!(),
+                " LIMIT 1"
+            ),
             params![tenant, entity_type, entity_id],
         )
         .await

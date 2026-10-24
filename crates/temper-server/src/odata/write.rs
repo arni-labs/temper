@@ -743,8 +743,7 @@ pub async fn handle_odata_post(
                             set_name: &name,
                             entity_id: &entity_id,
                         };
-                        // A deleted entity's key stays taken.
-                        if existing.status == "Deleted" || !may_read(&state, &target, &body) {
+                        if !may_read(&state, &target, &body) {
                             return existing_key_conflict();
                         }
                         EXISTING_ENTITY_STATUS
