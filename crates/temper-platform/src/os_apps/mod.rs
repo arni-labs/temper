@@ -1411,8 +1411,11 @@ pub(super) async fn install_os_app_with_plan(
     // App installs can add or change cross-entity reactions. Refresh the live
     // dispatcher immediately so the newly registered tenant config takes effect
     // without requiring a process restart or a separate specs reload.
+    // A changed spec can move records to other states on replay; their
+    // timers follow.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
+        state.server.spawn_follow_spec_changes();
     }
 
     // ── Step 3: Load Cedar policies into memory. ────────────────────

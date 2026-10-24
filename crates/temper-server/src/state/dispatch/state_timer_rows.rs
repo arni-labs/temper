@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
+use crate::storage::{MetadataTimerRows, StateTimerStore};
 
 /// How many timers armed at boot fire at once. Every timer that fell due while
 /// the server was down is due at boot; firing them all together is a burst of
@@ -92,10 +93,20 @@ impl From<ArmedBy> for AgentContext {
 }
 
 impl ServerState {
+    /// Where `tenant`'s timer rows are kept: [`Self::state_timer_rows`] when
+    /// set, else the tenant's metadata store. None: rows are not kept.
+    async fn timer_rows_for_tenant(&self, tenant: &str) -> Option<Arc<dyn StateTimerStore>> {
+        if let Some(rows) = self.state_timer_rows.clone() {
+            return Some(rows);
+        }
+        let store = self.metadata_store_for_tenant(tenant).await?;
+        Some(Arc::new(MetadataTimerRows(store)))
+    }
+
     /// Write a newly armed timer's row. A failed write leaves the timer armed
     /// in this process; only a restart before it fires would lose it.
     pub(super) async fn persist_state_timer(&self, timer: &ArmedTimer) {
-        let Some(store) = self.metadata_store_for_tenant(timer.tenant.as_str()).await else {
+        let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return;
         };
         let record = match timer_record(timer) {
@@ -115,7 +126,7 @@ impl ServerState {
 
     /// Remove an ended timer's row, unless a newer arm has replaced it.
     pub(super) async fn forget_state_timer(&self, timer: &ArmedTimer) {
-        let Some(store) = self.metadata_store_for_tenant(timer.tenant.as_str()).await else {
+        let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return;
         };
         if let Err(error) = store
@@ -137,16 +148,17 @@ impl ServerState {
     ///
     /// Call once at boot, after specs, policies and modules are loaded and
     /// before the server takes requests. Reads one row per waiting timer and
-    /// loads no entity: an entity is loaded only when its timer fires. At
-    /// most [`BOOT_FIRES_AT_ONCE`] of these timers fire at once. Returns how
-    /// many timers were armed.
+    /// loads no entity until its timer fires; a row whose state declares no
+    /// timeout now is removed and its record read to arm what its state
+    /// declares. At most [`BOOT_FIRES_AT_ONCE`] of these run at once. Returns
+    /// how many timers were armed.
     pub async fn rearm_state_timers(&self) -> usize {
         let started = Instant::now();
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
         let mut armed = 0usize;
         let mut overdue = 0usize;
         for (tenant, timeouts) in self.declared_state_timeouts() {
-            let Some(store) = self.metadata_store_for_tenant(tenant.as_str()).await else {
+            let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
                 continue;
             };
             let rows = match store.list_state_timers(tenant.as_str()).await {
@@ -161,11 +173,14 @@ impl ServerState {
                 let declared = timeouts.get(&(row.entity_type.clone(), row.state.clone()));
                 let timer = match declared {
                     Some((after_seconds, action)) => {
-                        armed_timer(&tenant, &row, action).map(|timer| (*after_seconds, timer))
+                        armed_timer(&tenant, &row, action, *after_seconds)
                     }
-                    None => Err("its state no longer declares a timeout".to_string()),
+                    None => {
+                        self.spawn_boot_reconcile(&tenant, &row, gate.clone());
+                        Err("its state no longer declares a timeout".to_string())
+                    }
                 };
-                let (after_seconds, timer) = match timer {
+                let timer = match timer {
                     Ok(timer) => timer,
                     Err(reason) => {
                         tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,
@@ -182,7 +197,7 @@ impl ServerState {
                         continue;
                     }
                 };
-                let delay = remaining_budget(timer.started_at, after_seconds, now);
+                let delay = remaining_budget(timer.started_at, timer.after_seconds, now);
                 let label = if delay.is_zero() {
                     "overdue"
                 } else {
@@ -236,6 +251,13 @@ impl ServerState {
     }
 }
 
+/// The identity a row's timer fires as, if the row keeps a readable one.
+pub(super) fn row_armed_by(row: &StateTimerRecord) -> Option<AgentContext> {
+    serde_json::from_str::<ArmedBy>(&row.armed_by)
+        .ok()
+        .map(AgentContext::from)
+}
+
 fn timer_record(timer: &ArmedTimer) -> Result<StateTimerRecord, serde_json::Error> {
     Ok(StateTimerRecord {
         tenant: timer.tenant.to_string(),
@@ -254,6 +276,7 @@ fn armed_timer(
     tenant: &TenantId,
     row: &StateTimerRecord,
     action: &str,
+    after_seconds: u64,
 ) -> Result<ArmedTimer, String> {
     let started_at = DateTime::parse_from_rfc3339(&row.started_at)
         .map_err(|error| format!("started_at: {error}"))?
@@ -268,6 +291,7 @@ fn armed_timer(
         state: row.state.clone(),
         action: action.to_string(),
         params,
+        after_seconds,
         agent_ctx: armed_by.into(),
         arm_id: row.arm_id.clone(),
         sequence_nr: row.sequence_nr,

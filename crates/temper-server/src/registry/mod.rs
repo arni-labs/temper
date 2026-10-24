@@ -11,7 +11,7 @@ pub mod types;
 
 use server_derived_names::warn_on_server_derived_csdl_properties;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use tracing::instrument;
@@ -37,12 +37,24 @@ use relations::{build_relation_graph, build_webhook_routes, synthesize_action_tr
 #[derive(Debug, Clone, Default)]
 pub struct SpecRegistry {
     tenants: BTreeMap<TenantId, TenantConfig>,
+    /// Types whose spec a registration replaced with a different one that
+    /// declares state timeouts, or did before: their records' timers must be
+    /// made to follow the state each record is in under the new spec.
+    changed_types: BTreeSet<(TenantId, String)>,
 }
 
 impl SpecRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Take the types whose spec changed since the last call (see
+    /// `ServerState::follow_spec_changes`).
+    pub fn take_changed_types(&mut self) -> Vec<(TenantId, String)> {
+        std::mem::take(&mut self.changed_types)
+            .into_iter()
+            .collect()
     }
 
     /// Register a tenant with its CSDL document and IOA specs.
@@ -203,6 +215,12 @@ impl SpecRegistry {
                 let integrations = automaton.integrations.clone();
 
                 if let Some(existing_spec) = existing_config.entities.get_mut(*entity_type) {
+                    let timed = !existing_spec.automaton.state_timeouts.is_empty()
+                        || !automaton.state_timeouts.is_empty();
+                    if timed && existing_spec.ioa_source != *ioa_source {
+                        self.changed_types
+                            .insert((tenant.clone(), (*entity_type).to_string()));
+                    }
                     // Hot-swap: write new table into the SAME RwLock that actors hold.
                     let result = existing_spec.swap_controller().swap(table);
                     tracing::info!(
