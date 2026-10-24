@@ -34,22 +34,25 @@
 mod boot_burst;
 #[path = "dst_state_timers_follow_state/delete_race.rs"]
 mod delete_race;
+#[path = "dst_state_timers_follow_state/embedder.rs"]
+mod embedder;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use invariants::{check_all_done, check_rows_follow_state};
+use invariants::{check_all_done, check_boot_counts, check_rows_follow_state, check_seeds};
 use serde_json::json;
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_sim_context};
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
+use temper_server::state::BootTimers;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -159,16 +162,18 @@ struct World {
 struct Process {
     runtime: tokio::runtime::Runtime,
     state: ServerState,
+    /// What its boot did with each timed type's timers, once its walk ended.
+    booted: BootTimers,
 }
 
 impl Process {
-    /// Boot the way `temper serve` does: specs, storage, then the re-arm of
-    /// the timers the last process left waiting, and the walk of every timed
-    /// type's records that follows it (awaited here, in the background in
-    /// `temper serve`).
+    /// Boot the way every embedder does: specs, storage, then
+    /// `start_runtime`, which re-arms the timers the last process left
+    /// waiting and walks the timed types' records (awaited here, in the
+    /// background in `temper serve`).
     fn start(world: &World, alpha_spec: &str, gamma_spec: &str, name: &str) -> Self {
-        let (process, walk) = Self::boot(world, alpha_spec, gamma_spec, name);
-        process.runtime.block_on(walk).unwrap();
+        let (mut process, walk) = Self::boot(world, alpha_spec, gamma_spec, name);
+        process.booted = process.runtime.block_on(walk).unwrap();
         process
     }
 
@@ -179,7 +184,7 @@ impl Process {
         alpha_spec: &str,
         gamma_spec: &str,
         name: &str,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    ) -> (Self, tokio::task::JoinHandle<BootTimers>) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -199,16 +204,24 @@ impl Process {
             let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
             state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
             state.state_timer_rows = Some(world.rows.clone());
-            let walk = state.rearm_state_timers().await;
+            let walk = state.start_runtime().await.expect("the first start");
             (state, walk)
         });
-        (Self { runtime, state }, walk)
+        let booted = BootTimers::new();
+        (
+            Self {
+                runtime,
+                state,
+                booted,
+            },
+            walk,
+        )
     }
 
     /// Exit: every task of this process stops.
     fn kill(self, world: &World, downtime: Duration) {
         self.runtime.block_on(async { world.clock.end(downtime) });
-        let Self { runtime, state } = self;
+        let Self { runtime, state, .. } = self;
         drop(state);
         drop(runtime);
     }
@@ -226,9 +239,26 @@ struct Run {
     seed: u64,
     trace: Vec<String>,
     deleted: BTreeSet<(String, String)>,
+    /// Records in a timed state that nothing armed: no dispatch since their
+    /// type gained its timeouts, and no install walk. They wait, with no row.
+    unarmed: BTreeSet<(String, String)>,
 }
 
 impl Run {
+    fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            trace: Vec::new(),
+            deleted: BTreeSet::new(),
+            unarmed: BTreeSet::new(),
+        }
+    }
+
+    fn is_unarmed(&self, job: &Job) -> bool {
+        self.unarmed
+            .contains(&(job.tenant.to_string(), job.id.clone()))
+    }
+
     fn note(&mut self, line: String) {
         self.trace.push(line);
     }
@@ -312,11 +342,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         clock,
     };
     let mut rng = DeterministicRng::new(seed);
-    let mut run = Run {
-        seed,
-        trace: Vec::new(),
-        deleted: BTreeSet::new(),
-    };
+    let mut run = Run::new(seed);
     let mut jobs = Vec::new();
     for tenant in TENANTS {
         for i in 0..3 + rng.next_bound(3) {
@@ -379,6 +405,12 @@ fn run_seed(seed: u64) -> Result<(), String> {
             // The process stops before the install's walk reaches gamma.
             install(state, "gamma", JOB_V1);
             state.registry.write().unwrap().take_changed_types();
+            // Nothing armed gamma's records: they wait until their next action.
+            for job in &jobs {
+                if job.tenant.as_str() == "gamma" && !run.is_deleted(job) {
+                    run.unarmed.insert((job.tenant.to_string(), job.id.clone()));
+                }
+            }
         }
         settle().await;
         run.note(format!(
@@ -399,7 +431,11 @@ fn run_seed(seed: u64) -> Result<(), String> {
             match rng.next_bound(3) {
                 0 => {}
                 1 => {
-                    act(state, job, "Poke").await;
+                    // A dispatch arms the timer its record's state declares.
+                    if act(state, job, "Poke").await {
+                        run.unarmed
+                            .remove(&(job.tenant.to_string(), job.id.clone()));
+                    }
                     run.note(format!("poked {}/{}", job.tenant, job.id));
                 }
                 _ => {
@@ -411,12 +447,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         if rng.chance(0.7) {
             passivate_some(state, &jobs, &mut rng, &mut run).await;
         }
-        let followed: Vec<Job> = jobs
-            .iter()
-            .filter(|job| gamma_followed || job.tenant.as_str() != "gamma")
-            .cloned()
-            .collect();
-        check_rows_follow_state(state, &world, &followed, &run, "after the install").await
+        check_rows_follow_state(state, &world, &jobs, &run, "after the install").await
     })?;
 
     let downtime = Duration::from_secs(rng.next_bound(600) as u64);
@@ -426,13 +457,11 @@ fn run_seed(seed: u64) -> Result<(), String> {
     let second = Process::start(&world, &v2, JOB_V1, &format!("follow-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
+        check_boot_counts(&second.booted, &jobs, &run)?;
         check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
-        // Keep gamma untouched until its timers alone have finished.
-        let looked: Vec<Job> = jobs
-            .iter()
-            .filter(|job| job.tenant.as_str() != "gamma" && rng.chance(0.4))
-            .cloned()
-            .collect();
+        // A read rehydrates a record: one with a row follows its state, one
+        // without stays unarmed.
+        let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
         run.note(format!(
             "rehydrated {:?}",
             looked
@@ -444,7 +473,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
             status(state, job).await;
         }
         settle().await;
-        // Nobody touches the records: their timers alone must finish them.
+        // Nobody acts on the records: their timers alone must finish them.
         for _ in 0..360 {
             advance(Duration::from_secs(30)).await;
         }
@@ -460,28 +489,4 @@ mod read_failure;
 #[test]
 fn dst_state_timers_follow_the_current_state() {
     check_seeds(run_seed);
-}
-
-/// Run `run_seed` over every seed and report each invariant it broke, with the
-/// seeds that broke it and the first such seed's report.
-fn check_seeds(run_seed: fn(u64) -> Result<(), String>) {
-    let mut broken: BTreeMap<String, (Vec<u64>, String)> = BTreeMap::new();
-    for seed in 0..SEEDS {
-        if let Err(report) = run_seed(seed) {
-            let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
-            let entry = broken
-                .entry(invariant)
-                .or_insert_with(|| (Vec::new(), report));
-            entry.0.push(seed);
-        }
-    }
-    let summary: Vec<String> = broken
-        .iter()
-        .map(|(invariant, (seeds, first))| format!("{invariant}: seeds {seeds:?}\nfirst: {first}"))
-        .collect();
-    assert!(
-        broken.is_empty(),
-        "invariants broken over {SEEDS} seeds:\n\n{}",
-        summary.join("\n\n")
-    );
 }

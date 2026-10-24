@@ -2,7 +2,7 @@
 //!
 //! This module provides metric recording helpers called from hot paths
 //! (entity actor replay, entity ops).  The periodic canary loop and
-//! sampler live in `state::runtime_metrics` via `spawn_runtime_metrics_loop`.
+//! sampler live in `state::runtime_metrics`, started by `ServerState::start_runtime`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;

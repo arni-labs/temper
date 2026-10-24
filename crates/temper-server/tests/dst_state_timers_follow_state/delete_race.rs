@@ -12,7 +12,6 @@
 //!
 //! Invariant: once every write has landed, no deleted record has a row.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,11 +55,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         clock,
     };
     let mut rng = DeterministicRng::new(seed ^ 0xde1e7e);
-    let mut run = Run {
-        seed,
-        trace: Vec::new(),
-        deleted: BTreeSet::new(),
-    };
+    let mut run = Run::new(seed);
     let jobs: Vec<Job> = (0..4 + rng.next_bound(5))
         .map(|i| Job {
             tenant: TenantId::new("alpha"),

@@ -2,12 +2,17 @@
 //!
 //! An install that changes a type's spec, or gives a type its first timeout,
 //! can leave records in a timed state with the timer of another state or
-//! none. A boot can find records in a timed state with no timer row (an
-//! install walk the last process did not finish, a row write that failed).
-//! Both walk the type's records and reconcile each one
+//! none. Its walk reconciles every record of the type
 //! ([`ServerState::reconcile_state_timers`]), so every record in a timed state
 //! ends with its timer armed, or waits for a caller (see
 //! [`TimerFollow::WaitsForCaller`]).
+//!
+//! At boot, after the rows are re-armed, a walk makes each record that had a
+//! row follow the state it replays into: a row of `Waiting` on a record that
+//! now replays into `Review` gets `Review`'s timer at once, not when the stale
+//! one fires. A record in a timed state with no row is not armed: it waits for
+//! its next action ([`Arming::FromRow`]). The walk counts those records, and
+//! ends with one log line of counts per tenant and type.
 //!
 //! A record in memory is reconciled with its actor's state. One that is not is
 //! replayed from the store without starting an actor, so a walk over many
@@ -20,7 +25,7 @@ use tokio::sync::Semaphore;
 
 use temper_runtime::tenant::TenantId;
 
-use super::state_timer_reconcile::TimerFollow;
+use super::state_timer_reconcile::{Arming, Follow, TimerFollow};
 use crate::entity_actor::{EntityState, recover_entity_state_from_store};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
@@ -36,6 +41,21 @@ const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
 /// longer declares a timeout), so the record's new timer fires as them.
 pub(super) type BootCallers = BTreeMap<(TenantId, String, String), AgentContext>;
 
+/// What the boot did with one timed type's timers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootTimerCounts {
+    /// Rows armed again.
+    pub rearmed: usize,
+    /// Rows removed: their state no longer declares a timeout.
+    pub dropped: usize,
+    /// Records in a timed state with no row: not armed, they wait for their
+    /// next action.
+    pub waiting: usize,
+}
+
+/// The boot's [`BootTimerCounts`] by tenant and entity type.
+pub type BootTimers = BTreeMap<(TenantId, String), BootTimerCounts>;
+
 impl ServerState {
     /// Make the timers of every record of each type whose spec an install
     /// changed follow the state the record is in now, including a type that
@@ -46,7 +66,8 @@ impl ServerState {
             Ok(mut registry) => registry.take_changed_types(),
             Err(_) => return,
         };
-        self.follow_types(changed, &BootCallers::new(), None).await;
+        self.follow_types(changed, &BootCallers::new(), None, Arming::Any)
+            .await;
     }
 
     /// [`Self::follow_spec_changes`] in the background, for an install that
@@ -60,8 +81,14 @@ impl ServerState {
     }
 
     /// At boot, after the rows are re-armed: make every record of every type
-    /// that declares a timeout follow its state, as an install would.
-    pub(super) async fn follow_timed_types(&self, callers: BootCallers, gate: Arc<Semaphore>) {
+    /// that declares a timeout and had a row follow its state, and count the
+    /// records in a timed state with no row into `counts`, which it logs.
+    pub(super) async fn follow_timed_types(
+        &self,
+        callers: BootCallers,
+        gate: Arc<Semaphore>,
+        mut counts: BootTimers,
+    ) -> BootTimers {
         let types: Vec<(TenantId, String)> = match self.registry.read() {
             Ok(registry) => registry
                 .tenant_ids()
@@ -79,22 +106,49 @@ impl ServerState {
                         .collect::<Vec<_>>()
                 })
                 .collect(),
-            Err(_) => return,
+            Err(_) => return counts,
         };
-        self.follow_types(types, &callers, Some(gate)).await;
+        let waiting = self
+            .follow_types(types, &callers, Some(gate), Arming::FromRow)
+            .await;
+        for (key, waiting) in waiting {
+            counts.entry(key).or_default().waiting = waiting;
+        }
+        let by_type = counts
+            .iter()
+            .map(|((tenant, entity_type), counts)| {
+                format!(
+                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={}",
+                    counts.rearmed, counts.dropped, counts.waiting
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::info!(
+            rearmed = counts.values().map(|c| c.rearmed).sum::<usize>(),
+            dropped = counts.values().map(|c| c.dropped).sum::<usize>(),
+            waiting = counts.values().map(|c| c.waiting).sum::<usize>(),
+            by_type,
+            "state timers after boot"
+        );
+        counts
     }
 
-    /// Reconcile every record of each of `types`. A type whose records the
-    /// store cannot list or read is tried again after a wait. Repeating a
-    /// successful reconcile is idempotent; an unreadable record may have no
-    /// timer at all, so the walk must retain responsibility for retrying it.
+    /// Reconcile every record of each of `types` as `arming` allows, and
+    /// return how many records of each type wait for their next action. A type
+    /// whose records the store cannot list or read is tried again after a
+    /// wait. Repeating a successful reconcile is idempotent; an unreadable
+    /// record may have no timer at all, so the walk must retain responsibility
+    /// for retrying it.
     async fn follow_types(
         &self,
         mut types: Vec<(TenantId, String)>,
         callers: &BootCallers,
         gate: Option<Arc<Semaphore>>,
-    ) {
+        arming: Arming,
+    ) -> BTreeMap<(TenantId, String), usize> {
         let mut wait = FOLLOW_RETRY_FIRST;
+        let mut waiting_by_type = BTreeMap::new();
         loop {
             let mut pending = Vec::new();
             for (tenant, entity_type) in types {
@@ -106,20 +160,19 @@ impl ServerState {
                     continue;
                 }
                 let ids = self.list_entity_ids(&tenant, &entity_type);
-                let mut waiting = 0usize;
-                let mut unreadable = 0usize;
+                let (mut for_caller, mut for_row, mut unreadable) = (0usize, 0usize, 0usize);
                 for entity_id in &ids {
                     let key = (tenant.clone(), entity_type.clone(), entity_id.clone());
+                    let follow = Follow {
+                        armed_by: callers.get(&key),
+                        gate: gate.clone(),
+                        arming,
+                    };
                     let followed = self
-                        .reconcile_stored_record(
-                            &tenant,
-                            &entity_type,
-                            entity_id,
-                            callers.get(&key),
-                            gate.clone(),
-                        )
+                        .reconcile_stored_record(&tenant, &entity_type, entity_id, follow)
                         .await;
-                    waiting += usize::from(followed == TimerFollow::WaitsForCaller);
+                    for_caller += usize::from(followed == TimerFollow::WaitsForCaller);
+                    for_row += usize::from(followed == TimerFollow::WaitsForRow);
                     unreadable += usize::from(followed == TimerFollow::RetryRead);
                 }
                 if unreadable > 0 {
@@ -129,15 +182,17 @@ impl ServerState {
                     pending.push((tenant, entity_type));
                     continue;
                 }
-                tracing::info!(tenant = %tenant, entity_type, records = ids.len(), waiting,
+                tracing::info!(tenant = %tenant, entity_type, records = ids.len(),
+                    waiting_for_caller = for_caller, waiting_for_row = for_row,
                     "state timers follow the records' states");
-                if waiting > 0 {
-                    tracing::warn!(tenant = %tenant, entity_type, waiting,
+                if for_caller > 0 {
+                    tracing::warn!(tenant = %tenant, entity_type, waiting = for_caller,
                         "records in a timed state wait for their next action: the timeout action binds its caller and nobody armed it");
                 }
+                waiting_by_type.insert((tenant, entity_type), for_caller + for_row);
             }
             if pending.is_empty() {
-                return;
+                return waiting_by_type;
             }
             tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
             wait = (wait * 2).min(FOLLOW_RETRY_MAX);
@@ -153,8 +208,7 @@ impl ServerState {
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-        armed_by: Option<&AgentContext>,
-        gate: Option<Arc<Semaphore>>,
+        follow: Follow<'_>,
     ) -> TimerFollow {
         let Some(current) = self
             .current_record_state(tenant, entity_type, entity_id)
@@ -165,7 +219,7 @@ impl ServerState {
         if current.total_event_count == 0 {
             return TimerFollow::Settled;
         }
-        self.reconcile_state_timers_gated(tenant, entity_type, entity_id, &current, armed_by, gate)
+        self.follow_state_timer(tenant, entity_type, entity_id, &current, follow)
             .await
     }
 

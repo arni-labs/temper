@@ -876,19 +876,12 @@ mod tests {
                 old.boot_gate = Some(gate.clone());
                 server.reserve_state_timer(&old).unwrap();
             }
+            let follow = super::super::state_timer_reconcile::Follow {
+                gate: (!has_prior_row).then(|| gate.clone()),
+                ..Default::default()
+            };
             server
-                .reconcile_state_timers_gated(
-                    &tenant,
-                    "Ticket",
-                    "e-1",
-                    &created.state,
-                    None,
-                    if has_prior_row {
-                        None
-                    } else {
-                        Some(gate.clone())
-                    },
-                )
+                .follow_state_timer(&tenant, "Ticket", "e-1", &created.state, follow)
                 .await;
             let armed = server.armed_state_timer(&tenant, "Ticket", "e-1").unwrap();
             assert!(Arc::ptr_eq(armed.boot_gate.as_ref().unwrap(), &gate));

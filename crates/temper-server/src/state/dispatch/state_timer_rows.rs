@@ -21,7 +21,7 @@ use temper_runtime::tenant::TenantId;
 use tokio::sync::Semaphore;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
-use super::state_timer_follow::BootCallers;
+use super::state_timer_follow::{BootCallers, BootTimers};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 use crate::storage::{MetadataTimerRows, StateTimerStore};
@@ -145,20 +145,22 @@ impl ServerState {
         }
     }
 
-    /// Arm again every state timer that a previous process left waiting.
+    /// Arm again every state timer that a previous process left waiting
+    /// (`ServerState::start_runtime` calls it once at boot).
     ///
-    /// Call once at boot, after specs, policies and modules are loaded and
-    /// before the server takes requests. Reads one row per waiting timer and
-    /// loads no entity until its timer fires, at most [`BOOT_FIRES_AT_ONCE`]
-    /// firing at once; a row whose state declares no timeout now is removed.
-    /// Then, in the background, every record of a timed type is made to
-    /// follow its state, so one in a timed state with no row gets its timer
-    /// (as whoever armed its removed row, if it had one). Returns that
-    /// background walk, which a caller may await.
-    pub async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<()> {
+    /// Reads one row per waiting timer and loads no entity until its timer
+    /// fires, at most [`BOOT_FIRES_AT_ONCE`] firing at once; a row whose state
+    /// declares no timeout now is removed. Then, in the background, each
+    /// record that had a row follows the state it is in now (as whoever armed
+    /// its row), through the same gate. A record in a timed state with no row
+    /// is not armed: it waits for its next action. Returns that background
+    /// walk, which ends with the boot's counts per tenant and type, and logs
+    /// them as `state timers after boot`.
+    pub(crate) async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<BootTimers> {
         let started = Instant::now();
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
         let mut callers = BootCallers::new();
+        let mut counts = BootTimers::new();
         let mut armed = 0usize;
         let mut overdue = 0usize;
         for (tenant, timeouts) in self.declared_state_timeouts() {
@@ -191,9 +193,13 @@ impl ServerState {
                         Err("its state no longer declares a timeout".to_string())
                     }
                 };
+                let counted = counts
+                    .entry((tenant.clone(), row.entity_type.clone()))
+                    .or_default();
                 let mut timer = match timer {
                     Ok(timer) => timer,
                     Err(reason) => {
+                        counted.dropped += 1;
                         tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,
                             entity_id = %row.entity_id, state = %row.state, %reason,
                             "state timer row dropped at boot");
@@ -225,6 +231,7 @@ impl ServerState {
                 let Some(armed_seq) = self.reserve_state_timer(&timer) else {
                     continue;
                 };
+                counted.rearmed += 1;
                 self.spawn_state_timer(timer, delay, Some(gate.clone()), armed_seq);
                 armed += 1;
             }
@@ -237,7 +244,7 @@ impl ServerState {
         );
         let server = self.clone();
         // determinism-ok: boot follow-up runs in the background, as boot timers do.
-        tokio::spawn(async move { server.follow_timed_types(callers, gate).await })
+        tokio::spawn(async move { server.follow_timed_types(callers, gate, counts).await })
     }
 
     /// Every tenant's declared timeouts. Tenants without any are left out.

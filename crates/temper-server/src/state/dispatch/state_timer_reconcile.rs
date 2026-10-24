@@ -13,14 +13,21 @@
 //! - after a dispatch that neither entered nor reset a timed state, after a
 //!   create, and after a delete.
 //!
+//! Only a fresh event arms a record that has no timer, and so no row: a
+//! dispatch, a create, or an install that changed the record's spec. A
+//! rehydration and a boot follow only a timer the record already has, from
+//! its row ([`Arming::FromRow`]); a record in a timed state with no row waits
+//! for its next action, and the boot walk counts it.
+//!
 //! It is idempotent: a record whose armed timer is already the one its state
 //! declares keeps it, so any number of calls leave one timer armed. The timer's
 //! clock starts when the record entered its state, so a timer re-armed after a
 //! restart or a rehydration waits only the rest of its budget, or fires at once.
 //!
 //! A timer fires as someone: the caller of the dispatch that reconciles, else
-//! whoever armed the timer it replaces, else (a record nobody armed a timer
-//! for, as when an install adds a timeout to its type) the kernel's
+//! whoever armed the timer it replaces (its row's `armed_by`), else (a record
+//! nobody armed a timer for, as when an install adds a timeout to its type)
+//! the kernel's
 //! [`STATE_TIMER_SERVICE`]. A timeout action that binds its caller's identity
 //! (`authenticated_subject`) refuses a service caller by design, so such a
 //! record waits for its next action, whose caller arms it.
@@ -39,7 +46,7 @@ use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
 /// The service a timer fires as when nobody armed it: a record found in a
-/// timed state by an install or a boot with no timer armed and no row.
+/// timed state by an install with no timer armed and no row.
 const STATE_TIMER_SERVICE: &str = "state-timer";
 
 /// What a reconcile left a record with.
@@ -52,6 +59,36 @@ pub(crate) enum TimerFollow {
     /// Its state declares a timer whose action binds its caller's identity,
     /// and nobody armed it: the record's next action arms it as that caller.
     WaitsForCaller,
+    /// Its state declares a timer, but it has no timer and no row, and a
+    /// rehydration or a boot does not arm one: its next action does.
+    WaitsForRow,
+}
+
+/// Whether a reconcile may arm a timer for a record that has none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Arming {
+    /// A fresh event says the record is in its state now: a dispatch, a
+    /// create, a delete, a timer that found its record elsewhere, or an
+    /// install that changed the record's spec. A missing timer is armed.
+    #[default]
+    Any,
+    /// A rehydration or a boot: only a timer the record has (armed from its
+    /// row, or the row the boot dropped) follows its state. A record with
+    /// neither waits ([`TimerFollow::WaitsForRow`]), so a boot never arms
+    /// records that had no timer, and never fires them all at once.
+    FromRow,
+}
+
+/// How a reconcile treats the record: who its new timer fires as, the boot
+/// gate it fires through, and whether it may arm a record that has no timer.
+#[derive(Clone, Default)]
+pub(crate) struct Follow<'a> {
+    /// The caller of the dispatch that reconciles, or whoever armed the row
+    /// the boot dropped.
+    pub(crate) armed_by: Option<&'a AgentContext>,
+    /// The boot walk's fire gate.
+    pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
+    pub(crate) arming: Arming,
 }
 
 impl ServerState {
@@ -68,20 +105,28 @@ impl ServerState {
         current: &EntityState,
         armed_by: Option<&AgentContext>,
     ) -> TimerFollow {
-        self.reconcile_state_timers_gated(tenant, entity_type, entity_id, current, armed_by, None)
+        let follow = Follow {
+            armed_by,
+            ..Follow::default()
+        };
+        self.follow_state_timer(tenant, entity_type, entity_id, current, follow)
             .await
     }
 
-    /// Reconcile with the shared boot dispatch gate when called by its walk.
-    pub(super) async fn reconcile_state_timers_gated(
+    /// [`Self::reconcile_state_timers`] as `follow` says.
+    pub(super) async fn follow_state_timer(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         current: &EntityState,
-        armed_by: Option<&AgentContext>,
-        gate: Option<Arc<tokio::sync::Semaphore>>,
+        follow: Follow<'_>,
     ) -> TimerFollow {
+        let Follow {
+            armed_by,
+            gate,
+            arming,
+        } = follow;
         let declared = {
             let Ok(registry) = self.registry.read() else {
                 return TimerFollow::Settled;
@@ -104,10 +149,13 @@ impl ServerState {
                 .await;
             return TimerFollow::Settled;
         };
-        let known = armed_by.cloned().or_else(|| {
-            self.armed_state_timer(tenant, entity_type, entity_id)
-                .map(|armed| armed.agent_ctx)
-        });
+        let armed = self.armed_state_timer(tenant, entity_type, entity_id);
+        if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() {
+            return TimerFollow::WaitsForRow;
+        }
+        let known = armed_by
+            .cloned()
+            .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()));
         let identity = match known {
             Some(identity) => identity,
             None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
@@ -124,10 +172,7 @@ impl ServerState {
             &identity,
             started_at,
         );
-        timer.boot_gate = gate.or_else(|| {
-            self.armed_state_timer(tenant, entity_type, entity_id)
-                .and_then(|armed| armed.boot_gate)
-        });
+        timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
         let delay = remaining_budget(started_at, st.after_seconds, now);
         if self
             .start_armed_timer(timer, delay, Reservation::Missing)
@@ -169,8 +214,9 @@ impl ServerState {
     }
 
     /// The hook an entity actor runs when it starts from stored events: it
-    /// makes the record's timer follow the state it rehydrated into. None for
-    /// a type that declares no timeout and a record with no timer armed.
+    /// makes the record's timer, if it has one, follow the state it
+    /// rehydrated into ([`Arming::FromRow`]). None for a type that declares no
+    /// timeout and a record with no timer armed.
     pub(crate) fn state_timer_rehydrate_hook(
         &self,
         tenant: &TenantId,
@@ -195,8 +241,12 @@ impl ServerState {
             // determinism-ok: background reconcile, as timers are spawned; under
             // simulation it runs on the single-threaded test runtime.
             tokio::spawn(async move {
+                let follow = Follow {
+                    arming: Arming::FromRow,
+                    ..Follow::default()
+                };
                 server
-                    .reconcile_state_timers(&tenant, &entity_type, &entity_id, &rehydrated, None)
+                    .follow_state_timer(&tenant, &entity_type, &entity_id, &rehydrated, follow)
                     .await;
             });
         }))

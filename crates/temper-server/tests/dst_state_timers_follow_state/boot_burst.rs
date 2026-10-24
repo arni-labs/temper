@@ -4,16 +4,18 @@
 //! never passivated, so none has a snapshot; records in `gamma` start untimed.
 //! The process stays down longer than any budget, then boots under the second
 //! spec with `gamma` timed. `alpha`'s records replay into `Review`, whose timer
-//! replaces the `Waiting` one their rows name, and `gamma`'s get their first
-//! timer from the boot walk: every one of these timers is due at boot. A
-//! record's first append in the new process (its timer's fire) takes a
-//! minute, so fires that run together start at the same instant.
+//! replaces the `Waiting` one their rows name, and every one of those timers
+//! is due at boot. `gamma`'s records have no row. A record's first append in
+//! the new process (its timer's fire) takes a minute, so fires that run
+//! together start at the same instant.
 //!
 //! Invariants:
 //! - at most [`FIRES_AT_ONCE`] timers start firing at one instant;
-//! - every record still reaches `Done` on exactly one timer fire.
+//! - every `alpha` record still reaches `Done` on exactly one timer fire;
+//! - no `gamma` record fires: with no row, each waits for its next action,
+//!   and the boot counts it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,11 +47,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         clock,
     };
     let mut rng = DeterministicRng::new(seed ^ 0xb0b5);
-    let mut run = Run {
-        seed,
-        trace: Vec::new(),
-        deleted: BTreeSet::new(),
-    };
+    let mut run = Run::new(seed);
     let mut jobs = Vec::new();
     for tenant in ["alpha", "gamma"] {
         for i in 0..FIRES_AT_ONCE + 1 + rng.next_bound(4) {
@@ -92,6 +90,20 @@ fn run_seed(seed: u64) -> Result<(), String> {
     let second = Process::start(&world, &job_v2(), JOB_V1, &format!("burst-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
+        let gamma = jobs
+            .iter()
+            .filter(|job| job.tenant.as_str() == "gamma")
+            .count();
+        let waiting = second
+            .booted
+            .get(&(TenantId::new("gamma"), "Job".to_string()))
+            .map_or(0, |counts| counts.waiting);
+        if waiting != gamma {
+            return Err(run.fail(
+                "the boot counts the records that wait without a row",
+                format!("gamma/Job: {gamma} records have no row, the boot counted {waiting}"),
+            ));
+        }
         for _ in 0..4 * jobs.len() / FIRES_AT_ONCE + 4 {
             advance(FIRE_APPEND).await;
         }
@@ -107,6 +119,21 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 .iter()
                 .filter(|event| event.action == "Expire" || event.action == "Approve")
                 .collect();
+            if job.tenant.as_str() == "gamma" {
+                if record.status != "Waiting" || !fires.is_empty() {
+                    return Err(run.fail(
+                        "a record with no row waits for its next action",
+                        format!(
+                            "{}/{} is {} after {} timer fires",
+                            job.tenant,
+                            job.id,
+                            record.status,
+                            fires.len()
+                        ),
+                    ));
+                }
+                continue;
+            }
             if record.status != "Done" || fires.len() != 1 {
                 return Err(run.fail(
                     "every record leaves its timed state on its timer",
