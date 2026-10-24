@@ -212,7 +212,7 @@ impl crate::state::ServerState {
         let Some((_lease, agent_ctx)) = self.admit_tenant_work(tenant, agent_ctx) else {
             return Err(DispatchError::TenantGone(tenant.to_string()));
         };
-        let agent_ctx = &agent_ctx;
+        let agent_ctx: &AgentContext = &agent_ctx;
 
         if self
             .composite_metadata_for(tenant, entity_type, action)?
@@ -396,7 +396,7 @@ impl crate::state::ServerState {
         let Some((_lease, agent_ctx)) = self.admit_tenant_work(tenant, agent_ctx) else {
             return Err(DispatchError::TenantGone(tenant.to_string()));
         };
-        let agent_ctx = &agent_ctx;
+        let agent_ctx: &AgentContext = &agent_ctx;
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
 

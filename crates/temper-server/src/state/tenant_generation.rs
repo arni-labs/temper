@@ -202,12 +202,12 @@ impl super::ServerState {
     /// follow-on, a reaction or a callback of earlier work) is admitted only while that generation is live; other
     /// work joins the live generation. Returns the lease to hold while the work runs and the context, stamped with
     /// the generation, for the work it starts. None while the tenant is removed, or when the work's generation no
-    /// longer exists.
+    /// longer exists. The context is boxed because dispatch futures hold it across their awaits, and they nest.
     pub fn admit_tenant_work(
         &self,
         tenant: &TenantId,
         agent_ctx: &crate::request_context::AgentContext,
-    ) -> Option<(GenerationLease, crate::request_context::AgentContext)> {
+    ) -> Option<(GenerationLease, Box<crate::request_context::AgentContext>)> {
         let lease = match agent_ctx
             .tenant_generation
             .as_ref()
@@ -216,7 +216,7 @@ impl super::ServerState {
             Some(stamp) => self.tenant_generations.lease(stamp),
             None => self.tenant_generations.lease_live(tenant),
         }?;
-        let mut stamped = agent_ctx.clone();
+        let mut stamped = Box::new(agent_ctx.clone());
         stamped.tenant_generation = Some(lease.stamp().clone());
         Some((lease, stamped))
     }
