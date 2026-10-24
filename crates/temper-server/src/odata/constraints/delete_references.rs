@@ -19,6 +19,12 @@
 //! and only while it fits [`UNINDEXED_REFERENCE_READ_BUDGET`]; past it the
 //! lookup reports that it could not check the rows instead of reading the
 //! whole type.
+//!
+//! A row holds a reference where the create check reads it (`extract_field`):
+//! the field at the top level, else inside a `fields` object, which is how a
+//! write that wraps its body under `fields` stores it. The index holds only
+//! top-level fields, so the catalog rows that hold a `fields` object come back
+//! with their projected fields, and a current one is checked from those.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,6 +66,9 @@ struct Catalog {
     /// Rows whose journal has moved past them. Their index entries may hold
     /// earlier fields, so a probe hit on one proves nothing.
     stale: BTreeSet<String>,
+    /// Current rows that hold a `fields` object, with their projected
+    /// fields: the index does not look inside that object.
+    wrapped: Vec<(String, serde_json::Value)>,
 }
 
 /// Rows read from their actors because the index could not vouch for them.
@@ -100,7 +109,7 @@ impl<'a> ReferenceFinder<'a> {
         self.load_catalog(&edge.from_entity).await;
         let probed = match self.catalogs[&edge.from_entity].as_ref() {
             Some(catalog) => {
-                self.probe_field_index(edge, entity_id, skip, limit, &catalog.stale)
+                self.probe_field_index(edge, entity_id, skip, limit, catalog)
                     .await
             }
             None => None,
@@ -143,13 +152,17 @@ impl<'a> ReferenceFinder<'a> {
                     let mut catalog = Catalog {
                         current: BTreeSet::new(),
                         stale: BTreeSet::new(),
+                        wrapped: Vec::new(),
                     };
                     for row in rows {
-                        if row.current {
-                            catalog.current.insert(row.entity_id);
-                        } else {
+                        if !row.current {
                             catalog.stale.insert(row.entity_id);
+                            continue;
                         }
+                        if let Some(fields) = row.wrapped_fields {
+                            catalog.wrapped.push((row.entity_id.clone(), fields));
+                        }
+                        catalog.current.insert(row.entity_id);
                     }
                     catalog
                 }),
@@ -166,16 +179,18 @@ impl<'a> ReferenceFinder<'a> {
         self.catalogs.insert(entity_type.to_string(), catalog);
     }
 
-    /// Ask the field index for up to `limit` rows outside `skip` and `stale`
-    /// whose `source_field` is `entity_id`, using the same predicate an OData
-    /// `$filter` equality pushes down. `None` when the index cannot answer.
+    /// Ask the field index for up to `limit` rows outside `skip` and the
+    /// catalog's stale rows whose `source_field` is `entity_id`, using the
+    /// same predicate an OData `$filter` equality pushes down, and add the
+    /// current rows that hold it inside a `fields` object. `None` when the
+    /// index cannot answer.
     async fn probe_field_index(
         &self,
         edge: &RelationEdge,
         entity_id: &str,
         skip: &BTreeSet<String>,
         limit: usize,
-        stale: &BTreeSet<String>,
+        catalog: &Catalog,
     ) -> Option<Vec<String>> {
         let query_plane = self.state.query_plane_store()?;
         if !self.state.query_projection_indexes_field(
@@ -196,7 +211,9 @@ impl<'a> ReferenceFinder<'a> {
         let predicate = crate::odata::filter_sql::try_translate_candidate_filter(&equality)?;
         // Skipped and stale rows can fill the page; asking for that many more
         // than `limit` reaches `limit` others whenever that many match.
-        let top = limit.saturating_add(skip.len()).saturating_add(stale.len());
+        let top = limit
+            .saturating_add(skip.len())
+            .saturating_add(catalog.stale.len());
         match query_plane
             .query_field_index_page(
                 self.tenant.as_str(),
@@ -212,12 +229,20 @@ impl<'a> ReferenceFinder<'a> {
         {
             Ok(Some(page)) => {
                 debug_assert!(page.entity_ids.len() <= top);
-                Some(
-                    page.entity_ids
-                        .into_iter()
-                        .filter(|id| !skip.contains(id) && !stale.contains(id))
-                        .collect(),
-                )
+                let mut found: Vec<String> = page
+                    .entity_ids
+                    .into_iter()
+                    .filter(|id| !skip.contains(id) && !catalog.stale.contains(id))
+                    .collect();
+                for (source_id, fields) in &catalog.wrapped {
+                    if holds_id(fields, &edge.source_field, entity_id)
+                        && !skip.contains(source_id)
+                        && !found.contains(source_id)
+                    {
+                        found.push(source_id.clone());
+                    }
+                }
+                Some(found)
             }
             Ok(None) => None,
             Err(error) => {
@@ -301,10 +326,11 @@ impl<'a> ReferenceFinder<'a> {
     }
 }
 
-/// Whether `fields[field]` holds `entity_id`, compared as the field index
-/// stores a scalar: its text.
+/// Whether the reference `fields` holds through `field` is `entity_id`, read
+/// where the create check reads it (`extract_field`) and compared as the field
+/// index stores a scalar: its text.
 pub(super) fn holds_id(fields: &serde_json::Value, field: &str, entity_id: &str) -> bool {
-    match fields.get(field) {
+    match super::extract_field(fields, field) {
         Some(serde_json::Value::String(value)) => value == entity_id,
         Some(serde_json::Value::Number(value)) => value.to_string() == entity_id,
         Some(serde_json::Value::Bool(value)) => value.to_string() == entity_id,

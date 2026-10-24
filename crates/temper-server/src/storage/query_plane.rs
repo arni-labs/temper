@@ -64,6 +64,11 @@ pub struct CatalogRowFreshness {
     /// committed change whose projection failed or is still queued, or belong
     /// to an entity that has since been deleted.
     pub current: bool,
+    /// The row's projected fields when they hold a `fields` object, the shape
+    /// a write that wraps its body under `fields` leaves. The field index does
+    /// not look inside that object, so a reference held there is read from
+    /// these fields. `None` for every other row.
+    pub wrapped_fields: Option<serde_json::Value>,
 }
 
 /// Backend-neutral durable projection upsert.

@@ -7,9 +7,15 @@ use super::{
     QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 
-pub(super) fn catalog_freshness(rows: Vec<(String, bool)>) -> Vec<CatalogRowFreshness> {
+pub(super) fn catalog_freshness(
+    rows: Vec<(String, bool, Option<serde_json::Value>)>,
+) -> Vec<CatalogRowFreshness> {
     rows.into_iter()
-        .map(|(entity_id, current)| CatalogRowFreshness { entity_id, current })
+        .map(|(entity_id, current, wrapped_fields)| CatalogRowFreshness {
+            entity_id,
+            current,
+            wrapped_fields,
+        })
         .collect()
 }
 

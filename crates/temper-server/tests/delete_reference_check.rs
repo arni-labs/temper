@@ -375,3 +375,39 @@ async fn restrict_delete_ignores_a_stale_row_that_no_longer_references_it() {
     );
     assert_eq!(get_order(&state, "ord-target").await, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn restrict_delete_sees_a_reference_written_under_a_fields_object() {
+    let store = Store::new("wrapped");
+    let writer = indexed_server("delete-reference-wrapped-writer", &store).await;
+    create(&writer, "Order", "ord-wrapped", serde_json::json!({})).await;
+    create_payments(&writer, "pay", REFERENCING_PAYMENTS, "ord-elsewhere").await;
+    // The create check reads this reference inside the `fields` object, so
+    // the delete must too, though the field index holds top-level fields only.
+    create(
+        &writer,
+        "Payment",
+        "pay-wrapped",
+        serde_json::json!({ "fields": { "OrderId": "ord-wrapped" } }),
+    )
+    .await;
+
+    let state = restarted_server("delete-reference-wrapped-restarted", &store).await;
+    let actors_before = state.active_actor_count();
+    let (status, body) = delete_order(&state, "ord-wrapped").await;
+    assert_eq!(status, StatusCode::CONFLICT, "wrapped reference: {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("referenced by Payment('pay-wrapped')"),
+        "refusal names the wrapped Payment: {body}"
+    );
+    let actors_started = state.active_actor_count().saturating_sub(actors_before);
+    assert!(
+        actors_started <= 1,
+        "the delete started {actors_started} actors; the wrapped reference is \
+         read from its projection, not its actor"
+    );
+    assert_eq!(get_order(&state, "ord-wrapped").await, StatusCode::OK);
+}
