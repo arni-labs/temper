@@ -183,6 +183,7 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         timestamp: sim_now(),
         params: fields.clone(),
         idempotency_key: None,
+        kind: temper_runtime::persistence::EventKind::Transition,
     }
 }
 
