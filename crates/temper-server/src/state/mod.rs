@@ -530,6 +530,8 @@ pub struct ServerState {
     /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
+    /// When each live timer is due, for wakes and wake reports.
+    pub(crate) due_times: Arc<crate::wake::DueTimes>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
@@ -833,6 +835,7 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            due_times: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
@@ -1113,6 +1116,7 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            due_times: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(

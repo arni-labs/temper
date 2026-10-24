@@ -56,6 +56,7 @@ use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 use crate::request_context::AgentContext;
+use crate::wake::TimerRef;
 
 use super::effects::PostDispatchContext;
 
@@ -634,12 +635,25 @@ impl crate::state::ServerState {
             "armed state timeout"
         );
 
+        let budget = chrono::Duration::seconds(
+            i64::try_from(timer.after_seconds).unwrap_or(i64::MAX / 1000),
+        );
+        let due_at = timer.started_at + budget;
+        let due = self.due_times.arm(
+            TimerRef::State {
+                tenant: timer.tenant.as_str().to_string(),
+                entity_type: timer.entity_type.clone(),
+                entity_id: timer.entity_id.clone(),
+            },
+            due_at,
+        );
         let state = self.clone();
         let armed_by = crate::trace_context::cause();
         tokio::spawn(async move {
             // determinism-ok: wall-clock timer fires a side-effect action;
             // the action itself is deterministic under DST via sim_now().
-            tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
+            // A wake ends the wait early once the timer is due.
+            due.wait_until(due_at).await;
             let _permit = match gate {
                 Some(gate) => gate.acquire_owned().await.ok(),
                 None => None,
@@ -659,6 +673,7 @@ impl crate::state::ServerState {
             );
 
             async move {
+                let mut fired = false;
                 // Sequence-based cancellation check. A newer arm (or a state
                 // change that bumped the seq on exit) renders this timer a
                 // no-op. Then the timer fires only on a record still in its
@@ -695,7 +710,7 @@ impl crate::state::ServerState {
                             &timer.state,
                             &timer.action,
                         );
-                        let _ = state
+                        fired = state
                             .dispatch_tenant_action(
                                 &timer.tenant,
                                 &timer.entity_type,
@@ -704,11 +719,13 @@ impl crate::state::ServerState {
                                 timer.params.clone(),
                                 &timer.agent_ctx,
                             )
-                            .await;
+                            .await
+                            .is_ok_and(|response| response.success);
                     }
                 }
                 state.forget_state_timer(&timer).await;
                 state.state_timeout_tracker.dec_pending(&timer.entity_type);
+                state.due_times.end(&due, fired);
             }
             .instrument(span)
             .await;
