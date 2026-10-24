@@ -56,8 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_events_tenant_entity
 
 /// CREATE INDEX statement for the tombstone probe of every entity listing.
 ///
-/// Listings keep an entity unless its journal has a `Deleted` event; the
-/// partial index lets that probe read only tombstones (migration 0017).
+/// Listings keep an entity unless its journal has the kernel's tombstone
+/// ([`tombstone_sql`]); the partial index lets that probe read only events of
+/// the tombstone's type (migration 0017).
 pub const CREATE_EVENTS_DELETED_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_events_deleted
     ON events (tenant, entity_type, entity_id) WHERE event_type = 'Deleted';";
@@ -704,6 +705,21 @@ pub const ENABLE_TENANT_RLS: &[&str] = &[
        END IF; \
      END $$",
 ];
+
+/// SQL form of `PersistenceEnvelope::is_tombstone` over the events row `d`:
+/// the kernel's tombstone, never a spec action that shares its name. The
+/// `idx_events_deleted` partial index still serves the probe.
+macro_rules! tombstone_sql {
+    () => {
+        "d.event_type = 'Deleted' \
+         AND (d.payload->>'kind' = 'tombstone' \
+           OR (d.payload->'kind' IS NULL \
+             AND d.payload->>'to_status' = 'Deleted' \
+             AND d.payload->'params' = '{}'::jsonb \
+             AND d.payload->>'idempotency_key' IS NULL)) "
+    };
+}
+pub(crate) use tombstone_sql;
 
 #[cfg(test)]
 mod tests {

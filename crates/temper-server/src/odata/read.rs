@@ -1398,6 +1398,19 @@ async fn handle_stream_get(
         .into_response();
     }
 
+    // A server that keeps Files only in an object store, without one, serves a File only from its own database copy
+    // (the fast path above), never through the blob adapter from a local store other servers may share.
+    if matches!(entity_type.as_str(), "File" | "FileVersion")
+        && let Some(why) = state.files_refused_here(tenant)
+    {
+        return odata_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "FilesNeedObjectStore",
+            &why,
+        )
+        .into_response();
+    }
+
     // 4. Invoke WASM blob_adapter for download
     let response_stream_id = format!("download-{}", temper_runtime::scheduler::sim_uuid());
     let streams = Arc::new(RwLock::new(StreamRegistry::default()));

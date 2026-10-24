@@ -195,9 +195,18 @@ pub(super) async fn build_registry(
             println!("  Restored {total_restored} specs from Turso.");
         }
     }
+    for (tenant, reason) in registry.unavailable_tenants() {
+        tracing::warn!(tenant = %tenant, %reason, "tenant is unavailable, its stored specs did not load");
+    }
 
     // Load app specs from disk, persisting to backend.
     for (tenant, specs_dir) in apps {
+        let unavailable = registry
+            .tenant_unavailable_reason(&TenantId::new(tenant))
+            .is_some();
+        if skip_if_marked(unavailable, tenant, &format!("specs from {specs_dir}")) {
+            continue;
+        }
         println!("  Loading app: {tenant} from {specs_dir}");
         let loaded = load_into_registry(&mut registry, specs_dir, tenant)?;
         if let Some(text) = loaded.cedar_policy_text.as_ref() {
@@ -213,6 +222,29 @@ pub(super) async fn build_registry(
     }
 
     Ok((registry, tenant_policy_seed))
+}
+
+/// Whether startup must leave `tenant` alone, printing one line if so.
+///
+/// A tenant whose stored specs did not load keeps its stored rows exactly as
+/// they are, for repair; every startup step that would write for it skips it.
+fn skip_unavailable_tenant(state: &PlatformState, tenant: &str, what: &str) -> bool {
+    skip_if_marked(
+        state.tenant_unavailable_reason(tenant).is_some(),
+        tenant,
+        what,
+    )
+}
+
+fn skip_if_marked(unavailable: bool, tenant: &str, what: &str) -> bool {
+    if !unavailable {
+        return false;
+    }
+    tracing::warn!(
+        tenant = %tenant,
+        "skipping {what}: the tenant is unavailable, its stored rows are kept for repair"
+    );
+    true
 }
 
 /// Phase 4: Load webhook configurations from app directories.
@@ -474,63 +506,49 @@ pub(super) async fn bootstrap_tenants(state: &PlatformState, apps: &[(String, St
 
     // Every tenant that receives the agent specs also needs the trusted issuer
     // registered, or issuer-signed JWTs 401 there: bearer resolution looks the
-    // issuer up in the REQUEST's tenant, not in `default`.
+    // issuer up in the REQUEST's tenant, not in `default`. App tenants already
+    // have user specs loaded in Phase 2. In TenantRouted mode every connected
+    // tenant gets them too: its OS app specs were restored from the `specs`
+    // table in Phase 2 and its Cedar policies in Phase 6, so no reinstall loop
+    // is needed. Every tenant merges (`default` included), so specs restored
+    // in Phase 2 keep their entity sets.
     let mut agent_spec_tenants: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     agent_spec_tenants.insert("default".to_string());
-
-    let default_cache = load_verified_cache(state, "default").await;
-    // Merge like every other tenant: `default` may already hold specs restored
-    // in Phase 2, and replacing its entity sets would hide them until reinstall.
-    let default_hashes =
-        temper_platform::bootstrap_agent_specs(state, "default", true, &default_cache);
-    if let Some(turso) = state.server.turso_store_for_tenant("default").await {
-        temper_platform::persist_agent_verification(
-            &turso,
-            "default",
-            &default_hashes,
-            &default_cache,
-        )
-        .await;
-    }
-
-    for (tenant, _dir) in apps {
-        agent_spec_tenants.insert(tenant.clone());
-        let cache = load_verified_cache(state, tenant).await;
-        // App tenants already have user specs loaded in Phase 2; merge the
-        // built-in agent OS entities so we do not replace their entity-set map.
-        let hashes = temper_platform::bootstrap_agent_specs(state, tenant, true, &cache);
-        if let Some(turso) = state.server.turso_store_for_tenant(tenant).await {
-            temper_platform::persist_agent_verification(&turso, tenant, &hashes, &cache).await;
-        }
-    }
-    // In TenantRouted mode, bootstrap agent specs for all registered tenants.
-    // OS app specs are already restored from the `specs` table by
-    // `restore_registry_from_turso` (Phase 2) and Cedar policies by
-    // `recover_cedar_policies` (Phase 6), so no reinstall loop is needed.
+    agent_spec_tenants.extend(apps.iter().map(|(tenant, _dir)| tenant.clone()));
     if let Some(provider) = state
         .server
         .storage_stack
         .as_ref()
         .and_then(|stack| stack.turso.clone())
     {
-        for tenant in provider.connected_tenants().await {
-            agent_spec_tenants.insert(tenant.clone());
-            let cache = load_verified_cache(state, &tenant).await;
-            let hashes = temper_platform::bootstrap_agent_specs(state, &tenant, true, &cache);
-            if let Some(turso) = state.server.turso_store_for_tenant(&tenant).await {
-                temper_platform::persist_agent_verification(&turso, &tenant, &hashes, &cache).await;
-            }
+        agent_spec_tenants.extend(provider.connected_tenants().await);
+    }
+    agent_spec_tenants.retain(|tenant| !skip_unavailable_tenant(state, tenant, "agent specs"));
+
+    for tenant in &agent_spec_tenants {
+        let cache = load_verified_cache(state, tenant).await;
+        let hashes = temper_platform::bootstrap_agent_specs(state, tenant, true, &cache);
+        if let Some(turso) = state.server.turso_store_for_tenant(tenant).await {
+            temper_platform::persist_agent_verification(&turso, tenant, &hashes, &cache).await;
         }
     }
 
     // Register the bootstrap key as a normal operator credential in the default
     // tenant. It grants no implicit authority in other tenants (ADR-0157).
     if let Some(ref api_key) = state.api_token
+        && agent_spec_tenants.contains("default")
         && let Err(e) =
             temper_platform::bootstrap_operator_credential(state, api_key, "default").await
     {
         eprintln!("  Warning: failed to bootstrap operator credential for tenant 'default': {e}");
+    }
+    // A deployment that is the only holder of its key (a Katagami app's Temper,
+    // keyed by its control plane) retires the credentials earlier boots issued
+    // for other keys, so a key it no longer holds stops working.
+    let retire = std::env::var("TEMPER_RETIRE_OLD_OPERATOR_KEYS").is_ok_and(|v| v == "1"); // determinism-ok: read once at startup
+    if retire && let Some(ref api_key) = state.api_token {
+        temper_platform::retire_other_operator_credentials(state, api_key, "default").await;
     }
 
     // Register a trusted JWT issuer from env config, if provided (ARN-255).
@@ -605,16 +623,21 @@ pub(super) async fn bootstrap_installed_apps(
             .ok()
             .filter(|tenant| !tenant.trim().is_empty())
             .unwrap_or_else(|| "default".to_string());
-        let result =
-            temper_platform::os_apps::bootstrap_closure_manifest(state, &tenant, &manifest_path)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        println!(
-            "  Bootstrap closure '{}' installed for '{}': {}",
-            result.closure.id,
-            tenant,
-            result.installed_apps.join(", ")
-        );
+        if !skip_unavailable_tenant(state, &tenant, "the bootstrap closure") {
+            let result = temper_platform::os_apps::bootstrap_closure_manifest(
+                state,
+                &tenant,
+                &manifest_path,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            println!(
+                "  Bootstrap closure '{}' installed for '{}': {}",
+                result.closure.id,
+                tenant,
+                result.installed_apps.join(", ")
+            );
+        }
     }
 
     let restored_genesis_caches =
@@ -628,6 +651,9 @@ pub(super) async fn bootstrap_installed_apps(
     }
 
     for ((tenant, app_name), source) in requested {
+        if skip_unavailable_tenant(state, &tenant, &format!("app '{app_name}'")) {
+            continue;
+        }
         if matches!(source, AppBootstrapSource::Persisted)
             && temper_platform::os_apps::get_os_app(&app_name).is_none()
         {

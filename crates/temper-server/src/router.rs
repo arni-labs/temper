@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderName};
 use axum::http::{Method, StatusCode};
-use axum::routing::{get, put};
+use axum::routing::{any, get, put};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -48,7 +48,7 @@ async fn serve_temper_client() -> (
 /// - GET  /tdata/$events              → SSE stream of entity state changes
 /// - GET  /tdata/{*path}              → entity set / entity / navigation / function
 /// - POST /tdata/{*path}              → create entity / bound action
-/// - GET|POST /webhooks/{tenant}/{*path} → inbound webhook receiver
+/// - any method on /webhooks/{tenant}/{*path} → inbound webhook receiver
 ///
 /// Tenant is extracted from the `X-Tenant-Id` header. Falls back to the
 /// first registered tenant in the SpecRegistry.
@@ -83,7 +83,11 @@ pub fn build_routes(state: ServerState) -> Router {
                 .patch(odata::handle_odata_patch)
                 .put(odata::handle_odata_put)
                 .delete(odata::handle_odata_delete),
-        );
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            odata::refuse_unavailable_tenant,
+        ));
 
     let router = Router::new()
         .nest("/tdata", tdata)
@@ -96,9 +100,11 @@ pub fn build_routes(state: ServerState) -> Router {
             "/genesis/{*path}",
             get(crate::static_web::serve_genesis_web),
         )
+        // Any method: the webhook's signature, not the verb, admits a
+        // request (ADR-0182).
         .route(
             "/webhooks/{tenant}/{*path}",
-            get(webhook_receiver::handle_webhook).post(webhook_receiver::handle_webhook),
+            any(webhook_receiver::handle_webhook),
         )
         .route(
             "/_internal/blobs/{*path}",

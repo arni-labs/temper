@@ -895,6 +895,7 @@ fn test_intent_discovery_specs_verify() {
     }
 }
 
+mod bundle_refusal;
 mod directed_evolution;
 mod policy_reinstall;
 #[test]
