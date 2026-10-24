@@ -322,8 +322,8 @@ async fn a_state_timers_move_calls_out_as_the_arming_agent_and_its_follow_ons_na
     );
 }
 
-/// The record's history from the observe API, read as the system.
-async fn history(state: &ServerState, id: &str) -> Vec<serde_json::Value> {
+/// The observe API's history response for a gate, read as the system.
+async fn history_response(state: &ServerState, id: &str) -> (StatusCode, serde_json::Value) {
     let mut request = Request::get(format!("/observe/entities/Gate/{id}/history"))
         .body(Body::empty())
         .unwrap();
@@ -334,11 +334,17 @@ async fn history(state: &ServerState, id: &str) -> Vec<serde_json::Value> {
             SecurityContext::system(),
         ));
     let response = build_router(state.clone()).oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+/// The record's history from the observe API, read as the system.
+async fn history(state: &ServerState, id: &str) -> Vec<serde_json::Value> {
+    let (status, json) = history_response(state, id).await;
+    assert_eq!(status, StatusCode::OK);
     json["events"].as_array().cloned().unwrap_or_default()
 }
 
@@ -385,5 +391,58 @@ async fn a_timers_cause_names_the_history_entry_of_the_arming_move() {
     assert_eq!(
         named["action"], "Add",
         "the timer's cause names the arming move's entry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loaded_records_history_shows_the_same_point_in_time_as_its_state() {
+    let journal = SimEventStore::no_faults(81);
+    let mut state = build_state(GATE_IOA);
+    state.set_storage_stack(StorageStack::from_sim(journal.clone(), None));
+    assert_eq!(
+        post(&state, "/tdata/Gates", r#"{"Id":"g4"}"#, "member").await,
+        StatusCode::CREATED
+    );
+
+    // The history request reads the actor's state, then the journal. A move
+    // commits between those two reads.
+    let mut held = journal.hold_next_read("default:Gate:g4");
+    let reader = tokio::spawn({
+        let state = state.clone();
+        async move { history_response(&state, "g4").await }
+    });
+    held.reached().await;
+    let added = post(&state, "/tdata/Gates('g4')/Gates.Add", "{}", "member").await;
+    assert!(added.is_success(), "the member's Add was refused: {added}");
+    held.release();
+
+    let (status, body) = reader.await.expect("the history request finishes");
+    assert_eq!(status, StatusCode::OK);
+    let events = body["events"].as_array().cloned().unwrap_or_default();
+    let last = events
+        .last()
+        .expect("the history shows the record's Created");
+    assert_eq!(
+        last["to_state"], body["current_state"],
+        "the history's newest move must end in the state the same response shows: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_whose_journal_cannot_be_read_says_so() {
+    let journal = SimEventStore::no_faults(82);
+    let mut state = build_state(GATE_IOA);
+    state.set_storage_stack(StorageStack::from_sim(journal.clone(), None));
+    assert_eq!(
+        post(&state, "/tdata/Gates", r#"{"Id":"g5"}"#, "member").await,
+        StatusCode::CREATED
+    );
+
+    journal.fail_next_reads("default:Gate:g5", 1);
+    let (status, body) = history_response(&state, "g5").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a history that could not read the journal must not number its events itself: {body}"
     );
 }

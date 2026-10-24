@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use temper_runtime::persistence::{
     EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend, PersistenceAppendResult,
     PersistenceEnvelope, PersistenceError,
@@ -148,6 +150,10 @@ struct SimEventStoreInner {
     /// persisted the transition, but the caller's ask timeout expired before
     /// the reply arrived".
     pending_append_delays: BTreeMap<String, VecDeque<Duration>>,
+    /// One-shot read holds per `persistence_id` (see `hold_next_read`): the
+    /// next `read_events` for that id says it has started, then waits to be
+    /// released, so a test can land a write between a caller's reads.
+    pending_read_holds: BTreeMap<String, (oneshot::Sender<()>, oneshot::Receiver<()>)>,
     /// ADR-0153: declared key-index, co-committed with the journal under the same
     /// lock. `(tenant, entity_type, key_name, key_hash) -> entity_id`. This is the
     /// deterministic reference for the negative-existence access path the real
@@ -195,6 +201,7 @@ impl SimEventStore {
                 pending_concurrency_violations: BTreeMap::new(),
                 pending_read_failures: BTreeMap::new(),
                 pending_append_delays: BTreeMap::new(),
+                pending_read_holds: BTreeMap::new(),
                 key_index: BTreeMap::new(),
                 key_index_watermark: BTreeMap::new(),
                 vector_index: BTreeMap::new(),
@@ -266,6 +273,24 @@ impl SimEventStore {
             .push_back(delay);
     }
 
+    /// Hold the next `read_events` for `persistence_id` open: it signals the
+    /// returned [`SimReadHold`] when it starts, then waits for its release
+    /// before reading. This places a write exactly between a caller's earlier
+    /// read of the actor and its journal read, with no clock involved. A new
+    /// hold replaces one not yet reached.
+    pub fn hold_next_read(&self, persistence_id: &str) -> SimReadHold {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner
+            .pending_read_holds
+            .insert(persistence_id.to_string(), (reached_tx, release_rx));
+        SimReadHold {
+            reached: reached_rx,
+            release: release_tx,
+        }
+    }
+
     /// Create a SimEventStore with no fault injection.
     pub fn no_faults(seed: u64) -> Self {
         Self::new(seed, SimFaultConfig::none())
@@ -334,6 +359,27 @@ impl SimEventStore {
             .get(persistence_id)
             .cloned()
             .unwrap_or_default()
+    }
+}
+
+/// A journal read held open by [`SimEventStore::hold_next_read`].
+#[derive(Debug)]
+pub struct SimReadHold {
+    reached: oneshot::Receiver<()>,
+    release: oneshot::Sender<()>,
+}
+
+impl SimReadHold {
+    /// Wait until the held read has started and is waiting.
+    pub async fn reached(&mut self) {
+        // A dropped sender means the store went away; nothing is waiting.
+        let _ = (&mut self.reached).await;
+    }
+
+    /// Let the held read go on.
+    pub fn release(self) {
+        // The read may have been dropped with its caller; nothing to release.
+        let _ = self.release.send(());
     }
 }
 
@@ -882,6 +928,16 @@ impl EventStore for SimEventStore {
         persistence_id: &str,
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let hold = {
+            let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+            inner.pending_read_holds.remove(persistence_id)
+        };
+        if let Some((reached, release)) = hold {
+            // The holder may have stopped listening; the read goes on either way.
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
 
         // Deterministic injected read failure (see `fail_next_reads`).
