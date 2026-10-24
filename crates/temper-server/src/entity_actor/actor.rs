@@ -543,10 +543,11 @@ impl EntityActor {
 
     /// Replay events from the configured store to rebuild state (called in pre_start).
     ///
-    /// Re-evaluates each event through the `TransitionTable` to reconstruct
-    /// all state variables (status, counters, booleans). This is option 2 from
-    /// the replay design: the TransitionTable is the authoritative source of
-    /// effects, so replay produces the same state as the original execution.
+    /// Each event restores what it committed: its stored `to_status`, the
+    /// outcome its effects recorded (counters, booleans, lists, and fields such
+    /// as a spawned child's id), and its params. Replay mints, spawns, schedules
+    /// and calls out nothing. Events journaled before outcomes were recorded
+    /// re-derive their effects from the `TransitionTable`, minting nothing.
     pub(super) async fn replay_events(
         table: &TransitionTable,
         store: &BoxedEventStore,
@@ -678,6 +679,7 @@ impl EntityActor {
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
+                                outcome: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -787,29 +789,36 @@ impl EntityActor {
                             event.params =
                                 super::effects::sanitize_action_params(&event.params).into_owned();
                             // A persisted event is a historical fact: its guard
-                            // already passed at commit time and its `to_status`
-                            // is authoritative. Replay therefore re-derives the
-                            // transition's EFFECTS from the table but never
-                            // re-gates it — guards (especially cross-entity ones,
-                            // whose related-entity context is not reconstructed
-                            // here) must not silently drop committed history.
-                            // `replay_effects` returns the matching rule's
-                            // effects ignoring guards; `None` means the table no
-                            // longer knows this action/from-state, in which case
-                            // the stored `to_status` alone carries the state.
+                            // already passed at commit time, and its `to_status`
+                            // and recorded outcome are what it committed. Replay
+                            // never re-gates it — guards (especially cross-entity
+                            // ones, whose related-entity context is not
+                            // reconstructed here) must not silently drop
+                            // committed history — and never re-runs its effects
+                            // when the event recorded what they wrote: a spawn
+                            // would mint a new child id, and any effect would
+                            // compute with the active spec, not the one that ran.
                             let from_status = event.from_status.clone();
-                            if !frozen_bootstrap
+                            if !frozen_bootstrap && let Some(outcome) = event.outcome.as_ref() {
+                                outcome.restore(state);
+                                if !event.to_status.is_empty() {
+                                    state.status.clone_from(&event.to_status);
+                                }
+                            } else if !frozen_bootstrap
                                 && let Some(effects) =
                                     table.replay_effects(&state.status, &event.action)
                             {
+                                // Journaled before outcomes were recorded:
+                                // re-derive the effects from the table (ignoring
+                                // guards), minting nothing. `None` means the
+                                // table no longer knows this action/from-state,
+                                // and the stored `to_status` alone carries it.
                                 let effects = effects.to_vec();
-                                // Shared effect application — same code as handle() and simulation.
-                                let (
-                                    _custom_effects,
-                                    _scheduled_actions,
-                                    _spawn_requests,
-                                    _schedule_at_requests,
-                                ) = super::effects::apply_effects(state, &effects, &event.params);
+                                super::effects::apply_legacy_replay_effects(
+                                    state,
+                                    &effects,
+                                    &event.params,
+                                );
                             }
                             // Always honor the durably-stored target status. This
                             // is safe (status is always persisted on the event)
@@ -1045,6 +1054,7 @@ impl Actor for EntityActor {
                 params: initial_params,
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                outcome: None,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -1827,6 +1837,7 @@ impl Actor for EntityActor {
                     params: serde_json::json!({}),
                     idempotency_key: None,
                     kind: temper_runtime::persistence::EventKind::Tombstone,
+                    outcome: None,
                 };
 
                 if let (Some(store), Some(backend)) =
