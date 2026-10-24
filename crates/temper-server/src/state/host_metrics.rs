@@ -38,27 +38,32 @@ pub(super) struct HostMetricSettings {
     pub(super) dir_time_limit: Duration,
 }
 
-/// The host gauges and the one directory walk that may be running.
+/// The host gauges, and the directory walk they share with its thread.
 pub(super) struct HostMetricInstruments {
     memory_used_ratio: Gauge<f64>,
     memory_total_bytes: Gauge<u64>,
     disk_used_ratio: Gauge<f64>,
-    dir_bytes: Gauge<u64>,
     disk_paths: Vec<String>,
-    dir_patterns: Arc<[String]>,
-    dir_time_limit: Duration,
+    dir_walk: Arc<DirWalk>,
+}
+
+/// What a directory walk needs on its blocking thread.
+struct DirWalk {
+    dir_bytes: Gauge<u64>,
+    patterns: Vec<String>,
+    time_limit: Duration,
     /// Set while a walk runs. A walk can sit in one filesystem call for as long
     /// as the filesystem takes; starting another each tick would pile up
     /// blocking threads behind it, so a tick skips the walk while one runs.
-    walk_running: Arc<AtomicBool>,
+    running: AtomicBool,
 }
 
-/// Clears `walk_running` when the walk ends, panicked or not.
-struct WalkRunning(Arc<AtomicBool>);
+/// Clears `DirWalk::running` when the walk ends, panicked or not.
+struct WalkRunning(Arc<DirWalk>);
 
 impl Drop for WalkRunning {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.running.store(false, Ordering::Release);
     }
 }
 
@@ -106,17 +111,19 @@ impl HostMetricInstruments {
                     "Used share of the filesystem holding `path`, as df counts it: used / (used + available).",
                 )
                 .build(),
-            dir_bytes: meter
-                .u64_gauge("temper_host_dir_bytes")
-                .with_unit("By")
-                .with_description(
-                    "Bytes on disk of every directory tree matching the pattern `path`, as du counts them.",
-                )
-                .build(),
             disk_paths: settings.disk_paths,
-            dir_patterns: settings.dir_patterns.into(),
-            dir_time_limit: settings.dir_time_limit,
-            walk_running: Arc::new(AtomicBool::new(false)),
+            dir_walk: Arc::new(DirWalk {
+                dir_bytes: meter
+                    .u64_gauge("temper_host_dir_bytes")
+                    .with_unit("By")
+                    .with_description(
+                        "Bytes on disk of every directory tree matching the pattern `path`, as du counts them.",
+                    )
+                    .build(),
+                patterns: settings.dir_patterns,
+                time_limit: settings.dir_time_limit,
+                running: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -140,32 +147,34 @@ impl HostMetricInstruments {
     }
 
     fn start_dir_walk(&self) {
-        if self.dir_patterns.is_empty() || self.walk_running.swap(true, Ordering::AcqRel) {
+        let walk = &self.dir_walk;
+        if walk.patterns.is_empty() || walk.running.swap(true, Ordering::AcqRel) {
             return;
         }
         debug_assert!(
-            self.walk_running.load(Ordering::Acquire),
+            walk.running.load(Ordering::Acquire),
             "this tick owns the walk until it ends"
         );
-        let running = WalkRunning(Arc::clone(&self.walk_running));
-        let patterns = Arc::clone(&self.dir_patterns);
-        let gauge = self.dir_bytes.clone();
-        let time_limit = self.dir_time_limit;
+        let running = WalkRunning(Arc::clone(walk));
         // determinism-ok: host metrics read the real filesystem, off the async runtime
-        tokio::task::spawn_blocking(move || {
-            let _running = running;
-            for pattern in patterns.iter() {
-                match pattern_bytes(pattern, time_limit) {
-                    Ok(Some(bytes)) => {
-                        gauge.record(bytes, &[KeyValue::new("path", pattern.clone())]);
-                    }
-                    Ok(None) => {}
-                    Err(stop) => {
-                        tracing::warn!(path = %pattern, error = %stop, "directory size not reported");
-                    }
+        tokio::task::spawn_blocking(move || running.0.run());
+    }
+}
+
+impl DirWalk {
+    /// Measure every pattern and record each size; runs on a blocking thread.
+    fn run(&self) {
+        for pattern in &self.patterns {
+            match pattern_bytes(pattern, self.time_limit) {
+                Ok(Some(bytes)) => self
+                    .dir_bytes
+                    .record(bytes, &[KeyValue::new("path", pattern.clone())]),
+                Ok(None) => {}
+                Err(stop) => {
+                    tracing::warn!(path = %pattern, error = %stop, "directory size not reported");
                 }
             }
-        });
+        }
     }
 }
 
