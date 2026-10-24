@@ -60,6 +60,11 @@ impl EntityActor {
         holder: uuid::Uuid,
     ) -> EntityResponse {
         debug_assert!(self.holder().is_none());
+        // A hold promises a delete, so an entity the delete would refuse is
+        // not held, and the batch refuses before it deletes anything.
+        if self.strict() {
+            return reply(state, Err(STRICT_DELETE.to_owned()));
+        }
         if state.status == "Deleted" {
             return reply(state, Err("entity is already deleted".to_string()));
         }
@@ -106,16 +111,8 @@ impl EntityActor {
         state: &mut EntityState,
         expected: Option<&str>,
     ) -> EntityResponse {
-        if self
-            .table
-            .read()
-            .expect("table lock poisoned")
-            .strict_action_params
-        {
-            return reply(
-                state,
-                Err("Strict entities require a declared action for deletion".to_owned()),
-            );
+        if self.strict() {
+            return reply(state, Err(STRICT_DELETE.to_owned()));
         }
         if let Some(expected) = expected
             && super::effects::entity_authorization_precondition(state) != expected
@@ -137,6 +134,18 @@ impl EntityActor {
         reply(state, Ok(()))
     }
 }
+
+impl EntityActor {
+    /// Whether only a declared action may delete this entity.
+    fn strict(&self) -> bool {
+        self.table
+            .read()
+            .expect("table lock poisoned")
+            .strict_action_params
+    }
+}
+
+const STRICT_DELETE: &str = "Strict entities require a declared action for deletion";
 
 /// The reply to a delete-side message, with the entity's state after it.
 pub(super) fn reply(state: &EntityState, outcome: Result<(), String>) -> EntityResponse {

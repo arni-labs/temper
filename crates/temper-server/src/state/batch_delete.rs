@@ -201,8 +201,10 @@ impl ServerState {
         }
 
         // Every member is held at the state it was checked in, so each
-        // delete below finds that state.
-        for (actor, member) in actors.iter().zip(&members) {
+        // delete below finds that state. A delete that does not answer leaves
+        // the members after it held by nothing but this call, so they are
+        // released.
+        for (index, (actor, member)) in actors.iter().zip(&members).enumerate() {
             let deleted = actor
                 .ask::<EntityResponse>(
                     EntityMsg::DeleteHeld { holder },
@@ -212,6 +214,7 @@ impl ServerState {
             match deleted {
                 Ok(response) if response.success => {}
                 Ok(response) => {
+                    release(&actors[index..], holder);
                     return Err(BatchDeleteError::Storage(format!(
                         "{}('{}') was held but not deleted: {}",
                         member.entity_type,
@@ -220,6 +223,7 @@ impl ServerState {
                     )));
                 }
                 Err(error) => {
+                    release(&actors[index..], holder);
                     return Err(BatchDeleteError::Storage(format!(
                         "{}('{}') was held but not deleted: {error}",
                         member.entity_type, member.entity_id

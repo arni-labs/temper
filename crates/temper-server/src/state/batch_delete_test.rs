@@ -21,8 +21,13 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
         <Property Name="album_id" Type="Edm.String"/>
       </EntityType>
+      <EntityType Name="Credit">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
       <EntityContainer Name="BatchService">
         <EntitySet Name="Tracks" EntityType="Test.Batch.Track"/>
+        <EntitySet Name="Credits" EntityType="Test.Batch.Credit"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
@@ -33,6 +38,15 @@ const TRACK_IOA: &str = r#"
 name = "Track"
 states = ["Active"]
 initial = "Active"
+"#;
+
+/// Only a declared action deletes a strict entity.
+const CREDIT_IOA: &str = r#"
+[automaton]
+name = "Credit"
+states = ["Draft"]
+initial = "Draft"
+strict_action_params = true
 "#;
 
 struct Fixture {
@@ -47,7 +61,7 @@ fn memory_only(name: &str) -> ServerState {
         "default",
         parse_csdl(CSDL).expect("CSDL parses"),
         CSDL.to_string(),
-        &[("Track", TRACK_IOA)],
+        &[("Track", TRACK_IOA), ("Credit", CREDIT_IOA)],
     );
     ServerState::from_registry(ActorSystem::new(name), registry)
 }
@@ -308,4 +322,37 @@ async fn a_refused_batch_does_not_release_another_deletes_hold() {
     try_move_track(state, "t-2", "a-2")
         .await
         .expect("t-2 takes writes once its holder releases it");
+}
+
+#[tokio::test]
+async fn without_a_journal_a_member_only_an_action_deletes_refuses_before_any_delete() {
+    let state = &memory_only("batch-delete-memory-strict");
+    let tenant = TenantId::default();
+    create_tracks(state, &["t-1", "t-2"], "a-1").await;
+    state
+        .get_or_create_tenant_entity(&tenant, "Credit", "c-1", serde_json::json!({}))
+        .await
+        .expect("create Credit('c-1')");
+    let credit = state
+        .get_tenant_entity_state(&tenant, "Credit", "c-1")
+        .await
+        .expect("read Credit('c-1')")
+        .state;
+    let members = vec![read(state, "t-1").await, credit, read(state, "t-2").await];
+
+    let refused = state.delete_entities_together(&tenant, members).await;
+    assert!(
+        matches!(refused, Err(BatchDeleteError::Changed(ref reason)) if reason.contains("declared action")),
+        "a strict member refuses the batch: {refused:?}"
+    );
+    for id in ["t-1", "t-2"] {
+        assert!(
+            state.ensure_entity_loaded(&tenant, "Track", id).await,
+            "{id} is still there"
+        );
+        try_move_track(state, id, "a-2")
+            .await
+            .unwrap_or_else(|error| panic!("{id} takes writes again: {error}"));
+    }
+    assert!(state.ensure_entity_loaded(&tenant, "Credit", "c-1").await);
 }
