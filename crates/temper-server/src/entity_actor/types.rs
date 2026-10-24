@@ -207,6 +207,25 @@ pub struct EntityEvent {
     /// Optional idempotency key that caused this transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Which kind of event the kernel wrote. Only the kernel's delete writes a
+    /// tombstone, whatever a spec names its actions.
+    #[serde(default)]
+    pub kind: temper_runtime::persistence::EventKind,
+}
+
+impl EntityEvent {
+    /// The `Created` event that starts a journal, carrying no params.
+    pub(crate) fn bootstrap(to_status: String) -> Self {
+        Self {
+            action: "Created".to_string(),
+            from_status: String::new(),
+            to_status,
+            timestamp: temper_runtime::scheduler::sim_now(),
+            params: serde_json::json!({}),
+            idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
+        }
+    }
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.
