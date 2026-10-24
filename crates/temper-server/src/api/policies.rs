@@ -45,8 +45,11 @@ pub(crate) async fn handle_get_policies(
         .into_response()
 }
 
-/// PUT /api/tenants/{tenant}/policies — replace all policies (validate then reload).
+/// PUT /api/tenants/{tenant}/policies — replace all policies.
 ///
+/// The text is validated in a scratch engine, stored as the tenant's only
+/// enabled entry (other entries stay listed, disabled), and only then made
+/// live, so a reload or restart activates exactly this text.
 /// Cedar-gated: requires `manage_policies` action on `PolicySet` resource.
 #[instrument(skip_all, fields(tenant, otel.name = "PUT /api/tenants/{tenant}/policies"))]
 pub(crate) async fn handle_put_policies(
@@ -77,23 +80,38 @@ pub(crate) async fn handle_put_policies(
         }
     };
 
+    if let Err(e) = temper_authz::AuthzEngine::empty().reload_tenant_policies(&tenant, &policy_text)
+    {
+        tracing::warn!(error = %e, "policy validation failed");
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Policy validation failed: {e}"),
+        )
+            .into_response();
+    }
+
+    let created_by = auth.security_context().principal.id.as_str();
+    if let Some(store) = state.policy_store()
+        && let Err(e) = store
+            .replace_tenant_policies(&tenant, "primary", &policy_text, created_by)
+            .await
+    {
+        tracing::warn!(error = %e, tenant, "failed to store replacement policies");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Policy write failed; nothing changed",
+        )
+            .into_response();
+    }
+
     if let Err(resp) = super::validate_and_reload_policies(&state, &tenant, &policy_text) {
         return resp;
     }
-
     {
         let mut policies = state.tenant_policies.write().unwrap(); // ci-ok: infallible lock
-        policies.insert(tenant.clone(), policy_text.clone());
+        policies.insert(tenant.clone(), policy_text);
     }
-
-    persist_and_activate_policy(
-        &state,
-        &tenant,
-        "primary",
-        &policy_text,
-        &auth.security_context().principal.id,
-    )
-    .await;
+    crate::authz::record_policy_change(&state, &tenant, "primary", created_by);
 
     let _ = state
         .observe_refresh_tx
