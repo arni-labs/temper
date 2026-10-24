@@ -8,7 +8,8 @@
 //! Before, the refusal left the Notice in `Answered` as if the answer had moved
 //! the Release. Each case runs with an event journal (the atomic batch) and
 //! without one (the per-write path). A sub-write that commits is not a
-//! refusal, even when a later step of its write reports a failure.
+//! refusal, even when a later step of its write reports a failure, and
+//! neither is one whose storage fails, since that write may have landed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,6 +153,8 @@ forbid(principal, action == Action::"Approve", resource is Release);
 
 const NOTICE: &str = "notice-1";
 const RELEASE: &str = "release-1";
+/// The Release's journal in the event store.
+const RELEASE_JOURNAL: &str = "default:Release:release-1";
 
 /// Whether the server keeps an event journal, which decides how a composite's
 /// sub-writes are written.
@@ -455,5 +458,52 @@ async fn a_sub_write_that_committed_does_not_run_the_composites_on_failure() {
             "a committed sub-write does not run on_failure"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Storage fails for every write to the Release. The composite's sub-write may
+/// have landed, so it is not a refusal: `on_failure` does not run, and the
+/// error propagates. With the atomic batch the whole batch append fails. When
+/// `Approve` has its own effect, the composite writes it on the per-write
+/// path, and the Release's own append fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_write_whose_storage_fails_does_not_run_the_composites_on_failure() {
+    for (path, release_ioa) in [
+        ("atomic batch", RELEASE_IOA.to_string()),
+        ("per-write", release_with_own_effect()),
+    ] {
+        let store = SimEventStore::no_faults(37);
+        let stack = StorageStack::from_sim(store.clone(), None);
+        let state = notice_server(&release_ioa, Some(stack), PERMIT_ALL);
+        act(&state, "Release", RELEASE, "Hold").await;
+        const FAILURES: usize = 100;
+        store.fail_next_appends(RELEASE_JOURNAL, FAILURES);
+
+        act(&state, "Notice", NOTICE, "PutItLive").await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while store.pending_append_failures(RELEASE_JOURNAL) == FAILURES
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            store.pending_append_failures(RELEASE_JOURNAL) < FAILURES,
+            "{path}: the composite should have tried to write the Release"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            assert_eq!(
+                status_of(&state, "Notice", NOTICE).await,
+                "Answered",
+                "{path}: a sub-write whose storage failed does not run on_failure"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            status_of(&state, "Release", RELEASE).await,
+            "Held",
+            "{path}: the failed write leaves the Release as it was"
+        );
     }
 }

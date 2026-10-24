@@ -142,6 +142,9 @@ struct SimEventStoreInner {
     /// (e.g. proving the key-index backfill treats an unreadable entity as
     /// `LoadFailed` and does not watermark its type). See `fail_next_reads`.
     pending_read_failures: BTreeMap<String, usize>,
+    /// Each entry makes the next N appends that write that id (alone or in a
+    /// batch) fail with a storage error, writing nothing. See `fail_next_appends`.
+    pending_append_failures: BTreeMap<String, usize>,
     /// One-shot append delays per `persistence_id`.
     ///
     /// Used by dispatch retry tests to deterministically model "the actor
@@ -194,6 +197,7 @@ impl SimEventStore {
                 faults,
                 pending_concurrency_violations: BTreeMap::new(),
                 pending_read_failures: BTreeMap::new(),
+                pending_append_failures: BTreeMap::new(),
                 pending_append_delays: BTreeMap::new(),
                 key_index: BTreeMap::new(),
                 key_index_watermark: BTreeMap::new(),
@@ -237,6 +241,32 @@ impl SimEventStore {
                 .pending_read_failures
                 .insert(persistence_id.to_string(), count);
         }
+    }
+
+    /// Make the next `count` appends that write `persistence_id`, alone or in a
+    /// batch, fail with a storage error and write nothing, then behave normally.
+    /// Deterministic (unlike `write_failure_prob`) so tests can prove how a
+    /// failed write is answered. `count == 0` clears the injection.
+    pub fn fail_next_appends(&self, persistence_id: &str, count: usize) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if count == 0 {
+            inner.pending_append_failures.remove(persistence_id);
+        } else {
+            inner
+                .pending_append_failures
+                .insert(persistence_id.to_string(), count);
+        }
+    }
+
+    /// Return how many injected append failures are still pending for
+    /// `persistence_id`. Zero if none are set.
+    pub fn pending_append_failures(&self, persistence_id: &str) -> usize {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner
+            .pending_append_failures
+            .get(persistence_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Return the current count of pending injected concurrency violations for
@@ -337,6 +367,20 @@ impl SimEventStore {
     }
 }
 
+impl SimEventStoreInner {
+    /// Consume one injected append failure for `persistence_id`, if one is set.
+    fn take_append_failure(&mut self, persistence_id: &str) -> Option<PersistenceError> {
+        let remaining = self.pending_append_failures.get_mut(persistence_id)?;
+        *remaining -= 1;
+        if *remaining == 0 {
+            self.pending_append_failures.remove(persistence_id);
+        }
+        Some(PersistenceError::Storage(format!(
+            "SimEventStore: injected append failure for '{persistence_id}'"
+        )))
+    }
+}
+
 impl std::fmt::Debug for SimEventStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
@@ -418,6 +462,9 @@ impl EventStore for SimEventStore {
                 expected: expected_sequence,
                 actual: expected_sequence,
             });
+        }
+        if let Some(error) = inner.take_append_failure(persistence_id) {
+            return Err(error);
         }
 
         // Fault injection: spurious concurrency violation (probabilistic).
@@ -820,6 +867,11 @@ impl EventStore for SimEventStore {
                     expected: append.expected_sequence,
                     actual: append.expected_sequence,
                 });
+            }
+        }
+        for append in appends {
+            if let Some(error) = inner.take_append_failure(&append.persistence_id) {
+                return Err(error);
             }
         }
 
