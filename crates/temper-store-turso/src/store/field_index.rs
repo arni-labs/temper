@@ -82,20 +82,22 @@ pub struct QueryProjectionUpsert {
     pub known_new: bool,
 }
 
-/// Whether the entity's journal holds its deletion tombstone; served by
-/// `idx_events_deleted`. Every projection write checks it inside its write
-/// transaction. Deletion is terminal and in the journal before the delete
-/// removes the projection row, and SQLite runs one write transaction at a
-/// time, so a write of older state either lands before the tombstone, and the
-/// delete then removes it, or sees the tombstone and writes nothing. A deleted
-/// entity's row cannot come back.
-async fn journal_has_tombstone(
+/// Whether the entity's journal leaves it deleted: it holds the entity's
+/// tombstone (served by `idx_events_deleted`), or its newest event moves it to
+/// the `Deleted` status, as a declared action can. Either way the projection
+/// has dropped, or is about to drop, the entity's row. Every projection write
+/// checks this inside its write transaction. The journal commits the event
+/// before the projection row is removed, and SQLite runs one write
+/// transaction at a time. So a write of older state either lands before that
+/// event, and the removal then deletes it, or sees the event and writes
+/// nothing. A deleted entity's row cannot come back.
+async fn journal_leaves_deleted(
     tx: &Transaction<'_>,
     tenant: &str,
     entity_type: &str,
     entity_id: &str,
 ) -> Result<bool, PersistenceError> {
-    let mut rows = tx
+    let mut tombstones = tx
         .query(
             "SELECT 1 FROM events \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND event_type = 'Deleted' \
@@ -104,7 +106,22 @@ async fn journal_has_tombstone(
         )
         .await
         .map_err(storage_error)?;
-    Ok(rows.next().await.map_err(storage_error)?.is_some())
+    if tombstones.next().await.map_err(storage_error)?.is_some() {
+        return Ok(true);
+    }
+    let mut newest = tx
+        .query(
+            "SELECT json_extract(payload, '$.to_status') = 'Deleted' FROM events \
+             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 \
+             ORDER BY sequence_nr DESC LIMIT 1",
+            params![tenant, entity_type, entity_id],
+        )
+        .await
+        .map_err(storage_error)?;
+    let Some(row) = newest.next().await.map_err(storage_error)? else {
+        return Ok(false);
+    };
+    Ok(row.get::<Option<i64>>(0).map_err(storage_error)? == Some(1))
 }
 
 impl TursoEventStore {
@@ -218,7 +235,7 @@ impl TursoEventStore {
             }
         };
         if existing_sequence.is_some_and(|existing| existing > sequence_nr)
-            || journal_has_tombstone(&tx, tenant, entity_type, entity_id).await?
+            || journal_leaves_deleted(&tx, tenant, entity_type, entity_id).await?
         {
             tx.commit().await.map_err(storage_error)?;
             return Ok(());
@@ -375,7 +392,7 @@ impl TursoEventStore {
             let key = (projection.entity_type.clone(), projection.entity_id.clone());
             let existing_row = existing.get(&key);
             if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr)
-                || journal_has_tombstone(
+                || journal_leaves_deleted(
                     &tx,
                     tenant,
                     &projection.entity_type,

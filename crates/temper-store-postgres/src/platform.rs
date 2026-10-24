@@ -116,19 +116,22 @@ async fn lock_entity_projection(
     Ok(())
 }
 
-/// Whether the entity's journal holds its deletion tombstone, read after
-/// [`lock_entity_projection`]. Deletion is terminal and committed before the
-/// delete removes the projection row under the same lock, so a write of older
-/// state either commits before that removal, which then deletes it, or sees
-/// the tombstone and writes nothing. A deleted entity's row cannot come back.
-async fn journal_has_tombstone(
+/// Whether the entity's journal leaves it deleted, read after
+/// [`lock_entity_projection`]: it holds the entity's tombstone, or its newest
+/// event moves it to the `Deleted` status, as a declared action can. Either
+/// way the projection has dropped, or is about to drop, the entity's row. The
+/// journal commits the event before the removal runs under the same lock, so
+/// a write of older state either commits before that removal, which then
+/// deletes it, or sees the event and writes nothing. A deleted entity's row
+/// cannot come back.
+async fn journal_leaves_deleted(
     schema: &crate::PostgresSchema,
     tx: &mut Transaction<'_, Postgres>,
     tenant: &str,
     entity_type: &str,
     entity_id: &str,
 ) -> Result<bool, PersistenceError> {
-    let found: Option<i32> = crate::dbm::postgres_query_scalar!(
+    let tombstone: Option<i32> = crate::dbm::postgres_query_scalar!(
         schema,
         "SELECT 1 FROM {schema}events \
          WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND event_type = 'Deleted' \
@@ -140,7 +143,22 @@ async fn journal_has_tombstone(
     .fetch_optional(&mut **tx)
     .await
     .map_err(storage_error)?;
-    Ok(found.is_some())
+    if tombstone.is_some() {
+        return Ok(true);
+    }
+    let newest_deleted: Option<Option<bool>> = crate::dbm::postgres_query_scalar!(
+        schema,
+        "SELECT payload->>'to_status' = 'Deleted' FROM {schema}events \
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
+         ORDER BY sequence_nr DESC LIMIT 1",
+    )
+    .bind(tenant)
+    .bind(entity_type)
+    .bind(entity_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage_error)?;
+    Ok(newest_deleted.flatten() == Some(true))
 }
 
 async fn reconcile_query_projection_field_index(
@@ -695,7 +713,7 @@ impl PostgresEventStore {
         };
 
         lock_entity_projection(&self.schema, &mut tx, tenant, entity_type, entity_id).await?;
-        if journal_has_tombstone(&self.schema, &mut tx, tenant, entity_type, entity_id).await? {
+        if journal_leaves_deleted(&self.schema, &mut tx, tenant, entity_type, entity_id).await? {
             tx.commit().await.map_err(storage_error)?;
             transaction_timer.set_outcome("deleted_skipped");
             return Ok(());

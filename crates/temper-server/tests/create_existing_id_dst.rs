@@ -16,9 +16,10 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use temper_runtime::buggify::install_buggify_context;
-use temper_runtime::persistence::{EventStore, PersistenceError};
+use temper_runtime::persistence::{EventStore, PersistenceEnvelope, PersistenceError};
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
+use temper_server::request_context::AgentContext;
 use temper_server::storage::{
     BackendLabel, BoxedEventStore, QueryPlaneStore, QueryProjectionFieldsRow,
 };
@@ -47,6 +48,11 @@ const DELETE_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
 /// (0, 1, 7, 12, 22, 23, 27, 29 kept).
 const DELETED_KEY_REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 12, 22, 23, 27, 29];
 
+/// Seeds whose schedule put an order back into the query projection after a
+/// declared action moved it to `Deleted`, while the stores checked only for a
+/// tombstone (14 of seeds 0..64 did; these are the first eight).
+const DELETING_ACTION_REGRESSION_SEEDS: &[u64] = &[3, 6, 9, 12, 15, 18, 24, 30];
+
 /// Seeds explored on every run besides the regression cases.
 const EXPLORED_SEEDS: u64 = 64;
 
@@ -63,9 +69,32 @@ fn order(owner: &str) -> Value {
     })
 }
 
+/// An Order that a declared action, not a delete, moves to `Deleted`.
+const ORDER_DISCARDABLE_IOA: &str = r#"
+[automaton]
+name = "Order"
+states = ["Draft", "Deleted"]
+initial = "Draft"
+
+[[action]]
+name = "Discard"
+kind = "input"
+from = ["Draft"]
+to = "Deleted"
+"#;
+
+/// Whether the journal leaves the entity deleted, as the stores read it: it
+/// holds the tombstone, or its newest event moves the entity to `Deleted`.
+fn journal_leaves_deleted(journal: &[PersistenceEnvelope]) -> bool {
+    journal.iter().any(|event| event.event_type == "Deleted")
+        || journal
+            .last()
+            .is_some_and(|event| event.payload["to_status"] == "Deleted")
+}
+
 /// The query projection as rows keyed by entity, with the stores' guards: a
 /// write older than the row it would replace is refused, and so is any write
-/// of an entity whose journal holds its tombstone.
+/// of an entity whose journal leaves it deleted.
 struct ProjectionModel {
     rows: Mutex<BTreeMap<(String, String, String), u64>>,
     journal: SimEventStore,
@@ -105,7 +134,7 @@ impl QueryPlaneStore for ProjectionModel {
             .journal
             .read_events(&format!("{tenant}:{entity_type}:{entity_id}"), 0)
             .await?;
-        if journal.iter().any(|event| event.event_type == "Deleted") {
+        if journal_leaves_deleted(&journal) {
             return Ok(());
         }
         let key = (
@@ -165,9 +194,23 @@ impl QueryPlaneStore for ProjectionModel {
 /// An Order state on the simulated journal with owner-only reads, and the
 /// modelled query projection it writes to.
 fn order_state(seed: u64, system: &str) -> (ServerState, Arc<ProjectionModel>) {
+    order_state_with_spec(seed, system, common::ORDER_IOA)
+}
+
+/// [`order_state`] with the given Order spec.
+fn order_state_with_spec(
+    seed: u64,
+    system: &str,
+    order_ioa: &str,
+) -> (ServerState, Arc<ProjectionModel>) {
     let journal = SimEventStore::no_faults(seed);
     let projection = Arc::new(ProjectionModel::new(journal.clone()));
-    let mut state = common::build_default_state_with_store(journal.clone(), system);
+    let mut state = common::build_single_tenant_state_with_store(
+        journal.clone(),
+        system,
+        "default",
+        &[("Order", order_ioa)],
+    );
     state.set_storage_stack(StorageStack::new(
         BackendLabel::Sim,
         BoxedEventStore::new(journal),
@@ -265,6 +308,54 @@ async fn repeated_create_racing_delete(seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The owner repeats a create while a declared action moves the order to
+/// `Deleted`. However the two interleave, the order keeps no query projection
+/// row, so collection queries do not list it again. `Err` names the broken
+/// invariant.
+async fn repeated_create_racing_a_deleting_action(seed: u64) -> Result<(), String> {
+    let _sim = install_deterministic_context(seed);
+    let (state, projection) = order_state_with_spec(
+        seed,
+        &format!("create-discard-{seed}"),
+        ORDER_DISCARDABLE_IOA,
+    );
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/tdata/Orders",
+        "alice",
+        Some(order("alice")),
+    )
+    .await;
+    if status != StatusCode::CREATED || !projection.holds("Order", "raced-key") {
+        return Err(format!("the first create got {status} {body}"));
+    }
+
+    let _faults = install_buggify_context(seed);
+    let tenant = TenantId::default();
+    let system = AgentContext::system();
+    let (repeat, discarded) = tokio::join!(
+        send(
+            &state,
+            "POST",
+            "/tdata/Orders",
+            "alice",
+            Some(order("alice"))
+        ),
+        state.dispatch_tenant_action(&tenant, "Order", "raced-key", "Discard", json!({}), &system,),
+    );
+    match discarded {
+        Ok(response) if response.success && response.state.is_deleted() => {}
+        other => return Err(format!("the discard failed: {other:?}")),
+    }
+    if projection.holds("Order", "raced-key") {
+        return Err(format!(
+            "the discarded order is back in the query projection; the repeat got {repeat:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// An order is created and deleted, then its owner and another caller create
 /// its key at once. Deletion is terminal: both get 409 with no body (never a
 /// 500 from an actor the other create stopped), neither sees the deleted
@@ -337,6 +428,15 @@ async fn racing_creates_of_one_key_answer_each_caller_only_with_its_own_record()
 async fn a_repeated_create_racing_a_delete_leaves_the_deleted_record_out_of_queries() {
     for seed in seeds(DELETE_REGRESSION_SEEDS) {
         if let Err(violation) = repeated_create_racing_delete(seed).await {
+            panic!("seed {seed}: {violation}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_create_racing_a_deleting_action_leaves_the_record_out_of_queries() {
+    for seed in seeds(DELETING_ACTION_REGRESSION_SEEDS) {
+        if let Err(violation) = repeated_create_racing_a_deleting_action(seed).await {
             panic!("seed {seed}: {violation}");
         }
     }
