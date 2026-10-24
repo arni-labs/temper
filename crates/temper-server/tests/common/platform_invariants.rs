@@ -701,7 +701,7 @@ pub async fn assert_p16_event_replay_fidelity(harness: &SimPlatformHarness) -> R
 
                 for event in &events {
                     // Match replay's tombstone discriminator, not a spec state name.
-                    tombstoned |= event.event_type == "Deleted";
+                    tombstoned |= event.is_tombstone();
                     let field =
                         |key: &str| event.payload.get(key).and_then(serde_json::Value::as_str);
                     // Events without a stored transition (composite
