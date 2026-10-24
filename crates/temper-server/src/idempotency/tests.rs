@@ -30,6 +30,7 @@ fn make_response(status: &str) -> EntityResponse {
         scheduled_actions: vec![],
         spawn_requests: vec![],
         spec_governed: true,
+        refused: false,
     }
 }
 

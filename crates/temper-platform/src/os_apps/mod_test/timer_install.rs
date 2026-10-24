@@ -91,7 +91,7 @@ impl TursoStoreProvider for ObserveModuleInstall {
 
 #[tokio::test]
 async fn overdue_install_timer_waits_for_module_registration() {
-    overdue_install_timer_waits(None).await;
+    overdue_install_timer_waits("timer-install-module-registration", None).await;
 }
 
 /// Tenant B installs the same app, and its walk runs, while tenant A's
@@ -100,10 +100,10 @@ async fn overdue_install_timer_waits_for_module_registration() {
 /// fire, and A's own install arms it once its module is in.
 #[tokio::test]
 async fn overdue_install_timer_waits_while_another_tenant_installs() {
-    overdue_install_timer_waits(Some("timer-install-b")).await;
+    overdue_install_timer_waits("timer-install-cross-tenant", Some("timer-install-b")).await;
 }
 
-async fn overdue_install_timer_waits(other_tenant: Option<&str>) {
+async fn overdue_install_timer_waits(app: &str, other_tenant: Option<&str>) {
     let plan = OsAppInstallPlan {
         specs: true,
         policies: true,
@@ -112,7 +112,6 @@ async fn overdue_install_timer_waits(other_tenant: Option<&str>) {
         seed: false,
     };
     let root = std::env::temp_dir().join(format!("timer-install-{}", uuid::Uuid::new_v4()));
-    let app = "timer-install";
     let dir = root.join(app);
     fs::create_dir_all(dir.join("specs")).expect("create specs dir");
     fs::create_dir_all(dir.join("wasm/echo")).expect("create the echo module dir");
@@ -124,13 +123,15 @@ async fn overdue_install_timer_waits(other_tenant: Option<&str>) {
     .expect("write policy");
     fs::write(
         dir.join("app.toml"),
-        r#"name = "timer-install"
+        format!(
+            r#"name = "{app}"
 version = "0.1.0"
 [[wasm_modules]]
 name = "echo"
 criticality = "app-required"
 startup_loading = "lazy"
-"#,
+"#
+        ),
     )
     .expect("write app.toml");
     fs::write(dir.join("APP.md"), "# Timer install").expect("write APP.md");
