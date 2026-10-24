@@ -16,7 +16,7 @@
 pub trait CustomEffectHandler: Send + Sync {
     /// Handle a custom effect.
     ///
-    /// - `effect_name`: the effect trigger name (e.g. "GenerateCedarPolicy")
+    /// - `effect_name`: the effect trigger name (e.g. "DispatchCallback")
     /// - `entity_type`: the entity type that transitioned
     /// - `entity_id`: the entity instance ID
     /// - `entity_fields`: merged entity state fields (includes all params from all prior actions)
