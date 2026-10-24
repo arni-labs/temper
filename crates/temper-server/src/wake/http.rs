@@ -6,7 +6,7 @@ use super::{WakeReport, WakeSink};
 
 /// How long one report may take. A request the control plane never answered
 /// would stay in flight for good, and the due time it carries would never be
-/// sent again; one that times out is sent again at the next change or wake.
+/// sent again; one that times out is sent again, as any undelivered report is.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// POSTs each report as JSON to the control plane's address with the

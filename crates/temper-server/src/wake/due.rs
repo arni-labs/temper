@@ -19,6 +19,14 @@ use tokio::sync::{Notify, oneshot};
 use super::{WakeReport, WakeSink};
 use crate::request_context::ScheduledFire;
 
+/// The wait before an undelivered report is sent again; it doubles with each
+/// try, up to [`LAST_RETRY_WAIT`].
+const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait between tries: a control plane that is down for long is
+/// tried about once an hour, not hammered.
+const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
+
 /// One live timer: a record's state timer (a record has at most one), or one
 /// scheduled-action row.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,7 +78,7 @@ struct Reported {
     /// The earliest due time the control plane acknowledged last; None until
     /// it acknowledges one.
     acked: Option<Option<DateTime<Utc>>>,
-    /// The report being sent, by seq.
+    /// The report being sent, or sent again until delivered, by seq.
     in_flight: Option<(u64, Option<DateTime<Utc>>)>,
 }
 
@@ -230,9 +238,11 @@ impl DueTimes {
 
     /// Send the earliest due time to the sink when the control plane has not
     /// acknowledged it and it is not on its way already, or always when
-    /// `force`. Best effort: a refused report leaves nothing acknowledged, so
-    /// the next change or wake sends it again. The report carries the current
-    /// span's trace: the move that changed the earliest due time.
+    /// `force`. A report that is not delivered is sent again, waiting longer
+    /// after each failure, until it is delivered or a newer report replaces
+    /// it: without it the control plane would not wake the process for that
+    /// due time. The report carries the current span's trace: the move that
+    /// changed the earliest due time.
     pub(crate) fn report(self: &Arc<Self>, force: bool) {
         let Some(sink) = self
             .sink
@@ -266,24 +276,34 @@ impl DueTimes {
         let traceparent = crate::trace_context::traceparent(&tracing::Span::current());
         let due = self.clone();
         let send = async move {
-            let result = sink.send(&report, traceparent.as_deref()).await;
-            if let Err(error) = &result {
-                tracing::warn!(seq = report.seq, %error,
-                    "wake report not delivered; sent again at the next change or wake");
-            }
-            let mut inner = due.lock();
-            if inner
-                .reported
-                .in_flight
-                .is_some_and(|(seq, _)| seq == report.seq)
-            {
-                inner.reported.in_flight = None;
-                if result.is_ok() {
-                    inner.reported.acked = Some(report.next_due_at);
+            let mut wait = FIRST_RETRY_WAIT;
+            loop {
+                let result = sink.send(&report, traceparent.as_deref()).await;
+                {
+                    let mut inner = due.lock();
+                    if inner
+                        .reported
+                        .in_flight
+                        .is_none_or(|(seq, _)| seq != report.seq)
+                    {
+                        // A newer report replaced this one.
+                        return;
+                    }
+                    if result.is_ok() {
+                        inner.reported.in_flight = None;
+                        inner.reported.acked = Some(report.next_due_at);
+                        return;
+                    }
                 }
+                if let Err(error) = &result {
+                    tracing::warn!(seq = report.seq, %error, retry_in_ms = wait.as_millis() as u64,
+                        "wake report not delivered; retrying");
+                }
+                tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+                wait = (wait * 2).min(LAST_RETRY_WAIT);
             }
         };
-        tokio::spawn(send); // determinism-ok: best-effort report, one POST per change
+        tokio::spawn(send); // determinism-ok: a report's delivery runs beside the commit
     }
 }
 

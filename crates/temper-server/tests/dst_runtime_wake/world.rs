@@ -111,20 +111,55 @@ impl StateTimerStore for TimerRows {
     }
 }
 
-/// The control plane's end of the reports: it keeps every report it was sent,
-/// and refuses the ones the seed picks.
+/// Most sends in a row the control plane refuses.
+pub(crate) const MOST_REFUSED: u64 = 3;
+
+/// The control plane's end of the reports: it keeps every report it was sent
+/// and every one it took. After a send it takes, it refuses the next 1 to
+/// [`MOST_REFUSED`] sends a quarter of the time.
 pub(crate) struct Reports {
     pub(crate) sent: Mutex<Vec<WakeReport>>,
-    pub(crate) rng: Mutex<DeterministicRng>,
+    pub(crate) delivered: Mutex<Vec<WakeReport>>,
+    rng: Mutex<DeterministicRng>,
+    refusing: Mutex<u64>,
+}
+
+impl Reports {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+            delivered: Mutex::new(Vec::new()),
+            rng: Mutex::new(DeterministicRng::new(seed ^ 0x3a7e)),
+            refusing: Mutex::new(0),
+        }
+    }
+
+    /// What the control plane believes: the newest report it took, by
+    /// `reported_at`, as it orders them. None: it took none.
+    pub(crate) fn told(&self) -> Option<WakeReport> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .max_by_key(|report| (report.reported_at, report.seq))
+            .cloned()
+    }
 }
 
 #[async_trait::async_trait]
 impl WakeSink for Reports {
     async fn send(&self, report: &WakeReport, _traceparent: Option<&str>) -> Result<(), String> {
         self.sent.lock().unwrap().push(report.clone());
-        if self.rng.lock().unwrap().next_bound(4) == 0 {
+        let mut refusing = self.refusing.lock().unwrap();
+        if *refusing > 0 {
+            *refusing -= 1;
             return Err("simulated refusal".to_string());
         }
+        let mut rng = self.rng.lock().unwrap();
+        if rng.next_bound(4) == 0 {
+            *refusing = rng.next_bound(MOST_REFUSED as usize) as u64 + 1;
+        }
+        self.delivered.lock().unwrap().push(report.clone());
         Ok(())
     }
 }
