@@ -165,7 +165,7 @@ impl SyncCopy {
     }
 
     /// The number of the newest committed change in the local change log.
-    pub(super) async fn last_change(&self) -> Result<i64, PersistenceError> {
+    pub async fn last_change(&self) -> Result<i64, PersistenceError> {
         let conn = self.connect().await.map_err(storage_error)?;
         let mut rows = conn
             .query("SELECT MAX(change_id) FROM turso_cdc", ())
