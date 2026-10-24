@@ -4,7 +4,7 @@ use tokio::sync::Semaphore;
 use tracing::{Instrument, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::entity_actor::{EntityMsg, EntityResponse};
+use crate::entity_actor::{EntityMsg, EntityResponse, MoveOrigin};
 use crate::request_context::{AgentContext, remote_parent_context};
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
@@ -181,21 +181,44 @@ impl crate::state::ServerState {
         cmd: DispatchCommand<'_>,
         expected_authorization_precondition: String,
     ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, Some(expected_authorization_precondition))
+        self.dispatch_typed_checked(cmd, Some(expected_authorization_precondition), None)
             .await
+    }
+
+    /// Dispatch a move the runtime makes itself (a state timer's), recorded
+    /// with `origin` as who made it and what led to it.
+    ///
+    /// `cmd.agent_ctx` is the authority the move runs with. `origin` is never
+    /// part of it: it reaches this one move's records only, so the reactions,
+    /// spawns, scheduled actions and callbacks the move starts, which all
+    /// inherit the context, are recorded as their own.
+    #[instrument(skip_all, fields(
+        otel.name = %format_args!("{}.{}", cmd.entity_type, cmd.action),
+        tenant = %cmd.tenant,
+        entity_type = cmd.entity_type,
+        entity_id = cmd.entity_id,
+        action_name = cmd.action,
+    ))]
+    pub(crate) async fn dispatch_runtime_move(
+        &self,
+        cmd: DispatchCommand<'_>,
+        origin: MoveOrigin,
+    ) -> Result<EntityResponse, DispatchError> {
+        self.dispatch_typed_checked(cmd, None, Some(origin)).await
     }
 
     async fn dispatch_typed(
         &self,
         cmd: DispatchCommand<'_>,
     ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, None).await
+        self.dispatch_typed_checked(cmd, None, None).await
     }
 
     async fn dispatch_typed_checked(
         &self,
         cmd: DispatchCommand<'_>,
         expected_authorization_precondition: Option<String>,
+        origin: Option<MoveOrigin>,
     ) -> Result<EntityResponse, DispatchError> {
         let DispatchCommand {
             tenant,
@@ -225,6 +248,7 @@ impl crate::state::ServerState {
                 agent_ctx,
                 await_integration,
                 expected_authorization_precondition,
+                origin,
             )
             .await?;
 
@@ -385,6 +409,7 @@ impl crate::state::ServerState {
         agent_ctx: &AgentContext,
         await_integration: bool,
         expected_authorization_precondition: Option<String>,
+        origin: Option<MoveOrigin>,
     ) -> Result<EntityResponse, DispatchError> {
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
@@ -459,6 +484,7 @@ impl crate::state::ServerState {
                             agent_ctx: enriched_agent_ctx,
                             await_integration,
                             expected_authorization_precondition,
+                            origin,
                             workflow_root_active: true,
                         })
                         .instrument(step)
@@ -485,6 +511,7 @@ impl crate::state::ServerState {
             agent_ctx: enriched_agent_ctx,
             await_integration,
             expected_authorization_precondition,
+            origin,
             workflow_root_active: false,
         })
         .await
@@ -505,12 +532,10 @@ impl crate::state::ServerState {
             agent_ctx: enriched_agent_ctx,
             await_integration,
             expected_authorization_precondition,
+            origin,
             workflow_root_active,
         } = steps;
-        let mut enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
-        // The origin names this move only: the context its follow-ons inherit
-        // goes on without it.
-        let origin = enriched_agent_ctx.origin.take();
+        let enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();
@@ -914,6 +939,9 @@ struct DispatchSteps<'a> {
     agent_ctx: AgentContext,
     await_integration: bool,
     expected_authorization_precondition: Option<String>,
+    /// Who made the move when the runtime made it itself; kept apart from
+    /// `agent_ctx` so nothing the move starts inherits it.
+    origin: Option<MoveOrigin>,
     /// The work runs in a workflow's step span.
     workflow_root_active: bool,
 }

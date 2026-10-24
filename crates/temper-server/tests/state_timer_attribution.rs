@@ -141,33 +141,119 @@ on_timeout = "Pass"
     )
 }
 
+const BELL_CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Gates" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Gate">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
+      <EntityType Name="Bell">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
+      <Action Name="Add" IsBound="true"><Parameter Name="bindingParameter" Type="Gates.Gate"/></Action>
+      <Action Name="Pass" IsBound="true"><Parameter Name="bindingParameter" Type="Gates.Gate"/></Action>
+      <Action Name="Ring" IsBound="true"><Parameter Name="bindingParameter" Type="Gates.Bell"/></Action>
+      <EntityContainer Name="Container">
+        <EntitySet Name="Gates" EntityType="Gates.Gate"/>
+        <EntitySet Name="Bells" EntityType="Gates.Bell"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"#;
+
+/// A gate that passes itself a second after it is added, and whose pass
+/// rings the bell of the same id. The reaction declares no principal, so it
+/// runs with the authority of the move it reacts to.
+const RINGING_GATE_IOA: &str = r#"
+[automaton]
+name = "Gate"
+states = ["Unmade", "Closed", "Passed"]
+initial = "Unmade"
+allow_indefinite_states = ["Unmade", "Closed", "Passed"]
+
+[[action]]
+name = "Add"
+from = ["Unmade"]
+to = "Closed"
+params = []
+
+[[action]]
+name = "Pass"
+kind = "input"
+from = ["Closed"]
+to = "Passed"
+
+[[action.triggers]]
+name = "pass_rings_the_bell"
+kind = "entity"
+target_entity = "Bell"
+target_action = "Ring"
+resolve_target = { kind = "same_id" }
+
+[[state_timeout]]
+state = "Closed"
+after_seconds = 1
+on_timeout = "Pass"
+"#;
+
+const BELL_IOA: &str = r#"
+[automaton]
+name = "Bell"
+states = ["Silent", "Rung"]
+initial = "Silent"
+allow_indefinite_states = ["Silent", "Rung"]
+
+[[action]]
+name = "Ring"
+kind = "input"
+from = ["Silent"]
+to = "Rung"
+"#;
+
+/// Anyone may add a gate and ring a bell.
+const RINGING_POLICY: &str = r#"
+permit(principal, action in [Action::"create", Action::"read", Action::"Add", Action::"Pass"], resource is Gate);
+permit(principal, action in [Action::"read", Action::"Ring"], resource is Bell);
+"#;
+
 fn build_state(gate_ioa: &str) -> ServerState {
+    build_tenant(CSDL_XML, &[("Gate", gate_ioa)], POLICY)
+}
+
+/// The default tenant with `specs`, each marked verified, and `policy`.
+fn build_tenant(csdl: &str, specs: &[(&str, &str)], policy: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
-        parse_csdl(CSDL_XML).expect("CSDL should parse"),
-        CSDL_XML.to_string(),
-        &[("Gate", gate_ioa)],
+        parse_csdl(csdl).expect("CSDL should parse"),
+        csdl.to_string(),
+        specs,
     );
     let state = ServerState::from_registry(ActorSystem::new("state-timer-attribution"), registry);
-    state.registry.write().unwrap().set_verification_status(
-        &TenantId::default(),
-        "Gate",
-        VerificationStatus::Completed(EntityVerificationResult {
-            all_passed: true,
-            levels: vec![EntityLevelSummary {
-                level: "L0 SMT".to_string(),
-                passed: true,
-                summary: "OK".to_string(),
-                details: None,
-            }],
-            verified_at: "2026-10-23T00:00:00Z".to_string(),
-        }),
-    );
+    for (entity_type, _) in specs {
+        state.registry.write().unwrap().set_verification_status(
+            &TenantId::default(),
+            entity_type,
+            VerificationStatus::Completed(EntityVerificationResult {
+                all_passed: true,
+                levels: vec![EntityLevelSummary {
+                    level: "L0 SMT".to_string(),
+                    passed: true,
+                    summary: "OK".to_string(),
+                    details: None,
+                }],
+                verified_at: "2026-10-23T00:00:00Z".to_string(),
+            }),
+        );
+    }
     state
         .authz
-        .reload_tenant_policies("default", POLICY)
+        .reload_tenant_policies("default", policy)
         .expect("policy should load");
+    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -319,6 +405,61 @@ async fn a_state_timers_move_calls_out_as_the_arming_agent_and_its_follow_ons_na
     assert_eq!(
         notified.origin, None,
         "the move the service's answer makes is its own, not the timer's"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reaction_to_a_state_timers_move_is_recorded_as_its_own() {
+    let state = build_tenant(
+        BELL_CSDL_XML,
+        &[("Gate", RINGING_GATE_IOA), ("Bell", BELL_IOA)],
+        RINGING_POLICY,
+    );
+    assert_eq!(
+        post(&state, "/tdata/Gates", r#"{"Id":"g6"}"#, "member").await,
+        StatusCode::CREATED
+    );
+    let added = post(&state, "/tdata/Gates('g6')/Gates.Add", "{}", "member").await;
+    assert!(added.is_success(), "the member's Add was refused: {added}");
+
+    let (status, _, events) = settle(&state, "g6", Duration::from_secs(6)).await;
+    assert_eq!(status, "Passed", "the state timer did not move the gate on");
+    let pass = events
+        .iter()
+        .find(|event| event.action == "Pass")
+        .expect("the history keeps the timer's move");
+    assert_eq!(
+        pass.origin.as_ref().map(|origin| origin.actor.as_str()),
+        Some(STATE_TIMER_ACTOR),
+        "the gate's pass is the state timer's"
+    );
+
+    // The reaction runs after the gate's pass commits.
+    let deadline = Instant::now() + Duration::from_secs(4); // determinism-ok: real-time timer test
+    let bell = loop {
+        let bell = state
+            .get_tenant_entity_state(&TenantId::default(), "Bell", "g6")
+            .await
+            .expect("the reaction reaches the bell");
+        let now = Instant::now(); // determinism-ok: real-time timer test
+        if bell.state.status == "Rung" || now >= deadline {
+            break bell;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await; // determinism-ok: real-time timer test
+    };
+    assert_eq!(
+        bell.state.status, "Rung",
+        "the gate's pass did not ring the bell"
+    );
+    let ring = bell
+        .state
+        .events
+        .iter()
+        .find(|event| event.action == "Ring")
+        .expect("the bell's history keeps the reaction's move");
+    assert_eq!(
+        ring.origin, None,
+        "the reaction's move is its own: it names neither the state timer nor the gate's cause"
     );
 }
 

@@ -58,6 +58,7 @@ use crate::entity_actor::{
 };
 use crate::request_context::AgentContext;
 
+use super::DispatchCommand;
 use super::effects::PostDispatchContext;
 
 /// Walk the event history backward to find the timestamp of the most recent
@@ -619,13 +620,18 @@ impl crate::state::ServerState {
                         &timer.action,
                     );
                     let _ = state
-                        .dispatch_tenant_action(
-                            &timer.tenant,
-                            &timer.entity_type,
-                            &timer.entity_id,
-                            &timer.action,
-                            timer.params.clone(),
-                            &timer.fire_agent(),
+                        .dispatch_runtime_move(
+                            DispatchCommand {
+                                tenant: &timer.tenant,
+                                entity_type: &timer.entity_type,
+                                entity_id: &timer.entity_id,
+                                action: &timer.action,
+                                params: timer.params.clone(),
+                                agent_ctx: &timer.armed_by,
+                                await_integration: false,
+                                await_reactions: true,
+                            },
+                            timer.origin(),
                         )
                         .await;
                 }
@@ -663,24 +669,23 @@ pub(super) struct ArmedTimer {
 }
 
 impl ArmedTimer {
-    /// The context the timer's move is dispatched with. It keeps the arming
-    /// dispatch's identity and authority (`agent_id`, `security_ctx`), so
-    /// bound parameters, Cedar checks on the move's integrations and its
-    /// adapters see what they saw when the move was armed. Its `origin`
-    /// records it as the state timer's move, with the arming move as its
-    /// cause, because the spec's follow-on is the app's rule rather than a
-    /// move the arming person asked for.
-    pub(super) fn fire_agent(&self) -> AgentContext {
-        let mut agent = self.armed_by.clone();
-        agent.origin = Some(MoveOrigin {
+    /// Who the timer's move is recorded as: the state timer, with the arming
+    /// move as its cause, because the spec's follow-on is the app's rule
+    /// rather than a move the arming person asked for. The move itself runs
+    /// with `armed_by`, the arming dispatch's identity and authority, so bound
+    /// parameters, Cedar checks on the move's integrations and its adapters
+    /// see what they saw when the move was armed. The origin is handed to the
+    /// dispatch beside that context, never inside it, so the follow-ons the
+    /// move starts do not inherit it.
+    pub(super) fn origin(&self) -> MoveOrigin {
+        MoveOrigin {
             actor: STATE_TIMER_ACTOR.to_string(),
             caused_by: MoveCause {
                 agent_id: self.armed_by.agent_id.clone(),
                 action: self.cause_action.clone(),
                 sequence_nr: self.sequence_nr,
             },
-        });
-        agent
+        }
     }
 }
 

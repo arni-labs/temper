@@ -30,7 +30,7 @@ pub(crate) struct PostDispatchContext<'a> {
     pub action: &'a str,
     pub agent_ctx: &'a AgentContext,
     /// Who made this move when the runtime made it itself (a state timer).
-    /// `agent_ctx` no longer carries it, so the follow-ons it starts do not.
+    /// `agent_ctx` never carries it, so the follow-ons it starts do not.
     pub origin: Option<&'a MoveOrigin>,
     pub dispatch_idempotency_key: Option<&'a str>,
     pub action_params: &'a serde_json::Value,
