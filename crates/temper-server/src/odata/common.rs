@@ -148,6 +148,9 @@ pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::r
         super::constraints::ConstraintViolationType::RelationIntegrity => "relation_integrity",
         super::constraints::ConstraintViolationType::CrossInvariant => "cross_invariant",
         super::constraints::ConstraintViolationType::FieldInvariant => "field_invariant",
+        super::constraints::ConstraintViolationType::StoredValueUnreadable => {
+            "stored_value_unreadable"
+        }
     };
     let body = serde_json::json!({
         "error": {

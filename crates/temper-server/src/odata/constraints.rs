@@ -1,8 +1,9 @@
 //! Cross-entity relation and invariant enforcement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant; // determinism-ok: scoped duration measurement only
 
+use futures_util::FutureExt;
 use tracing::instrument;
 
 use temper_runtime::tenant::TenantId;
@@ -43,6 +44,9 @@ pub enum ConstraintViolationType {
     RelationIntegrity,
     CrossInvariant,
     FieldInvariant,
+    /// A value the checks read could not be read back from where an earlier
+    /// write stored it, so the record cannot be checked and is not written.
+    StoredValueUnreadable,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -100,6 +104,24 @@ impl ConstraintViolation {
             violation_type: ConstraintViolationType::FieldInvariant,
             invariant: Some(invariant.to_string()),
             message: message.into(),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            operation: operation.to_string(),
+        }
+    }
+
+    /// The record's checks read a stored value that could not be read.
+    pub(crate) fn stored_value_unreadable(
+        entity_type: &str,
+        entity_id: &str,
+        operation: &str,
+    ) -> Self {
+        Self {
+            violation_type: ConstraintViolationType::StoredValueUnreadable,
+            invariant: None,
+            message: format!(
+                "a stored value of {entity_type}('{entity_id}') that this write is checked against could not be read; retry the write"
+            ),
             entity_type: entity_type.to_string(),
             entity_id: entity_id.to_string(),
             operation: operation.to_string(),
@@ -406,6 +428,26 @@ pub(crate) async fn post_write_invariant_checks(
                 .get_tenant_entity_state(tenant, &assertion.target_entity, target_id)
                 .await
                 .map(|resp| resp.state),
+        };
+        // The related record's field as its value: one an earlier write
+        // stored out of line is read back, never compared as a reference.
+        let target = match target {
+            Ok(mut target) if assertion.field_name != "status" => {
+                let names = BTreeSet::from([assertion.field_name.clone()]);
+                let source = crate::blobs::BlobReadSource::Tenant { state, tenant };
+                // Boxed: the blob read's future is too deep for the write
+                // paths' `Send` checks.
+                crate::blobs::resolve_stored_fields(&source, &target.fields, &names)
+                    .boxed()
+                    .await
+                    .map(|resolved| {
+                        if let Some(resolved) = resolved {
+                            target.fields = resolved;
+                        }
+                        target
+                    })
+            }
+            other => other,
         };
         let target_field_value = match target {
             Ok(target) => {

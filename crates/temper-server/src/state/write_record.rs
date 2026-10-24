@@ -5,7 +5,9 @@
 //! stored record. Each write path builds the record it is about to store with
 //! the same function the entity actor applies for that write (create, field
 //! update, action) and checks that record here, so the record that is checked
-//! is the record that is stored.
+//! is the record that is stored. The checks read the record's values, never
+//! how they are stored: a large value an earlier write stored out of line is
+//! read back for the fields the checks read.
 //!
 //! Only writes from outside the kernel are checked. The kernel's own
 //! follow-ons for a spec (reactions, state timers, schedules, WASM callbacks,
@@ -13,11 +15,14 @@
 //! finish what an earlier move started, such as ending a session whose parent
 //! was archived since.
 
+use std::collections::BTreeSet;
+
 use futures_util::FutureExt;
 use serde_json::Value;
 use temper_authz::SecurityContext;
 use temper_jit::table::{RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
+use temper_spec::cross_invariant::parse_related_field_assert;
 use tracing::instrument::WithSubscriber;
 
 use super::ServerState;
@@ -120,6 +125,8 @@ impl ServerState {
         if caller == WriteCaller::Kernel {
             return Ok(());
         }
+        let resolved = self.stored_values_checked(write, record).await?;
+        let record = resolved.as_ref().unwrap_or(record);
         constraints::pre_upsert_relation_checks(
             self,
             tenant,
@@ -140,6 +147,83 @@ impl ServerState {
         )
         .await?;
         constraints::post_write_invariant_checks(self, write, record, pending).await
+    }
+
+    /// `record` with each field its checks read holding its value, when an
+    /// earlier write stored one of them out of line (a field-overflow
+    /// reference, carried unchanged into the record this write stores): the
+    /// value is read back from the tenant's blob store, so the checks read
+    /// the domain value whatever its size. `None` when no field the checks
+    /// read is stored that way. Values this write brings are already in the
+    /// record (an action's preview keeps every value inline).
+    async fn stored_values_checked(
+        &self,
+        write: RecordWrite<'_>,
+        record: &Value,
+    ) -> Result<Option<Value>, ConstraintViolation> {
+        let RecordWrite {
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            operation,
+            ..
+        } = write;
+        let names = self.fields_checked(tenant, entity_type, action);
+        let source = crate::blobs::BlobReadSource::Tenant {
+            state: self,
+            tenant,
+        };
+        // Boxed: the blob read's future nested in every write path is too
+        // deep for their callers' `Send` checks.
+        crate::blobs::resolve_stored_fields(&source, record, &names)
+            .boxed()
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    tenant = %tenant, entity_type, entity_id, operation, %error,
+                    "constraint check: a stored value it reads could not be read"
+                );
+                ConstraintViolation::stored_value_unreadable(entity_type, entity_id, operation)
+            })
+    }
+
+    /// The fields of an `entity_type` record that the checks on `action`
+    /// read: the names its field invariants read, its relation fields, and
+    /// the source fields of the cross-invariants the action triggers.
+    fn fields_checked(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        action: &str,
+    ) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        if !self.cross_invariant_enforce {
+            return names;
+        }
+        let registry = self.registry.read().expect("registry lock poisoned");
+        for invariant in registry
+            .field_invariants_for(tenant, entity_type)
+            .unwrap_or_default()
+        {
+            names.extend(invariant.referenced_fields());
+        }
+        let Some(tenant_config) = registry.get_tenant(tenant) else {
+            return names;
+        };
+        if let Some(edges) = tenant_config.relation_graph.outgoing.get(entity_type) {
+            names.extend(edges.iter().map(|edge| edge.source_field.clone()));
+        }
+        if let Some(spec) = &tenant_config.cross_invariants {
+            names.extend(
+                spec.invariants
+                    .iter()
+                    .filter(|inv| constraints::trigger_matches(&inv.on, entity_type, action))
+                    .filter_map(|inv| parse_related_field_assert(&inv.assertion))
+                    .map(|assertion| assertion.source_field),
+            );
+        }
+        names
     }
 
     /// Check the record `action` will store when applied to `current`.
@@ -262,14 +346,17 @@ impl ServerState {
         related: &RelatedMap,
     ) -> Option<(EntityState, Vec<SpawnRequest>)> {
         // The preview repeats the interpreter's own log lines; only the real
-        // application of the action should appear in the logs.
+        // application of the action should appear in the logs. It keeps every
+        // value the action writes in the record, however large: the checks
+        // read values, and the preview stores nothing, so it has no use for
+        // the out-of-line references the actor stores large values behind.
         let result = crate::entity_actor::action_input::process_action_with_blob_prestate(
             &mut state,
             table,
             action,
             params,
             related,
-            FieldSyncMode::blob_refs_default(),
+            FieldSyncMode::Inline,
             crate::blobs::BlobReadSource::Tenant {
                 state: self,
                 tenant,
