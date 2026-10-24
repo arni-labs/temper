@@ -167,7 +167,13 @@ pub struct EntityActor {
     /// Object store for field-overflow blob bytes. SQL stores only refs.
     pub(super) blob_store: Option<crate::blob_store::BlobStore>,
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
+    /// Run once with the state this actor rehydrated from stored events.
+    on_rehydrated: Option<RehydrateHook>,
 }
+
+/// What an entity actor runs when it starts from stored events, with the
+/// state it rehydrated into, before it takes any message.
+pub(crate) type RehydrateHook = Arc<dyn Fn(&EntityState) + Send + Sync>;
 
 impl EntityActor {
     pub(crate) fn build_initial_state(
@@ -303,6 +309,7 @@ impl EntityActor {
             idempotency_cache: None,
             blob_store: None,
             legacy_blob_store: None,
+            on_rehydrated: None,
         }
     }
 
@@ -328,6 +335,7 @@ impl EntityActor {
             idempotency_cache: None,
             blob_store: None,
             legacy_blob_store: None,
+            on_rehydrated: None,
         }
     }
 
@@ -359,6 +367,12 @@ impl EntityActor {
         store: Option<Arc<dyn crate::storage::BlobStore>>,
     ) -> Self {
         self.legacy_blob_store = store;
+        self
+    }
+
+    /// Attach the hook run when this actor rehydrates from stored events.
+    pub(crate) fn with_on_rehydrated(mut self, hook: Option<RehydrateHook>) -> Self {
+        self.on_rehydrated = hook;
         self
     }
 
@@ -1055,6 +1069,11 @@ impl Actor for EntityActor {
                 self.blob_store.as_ref(),
             )
             .await?;
+            if state.sequence_nr > 0
+                && let Some(hook) = self.on_rehydrated.as_ref()
+            {
+                hook(&state);
+            }
         }
 
         // Persist a bootstrap Created event for first-time entities so initial
