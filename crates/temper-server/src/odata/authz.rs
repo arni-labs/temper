@@ -217,3 +217,70 @@ pub(super) async fn authorize_mutation(
     )
     .into_response())
 }
+
+/// An outside call of a bound action: the entity as it is, and the body sent.
+pub(super) struct BoundActionCall<'a> {
+    pub(super) entity_type: &'a str,
+    pub(super) entity_id: &'a str,
+    pub(super) action: &'a str,
+    pub(super) status: &'a str,
+    pub(super) fields: &'a serde_json::Value,
+    pub(super) body: &'a serde_json::Value,
+    /// The runtime's rule for which body keys reach fields.
+    pub(super) writes: &'a (dyn Fn(&str) -> bool + Sync),
+}
+
+/// An action body that writes fields its action does not declare changes the
+/// entity the way a PATCH does, so it needs the same two `update` decisions a
+/// PATCH needs: on the entity as it is and as it would be, each built the way
+/// a PATCH builds it. A body of declared params needs neither. A denial is
+/// recorded like any other, so a person can approve it.
+pub(super) async fn authorize_undeclared_field_write(
+    state: &ServerState,
+    tenant: &TenantId,
+    security_ctx: &SecurityContext,
+    agent_ctx: &AgentContext,
+    call: BoundActionCall<'_>,
+) -> Result<(), Response> {
+    let Ok(table) = state.transition_table_for_dispatch(tenant, call.entity_type) else {
+        // Dispatch answers for a type without a table.
+        return Ok(());
+    };
+    let Some(prospective) = crate::entity_actor::undeclared_params::fields_after_undeclared_write(
+        &table,
+        call.action.rsplit('.').next().unwrap_or(call.action),
+        call.fields,
+        call.body,
+        call.writes,
+    ) else {
+        return Ok(());
+    };
+    for fields in [call.fields, &prospective] {
+        let attrs = state
+            .build_authz_resource_attrs(
+                tenant,
+                call.entity_type,
+                call.entity_id,
+                call.status,
+                fields,
+            )
+            .await
+            .map_err(|error| {
+                odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error).into_response()
+            })?;
+        authorize_mutation(
+            state,
+            tenant,
+            security_ctx,
+            agent_ctx,
+            UPDATE_ACTION,
+            MutationResource {
+                entity_type: call.entity_type,
+                entity_id: call.entity_id,
+                attrs: &attrs,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}

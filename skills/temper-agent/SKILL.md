@@ -509,7 +509,7 @@ await temper.action("<your-tenant>", "Issues", issue_id, "StartWork", {})
 
 # 3. When done, submit for review
 await temper.action("<your-tenant>", "Issues", issue_id, "SubmitForReview", {
-    "review_notes": "Implemented per plan. All gates green."
+    "pr_url": "https://github.com/<org>/<repo>/pull/<number>"
 })
 
 # 4. Wait for human approval — `ApproveReview` is gated to humans/supervisors

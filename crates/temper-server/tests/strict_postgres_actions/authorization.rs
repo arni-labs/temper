@@ -166,3 +166,195 @@ permit(principal == Agent::"bob", action, resource) when { resource.Notes == "bo
     assert_eq!(message_count(&pool, &handle.namespace).await, 4);
     server.abort();
 }
+
+/// The Postgres runtime writes every key of a non-strict action's body into
+/// fields, so keys the action does not declare need the caller's update grant.
+#[tokio::test]
+async fn postgres_undeclared_keys_need_the_callers_update_grant() {
+    let spec = r#"
+[automaton]
+name = "Order"
+states = ["Draft"]
+initial = "Draft"
+[[state]]
+name = "Notes"
+type = "string"
+initial = "alice"
+[[action]]
+name = "Observe"
+from = ["Draft"]
+params = []
+"#;
+    let (pool, _container) = pool().await;
+    let actors = Arc::new(ActorSystem::new(pool.clone(), SchedulerConfig::default()));
+    actors
+        .register(Arc::new(SpecDrivenActor::from_ioa(spec).unwrap()))
+        .await
+        .unwrap();
+    let mut registry = SpecRegistry::new();
+    registry.register_tenant(
+        "default",
+        temper_spec::csdl::parse_csdl(CSDL).unwrap(),
+        CSDL.into(),
+        &[("Order", spec)],
+    );
+    registry.set_verification_status(
+        &TenantId::default(),
+        "Order",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![],
+            verified_at: "2026-10-23T00:00:00Z".into(),
+        }),
+    );
+    let mut state = ServerState::from_pg_registry(actors.clone(), registry);
+    state.actor_backed_types.insert("Order".into());
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            r#"
+permit(principal, action == Action::"Observe", resource);
+permit(principal, action == Action::"update", resource) when { resource.Notes == principal.id };
+"#,
+        )
+        .unwrap();
+    let router = build_router(state).layer(axum::middleware::from_fn(owner_identity));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let id = uuid::Uuid::new_v4().to_string();
+    let handle = actors
+        .spawn_with_fields(&format!("default/{id}"), "Order", json!({"Notes":"alice"}))
+        .await
+        .unwrap();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let observe = |who: &'static str, body: Value| {
+        client
+            .post(format!("{base}/tdata/Orders('{id}')/Temper.Observe"))
+            .header("x-test-owner", who)
+            .json(&body)
+            .send()
+    };
+
+    let refused = observe("bob", json!({"Notes": "bob"})).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        message_count(&pool, &handle.namespace).await,
+        0,
+        "a refused call queues nothing"
+    );
+
+    let accepted = observe("bob", json!({})).await.unwrap();
+    assert_eq!(
+        accepted.status(),
+        StatusCode::ACCEPTED,
+        "declared params work as before"
+    );
+
+    let accepted = observe("alice", json!({"label": "kept"})).await.unwrap();
+    assert_eq!(
+        accepted.status(),
+        StatusCode::ACCEPTED,
+        "the owner may update"
+    );
+    assert_eq!(message_count(&pool, &handle.namespace).await, 2);
+    server.abort();
+}
+
+/// The update grant on the Postgres route sees the entity as a PATCH does,
+/// related statuses included, on the entity as it is and as it would be.
+#[tokio::test]
+async fn postgres_undeclared_keys_are_decided_with_related_statuses() {
+    let spec = r#"
+[automaton]
+name = "Order"
+states = ["Draft"]
+initial = "Draft"
+[[context_entity]]
+name = "customer"
+entity_type = "Customer"
+id_field = "CustomerId"
+[[action]]
+name = "Observe"
+from = ["Draft"]
+params = []
+"#;
+    let customer_spec = r#"
+[automaton]
+name = "Customer"
+states = ["Active"]
+initial = "Active"
+allow_indefinite_states = ["Active"]
+"#;
+    let (pool, _container) = pool().await;
+    let actors = Arc::new(ActorSystem::new(pool.clone(), SchedulerConfig::default()));
+    actors
+        .register(Arc::new(SpecDrivenActor::from_ioa(spec).unwrap()))
+        .await
+        .unwrap();
+    let mut registry = SpecRegistry::new();
+    registry.register_tenant(
+        "default",
+        temper_spec::csdl::parse_csdl(CSDL).unwrap(),
+        CSDL.into(),
+        &[("Order", spec), ("Customer", customer_spec)],
+    );
+    registry.set_verification_status(
+        &TenantId::default(),
+        "Order",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![],
+            verified_at: "2026-10-23T00:00:00Z".into(),
+        }),
+    );
+    let mut state = ServerState::from_pg_registry(actors.clone(), registry);
+    state.actor_backed_types.insert("Order".into());
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            r#"
+permit(principal, action == Action::"Observe", resource);
+permit(principal, action == Action::"update", resource)
+  when { resource has ctx_customer_status && resource.ctx_customer_status == "Active" };
+"#,
+        )
+        .unwrap();
+    let router = build_router(state).layer(axum::middleware::from_fn(owner_identity));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let id = uuid::Uuid::new_v4().to_string();
+    let handle = actors
+        .spawn_with_fields(
+            &format!("default/{id}"),
+            "Order",
+            json!({"CustomerId": "customer-1"}),
+        )
+        .await
+        .unwrap();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let accepted = client
+        .post(format!("{base}/tdata/Orders('{id}')/Temper.Observe"))
+        .header("x-test-owner", "bob")
+        .json(&json!({"label": "kept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.status(),
+        StatusCode::ACCEPTED,
+        "the customer is active, so the update grant holds"
+    );
+    assert_eq!(message_count(&pool, &handle.namespace).await, 1);
+    server.abort();
+}

@@ -16,8 +16,9 @@ use axum::Extension;
 use super::account_verification::enforce_commons_account_verified_for_write;
 use super::app_uniqueness::enforce_commons_app_name_unique_for_write;
 use super::authz::{
-    CREATE_ACTION, DELETE_ACTION, MutationResource, UPDATE_ACTION, apply_authenticated_context,
-    authorize_mutation, require_authenticated_context, resource_attrs_from_body,
+    BoundActionCall, CREATE_ACTION, DELETE_ACTION, MutationResource, UPDATE_ACTION,
+    apply_authenticated_context, authorize_mutation, authorize_undeclared_field_write,
+    require_authenticated_context, resource_attrs_from_body,
 };
 use super::bindings::dispatch_bound_action;
 use super::common::{
@@ -902,6 +903,29 @@ pub async fn handle_odata_post(
                     Ok(state) => state,
                     Err(response) => return *response,
                 };
+                // This runtime writes every key of a non-strict action's body
+                // into fields, so the caller's own update grant decides the
+                // keys the action does not declare.
+                let call = BoundActionCall {
+                    entity_type: &entity_type,
+                    entity_id: &key_str,
+                    action: &action,
+                    status: &actor_state.status,
+                    fields: &actor_state.fields,
+                    body: &body_json,
+                    writes: &|_| true,
+                };
+                if let Err(response) = authorize_undeclared_field_write(
+                    &state,
+                    &tenant,
+                    &security_ctx,
+                    &agent_ctx,
+                    call,
+                )
+                .await
+                {
+                    return response;
+                }
                 if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
                     return *resp;
                 }

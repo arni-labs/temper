@@ -9,7 +9,9 @@
 //! - `report` (the default): nothing changes; each undeclared key is counted in
 //!   `temper_undeclared_action_params_total` by type, action and kind, and the
 //!   keys are named in a warning the first time a type and action get that kind,
-//!   so the apps that still send them can be found;
+//!   so the apps that still send them can be found. An outside call that
+//!   sends one writes fields the way a PATCH does, so it also needs the
+//!   caller's `update` grant on the entity as it is and as it would be;
 //! - `enforce`: undeclared keys are dropped on every dispatch path, and an
 //!   outside call that sends one is answered 400 after Cedar has decided it.
 
@@ -120,6 +122,45 @@ pub(crate) fn external_refusal(
     }
 }
 
+/// The fields an entity would hold after an outside call to a non-strict
+/// action whose body carries keys the action does not declare, or `None` when
+/// no such key is written (or the spec is strict, which refuses such keys).
+///
+/// Those keys are written into fields just as a PATCH writes its body, so the
+/// caller's own `update` grant decides them, on these prospective fields as on
+/// the current ones. `writes` is the runtime's own rule for which body keys
+/// reach fields: a key it does not write changes nothing and does not count.
+/// Server-derived names are never written.
+pub(crate) fn fields_after_undeclared_write(
+    table: &TransitionTable,
+    action: &str,
+    current_fields: &serde_json::Value,
+    body: &serde_json::Value,
+    writes: &dyn Fn(&str) -> bool,
+) -> Option<serde_json::Value> {
+    if table.strict_action_params {
+        return None;
+    }
+    let object = body.as_object()?;
+    let written =
+        |key: &str| !temper_spec::automaton::is_server_derived_field_name(key) && writes(key);
+    let undeclared = match undeclared_param_keys(table, action, body) {
+        Ok(keys) => keys,
+        // A body the declared params cannot be read from is written as sent.
+        Err(_) => object.keys().cloned().collect(),
+    };
+    if !undeclared.iter().any(|key| written(key)) {
+        return None;
+    }
+    let mut fields = current_fields.as_object().cloned().unwrap_or_default();
+    for (key, value) in object {
+        if written(key) {
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    Some(serde_json::Value::Object(fields))
+}
+
 /// Count the keys, and name them in a warning the first time this process sees
 /// that kind on this type and action (so the warnings are bounded by the
 /// specs, whatever callers send). Key names come from callers' code, never
@@ -182,6 +223,76 @@ params = ["status_code"]
         let screened = screen(&table(false), "Day", "Fetched", &body).unwrap();
         assert_eq!(screened.as_ref(), &body);
         assert!(external_refusal(&table(false), "Fetched", &body).is_none());
+    }
+
+    #[test]
+    fn undeclared_keys_give_the_fields_the_call_would_write() {
+        let current = json!({ "owner": "a", "status_code": 1 });
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &current,
+                &json!({ "StatusCode": 2 }),
+                &|_| true,
+            ),
+            None,
+            "declared params, in either spelling, need no update grant"
+        );
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &current,
+                &json!({ "Id": "x", "Status": "y" }),
+                &|_| true,
+            ),
+            None,
+            "server-derived names are never written"
+        );
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &current,
+                &json!({ "status_code": 3, "owner": "b", "Id": "x" }),
+                &|_| true,
+            ),
+            Some(json!({ "owner": "b", "status_code": 3 }))
+        );
+        let keeps_count = |key: &str| key != "count";
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &json!({ "owner": "a", "count": 10 }),
+                &json!({ "count": 11 }),
+                &keeps_count,
+            ),
+            None,
+            "a key the runtime keeps its own value for writes nothing"
+        );
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(false),
+                "Fetched",
+                &json!({ "owner": "a", "count": 10 }),
+                &json!({ "count": 11, "owner": "b" }),
+                &keeps_count,
+            ),
+            Some(json!({ "owner": "b", "count": 10 }))
+        );
+        assert_eq!(
+            fields_after_undeclared_write(
+                &table(true),
+                "Fetched",
+                &current,
+                &json!({ "owner": "b" }),
+                &|_| true,
+            ),
+            None,
+            "strict specs refuse the key themselves"
+        );
     }
 
     #[test]

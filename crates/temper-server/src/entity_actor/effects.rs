@@ -1032,6 +1032,18 @@ fn prune_transient_action_fields(
     fields.remove("ClientRequestId");
 }
 
+/// Whether an action param named `key` reaches the entity's fields. The actor
+/// skips transient and server-derived names, and keeps its own counter,
+/// boolean and list values over a param of the same name
+/// ([`sync_fields_with_metadata`]).
+pub(crate) fn action_param_writes_field(state: &EntityState, key: &str) -> bool {
+    !is_transient_action_field(&state.entity_type, key)
+        && !temper_spec::automaton::is_server_derived_field_name(key)
+        && !state.counters.contains_key(key)
+        && !state.booleans.contains_key(key)
+        && !state.lists.contains_key(key)
+}
+
 fn is_transient_action_field(entity_type: &str, field_name: &str) -> bool {
     entity_type == "Repository"
         && matches!(field_name, "PackBytes" | "RefUpdates" | "ClientRequestId")
