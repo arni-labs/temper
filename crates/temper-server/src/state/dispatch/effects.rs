@@ -532,9 +532,8 @@ impl crate::state::ServerState {
         }
     }
 
-    /// Dispatch a transition's deferred child effects: its spawn requests.
-    /// (Its scheduled actions are armed with its state timer, before
-    /// integrations.)
+    /// Dispatch a transition's deferred child effects: its spawn requests,
+    /// and arm its scheduled actions (their rows were written with its event).
     ///
     /// These belong to the ORIGINAL transition response and must run on every
     /// successful path — including when an inline integration produced a
@@ -546,6 +545,7 @@ impl crate::state::ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
+        self.arm_scheduled_actions(ctx, response);
         // Spawn requests
         if !response.spawn_requests.is_empty() {
             self.dispatch_spawn_requests(
@@ -606,6 +606,8 @@ impl crate::state::ServerState {
             // The journal is committed: hand the projection to the retrying
             // queue so reads catch up once the store recovers.
             self.apply_query_projection_update(ctx, &response).await;
+            // Its scheduled actions were committed with its event: arm them.
+            self.arm_scheduled_actions(ctx, &response);
             let mut response = response;
             response.success = false;
             response.error = Some(format!(
@@ -628,8 +630,6 @@ impl crate::state::ServerState {
         // projection update above: the timer row's write inline overflowed a
         // test thread's stack once dispatch carried request traces.
         Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
-        // Its scheduled actions too: their rows were written with its event.
-        self.arm_scheduled_actions(ctx, &response);
 
         // 4. Fire webhooks
         self.fire_webhooks(ctx, &response);
@@ -687,6 +687,8 @@ impl crate::state::ServerState {
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        // Committed with its event: its scheduled actions still fire.
+                        self.arm_scheduled_actions(ctx, &response);
                         return EntityResponse {
                             success: false,
                             refusal: None,
@@ -722,6 +724,8 @@ impl crate::state::ServerState {
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        // Committed with its event: its scheduled actions still fire.
+                        self.arm_scheduled_actions(ctx, &response);
                         return EntityResponse {
                             success: false,
                             refusal: None,
@@ -738,16 +742,16 @@ impl crate::state::ServerState {
                 if let Some(final_response) = inline_response {
                     // ARN-188: the inline integration produced a callback
                     // response (a separate action), but the ORIGINAL
-                    // transition's spawn requests still need to run — the
-                    // previous early return dropped them silently. Dispatch
-                    // them before returning the integration-updated response.
+                    // transition's spawn requests and scheduled actions still
+                    // need to run — the previous early return dropped them
+                    // silently. Dispatch them before returning the
+                    // integration-updated response.
                     //
                     // Platform hooks (5b) stay skipped on this path: the
                     // original custom effects already went to the inline
                     // integration, and routing them to the hooks too would
-                    // handle them twice. The projection, the state-timer arm
-                    // and the scheduled actions ran above, before the
-                    // integration.
+                    // handle them twice. The projection and the state-timer
+                    // arm ran above, before the integration.
                     self.dispatch_transition_deferred_effects(ctx, &response);
                     return final_response;
                 }

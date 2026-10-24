@@ -183,9 +183,16 @@ async fn settle() {
     }
 }
 
-async fn advance(by: Duration) {
-    tokio::time::advance(by).await;
+/// Let `by` pass. The paused clock jumps from one timer to the next, so each
+/// fires at its own instant.
+async fn pass(by: Duration) {
+    tokio::time::sleep(by).await;
     settle().await;
+}
+
+/// Let time pass until `at`, waking exactly then.
+async fn until(at: DateTime<Utc>) {
+    tokio::time::sleep((at - sim_now()).to_std().unwrap_or_default()).await;
 }
 
 async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Value) -> bool {
@@ -239,7 +246,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         let state = &first.state;
         for i in 0..2 + rng.next_bound(5) {
             let id = format!("job-{i}");
-            advance(Duration::from_secs(rng.next_bound(120) as u64)).await;
+            pass(Duration::from_secs(rng.next_bound(120) as u64)).await;
             state
                 .get_or_create_tenant_entity(&TenantId::new(TENANT), "Job", &id, json!({}))
                 .await
@@ -268,11 +275,24 @@ fn run_seed(seed: u64) -> Result<(), String> {
             arms.insert(id, arm);
         }
         settle().await;
-        // Stop at a seeded time, sometimes a few turns into a due fire, before
-        // its row is removed.
-        let ran = Duration::from_secs(rng.next_bound(3600) as u64);
-        tokio::time::advance(ran).await;
-        let turns = rng.next_bound(60);
+        // Stop at a seeded time; half the time at an armed action's due
+        // instant, a few turns into its fire: its event may be written and
+        // its row not yet removed.
+        let now = sim_now();
+        let dues: Vec<DateTime<Utc>> = arms
+            .values()
+            .filter_map(|arm| match arm {
+                Arm::Once(due) if *due > now => Some(*due),
+                _ => None,
+            })
+            .collect();
+        let stop_at = if !dues.is_empty() && rng.next_bound(2) == 0 {
+            dues[rng.next_bound(dues.len())]
+        } else {
+            now + chrono::Duration::seconds(rng.next_bound(3600) as i64)
+        };
+        until(stop_at).await;
+        let turns = rng.next_bound(200);
         for _ in 0..turns {
             tokio::task::yield_now().await;
         }
@@ -297,10 +317,8 @@ fn run_seed(seed: u64) -> Result<(), String> {
             .max()
             .unwrap_or(boot)
             .max(boot);
-        let until = last_due + chrono::Duration::seconds(3 * PERIOD);
-        while sim_now() < until {
-            advance(Duration::from_secs(10)).await;
-        }
+        until(last_due + chrono::Duration::seconds(3 * PERIOD)).await;
+        settle().await;
         let end = sim_now();
         let pending = world.events.list_scheduled_actions(TENANT).await.unwrap();
         for (id, arm) in &arms {

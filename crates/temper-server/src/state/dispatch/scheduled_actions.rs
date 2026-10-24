@@ -2,8 +2,10 @@
 //!
 //! The actor writes a scheduled action's row in the commit of the event that
 //! armed it (`EntityActor::arm_scheduled_actions`), so the rows are the
-//! scheduled actions still waiting. After the commit this process arms each
-//! one ([`ServerState::arm_scheduled_actions`]); at boot
+//! scheduled actions still waiting. After the commit, and after the
+//! transition's integrations, this process arms each one
+//! ([`ServerState::arm_scheduled_actions`]) on every path where the event was
+//! written; at boot
 //! [`ServerState::rearm_scheduled_actions`] arms every row again, through the
 //! boot gate, for the rest of its wait or at once if it fell due while the
 //! server was down. Replay never arms one: the rows are the source of truth.
