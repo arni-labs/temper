@@ -44,12 +44,8 @@ fn sandbox_command(port: u16, workdir: &Path) -> Command {
     command
 }
 
-/// Start the sandbox with the token and wait until it accepts connections.
-fn start_sandbox(workdir: &Path) -> (Process, SocketAddr) {
-    let port = free_port();
-    let mut command = sandbox_command(port, workdir);
-    command.env("TEMPER_SANDBOX_TOKEN", TOKEN);
-    let mut process = Process(command.spawn().expect("start python3 sandbox"));
+/// Wait until the sandbox accepts connections on `port`.
+fn wait_until_listening(process: &mut Process, port: u16) -> SocketAddr {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let deadline = Instant::now() + Duration::from_secs(30);
     while TcpStream::connect(address).is_err() {
@@ -59,6 +55,16 @@ fn start_sandbox(workdir: &Path) -> (Process, SocketAddr) {
         assert!(Instant::now() < deadline, "sandbox did not start listening");
         thread::sleep(Duration::from_millis(50));
     }
+    address
+}
+
+/// Start the sandbox with the token and wait until it accepts connections.
+fn start_sandbox(workdir: &Path) -> (Process, SocketAddr) {
+    let port = free_port();
+    let mut command = sandbox_command(port, workdir);
+    command.env("TEMPER_SANDBOX_TOKEN", TOKEN);
+    let mut process = Process(command.spawn().expect("start python3 sandbox"));
+    let address = wait_until_listening(&mut process, port);
     (process, address)
 }
 
@@ -187,5 +193,54 @@ fn the_sandbox_does_not_start_without_a_token() {
     assert!(
         TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err(),
         "something listens on the sandbox port"
+    );
+}
+
+#[test]
+fn commands_run_by_the_sandbox_do_not_see_its_token() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (_sandbox, address) = start_sandbox(dir.path());
+    let auth = format!("Bearer {TOKEN}");
+    let command = serde_json::json!({ "command": "printenv TEMPER_SANDBOX_TOKEN; env" });
+
+    let (status, body) = request(
+        address,
+        "POST",
+        "/v1/processes/run",
+        Some(&auth),
+        &command.to_string(),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains(TOKEN),
+        "a command's output shows the token: {body}"
+    );
+}
+
+#[test]
+fn the_sandbox_stops_when_its_starter_closes_the_pipe() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let port = free_port();
+    let mut command = sandbox_command(port, dir.path());
+    command
+        .arg("--exit-with-stdin")
+        .env("TEMPER_SANDBOX_TOKEN", TOKEN)
+        .stdin(Stdio::piped());
+    let mut process = Process(command.spawn().expect("start python3 sandbox"));
+    let address = wait_until_listening(&mut process, port);
+
+    drop(process.0.stdin.take());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process.0.try_wait().expect("read sandbox status").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the sandbox kept running after its pipe closed"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        TcpStream::connect(address).is_err(),
+        "the sandbox port is still taken"
     );
 }

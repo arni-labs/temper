@@ -13,8 +13,11 @@ For production, use E2B sandboxes via the sandbox_provisioner WASM module.
 Because it runs commands and touches files as the user who started it, it
 listens on 127.0.0.1 only, and every request must carry
 `Authorization: Bearer <token>`, where the token is read at start from the
-environment variable named by --token-env. `temper serve` generates a fresh
-token at each start and is the only holder.
+environment variable named by --token-env. The token is removed from the
+environment at start, so the commands it runs never see it. `temper serve`
+generates a fresh token at each start and is the only holder; it passes
+--exit-with-stdin and holds the other end of the pipe, so the sandbox stops
+when that server stops, however it stops.
 
 Usage:
   TEMPER_SANDBOX_TOKEN=<token> python3 local_sandbox.py [--port 9999] [--workdir /tmp/sandbox]
@@ -26,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -167,9 +171,15 @@ def main():
         help="Environment variable holding the token every request must carry "
              "(default: TEMPER_SANDBOX_TOKEN)"
     )
+    parser.add_argument(
+        "--exit-with-stdin", action="store_true",
+        help="Exit when standard input closes, so the sandbox stops with the "
+             "process that started it and holds the pipe"
+    )
     args = parser.parse_args()
 
-    token = os.environ.get(args.token_env, "")
+    # Taken out of the environment so commands run here cannot read it.
+    token = os.environ.pop(args.token_env, "")
     if not token:
         print(f"Set {args.token_env} to the token requests must carry.", file=sys.stderr)
         sys.exit(2)
@@ -188,11 +198,20 @@ def main():
     print(f"  PUT  http://localhost:{args.port}/v1/fs/file?path=...", file=sys.stderr)
     print(f"  POST http://localhost:{args.port}/v1/processes/run", file=sys.stderr)
 
+    if args.exit_with_stdin:
+        threading.Thread(target=_exit_when_stdin_closes, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.", file=sys.stderr)
         server.server_close()
+
+
+def _exit_when_stdin_closes():
+    # Returns at end of input: the starting process has exited.
+    sys.stdin.buffer.read()
+    os._exit(0)
 
 
 if __name__ == "__main__":
