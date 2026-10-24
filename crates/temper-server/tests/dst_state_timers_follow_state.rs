@@ -1,11 +1,14 @@
 //! DST: a record's armed timer follows its current state.
 //!
-//! Workload, per seed: records in two tenants enter a timed state; some are
-//! poked, deleted, passivated and rehydrated; tenant `alpha` hot-swaps to a
-//! spec under which replay lands its records in another timed state (`Start`
-//! now goes to `Review`, not `Waiting`); the server restarts, so records that
-//! were never snapshotted replay into the new state while their timer rows
-//! still name the old one.
+//! Workload, per seed: records in three tenants enter `Waiting`, timed in
+//! `alpha` and `beta` and untimed in `gamma`; some are poked, deleted,
+//! passivated and rehydrated. An install then changes two specs: `alpha`'s,
+//! under which replay lands its records in another timed state (`Start` now
+//! goes to `Review`, not `Waiting`), and `gamma`'s, which gains the timeouts.
+//! In some seeds the process stops before the install's walk reaches `gamma`.
+//! The server restarts, so records that were never snapshotted replay into
+//! the new state while their timer rows still name the old one, and `gamma`'s
+//! records may have no row at all.
 //!
 //! Invariants:
 //! - after a record rehydrates, it has exactly one armed timer row, for its
@@ -23,6 +26,8 @@
 //! both shared across restarts. Each row write lands after a seeded delay, so
 //! the writes of overlapping arms and cancellations land in any order.
 
+#[path = "dst_state_timers_follow_state/invariants.rs"]
+mod invariants;
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
@@ -30,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use invariants::{check_all_done, check_rows_follow_state};
 use serde_json::json;
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_sim_context};
@@ -96,6 +102,16 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 <EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/></EntityContainer>
 </Schema></edmx:DataServices></edmx:Edmx>"#;
 
+/// `Job` with no timeout: records wait in `Waiting` and `Review` for good.
+fn job_untimed() -> String {
+    let untimed = JOB_V1[..JOB_V1.find("[[state_timeout]]").unwrap()].to_string();
+    untimed.replacen(
+        "allow_indefinite_states = [\"Idle\", \"Done\"]",
+        "allow_indefinite_states = [\"Idle\", \"Waiting\", \"Review\", \"Done\"]",
+        1,
+    )
+}
+
 /// The second spec: replay of a stored `Start` now lands in `Review`.
 fn job_v2() -> String {
     JOB_V1.replacen(
@@ -103,6 +119,16 @@ fn job_v2() -> String {
         "from = [\"Idle\"]\nto = \"Review\"",
         1,
     )
+}
+
+/// The tenants of the workload: `gamma` starts with [`job_untimed`].
+const TENANTS: [&str; 3] = ["alpha", "beta", "gamma"];
+
+/// Install `spec` as `tenant`'s `Job`, replacing the one it had.
+fn install(state: &ServerState, tenant: &str, spec: &str) {
+    let mut registry = state.registry.write().unwrap();
+    let csdl = parse_csdl(CSDL).unwrap();
+    registry.register_tenant(tenant, csdl, CSDL.to_string(), &[("Job", spec)]);
 }
 
 /// The declared timer of each state: the action it fires.
@@ -129,8 +155,10 @@ struct Process {
 
 impl Process {
     /// Boot the way `temper serve` does: specs, storage, then the re-arm of
-    /// the timers the last process left waiting.
-    fn start(world: &World, alpha_spec: &str, name: &str) -> Self {
+    /// the timers the last process left waiting, and the walk of every timed
+    /// type's records that follows it (awaited here, in the background in
+    /// `temper serve`).
+    fn start(world: &World, alpha_spec: &str, gamma_spec: &str, name: &str) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -139,7 +167,11 @@ impl Process {
         let state = runtime.block_on(async {
             world.clock.begin();
             let mut registry = SpecRegistry::new();
-            for (tenant, spec) in [("alpha", alpha_spec), ("beta", JOB_V1)] {
+            for (tenant, spec) in [
+                ("alpha", alpha_spec),
+                ("beta", JOB_V1),
+                ("gamma", gamma_spec),
+            ] {
                 let csdl = parse_csdl(CSDL).unwrap();
                 registry.register_tenant(tenant, csdl, CSDL.to_string(), &[("Job", spec)]);
             }
@@ -250,96 +282,6 @@ async fn passivate_some(
     run.note(format!("passivated all but {kept:?}"));
 }
 
-/// Invariant: after `jobs` rehydrate, each has exactly the timer row its
-/// current state declares.
-async fn check_rows_follow_state(
-    state: &ServerState,
-    world: &World,
-    jobs: &[Job],
-    run: &Run,
-    when: &str,
-) -> Result<(), String> {
-    for job in jobs.iter().filter(|job| !run.is_deleted(job)) {
-        status(state, job).await;
-    }
-    settle().await;
-    for job in jobs {
-        let row = world.rows.row(job.tenant.as_str(), &job.id);
-        let current = if run.is_deleted(job) {
-            "<deleted>".to_string()
-        } else {
-            status(state, job).await
-        };
-        let wanted = timer_action(&current).map(|_| current.as_str());
-        if row.as_ref().map(|row| row.state.as_str()) != wanted {
-            return Err(run.fail(
-                "timer rows follow the current state",
-                format!(
-                    "{when}: {}/{} is {current} but its timer row is {:?}",
-                    job.tenant,
-                    job.id,
-                    row.map(|row| row.state)
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Invariants at the end: every record reached `Done` on its timers, every
-/// timer fired once and in its own state, and no row is left.
-async fn check_all_done(
-    state: &ServerState,
-    world: &World,
-    jobs: &[Job],
-    run: &Run,
-) -> Result<(), String> {
-    for job in jobs.iter().filter(|job| !run.is_deleted(job)) {
-        let response = state
-            .get_tenant_entity_state(&job.tenant, "Job", &job.id)
-            .await
-            .map_err(|error| run.fail("records stay readable", error))?;
-        let record = &response.state;
-        let fires: Vec<_> = record
-            .events
-            .iter()
-            .filter(|event| event.action == "Expire" || event.action == "Approve")
-            .collect();
-        for event in &fires {
-            if timer_action(&event.from_status) != Some(event.action.as_str()) {
-                return Err(run.fail(
-                    "timers fire only in their state",
-                    format!(
-                        "{}/{}: {} fired in {}",
-                        job.tenant, job.id, event.action, event.from_status
-                    ),
-                ));
-            }
-        }
-        if record.status != "Done" || fires.len() != 1 {
-            return Err(run.fail(
-                "every record leaves its timed state on its timer",
-                format!(
-                    "{}/{} is {} after {} timer fires",
-                    job.tenant,
-                    job.id,
-                    record.status,
-                    fires.len()
-                ),
-            ));
-        }
-    }
-    for job in jobs {
-        if let Some(row) = world.rows.row(job.tenant.as_str(), &job.id) {
-            return Err(run.fail(
-                "no timer outlives its state",
-                format!("{}/{} keeps a row for {}", job.tenant, job.id, row.state),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn run_seed(seed: u64) -> Result<(), String> {
     let clock = Arc::new(ProcessClock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
@@ -355,7 +297,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         deleted: BTreeSet::new(),
     };
     let mut jobs = Vec::new();
-    for tenant in ["alpha", "beta"] {
+    for tenant in TENANTS {
         for i in 0..3 + rng.next_bound(3) {
             jobs.push(Job {
                 tenant: TenantId::new(tenant),
@@ -364,8 +306,9 @@ fn run_seed(seed: u64) -> Result<(), String> {
         }
     }
     let v2 = job_v2();
+    let untimed = job_untimed();
 
-    let first = Process::start(&world, JOB_V1, &format!("follow-{seed}-a"));
+    let first = Process::start(&world, JOB_V1, &untimed, &format!("follow-{seed}-a"));
     first.runtime.block_on(async {
         let state = &first.state;
         for job in &jobs {
@@ -385,7 +328,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 run.note(format!("poked {}/{}", job.tenant, job.id));
             }
         }
-        for tenant in ["alpha", "beta"] {
+        for tenant in TENANTS {
             if rng.chance(0.3) {
                 let of_tenant: Vec<_> = jobs
                     .iter()
@@ -405,14 +348,26 @@ fn run_seed(seed: u64) -> Result<(), String> {
             passivate_some(state, &jobs, &mut rng, &mut run).await;
         }
 
-        {
-            let mut registry = state.registry.write().unwrap();
-            let csdl = parse_csdl(CSDL).unwrap();
-            registry.register_tenant("alpha", csdl, CSDL.to_string(), &[("Job", v2.as_str())]);
+        install(state, "alpha", &v2);
+        let gamma_followed = rng.chance(0.5);
+        if gamma_followed {
+            install(state, "gamma", JOB_V1);
+            state.follow_spec_changes().await;
+        } else {
+            state.follow_spec_changes().await;
+            // The process stops before the install's walk reaches gamma.
+            install(state, "gamma", JOB_V1);
+            // main keeps no list of changed types.
         }
-        state.follow_spec_changes().await;
         settle().await;
-        run.note("hot-swapped alpha: Start now enters Review".to_string());
+        run.note(format!(
+            "installed: alpha's Start now enters Review, gamma gains timeouts{}",
+            if gamma_followed {
+                ""
+            } else {
+                " (its walk never ran)"
+            }
+        ));
 
         let live: Vec<Job> = jobs
             .iter()
@@ -435,14 +390,19 @@ fn run_seed(seed: u64) -> Result<(), String> {
         if rng.chance(0.7) {
             passivate_some(state, &jobs, &mut rng, &mut run).await;
         }
-        check_rows_follow_state(state, &world, &jobs, &run, "after the hot swap").await
+        let followed: Vec<Job> = jobs
+            .iter()
+            .filter(|job| gamma_followed || job.tenant.as_str() != "gamma")
+            .cloned()
+            .collect();
+        check_rows_follow_state(state, &world, &followed, &run, "after the install").await
     })?;
 
     let downtime = Duration::from_secs(rng.next_bound(600) as u64);
     run.note(format!("restart after {}s down", downtime.as_secs()));
     first.kill(&world, downtime);
 
-    let second = Process::start(&world, &v2, &format!("follow-{seed}-b"));
+    let second = Process::start(&world, &v2, JOB_V1, &format!("follow-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
         let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
@@ -453,7 +413,12 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 .map(|job| format!("{}/{}", job.tenant, job.id))
                 .collect::<Vec<_>>()
         ));
-        check_rows_follow_state(state, &world, &looked, &run, "after the restart").await?;
+        for job in &looked {
+            status(state, job).await;
+        }
+        settle().await;
+        // The boot walk has run: every record follows its state, read or not.
+        check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
         // Nobody touches the records: their timers alone must finish them.
         for _ in 0..360 {
             advance(Duration::from_secs(30)).await;
