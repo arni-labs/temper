@@ -28,6 +28,26 @@ impl ServerState {
     }
 }
 
+/// The 503 for a request acting for `tenant`, if startup left it unavailable.
+///
+/// The platform's credential check answers with it before it looks a
+/// credential up: an unavailable tenant has no credential records loaded, so
+/// a lookup would report a valid credential as invalid.
+pub fn unavailable_tenant_response(state: &ServerState, tenant: &TenantId) -> Option<Response> {
+    state.tenant_unavailable_reason(tenant)?;
+    Some(
+        odata_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TenantUnavailable",
+            &format!(
+                "Tenant '{tenant}' is unavailable: its stored specs did not load at startup. \
+                 The server log names the row; fix it and restart."
+            ),
+        )
+        .into_response(),
+    )
+}
+
 /// Refuse `/tdata` requests for a tenant marked unavailable at startup.
 ///
 /// The tenant is the one each handler would act for: the credential's tenant
@@ -41,17 +61,8 @@ pub(crate) async fn refuse_unavailable_tenant(
         Some(context) => Some(context.tenant().clone()),
         None => extract_tenant(request.headers(), &state).ok(),
     };
-    let unavailable = tenant.filter(|tenant| state.tenant_unavailable_reason(tenant).is_some());
-    if let Some(tenant) = unavailable {
-        return odata_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "TenantUnavailable",
-            &format!(
-                "Tenant '{tenant}' is unavailable: its stored specs did not load at startup. \
-                 The server log names the row; fix it and restart."
-            ),
-        )
-        .into_response();
+    if let Some(response) = tenant.and_then(|tenant| unavailable_tenant_response(&state, &tenant)) {
+        return response;
     }
     next.run(request).await
 }
