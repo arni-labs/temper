@@ -21,7 +21,8 @@ const APPEND_BATCH_INSERT_CHUNK_ROWS: usize = 400;
 
 /// Every live `(entity_type, entity_id)` of a tenant. The `NOT EXISTS` probe is
 /// served by `idx_events_deleted`; see `schema::CREATE_EVENTS_DELETED_INDEX`.
-pub(super) const LIST_ENTITY_IDS_SQL: &str = "\
+pub(super) const LIST_ENTITY_IDS_SQL: &str = concat!(
+    "\
 SELECT DISTINCT e.entity_type, e.entity_id
     FROM events e
     WHERE e.tenant = ?1
@@ -31,11 +32,16 @@ SELECT DISTINCT e.entity_type, e.entity_id
         WHERE d.tenant = e.tenant
           AND d.entity_type = e.entity_type
           AND d.entity_id = e.entity_id
-          AND d.event_type = 'Deleted'
-      )";
+          ",
+    "AND ",
+    tombstone_sql!(),
+    "
+      )"
+);
 
 /// At most `?3` live ids of one entity type, in id order.
-pub(super) const LIST_ENTITY_IDS_OF_TYPE_LIMITED_SQL: &str = "\
+pub(super) const LIST_ENTITY_IDS_OF_TYPE_LIMITED_SQL: &str = concat!(
+    "\
 SELECT DISTINCT e.entity_type, e.entity_id
     FROM events e
     WHERE e.tenant = ?1
@@ -46,13 +52,18 @@ SELECT DISTINCT e.entity_type, e.entity_id
         WHERE d.tenant = e.tenant
           AND d.entity_type = e.entity_type
           AND d.entity_id = e.entity_id
-          AND d.event_type = 'Deleted'
+          ",
+    "AND ",
+    tombstone_sql!(),
+    "
       )
     ORDER BY e.entity_type, e.entity_id
-    LIMIT ?3";
+    LIMIT ?3"
+);
 
 /// At most `?2` live `(entity_type, entity_id)` pairs of a tenant, in order.
-pub(super) const LIST_ENTITY_IDS_LIMITED_SQL: &str = "\
+pub(super) const LIST_ENTITY_IDS_LIMITED_SQL: &str = concat!(
+    "\
 SELECT DISTINCT e.entity_type, e.entity_id
     FROM events e
     WHERE e.tenant = ?1
@@ -62,10 +73,14 @@ SELECT DISTINCT e.entity_type, e.entity_id
         WHERE d.tenant = e.tenant
           AND d.entity_type = e.entity_type
           AND d.entity_id = e.entity_id
-          AND d.event_type = 'Deleted'
+          ",
+    "AND ",
+    tombstone_sql!(),
+    "
       )
     ORDER BY e.entity_type, e.entity_id
-    LIMIT ?2";
+    LIMIT ?2"
+);
 
 struct PreparedEventInsert {
     tenant: String,
