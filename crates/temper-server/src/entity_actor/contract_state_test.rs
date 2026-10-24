@@ -41,6 +41,7 @@ fn overflow_action(name: &str, params: serde_json::Value) -> EntityMsg {
         related: BTreeMap::new(),
         idempotency_key: None,
         expected_authorization_precondition: None,
+        origin: None,
     }
 }
 

@@ -384,6 +384,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 timestamp: sim_now(),
                 params: params.clone(),
                 idempotency_key: None,
+                origin: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
             };
 

@@ -44,6 +44,7 @@ async fn action(actor: &ActorRef<EntityMsg>, name: &str) -> EntityResponse {
                 related: BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             ASK_BUDGET,
         )

@@ -197,6 +197,7 @@ impl crate::state::ServerState {
                     &sub_agent_ctx,
                     false,
                     None,
+                    None,
                 )
                 .await?;
 

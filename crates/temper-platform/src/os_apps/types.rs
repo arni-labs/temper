@@ -35,6 +35,10 @@ pub struct InstallResult {
     /// Seed data instances created.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub seed_instances: Vec<String>,
+    /// State timers whose move the tenant's Cedar forbids to people who arm
+    /// them. The install goes ahead; the author decides.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<super::timer_policy::StateTimerPolicyWarning>,
 }
 
 /// Component phases an OS-app install/reconcile should execute.

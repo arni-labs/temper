@@ -1254,6 +1254,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: fields,
             idempotency_key: None,
+            origin: None,
             kind: temper_runtime::persistence::EventKind::Transition,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
@@ -1440,6 +1441,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: initial_fields,
             idempotency_key: None,
+            origin: None,
             kind: temper_runtime::persistence::EventKind::Transition,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)

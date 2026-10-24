@@ -19,10 +19,14 @@
 //! old deadline cannot fire while a committed reset is being projected.
 //!
 //! Durability (ADR-0056): every armed timer keeps a durable row with its
-//! clock start, parameters and the identity it fires as, and removes it when
+//! clock start, parameters and the move that armed it, and removes it when
 //! it ends. At boot `rearm_state_timers` (`state_timer_rows.rs`) arms each
 //! waiting row again: for the rest of its budget, or at once if it fell due
-//! while the server was down. A timer fires once and as whoever armed it.
+//! while the server was down. A timer fires once, with the authority of
+//! whoever armed it, and its move is recorded as the state timer's
+//! ([`crate::entity_actor::STATE_TIMER_ACTOR`]) with the arming move as its
+//! cause: the spec's follow-on is the app's own rule, and Cedar judged the move
+//! into the timed state.
 //!
 //! The arm logic also detects the **hydration case**: the entity is in a
 //! state with a declared timeout but has no live in-memory timer (seq == 0 in
@@ -32,11 +36,11 @@
 //! `reset_on` event after it) from the entity's status clock, which snapshots
 //! keep, or from its retained events when the state predates the clock. It
 //! fires `on_timeout` at once if that is a full budget, or arms a timer for the
-//! rest. That timer fires as the dispatch that found it. Before the status
-//! clock, a state restored from a snapshot (which leaves events out) or with
-//! the entry pushed out of the retained events armed a full budget on every
-//! hydration, so a daily timer on a server restarted more often than daily
-//! never fired.
+//! rest. That timer counts the dispatch that found it as its arming move.
+//! Before the status clock, a state restored from a snapshot (which leaves
+//! events out) or with the entry pushed out of the retained events armed a
+//! full budget on every hydration, so a daily timer on a server restarted more
+//! often than daily never fired.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -49,9 +53,12 @@ use tracing::Instrument;
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
-use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
+use crate::entity_actor::{
+    EntityEvent, EntityResponse, EntityState, MoveCause, MoveOrigin, STATE_TIMER_ACTOR,
+};
 use crate::request_context::AgentContext;
 
+use super::DispatchCommand;
 use super::effects::PostDispatchContext;
 
 /// Walk the event history backward to find the timestamp of the most recent
@@ -395,7 +402,10 @@ impl crate::state::ServerState {
                 ctx.entity_id,
                 st,
                 &response.state,
-                ctx.agent_ctx,
+                ArmingMove {
+                    by: ctx.agent_ctx,
+                    action: ctx.action,
+                },
                 started_at,
             );
             let delay = remaining_budget(started_at, st.after_seconds, now);
@@ -406,8 +416,9 @@ impl crate::state::ServerState {
     /// Arm the timers of a record created straight into a timed state.
     ///
     /// Creation is not a dispatch, so nothing else arms them until the
-    /// record's first action. Like any arm, the timer fires as whoever armed
-    /// it: here, whoever created the record. A record that already has a live
+    /// record's first action. Like any arm, the timer fires with the authority
+    /// of whoever armed it: here, whoever created the record, and its move's
+    /// cause is the creation. A record that already has a live
     /// timer keeps it; one that already existed counts from when it entered
     /// its state, as the hydration re-arm does.
     pub(crate) async fn arm_state_timeouts_on_creation(
@@ -439,13 +450,21 @@ impl crate::state::ServerState {
             let Some(started_at) = rearm_clock_start(st, &created.state, now) else {
                 continue;
             };
+            let created_with = created
+                .state
+                .events
+                .back()
+                .map(|event| event.action.as_str());
             let timer = declared_timer(
                 tenant,
                 entity_type,
                 entity_id,
                 st,
                 &created.state,
-                created_by,
+                ArmingMove {
+                    by: created_by,
+                    action: created_with.unwrap_or_default(),
+                },
                 started_at,
             );
             let delay = remaining_budget(started_at, st.after_seconds, now);
@@ -526,17 +545,17 @@ impl crate::state::ServerState {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
-            .agent_ctx
+            .armed_by
             .workflow_root_entity_type
             .clone()
             .unwrap_or_else(|| timer.entity_type.clone());
         let workflow_root_entity_id = timer
-            .agent_ctx
+            .armed_by
             .workflow_root_entity_id
             .clone()
             .unwrap_or_else(|| timer.entity_id.clone());
         let workflow_run_id = timer
-            .agent_ctx
+            .armed_by
             .workflow_run_id
             .clone()
             .unwrap_or_else(|| format!("{}:{}", timer.entity_type, timer.entity_id));
@@ -601,13 +620,18 @@ impl crate::state::ServerState {
                         &timer.action,
                     );
                     let _ = state
-                        .dispatch_tenant_action(
-                            &timer.tenant,
-                            &timer.entity_type,
-                            &timer.entity_id,
-                            &timer.action,
-                            timer.params.clone(),
-                            &timer.agent_ctx,
+                        .dispatch_runtime_move(
+                            DispatchCommand {
+                                tenant: &timer.tenant,
+                                entity_type: &timer.entity_type,
+                                entity_id: &timer.entity_id,
+                                action: &timer.action,
+                                params: timer.params.clone(),
+                                agent_ctx: &timer.armed_by,
+                                await_integration: false,
+                                await_reactions: true,
+                            },
+                            timer.origin(),
                         )
                         .await;
                 }
@@ -620,8 +644,8 @@ impl crate::state::ServerState {
     }
 }
 
-/// One armed timer: what fires, when its state's clock started, and who it
-/// fires as.
+/// One armed timer: what fires, when its state's clock started, and the move
+/// that armed it.
 pub(super) struct ArmedTimer {
     pub(super) tenant: TenantId,
     pub(super) entity_type: String,
@@ -631,8 +655,12 @@ pub(super) struct ArmedTimer {
     /// The `on_timeout` action and its parameters, read when armed.
     pub(super) action: String,
     pub(super) params: serde_json::Value,
-    /// The identity the action is dispatched as.
-    pub(super) agent_ctx: AgentContext,
+    /// The dispatch that armed the timer, as a new background action. Its
+    /// authority is the authority the timer's move runs with.
+    pub(super) armed_by: AgentContext,
+    /// The action of the move that armed the timer; None for a row kept
+    /// before arming actions were.
+    pub(super) cause_action: Option<String>,
     /// Names this arming's durable row.
     pub(super) arm_id: String,
     /// The entity's journal sequence when the timer was armed.
@@ -640,10 +668,30 @@ pub(super) struct ArmedTimer {
     pub(super) started_at: DateTime<Utc>,
 }
 
-/// The identity a timer fires as: the dispatch that armed it, as a new
-/// background action. It does not keep the arming request's idempotency key:
-/// the entity has already recorded that key, so the fire would be answered as
-/// a duplicate and never run.
+impl ArmedTimer {
+    /// Who the timer's move is recorded as: the state timer, with the arming
+    /// move as its cause, because the spec's follow-on is the app's rule
+    /// rather than a move the arming person asked for. The move itself runs
+    /// with `armed_by`, the arming dispatch's identity and authority, so bound
+    /// parameters, Cedar checks on the move's integrations and its adapters
+    /// see what they saw when the move was armed. The origin is handed to the
+    /// dispatch beside that context, never inside it, so the follow-ons the
+    /// move starts do not inherit it.
+    pub(super) fn origin(&self) -> MoveOrigin {
+        MoveOrigin {
+            actor: STATE_TIMER_ACTOR.to_string(),
+            caused_by: MoveCause {
+                agent_id: self.armed_by.agent_id.clone(),
+                action: self.cause_action.clone(),
+                sequence_nr: self.sequence_nr,
+            },
+        }
+    }
+}
+
+/// The arming dispatch as a new background action. It does not keep the
+/// arming request's idempotency key: the entity has already recorded that key,
+/// so the fire would be answered as a duplicate and never run.
 fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
@@ -669,16 +717,21 @@ fn rearm_clock_start(
     (!fired_since || st.reset_on.contains(&st.on_timeout)).then_some(started_at)
 }
 
-/// The timer `st` arms on an entity, firing as `armed_by`. ADR-0181: `args`
-/// are read when the timer is armed, against the entity as it entered the
-/// state.
+/// The move that arms a timer: who made it, and its action.
+struct ArmingMove<'a> {
+    by: &'a AgentContext,
+    action: &'a str,
+}
+
+/// The timer `st` arms on an entity, armed by `arming`. ADR-0181: `args` are
+/// read when the timer is armed, against the entity as it entered the state.
 fn declared_timer(
     tenant: &TenantId,
     entity_type: &str,
     entity_id: &str,
     st: &temper_spec::automaton::StateTimeout,
     state: &EntityState,
-    armed_by: &AgentContext,
+    arming: ArmingMove<'_>,
     started_at: DateTime<Utc>,
 ) -> ArmedTimer {
     let (params, missing) =
@@ -698,7 +751,8 @@ fn declared_timer(
         state: st.state.clone(),
         action: st.on_timeout.clone(),
         params: serde_json::Value::Object(params),
-        agent_ctx: timer_agent(armed_by),
+        armed_by: timer_agent(arming.by),
+        cause_action: Some(arming.action.to_string()),
         arm_id: sim_uuid().to_string(),
         sequence_nr: state.sequence_nr,
         started_at,
@@ -808,6 +862,7 @@ mod tests {
             timestamp: ts,
             params: serde_json::json!({}),
             idempotency_key: None,
+            origin: None,
             kind: temper_runtime::persistence::EventKind::Transition,
         }
     }
@@ -1500,6 +1555,7 @@ queue_timeout_seconds = 30
             entity_id: "t-1",
             action: "__Created",
             agent_ctx: &agent_ctx,
+            origin: None,
             dispatch_idempotency_key: None,
             action_params: &serde_json::json!({}),
             await_integration: false,

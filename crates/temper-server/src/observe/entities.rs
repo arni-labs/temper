@@ -71,8 +71,15 @@ pub(crate) async fn handle_list_entities(
 /// GET /observe/entities/{entity_type}/{entity_id}/history -- entity event history.
 ///
 /// Returns the full event log for an entity. Checks two sources in order:
-/// 1. In-memory actor state (if the actor is currently loaded).
-/// 2. Postgres event store (if configured, for inactive entities).
+/// 1. In-memory actor state (if the actor is currently loaded): its recent
+///    events, read from the event journal when there is one.
+/// 2. The event journal (if configured, for inactive entities).
+///
+/// Each event's `sequence` is its journal sequence, the number a state
+/// timer's `caused_by.sequence_nr` names. A server without a journal keeps
+/// no sequence and numbers its in-memory events from 1. A loaded record's
+/// history stops at the sequence of the state it is shown with, and a
+/// journal that cannot be read answers 503.
 pub(crate) async fn handle_get_entity_history(
     State(state): State<ServerState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
@@ -97,7 +104,23 @@ pub(crate) async fn handle_get_entity_history(
             .ask::<EntityResponse>(EntityMsg::GetState, state.action_dispatch_timeout)
             .await
     {
-        let mut json = format_history_response(&entity_type, &entity_id, &response.state.events);
+        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
+        // The journal sequence just before the recent events kept in memory.
+        let before_recent = response
+            .state
+            .sequence_nr
+            .saturating_sub(response.state.events.len() as u64);
+        // Through the state's own sequence: a move committed after `GetState`
+        // answered belongs to a later state than the one this response shows.
+        let through = Some(response.state.sequence_nr);
+        let events = match journal_history(&state, &persistence_id, before_recent, through).await? {
+            Some(events) => events,
+            None => (1..)
+                .zip(&response.state.events)
+                .map(|(sequence, event)| history_event(sequence, event))
+                .collect(),
+        };
+        let mut json = format_history_response(&entity_type, &entity_id, events);
         // Include entity properties from in-memory state.
         if let Some(obj) = json.as_object_mut() {
             let mut fields = response.state.fields.clone();
@@ -121,31 +144,13 @@ pub(crate) async fn handle_get_entity_history(
     }
 
     // Path 2: Query event store directly (for inactive entities).
-    if let Some((store, _backend)) = state.event_journal() {
-        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-        if let Ok(envelopes) = store.read_events(&persistence_id, 0).await {
-            let events: Vec<serde_json::Value> = envelopes
-                .iter()
-                .filter_map(|env| serde_json::from_value::<EntityEvent>(env.payload.clone()).ok())
-                .enumerate()
-                .map(|(i, event)| {
-                    serde_json::json!({
-                        "sequence": i + 1,
-                        "action": event.action,
-                        "from_state": event.from_status,
-                        "to_state": event.to_status,
-                        "timestamp": event.timestamp,
-                        "params": event.params,
-                    })
-                })
-                .collect();
-
-            return Ok(Json(serde_json::json!({
-                "entity_type": entity_type,
-                "entity_id": entity_id,
-                "events": events,
-            })));
-        }
+    let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
+    if let Some(events) = journal_history(&state, &persistence_id, 0, None).await? {
+        return Ok(Json(format_history_response(
+            &entity_type,
+            &entity_id,
+            events,
+        )));
     }
 
     // No data sources available.
@@ -369,32 +374,74 @@ pub(crate) async fn handle_entity_event_stream(
     Ok(Sse::new(replay_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
-/// Format entity events into the history API response shape.
+/// The history API response shape.
 fn format_history_response(
     entity_type: &str,
     entity_id: &str,
-    events: &std::collections::VecDeque<EntityEvent>,
+    events: Vec<serde_json::Value>,
 ) -> serde_json::Value {
-    let formatted: Vec<serde_json::Value> = events
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            serde_json::json!({
-                "sequence": i + 1,
-                "action": e.action,
-                "from_state": e.from_status,
-                "to_state": e.to_status,
-                "timestamp": e.timestamp,
-                "params": e.params,
-            })
-        })
-        .collect();
-
     serde_json::json!({
         "entity_type": entity_type,
         "entity_id": entity_id,
-        "events": formatted,
+        "events": events,
     })
+}
+
+/// The journal's events after sequence `after` and up to `through`, each
+/// numbered by its journal sequence; `Ok(None)` when the server keeps no
+/// journal.
+///
+/// A journal that cannot be read is 503, never a history numbered some other
+/// way: a state timer's `caused_by.sequence_nr` is a journal sequence, and
+/// numbers made up here would point it at the wrong move.
+async fn journal_history(
+    state: &ServerState,
+    persistence_id: &str,
+    after: u64,
+    through: Option<u64>,
+) -> Result<Option<Vec<serde_json::Value>>, StatusCode> {
+    let Some((store, _backend)) = state.event_journal() else {
+        return Ok(None);
+    };
+    let envelopes = store
+        .read_events(persistence_id, after)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                persistence_id,
+                %error,
+                "entity history could not read the event journal"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+    Ok(Some(
+        envelopes
+            .iter()
+            .filter(|env| through.is_none_or(|through| env.sequence_nr <= through))
+            .filter_map(|env| {
+                let event = serde_json::from_value::<EntityEvent>(env.payload.clone()).ok()?;
+                Some(history_event(env.sequence_nr, &event))
+            })
+            .collect(),
+    ))
+}
+
+/// One event of the history API. `actor` and `caused_by` are present when the
+/// runtime made the move itself (a state timer); a caller's move has neither.
+fn history_event(sequence: u64, event: &EntityEvent) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "sequence": sequence,
+        "action": event.action,
+        "from_state": event.from_status,
+        "to_state": event.to_status,
+        "timestamp": event.timestamp,
+        "params": event.params,
+    });
+    if let Some(origin) = &event.origin {
+        json["actor"] = serde_json::json!(origin.actor);
+        json["caused_by"] = serde_json::json!(origin.caused_by);
+    }
+    json
 }
 
 // ---------------------------------------------------------------------------

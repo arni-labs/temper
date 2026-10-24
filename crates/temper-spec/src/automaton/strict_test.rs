@@ -469,3 +469,31 @@ params=[{name="owner",type="string",source="authenticated_subject"}]
     let json = serde_json::to_value(&auto.actions[0].params[0]).unwrap();
     assert_eq!(json["source"], "authenticated_subject");
 }
+
+#[test]
+fn dispatch_time_parameter_source_is_preserved_and_unknown_sources_fail() {
+    let source = |name: &str| {
+        format!(
+            r#"
+[automaton]
+name="Stamped"
+states=["Requested","Active"]
+initial="Requested"
+strict_action_params=true
+[[state]]
+name="moved_at"
+type="string"
+initial=""
+[[action]]
+name="Create"
+from=["Requested"]
+to="Active"
+params=[{{name="moved_at",type="string",source="{name}"}}]
+"#
+        )
+    };
+    let auto = super::parse_automaton(&source("dispatched_at")).expect("dispatch time must parse");
+    let json = serde_json::to_value(&auto.actions[0].params[0]).unwrap();
+    assert_eq!(json["source"], "dispatched_at");
+    assert!(super::parse_automaton(&source("caller_clock")).is_err());
+}

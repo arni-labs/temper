@@ -296,6 +296,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 related: BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -393,6 +394,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 related: BTreeMap::new(),
                 idempotency_key: Some("cancel-request".to_string()),
                 expected_authorization_precondition: Some(stale_precondition),
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -411,6 +413,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 related: BTreeMap::new(),
                 idempotency_key: Some("cancel-request".to_string()),
                 expected_authorization_precondition: Some(fresh_precondition.clone()),
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -427,6 +430,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 related: BTreeMap::new(),
                 idempotency_key: Some("cancel-request".to_string()),
                 expected_authorization_precondition: Some(fresh_precondition),
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -490,6 +494,7 @@ fn snapshot_keeps_the_status_clock() {
         timestamp: at(s),
         params: serde_json::json!({}),
         idempotency_key: None,
+        origin: None,
         kind: temper_runtime::persistence::EventKind::Transition,
     };
     state.push_event_bounded(event("Submit", "Draft", "Submitted", 10));
@@ -535,6 +540,7 @@ async fn dst_add_item_then_submit() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -553,6 +559,7 @@ async fn dst_add_item_then_submit() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -587,6 +594,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: Some("same-pack".into()),
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -605,6 +613,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: Some("same-pack".into()),
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -641,6 +650,7 @@ async fn dst_cannot_submit_without_items() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -685,6 +695,7 @@ async fn dst_full_order_lifecycle() {
                     related: std::collections::BTreeMap::new(),
                     idempotency_key: None,
                     expected_authorization_precondition: None,
+                    origin: None,
                 },
                 Duration::from_secs(1),
             )
@@ -721,6 +732,7 @@ async fn dst_cancel_from_draft() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -753,6 +765,7 @@ async fn dst_cannot_cancel_shipped_order() {
                     related: std::collections::BTreeMap::new(),
                     idempotency_key: None,
                     expected_authorization_precondition: None,
+                    origin: None,
                 },
                 Duration::from_secs(1),
             )
@@ -769,6 +782,7 @@ async fn dst_cannot_cancel_shipped_order() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -802,6 +816,7 @@ async fn dst_multiple_actors_independent() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -817,6 +832,7 @@ async fn dst_multiple_actors_independent() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: None,
             },
             Duration::from_secs(1),
         )
@@ -1688,6 +1704,7 @@ async fn reserved_field_update_event_names_are_refused_as_actions() {
                     related: BTreeMap::new(),
                     idempotency_key: None,
                     expected_authorization_precondition: None,
+                    origin: None,
                 },
                 Duration::from_secs(5),
             )
@@ -2613,6 +2630,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         timestamp: sim_now(),
         params: serde_json::json!({"Customer": "Alice"}),
         idempotency_key: None,
+        origin: None,
         kind: temper_runtime::persistence::EventKind::Transition,
     };
     let created_env = PersistenceEnvelope {

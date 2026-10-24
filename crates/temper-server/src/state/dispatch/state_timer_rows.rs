@@ -4,8 +4,9 @@
 //! rows are the timers still waiting. At boot [`ServerState::rearm_state_timers`]
 //! reads each tenant's rows once, without loading any entity, and arms every
 //! timer again from when its state's clock started: for the rest of its budget,
-//! or at once if it fell due while the server was down. It fires once, as the
-//! identity that armed it; ticks missed while the server was down are not
+//! or at once if it fell due while the server was down. It fires once, with
+//! the authority of the move that armed it and recorded as the state timer's
+//! move caused by that one; ticks missed while the server was down are not
 //! replayed.
 
 use std::collections::BTreeMap;
@@ -52,6 +53,10 @@ struct ArmedBy {
     workflow_run_id: Option<String>,
     #[serde(default)]
     observation_metadata: BTreeMap<String, String>,
+    /// The action of the move that armed the timer, recorded as the timer
+    /// move's cause. Rows written before it was kept have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cause_action: Option<String>,
 }
 
 impl From<&AgentContext> for ArmedBy {
@@ -68,6 +73,7 @@ impl From<&AgentContext> for ArmedBy {
             workflow_root_entity_id: agent.workflow_root_entity_id.clone(),
             workflow_run_id: agent.workflow_run_id.clone(),
             observation_metadata: agent.observation_metadata.clone(),
+            cause_action: None,
         }
     }
 }
@@ -246,7 +252,10 @@ fn timer_record(timer: &ArmedTimer) -> Result<StateTimerRecord, serde_json::Erro
         sequence_nr: timer.sequence_nr,
         started_at: timer.started_at.to_rfc3339(),
         params: serde_json::to_string(&timer.params)?,
-        armed_by: serde_json::to_string(&ArmedBy::from(&timer.agent_ctx))?,
+        armed_by: serde_json::to_string(&ArmedBy {
+            cause_action: timer.cause_action.clone(),
+            ..ArmedBy::from(&timer.armed_by)
+        })?,
     })
 }
 
@@ -259,8 +268,9 @@ fn armed_timer(
         .map_err(|error| format!("started_at: {error}"))?
         .with_timezone(&Utc);
     let params = serde_json::from_str(&row.params).map_err(|error| format!("params: {error}"))?;
-    let armed_by: ArmedBy =
+    let mut armed_by: ArmedBy =
         serde_json::from_str(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
+    let cause_action = armed_by.cause_action.take();
     Ok(ArmedTimer {
         tenant: tenant.clone(),
         entity_type: row.entity_type.clone(),
@@ -268,7 +278,8 @@ fn armed_timer(
         state: row.state.clone(),
         action: action.to_string(),
         params,
-        agent_ctx: armed_by.into(),
+        armed_by: armed_by.into(),
+        cause_action,
         arm_id: row.arm_id.clone(),
         sequence_nr: row.sequence_nr,
         started_at,

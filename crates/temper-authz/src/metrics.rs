@@ -95,6 +95,10 @@ impl CedarPhaseOutcome {
 pub(crate) enum CedarCheck {
     Gate,
     RowFilter,
+    /// A question about the policies themselves rather than about a request,
+    /// such as the warnings an app install reports. Nothing is let through or
+    /// refused.
+    Review,
 }
 
 impl CedarCheck {
@@ -102,6 +106,7 @@ impl CedarCheck {
         match self {
             Self::Gate => "gate",
             Self::RowFilter => "row_filter",
+            Self::Review => "review",
         }
     }
 }

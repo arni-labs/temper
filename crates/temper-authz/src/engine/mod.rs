@@ -19,6 +19,7 @@ use crate::error::{AuthzDenial, AuthzError};
 use crate::metrics::{CedarCheck, CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
+mod fallback;
 mod list_uniformity;
 mod platform_policy;
 
@@ -320,35 +321,6 @@ impl AuthzEngine {
             .read()
             .map_or(0, |ps| count_user_policies(&ps.policy_set));
         tenant_count + fallback_count
-    }
-
-    /// Evaluate an authorization request against the fallback global policy set.
-    ///
-    /// **Prefer [`authorize_for_tenant`](Self::authorize_for_tenant)** for
-    /// per-tenant isolation. This method exists for backward compatibility.
-    pub fn authorize(
-        &self,
-        security_ctx: &SecurityContext,
-        action: &str,
-        resource_type: &str,
-        resource_attrs: &HashMap<String, serde_json::Value>,
-    ) -> AuthzDecision {
-        let policy_set = match self.fallback_policy_set.read() {
-            Ok(ps) => ps,
-            Err(e) => {
-                return AuthzDecision::Deny(AuthzDenial::EngineError(format!(
-                    "policy lock poisoned: {e}"
-                )));
-            }
-        };
-        self.evaluate_request(
-            security_ctx,
-            action,
-            resource_type,
-            resource_attrs,
-            &policy_set,
-            CedarCheck::Gate,
-        )
     }
 
     /// Evaluate an authorization request against a specific tenant's policy set.
