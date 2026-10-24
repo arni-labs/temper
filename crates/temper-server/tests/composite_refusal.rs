@@ -8,8 +8,11 @@
 //! Before, the refusal left the Notice in `Answered` as if the answer had moved
 //! the Release. Each case runs with an event journal (the atomic batch) and
 //! without one (the per-write path). A sub-write that commits is not a
-//! refusal, even when a later step of its write reports a failure, and
-//! neither is one whose storage fails, since that write may have landed.
+//! refusal, even when a later step of its write reports a failure. Neither is
+//! one whose storage fails, since that write may have landed, nor one the store
+//! wrote although it answered with a concurrency violation. A sub-write that
+//! meets a journal another server moved, and no longer applies once the
+//! journal is read again, is a refusal.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +20,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use temper_runtime::ActorSystem;
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{EventStore, PersistenceError};
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
@@ -491,19 +494,102 @@ async fn a_sub_write_whose_storage_fails_does_not_run_the_composites_on_failure(
             store.pending_append_failures(RELEASE_JOURNAL) < FAILURES,
             "{path}: the composite should have tried to write the Release"
         );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
-            assert_eq!(
-                status_of(&state, "Notice", NOTICE).await,
-                "Answered",
-                "{path}: a sub-write whose storage failed does not run on_failure"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        notice_stays_answered(
+            &state,
+            &format!("{path}: a sub-write whose storage failed does not run on_failure"),
+        )
+        .await;
         assert_eq!(
             status_of(&state, "Release", RELEASE).await,
             "Held",
             "{path}: the failed write leaves the Release as it was"
         );
     }
+}
+
+/// Asserts for two seconds that the Notice stays `Answered`: its composite's
+/// `on_failure` does not run.
+async fn notice_stays_answered(state: &ServerState, why: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            status_of(state, "Notice", NOTICE).await,
+            "Answered",
+            "{why}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Another server sharing the event store rejects the Release while this one
+/// still holds it as `Held`. This server's `Approve` meets the moved journal;
+/// read again, the journal does not hold the `Approve` and the Release is
+/// `Out`, so the sub-write is refused and `Missed` runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_write_refused_after_another_server_moved_the_release_runs_on_failure() {
+    for (path, release_ioa) in [
+        ("atomic batch", RELEASE_IOA.to_string()),
+        ("per-write", release_with_own_effect()),
+    ] {
+        let store = SimEventStore::no_faults(41);
+        let server = |store: &SimEventStore| {
+            let stack = StorageStack::from_sim(store.clone(), None);
+            notice_server(&release_ioa, Some(stack), PERMIT_ALL)
+        };
+        let here = server(&store);
+        let elsewhere = server(&store);
+        act(&here, "Release", RELEASE, "Hold").await;
+        act(&elsewhere, "Release", RELEASE, "Reject").await;
+        assert_eq!(
+            status_of(&here, "Release", RELEASE).await,
+            "Held",
+            "{path}: this server has not read the Reject yet"
+        );
+
+        act(&here, "Notice", NOTICE, "PutItLive").await;
+
+        let (notice, fields) = settle(&here, "Notice", NOTICE, &["Closed"]).await;
+        assert_eq!(
+            notice, "Closed",
+            "{path}: the refused sub-write should run Missed"
+        );
+        let error = error_field(&fields);
+        assert!(
+            error.contains("Approve"),
+            "{path}: Missed should carry the refusal, got {error:?}"
+        );
+    }
+}
+
+/// The store writes the Release's `Approve` and then loses its answer, so it
+/// reports a concurrency violation, as the Turso store does when it retries a
+/// write whose first answer was lost. Read again, the journal holds the
+/// `Approve`: the sub-write landed, so it is not a refusal, `on_failure` does
+/// not run, and the Release is approved once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_write_that_landed_behind_a_concurrency_violation_does_not_run_on_failure() {
+    let store = SimEventStore::no_faults(43);
+    let stack = StorageStack::from_sim(store.clone(), None);
+    let state = notice_server(&release_with_own_effect(), Some(stack), PERMIT_ALL);
+    act(&state, "Release", RELEASE, "Hold").await;
+    store.lose_next_append_answers(RELEASE_JOURNAL, 1);
+
+    act(&state, "Notice", NOTICE, "PutItLive").await;
+
+    let (release, _) = settle(&state, "Release", RELEASE, &["Live"]).await;
+    assert_eq!(release, "Live", "the Approve landed");
+    assert_eq!(
+        store.pending_lost_append_answers(RELEASE_JOURNAL),
+        0,
+        "the Approve's answer was lost"
+    );
+    notice_stays_answered(&state, "a sub-write that landed does not run on_failure").await;
+    let approvals = store
+        .read_events(RELEASE_JOURNAL, 0)
+        .await
+        .expect("read the Release journal")
+        .into_iter()
+        .filter(|event| event.event_type == "Approve")
+        .count();
+    assert_eq!(approvals, 1, "the Approve is written once");
 }
