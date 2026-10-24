@@ -1192,8 +1192,10 @@ pub trait WasmInvocationStore: Send + Sync {
         entry: &TursoWasmInvocationInsert<'_>,
     ) -> Result<(), PersistenceError>;
 
+    /// Load one tenant's most recent invocations, newest first.
     async fn load_recent_wasm_invocations(
         &self,
+        tenant: &str,
         limit: i64,
     ) -> Result<Vec<TursoWasmInvocationRow>, PersistenceError>;
 }
@@ -2202,9 +2204,10 @@ impl WasmInvocationStore for PostgresEventStore {
 
     async fn load_recent_wasm_invocations(
         &self,
+        tenant: &str,
         limit: i64,
     ) -> Result<Vec<TursoWasmInvocationRow>, PersistenceError> {
-        self.load_recent_wasm_invocations(limit)
+        self.load_recent_wasm_invocations(tenant, limit)
             .await
             .map(|rows| rows.into_iter().map(pg_wasm_invocation_to_turso).collect())
     }
@@ -2221,9 +2224,10 @@ impl WasmInvocationStore for TursoEventStore {
 
     async fn load_recent_wasm_invocations(
         &self,
+        tenant: &str,
         limit: i64,
     ) -> Result<Vec<TursoWasmInvocationRow>, PersistenceError> {
-        self.load_recent_wasm_invocations(limit).await
+        self.load_recent_wasm_invocations(tenant, limit).await
     }
 }
 
