@@ -20,7 +20,6 @@ async fn legacy_bootstrap_after_skipped_history_remains_lenient() {
         BackendLabel::Turso,
         &serde_json::json!({}),
         None,
-        false,
     )
     .await
     .unwrap();
@@ -255,7 +254,6 @@ constraints = [{kind="param_equals_field",param="expected",field="revision"}]
         BackendLabel::Turso,
         &serde_json::json!({}),
         None,
-        true,
     )
     .await
     .unwrap();
@@ -263,13 +261,11 @@ constraints = [{kind="param_equals_field",param="expected",field="revision"}]
     assert_eq!(snapshot_recovery.fields, recovered.fields);
 }
 
+/// Every table, with or without input contracts, refuses to recover from a
+/// journal it could not read.
 #[tokio::test]
-async fn round_four_lenient_recovery_refuses_unreadable_contracted_prestate() {
-    for (strict, constrained, should_fail) in [
-        (true, false, true),
-        (false, true, true),
-        (false, false, false),
-    ] {
+async fn recovery_refuses_an_unreadable_journal_for_every_table() {
+    for (strict, constrained) in [(true, false), (false, true), (false, false)] {
         let mut table = order_table();
         table.strict_action_params = strict;
         if constrained {
@@ -282,7 +278,7 @@ async fn round_four_lenient_recovery_refuses_unreadable_contracted_prestate() {
             read_error: Some("injected unavailable journal".into()),
             ..Default::default()
         });
-        let recovered = recover_entity_state_from_store(
+        let error = recover_entity_state_from_store(
             "default",
             "Order",
             "unreadable",
@@ -291,17 +287,10 @@ async fn round_four_lenient_recovery_refuses_unreadable_contracted_prestate() {
             BackendLabel::Turso,
             &serde_json::json!({}),
             None,
-            false,
         )
-        .await;
-        assert_eq!(
-            recovered.is_err(),
-            should_fail,
-            "strict={strict}, constrained={constrained}"
-        );
-        if let Err(error) = recovered {
-            assert!(error.to_string().contains("injected unavailable journal"));
-        }
+        .await
+        .expect_err(&format!("strict={strict}, constrained={constrained}"));
+        assert!(error.to_string().contains("injected unavailable journal"));
     }
 }
 
