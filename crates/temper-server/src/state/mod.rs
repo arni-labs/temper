@@ -22,7 +22,9 @@ mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
 pub(crate) mod storage_caps;
+mod tenant_generation;
 mod tenant_removal;
+pub use tenant_generation::{GenerationLease, TenantGenerations, TenantStamp};
 pub use tenant_removal::TenantRemovalError;
 pub mod trajectory;
 pub mod wasm_invocation_log;
@@ -422,6 +424,9 @@ pub struct ServerState {
     pub transition_tables: Arc<BTreeMap<String, Arc<TransitionTable>>>,
     /// Live actor registry: actor_key -> ActorRef.
     pub actor_registry: Arc<RwLock<BTreeMap<String, ActorRef<EntityMsg>>>>,
+    /// Each tenant id's live generation. An actor is admitted only while its tenant's generation is live, checked
+    /// under the actor registry's write lock, and work outside actors runs under a lease of it.
+    pub tenant_generations: Arc<TenantGenerations>,
     /// Last access time per actor key (used for idle passivation).
     pub last_accessed: Arc<RwLock<BTreeMap<String, chrono::DateTime<chrono::Utc>>>>,
     /// First-class storage capabilities selected for this runtime.
@@ -666,7 +671,8 @@ impl ServerState {
             *slot = Some(snapshot_queue);
         }
         if let Some(query_plane) = stack.query_plane.clone() {
-            let queue = QueryProjectionWriteQueue::start(query_plane);
+            let queue =
+                QueryProjectionWriteQueue::start(query_plane, Arc::clone(&self.tenant_generations));
             if let Ok(mut slot) = self.query_projection_queue.lock() {
                 *slot = Some(queue);
             }
@@ -761,6 +767,7 @@ impl ServerState {
             entity_set_map: Arc::new(entity_set_map),
             transition_tables: Arc::new(BTreeMap::new()),
             actor_registry: Arc::new(RwLock::new(BTreeMap::new())),
+            tenant_generations: Arc::new(TenantGenerations::default()),
             last_accessed: Arc::new(RwLock::new(BTreeMap::new())),
             storage_stack: None,
             query_projection_queue: Arc::new(Mutex::new(None)),
@@ -1038,6 +1045,7 @@ impl ServerState {
             entity_set_map: Arc::new(BTreeMap::new()),
             transition_tables: Arc::new(BTreeMap::new()),
             actor_registry: Arc::new(RwLock::new(BTreeMap::new())),
+            tenant_generations: Arc::new(TenantGenerations::default()),
             last_accessed: Arc::new(RwLock::new(BTreeMap::new())),
             storage_stack: None,
             query_projection_queue: Arc::new(Mutex::new(None)),

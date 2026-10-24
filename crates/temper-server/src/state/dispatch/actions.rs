@@ -207,6 +207,12 @@ impl crate::state::ServerState {
             await_integration,
             await_reactions,
         } = cmd;
+        // Held through the action and its reactions, so a removal of the tenant waits for them before its storage
+        // goes; the reactions and every follow-on carry the generation in their context.
+        let Some((_lease, agent_ctx)) = self.admit_tenant_work(tenant, agent_ctx) else {
+            return Err(DispatchError::TenantGone(tenant.to_string()));
+        };
+        let agent_ctx = &agent_ctx;
 
         if self
             .composite_metadata_for(tenant, entity_type, action)?
@@ -386,6 +392,11 @@ impl crate::state::ServerState {
         await_integration: bool,
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
+        // Reactions enter here directly: each one is admitted for the generation of the work that caused it.
+        let Some((_lease, agent_ctx)) = self.admit_tenant_work(tenant, agent_ctx) else {
+            return Err(DispatchError::TenantGone(tenant.to_string()));
+        };
+        let agent_ctx = &agent_ctx;
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
 

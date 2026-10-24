@@ -126,6 +126,11 @@ pub enum DispatchError {
     #[error("entity type '{0}' is not governed by any registered spec")]
     Ungoverned(String),
 
+    /// The tenant was deleted or is being deleted, or the work belongs to a generation of it that no longer exists
+    /// (see `state::tenant_generation`).
+    #[error("tenant '{0}' was deleted; work of its earlier generation is refused")]
+    TenantGone(String),
+
     /// An internal error (serialization, persistence, unexpected state).
     #[error("{0}")]
     Internal(String),

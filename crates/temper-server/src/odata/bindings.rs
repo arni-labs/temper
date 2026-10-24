@@ -398,6 +398,11 @@ pub(super) async fn dispatch_bound_action(
             action_span.set_status(Status::error("EntityTypeNotGoverned"));
             odata_error(StatusCode::NOT_FOUND, "EntityTypeNotGoverned", &reason).into_response()
         }
+        Err(e @ DispatchError::TenantGone(_)) => {
+            let reason = e.to_string();
+            action_span.set_status(Status::error(reason.clone()));
+            odata_error(StatusCode::NOT_FOUND, "TenantGone", &reason).into_response()
+        }
         Err(DispatchError::AuthzDenied(reason)) => {
             action_span.set_status(Status::error(reason.clone()));
             odata_error(StatusCode::FORBIDDEN, "AuthorizationDenied", &reason).into_response()

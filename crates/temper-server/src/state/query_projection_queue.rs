@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::Instrument;
 
+use super::tenant_generation::{TenantGenerations, TenantStamp};
 use crate::storage::QueryPlaneStore;
 
 const DEFAULT_PROJECTION_QUEUE_CAPACITY: usize = 20_000;
@@ -20,6 +21,9 @@ const DEFAULT_PROJECTION_RETRY_DELAY_MS: u64 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct ProjectionKey {
+    /// The tenant generation that wrote the entity. Writes of a deleted tenant's generation stay apart from the
+    /// re-created tenant's, and are refused when applied.
+    stamp: TenantStamp,
     tenant: String,
     entity_type: String,
     entity_id: String,
@@ -63,6 +67,7 @@ pub(crate) enum ProjectionEnqueueOutcome {
 /// Background projection writer shared by all `ServerState` clones.
 pub(crate) struct QueryProjectionWriteQueue {
     store: Arc<dyn QueryPlaneStore>,
+    generations: Arc<TenantGenerations>,
     pending: Arc<Mutex<PendingProjectionUpdates>>,
     notify: Arc<Notify>,
     capacity: usize,
@@ -72,9 +77,13 @@ pub(crate) struct QueryProjectionWriteQueue {
 }
 
 impl QueryProjectionWriteQueue {
-    pub(crate) fn start(store: Arc<dyn QueryPlaneStore>) -> Arc<Self> {
+    pub(crate) fn start(
+        store: Arc<dyn QueryPlaneStore>,
+        generations: Arc<TenantGenerations>,
+    ) -> Arc<Self> {
         let queue = Arc::new(Self {
             store,
+            generations,
             pending: Arc::new(Mutex::new(PendingProjectionUpdates::default())),
             notify: Arc::new(Notify::new()),
             capacity: projection_queue_capacity(),
@@ -91,9 +100,11 @@ impl QueryProjectionWriteQueue {
         store: Arc<dyn QueryPlaneStore>,
         capacity: usize,
         drain_batch: usize,
+        generations: Arc<TenantGenerations>,
     ) -> Self {
         Self {
             store,
+            generations,
             pending: Arc::new(Mutex::new(PendingProjectionUpdates::default())),
             notify: Arc::new(Notify::new()),
             capacity,
@@ -113,6 +124,7 @@ impl QueryProjectionWriteQueue {
     ) -> Self {
         Self {
             store,
+            generations: Arc::new(TenantGenerations::default()),
             pending: Arc::new(Mutex::new(PendingProjectionUpdates::default())),
             notify: Arc::new(Notify::new()),
             capacity,
@@ -125,7 +137,7 @@ impl QueryProjectionWriteQueue {
     #[expect(clippy::too_many_arguments, reason = "projection enqueue boundary")]
     pub(crate) fn enqueue_upsert(
         &self,
-        tenant: String,
+        stamp: TenantStamp,
         entity_type: String,
         entity_id: String,
         status: String,
@@ -136,7 +148,8 @@ impl QueryProjectionWriteQueue {
     ) -> ProjectionEnqueueOutcome {
         self.enqueue(QueuedProjectionUpdate {
             key: ProjectionKey {
-                tenant,
+                tenant: stamp.tenant().to_string(),
+                stamp,
                 entity_type,
                 entity_id,
             },
@@ -154,7 +167,7 @@ impl QueryProjectionWriteQueue {
 
     pub(crate) fn enqueue_remove(
         &self,
-        tenant: String,
+        stamp: TenantStamp,
         entity_type: String,
         entity_id: String,
         sequence_nr: u64,
@@ -162,7 +175,8 @@ impl QueryProjectionWriteQueue {
     ) -> ProjectionEnqueueOutcome {
         self.enqueue(QueuedProjectionUpdate {
             key: ProjectionKey {
-                tenant,
+                tenant: stamp.tenant().to_string(),
+                stamp,
                 entity_type,
                 entity_id,
             },
@@ -233,6 +247,14 @@ impl QueryProjectionWriteQueue {
         });
     }
 
+    /// The live generation of `tenant`, as the queue's writes are stamped.
+    #[cfg(test)]
+    pub(crate) fn stamp_for_test(&self, tenant: &str) -> TenantStamp {
+        self.generations
+            .live(&temper_runtime::tenant::TenantId::new(tenant))
+            .expect("a live tenant generation")
+    }
+
     #[cfg(test)]
     pub(crate) async fn drain_once_for_test(&self) {
         for update in self.take_batch() {
@@ -282,6 +304,17 @@ impl QueryProjectionWriteQueue {
     }
 
     async fn apply(&self, update: QueuedProjectionUpdate) {
+        // Held while the write runs, so a removal of the tenant waits for it before the storage goes.
+        let Some(_lease) = self.generations.lease(&update.key.stamp) else {
+            tracing::debug!(
+                tenant = %update.key.tenant,
+                generation = update.key.stamp.generation(),
+                entity_type = %update.key.entity_type,
+                entity_id = %update.key.entity_id,
+                "dropping a queued query projection write of a deleted tenant generation"
+            );
+            return;
+        };
         let operation = update.operation.label();
         let source = update.source;
         let span = tracing::info_span!(

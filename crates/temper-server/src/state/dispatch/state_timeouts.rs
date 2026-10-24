@@ -529,11 +529,16 @@ impl crate::state::ServerState {
     /// the timer ends.
     pub(super) fn spawn_state_timer(
         &self,
-        timer: ArmedTimer,
+        mut timer: ArmedTimer,
         delay: Duration,
         gate: Option<Arc<Semaphore>>,
         armed_seq: u64,
     ) {
+        // The timer belongs to the tenant generation that armed it, and fires only while that one is live.
+        let Some(armed_by) = self.stamp_tenant_work(&timer.tenant, &timer.agent_ctx) else {
+            return;
+        };
+        timer.agent_ctx = armed_by;
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
@@ -588,6 +593,12 @@ impl crate::state::ServerState {
             );
 
             async move {
+                // A timer of a deleted tenant generation ends without touching the tenant created again.
+                let Some((_lease, _)) = state.admit_tenant_work(&timer.tenant, &timer.agent_ctx)
+                else {
+                    state.state_timeout_tracker.dec_pending(&timer.entity_type);
+                    return;
+                };
                 // Sequence-based cancellation check. A newer arm (or a state
                 // change that bumped the seq on exit) renders this timer a
                 // no-op. The secondary check confirms the entity is still in

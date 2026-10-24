@@ -113,6 +113,10 @@ impl ServerState {
         mime_type: &str,
         agent_ctx: &crate::request_context::AgentContext,
     ) -> Result<crate::entity_actor::EntityResponse, FileStreamContentError> {
+        // The create appends to the journal outside an actor: a removal of the tenant waits for it.
+        let _lease = self
+            .lease_tenant(tenant)
+            .map_err(FileStreamContentError::State)?;
         let Some((store, _backend)) = self.event_journal() else {
             return Err(FileStreamContentError::State(
                 "File initial content create requires an event journal".to_string(),

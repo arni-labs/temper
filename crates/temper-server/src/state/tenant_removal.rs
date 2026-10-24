@@ -1,6 +1,8 @@
 //! Removing a tenant from the running server, in an order that keeps its storage until nothing can still write to
-//! it: refuse the tenant's new work, stop its actors and wait for each to end, remove its storage, then forget what
-//! this process holds for it.
+//! it: close the tenant's generation so no new work or actor is admitted, stop its actors and wait for them and for
+//! the work still running to end, remove its storage, then forget what this process holds for it. Work of the closed
+//! generation that acts later (a timer, a follow-on, a queued projection write) is refused, so the id created again
+//! starts a new generation that nothing of the old one reaches.
 
 use std::future::Future;
 
@@ -9,6 +11,7 @@ use temper_runtime::persistence::PersistenceError;
 use temper_runtime::tenant::TenantId;
 
 use super::ServerState;
+use super::tenant_generation::{Generation, TenantGenerations};
 
 /// Why a tenant removal did not finish. The tenant stays marked gone (no specs, so no new actors and no new work),
 /// and running the removal again picks up where this one stopped.
@@ -16,10 +19,12 @@ use super::ServerState;
 pub enum TenantRemovalError {
     /// A lock over the tenant's in-memory state was poisoned by a panic elsewhere.
     LockPoisoned(&'static str),
-    /// Some of the tenant's actors were still handling a message when the wait ended.
+    /// Some of the tenant's actors, or work admitted for it, were still running when the wait ended.
     ActorsStillRunning {
-        /// How many had not ended.
+        /// How many actors had not ended.
         running: usize,
+        /// How many pieces of admitted work (leases of the tenant's generation) were still held.
+        work: usize,
         /// How long the removal waited for them.
         waited: std::time::Duration,
     },
@@ -31,10 +36,14 @@ impl std::fmt::Display for TenantRemovalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LockPoisoned(what) => write!(f, "the {what} lock is poisoned"),
-            Self::ActorsStillRunning { running, waited } => write!(
+            Self::ActorsStillRunning {
+                running,
+                work,
+                waited,
+            } => write!(
                 f,
-                "{running} of the tenant's actors were still running after {waited:?}; its storage was kept, retry \
-                 the delete"
+                "{running} of the tenant's actors and {work} pieces of its work were still running after {waited:?}; \
+                 its storage was kept, retry the delete"
             ),
             Self::Storage(error) => write!(f, "removing the tenant's storage failed: {error}"),
         }
@@ -64,12 +73,13 @@ impl ServerState {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<bool, PersistenceError>>,
     {
-        // Without specs, no actor of the tenant is spawned and no request for it is admitted.
+        // A closed generation admits no new work and no new actor; without specs, no request for it is governed.
+        let closing = self.tenant_generations.close(tenant);
         self.registry
             .write()
             .map_err(poisoned("spec registry"))?
             .remove_tenant(tenant);
-        self.stop_tenant_actors(tenant).await?;
+        self.stop_tenant_actors(tenant, &closing).await?;
         let existed = remove_storage()
             .await
             .map_err(TenantRemovalError::Storage)?;
@@ -77,11 +87,16 @@ impl ServerState {
         Ok(existed)
     }
 
-    /// Halt every actor of `tenant` and wait until each has ended, for as long as a dispatch waits for its actor
-    /// (`action_dispatch_timeout`): a message still being handled after that has a caller that already gave up.
-    /// A halt needs no mailbox space and drops the actor's queued messages. Actors that ended leave the registry;
-    /// the rest stay there, halted, for the next attempt to wait on.
-    async fn stop_tenant_actors(&self, tenant: &TenantId) -> Result<(), TenantRemovalError> {
+    /// Halt every actor of `tenant` and wait until each has ended and the work admitted for its closed `generation`
+    /// has finished, for as long as a dispatch waits for its actor (`action_dispatch_timeout`): a message still being
+    /// handled after that has a caller that already gave up. A halt needs no mailbox space and drops the actor's
+    /// queued messages, so a dispatch waiting on a halted actor ends. Actors that ended leave the registry; the rest
+    /// stay there, halted, for the next attempt to wait on.
+    async fn stop_tenant_actors(
+        &self,
+        tenant: &TenantId,
+        generation: &Generation,
+    ) -> Result<(), TenantRemovalError> {
         let prefix = format!("{tenant}:");
         let actors: Vec<_> = self
             .actor_registry
@@ -95,8 +110,12 @@ impl ServerState {
             actor.halt();
         }
         let waited = self.action_dispatch_timeout;
-        let all_ended = futures_util::future::join_all(actors.iter().map(|actor| actor.stopped()));
+        let all_ended = async {
+            futures_util::future::join_all(actors.iter().map(|actor| actor.stopped())).await;
+            TenantGenerations::drained(generation).await;
+        };
         let finished = tokio::time::timeout(waited, all_ended).await.is_ok();
+        let work = generation.leases();
 
         let mut registry = self
             .actor_registry
@@ -110,10 +129,14 @@ impl ServerState {
             .filter(|key| key.starts_with(&prefix))
             .count();
         drop(registry);
-        if finished && running == 0 {
+        if finished && running == 0 && work == 0 {
             Ok(())
         } else {
-            Err(TenantRemovalError::ActorsStillRunning { running, waited })
+            Err(TenantRemovalError::ActorsStillRunning {
+                running,
+                work,
+                waited,
+            })
         }
     }
 
@@ -190,6 +213,8 @@ impl ServerState {
             .write()
             .map_err(poisoned("spec registry"))?
             .remove_tenant(tenant);
+        // Last: the id's next use starts a new generation only once nothing of this one is left in memory.
+        self.tenant_generations.forget(tenant);
         crate::runtime_metrics::record_server_state_metrics(self);
         Ok(())
     }

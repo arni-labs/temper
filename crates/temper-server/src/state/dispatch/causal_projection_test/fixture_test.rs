@@ -219,6 +219,7 @@ async fn fixture_from_source(
         query.clone(),
         32,
         32,
+        Arc::clone(&state.tenant_generations),
     ));
     *state.query_projection_queue.lock().unwrap() = Some(queue.clone());
     state

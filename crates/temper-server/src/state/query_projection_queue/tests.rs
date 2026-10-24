@@ -97,11 +97,11 @@ impl QueryPlaneStore for RecordingQueryPlane {
 #[test]
 fn enqueue_coalesces_newer_entity_update() {
     let store = Arc::new(RecordingQueryPlane::default());
-    let queue = QueryProjectionWriteQueue::new_for_test(store, 10, 10);
+    let queue = QueryProjectionWriteQueue::new_for_test(store, 10, 10, Arc::default());
 
     assert_eq!(
         queue.enqueue_upsert(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-1".to_string(),
             "Running".to_string(),
@@ -114,7 +114,7 @@ fn enqueue_coalesces_newer_entity_update() {
     );
     assert_eq!(
         queue.enqueue_upsert(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-1".to_string(),
             "Idle".to_string(),
@@ -134,11 +134,11 @@ fn enqueue_coalesces_newer_entity_update() {
 #[test]
 fn enqueue_skips_stale_update_before_store_access() {
     let store = Arc::new(RecordingQueryPlane::default());
-    let queue = QueryProjectionWriteQueue::new_for_test(store, 10, 10);
+    let queue = QueryProjectionWriteQueue::new_for_test(store, 10, 10, Arc::default());
 
     assert_eq!(
         queue.enqueue_upsert(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-1".to_string(),
             "Idle".to_string(),
@@ -151,7 +151,7 @@ fn enqueue_skips_stale_update_before_store_access() {
     );
     assert_eq!(
         queue.enqueue_upsert(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-1".to_string(),
             "Running".to_string(),
@@ -171,11 +171,11 @@ fn enqueue_skips_stale_update_before_store_access() {
 #[test]
 fn enqueue_rejects_new_entity_when_capacity_is_exhausted() {
     let store = Arc::new(RecordingQueryPlane::default());
-    let queue = QueryProjectionWriteQueue::new_for_test(store, 1, 10);
+    let queue = QueryProjectionWriteQueue::new_for_test(store, 1, 10, Arc::default());
 
     assert_eq!(
         queue.enqueue_remove(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-1".to_string(),
             1,
@@ -185,7 +185,7 @@ fn enqueue_rejects_new_entity_when_capacity_is_exhausted() {
     );
     assert_eq!(
         queue.enqueue_remove(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-2".to_string(),
             1,
@@ -211,7 +211,7 @@ async fn failed_projection_write_is_retried_before_drop() {
 
     assert_eq!(
         queue.enqueue_upsert(
-            "tenant".to_string(),
+            queue.stamp_for_test("tenant"),
             "Session".to_string(),
             "s-1".to_string(),
             "Idle".to_string(),
