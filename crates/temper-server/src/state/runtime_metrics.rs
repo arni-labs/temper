@@ -254,3 +254,7 @@ fn read_macos_resident_memory_bytes() -> Option<u64> {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_metrics_test.rs"]
+mod tests;
