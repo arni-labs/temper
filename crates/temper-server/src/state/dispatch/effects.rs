@@ -18,6 +18,10 @@ use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
+/// The only tenant whose entities reach the platform custom effect handler:
+/// the system tenant, where the platform installs its own specs.
+const PLATFORM_HOOK_TENANT: &str = "temper-system";
+
 /// Collected context needed by post-dispatch effect handlers.
 pub(crate) struct PostDispatchContext<'a> {
     pub tenant: &'a TenantId,
@@ -747,6 +751,7 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("WASM integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
@@ -781,6 +786,7 @@ impl crate::state::ServerState {
                     Err(err) => {
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("adapter integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
@@ -835,8 +841,13 @@ impl crate::state::ServerState {
         //
         // For system-tenant entities whose specs declare custom effects
         // but have no WASM/adapter integrations (e.g. GovernanceDecision),
-        // the handler routes effects to platform hooks (hooks.rs).
+        // the handler routes effects to platform hooks (hooks.rs). The
+        // platform installs those specs only in the system tenant, and the
+        // hooks act on whatever tenant and entity the record names, so only
+        // system-tenant entities reach them. A hook name in another tenant's
+        // spec is an ordinary custom effect for that tenant's integrations.
         if !response.custom_effects.is_empty()
+            && ctx.tenant.as_str() == PLATFORM_HOOK_TENANT
             && let Some(handler) = &self.custom_effect_handler
         {
             for effect_name in &response.custom_effects {
