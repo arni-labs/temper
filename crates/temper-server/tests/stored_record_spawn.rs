@@ -1,7 +1,8 @@
 //! An outside action that spawns a child is checked on the record it stores,
-//! including the child's id in the field the spawn writes. The child itself
-//! is created by the kernel after the parent commits, so the relation to it
-//! is not looked up before then.
+//! including the child's id in the field the spawn writes. The kernel creates
+//! the child after the parent commits, so the relation and the hard
+//! cross-invariant that read the child read it as the spawn will create it:
+//! its first state with its initial action applied.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -42,7 +43,7 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 const CHILD_IOA: &str = r#"
 [automaton]
 name = "Child"
-states = ["New", "Initialized"]
+states = ["New", "Initialized", "Archived"]
 initial = "New"
 
 [[action]]
@@ -50,6 +51,18 @@ name = "Init"
 kind = "input"
 from = ["New"]
 to = "Initialized"
+
+[[action]]
+name = "InitArchived"
+kind = "input"
+from = ["New"]
+to = "Archived"
+
+[[action]]
+name = "Archive"
+kind = "input"
+from = ["New", "Initialized"]
+to = "Archived"
 "#;
 
 const RUN_IOA: &str = r#"
@@ -66,10 +79,34 @@ to = "Running"
 params = ["child_id"]
 effect = ["spawn('Child', 'Init', ChildRef, params.child_id)"]
 
+[[action]]
+name = "StartArchived"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = ["child_id"]
+effect = ["spawn('Child', 'InitArchived', ChildRef, params.child_id)"]
+
 [[field_invariant]]
 name = "RunningRunsHaveAChild"
 message = "a running run names its child"
 assert = "status == 'Running' => ChildRef != null"
+"#;
+
+const CROSS_INVARIANTS: &str = r#"
+version = 1
+
+[[invariant]]
+name = "StartedRunChildNotArchived"
+kind = "hard"
+on = "Run.Start"
+assert = 'related(Child, ChildRef).status not in ["Archived"]'
+
+[[invariant]]
+name = "StartedArchivedRunChildNotArchived"
+kind = "hard"
+on = "Run.StartArchived"
+assert = 'related(Child, ChildRef).status not in ["Archived"]'
 "#;
 
 fn verified() -> VerificationStatus {
@@ -87,11 +124,12 @@ fn verified() -> VerificationStatus {
 
 fn build_state() -> ServerState {
     let mut registry = SpecRegistry::new();
-    registry.register_tenant(
+    registry.register_tenant_with_constraints(
         "default",
         parse_csdl(CSDL).expect("CSDL parse"),
         CSDL.to_string(),
         &[("Child", CHILD_IOA), ("Run", RUN_IOA)],
+        Some(CROSS_INVARIANTS.to_string()),
     );
     let state = ServerState::from_registry(ActorSystem::new("stored-record-spawn"), registry);
     {
@@ -156,4 +194,130 @@ async fn an_action_that_starts_a_child_is_checked_with_the_childs_id() {
         .expect("run should be readable");
     assert_eq!(run.state.status, "Running");
     assert_eq!(run.state.fields["ChildRef"], "c1");
+}
+
+async fn stored_run(state: &ServerState, id: &str) -> (String, Value) {
+    let run = state
+        .get_tenant_entity_state(&TenantId::default(), "Run", id)
+        .await
+        .expect("run should be readable");
+    (run.state.status, run.state.fields["ChildRef"].clone())
+}
+
+/// A run's first child: the run names no child before the action, and the
+/// child it starts begins initialized, so the cross-invariant holds.
+#[tokio::test]
+async fn a_first_spawn_is_checked_against_the_child_it_creates() {
+    let state = build_state();
+    let (status, body) = send(&state, Method::POST, "/tdata/Runs", json!({"Id": "r1"})).await;
+    assert_eq!(status, StatusCode::CREATED, "seed r1: {body}");
+
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Runs('r1')/Temper.Spawn.Start",
+        json!({"child_id": "c1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stored_run(&state, "r1").await,
+        ("Running".to_string(), json!("c1"))
+    );
+}
+
+/// A run that names an archived child starts a new one: the check reads the
+/// new child, not the one the run named before.
+#[tokio::test]
+async fn a_changed_child_reference_is_checked_against_the_new_child() {
+    let state = build_state();
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Children",
+        json!({"Id": "old"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed old: {body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Children('old')/Temper.Spawn.Archive",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "archive old: {body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Runs",
+        json!({"Id": "r1", "ChildRef": "old"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed r1: {body}");
+
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Runs('r1')/Temper.Spawn.Start",
+        json!({"child_id": "new"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stored_run(&state, "r1").await,
+        ("Running".to_string(), json!("new"))
+    );
+}
+
+/// The child is read as the spawn leaves it: a new child whose initial action
+/// archives it, and an existing archived child its initial action cannot
+/// move, both break the cross-invariant.
+#[tokio::test]
+async fn a_spawn_is_refused_when_the_child_it_leaves_breaks_the_invariant() {
+    let state = build_state();
+    for id in ["r1", "r2"] {
+        let (status, body) = send(&state, Method::POST, "/tdata/Runs", json!({"Id": id})).await;
+        assert_eq!(status, StatusCode::CREATED, "seed {id}: {body}");
+    }
+
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Runs('r1')/Temper.Spawn.StartArchived",
+        json!({"child_id": "c1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.to_string()
+            .contains("Child('c1') has status='Archived'"),
+        "{body}"
+    );
+    assert_eq!(stored_run(&state, "r1").await.0, "Idle");
+
+    let (status, body) = send(&state, Method::POST, "/tdata/Children", json!({"Id": "c2"})).await;
+    assert_eq!(status, StatusCode::CREATED, "seed c2: {body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Children('c2')/Temper.Spawn.Archive",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "archive c2: {body}");
+    let (status, body) = send(
+        &state,
+        Method::POST,
+        "/tdata/Runs('r2')/Temper.Spawn.Start",
+        json!({"child_id": "c2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.to_string()
+            .contains("Child('c2') has status='Archived'"),
+        "{body}"
+    );
+    assert_eq!(stored_run(&state, "r2").await.0, "Idle");
 }

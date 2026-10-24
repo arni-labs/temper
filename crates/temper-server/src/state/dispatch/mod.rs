@@ -19,6 +19,7 @@ mod effects;
 mod generated_callbacks;
 mod outside_write;
 mod projection_barrier;
+pub(crate) mod spawn_plan;
 pub use outside_write::StaleWrite;
 pub(crate) mod retry;
 pub(crate) mod state_timeouts;

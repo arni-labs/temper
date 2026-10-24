@@ -1,5 +1,6 @@
 //! Cross-entity relation and invariant enforcement.
 
+use std::collections::BTreeMap;
 use std::time::Instant; // determinism-ok: scoped duration measurement only
 
 use tracing::instrument;
@@ -10,8 +11,31 @@ use temper_spec::cross_invariant::{
     CrossInvariant, CrossInvariantOperator, DeletePolicy, InvariantKind, parse_related_field_assert,
 };
 
+use crate::entity_actor::EntityState;
 use crate::registry::RelationEdge;
 use crate::state::ServerState;
+use crate::state::write_record::RecordWrite;
+
+/// Records a write brings into being after it commits, read by the checks in
+/// place of the store: the children a parent's action spawns, which the
+/// kernel creates once the parent commits.
+#[derive(Debug, Default)]
+pub(crate) struct PendingRecords(BTreeMap<(String, String), EntityState>);
+
+impl PendingRecords {
+    /// Add the record as it will stand once the write commits.
+    pub(crate) fn insert(&mut self, record: EntityState) {
+        self.0.insert(
+            (record.entity_type.clone(), record.entity_id.clone()),
+            record,
+        );
+    }
+
+    fn get(&self, entity_type: &str, entity_id: &str) -> Option<&EntityState> {
+        self.0
+            .get(&(entity_type.to_string(), entity_id.to_string()))
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,15 +107,17 @@ impl ConstraintViolation {
     }
 }
 
-/// Check FK integrity for create/update style writes.
+/// Check FK integrity for create/update style writes. A target in `pending`
+/// exists: the write creates it once it commits.
 #[instrument(skip_all, fields(otel.name = "constraint.pre_upsert_relation_checks", tenant = %tenant, entity_type, entity_id, operation))]
-pub async fn pre_upsert_relation_checks(
+pub(crate) async fn pre_upsert_relation_checks(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
     entity_id: &str,
     operation: &str,
     fields: &serde_json::Value,
+    pending: &PendingRecords,
 ) -> Result<(), ConstraintViolation> {
     if !state.cross_invariant_enforce {
         state.metrics.record_cross_bypass();
@@ -157,9 +183,10 @@ pub async fn pre_upsert_relation_checks(
                 operation,
             ));
         };
-        if !state
-            .ensure_entity_loaded(tenant, &edge.to_entity, target_id)
-            .await
+        if pending.get(&edge.to_entity, target_id).is_none()
+            && !state
+                .ensure_entity_loaded(tenant, &edge.to_entity, target_id)
+                .await
         {
             tracing::warn!(
                 tenant = %tenant_name, entity_type, entity_id, operation,
@@ -253,17 +280,24 @@ pub async fn pre_delete_relation_checks(
     Ok(())
 }
 
-/// Evaluate cross-entity invariants triggered by a write.
-#[instrument(skip_all, fields(otel.name = "constraint.post_write_invariant_checks", tenant = %tenant, entity_type, entity_id, action_name = action, operation))]
-pub async fn post_write_invariant_checks(
+/// Evaluate the cross-entity invariants `write` triggers on the record it
+/// stores (`fields`). A related record in `pending` is read as it will stand
+/// once the write commits.
+#[instrument(skip_all, fields(otel.name = "constraint.post_write_invariant_checks", tenant = %write.tenant, entity_type = write.entity_type, entity_id = write.entity_id, action_name = write.action, operation = write.operation))]
+pub(crate) async fn post_write_invariant_checks(
     state: &ServerState,
-    tenant: &TenantId,
-    entity_type: &str,
-    entity_id: &str,
-    action: &str,
+    write: RecordWrite<'_>,
     fields: &serde_json::Value,
-    operation: &str,
+    pending: &PendingRecords,
 ) -> Result<(), ConstraintViolation> {
+    let RecordWrite {
+        tenant,
+        entity_type,
+        entity_id,
+        action,
+        operation,
+        ..
+    } = write;
     if !state.cross_invariant_enforce {
         state.metrics.record_cross_bypass();
         return Ok(());
@@ -333,9 +367,11 @@ pub async fn post_write_invariant_checks(
             ));
         };
 
-        if !state
-            .ensure_entity_loaded(tenant, &assertion.target_entity, target_id)
-            .await
+        let pending_target = pending.get(&assertion.target_entity, target_id);
+        if pending_target.is_none()
+            && !state
+                .ensure_entity_loaded(tenant, &assertion.target_entity, target_id)
+                .await
         {
             tracing::warn!(
                 tenant = %tenant_name, entity_type, entity_id, invariant = %inv.name,
@@ -364,16 +400,19 @@ pub async fn post_write_invariant_checks(
             return Err(violation);
         }
 
-        let target_field_value = match state
-            .get_tenant_entity_state(tenant, &assertion.target_entity, target_id)
-            .await
-        {
-            Ok(resp) => {
+        let target = match pending_target {
+            Some(target) => Ok(target.clone()),
+            None => state
+                .get_tenant_entity_state(tenant, &assertion.target_entity, target_id)
+                .await
+                .map(|resp| resp.state),
+        };
+        let target_field_value = match target {
+            Ok(target) => {
                 if assertion.field_name == "status" {
-                    resp.state.status.clone()
+                    target.status
                 } else {
-                    let target_fields =
-                        serde_json::to_value(&resp.state.fields).unwrap_or_default();
+                    let target_fields = serde_json::to_value(&target.fields).unwrap_or_default();
                     let Some(value) =
                         extract_field_as_string(&target_fields, &assertion.field_name)
                     else {

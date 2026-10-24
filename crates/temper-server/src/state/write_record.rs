@@ -13,6 +13,7 @@
 //! finish what an earlier move started, such as ending a session whose parent
 //! was archived since.
 
+use futures_util::FutureExt;
 use serde_json::Value;
 use temper_authz::SecurityContext;
 use temper_jit::table::{RelatedMap, TransitionTable};
@@ -20,9 +21,9 @@ use temper_runtime::tenant::TenantId;
 use tracing::instrument::WithSubscriber;
 
 use super::ServerState;
-use crate::entity_actor::effects::{self, FieldSyncMode};
+use crate::entity_actor::effects::{self, FieldSyncMode, SpawnRequest};
 use crate::entity_actor::{EntityActor, EntityState};
-use crate::odata::constraints::{self, ConstraintViolation};
+use crate::odata::constraints::{self, ConstraintViolation, PendingRecords};
 
 /// Where a write came from. It decides whether the record the write stores
 /// is checked before it is applied.
@@ -95,26 +96,26 @@ impl ServerState {
         write: RecordWrite<'_>,
         record: &Value,
     ) -> Result<(), ConstraintViolation> {
-        self.check_record_and_links(write, record, record).await
+        self.check_record_with_pending(write, record, &PendingRecords::default())
+            .await
     }
 
     /// [`Self::check_record_to_store`], with relation integrity and
-    /// cross-invariants reading the related ids from `links`, which differs
-    /// from `record` only when the write names a record the kernel creates
-    /// after it commits.
-    async fn check_record_and_links(
+    /// cross-invariants reading each record in `pending`, which the write
+    /// brings into being after it commits, as it will then stand.
+    async fn check_record_with_pending(
         &self,
         write: RecordWrite<'_>,
         record: &Value,
-        links: &Value,
+        pending: &PendingRecords,
     ) -> Result<(), ConstraintViolation> {
         let RecordWrite {
             caller,
             tenant,
             entity_type,
             entity_id,
-            action,
             operation,
+            ..
         } = write;
         if caller == WriteCaller::Kernel {
             return Ok(());
@@ -125,7 +126,8 @@ impl ServerState {
             entity_type,
             entity_id,
             operation,
-            links,
+            record,
+            pending,
         )
         .await?;
         constraints::pre_upsert_field_invariant_checks(
@@ -137,16 +139,7 @@ impl ServerState {
             record,
         )
         .await?;
-        constraints::post_write_invariant_checks(
-            self,
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            links,
-            operation,
-        )
-        .await
+        constraints::post_write_invariant_checks(self, write, record, pending).await
     }
 
     /// Check the record `action` will store when applied to `current`.
@@ -172,15 +165,19 @@ impl ServerState {
         if !self.action_record_checked(caller, tenant, &current.entity_type, action) {
             return Ok(());
         }
-        let Some((record, links)) = self
+        // Boxed as a trait object: the preview runs the action interpreter,
+        // and its future type nested in every dispatch path is too deep for
+        // their callers' `Send` checks.
+        let Some((record, pending)) = self
             .action_record(tenant, table, current, action, params, related)
+            .boxed()
             .await
         else {
             // The interpreter refused on `current`, so the action stores
             // nothing there, and the actor applies it to no other state.
             return Ok(());
         };
-        self.check_record_and_links(
+        self.check_record_with_pending(
             RecordWrite {
                 caller,
                 tenant,
@@ -190,7 +187,7 @@ impl ServerState {
                 operation: "action",
             },
             &record,
-            links.as_ref().unwrap_or(&record),
+            &pending,
         )
         .await
     }
@@ -228,13 +225,9 @@ impl ServerState {
         has_relations || has_cross_invariants || has_field_invariants
     }
 
-    /// The fields `action` stores when applied to `current`: the actor's own
-    /// action interpreter run on a copy of the state, or `None` when the
-    /// interpreter refuses the action on that state. When the action spawns
-    /// children, the second value is the same record with each field that
-    /// stores a child's id as it stood before the action, for the checks
-    /// that look related records up: the kernel creates those children only
-    /// after this commit.
+    /// The fields `action` stores when applied to `current`, and the
+    /// children its spawns create once it commits, or `None` when the
+    /// interpreter refuses the action on that state.
     async fn action_record(
         &self,
         tenant: &TenantId,
@@ -243,12 +236,35 @@ impl ServerState {
         action: &str,
         params: &Value,
         related: &RelatedMap,
-    ) -> Option<(Value, Option<Value>)> {
-        let mut preview = current.clone();
+    ) -> Option<(Value, PendingRecords)> {
+        let (record, spawns) = self
+            .preview_action(tenant, table, current.clone(), action, params, related)
+            .await?;
+        let mut pending = PendingRecords::default();
+        for spawn in &spawns {
+            if let Some(child) = self.pending_child(tenant, current, spawn, params).await {
+                pending.insert(child);
+            }
+        }
+        Some((record.fields, pending))
+    }
+
+    /// `state` after `action`, with the spawns the action requests: the
+    /// actor's own action interpreter run on the copy, or `None` when the
+    /// interpreter refuses the action on that state.
+    async fn preview_action(
+        &self,
+        tenant: &TenantId,
+        table: &TransitionTable,
+        mut state: EntityState,
+        action: &str,
+        params: &Value,
+        related: &RelatedMap,
+    ) -> Option<(EntityState, Vec<SpawnRequest>)> {
         // The preview repeats the interpreter's own log lines; only the real
         // application of the action should appear in the logs.
         let result = crate::entity_actor::action_input::process_action_with_blob_prestate(
-            &mut preview,
+            &mut state,
             table,
             action,
             params,
@@ -261,32 +277,64 @@ impl ServerState {
         )
         .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await;
-        if !result.success {
-            return None;
-        }
-        let record = preview.fields;
-        let mut child_fields = result
-            .spawn_requests
-            .iter()
-            .filter_map(|spawn| spawn.store_id_in.as_deref())
-            .peekable();
-        if child_fields.peek().is_none() {
-            return Some((record, None));
-        }
-        let mut links = record.clone();
-        if let Some(links) = links.as_object_mut() {
-            for field in child_fields {
-                match current.fields.get(field) {
-                    Some(previous) => {
-                        links.insert(field.to_string(), previous.clone());
-                    }
-                    None => {
-                        links.remove(field);
-                    }
-                }
-            }
-        }
-        Some((record, Some(links)))
+        result.success.then_some((state, result.spawn_requests))
+    }
+
+    /// The child `spawn` creates once `parent`'s action (with `params`)
+    /// commits, as it will stand after its initial action, from the same plan
+    /// the kernel creates it by. `None` when the kernel creates no child for
+    /// the spawn.
+    async fn pending_child(
+        &self,
+        tenant: &TenantId,
+        parent: &EntityState,
+        spawn: &SpawnRequest,
+        params: &Value,
+    ) -> Option<EntityState> {
+        let plan = self
+            .spawn_plan(
+                tenant,
+                &parent.entity_type,
+                &parent.entity_id,
+                spawn,
+                params,
+            )
+            .await
+            .ok()?;
+        let child = if self
+            .ensure_entity_loaded(tenant, &spawn.entity_type, &spawn.entity_id)
+            .await
+        {
+            self.get_tenant_entity_state(tenant, &spawn.entity_type, &spawn.entity_id)
+                .await
+                .ok()?
+                .state
+        } else {
+            EntityActor::build_initial_state(
+                &spawn.entity_type,
+                &spawn.entity_id,
+                &plan.table,
+                &plan.initial_fields,
+            )
+        };
+        let Some((action, action_params)) = &plan.initializer else {
+            return Some(child);
+        };
+        let related = self
+            .resolve_guards_from_fields(tenant, &spawn.entity_type, action, &child.fields)
+            .await;
+        let initialized = self
+            .preview_action(
+                tenant,
+                &plan.table,
+                child.clone(),
+                action,
+                action_params,
+                &related,
+            )
+            .await;
+        // A refused initial action leaves the child in its first state.
+        Some(initialized.map_or(child, |(initialized, _)| initialized))
     }
 }
 
