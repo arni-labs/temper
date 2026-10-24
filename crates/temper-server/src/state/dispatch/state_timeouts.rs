@@ -29,6 +29,12 @@
 //! waiting row again: for the rest of its budget, or at once if it fell due
 //! while the server was down. A timer fires once and as whoever armed it.
 //!
+//! A fire ends its timer once the record answers it, a refusal included: a
+//! guard's no stays no until a transition arms the timer again. A fire that
+//! gets no answer (the record could not be read, or the dispatch failed
+//! before the record replied) is armed again for a full budget, as long as it
+//! is still the record's current arm and its spec still declares it.
+//!
 //! The arm logic also detects the **hydration case**: the entity is in a
 //! state with a declared timeout but has no live in-memory timer (seq == 0 in
 //! the tracker), as for a timer armed before its row was kept. Then the
@@ -593,9 +599,10 @@ impl crate::state::ServerState {
     /// Start one armed timer's task, with the cancellation value
     /// [`Self::reserve_state_timer`] gave it: it waits `delay`, then fires the
     /// timer's action as the timer's identity if no newer arm or state change
-    /// has superseded it, and removes the timer's durable row when it ends.
-    /// With a `gate`, the fire waits for one of its permits and holds it until
-    /// the timer ends.
+    /// has superseded it, and removes the timer's durable row when it ends. A
+    /// fire that gets no answer arms the timer again first
+    /// ([`Self::rearm_unanswered_state_timer`]). With a `gate`, the fire waits
+    /// for one of its permits and holds it until the timer ends.
     pub(super) fn spawn_state_timer(
         &self,
         timer: ArmedTimer,
@@ -603,7 +610,6 @@ impl crate::state::ServerState {
         gate: Option<Arc<Semaphore>>,
         armed_seq: u64,
     ) {
-        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
             .agent_ctx
@@ -659,53 +665,12 @@ impl crate::state::ServerState {
             );
 
             async move {
-                // Sequence-based cancellation check. A newer arm (or a state
-                // change that bumped the seq on exit) renders this timer a
-                // no-op. Then the timer fires only on a record still in its
-                // state, under a spec that still declares it: a timer armed at
-                // boot has no other check against changes made before the
-                // restart, and a record can rehydrate into another state after
-                // a spec install. On a record that is no longer where this
-                // timer belongs, the timer its current state declares is armed.
-                if state.state_timeout_tracker.current(&key) == armed_seq
-                    && let Ok(current) = state
-                        .get_tenant_entity_state(
-                            &timer.tenant,
-                            &timer.entity_type,
-                            &timer.entity_id,
-                        )
-                        .await
-                {
-                    let belongs =
-                        current.state.status == timer.state && state.declares_state_timer(&timer);
-                    if !belongs {
-                        state
-                            .reconcile_state_timers(
-                                &timer.tenant,
-                                &timer.entity_type,
-                                &timer.entity_id,
-                                &current.state,
-                                Some(&timer.agent_ctx),
-                            )
-                            .await;
-                    } else if !state.state_timer_already_fired(&timer, &current.state) {
-                        crate::runtime_metrics::record_state_timeout_fired(
-                            timer.tenant.as_str(),
-                            &timer.entity_type,
-                            &timer.state,
-                            &timer.action,
-                        );
-                        let _ = state
-                            .dispatch_tenant_action(
-                                &timer.tenant,
-                                &timer.entity_type,
-                                &timer.entity_id,
-                                &timer.action,
-                                timer.params.clone(),
-                                &timer.agent_ctx,
-                            )
-                            .await;
-                    }
+                // A timer armed again writes its new row before this one
+                // removes its own, so no restart falls between the two.
+                if let Err(error) = state.fire_state_timer(&timer, armed_seq).await {
+                    state
+                        .rearm_unanswered_state_timer(&timer, armed_seq, &error)
+                        .await;
                 }
                 state.forget_state_timer(&timer).await;
                 state.state_timeout_tracker.dec_pending(&timer.entity_type);
@@ -713,6 +678,111 @@ impl crate::state::ServerState {
             .instrument(span)
             .await;
         });
+    }
+
+    /// Fire `timer` unless a newer arm or a state change has superseded it
+    /// (its `armed_seq` is no longer current). Then it fires only on a record
+    /// still in its state, under a spec that still declares it: a timer armed
+    /// at boot has no other check against changes made before the restart,
+    /// and a record can rehydrate into another state after a spec install. On
+    /// a record that is no longer where this timer belongs, the timer its
+    /// current state declares is armed.
+    ///
+    /// # Errors
+    ///
+    /// The fire got no answer: the record could not be read, or the action's
+    /// dispatch failed before the record answered it (an ask timeout or a
+    /// full mailbox after its retries, a deferred admission, a stopped
+    /// actor). A refusal is an answer, not an error.
+    async fn fire_state_timer(&self, timer: &ArmedTimer, armed_seq: u64) -> Result<(), String> {
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        if self.state_timeout_tracker.current(&key) != armed_seq {
+            return Ok(());
+        }
+        let current = self
+            .get_tenant_entity_state(&timer.tenant, &timer.entity_type, &timer.entity_id)
+            .await?;
+        let belongs = current.state.status == timer.state && self.declares_state_timer(timer);
+        if !belongs {
+            self.reconcile_state_timers(
+                &timer.tenant,
+                &timer.entity_type,
+                &timer.entity_id,
+                &current.state,
+                Some(&timer.agent_ctx),
+            )
+            .await;
+            return Ok(());
+        }
+        if self.state_timer_already_fired(timer, &current.state) {
+            return Ok(());
+        }
+        crate::runtime_metrics::record_state_timeout_fired(
+            timer.tenant.as_str(),
+            &timer.entity_type,
+            &timer.state,
+            &timer.action,
+        );
+        self.dispatch_tenant_action(
+            &timer.tenant,
+            &timer.entity_type,
+            &timer.entity_id,
+            &timer.action,
+            timer.params.clone(),
+            &timer.agent_ctx,
+        )
+        .await
+        .map(|_answer| ())
+    }
+
+    /// Arm `timer` again for a full budget after its fire got no answer
+    /// (`error`), while it is still its record's current arm (no transition
+    /// has armed or cancelled another since) and its spec still declares it.
+    ///
+    /// Without this a fire that got no answer ended its timer for good: its
+    /// row was removed, nothing armed it again, and the tracker still listed
+    /// it as armed, so a reconcile kept a timer no task ran. On 2026-10-24 a
+    /// record's 30-second repeating timer stopped for about 20 minutes around
+    /// an app install, until someone dispatched its action by hand.
+    ///
+    /// The new arming waits a full budget but keeps the clock start, which
+    /// says when its state's clock started: a restart while it waits fires it
+    /// at once, as it is due, and for a timer that fires once, a first fire
+    /// whose write landed after its dispatch gave up counts as fired
+    /// ([`Self::state_timer_already_fired`]). There is no attempt limit: each
+    /// attempt waits a full budget, and the timer ends once its record
+    /// answers, leaves the state, or its spec stops declaring it.
+    async fn rearm_unanswered_state_timer(&self, timer: &ArmedTimer, armed_seq: u64, error: &str) {
+        // PRECONDITION: spec validation refuses a zero budget, which would
+        // make an unanswered timer retry in a tight loop.
+        debug_assert!(timer.after_seconds > 0, "state timeout with a zero budget");
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        if self.state_timeout_tracker.current(&key) != armed_seq
+            || !self.declares_state_timer(timer)
+        {
+            return;
+        }
+        let again = ArmedTimer {
+            arm_id: sim_uuid().to_string(),
+            ..timer.clone()
+        };
+        // A new arm id: removing the old timer's row leaves this one's.
+        debug_assert_ne!(again.arm_id, timer.arm_id);
+        let delay = Duration::from_secs(timer.after_seconds);
+        let armed_again = self
+            .start_armed_timer(again, delay, Reservation::Fresh)
+            .await;
+        tracing::warn!(
+            tenant = %timer.tenant,
+            entity_type = %timer.entity_type,
+            entity_id = %timer.entity_id,
+            state = %timer.state,
+            action = %timer.action,
+            armed_again,
+            retry_in_secs = timer.after_seconds,
+            %error,
+            "state timeout fire got no answer"
+        );
     }
 }
 
