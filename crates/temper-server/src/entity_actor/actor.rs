@@ -173,7 +173,13 @@ pub struct EntityActor {
     /// The delete that holds this entity, removing it with others
     /// (`delete_hold`); its writes are refused while one does.
     pub(super) held_by: Mutex<Option<uuid::Uuid>>,
+    /// Run once with the state this actor rehydrated from stored events.
+    on_rehydrated: Option<RehydrateHook>,
 }
+
+/// What an entity actor runs when it starts from stored events, with the
+/// state it rehydrated into, before it takes any message.
+pub(crate) type RehydrateHook = Arc<dyn Fn(&EntityState) + Send + Sync>;
 
 impl EntityActor {
     pub(crate) fn build_initial_state(
@@ -310,6 +316,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             held_by: Mutex::new(None),
+            on_rehydrated: None,
         }
     }
 
@@ -336,6 +343,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             held_by: Mutex::new(None),
+            on_rehydrated: None,
         }
     }
 
@@ -367,6 +375,12 @@ impl EntityActor {
         store: Option<Arc<dyn crate::storage::BlobStore>>,
     ) -> Self {
         self.legacy_blob_store = store;
+        self
+    }
+
+    /// Attach the hook run when this actor rehydrates from stored events.
+    pub(crate) fn with_on_rehydrated(mut self, hook: Option<RehydrateHook>) -> Self {
+        self.on_rehydrated = hook;
         self
     }
 
@@ -1056,6 +1070,11 @@ impl Actor for EntityActor {
                 self.blob_store.as_ref(),
             )
             .await?;
+            if state.sequence_nr > 0
+                && let Some(hook) = self.on_rehydrated.as_ref()
+            {
+                hook(&state);
+            }
         }
 
         // Persist a bootstrap Created event for first-time entities so initial
