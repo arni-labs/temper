@@ -14,7 +14,7 @@ Writes key=value lines to $GITHUB_OUTPUT (stdout when unset):
   lane      full | pr
   mode      full | affected | none
   packages  space-separated package names to test (empty for none)
-  server    true when temper-server is among them (DST, GEPA modules)
+  test_args cargo arguments that select those packages' tests (empty for none)
   rust      false only when nothing but DOCS changed
   shards    JSON matrix of Tests shards for the pr lane
 """
@@ -123,10 +123,16 @@ def shards(packages):
     return cells
 
 
+def test_args(packages):
+    # temper-server gets the features the workspace run turns on for it, as in shards().
+    args = " ".join(f"-p {name}" for name in sorted(packages))
+    return f"{args} --features {SERVER_FEATURES}" if SERVER in packages else args
+
+
 def main():
     lane = "pr" if os.environ.get("EVENT") == "pull_request" or os.environ.get("CHANGED_PATHS", "").strip() else "full"
     dirs, names, dependents = workspace()
-    out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "server": "true", "rust": "true"}
+    out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true"}
     if lane == "pr":
         direct, outside, docs_only = set(), [], True
         for path in changed_paths():
@@ -144,7 +150,7 @@ def main():
             packages = closure(direct, dependents)
             out["mode"] = "affected" if packages else "none"
         out["packages"] = " ".join(sorted(packages))
-        out["server"] = "true" if SERVER in packages else "false"
+        out["test_args"] = test_args(packages)
         out["rust"] = "false" if docs_only else "true"
         out["shards"] = json.dumps({"include": shards(packages)}) if packages else json.dumps({"include": []})
         print(f"Direct: {sorted(direct)}; testing {len(packages)} package(s): {out['packages'] or 'none'}", file=sys.stderr)
