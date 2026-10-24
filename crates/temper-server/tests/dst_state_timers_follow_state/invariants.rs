@@ -40,6 +40,37 @@ pub(super) async fn check_rows_follow_state(
     Ok(())
 }
 
+/// Invariant: `jobs`, known to be in `state` and not read since the boot, have
+/// its timer rows (none when deleted). Checked without reading them, since a
+/// read rehydrates a record and arms its timer, so only the boot armed these.
+pub(super) fn check_rows_before_reads(
+    world: &World,
+    jobs: &[Job],
+    state: &str,
+    run: &Run,
+) -> Result<(), String> {
+    for job in jobs {
+        let row = world.rows.row(job.tenant.as_str(), &job.id);
+        let (current, wanted) = if run.is_deleted(job) {
+            ("<deleted>", None)
+        } else {
+            (state, timer_action(state).map(|_| state))
+        };
+        if row.as_ref().map(|row| row.state.as_str()) != wanted {
+            return Err(run.fail(
+                "the boot arms every record's timer",
+                format!(
+                    "before any read: {}/{} is {current} but its timer row is {:?}",
+                    job.tenant,
+                    job.id,
+                    row.map(|row| row.state)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Invariants at the end: every record reached `Done` on its timers, every
 /// timer fired once and in its own state, and no row is left.
 pub(super) async fn check_all_done(
