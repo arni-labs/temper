@@ -11,6 +11,7 @@
 pub mod dispatcher;
 pub(crate) mod guard;
 pub(crate) mod params;
+mod principal;
 pub mod registry;
 mod repeat_stop;
 pub(crate) mod resolver;

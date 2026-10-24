@@ -28,10 +28,17 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
         <Property Name="Status" Type="Edm.String"/>
       </EntityType>
+      <EntityType Name="Cell">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Edm.String"/>
+        <Property Name="child_id" Type="Edm.String"/>
+      </EntityType>
       <EntityContainer Name="Container">
         <EntitySet Name="Tickers" EntityType="Temper.ReactionChain.Ticker"/>
         <EntitySet Name="Nodes" EntityType="Temper.ReactionChain.Node"/>
         <EntitySet Name="Seeds" EntityType="Temper.ReactionChain.Seed"/>
+        <EntitySet Name="Cells" EntityType="Temper.ReactionChain.Cell"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
@@ -119,6 +126,26 @@ target_action = "Sprout"
 resolve_target = { kind = "create" }
 "#;
 
+/// `Divide` spawns a new Cell that divides in turn: a loop through spawns,
+/// with no reaction in it.
+const CELL_IOA: &str = r#"
+[automaton]
+name = "Cell"
+states = ["Alive"]
+initial = "Alive"
+
+[[state]]
+name = "child_id"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Divide"
+kind = "input"
+from = ["Alive"]
+effect = ["spawn('Cell', 'Divide', child_id)"]
+"#;
+
 fn chain_state() -> crate::ServerState {
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(CSDL).expect("CSDL parses");
@@ -130,6 +157,7 @@ fn chain_state() -> crate::ServerState {
             ("Ticker", TICKER_IOA),
             ("Node", NODE_IOA),
             ("Seed", SEED_IOA),
+            ("Cell", CELL_IOA),
         ],
     );
     let state = crate::ServerState::from_registry(ActorSystem::new("reaction-chain"), registry);
@@ -152,6 +180,23 @@ fn stops(state: &crate::ServerState, entity_type: &str, entity_id: &str) -> Vec<
 }
 
 async fn run(state: &crate::ServerState, entity_type: &str, entity_id: &str, action: &str) {
+    run_as(
+        state,
+        entity_type,
+        entity_id,
+        action,
+        &AgentContext::for_service("reaction-chain-test"),
+    )
+    .await;
+}
+
+async fn run_as(
+    state: &crate::ServerState,
+    entity_type: &str,
+    entity_id: &str,
+    action: &str,
+    agent_ctx: &AgentContext,
+) {
     let response = state
         .dispatch_tenant_action(
             &TenantId::default(),
@@ -159,11 +204,26 @@ async fn run(state: &crate::ServerState, entity_type: &str, entity_id: &str, act
             entity_id,
             action,
             serde_json::json!({}),
-            &AgentContext::for_service("reaction-chain-test"),
+            agent_ctx,
         )
         .await
         .expect("dispatch");
     assert!(response.success, "{action}: {:?}", response.error);
+}
+
+/// Nodes `n0..n{count}`, each naming the next as `next_id`.
+async fn seed_nodes(state: &crate::ServerState, count: usize) {
+    for index in 0..count {
+        let fields = if index + 1 < count {
+            serde_json::json!({ "next_id": format!("n{}", index + 1) })
+        } else {
+            serde_json::json!({})
+        };
+        state
+            .get_or_create_tenant_entity(&TenantId::default(), "Node", &format!("n{index}"), fields)
+            .await
+            .expect("seed node");
+    }
 }
 
 /// The old bound let `Tick` run itself eight more times before stopping it.
@@ -196,17 +256,7 @@ async fn a_chain_that_never_repeats_runs_to_its_end() {
     const NODES: usize = 200;
     let state = chain_state();
     let tenant = TenantId::default();
-    for index in 0..NODES {
-        let fields = if index + 1 < NODES {
-            serde_json::json!({ "next_id": format!("n{}", index + 1) })
-        } else {
-            serde_json::json!({})
-        };
-        state
-            .get_or_create_tenant_entity(&tenant, "Node", &format!("n{index}"), fields)
-            .await
-            .expect("seed node");
-    }
+    seed_nodes(&state, NODES).await;
 
     run(&state, "Node", "n0", "Pass").await;
 
@@ -248,6 +298,87 @@ async fn a_loop_that_makes_an_entity_each_lap_stops_on_its_second_lap() {
         stopped[0]["cycle"],
         serde_json::json!(["Seed(new).Sprout", "Seed(new).Sprout"])
     );
+}
+
+/// A spawned child's initial action is a step on an entity the chain made, so
+/// a Cell whose child divides in turn stops at the second division, on the
+/// Cell whose spawn would repeat it. Before, Cells were made for as long as
+/// the server ran.
+#[tokio::test]
+async fn a_spawn_loop_stops_at_its_first_repeat() {
+    let state = chain_state();
+    let tenant = TenantId::default();
+    run(&state, "Cell", "c0", "Divide").await;
+    let child = state
+        .get_tenant_entity_state(&tenant, "Cell", "c0")
+        .await
+        .expect("Cell c0")
+        .state
+        .fields["child_id"]
+        .as_str()
+        .expect("c0 names its child")
+        .to_string();
+
+    let mut refused = Vec::new();
+    for _ in 0..250 {
+        refused = state
+            .entity_observe_replay(tenant.as_str(), "Cell", &child, 0)
+            .events
+            .into_iter()
+            .filter(|event| event.event_name == "integration_callback_rejected")
+            .map(|event| event.data)
+            .collect();
+        if !refused.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(refused.len(), 1, "the child's own spawn is refused once");
+    assert_eq!(refused[0]["action"], "Divide");
+    let error = refused[0]["error"].as_str().expect("refusal says why");
+    assert!(
+        error.contains("Cell(new).Divide -> Cell(new).Divide"),
+        "{error}"
+    );
+    let cells = state.list_entity_ids(&tenant, "Cell");
+    assert_eq!(cells.len(), 2, "c0 and the one Cell it made: {cells:?}");
+}
+
+/// A reaction's idempotency key is the same length at every depth of its
+/// chain. It used to grow by a suffix at each reaction, so the keys a chain
+/// stored cost the square of its length.
+#[tokio::test]
+async fn reaction_keys_stay_one_length_along_a_chain() {
+    const NODES: usize = 40;
+    let state = chain_state();
+    seed_nodes(&state, NODES).await;
+    let caller = AgentContext {
+        idempotency_key: Some("caller-key".to_string()),
+        ..AgentContext::for_service("reaction-chain-test")
+    };
+    run_as(&state, "Node", "n0", "Pass", &caller).await;
+
+    let mut keys = Vec::new();
+    for index in 1..NODES {
+        let node = state
+            .get_tenant_entity_state(&TenantId::default(), "Node", &format!("n{index}"))
+            .await
+            .expect("Node state")
+            .state;
+        let pass = node
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.action == "Pass")
+            .unwrap_or_else(|| panic!("node n{index} did not pass"));
+        keys.push(pass.idempotency_key.clone().expect("a reaction key"));
+    }
+    assert!(
+        keys.iter().all(|key| key.len() == keys[0].len()),
+        "{keys:?}"
+    );
+    let distinct: std::collections::BTreeSet<_> = keys.iter().collect();
+    assert_eq!(distinct.len(), keys.len(), "each reaction has its own key");
 }
 
 /// A reaction stopped as a repeat is a failed result, not a missing one.

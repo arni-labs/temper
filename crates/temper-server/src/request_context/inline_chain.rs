@@ -24,8 +24,13 @@
 //! action, compensation) starts a new chain: the caller is not waiting for
 //! it, so a loop through it is paced by that work and counted by
 //! [`MAX_CALLBACK_HOPS`](super::MAX_CALLBACK_HOPS) instead. A spawned child's
-//! initial action continues its parent's chain, so a loop that spawns a child
-//! whose reaction comes back to the parent's action stops there.
+//! initial action is the next step of its parent's chain, on an entity the
+//! chain made, so a loop through spawns stops at its first repeat too.
+//!
+//! So a chain is bounded by its data: every entity it makes is one step per
+//! type and action the tenant's specs declare, and every other step is on an
+//! entity whose id it read (reaction ids and params come only from literals,
+//! the source's id and its fields).
 
 use std::fmt;
 use std::sync::Arc;
