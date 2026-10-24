@@ -743,28 +743,42 @@ impl EventStore for TenantStoreRouter {
     // ADR-0155: forward the vector-index surface to the per-tenant store so kNN works
     // on the routed Turso deployment. (Keys deliberately fall through to the no-op
     // defaults — Turso does not maintain entity_key_index live; see event_store.rs.)
-    #[instrument(skip_all, fields(persistence_id, otel.name = "router.append_with_index_rows"))]
-    async fn append_with_index_rows(
+    #[instrument(skip_all, fields(persistence_id, otel.name = "router.append_with_rows"))]
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         let (tenant, _, _) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
         let store = self.store_for_tenant(tenant).await?;
         store
-            .append_with_index_rows(
-                persistence_id,
-                expected_sequence,
-                events,
-                key_rows,
-                vector_rows,
-                reconcile_vectors,
-            )
+            .append_with_rows(persistence_id, expected_sequence, events, rows)
+            .await
+    }
+
+    #[instrument(skip_all, fields(tenant, otel.name = "router.list_scheduled_actions"))]
+    async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store.list_scheduled_actions(tenant).await
+    }
+
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "router.delete_scheduled_action"))]
+    async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .delete_scheduled_action(tenant, entity_type, entity_id, arm_id)
             .await
     }
 

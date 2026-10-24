@@ -39,6 +39,7 @@ async fn action(actor: &ActorRef<EntityMsg>, name: &str) -> EntityResponse {
     actor
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: name.to_string(),
                 params: serde_json::json!({}),
                 related: BTreeMap::new(),

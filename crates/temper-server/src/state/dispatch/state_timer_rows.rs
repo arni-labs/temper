@@ -13,8 +13,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use temper_authz::SecurityContext;
 use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
@@ -23,6 +21,7 @@ use tokio::sync::Semaphore;
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use super::state_timer_follow::{BootCallers, BootTimers};
 use crate::request_context::AgentContext;
+use crate::request_context::armed_by::{decode_armed_by, encode_armed_by};
 use crate::state::ServerState;
 use crate::storage::{MetadataTimerRows, StateTimerStore};
 
@@ -36,62 +35,6 @@ const BOOT_FIRES_AT_ONCE: usize = 8;
 /// A tenant's declared timeouts: `(entity type, state)` to
 /// `(after_seconds, on_timeout)`.
 type DeclaredTimeouts = BTreeMap<(String, String), (u64, String)>;
-
-/// The identity part of an [`AgentContext`] that a timer row keeps. Runtime
-/// budgets and the idempotency key are not kept: a timer fires as a new
-/// background action.
-#[derive(Serialize, Deserialize)]
-struct ArmedBy {
-    security_ctx: Option<SecurityContext>,
-    agent_id: Option<String>,
-    session_id: Option<String>,
-    agent_type: Option<String>,
-    intent: Option<String>,
-    trace_id: Option<String>,
-    parent_span_id: Option<String>,
-    workflow_root_entity_type: Option<String>,
-    workflow_root_entity_id: Option<String>,
-    workflow_run_id: Option<String>,
-    #[serde(default)]
-    observation_metadata: BTreeMap<String, String>,
-}
-
-impl From<&AgentContext> for ArmedBy {
-    fn from(agent: &AgentContext) -> Self {
-        Self {
-            security_ctx: agent.security_ctx.clone(),
-            agent_id: agent.agent_id.clone(),
-            session_id: agent.session_id.clone(),
-            agent_type: agent.agent_type.clone(),
-            intent: agent.intent.clone(),
-            trace_id: agent.trace_id.clone(),
-            parent_span_id: agent.parent_span_id.clone(),
-            workflow_root_entity_type: agent.workflow_root_entity_type.clone(),
-            workflow_root_entity_id: agent.workflow_root_entity_id.clone(),
-            workflow_run_id: agent.workflow_run_id.clone(),
-            observation_metadata: agent.observation_metadata.clone(),
-        }
-    }
-}
-
-impl From<ArmedBy> for AgentContext {
-    fn from(armed_by: ArmedBy) -> Self {
-        Self {
-            security_ctx: armed_by.security_ctx,
-            agent_id: armed_by.agent_id,
-            session_id: armed_by.session_id,
-            agent_type: armed_by.agent_type,
-            intent: armed_by.intent,
-            trace_id: armed_by.trace_id,
-            parent_span_id: armed_by.parent_span_id,
-            workflow_root_entity_type: armed_by.workflow_root_entity_type,
-            workflow_root_entity_id: armed_by.workflow_root_entity_id,
-            workflow_run_id: armed_by.workflow_run_id,
-            observation_metadata: armed_by.observation_metadata,
-            ..Self::default()
-        }
-    }
-}
 
 impl ServerState {
     /// Where `tenant`'s timer rows are kept: [`Self::state_timer_rows`] when
@@ -153,9 +96,11 @@ impl ServerState {
     /// declares no timeout now is removed. Then, in the background, each
     /// record that had a row follows the state it is in now (as whoever armed
     /// its row), through the same gate. A record in a timed state with no row
-    /// is not armed: it waits for its next action. Returns that background
-    /// walk, which ends with the boot's counts per tenant and type, and logs
-    /// them as `state timers after boot`.
+    /// is not armed: it waits for its next action. The scheduled actions left
+    /// waiting are armed again from their rows through the same gate
+    /// (`rearm_scheduled_actions`). Returns that background walk, which ends
+    /// with the boot's counts per tenant and type, and logs them as
+    /// `state timers after boot`.
     pub(crate) async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<BootTimers> {
         let started = Instant::now();
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
@@ -242,6 +187,7 @@ impl ServerState {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "re-armed state timers from the store"
         );
+        self.rearm_scheduled_actions(&gate, &mut counts).await;
         {
             // Serialize with install walks so none can consume startup changes
             // before saved identities and gates have been restored. The boot
@@ -283,9 +229,7 @@ impl ServerState {
 
 /// The identity a row's timer fires as, if the row keeps a readable one.
 fn row_armed_by(row: &StateTimerRecord) -> Option<AgentContext> {
-    serde_json::from_str::<ArmedBy>(&row.armed_by)
-        .ok()
-        .map(AgentContext::from)
+    decode_armed_by(&row.armed_by).ok()
 }
 
 fn timer_record(timer: &ArmedTimer) -> Result<StateTimerRecord, serde_json::Error> {
@@ -298,7 +242,7 @@ fn timer_record(timer: &ArmedTimer) -> Result<StateTimerRecord, serde_json::Erro
         sequence_nr: timer.sequence_nr,
         started_at: timer.started_at.to_rfc3339(),
         params: serde_json::to_string(&timer.params)?,
-        armed_by: serde_json::to_string(&ArmedBy::from(&timer.agent_ctx))?,
+        armed_by: encode_armed_by(&timer.agent_ctx)?,
     })
 }
 
@@ -312,8 +256,7 @@ fn armed_timer(
         .map_err(|error| format!("started_at: {error}"))?
         .with_timezone(&Utc);
     let params = serde_json::from_str(&row.params).map_err(|error| format!("params: {error}"))?;
-    let armed_by: ArmedBy =
-        serde_json::from_str(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
+    let armed_by = decode_armed_by(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
     Ok(ArmedTimer {
         boot_gate: None,
         tenant: tenant.clone(),
@@ -323,7 +266,7 @@ fn armed_timer(
         action: action.to_string(),
         params,
         after_seconds,
-        agent_ctx: armed_by.into(),
+        agent_ctx: armed_by,
         arm_id: row.arm_id.clone(),
         sequence_nr: row.sequence_nr,
         started_at,

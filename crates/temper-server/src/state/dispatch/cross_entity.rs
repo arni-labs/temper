@@ -61,7 +61,7 @@ impl crate::state::ServerState {
 
     /// Dispatch entity spawn requests post-transition.
     ///
-    /// This is a **sync** method (like `dispatch_scheduled_actions`) so that
+    /// This is a **sync** method (like `arm_scheduled_actions`) so that
     /// `tokio::spawn` inside it does not cause async recursion.
     /// Creates child entities and optionally dispatches initial actions.
     ///
