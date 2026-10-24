@@ -149,3 +149,75 @@ forbid(principal, action == Action::"Pass", resource is KgGate) unless { princip
         warnings[0].principals
     );
 }
+
+#[test]
+fn a_statement_that_excludes_another_type_still_names_who_may_arm_the_timer() {
+    // The permit applies to KgGate because it only leaves out another type.
+    let policy = r#"
+permit(principal == Customer::"member", action == Action::"Add", resource) unless { resource is KgOther };
+forbid(principal, action == Action::"Pass", resource is KgGate) unless { principal.id == "owner" };
+"#;
+    let warnings = state_timer_policy_warnings(&specs("KgGate", GATE), policy);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .principals
+            .contains(&"Customer::\"member\"".to_string()),
+        "{:?}",
+        warnings[0].principals
+    );
+}
+
+/// A lease a heartbeat keeps alive; it lapses when the heartbeats stop.
+const LEASE: &str = r#"
+[automaton]
+name = "KgLease"
+states = ["Unmade", "Held", "Lapsed"]
+initial = "Unmade"
+allow_indefinite_states = ["Unmade", "Held", "Lapsed"]
+
+[[action]]
+name = "Take"
+kind = "input"
+from = ["Unmade"]
+to = "Held"
+
+[[action]]
+name = "Heartbeat"
+kind = "input"
+from = ["Held"]
+
+[[state_timeout]]
+state = "Held"
+after_seconds = 30
+on_timeout = "Lapse"
+reset_on = ["Heartbeat"]
+
+[[action]]
+name = "Lapse"
+kind = "input"
+from = ["Held"]
+to = "Lapsed"
+"#;
+
+#[test]
+fn a_reset_that_arms_the_timer_again_counts_as_arming_it() {
+    // Only the owner takes a lease, but a member's heartbeat re-arms its timer.
+    let policy = format!(
+        r#"
+permit(principal, action == Action::"Take", resource is KgLease) when {{ {IS_OWNER} }};
+permit(principal, action == Action::"Heartbeat", resource is KgLease) when {{ {IS_MEMBER} }};
+forbid(principal, action == Action::"Lapse", resource is KgLease) unless {{ {IS_OWNER} }};
+"#
+    );
+    let warnings = state_timer_policy_warnings(&specs("KgLease", LEASE), &policy);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].entered_by, vec!["Heartbeat".to_string()]);
+    assert!(
+        warnings[0]
+            .principals
+            .contains(&"Customer::\"member\"".to_string()),
+        "{:?}",
+        warnings[0].principals
+    );
+}

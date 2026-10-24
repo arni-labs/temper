@@ -9,11 +9,12 @@
 //! warning and does not refuse.
 //!
 //! What the check can see: it asks Cedar's own evaluator about the principals
-//! the relevant statements name. For every string literal in a statement that
-//! names the timer's entity type, or that does not constrain the resource
-//! type, it tries a `Customer`, `Agent` and `Admin` principal with that id, and
-//! an `Agent` acting for it; plus one principal of each kind the statements do
-//! not name. The resource carries no attributes, the principal no role, agent
+//! the statements name. For every string literal in the policy text it tries a
+//! `Customer`, `Agent` and `Admin` principal with that id, and an `Agent`
+//! acting for it; plus one principal of each kind the statements do not name.
+//! Cedar decides which statements apply to the timer's entity type, so a
+//! literal from a statement about another type only adds a principal Cedar
+//! then judges. The resource carries no attributes, the principal no role, agent
 //! type or attributes, and the context only `actingFor`. Conditions on those
 //! (record fields, roles, entity hierarchy, other context) evaluate as Cedar
 //! evaluates a missing attribute, so a statement that depends on them can be
@@ -27,7 +28,7 @@ use serde::Serialize;
 use temper_authz::{
     AuthzDecision, AuthzDenial, AuthzEngine, Principal, PrincipalKind, SecurityContext,
 };
-use temper_spec::automaton::{Automaton, parse_automaton};
+use temper_spec::automaton::{Automaton, StateTimeout, parse_automaton};
 
 /// The Cedar action a create is judged as (`temper-server`'s OData create).
 const CREATE_ACTION: &str = "create";
@@ -75,11 +76,11 @@ pub fn state_timer_policy_warnings(
     let Ok(engine) = AuthzEngine::new(policy_text) else {
         return Vec::new();
     };
+    let candidates = candidate_principals(policy_text);
     let mut warnings = Vec::new();
     for (entity_type, automaton) in &timed {
-        let candidates = candidate_principals(policy_text, entity_type);
         for timeout in &automaton.state_timeouts {
-            let entering = entering_actions(automaton, &timeout.state, &timeout.on_timeout);
+            let entering = entering_actions(automaton, timeout);
             if entering.is_empty() {
                 continue;
             }
@@ -138,14 +139,23 @@ pub fn state_timer_policy_warnings(
     warnings
 }
 
-/// The Cedar actions that land a record in `state`: every action whose `to`
-/// is `state` (other than the timer's own action, which a timer makes), and
-/// `create` when `state` is where a record starts.
-fn entering_actions(automaton: &Automaton, state: &str, on_timeout: &str) -> Vec<String> {
+/// The Cedar actions that arm the timer: every action whose `to` is the
+/// timed state, every `reset_on` action that can leave the record in it (a
+/// reset arms the timer again), and `create` when the state is where a record
+/// starts. The timer's own action is left out: the timer makes it.
+fn entering_actions(automaton: &Automaton, timeout: &StateTimeout) -> Vec<String> {
+    let state = timeout.state.as_str();
     let mut actions: BTreeSet<String> = automaton
         .actions
         .iter()
-        .filter(|action| action.name != on_timeout && action.to.as_deref() == Some(state))
+        .filter(|action| action.name != timeout.on_timeout)
+        .filter(|action| {
+            let enters = action.to.as_deref() == Some(state);
+            let resets = timeout.reset_on.contains(&action.name)
+                && action.from.iter().any(|from| from == state)
+                && action.to.as_deref().is_none_or(|to| to == state);
+            enters || resets
+        })
         .map(|action| action.name.clone())
         .collect();
     if automaton.automaton.initial == state {
@@ -160,16 +170,13 @@ struct Candidate {
     label: String,
 }
 
-/// The principals the statements that can apply to `entity_type` name, in
-/// each principal kind, plus one each that they do not name.
-fn candidate_principals(policy_text: &str, entity_type: &str) -> Vec<Candidate> {
+/// The principals the statements name, in each principal kind, plus one each
+/// that they do not name.
+fn candidate_principals(policy_text: &str) -> Vec<Candidate> {
     let mut literals: BTreeSet<String> = BTreeSet::new();
     if let Ok(statements) = temper_authz::statements::policy_statements(policy_text) {
         for (span, _) in statements {
-            let statement = &policy_text[span];
-            if statement_can_apply(statement, entity_type) {
-                literals.extend(string_literals(statement));
-            }
+            literals.extend(string_literals(&policy_text[span]));
         }
     }
     let kinds = [
@@ -201,15 +208,6 @@ fn candidate_principals(policy_text: &str, entity_type: &str) -> Vec<Candidate> 
         });
     }
     candidates
-}
-
-/// Whether a statement can decide a request on `entity_type`: it names the
-/// type, or it does not constrain the resource's type at all.
-fn statement_can_apply(statement: &str, entity_type: &str) -> bool {
-    let names_type = statement
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .any(|word| word == entity_type);
-    names_type || !statement.contains("resource is") && !statement.contains("resource ==")
 }
 
 /// The string literals in a Cedar statement, unescaped for `\"` and `\\`.
