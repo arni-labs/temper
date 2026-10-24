@@ -104,25 +104,27 @@ impl ServerState {
         Some(Arc::new(MetadataTimerRows(store)))
     }
 
-    /// Write a newly armed timer's row. A failed write leaves the timer armed
-    /// in this process; only a restart before it fires would lose it.
-    pub(super) async fn persist_state_timer(&self, timer: &ArmedTimer) {
+    /// Write a newly armed timer's row; whether persistence succeeded. A
+    /// failed retry write retains its predecessor row for recovery at boot.
+    pub(super) async fn persist_state_timer(&self, timer: &ArmedTimer) -> bool {
         let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
-            return;
+            return false;
         };
         let record = match timer_record(timer) {
             Ok(record) => record,
             Err(error) => {
                 tracing::error!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                     entity_id = %timer.entity_id, %error, "state timer row not encodable");
-                return;
+                return false;
             }
         };
         if let Err(error) = store.upsert_state_timer(&record).await {
             tracing::error!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id, %error,
-                "state timer row not written; a restart before it fires loses it");
+                "state timer row not written; retaining any predecessor for restart");
+            return false;
         }
+        true
     }
 
     /// Remove an ended timer's row, unless a newer arm has replaced it.
@@ -130,18 +132,20 @@ impl ServerState {
         let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return;
         };
-        if let Err(error) = store
-            .delete_state_timer(
-                timer.tenant.as_str(),
-                &timer.entity_type,
-                &timer.entity_id,
-                &timer.arm_id,
-            )
-            .await
-        {
-            tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
+        for arm_id in std::iter::once(&timer.arm_id).chain(timer.previous_arm_id.iter()) {
+            if let Err(error) = store
+                .delete_state_timer(
+                    timer.tenant.as_str(),
+                    &timer.entity_type,
+                    &timer.entity_id,
+                    arm_id,
+                )
+                .await
+            {
+                tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id, %error,
                 "ended state timer row not removed; the next boot finds it stale");
+            }
         }
     }
 
@@ -315,6 +319,7 @@ fn armed_timer(
     let armed_by: ArmedBy =
         serde_json::from_str(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
     Ok(ArmedTimer {
+        previous_arm_id: None,
         boot_gate: None,
         tenant: tenant.clone(),
         entity_type: row.entity_type.clone(),

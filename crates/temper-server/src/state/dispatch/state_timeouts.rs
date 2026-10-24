@@ -463,14 +463,16 @@ impl crate::state::ServerState {
     /// write landed last, or is removed when no timer is armed.
     pub(super) async fn start_armed_timer(
         &self,
-        timer: ArmedTimer,
+        mut timer: ArmedTimer,
         delay: Duration,
         reservation: Reservation,
     ) -> bool {
         let Some(armed_seq) = self.state_timeout_tracker.reserve(&timer, reservation) else {
             return false;
         };
-        self.persist_state_timer(&timer).await;
+        if self.persist_state_timer(&timer).await {
+            timer.previous_arm_id = None;
+        }
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         if self.state_timeout_tracker.current(&key) != armed_seq {
             let mut written = timer.clone();
@@ -665,14 +667,18 @@ impl crate::state::ServerState {
             );
 
             async move {
-                // A timer armed again writes its new row before this one
-                // removes its own, so no restart falls between the two.
-                if let Err(error) = state.fire_state_timer(&timer, armed_seq).await {
+                // A retry takes responsibility for the durable row, including
+                // its predecessor when saving the replacement fails.
+                let rearmed = if let Err(error) = state.fire_state_timer(&timer, armed_seq).await {
                     state
                         .rearm_unanswered_state_timer(&timer, armed_seq, &error)
-                        .await;
+                        .await
+                } else {
+                    false
+                };
+                if !rearmed {
+                    state.forget_state_timer(&timer).await;
                 }
-                state.forget_state_timer(&timer).await;
                 state.state_timeout_tracker.dec_pending(&timer.entity_type);
             }
             .instrument(span)
@@ -752,7 +758,12 @@ impl crate::state::ServerState {
     /// ([`Self::state_timer_already_fired`]). There is no attempt limit: each
     /// attempt waits a full budget, and the timer ends once its record
     /// answers, leaves the state, or its spec stops declaring it.
-    async fn rearm_unanswered_state_timer(&self, timer: &ArmedTimer, armed_seq: u64, error: &str) {
+    async fn rearm_unanswered_state_timer(
+        &self,
+        timer: &ArmedTimer,
+        armed_seq: u64,
+        error: &str,
+    ) -> bool {
         // PRECONDITION: spec validation refuses a zero budget, which would
         // make an unanswered timer retry in a tight loop.
         debug_assert!(timer.after_seconds > 0, "state timeout with a zero budget");
@@ -760,9 +771,15 @@ impl crate::state::ServerState {
         if self.state_timeout_tracker.current(&key) != armed_seq
             || !self.declares_state_timer(timer)
         {
-            return;
+            return false;
         }
         let again = ArmedTimer {
+            previous_arm_id: Some(
+                timer
+                    .previous_arm_id
+                    .clone()
+                    .unwrap_or_else(|| timer.arm_id.clone()),
+            ),
             arm_id: sim_uuid().to_string(),
             ..timer.clone()
         };
@@ -783,6 +800,7 @@ impl crate::state::ServerState {
             %error,
             "state timeout fire got no answer"
         );
+        armed_again
     }
 }
 
@@ -804,6 +822,8 @@ pub(super) struct ArmedTimer {
     pub(super) agent_ctx: AgentContext,
     /// Names this arming's durable row.
     pub(super) arm_id: String,
+    /// Durable predecessor retained until a replacement write succeeds.
+    pub(super) previous_arm_id: Option<String>,
     /// The entity's journal sequence when the timer was armed.
     pub(super) sequence_nr: u64,
     pub(super) started_at: DateTime<Utc>,
@@ -873,6 +893,7 @@ pub(super) fn declared_timer(
         );
     }
     ArmedTimer {
+        previous_arm_id: None,
         boot_gate: None,
         tenant: tenant.clone(),
         entity_type: entity_type.to_string(),
@@ -1076,6 +1097,7 @@ mod tests {
     /// A timer on `E/e-1` in `state`, armed by the transition at `journal`.
     fn timer(state: &str, journal: u64) -> ArmedTimer {
         ArmedTimer {
+            previous_arm_id: None,
             boot_gate: None,
             tenant: TenantId::from("t".to_string()),
             entity_type: "E".to_string(),

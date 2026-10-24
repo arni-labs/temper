@@ -164,3 +164,73 @@ fn a_refused_fire_is_not_armed_again() {
     });
     process.kill(&world, Duration::ZERO);
 }
+
+/// A failed replacement write must leave a bootable row, even if deletion
+/// would succeed. No record read or external action rescues it after boot.
+#[test]
+fn failed_retry_write_survives_restart() {
+    for seed in [99, 100, 101] {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let spec = expire_admits_one();
+        let (world, process, job) = started(seed, clock, &spec, "failed-retry-write");
+        process.runtime.block_on(async {
+            let first = world.rows.row("gamma", &job.id).unwrap();
+            let _in_flight = hold_expire_permit(&process.state, &job.tenant).await;
+            world.rows.fail_next_writes(1);
+            advance(PAST_THE_BUDGET).await;
+            assert_eq!(
+                world
+                    .rows
+                    .row("gamma", &job.id)
+                    .expect("failed replacement retains the old durable arm")
+                    .arm_id,
+                first.arm_id
+            );
+        });
+        process.kill(&world, Duration::ZERO);
+        let restarted = Process::start(&world, JOB_V1, &spec, "retry-after-restart");
+        restarted.runtime.block_on(async {
+            advance(Duration::from_secs(1)).await;
+            assert_eq!(status(&restarted.state, &job).await, "Done");
+            assert!(world.rows.row("gamma", &job.id).is_none());
+        });
+        restarted.kill(&world, Duration::ZERO);
+    }
+}
+
+/// Even across consecutive failed saves, a later answer (including a guard
+/// refusal) removes the retained row, so boot cannot resurrect an ended fire.
+#[test]
+fn answered_retry_removes_retained_row() {
+    for refused in [false, true] {
+        let seed = 102;
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let spec = if refused {
+            expire_refused()
+                + "\n[admission]\nmax_concurrent_actions = { \"Expire\" = 1 }\nqueue_timeout_seconds = 0\n"
+        } else {
+            expire_admits_one()
+        };
+        let (world, process, job) = started(seed, clock, &spec, "answered-retry");
+        process.runtime.block_on(async {
+            let in_flight = hold_expire_permit(&process.state, &job.tenant).await;
+            world.rows.fail_next_writes(2);
+            advance(PAST_THE_BUDGET).await;
+            advance(PAST_THE_BUDGET).await;
+            assert!(world.rows.row("gamma", &job.id).is_some());
+            drop(in_flight);
+            advance(PAST_THE_BUDGET).await;
+            assert_eq!(
+                status(&process.state, &job).await,
+                if refused { "Waiting" } else { "Done" }
+            );
+            assert!(
+                world.rows.row("gamma", &job.id).is_none(),
+                "an answer ends the durable timer"
+            );
+        });
+        process.kill(&world, Duration::ZERO);
+    }
+}
