@@ -24,8 +24,8 @@ use crate::request_context::AgentContext;
 use crate::state::ServerState;
 use crate::state::projection_backfill::transition_table_for;
 
-/// The wait before listing a type's records again after the store failed to
-/// list them. It doubles up to [`FOLLOW_RETRY_MAX`], so a store that stays
+/// The wait before retrying a type after the store failed to list or read
+/// its records. It doubles up to [`FOLLOW_RETRY_MAX`], so a store that stays
 /// down is asked about once a minute, not in a tight loop.
 const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
 const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -37,7 +37,8 @@ pub(super) type BootCallers = BTreeMap<(TenantId, String, String), AgentContext>
 impl ServerState {
     /// Make the timers of every record of each type whose spec an install
     /// changed follow the state the record is in now, including a type that
-    /// had no timeout before. Each changed type is followed once.
+    /// had no timeout before. Failed listings and reads remain pending until
+    /// the store recovers.
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
             Ok(mut registry) => registry.take_changed_types(),
@@ -82,22 +83,24 @@ impl ServerState {
     }
 
     /// Reconcile every record of each of `types`. A type whose records the
-    /// store cannot list is tried again after a wait, since its records not
-    /// in memory would otherwise keep the timers of their old state.
+    /// store cannot list or read is tried again after a wait. Repeating a
+    /// successful reconcile is idempotent; an unreadable record may have no
+    /// timer at all, so the walk must retain responsibility for retrying it.
     async fn follow_types(&self, mut types: Vec<(TenantId, String)>, callers: &BootCallers) {
         let mut wait = FOLLOW_RETRY_FIRST;
         loop {
-            let mut unlisted = Vec::new();
+            let mut pending = Vec::new();
             for (tenant, entity_type) in types {
                 if let Err(error) = self.ensure_type_indexed(&tenant, &entity_type).await {
                     tracing::warn!(tenant = %tenant, entity_type, %error,
                         retry_in_secs = wait.as_secs(),
                         "records of a timed type could not be listed; trying again");
-                    unlisted.push((tenant, entity_type));
+                    pending.push((tenant, entity_type));
                     continue;
                 }
                 let ids = self.list_entity_ids(&tenant, &entity_type);
                 let mut waiting = 0usize;
+                let mut unreadable = 0usize;
                 for entity_id in &ids {
                     let key = (tenant.clone(), entity_type.clone(), entity_id.clone());
                     let followed = self
@@ -109,6 +112,14 @@ impl ServerState {
                         )
                         .await;
                     waiting += usize::from(followed == TimerFollow::WaitsForCaller);
+                    unreadable += usize::from(followed == TimerFollow::RetryRead);
+                }
+                if unreadable > 0 {
+                    tracing::warn!(tenant = %tenant, entity_type, unreadable,
+                        retry_in_secs = wait.as_secs(),
+                        "records of a timed type could not be read; trying again");
+                    pending.push((tenant, entity_type));
+                    continue;
                 }
                 tracing::info!(tenant = %tenant, entity_type, records = ids.len(), waiting,
                     "state timers follow the records' states");
@@ -117,18 +128,18 @@ impl ServerState {
                         "records in a timed state wait for their next action: the timeout action binds its caller and nobody armed it");
                 }
             }
-            if unlisted.is_empty() {
+            if pending.is_empty() {
                 return;
             }
             tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
             wait = (wait * 2).min(FOLLOW_RETRY_MAX);
-            types = unlisted;
+            types = pending;
         }
     }
 
     /// Reconcile one record: with its actor's state when it is in memory,
     /// else with its state replayed from the store. A record that cannot be
-    /// read keeps its timer; that is checked again when the timer fires.
+    /// read remains pending, even when it has no timer to check it again.
     pub(super) async fn reconcile_stored_record(
         &self,
         tenant: &TenantId,
@@ -140,7 +151,7 @@ impl ServerState {
             .current_record_state(tenant, entity_type, entity_id)
             .await
         else {
-            return TimerFollow::Settled;
+            return TimerFollow::RetryRead;
         };
         if current.total_event_count == 0 {
             return TimerFollow::Settled;

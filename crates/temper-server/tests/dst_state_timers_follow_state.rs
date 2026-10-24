@@ -429,6 +429,9 @@ fn run_seed(seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+#[path = "dst_state_timers_follow_state/read_failure.rs"]
+mod read_failure;
+
 #[test]
 fn dst_state_timers_follow_the_current_state() {
     // Seeds that broke each invariant, and the first such seed's report.
