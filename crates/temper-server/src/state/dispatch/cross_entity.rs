@@ -86,27 +86,7 @@ impl crate::state::ServerState {
             let initial_action = req.initial_action.clone();
             let parent_params = action_params.clone();
             let copied_fields = req.copied_fields.clone();
-            // A spawned child continues its parent's callback lineage: the
-            // child's work runs in a detached task (inline depth starts over)
-            // and counts one hop, so a chain of children that spawn again
-            // ends at MAX_CALLBACK_HOPS generations, as integration callbacks
-            // do. Admitting with for_callback alone would end it at the inline
-            // depth (8) instead, which ordinary nesting already uses.
-            let agent = match agent_ctx.for_background_task().for_callback() {
-                Ok(context) => context,
-                Err(error) => {
-                    self.record_generated_callback_refusal(
-                        super::WasmEntityRef {
-                            tenant,
-                            entity_type: parent_type,
-                            entity_id: parent_id,
-                        },
-                        "spawn",
-                        &error.to_string(),
-                    );
-                    continue;
-                }
-            };
+            let agent = agent_ctx.clone();
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
                 .clone()

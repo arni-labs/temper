@@ -143,21 +143,17 @@ fn detached_boundary_preserves_authority_and_idempotency() {
 }
 
 #[test]
-fn immediate_scheduled_follow_ons_spend_a_hop_and_clocked_ones_start_fresh() {
+fn immediate_scheduled_follow_ons_keep_the_parent_lineage_and_clocked_ones_start_fresh() {
     let context = AgentContext {
         callback_depth: 8,
         callback_hops: MAX_CALLBACK_HOPS - 1,
         ..AgentContext::for_service("invoker")
     };
-    let immediate = context.for_scheduled_follow_on(0).unwrap();
-    assert_eq!(immediate.callback_depth, 1);
-    assert_eq!(immediate.callback_hops, MAX_CALLBACK_HOPS);
-    assert_eq!(
-        immediate.for_scheduled_follow_on(0).unwrap_err(),
-        CallbackBudgetExceeded::TotalHops
-    );
+    let immediate = context.for_scheduled_follow_on(0);
+    assert_eq!(immediate.callback_depth, context.callback_depth);
+    assert_eq!(immediate.callback_hops, context.callback_hops);
 
-    let clocked = immediate.for_scheduled_follow_on(1).unwrap();
+    let clocked = immediate.for_scheduled_follow_on(1);
     assert_eq!(clocked.callback_depth, 0);
     assert_eq!(clocked.callback_hops, 0);
     assert_eq!(clocked.agent_id, context.agent_id);

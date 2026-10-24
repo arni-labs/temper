@@ -1,10 +1,10 @@
 //! Follow-ons the runtime starts by itself after a transition commits.
 //!
-//! A zero-delay `schedule` and a spawned child's initial action continue
-//! their parent's callback lineage and spend one hop each, so a chain that
-//! renews itself without waiting ends at `MAX_CALLBACK_HOPS`. A `schedule`
-//! that waits on the clock starts a fresh lineage, so a periodic schedule
-//! (a cron, a token refresh) keeps cycling however many hops its cycles spend.
+//! A `schedule` that waits on the clock starts a fresh callback lineage, so a
+//! periodic schedule (a cron, a token refresh) keeps cycling however many hops
+//! its cycles spend. A scheduled follow-on is named by the transition that
+//! made it: a retried request that replays the same reply starts no second
+//! copy, and two transitions that schedule the same action both run.
 
 use std::time::Duration;
 
@@ -21,14 +21,6 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
   <edmx:DataServices>
     <Schema Namespace="Temper.FollowOn" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-      <EntityType Name="Loop">
-        <Key><PropertyRef Name="Id"/></Key>
-        <Property Name="Id" Type="Edm.String" Nullable="false"/>
-      </EntityType>
-      <EntityType Name="Bud">
-        <Key><PropertyRef Name="Id"/></Key>
-        <Property Name="Id" Type="Edm.String" Nullable="false"/>
-      </EntityType>
       <EntityType Name="Cron">
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
@@ -37,7 +29,7 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
       </EntityType>
-      <EntityType Name="Twin">
+      <EntityType Name="Bell">
         <Key><PropertyRef Name="Id"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
       </EntityType>
@@ -46,54 +38,14 @@ const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
       </EntityType>
       <EntityContainer Name="Container">
-        <EntitySet Name="Loops" EntityType="Temper.FollowOn.Loop"/>
-        <EntitySet Name="Buds" EntityType="Temper.FollowOn.Bud"/>
         <EntitySet Name="Crons" EntityType="Temper.FollowOn.Cron"/>
         <EntitySet Name="Runs" EntityType="Temper.FollowOn.Run"/>
-        <EntitySet Name="Twins" EntityType="Temper.FollowOn.Twin"/>
+        <EntitySet Name="Bells" EntityType="Temper.FollowOn.Bell"/>
         <EntitySet Name="Reminders" EntityType="Temper.FollowOn.Reminder"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
 </edmx:Edmx>"#;
-
-/// Re-schedules itself with no delay on every step.
-const LOOP_SPEC: &str = r#"
-[automaton]
-name = "Loop"
-states = ["Idle", "On"]
-initial = "Idle"
-
-[[state]]
-name = "n"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "Go"
-from = ["Idle"]
-to = "On"
-effect = ["n += 1", "schedule('Tick', 0)"]
-
-[[action]]
-name = "Tick"
-from = ["On"]
-effect = ["n += 1", "schedule('Tick', 0)"]
-"#;
-
-/// Each child's initial action spawns another child of the same type.
-const BUD_SPEC: &str = r#"
-[automaton]
-name = "Bud"
-states = ["Seed", "Grown"]
-initial = "Seed"
-
-[[action]]
-name = "Sprout"
-from = ["Seed"]
-to = "Grown"
-effect = ["spawn('Bud', 'Sprout')"]
-"#;
 
 /// The shape of a cron job: each cycle calls an integration, whose callback
 /// spawns a run and schedules the next cycle one second later.
@@ -149,12 +101,12 @@ from = ["New"]
 to = "Started"
 "#;
 
-/// Schedules the same action twice, for the same moment, on every step.
-const TWIN_SPEC: &str = r#"
+/// Each press schedules one ring a second later.
+const BELL_SPEC: &str = r#"
 [automaton]
-name = "Twin"
-states = ["Idle", "Armed"]
-initial = "Idle"
+name = "Bell"
+states = ["Ready"]
+initial = "Ready"
 
 [[state]]
 name = "n"
@@ -162,15 +114,14 @@ type = "counter"
 initial = 0
 
 [[action]]
-name = "Arm"
-from = ["Idle"]
-to = "Armed"
-effect = ["n += 1", "schedule('Ring', 1)", "schedule('Ring', 1)"]
+name = "Press"
+from = ["Ready"]
+effect = ["schedule('Ring', 1)"]
 
 [[action]]
 name = "Ring"
-from = ["Armed"]
-effect = ["n += 1", "schedule('Ring', 1)", "schedule('Ring', 1)"]
+from = ["Ready"]
+effect = ["n += 1"]
 "#;
 
 /// Schedules one action for two different moments.
@@ -206,11 +157,9 @@ fn build_state(integration_url: &str) -> ServerState {
         csdl,
         CSDL_XML.to_string(),
         &[
-            ("Loop", LOOP_SPEC),
-            ("Bud", BUD_SPEC),
             ("Cron", cron_spec.as_str()),
             ("Run", RUN_SPEC),
-            ("Twin", TWIN_SPEC),
+            ("Bell", BELL_SPEC),
             ("Reminder", REMINDER_SPEC),
         ],
     );
@@ -223,81 +172,6 @@ async fn counter(state: &ServerState, tenant: &TenantId, entity_type: &str, id: 
         .await
         .map(|r| r.state.counters.get("n").copied().unwrap_or(0))
         .unwrap_or(0)
-}
-
-/// Sample `read` every 100 ms until it holds still for one second (or the
-/// deadline passes) and return the last value.
-async fn settle<F, Fut>(read: F, deadline: Duration) -> usize
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = usize>,
-{
-    let start = tokio::time::Instant::now();
-    let mut last = read().await;
-    let mut still_since = tokio::time::Instant::now();
-    while start.elapsed() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let now = read().await;
-        if now != last {
-            last = now;
-            still_since = tokio::time::Instant::now();
-        } else if still_since.elapsed() >= Duration::from_secs(1) {
-            break;
-        }
-    }
-    last
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_immediate_self_schedule_ends_at_the_callback_hop_budget() {
-    let state = build_state("http://127.0.0.1:9");
-    let tenant = TenantId::default();
-    let response = state
-        .dispatch_tenant_action(
-            &tenant,
-            "Loop",
-            "l1",
-            "Go",
-            serde_json::json!({}),
-            &AgentContext::default(),
-        )
-        .await
-        .expect("Go should commit");
-    assert!(response.success);
-
-    let n = settle(
-        || counter(&state, &tenant, "Loop", "l1"),
-        Duration::from_secs(30),
-    )
-    .await;
-    // Go, then one Tick per hop.
-    assert_eq!(n, 1 + MAX_CALLBACK_HOPS as usize);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_self_spawning_chain_ends_at_the_callback_hop_budget() {
-    let state = build_state("http://127.0.0.1:9");
-    let tenant = TenantId::default();
-    let response = state
-        .dispatch_tenant_action(
-            &tenant,
-            "Bud",
-            "root",
-            "Sprout",
-            serde_json::json!({}),
-            &AgentContext::default(),
-        )
-        .await
-        .expect("Sprout should commit");
-    assert!(response.success);
-
-    let buds = settle(
-        || async { state.list_entity_ids(&tenant, "Bud").len() },
-        Duration::from_secs(30),
-    )
-    .await;
-    // The root, then one child per hop.
-    assert_eq!(buds, 1 + MAX_CALLBACK_HOPS as usize);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -341,8 +215,7 @@ async fn a_clocked_schedule_keeps_cycling_past_the_callback_hop_budget() {
     }
     assert!(cycles >= 5, "cron stopped after {cycles} cycles");
 
-    // Every completed cycle's run starts: the run begins from the hop count of
-    // the cycle that spawned it, not of the whole cron history.
+    // Every completed cycle's spawned run starts.
     let mut started = 0;
     for id in state.list_entity_ids(&tenant, "Run") {
         let run = state
@@ -359,28 +232,40 @@ async fn a_clocked_schedule_keeps_cycling_past_the_callback_hop_budget() {
     );
 }
 
+async fn press(state: &ServerState, tenant: &TenantId, agent: &AgentContext) {
+    let response = state
+        .dispatch_tenant_action(tenant, "Bell", "b1", "Press", serde_json::json!({}), agent)
+        .await
+        .expect("Press should commit");
+    assert!(response.success);
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn one_action_scheduled_twice_for_the_same_moment_fires_once() {
+async fn a_retried_request_rings_once() {
     let state = build_state("http://127.0.0.1:9");
     let tenant = TenantId::default();
-    let response = state
-        .dispatch_tenant_action(
-            &tenant,
-            "Twin",
-            "w1",
-            "Arm",
-            serde_json::json!({}),
-            &AgentContext::default(),
-        )
-        .await
-        .expect("Arm should commit");
-    assert!(response.success);
+    let agent = AgentContext {
+        idempotency_key: Some("press-once".into()),
+        ..AgentContext::default()
+    };
+    // The retry is answered from the first request's reply, which carries
+    // the same scheduled ring.
+    press(&state, &tenant, &agent).await;
+    press(&state, &tenant, &agent).await;
 
-    // Once a second: Arm, then Ring at about 1, 2, 3 and 4 s. Without the
-    // merge the rings double every second (2 + 4 + 8 + 16 by 4.5 s).
-    tokio::time::sleep(Duration::from_millis(4_500)).await;
-    let n = counter(&state, &tenant, "Twin", "w1").await;
-    assert!((4..=6).contains(&n), "Twin committed {n} steps in 4.5 s");
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(counter(&state, &tenant, "Bell", "b1").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_presses_in_the_same_second_ring_twice() {
+    let state = build_state("http://127.0.0.1:9");
+    let tenant = TenantId::default();
+    press(&state, &tenant, &AgentContext::default()).await;
+    press(&state, &tenant, &AgentContext::default()).await;
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(counter(&state, &tenant, "Bell", "b1").await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -534,49 +534,37 @@ impl crate::state::ServerState {
     ///
     /// Propagates the originating `AgentContext` so that scheduled actions
     /// retain identity attribution in trajectories and SSE events.
+    /// `parent_event` names the transition that scheduled them (its
+    /// `total_event_count`), so a replayed reply of that transition starts no
+    /// second copy of a follow-on still in flight (see `state::follow_ons`).
     pub(crate) fn dispatch_scheduled_actions(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
+        parent_event: usize,
         scheduled_actions: &[ScheduledAction],
         agent_ctx: &AgentContext,
     ) {
-        // One transition's follow-ons are scheduled at one moment, so the same
-        // action with the same delay always lands in the same due second.
-        let scheduled_at = sim_now().timestamp();
-        for sched in scheduled_actions {
+        for (effect_index, sched) in scheduled_actions.iter().enumerate() {
             let state = self.clone();
             let t = tenant.clone();
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = match agent_ctx.for_scheduled_follow_on(sched.delay_seconds) {
-                Ok(context) => context,
-                Err(error) => {
-                    let entity = super::WasmEntityRef {
-                        tenant,
-                        entity_type,
-                        entity_id,
-                    };
-                    self.record_generated_callback_refusal(entity, &action, &error.to_string());
-                    continue;
-                }
-            };
-            // The same action due in the same second on this record is already
-            // one pending follow-on (see `state::follow_ons`).
+            let ctx = agent_ctx.for_scheduled_follow_on(sched.delay_seconds);
             let pending = crate::state::follow_ons::FollowOnKey {
                 tenant: tenant.to_string(),
                 entity_type: et.clone(),
                 entity_id: eid.clone(),
-                action: action.clone(),
-                due_second: scheduled_at.saturating_add_unsigned(sched.delay_seconds),
+                parent_event,
+                effect_index,
             };
             if !self.pending_follow_ons.claim(pending.clone()) {
                 tracing::debug!(
                     tenant = %tenant, entity_type, entity_id, action = %action,
-                    due_second = pending.due_second,
-                    "scheduled follow-on merged into the one already pending"
+                    parent_event, effect_index,
+                    "scheduled follow-on of a replayed reply is already in flight"
                 );
                 continue;
             }
@@ -606,10 +594,10 @@ impl crate::state::ServerState {
                 // determinism-ok: timer delivery is a background side-effect
                 async move {
                     tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
-                    state.pending_follow_ons.release(&pending);
                     let _ = state
                         .dispatch_tenant_action(&t, &et, &eid, &action, serde_json::json!({}), &ctx)
                         .await;
+                    state.pending_follow_ons.release(&pending);
                 }
                 .instrument(span),
             );
@@ -647,6 +635,7 @@ impl crate::state::ServerState {
                 ctx.tenant,
                 ctx.entity_type,
                 ctx.entity_id,
+                response.state.total_event_count,
                 &response.scheduled_actions,
                 ctx.agent_ctx,
             );
