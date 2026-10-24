@@ -28,7 +28,7 @@ pub const PASSIVATE_IDLE_ACTORS_PER_TICK: usize = 32;
 #[derive(Debug)]
 pub enum DataOnlyCreate {
     /// The entity was created; its state.
-    Created(EntityResponse),
+    Created(Box<EntityResponse>),
     /// The entity type does not take the data-only path; nothing was written.
     Ineligible,
     /// The store already holds this key, usually because a concurrent create
@@ -1723,7 +1723,7 @@ impl ServerState {
         );
         let _ = self.event_tx.send(change);
 
-        Ok(DataOnlyCreate::Created(EntityResponse {
+        Ok(DataOnlyCreate::Created(Box::new(EntityResponse {
             success: true,
             state,
             error: None,
@@ -1731,7 +1731,7 @@ impl ServerState {
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
-        }))
+        })))
     }
 
     /// Update fields on an existing entity.
