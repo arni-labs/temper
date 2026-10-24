@@ -17,6 +17,12 @@
 //! declares keeps it, so any number of calls leave one timer armed. The timer's
 //! clock starts when the record entered its state, so a timer re-armed after a
 //! restart or a rehydration waits only the rest of its budget, or fires at once.
+//!
+//! A timer fires as someone: the caller of the dispatch that reconciles, else
+//! whoever armed the timer it replaces. A record with neither (no timer armed,
+//! no row, as for a timeout an install adds to a type) gets its timer on its
+//! next action, as before: a timer's action may read its caller's identity
+//! (`authenticated_subject`), and nobody is there to give it one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,11 +39,6 @@ use crate::entity_actor::{EntityState, RehydrateHook};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 
-/// The service a timer fires as when nothing else armed it: a record found in
-/// a timed state by a rehydration or a spec install, with no timer armed and
-/// no dispatch to take an identity from.
-const STATE_TIMER_SERVICE: &str = "state-timer";
-
 /// The wait before listing a changed type's records again after the store
 /// failed to list them. It doubles up to [`FOLLOW_RETRY_MAX`], so a store
 /// that stays down is asked about once a minute, not in a tight loop.
@@ -48,8 +49,8 @@ impl ServerState {
     /// Make `entity_id`'s armed timer the one `current`'s state declares, or
     /// none. A timer already armed for that declaration is kept; any other is
     /// cancelled and its row removed. A timer armed here fires as `armed_by`,
-    /// else as whoever armed the timer it replaces, else as the
-    /// [`STATE_TIMER_SERVICE`].
+    /// else as whoever armed the timer it replaces; with neither, nothing is
+    /// armed until the record's next action.
     pub(crate) async fn reconcile_state_timers(
         &self,
         tenant: &TenantId,
@@ -80,13 +81,12 @@ impl ServerState {
                 .await;
             return;
         };
-        let identity = armed_by
-            .cloned()
-            .or_else(|| {
-                self.armed_state_timer(tenant, entity_type, entity_id)
-                    .map(|armed| armed.agent_ctx)
-            })
-            .unwrap_or_else(|| AgentContext::for_service(STATE_TIMER_SERVICE));
+        let Some(identity) = armed_by.cloned().or_else(|| {
+            self.armed_state_timer(tenant, entity_type, entity_id)
+                .map(|armed| armed.agent_ctx)
+        }) else {
+            return;
+        };
         let timer = declared_timer(
             tenant,
             entity_type,
@@ -159,17 +159,16 @@ impl ServerState {
     }
 
     /// The hook an entity actor runs when it starts from stored events: it
-    /// makes the record's timer follow the state it rehydrated into. None for
-    /// a type that declares no timeout and a record with no timer armed.
+    /// makes the record's armed timer follow the state it rehydrated into.
+    /// None for a record with no timer armed: there is nothing to move, and
+    /// nobody to arm a new one as.
     pub(crate) fn state_timer_rehydrate_hook(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
     ) -> Option<RehydrateHook> {
-        if !self.declares_state_timeouts(tenant, entity_type)
-            && !self.has_armed_state_timer(tenant, entity_type, entity_id)
-        {
+        if !self.has_armed_state_timer(tenant, entity_type, entity_id) {
             return None;
         }
         let server = self.clone();
