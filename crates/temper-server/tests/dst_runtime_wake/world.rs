@@ -9,7 +9,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
 use temper_runtime::scheduler::{DeterministicRng, SimClock};
 use temper_server::storage::StateTimerStore;
-use temper_server::wake::{WakeReport, WakeSink};
+use temper_server::wake::{SendError, WakeReport, WakeSink};
 
 /// Simulation time: the process's paused clock, plus every suspension, during
 /// which the wall clock moves on and the process's clock does not.
@@ -115,8 +115,9 @@ impl StateTimerStore for TimerRows {
 pub(crate) const MOST_REFUSED: u64 = 3;
 
 /// The control plane's end of the reports: it keeps every report it was sent
-/// and every one it took. After a send it takes, it refuses the next 1 to
-/// [`MOST_REFUSED`] sends a quarter of the time.
+/// and every one it took. After a send it takes, it fails the next 1 to
+/// [`MOST_REFUSED`] sends a quarter of the time, as a control plane that
+/// answers 5xx does.
 pub(crate) struct Reports {
     pub(crate) sent: Mutex<Vec<WakeReport>>,
     pub(crate) delivered: Mutex<Vec<WakeReport>>,
@@ -148,12 +149,12 @@ impl Reports {
 
 #[async_trait::async_trait]
 impl WakeSink for Reports {
-    async fn send(&self, report: &WakeReport, _traceparent: Option<&str>) -> Result<(), String> {
+    async fn send(&self, report: &WakeReport, _traceparent: Option<&str>) -> Result<(), SendError> {
         self.sent.lock().unwrap().push(report.clone());
         let mut refusing = self.refusing.lock().unwrap();
         if *refusing > 0 {
             *refusing -= 1;
-            return Err("simulated refusal".to_string());
+            return Err(SendError::Undelivered("simulated 503".to_string()));
         }
         let mut rng = self.rng.lock().unwrap();
         if rng.next_bound(4) == 0 {

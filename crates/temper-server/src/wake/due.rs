@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use temper_runtime::scheduler::sim_now;
 use tokio::sync::{Notify, oneshot};
 
-use super::{WakeReport, WakeSink};
+use super::{SendError, WakeReport, WakeSink};
 use crate::request_context::ScheduledFire;
 
 /// The wait before an undelivered report is sent again; it doubles with each
@@ -241,7 +241,9 @@ impl DueTimes {
     /// `force`. A report that is not delivered is sent again, waiting longer
     /// after each failure, until it is delivered or a newer report replaces
     /// it: without it the control plane would not wake the process for that
-    /// due time. The report carries the current span's trace: the move that
+    /// due time. A report the control plane refuses on purpose
+    /// ([`SendError::Refused`]) is not sent again: its pass would be refused
+    /// on every retry. The report carries the current span's trace: the move that
     /// changed the earliest due time.
     pub(crate) fn report(self: &Arc<Self>, force: bool) {
         let Some(sink) = self
@@ -279,7 +281,7 @@ impl DueTimes {
             let mut wait = FIRST_RETRY_WAIT;
             loop {
                 let result = sink.send(&report, traceparent.as_deref()).await;
-                {
+                let error = {
                     let mut inner = due.lock();
                     if inner
                         .reported
@@ -289,16 +291,29 @@ impl DueTimes {
                         // A newer report replaced this one.
                         return;
                     }
-                    if result.is_ok() {
-                        inner.reported.in_flight = None;
-                        inner.reported.acked = Some(report.next_due_at);
-                        return;
+                    match result {
+                        Ok(()) => {
+                            inner.reported.in_flight = None;
+                            inner.reported.acked = Some(report.next_due_at);
+                            return;
+                        }
+                        Err(SendError::Refused(status)) => {
+                            // Nothing acknowledged, nothing on its way: the
+                            // next change or wake sends a new report.
+                            inner.reported.in_flight = None;
+                            drop(inner);
+                            tracing::warn!(
+                                seq = report.seq,
+                                status,
+                                "wake report refused by the control plane; not sent again"
+                            );
+                            return;
+                        }
+                        Err(SendError::Undelivered(error)) => error,
                     }
-                }
-                if let Err(error) = &result {
-                    tracing::warn!(seq = report.seq, %error, retry_in_ms = wait.as_millis() as u64,
-                        "wake report not delivered; retrying");
-                }
+                };
+                tracing::warn!(seq = report.seq, %error, retry_in_ms = wait.as_millis() as u64,
+                    "wake report not delivered; retrying");
                 tokio::time::sleep(wait).await; // determinism-ok: retry backoff
                 wait = (wait * 2).min(LAST_RETRY_WAIT);
             }

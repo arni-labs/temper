@@ -40,8 +40,23 @@ pub struct WakeReport {
 #[async_trait::async_trait]
 pub trait WakeSink: Send + Sync {
     /// Deliver one report, with the W3C `traceparent` of the move that
-    /// changed the earliest due time. Err: not delivered.
-    async fn send(&self, report: &WakeReport, traceparent: Option<&str>) -> Result<(), String>;
+    /// changed the earliest due time.
+    async fn send(&self, report: &WakeReport, traceparent: Option<&str>) -> Result<(), SendError>;
+}
+
+/// Why a report was not delivered, which decides whether it is sent again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError {
+    /// It did not get through: the network, a timeout, or a control plane
+    /// that failed or asked for a later try. Sent again, waiting longer each
+    /// time.
+    Undelivered(String),
+    /// The control plane refused it on purpose, with this status: the
+    /// process's pass is bad or revoked, as when the app was deleted or its
+    /// pass replaced. Not sent again, since a refused pass is refused on every
+    /// retry; the next change or wake sends a new report, so a pass that comes
+    /// back works again.
+    Refused(u16),
 }
 
 /// A wake's answer.

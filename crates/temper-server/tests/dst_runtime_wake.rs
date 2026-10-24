@@ -45,6 +45,8 @@ use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
 
+#[path = "dst_runtime_wake/refused.rs"]
+mod refused;
 #[path = "dst_runtime_wake/world.rs"]
 mod world;
 
