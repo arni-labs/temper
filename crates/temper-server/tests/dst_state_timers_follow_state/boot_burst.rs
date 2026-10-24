@@ -3,9 +3,9 @@
 //! Workload, per seed: records in `alpha` start under the first spec and are
 //! never passivated, so none has a snapshot; records in `gamma` start untimed.
 //! The process stays down longer than any budget, then boots under the second
-//! spec with `gamma` timed. `alpha`'s records replay into `Review`, whose timer
-//! replaces the `Waiting` one their rows name, and every one of those timers
-//! is due at boot. `gamma`'s records have no row. A record's first append in
+//! spec with `gamma` timed. `alpha`'s records replay into their stored
+//! `Waiting`, whose new budget replaces the timer their rows name, and every
+//! one of those timers is due at boot. `gamma`'s records have no row. A record's first append in
 //! the new process (its timer's fire) takes a minute, so fires that run
 //! together start at the same instant.
 //!

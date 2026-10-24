@@ -832,14 +832,23 @@ impl EntityActor {
                             // re-gates it — guards (especially cross-entity ones,
                             // whose related-entity context is not reconstructed
                             // here) must not silently drop committed history.
-                            // `replay_effects` returns the matching rule's
-                            // effects ignoring guards; `None` means the table no
-                            // longer knows this action/from-state, in which case
-                            // the stored `to_status` alone carries the state.
-                            let from_status = event.from_status.clone();
+                            // `replay_effects` returns the effects of the rule
+                            // for this action from the event's STORED
+                            // `from_status`, ignoring guards; `None` means the
+                            // table no longer knows this action/from-state.
+                            // Matching on the stored status, not the replayed
+                            // one, keeps one drifted event (an older snapshot,
+                            // a skipped event) from making every later event
+                            // match no rule. The bootstrap `Created` event has
+                            // no stored from-status and uses the replayed one.
+                            let rule_from = if event.from_status.is_empty() {
+                                state.status.as_str()
+                            } else {
+                                event.from_status.as_str()
+                            };
                             if !frozen_bootstrap
                                 && let Some(effects) =
-                                    table.replay_effects(&state.status, &event.action)
+                                    table.replay_effects(rule_from, &event.action)
                             {
                                 let effects = effects.to_vec();
                                 // Shared effect application — same code as handle() and simulation.
@@ -850,16 +859,14 @@ impl EntityActor {
                                     _schedule_at_requests,
                                 ) = super::effects::apply_effects(state, &effects, &event.params);
                             }
-                            // Always honor the durably-stored target status. This
-                            // is safe (status is always persisted on the event)
-                            // and is the single source of truth for the post-
-                            // transition state across both the known-action and
-                            // unknown-action cases.
-                            super::effects::apply_new_state_fallback(
-                                state,
-                                &from_status,
-                                &event.to_status,
-                            );
+                            // The stored target always wins over the active
+                            // spec's `SetState`: a spec change to this action's
+                            // `to` must not move records that already took it.
+                            // Counters, booleans and lists still follow the
+                            // active spec's effects.
+                            if !event.to_status.is_empty() {
+                                state.status.clone_from(&event.to_status);
+                            }
 
                             // Sync action params into fields — mirrors the live
                             // process_action() path (effects.rs:155) so data fields
