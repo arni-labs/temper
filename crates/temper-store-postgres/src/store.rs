@@ -17,6 +17,7 @@ use crate::metrics::{
     PostgresTransactionTimer, record_postgres_pool_acquire_duration,
     record_postgres_transaction_begin_duration, record_postgres_transaction_commit_duration,
 };
+use crate::schema::tombstone_sql;
 use crate::segments;
 
 const EVENT_APPEND_OPERATION: &str = "event_append";
@@ -993,7 +994,8 @@ impl EventStore for PostgresEventStore {
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<String> = crate::dbm::postgres_query_scalar!(
             &self.schema,
-            "SELECT entity_id \
+            concat!(
+                "SELECT entity_id \
              FROM ( \
                SELECT c.entity_id \
                FROM {schema}entity_catalog c \
@@ -1005,7 +1007,9 @@ impl EventStore for PostgresEventStore {
                    WHERE d.tenant = c.tenant \
                      AND d.entity_type = c.entity_type \
                      AND d.entity_id = c.entity_id \
-                     AND d.event_type = 'Deleted' \
+                     AND ",
+                tombstone_sql!(),
+                "
                  ) \
                UNION \
                SELECT f.entity_id \
@@ -1018,7 +1022,9 @@ impl EventStore for PostgresEventStore {
                    WHERE d.tenant = f.tenant \
                      AND d.entity_type = f.entity_type \
                      AND d.entity_id = f.entity_id \
-                     AND d.event_type = 'Deleted' \
+                     AND ",
+                tombstone_sql!(),
+                "
                  ) \
                UNION \
                SELECT DISTINCT e.entity_id \
@@ -1031,10 +1037,13 @@ impl EventStore for PostgresEventStore {
                    WHERE d.tenant = e.tenant \
                      AND d.entity_type = e.entity_type \
                      AND d.entity_id = e.entity_id \
-                     AND d.event_type = 'Deleted' \
+                     AND ",
+                tombstone_sql!(),
+                "
                  ) \
              ) ids \
-             ORDER BY entity_id",
+             ORDER BY entity_id"
+            ),
         )
         .bind(tenant)
         .bind(entity_type)
