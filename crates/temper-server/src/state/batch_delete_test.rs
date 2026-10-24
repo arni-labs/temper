@@ -1,5 +1,5 @@
 //! A batch delete removes every member, or none of them when one changed
-//! after it was read.
+//! after it was read or the server keeps no journal.
 
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
@@ -21,13 +21,8 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
         <Property Name="album_id" Type="Edm.String"/>
       </EntityType>
-      <EntityType Name="Credit">
-        <Key><PropertyRef Name="Id"/></Key>
-        <Property Name="Id" Type="Edm.String" Nullable="false"/>
-      </EntityType>
       <EntityContainer Name="BatchService">
         <EntitySet Name="Tracks" EntityType="Test.Batch.Track"/>
-        <EntitySet Name="Credits" EntityType="Test.Batch.Credit"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
@@ -38,15 +33,6 @@ const TRACK_IOA: &str = r#"
 name = "Track"
 states = ["Active"]
 initial = "Active"
-"#;
-
-/// Only a declared action deletes a strict entity.
-const CREDIT_IOA: &str = r#"
-[automaton]
-name = "Credit"
-states = ["Draft"]
-initial = "Draft"
-strict_action_params = true
 "#;
 
 struct Fixture {
@@ -61,7 +47,7 @@ fn memory_only(name: &str) -> ServerState {
         "default",
         parse_csdl(CSDL).expect("CSDL parses"),
         CSDL.to_string(),
-        &[("Track", TRACK_IOA), ("Credit", CREDIT_IOA)],
+        &[("Track", TRACK_IOA)],
     );
     ServerState::from_registry(ActorSystem::new(name), registry)
 }
@@ -211,21 +197,8 @@ async fn a_requested_entity_changed_after_it_was_authorized_leaves_its_dependent
     }
 }
 
-async fn try_move_track(state: &ServerState, id: &str, album: &str) -> Result<(), String> {
-    state
-        .update_tenant_entity_fields(
-            &TenantId::default(),
-            "Track",
-            id,
-            serde_json::json!({ "album_id": album }),
-            false,
-        )
-        .await
-        .map(|_| ())
-}
-
 #[tokio::test]
-async fn without_a_journal_members_are_removed_together() {
+async fn without_a_journal_a_batch_is_refused_and_every_member_stays() {
     let state = &memory_only("batch-delete-memory");
     let ids = ["t-1", "t-2", "t-3"];
     create_tracks(state, &ids, "a-1").await;
@@ -234,168 +207,13 @@ async fn without_a_journal_members_are_removed_together() {
         members.push(read(state, id).await);
     }
 
-    state
-        .delete_entities_together(&TenantId::default(), members)
-        .await
-        .expect("batch delete");
-
-    for id in ids {
-        assert!(
-            !state
-                .ensure_entity_loaded(&TenantId::default(), "Track", id)
-                .await,
-            "{id} is gone"
-        );
-    }
-}
-
-#[tokio::test]
-async fn without_a_journal_a_changed_member_leaves_every_member_writable() {
-    let state = &memory_only("batch-delete-memory-changed");
-    let ids = ["t-1", "t-2", "t-3"];
-    create_tracks(state, &ids, "a-1").await;
-    let mut members = Vec::new();
-    for id in ids {
-        members.push(read(state, id).await);
-    }
-    move_track(state, "t-2", "a-2").await;
-
     let refused = state
         .delete_entities_together(&TenantId::default(), members)
         .await;
-    assert!(
-        matches!(refused, Err(BatchDeleteError::Changed(_))),
-        "a member that changed refuses the batch: {refused:?}"
-    );
-    assert_eq!(read(state, "t-2").await.fields["album_id"], "a-2");
-    // t-1 was held before t-2 refused; the refusal released it.
-    for id in ["t-1", "t-3"] {
-        assert_eq!(read(state, id).await.fields["album_id"], "a-1");
-        try_move_track(state, id, "a-3")
-            .await
-            .unwrap_or_else(|error| panic!("{id} takes writes again: {error}"));
-    }
-}
-
-#[tokio::test]
-async fn a_refused_batch_does_not_release_another_deletes_hold() {
-    let state = &memory_only("batch-delete-memory-held");
-    create_tracks(state, &["t-1", "t-2"], "a-1").await;
-    let tenant = TenantId::default();
-    let t2 = read(state, "t-2").await;
-    let other_delete = uuid::Uuid::from_u128(7);
-    let actor = state
-        .get_or_spawn_tenant_actor(&tenant, "Track", "t-2")
-        .expect("Track actor");
-    let held = actor
-        .ask::<crate::entity_actor::EntityResponse>(
-            crate::entity_actor::EntityMsg::Hold {
-                expected_authorization_precondition:
-                    crate::entity_actor::effects::entity_authorization_precondition(&t2),
-                holder: other_delete,
-            },
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("hold answers");
-    assert!(held.success, "{:?}", held.error);
-
-    let members = vec![read(state, "t-1").await, t2];
-    let refused = state.delete_entities_together(&tenant, members).await;
-    assert!(
-        matches!(refused, Err(BatchDeleteError::Changed(_))),
-        "an entity another delete holds refuses the batch: {refused:?}"
-    );
-    try_move_track(state, "t-1", "a-2")
-        .await
-        .expect("t-1 takes writes again");
-    assert!(
-        try_move_track(state, "t-2", "a-2").await.is_err(),
-        "the other delete still holds t-2"
-    );
-
-    actor
-        .tell(crate::entity_actor::EntityMsg::Release {
-            holder: other_delete,
-        })
-        .expect("release sent");
-    try_move_track(state, "t-2", "a-2")
-        .await
-        .expect("t-2 takes writes once its holder releases it");
-}
-
-#[tokio::test]
-async fn without_a_journal_a_member_only_an_action_deletes_refuses_before_any_delete() {
-    let state = &memory_only("batch-delete-memory-strict");
-    let tenant = TenantId::default();
-    create_tracks(state, &["t-1", "t-2"], "a-1").await;
-    state
-        .get_or_create_tenant_entity(&tenant, "Credit", "c-1", serde_json::json!({}))
-        .await
-        .expect("create Credit('c-1')");
-    let credit = state
-        .get_tenant_entity_state(&tenant, "Credit", "c-1")
-        .await
-        .expect("read Credit('c-1')")
-        .state;
-    let members = vec![read(state, "t-1").await, credit, read(state, "t-2").await];
-
-    let refused = state.delete_entities_together(&tenant, members).await;
-    assert!(
-        matches!(refused, Err(BatchDeleteError::Changed(ref reason)) if reason.contains("declared action")),
-        "a strict member refuses the batch: {refused:?}"
-    );
-    for id in ["t-1", "t-2"] {
-        assert!(
-            state.ensure_entity_loaded(&tenant, "Track", id).await,
-            "{id} is still there"
-        );
-        try_move_track(state, id, "a-2")
-            .await
-            .unwrap_or_else(|error| panic!("{id} takes writes again: {error}"));
-    }
-    assert!(state.ensure_entity_loaded(&tenant, "Credit", "c-1").await);
-}
-
-#[tokio::test]
-async fn a_hold_and_its_delete_mean_the_same_when_sent_twice() {
-    use crate::entity_actor::{EntityMsg, EntityResponse};
-    let state = &memory_only("batch-delete-memory-resent");
-    let tenant = TenantId::default();
-    create_tracks(state, &["t-1"], "a-1").await;
-    let track = read(state, "t-1").await;
-    let holder = uuid::Uuid::from_u128(9);
-    let actor = state
-        .get_or_spawn_tenant_actor(&tenant, "Track", "t-1")
-        .expect("Track actor");
-    let ask = |msg: EntityMsg| {
-        let actor = actor.clone();
-        async move {
-            actor
-                .ask::<EntityResponse>(msg, std::time::Duration::from_secs(5))
-                .await
-                .expect("the actor answers")
-        }
-    };
-    let hold = || EntityMsg::Hold {
-        expected_authorization_precondition:
-            crate::entity_actor::effects::entity_authorization_precondition(&track),
-        holder,
-    };
-
-    // A hold sent again, as after a lost answer, stands.
-    for attempt in ["first", "again"] {
-        let held = ask(hold()).await;
-        assert!(held.success, "{attempt} hold: {:?}", held.error);
-    }
-    assert!(
-        try_move_track(state, "t-1", "a-2").await.is_err(),
-        "a held entity refuses writes"
-    );
-    // So does a delete sent again: the entity stays deleted.
-    for attempt in ["first", "again"] {
-        let deleted = ask(EntityMsg::DeleteHeld { holder }).await;
-        assert!(deleted.success, "{attempt} delete: {:?}", deleted.error);
-        assert_eq!(deleted.state.status, "Deleted");
+    assert_eq!(refused, Err(BatchDeleteError::NoJournal));
+    for id in ids {
+        let track = read(state, id).await;
+        assert_eq!(track.status, "Active", "{id} was not deleted");
+        assert_eq!(track.fields["album_id"], "a-1");
     }
 }

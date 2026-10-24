@@ -1611,7 +1611,7 @@ pub async fn handle_odata_delete(
 /// together and only while each is in the state it was checked in: the
 /// requested entity's as it was authorized, each dependent's as the plan read
 /// it (`ServerState::delete_entities_together`). When any of them has changed
-/// since, nothing is deleted.
+/// since, or the server keeps no journal, nothing is deleted.
 async fn delete_with_dependents(
     state: &ServerState,
     tenant: &TenantId,
@@ -1663,6 +1663,17 @@ async fn delete_with_dependents(
             StatusCode::CONFLICT,
             "ConcurrentModification",
             &format!("nothing was deleted: {reason}; retry against current state"),
+        )
+        .into_response(),
+        // 501, as a secret store that cannot delete answers: retrying cannot
+        // help, only a server with a journal can.
+        Err(BatchDeleteError::NoJournal) => odata_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            &format!(
+                "this server keeps no journal, so it cannot delete {entity_type}('{entity_id}') \
+                 and the {count} entities that belong to it as one change; nothing was deleted"
+            ),
         )
         .into_response(),
         Err(BatchDeleteError::Storage(error)) => odata_error(

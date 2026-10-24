@@ -9,22 +9,17 @@
 //! references inside it (a row that references itself, two rows that
 //! reference each other) needs none either. After the write each entity's
 //! actor is stopped, so the next read replays the tombstone, and its query
-//! projection row and any armed timer are removed. A projection removal that fails leaves a row
-//! whose journal has moved past it, which the delete reference lookup does
-//! not trust (`delete_references`).
+//! projection row and any armed timer are removed. A projection removal that
+//! fails leaves a row whose journal has moved past it, which the delete
+//! reference lookup does not trust (`delete_references`).
 //!
-//! Without a journal each entity lives only in its actor. Every member is
-//! held at the state it was checked in (`EntityMsg::Hold`), which refuses its
-//! writes; a member that changed refuses the hold, and every hold is released
-//! with nothing deleted. Once all are held, each is deleted.
+//! A server with no event journal refuses a delete that removes several
+//! entities, before it writes anything (`BatchDeleteError::NoJournal`).
 //!
 //! The work runs in its own task, so a request that goes away part way (its
-//! client disconnected) cannot leave members held, or live actors serving the
-//! state from before a committed tombstone.
+//! client disconnected) cannot leave live actors serving the state from before
+//! a committed tombstone.
 
-use std::time::Duration;
-
-use temper_runtime::actor::{ActorError, ActorRef};
 use temper_runtime::persistence::{
     EventMetadata, PersistenceAppend, PersistenceEnvelope, PersistenceError,
 };
@@ -33,16 +28,18 @@ use temper_runtime::tenant::TenantId;
 use tracing::{Instrument, instrument};
 
 use super::ServerState;
-use super::dispatch::retry;
-use crate::entity_actor::effects::entity_authorization_precondition;
-use crate::entity_actor::{EntityEvent, EntityMsg, EntityResponse, EntityState};
+use crate::entity_actor::{EntityEvent, EntityState};
+use crate::storage::BoxedEventStore;
 
 /// Why a batch delete removed nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BatchDeleteError {
     /// An entity changed after its state was read.
     Changed(String),
-    /// The store or an actor could not take the delete.
+    /// The server keeps no event journal, so it has no write that removes
+    /// several entities as one change.
+    NoJournal,
+    /// The store could not take the delete.
     Storage(String),
 }
 
@@ -65,17 +62,24 @@ impl ServerState {
             },
             "batch delete members must be distinct"
         );
+        // A store with no atomic multi-journal write refuses a delete that
+        // removes several entities. Without a journal each entity lives only
+        // in its own actor, and no single write covers several actors, so
+        // they would be deleted one at a time; a delete that stopped part way
+        // would leave the rest pointing at entities that are gone. Every
+        // journal store's `append_batch` commits all of its appends or none.
+        let Some((store, _backend)) = self.event_journal() else {
+            return Err(BatchDeleteError::NoJournal);
+        };
         let state = self.clone();
         let tenant = tenant.clone();
         // determinism-ok: the task only outlives a request that goes away; it
         // is awaited here, so the delete's order of effects does not change.
         tokio::spawn(
             async move {
-                if state.event_journal().is_some() {
-                    state.append_tombstones_together(&tenant, members).await
-                } else {
-                    state.delete_held_together(&tenant, members).await
-                }
+                state
+                    .append_tombstones_together(&store, &tenant, members)
+                    .await
             }
             .instrument(tracing::Span::current()),
         )
@@ -87,14 +91,10 @@ impl ServerState {
     /// sequence its state was read at.
     async fn append_tombstones_together(
         &self,
+        store: &BoxedEventStore,
         tenant: &TenantId,
         members: Vec<EntityState>,
     ) -> Result<(), BatchDeleteError> {
-        let Some((store, _backend)) = self.event_journal() else {
-            return Err(BatchDeleteError::Storage(
-                "the event journal went away".to_string(),
-            ));
-        };
         let mut appends = Vec::with_capacity(members.len());
         let mut deleted = Vec::with_capacity(members.len());
         for mut member in members {
@@ -160,149 +160,6 @@ impl ServerState {
         }
         Ok(())
     }
-
-    /// Hold every member at the state it was read in, then delete each.
-    async fn delete_held_together(
-        &self,
-        tenant: &TenantId,
-        members: Vec<EntityState>,
-    ) -> Result<(), BatchDeleteError> {
-        let holder = sim_uuid();
-        // A full mailbox or a lost answer is retried (ADR-0048); each message
-        // below means the same thing when it arrives twice.
-        let policy = self.dispatch_retry_policy();
-        let mut actors = Vec::with_capacity(members.len());
-        for member in &members {
-            let Some(actor) =
-                self.get_or_spawn_tenant_actor(tenant, &member.entity_type, &member.entity_id)
-            else {
-                release(&actors, holder);
-                return Err(BatchDeleteError::Storage(format!(
-                    "no transition table for {}",
-                    member.entity_type
-                )));
-            };
-            let expected = entity_authorization_precondition(member);
-            let held = retry::ask_with_backoff::<_, EntityResponse, _>(
-                &actor,
-                || EntityMsg::Hold {
-                    expected_authorization_precondition: expected.clone(),
-                    holder,
-                },
-                &policy,
-            )
-            .await
-            .result;
-            // Sent a hold, so it may hold even when its answer did not arrive.
-            actors.push(actor);
-            match held {
-                Ok(response) if response.success => {}
-                Ok(response) => {
-                    release(&actors, holder);
-                    return Err(BatchDeleteError::Changed(format!(
-                        "{}('{}'): {}",
-                        member.entity_type,
-                        member.entity_id,
-                        response.error.unwrap_or_default()
-                    )));
-                }
-                Err(error) => {
-                    release(&actors, holder);
-                    return Err(BatchDeleteError::Storage(format!(
-                        "could not hold {}('{}'): {error}",
-                        member.entity_type, member.entity_id
-                    )));
-                }
-            }
-        }
-
-        // Every member is held at the state it was checked in, so each
-        // delete below finds that state. A delete that does not answer after
-        // its retries leaves the members after it held by nothing but this
-        // call, so they are released.
-        for (index, (actor, member)) in actors.iter().zip(&members).enumerate() {
-            let deleted = retry::ask_with_backoff::<_, EntityResponse, _>(
-                actor,
-                || EntityMsg::DeleteHeld { holder },
-                &policy,
-            )
-            .await
-            .result;
-            let deleted = match deleted {
-                Ok(response) if response.success => response.state,
-                Ok(response) => {
-                    release(&actors[index..], holder);
-                    return Err(BatchDeleteError::Storage(format!(
-                        "{}('{}') was held but not deleted: {}",
-                        member.entity_type,
-                        member.entity_id,
-                        response.error.unwrap_or_default()
-                    )));
-                }
-                Err(error) => {
-                    release(&actors[index..], holder);
-                    return Err(BatchDeleteError::Storage(format!(
-                        "{}('{}') was held but not deleted: {error}",
-                        member.entity_type, member.entity_id
-                    )));
-                }
-            };
-            // Nothing keeps a tombstone without a journal, so the status
-            // cache entry goes with the entity, as a single delete does.
-            if let Ok(mut cache) = self.entity_state_cache.lock() {
-                cache.pop(&format!(
-                    "{tenant}:{}:{}",
-                    member.entity_type, member.entity_id
-                ));
-            }
-            self.stop_and_remove_entity(tenant, &member.entity_type, &member.entity_id);
-            self.reconcile_state_timers(
-                tenant,
-                &member.entity_type,
-                &member.entity_id,
-                &deleted,
-                None,
-            )
-            .await;
-        }
-        Ok(())
-    }
-}
-
-/// End `holder`'s holds on every actor a hold was sent to; a release reaches
-/// an actor after its hold, and leaves another delete's hold alone.
-///
-/// Every release is delivered. One that finds its actor's mailbox full is
-/// sent again after a pause, on its own task so the delete can answer, until
-/// the actor takes it or stops; a stopped actor's hold ends with it.
-fn release(actors: &[ActorRef<EntityMsg>], holder: uuid::Uuid) {
-    let mut busy = Vec::new();
-    for actor in actors {
-        if let Err(ActorError::MailboxFull) = actor.tell(EntityMsg::Release { holder }) {
-            busy.push(actor.clone());
-        }
-    }
-    if busy.is_empty() {
-        return;
-    }
-    tracing::warn!(
-        busy = busy.len(),
-        "batch delete release found full mailboxes; sending again"
-    );
-    // determinism-ok: a release outlives the delete only while a mailbox is
-    // full; the entity refuses writes until it lands.
-    tokio::spawn(
-        async move {
-            for actor in busy {
-                let mut pause = Duration::from_millis(10);
-                while let Err(ActorError::MailboxFull) = actor.tell(EntityMsg::Release { holder }) {
-                    tokio::time::sleep(pause).await;
-                    pause = (pause * 2).min(Duration::from_secs(1));
-                }
-            }
-        }
-        .instrument(tracing::Span::current()),
-    );
 }
 
 #[cfg(test)]

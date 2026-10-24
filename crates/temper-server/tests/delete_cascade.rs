@@ -143,6 +143,13 @@ async fn server(name: &str, store: &Store) -> ServerState {
 }
 
 fn server_on(name: &str, stack: StorageStack) -> ServerState {
+    let mut state = memory_only(name);
+    state.set_storage_stack(stack);
+    state
+}
+
+/// A server that keeps each entity only in its actor: no event journal.
+fn memory_only(name: &str) -> ServerState {
     let (album, track, entry, folder) = (
         ioa("Album"),
         ioa("Track"),
@@ -162,8 +169,7 @@ fn server_on(name: &str, stack: StorageStack) -> ServerState {
             ("Credit", CREDIT_IOA),
         ],
     );
-    let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
-    state.set_storage_stack(stack);
+    let state = ServerState::from_registry(ActorSystem::new(name), registry);
     {
         let mut registry = state.registry.write().unwrap();
         for entity_type in ENTITY_TYPES {
@@ -455,4 +461,30 @@ async fn a_cascade_into_a_strict_type_is_refused_before_anything_is_deleted() {
         );
     }
     assert_eq!(get(&state, "Credits", "c-1").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn without_a_journal_a_delete_that_cascades_is_refused_and_one_that_does_not_runs() {
+    let state = memory_only("delete-cascade-memory-only");
+    album_with_tracks(&state, "a-owner", &["t-1", "t-2"]).await;
+    create(&state, "Album", "a-empty", serde_json::json!({})).await;
+
+    let (status, body) = delete(&state, "Albums", "a-owner").await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "cascade: {body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("keeps no journal") && message.contains("nothing was deleted"),
+        "the refusal says why and that nothing was deleted: {message}"
+    );
+    assert_eq!(get(&state, "Albums", "a-owner").await, StatusCode::OK);
+    for track in ["t-1", "t-2"] {
+        assert_eq!(get(&state, "Tracks", track).await, StatusCode::OK);
+    }
+
+    let (status, body) = delete(&state, "Albums", "a-empty").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "no cascade: {body}");
+    assert_eq!(
+        get(&state, "Albums", "a-empty").await,
+        StatusCode::NOT_FOUND
+    );
 }
