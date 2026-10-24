@@ -269,10 +269,20 @@ fn lowered_field_predicates_match_the_old_evaluator() {
 
 #[test]
 fn an_assert_nested_past_the_budget_is_a_validation_error() {
-    let depth = 200_000;
-    let assert = format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
-    let err = invariant_to_expr(&[], &assert).expect_err("over-deep assert must be refused");
-    assert!(err.contains("nested too deeply"), "{err}");
+    let over = crate::predicate::MAX_DEPTH + 1;
+    let deep = 200_000;
+    let cases = [
+        format!("{}a{}", "(".repeat(deep), ")".repeat(deep)),
+        format!("{}a", "!".repeat(over)),
+        format!("{}a", "!".repeat(deep)),
+        "!(".repeat(over) + "a" + &")".repeat(over),
+        format!("!{}a{}", "(".repeat(over), ")".repeat(over)),
+        format!("b && {}a", "!".repeat(over)),
+    ];
+    for assert in &cases {
+        let err = invariant_to_expr(&[], assert).expect_err("over-deep assert must be refused");
+        assert!(err.contains("nested too deeply"), "{err}");
+    }
 }
 
 #[test]
