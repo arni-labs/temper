@@ -47,7 +47,7 @@ use crate::genesis_install_verify::{
     restore_prior_install, verify_install_closure_runtime_ready,
 };
 use crate::os_apps::{
-    AppManifest, InstallResult, OsAppReconcileResult, add_os_apps_dir_preferred,
+    AppManifest, DirApps, InstallResult, OsAppReconcileResult, add_os_apps_dir_preferred,
     add_tenant_os_apps_dir, reconcile_os_app, resolve_tenant_os_app_install_order,
     tenant_os_app_bundle_digest,
 };
@@ -386,7 +386,7 @@ pub async fn install_genesis_app_from_registry(
         .find(|record| record.app_name == root_ref.name)
         .cloned();
 
-    register_install_cache(&request.tenant, cache_root.clone());
+    register_install_cache(&request.tenant, cache_root.clone(), DirApps::Every);
 
     let install_platform = platform.clone();
     let reconcile_started = Instant::now();
@@ -958,7 +958,7 @@ impl BoundActionHook for GenesisInstallHook {
         )
         .await?;
         let app_dir = app_cache_dir(&cache_root, &name)?;
-        register_install_cache(&target_tenant, cache_root);
+        register_install_cache(&target_tenant, cache_root, DirApps::Every);
 
         let mut platform = self.platform.clone();
         platform.server = state.clone();
@@ -1912,16 +1912,16 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// Make an install's cache directory resolve for the tenant it was made for.
+/// Make `apps` of an install's cache directory resolve for the tenant it was made for.
 ///
 /// The platform tenant's installs are the shared catalog; every other
 /// tenant's are its own, so they never change what another tenant or a
 /// shared app resolves.
-fn register_install_cache(tenant: &str, cache_root: PathBuf) {
+fn register_install_cache(tenant: &str, cache_root: PathBuf, apps: DirApps) {
     if tenant == TenantId::default().as_str() {
-        add_os_apps_dir_preferred(cache_root);
+        add_os_apps_dir_preferred(cache_root, apps);
     } else {
-        add_tenant_os_apps_dir(tenant, cache_root);
+        add_tenant_os_apps_dir(tenant, cache_root, apps);
     }
 }
 
@@ -2142,7 +2142,11 @@ mod tests {
         let root = tempfile::tempdir().expect("cache root");
         write_catalog_app(root.path(), &app_name, "PLATFORM-INSTALL");
 
-        register_install_cache(TenantId::default().as_str(), root.path().to_path_buf());
+        register_install_cache(
+            TenantId::default().as_str(),
+            root.path().to_path_buf(),
+            DirApps::Every,
+        );
 
         let other_tenant = format!("tenant-{}", uuid::Uuid::new_v4());
         let guide = crate::os_apps::tenant_app_guide(&other_tenant, &app_name)
@@ -2156,7 +2160,7 @@ mod tests {
         let app_name = format!("tenant-install-{}", uuid::Uuid::new_v4());
         let shared = tempfile::tempdir().expect("shared root");
         write_catalog_app(shared.path(), &app_name, "SHARED");
-        add_os_apps_dir_preferred(shared.path().to_path_buf());
+        add_os_apps_dir_preferred(shared.path().to_path_buf(), DirApps::Every);
         let tenant_a = format!("tenant-a-{}", uuid::Uuid::new_v4());
         let tenant_b = format!("tenant-b-{}", uuid::Uuid::new_v4());
         let root_a = tempfile::tempdir().expect("tenant a root");
@@ -2164,7 +2168,7 @@ mod tests {
         let root_b = tempfile::tempdir().expect("tenant b root");
         write_catalog_app(root_b.path(), &app_name, "TENANT-B");
 
-        register_install_cache(&tenant_a, root_a.path().to_path_buf());
+        register_install_cache(&tenant_a, root_a.path().to_path_buf(), DirApps::Every);
 
         let guide =
             |tenant: &str| crate::os_apps::tenant_app_guide(tenant, &app_name).expect("guide");
@@ -2181,7 +2185,7 @@ mod tests {
                     .is_some_and(|g| g.contains("SHARED")))
         );
 
-        register_install_cache(&tenant_b, root_b.path().to_path_buf());
+        register_install_cache(&tenant_b, root_b.path().to_path_buf(), DirApps::Every);
 
         assert!(guide(&tenant_a).contains("TENANT-A"));
         assert!(guide(&tenant_b).contains("TENANT-B"));

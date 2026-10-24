@@ -1,4 +1,5 @@
-//! Restoring an install reuses a cache directory only while it holds the recorded versions.
+//! Restoring an install reuses a cache directory only while it holds the recorded versions:
+//! each app in it is taken while it matches its own record.
 
 use std::sync::Arc;
 
@@ -9,9 +10,23 @@ use temper_server::platform_store::{SimPlatformFaultConfig, SimPlatformStore};
 const TENANT: &str = "restore-test-tenant";
 
 fn write_app(root: &Path, app_name: &str, marker: &str) {
+    write_app_needing(root, app_name, marker, &[]);
+}
+
+/// `app_name` in `root`, declaring `dependencies` in its app.toml.
+fn write_app_needing(root: &Path, app_name: &str, marker: &str, dependencies: &[&str]) {
     let app_dir = root.join(app_name);
     std::fs::create_dir_all(&app_dir).expect("app dir");
-    std::fs::write(app_dir.join("app.toml"), format!("name = \"{app_name}\"\n")).expect("app.toml");
+    let dependencies = dependencies
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        app_dir.join("app.toml"),
+        format!("name = \"{app_name}\"\ndependencies = [{dependencies}]\n"),
+    )
+    .expect("app.toml");
     std::fs::write(
         app_dir.join("APP.md"),
         format!("# {app_name}\n\n{marker}\n"),
@@ -36,6 +51,10 @@ fn store() -> SimPlatformStore {
     SimPlatformStore::new(0, SimPlatformFaultConfig::none())
 }
 
+fn names(apps: &[&str]) -> BTreeSet<String> {
+    apps.iter().map(ToString::to_string).collect()
+}
+
 #[tokio::test]
 async fn a_cache_directory_is_reused_only_while_it_holds_the_recorded_version() {
     let root = tempfile::tempdir().expect("cache root");
@@ -43,15 +62,25 @@ async fn a_cache_directory_is_reused_only_while_it_holds_the_recorded_version() 
     let record = recorded(root.path(), "notes");
     let ps = store();
     let only = std::slice::from_ref(&record);
-    assert!(stored_install_matches(&ps, root.path(), &record, only).await);
+    assert_eq!(
+        cached_apps_matching_records(&ps, root.path(), &record, only).await,
+        Some(names(&["notes"]))
+    );
 
     write_app(root.path(), "notes", "another version");
-    assert!(!stored_install_matches(&ps, root.path(), &record, only).await);
-    assert!(!stored_install_matches(&ps, &root.path().join("gone"), &record, only).await);
+    assert_eq!(
+        cached_apps_matching_records(&ps, root.path(), &record, only).await,
+        None
+    );
+    let gone = root.path().join("gone");
+    assert_eq!(
+        cached_apps_matching_records(&ps, &gone, &record, only).await,
+        None
+    );
 }
 
 #[tokio::test]
-async fn a_cache_directory_whose_dependency_changed_is_not_reused() {
+async fn a_cache_directory_serves_only_the_apps_that_match_their_records() {
     let root = tempfile::tempdir().expect("cache root");
     write_app(root.path(), "notes", "first version");
     write_app(root.path(), "tags", "first version");
@@ -61,14 +90,25 @@ async fn a_cache_directory_whose_dependency_changed_is_not_reused() {
         .await
         .expect("record tags");
     let only = std::slice::from_ref(&notes);
-    assert!(stored_install_matches(&ps, root.path(), &notes, only).await);
+    assert_eq!(
+        cached_apps_matching_records(&ps, root.path(), &notes, only).await,
+        Some(names(&["notes", "tags"]))
+    );
 
     write_app(root.path(), "tags", "another version");
-    assert!(!stored_install_matches(&ps, root.path(), &notes, only).await);
+    assert_eq!(
+        cached_apps_matching_records(&ps, root.path(), &notes, only).await,
+        Some(names(&["notes"])),
+        "a dependency at another version than its record is left out, not the directory"
+    );
 
     write_app(root.path(), "tags", "first version");
     write_app(root.path(), "unrecorded", "no record names it");
-    assert!(!stored_install_matches(&ps, root.path(), &notes, only).await);
+    assert_eq!(
+        cached_apps_matching_records(&ps, root.path(), &notes, only).await,
+        Some(names(&["notes", "tags"])),
+        "an app no record names is left out"
+    );
 }
 
 #[tokio::test]
@@ -230,4 +270,70 @@ async fn a_replay_installs_nothing_when_only_another_bundle_of_the_name_is_here(
     assert_eq!(stored.source_kind, "genesis");
     assert_eq!(stored.app_ref, installed.app_ref);
     assert_eq!(stored.bundle_digest, installed.bundle_digest);
+}
+
+/// An app installed with a dependency, whose dependency was then upgraded on
+/// its own, comes back offline at the versions its records name: the app from
+/// its install's cache, the dependency at its upgraded version from its own.
+#[tokio::test]
+async fn an_app_comes_back_beside_a_dependency_upgraded_on_its_own() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let tenant = format!("{TENANT}-upgraded-dependency");
+    let mut platform = PlatformState::new(None);
+    platform.server.data_dir = data_dir.path().to_path_buf();
+    let cache_for = |app_ref: &str| {
+        genesis_cache_root(
+            &platform.server,
+            CacheOwner::Install {
+                tenant: &tenant,
+                source: InstallSource::Registry("default"),
+            },
+            app_ref,
+        )
+    };
+    // The registry is not reachable: everything comes from the caches.
+    let genesis_record = |cache: &Path, app_name: &str, version: &str| InstalledAppRecord {
+        tenant: tenant.clone(),
+        app_ref: format!("acme/{app_name}@{version}"),
+        version_hash: version.to_string(),
+        registry_url: "http://127.0.0.1:9".to_string(),
+        registry_tenant: "default".to_string(),
+        status: "installed".to_string(),
+        ..recorded(cache, app_name)
+    };
+    let (v1, v2) = ("1".repeat(40), "2".repeat(40));
+
+    // notes installed at v1, bringing tags v1 with it.
+    let notes_cache = cache_for(&format!("acme/notes@{v1}"));
+    write_app_needing(&notes_cache, "notes", "notes v1", &["tags"]);
+    write_app(&notes_cache, "tags", "tags v1");
+    // tags then upgraded to v2 on its own.
+    let tags_cache = cache_for(&format!("acme/tags@{v2}"));
+    write_app(&tags_cache, "tags", "tags v2");
+
+    let notes = genesis_record(&notes_cache, "notes", &v1);
+    let tags = genesis_record(&tags_cache, "tags", &v2);
+    let ps = Arc::new(store());
+    for record in [&notes, &tags] {
+        ps.record_installed_app_metadata(record)
+            .await
+            .expect("record the Genesis install");
+    }
+
+    assert_eq!(boot(data_dir.path(), &ps).await, 2, "both installs restore");
+    let guide = |app_name: &str| {
+        crate::os_apps::tenant_app_guide(&tenant, app_name)
+            .unwrap_or_else(|| panic!("the tenant resolves {app_name}"))
+    };
+    assert!(guide("notes").contains("notes v1"), "{}", guide("notes"));
+    assert!(guide("tags").contains("tags v2"), "{}", guide("tags"));
+    for record in [&notes, &tags] {
+        let stored = ps
+            .get_installed_app(&tenant, &record.app_name)
+            .await
+            .expect("read the install record")
+            .expect("the install record is kept");
+        assert_eq!(stored.app_ref, record.app_ref);
+        assert_eq!(stored.bundle_digest, record.bundle_digest);
+    }
 }

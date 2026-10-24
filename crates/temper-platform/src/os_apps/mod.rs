@@ -33,9 +33,9 @@ mod system_files;
 mod types;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
-    add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app, list_os_apps,
-    list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir, tenant_app_guide,
-    tenant_os_app,
+    DirApps, add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app,
+    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir,
+    tenant_app_guide, tenant_os_app,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,

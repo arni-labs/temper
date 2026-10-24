@@ -12,7 +12,7 @@ use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 
 use super::registry::recorded_registry;
 use super::*;
-use crate::os_apps::os_app_dir_bundle_digests;
+use crate::os_apps::{DirApps, os_app_dir_bundle_digests};
 
 /// Rebuild Genesis app materialization cache roots from durable Genesis rows.
 ///
@@ -90,7 +90,7 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
             match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
                 Ok(_) => {
                     legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                    register_install_cache(&target_tenant, cache_root);
+                    register_install_cache(&target_tenant, cache_root, DirApps::Every);
                     restored += 1;
                 }
                 Err(error) => {
@@ -122,6 +122,8 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
 /// its cache directory when that holds the recorded version, otherwise fetched
 /// again from the registry it was installed from. An install whose files can
 /// be neither found nor fetched keeps its record, and the reason is logged.
+/// Each app in a directory is taken only while it matches its own record, so a
+/// dependency installed again separately keeps the version it has now.
 pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> usize {
     let Some(ps) = platform
         .server
@@ -185,15 +187,11 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         if !seen.insert(cache_root.clone()) {
             continue;
         }
-        if let Some(stored) = first_matching_install(
-            ps.as_ref(),
-            &candidates,
-            &record,
-            std::slice::from_ref(&record),
-        )
-        .await
+        let recorded = std::slice::from_ref(&record);
+        if let Some((stored, apps)) =
+            first_matching_install(ps.as_ref(), &candidates, &record, recorded).await
         {
-            register_install_cache(&tenant, stored);
+            register_install_cache(&tenant, stored, DirApps::Only(apps));
             restored += 1;
             continue;
         }
@@ -235,8 +233,20 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         match materialized {
             Ok(_) => {
                 legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                register_install_cache(&tenant, cache_root);
-                restored += 1;
+                match cached_apps_matching_records(ps.as_ref(), &cache_root, &record, recorded)
+                    .await
+                {
+                    Some(apps) => {
+                        register_install_cache(&tenant, cache_root, DirApps::Only(apps));
+                        restored += 1;
+                    }
+                    None => tracing::warn!(
+                        tenant = %tenant,
+                        app = %app_name,
+                        app_ref = %record.app_ref,
+                        "Fetched Genesis app files do not hold the recorded version; its install record is kept"
+                    ),
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -283,8 +293,11 @@ pub(super) async fn ensure_prior_bundle_available(
     };
     let candidates =
         install_cache_candidates(platform, &prior.tenant, &registry_tenant, &cache_key);
-    if let Some(stored) = first_matching_install(ps, &candidates, prior, prior_records).await {
-        register_install_cache(&prior.tenant, stored);
+    if let Some((stored, apps)) =
+        first_matching_install(ps, &candidates, prior, prior_records).await
+    {
+        restore_prior_dependencies(platform, ps, prior, prior_records, &apps).await;
+        register_install_cache(&prior.tenant, stored, DirApps::Only(apps));
         return Ok(());
     }
     let cache_root = candidates[0].clone();
@@ -318,8 +331,51 @@ pub(super) async fn ensure_prior_bundle_available(
             prior.app_ref
         )
     })?;
-    register_install_cache(&prior.tenant, cache_root);
+    let apps = cached_apps_matching_records(ps, &cache_root, prior, prior_records)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "re-materialized previous version {} does not hold its recorded bundle",
+                prior.app_ref
+            )
+        })?;
+    restore_prior_dependencies(platform, ps, prior, prior_records, &apps).await;
+    register_install_cache(&prior.tenant, cache_root, DirApps::Only(apps));
     Ok(())
+}
+
+/// Bring back, from its own install's cache, every prior dependency the prior
+/// root's directory does not hold at its recorded version: one installed again
+/// separately since that root was installed.
+async fn restore_prior_dependencies(
+    platform: &PlatformState,
+    ps: &dyn PlatformStore,
+    prior: &InstalledAppRecord,
+    prior_records: &[InstalledAppRecord],
+    served: &BTreeSet<String>,
+) {
+    for record in prior_records {
+        if record.app_name == prior.app_name || served.contains(&record.app_name) {
+            continue;
+        }
+        let registry_tenant = if record.registry_tenant.trim().is_empty() {
+            "default"
+        } else {
+            record.registry_tenant.trim()
+        };
+        let candidates =
+            install_cache_candidates(platform, &record.tenant, registry_tenant, &record.app_ref);
+        match first_matching_install(ps, &candidates, record, prior_records).await {
+            Some((stored, apps)) => {
+                register_install_cache(&record.tenant, stored, DirApps::Only(apps));
+            }
+            None => tracing::warn!(
+                app = %record.app_name,
+                app_ref = %record.app_ref,
+                "Prior dependency's files are not on disk at its recorded version for rollback"
+            ),
+        }
+    }
 }
 
 /// The cache directories an install of `cache_key` into `tenant` may have, the registry's first.
@@ -357,59 +413,56 @@ fn install_cache_candidates(
         .collect()
 }
 
-/// The first of `candidates` that still holds the versions `record`'s install recorded.
+/// The first of `candidates` that holds `record`'s app at its recorded version,
+/// with the apps to take from it.
 async fn first_matching_install(
     ps: &dyn PlatformStore,
     candidates: &[PathBuf],
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
-) -> Option<PathBuf> {
+) -> Option<(PathBuf, BTreeSet<String>)> {
     for candidate in candidates {
-        if stored_install_matches(ps, candidate, record, recorded).await {
-            return Some(candidate.clone());
+        if let Some(apps) = cached_apps_matching_records(ps, candidate, record, recorded).await {
+            return Some((candidate.clone(), apps));
         }
     }
     None
 }
 
-/// Whether an install's cache directory still holds the versions its records name.
+/// The apps of an install's cache directory that still match their records,
+/// or `None` when `record`'s own app is not there at its recorded version.
 ///
 /// A directory on disk is not proof on its own: an install could have stopped
-/// partway, and a file in it could have changed since. Registering the
-/// directory makes every app in it what the tenant resolves, so every app in
-/// it must read back at its recorded digest: from `recorded` when that names
-/// the app, otherwise from the tenant's stored record. A record without a
-/// digest needs the app to read back. The installed app itself must be in the
-/// directory. It is checked before it is registered, so a directory that does
-/// not match never becomes what the tenant resolves.
-async fn stored_install_matches(
+/// partway, and a file in it could have changed since. Each app in it is
+/// decided on its own: it is taken when it reads back at its recorded digest,
+/// from `recorded` when that names the app, otherwise from the tenant's stored
+/// record. A record without a digest needs the app to read back. An app with
+/// no record, or at another version than its record names (a dependency
+/// installed again separately), is left out, so the tenant goes on resolving
+/// it from wherever it resolves it now. The apps are decided before they are
+/// registered, so an app that does not match never becomes what the tenant
+/// resolves.
+async fn cached_apps_matching_records(
     ps: &dyn PlatformStore,
     cache_root: &Path,
     record: &InstalledAppRecord,
     recorded: &[InstalledAppRecord],
-) -> bool {
-    let Some(digests) = os_app_dir_bundle_digests(cache_root) else {
-        return false;
-    };
-    if !digests
-        .iter()
-        .any(|digest| digest.app_name == record.app_name)
-    {
-        return false;
-    }
+) -> Option<BTreeSet<String>> {
+    let digests = os_app_dir_bundle_digests(cache_root)?;
+    let mut matching = BTreeSet::new();
     for digest in &digests {
         let expected = match recorded.iter().find(|r| r.app_name == digest.app_name) {
             Some(known) => known.bundle_digest.clone(),
             None => match ps.get_installed_app(&record.tenant, &digest.app_name).await {
                 Ok(Some(stored)) => stored.bundle_digest,
-                _ => return false,
+                _ => continue,
             },
         };
-        if !expected.is_empty() && expected != digest.bundle_digest {
-            return false;
+        if expected.is_empty() || expected == digest.bundle_digest {
+            matching.insert(digest.app_name.clone());
         }
     }
-    true
+    matching.contains(&record.app_name).then_some(matching)
 }
 
 #[cfg(test)]
