@@ -25,6 +25,10 @@ use super::common::{
     verification_gate_response,
 };
 use super::constraints::pre_delete_relation_checks;
+use super::create_answer::{
+    CreateTarget, EXISTING_ENTITY_STATUS, create_answer_body, existing_key_conflict, finish_create,
+    may_read, taken_key_response,
+};
 use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
 use super::response::annotate_entity;
@@ -33,10 +37,14 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error, odata_refusal};
-use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{DataOnlyCreate, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
+
+/// Most cooperative yields a simulation takes between a create's key check
+/// and its create.
+const CREATE_CHECK_YIELD_BUDGET: u32 = 8;
 
 fn parse_odata_path_or_400(path: &str) -> Result<ODataPath, ODataWriteError> {
     parse_path(&format!("/{path}")).map_err(|e| {
@@ -716,13 +724,54 @@ pub async fn handle_odata_post(
                     .into_response();
                 };
                 let namespace = format!("{tenant}/{entity_id}");
-                let spawn_result = actor_sys
-                    .spawn_with_fields(&namespace, &entity_type, initial_fields.clone())
-                    .await;
+                // A key that already names an entity writes nothing: the
+                // caller's read decision on it decides the answer.
+                let status = match actor_sys.load_state(&namespace, &entity_type).await {
+                    Ok(None) => StatusCode::CREATED,
+                    Ok(Some(state_bytes)) => {
+                        let existing: temper_actor_runtime::spec_actor::SpecActorState =
+                            serde_json::from_slice(&state_bytes).unwrap_or_default();
+                        let body = serde_json::json!({
+                            "entity_id": entity_id,
+                            "status": existing.status,
+                            "fields": existing.fields,
+                        });
+                        let target = CreateTarget {
+                            tenant: &tenant,
+                            security_ctx: &security_ctx,
+                            agent_ctx: &agent_ctx,
+                            entity_type: &entity_type,
+                            set_name: &name,
+                            entity_id: &entity_id,
+                        };
+                        // A key whose entity is in the Deleted status stays
+                        // taken.
+                        if existing.status == "Deleted" || !may_read(&state, &target, &body) {
+                            return existing_key_conflict();
+                        }
+                        EXISTING_ENTITY_STATUS
+                    }
+                    Err(error) => {
+                        return odata_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ActorReadError",
+                            &error.to_string(),
+                        )
+                        .into_response();
+                    }
+                };
+                let spawn_result = if status == StatusCode::CREATED {
+                    actor_sys
+                        .spawn_with_fields(&namespace, &entity_type, initial_fields.clone())
+                        .await
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
                 match spawn_result {
-                    Ok(_) => {
+                    Ok(()) => {
                         return ODataResponse {
-                            status: StatusCode::CREATED,
+                            status,
                             body: serde_json::json!({
                                 "@odata.type": format!("#{entity_type}"),
                                 "Id": entity_id,
@@ -741,6 +790,23 @@ pub async fn handle_odata_post(
                     }
                 }
             }
+
+            let target = CreateTarget {
+                tenant: &tenant,
+                security_ctx: &security_ctx,
+                agent_ctx: &agent_ctx,
+                entity_type: &entity_type,
+                set_name: &name,
+                entity_id: &entity_id,
+            };
+            if state
+                .ensure_entity_loaded(&tenant, &entity_type, &entity_id)
+                .await
+            {
+                return taken_key_response(&state, &target).await;
+            }
+            // Simulation runs a concurrent create of the same key here.
+            temper_runtime::buggify::buggify_yield(CREATE_CHECK_YIELD_BUDGET).await;
 
             // A new entity's first event holds its initial fields: one too large is
             // refused here, before any create path starts.
@@ -765,21 +831,24 @@ pub async fn handle_odata_post(
                 )
                 .await
             {
-                Ok(Some(response)) => {
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{name}/$entity"),
-                        Some(format!("{name}('{entity_id}')")),
-                    );
+                Ok(DataOnlyCreate::Created(response)) => {
+                    finish_create(&state, &target, &response).await;
                     return ODataResponse {
                         status: StatusCode::CREATED,
-                        body,
+                        body: create_answer_body(&state, &target, &response).await,
                     }
                     .into_response();
                 }
-                Ok(None) => {}
+                // A concurrent create of this key wrote its entity first.
+                Ok(DataOnlyCreate::KeyTaken)
+                    if state
+                        .ensure_entity_loaded(&tenant, &entity_type, &entity_id)
+                        .await =>
+                {
+                    return taken_key_response(&state, &target).await;
+                }
+                // No entity holds the key: the create takes the generic path.
+                Ok(DataOnlyCreate::KeyTaken | DataOnlyCreate::Ineligible) => {}
                 Err(e) => {
                     return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
                         .into_response();
@@ -787,35 +856,16 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
+                .create_new_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
                 .await
             {
-                Ok(response) => {
-                    // Creation is not a dispatch: a record created into a
-                    // timed first state has its timer armed here.
-                    state
-                        .arm_state_timeouts_on_creation(
-                            &tenant,
-                            &entity_type,
-                            &entity_id,
-                            &response,
-                            &agent_ctx,
-                        )
-                        .await;
-                    if entity_type == "RateLimit" {
-                        state.clear_commons_rate_limit_cache();
-                    }
-                    state.clear_commons_storage_projection_cache_for_entity(&entity_type);
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{name}/$entity"),
-                        Some(format!("{name}('{entity_id}')")),
-                    );
+                // A concurrent create of this key started its actor first.
+                Ok(None) => taken_key_response(&state, &target).await,
+                Ok(Some(response)) => {
+                    finish_create(&state, &target, &response).await;
                     ODataResponse {
                         status: StatusCode::CREATED,
-                        body,
+                        body: create_answer_body(&state, &target, &response).await,
                     }
                     .into_response()
                 }

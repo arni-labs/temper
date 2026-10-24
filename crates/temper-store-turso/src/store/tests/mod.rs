@@ -2430,3 +2430,95 @@ async fn deleted_probes_use_the_tombstone_index() {
         }
     }
 }
+
+/// A projection write of an entity whose journal leaves it deleted writes
+/// nothing. That holds for the kernel's tombstone and for a declared action
+/// that moves the entity to `Deleted`. State read before the deletion cannot
+/// bring back the row the deletion removed, in the catalog or the field
+/// index, by single or batch writes. A spec action named `Deleted` that leads elsewhere deletes
+/// nothing, and the write after it lands.
+#[tokio::test]
+async fn projection_writes_after_a_deletion_write_nothing() {
+    let store = make_store("projection-after-deletion").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    for (entity_id, action, kind, to_status) in [
+        ("ord-tombstoned", "Deleted", "tombstone", "Deleted"),
+        ("ord-discarded", "Discard", "transition", "Deleted"),
+        ("ord-archived", "Deleted", "transition", "Archived"),
+    ] {
+        let deleted = to_status == "Deleted";
+        let fields = serde_json::json!({"Owner": entity_id});
+        let persistence_id = format!("{tenant}:Order:{entity_id}");
+        let event = serde_json::json!({"action": action, "kind": kind, "to_status": to_status, "params": {}});
+        store
+            .append(
+                &persistence_id,
+                0,
+                &[test_envelope("Created", serde_json::json!({}))],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_query_projection(&tenant, "Order", entity_id, "Draft", &fields, 1)
+            .await
+            .unwrap();
+        store
+            .append(&persistence_id, 1, &[test_envelope(action, event)])
+            .await
+            .unwrap();
+        // A deletion removes the row and leaves only older state to write; any
+        // other action writes its own newer state.
+        let (status, sequence_nr) = if deleted {
+            store
+                .remove_query_projection(&tenant, "Order", entity_id)
+                .await
+                .unwrap();
+            ("Draft", 1)
+        } else {
+            (to_status, 2)
+        };
+
+        store
+            .upsert_query_projection(&tenant, "Order", entity_id, status, &fields, sequence_nr)
+            .await
+            .unwrap();
+        store
+            .upsert_query_projections(
+                &tenant,
+                &[QueryProjectionUpsert {
+                    entity_type: "Order".to_string(),
+                    entity_id: entity_id.to_string(),
+                    status: status.to_string(),
+                    fields: fields.clone(),
+                    state: serde_json::json!({}),
+                    indexed_fields: fields.clone(),
+                    sequence_nr,
+                    known_new: false,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let catalog = store
+            .load_entity_catalog_rows(&tenant, "Order", &[entity_id.to_string()])
+            .await
+            .unwrap();
+        let listed = store
+            .query_field_index(
+                &tenant,
+                "Order",
+                "field_name = ?3 AND field_value = ?4",
+                vec!["Owner".to_string(), entity_id.to_string()],
+            )
+            .await
+            .unwrap();
+        if deleted {
+            assert!(catalog.is_empty(), "{entity_id}: {catalog:?}");
+            assert!(listed.is_empty(), "{entity_id}: {listed:?}");
+        } else {
+            let statuses: Vec<_> = catalog.iter().map(|row| row.status.as_str()).collect();
+            assert_eq!(statuses, [to_status], "{entity_id}");
+            assert_eq!(listed, [entity_id], "{entity_id}");
+        }
+    }
+}

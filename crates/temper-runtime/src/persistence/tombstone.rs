@@ -41,26 +41,30 @@ impl PersistenceEnvelope {
     /// shape is a tombstone. A spec action named `Deleted` written then is read
     /// as one only if it had all three; written now, it has a kind.
     pub fn is_tombstone(&self) -> bool {
-        if self.event_type != TOMBSTONE_EVENT_TYPE {
-            return false;
-        }
-        match self.payload.get(EVENT_KIND_KEY) {
-            Some(kind) => kind.as_str() == Some("tombstone"),
-            None => {
-                self.payload
-                    .get("to_status")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(TOMBSTONE_EVENT_TYPE)
-                    && self
-                        .payload
-                        .get("params")
-                        .and_then(serde_json::Value::as_object)
-                        .is_some_and(serde_json::Map::is_empty)
-                    && self
-                        .payload
-                        .get("idempotency_key")
-                        .is_none_or(serde_json::Value::is_null)
-            }
+        is_tombstone_event(&self.event_type, &self.payload)
+    }
+}
+
+/// Whether an event journaled under `event_type` with `payload` is the
+/// kernel's deletion tombstone, by the rule [`PersistenceEnvelope::is_tombstone`]
+/// documents. For readers that hold an event's type and payload but not its
+/// whole envelope.
+pub fn is_tombstone_event(event_type: &str, payload: &serde_json::Value) -> bool {
+    if event_type != TOMBSTONE_EVENT_TYPE {
+        return false;
+    }
+    match payload.get(EVENT_KIND_KEY) {
+        Some(kind) => kind.as_str() == Some("tombstone"),
+        None => {
+            payload.get("to_status").and_then(serde_json::Value::as_str)
+                == Some(TOMBSTONE_EVENT_TYPE)
+                && payload
+                    .get("params")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                && payload
+                    .get("idempotency_key")
+                    .is_none_or(serde_json::Value::is_null)
         }
     }
 }

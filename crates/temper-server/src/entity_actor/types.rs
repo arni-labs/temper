@@ -147,6 +147,16 @@ impl StatusClock {
 }
 
 impl EntityState {
+    /// Whether the entity is gone: its status is `Deleted`. The kernel's
+    /// tombstone (`journal_is_deleted`) always leaves that status, and so does
+    /// a spec action that leads to `Deleted`. The loader, the query projection
+    /// and composite reloads all treat that status as gone, so a create of the
+    /// key answers 409 and never returns the stored fields. A spec action
+    /// named `Deleted` that leads to another status leaves the entity live.
+    pub fn is_deleted(&self) -> bool {
+        self.status == "Deleted"
+    }
+
     /// Return true if this entity can accept one more event under budget.
     pub fn can_accept_event(&self) -> bool {
         self.events_since_snapshot < MAX_EVENTS_SINCE_SNAPSHOT

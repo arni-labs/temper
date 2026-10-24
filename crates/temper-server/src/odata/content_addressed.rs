@@ -33,19 +33,19 @@ use super::authz::{
     require_authenticated_context,
 };
 use super::common::run_write_prechecks;
-use super::response::annotate_entity;
+use super::create_answer::{CreateTarget, finish_create};
 use super::storage_guardrails::storage_cap_error_response;
 use crate::blob_store::{BlobByteStream, BlobIngestAdmissionError, MAX_RAW_BLOB_BYTES};
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, blob_ref_value};
 use crate::request_context::extract_agent_context;
-use crate::response::{ODataResponse, odata_error};
+use crate::response::odata_error;
 use crate::state::ServerState;
 
 const EXPECTED_OBJECT_ID_HEADER: &str = "x-expected-object-id";
 
 pub(in crate::odata) mod responses;
 use responses::{
-    blob_store_error_response, remove_binary_fields_from_create_response, stage_error_response,
+    blob_create_response, blob_store_error_response, stage_error_response, taken_blob_answer,
 };
 
 /// `POST /tdata/Blobs/Temper.IngestRaw` — stream raw blob bytes,
@@ -164,6 +164,23 @@ async fn ingest_raw_inner(
     .await
     {
         return response;
+    }
+    let set_name = format!("{entity_type}s");
+    let target = CreateTarget {
+        tenant: &tenant,
+        security_ctx: &security_ctx,
+        agent_ctx: &agent_ctx,
+        entity_type,
+        set_name: &set_name,
+        entity_id: &expected_object_id,
+    };
+    // An object that already exists is not staged again: the caller's read
+    // decision on it decides the answer.
+    if state
+        .ensure_entity_loaded(&tenant, entity_type, target.entity_id)
+        .await
+    {
+        return taken_blob_answer(&state, &target).await;
     }
 
     // Reserve staging capacity only after Cedar admits the exact expected
@@ -392,25 +409,18 @@ async fn ingest_raw_inner(
     }
 
     let create_result = state
-        .get_or_create_tenant_entity(&tenant, entity_type, &expected_object_id, initial_fields)
+        .create_new_tenant_entity(&tenant, entity_type, &expected_object_id, initial_fields)
         .await;
     match create_result {
-        Ok(response) => {
-            let _ = agent_ctx;
-            state.clear_commons_storage_projection_cache_for_entity(entity_type);
+        Ok(Some(response)) => {
+            finish_create(&state, &target, &response).await;
             drop(final_guard);
-            let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-            remove_binary_fields_from_create_response(&mut state_json);
-            let body = annotate_entity(
-                state_json,
-                format!("$metadata#{entity_type}s/$entity"),
-                Some(format!("{entity_type}s('{expected_object_id}')")),
-            );
-            ODataResponse {
-                status: StatusCode::CREATED,
-                body,
-            }
-            .into_response()
+            blob_create_response(&target, StatusCode::CREATED, &response)
+        }
+        // A concurrent ingest of this object started its entity first.
+        Ok(None) => {
+            drop(final_guard);
+            taken_blob_answer(&state, &target).await
         }
         Err(error) => {
             drop(final_guard);

@@ -13,6 +13,7 @@ use crate::metrics::{
     record_postgres_projection_index_fields, record_postgres_projection_index_reconciliation,
     record_postgres_transaction_begin_duration, record_postgres_transaction_commit_duration,
 };
+use crate::schema::tombstone_sql;
 
 mod evolution;
 mod inputs;
@@ -90,6 +91,79 @@ async fn update_query_projection_catalog_row(
     .await
     .map_err(storage_error)?;
     Ok(())
+}
+
+/// Serialise the projection writes and removals of one entity for the rest
+/// of `tx`. An entity with no row yet has nothing for `FOR UPDATE` to lock, so
+/// without this a write could insert a row that a concurrent removal cannot
+/// see, and the row would outlive the removal.
+async fn lock_entity_projection(
+    schema: &crate::PostgresSchema,
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: &str,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<(), PersistenceError> {
+    crate::dbm::postgres_query!(
+        schema,
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'temper-projection:' || $1 || ':' || $2 || ':' || $3, 0))",
+    )
+    .bind(tenant)
+    .bind(entity_type)
+    .bind(entity_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Whether the entity's journal leaves it without a projection row, read after
+/// [`lock_entity_projection`]: it holds the kernel's tombstone
+/// ([`tombstone_sql`]), or its newest event moves it to the `Deleted` status,
+/// whose row the projection drops whichever action got it there. The journal
+/// commits the event before the removal runs under the same lock, so a write
+/// of older state either commits before that removal, which then deletes it,
+/// or sees the event and writes nothing. A deleted entity's row cannot come
+/// back.
+async fn journal_leaves_deleted(
+    schema: &crate::PostgresSchema,
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: &str,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<bool, PersistenceError> {
+    let tombstone: Option<i32> = crate::dbm::postgres_query_scalar!(
+        schema,
+        concat!(
+            "SELECT 1 FROM {schema}events d \
+             WHERE d.tenant = $1 AND d.entity_type = $2 AND d.entity_id = $3 AND ",
+            tombstone_sql!(),
+            " LIMIT 1"
+        ),
+    )
+    .bind(tenant)
+    .bind(entity_type)
+    .bind(entity_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage_error)?;
+    if tombstone.is_some() {
+        return Ok(true);
+    }
+    let newest_deleted: Option<Option<bool>> = crate::dbm::postgres_query_scalar!(
+        schema,
+        "SELECT payload->>'to_status' = 'Deleted' FROM {schema}events \
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
+         ORDER BY sequence_nr DESC LIMIT 1",
+    )
+    .bind(tenant)
+    .bind(entity_type)
+    .bind(entity_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage_error)?;
+    Ok(newest_deleted.flatten() == Some(true))
 }
 
 async fn reconcile_query_projection_field_index(
@@ -643,6 +717,13 @@ impl PostgresEventStore {
             }
         };
 
+        lock_entity_projection(&self.schema, &mut tx, tenant, entity_type, entity_id).await?;
+        if journal_leaves_deleted(&self.schema, &mut tx, tenant, entity_type, entity_id).await? {
+            tx.commit().await.map_err(storage_error)?;
+            transaction_timer.set_outcome("deleted_skipped");
+            return Ok(());
+        }
+
         let previous_catalog: Option<CatalogProjectionFingerprint> =
             crate::dbm::postgres_query_as!(
                 &self.schema,
@@ -896,6 +977,7 @@ impl PostgresEventStore {
                 return Err(storage_error(e));
             }
         };
+        lock_entity_projection(&self.schema, &mut tx, tenant, entity_type, entity_id).await?;
         crate::dbm::postgres_query!(&self.schema,
             "DELETE FROM {schema}entity_catalog WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
         )

@@ -1272,3 +1272,108 @@ fn migrations_create_the_tombstone_index() {
         );
     });
 }
+
+/// A projection write of an entity whose journal leaves it deleted writes
+/// nothing. That holds for the kernel's tombstone and for a declared action
+/// that moves the entity to `Deleted`. State read before the deletion cannot
+/// bring back the row the deletion removed, in the catalog or the field
+/// index. A spec action named `Deleted` that leads elsewhere deletes
+/// nothing, and the write after it lands.
+#[test]
+fn projection_write_after_a_deletion_writes_nothing() {
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+
+    sqlx::test_block_on(async {
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let store = PostgresEventStore::new(pool.clone());
+        let tenant = format!("tenant-projection-deletion-{}", uuid::Uuid::new_v4());
+        for (entity_id, action, kind, to_status) in [
+            ("ord-tombstoned", "Deleted", "tombstone", "Deleted"),
+            ("ord-discarded", "Discard", "transition", "Deleted"),
+            ("ord-archived", "Deleted", "transition", "Archived"),
+        ] {
+            let deleted = to_status == "Deleted";
+            let fields = serde_json::json!({"owner": entity_id});
+            let persistence_id = format!("{tenant}:Order:{entity_id}");
+            let event = serde_json::json!({"action": action, "kind": kind, "to_status": to_status, "params": {}});
+            store
+                .append(
+                    &persistence_id,
+                    0,
+                    &[test_envelope("Created", serde_json::json!({}))],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert_query_projection(&tenant, "Order", entity_id, "Draft", &fields, 1)
+                .await
+                .unwrap();
+            store
+                .append(&persistence_id, 1, &[test_envelope(action, event)])
+                .await
+                .unwrap();
+            // A deletion removes the row and leaves only older state to write;
+            // any other action writes its own newer state.
+            let (status, sequence_nr) = if deleted {
+                store
+                    .remove_query_projection(&tenant, "Order", entity_id)
+                    .await
+                    .unwrap();
+                ("Draft", 1)
+            } else {
+                (to_status, 2)
+            };
+
+            store
+                .upsert_query_projection(&tenant, "Order", entity_id, status, &fields, sequence_nr)
+                .await
+                .unwrap();
+
+            let statuses: Vec<String> = crate::dbm::postgres_query_scalar!(
+                "SELECT status FROM entity_catalog WHERE tenant = $1 AND entity_id = $2",
+            )
+            .bind(&tenant)
+            .bind(entity_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let listed = store
+                .query_field_index(
+                    &tenant,
+                    "Order",
+                    "entity_id IN (SELECT entity_id FROM entity_field_index \
+                     WHERE tenant = $1 AND entity_type = $2 AND field_name = ?3 AND field_value = ?4)",
+                    vec!["owner".to_string(), entity_id.to_string()],
+                )
+                .await
+                .unwrap();
+            if deleted {
+                assert!(statuses.is_empty(), "{entity_id}: {statuses:?}");
+                assert!(listed.is_empty(), "{entity_id}: {listed:?}");
+            } else {
+                assert_eq!(statuses, [to_status], "{entity_id}");
+                assert_eq!(listed, [entity_id], "{entity_id}");
+            }
+        }
+
+        crate::dbm::postgres_query!("DELETE FROM events WHERE tenant = $1")
+            .bind(&tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::dbm::postgres_query!("DELETE FROM entity_catalog WHERE tenant = $1")
+            .bind(&tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::dbm::postgres_query!("DELETE FROM entity_field_index WHERE tenant = $1")
+            .bind(&tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+}

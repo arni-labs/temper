@@ -12,6 +12,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
+use super::projection_guard::journal_leaves_deleted;
 use super::write_gate::WritePriority;
 use super::{TursoEventStore, TursoQueryProjectionRow};
 
@@ -192,7 +193,9 @@ impl TursoEventStore {
                 None
             }
         };
-        if existing_sequence.is_some_and(|existing| existing > sequence_nr) {
+        if existing_sequence.is_some_and(|existing| existing > sequence_nr)
+            || journal_leaves_deleted(&tx, tenant, entity_type, entity_id).await?
+        {
             tx.commit().await.map_err(storage_error)?;
             return Ok(());
         }
@@ -347,7 +350,15 @@ impl TursoEventStore {
             let sequence_nr = i64::try_from(projection.sequence_nr).unwrap_or(i64::MAX);
             let key = (projection.entity_type.clone(), projection.entity_id.clone());
             let existing_row = existing.get(&key);
-            if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr) {
+            if existing_row.is_some_and(|(existing_sequence, _)| *existing_sequence > sequence_nr)
+                || journal_leaves_deleted(
+                    &tx,
+                    tenant,
+                    &projection.entity_type,
+                    &projection.entity_id,
+                )
+                .await?
+            {
                 continue;
             }
             if existing_row.is_none_or(|(_, existing_hash)| existing_hash != &new_projection_hash) {
