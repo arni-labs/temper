@@ -1,4 +1,6 @@
-//! An overdue install timer cannot dispatch while module storage is awaiting.
+//! An overdue install timer cannot dispatch while module storage is awaiting,
+//! not even when another tenant's install finishes in the meantime and starts
+//! a walk of its own.
 use super::*;
 use std::sync::Arc;
 use temper_runtime::persistence::{EventStore, PersistenceError};
@@ -89,6 +91,26 @@ impl TursoStoreProvider for ObserveModuleInstall {
 
 #[tokio::test]
 async fn overdue_install_timer_waits_for_module_registration() {
+    overdue_install_timer_waits(None).await;
+}
+
+/// Tenant B installs the same app, and its walk runs, while tenant A's
+/// install waits for module storage: A's changed spec must stay out of B's
+/// walk, so A's overdue timer neither fires early nor is spent on a refused
+/// fire, and A's own install arms it once its module is in.
+#[tokio::test]
+async fn overdue_install_timer_waits_while_another_tenant_installs() {
+    overdue_install_timer_waits(Some("timer-install-b")).await;
+}
+
+async fn overdue_install_timer_waits(other_tenant: Option<&str>) {
+    let plan = OsAppInstallPlan {
+        specs: true,
+        policies: true,
+        wasm: true,
+        content: false,
+        seed: false,
+    };
     let root = std::env::temp_dir().join(format!("timer-install-{}", uuid::Uuid::new_v4()));
     let app = "timer-install";
     let dir = root.join(app);
@@ -144,34 +166,10 @@ to = "Done"
         .server
         .set_storage_stack(temper_server::StorageStack::from_turso(store.clone()));
     let tenant = TenantId::new("timer-install");
-    state
-        .registry
-        .write()
-        .expect("registry lock")
-        .register_tenant(
-            tenant.as_str(),
-            parse_csdl(csdl).expect("parse csdl"),
-            csdl.to_string(),
-            &[("Job", spec)],
-        );
-    state
-        .registry
-        .write()
-        .expect("registry lock")
-        .set_verification_status(
-            &tenant,
-            "Job",
-            VerificationStatus::Completed(EntityVerificationResult {
-                all_passed: true,
-                levels: vec![],
-                verified_at: "2026-10-24T00:00:00Z".to_string(),
-            }),
-        );
-    state
-        .server
-        .authz
-        .reload_tenant_policies(tenant.as_str(), "permit(principal, action, resource);")
-        .expect("load policies");
+    let other = other_tenant.map(TenantId::new);
+    for each in std::iter::once(&tenant).chain(other.as_ref()) {
+        register_untimed(&state, each, csdl, spec);
+    }
     state
         .server
         .start_runtime()
@@ -235,23 +233,18 @@ on_timeout = "Expire"
     add_os_apps_dir(root.clone());
     let install = INSTALLER.scope(
         true,
-        install_os_app_with_plan(
-            &state,
-            tenant.as_str(),
-            app,
-            OsAppInstallPlan {
-                specs: true,
-                policies: true,
-                wasm: true,
-                content: false,
-                seed: false,
-            },
-        ),
+        install_os_app_with_plan(&state, tenant.as_str(), app, plan),
     );
     tokio::pin!(install);
     tokio::select! {
         _ = entered.notified() => {},
         result = &mut install => panic!("installation missed the storage pause: {result:?}"),
+    }
+    if let Some(other) = &other {
+        // B's install ends with a walk of its own while A's still waits.
+        install_os_app_with_plan(&state, other.as_str(), app, plan)
+            .await
+            .expect("tenant B installs while tenant A waits for module storage");
     }
     assert!(
         state
@@ -298,4 +291,30 @@ on_timeout = "Expire"
     .await
     .expect("the overdue record must leave its timed state after installation");
     fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+/// Register `tenant` with the app's untimed spec, verified, under `allow`.
+fn register_untimed(state: &PlatformState, tenant: &TenantId, csdl: &str, spec: &str) {
+    let mut registry = state.registry.write().expect("registry lock");
+    registry.register_tenant(
+        tenant.as_str(),
+        parse_csdl(csdl).expect("parse csdl"),
+        csdl.to_string(),
+        &[("Job", spec)],
+    );
+    registry.set_verification_status(
+        tenant,
+        "Job",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![],
+            verified_at: "2026-10-24T00:00:00Z".to_string(),
+        }),
+    );
+    drop(registry);
+    state
+        .server
+        .authz
+        .reload_tenant_policies(tenant.as_str(), "permit(principal, action, resource);")
+        .expect("load policies");
 }
