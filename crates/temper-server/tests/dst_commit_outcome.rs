@@ -137,6 +137,12 @@ fn server(store: &SimEventStore, seed: u64) -> ServerState {
     state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
     state.state_timer_rows = Some(std::sync::Arc::new(rows::SimTimerRows(store.clone())));
     state.action_dispatch_timeout = Duration::from_millis(25);
+    // A reaction is authorized as its own move: with no tenant policy, Cedar
+    // refuses every `Ledger.Count`, and no hold could ever be counted.
+    state
+        .authz
+        .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
+        .expect("the tenant policy parses");
     state.rebuild_reaction_dispatcher();
     state
 }
