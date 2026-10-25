@@ -48,6 +48,8 @@ pub enum EntityMsg {
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
+        /// Who made the move and the dispatch path that carried it.
+        origin: super::MoveOrigin,
     },
     /// Get the current entity state.
     GetState,
@@ -61,12 +63,16 @@ pub enum EntityMsg {
         /// decision. The actor rejects the update if that state changed before
         /// this message reached its mailbox.
         expected_precondition: Option<String>,
+        /// Who made the update and the dispatch path that carried it.
+        origin: super::MoveOrigin,
     },
     /// Delete this entity.
     Delete {
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
+        /// Who made the delete and the dispatch path that carried it.
+        origin: super::MoveOrigin,
     },
 }
 
@@ -218,11 +224,21 @@ pub struct EntityEvent {
     /// tombstone, whatever a spec names its actions.
     #[serde(default)]
     pub kind: temper_runtime::persistence::EventKind,
+    /// Who made the move, as the kernel verified them. None on events written
+    /// before the kernel recorded it, and when the dispatch carried no
+    /// principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made_by: Option<super::MadeBy>,
+    /// The kernel's dispatch path that carried the move. None on events
+    /// written before the kernel recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<super::MoveSource>,
 }
 
 impl EntityEvent {
-    /// The `Created` event that starts a journal, carrying no params.
-    pub(crate) fn bootstrap(to_status: String) -> Self {
+    /// The `Created` event that starts a journal, carrying no params, made as
+    /// `origin` records.
+    pub(crate) fn bootstrap(to_status: String, origin: &super::MoveOrigin) -> Self {
         Self {
             action: "Created".to_string(),
             from_status: String::new(),
@@ -231,6 +247,8 @@ impl EntityEvent {
             params: serde_json::json!({}),
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            made_by: origin.made_by.clone(),
+            source: origin.source,
         }
     }
 }

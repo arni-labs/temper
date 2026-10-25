@@ -45,6 +45,10 @@ pub struct ResolvedIdentity {
     pub is_human: bool,
     /// Verified `role` claim (Cedar), when the issuer stamped one.
     pub role: Option<String>,
+    /// JWT path only: the issuer that verified the token and the token's own
+    /// verified facts, recorded with the moves this identity makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<temper_authz::VerifiedToken>,
 }
 
 /// Resolves bearer tokens to platform-assigned agent identities.
@@ -173,6 +177,7 @@ impl IdentityResolver {
             from_jwt: false,
             is_human: false,
             role: None,
+            token: None,
         };
 
         // Re-check after the linked AgentType lookup so a short-lived
@@ -268,7 +273,18 @@ impl IdentityResolver {
 
         // A token with an `agent_type` is an agent acting for the human `sub`;
         // a token with only a `sub` is the human themselves (a Customer).
-        let identity = match claims.agent_type.as_deref().filter(|s| !s.is_empty()) {
+        let agent_type = claims.agent_type.as_deref().filter(|s| !s.is_empty());
+        let token = temper_authz::VerifiedToken {
+            issuer: issuer_id.clone(),
+            kind: if agent_type.is_some() {
+                temper_authz::TokenKind::Access
+            } else {
+                temper_authz::TokenKind::Human
+            },
+            client_id: claims.client_id.clone().filter(|c| !c.is_empty()),
+            grant_id: claims.grant_id.clone().filter(|g| !g.is_empty()),
+        };
+        let identity = match agent_type {
             Some(agent_type) => {
                 let client_id = claims.client_id.clone().unwrap_or_default();
                 if client_id.is_empty() {
@@ -283,6 +299,7 @@ impl IdentityResolver {
                     from_jwt: true,
                     is_human: false,
                     role: claims.role.clone(),
+                    token: Some(token),
                 }
             }
             None => {
@@ -299,6 +316,7 @@ impl IdentityResolver {
                     from_jwt: true,
                     is_human: true,
                     role: claims.role.clone(),
+                    token: Some(token),
                 }
             }
         };

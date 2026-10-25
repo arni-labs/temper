@@ -117,7 +117,10 @@ fn test_authz_decision_event() {
         action: "SubmitOrder",
         resource_type: "Order",
         entity_id: "order-123",
-        principal_kind: "user",
+        principal: AuthzPrincipal {
+            kind: "user",
+            ..Default::default()
+        },
         decision: "Allow",
         duration_ns: 500_000,
         tenant: "tenant-b",
@@ -131,12 +134,55 @@ fn test_authz_decision_event() {
 }
 
 #[test]
+fn test_authz_decision_principal_facts_are_attributes_not_metric_tags() {
+    let event = from_authz_decision(AuthzDecisionInput {
+        action: "Claim",
+        resource_type: "Task",
+        entity_id: "task-1",
+        principal: AuthzPrincipal {
+            kind: "Agent",
+            id: "kc_agent",
+            issuer: Some("https://issuer.example"),
+            token_kind: Some("access"),
+            client_id: Some("kc_agent"),
+            grant_id: Some("grant-1"),
+            acting_for: Some("human-1"),
+            agent_type: Some("contributor"),
+            role: Some("owner"),
+        },
+        decision: "Allow",
+        duration_ns: 1,
+        tenant: "t",
+        trace_id: "",
+    });
+    let expected = [
+        ("principal_kind", "Agent"),
+        ("principal_id", "kc_agent"),
+        ("principal_issuer", "https://issuer.example"),
+        ("principal_token_kind", "access"),
+        ("principal_client_id", "kc_agent"),
+        ("principal_grant_id", "grant-1"),
+        ("principal_acting_for", "human-1"),
+        ("principal_agent_type", "contributor"),
+        ("principal_role", "owner"),
+    ];
+    for (key, value) in expected {
+        assert_eq!(event.attributes[key], value, "{key}");
+        // Ids are high-cardinality: a tag would multiply the metric series.
+        assert!(!event.tags.contains_key(key), "{key}");
+    }
+}
+
+#[test]
 fn test_authz_decision_carries_entity_and_trace_correlation() {
     let event = from_authz_decision(AuthzDecisionInput {
         action: "SubmitOrder",
         resource_type: "Order",
         entity_id: "order-123",
-        principal_kind: "user",
+        principal: AuthzPrincipal {
+            kind: "user",
+            ..Default::default()
+        },
         decision: "Allow",
         duration_ns: 500_000,
         tenant: "tenant-b",
@@ -158,7 +204,10 @@ fn test_authz_decision_without_instance_or_trace_context() {
         action: "list",
         resource_type: "Order",
         entity_id: "",
-        principal_kind: "user",
+        principal: AuthzPrincipal {
+            kind: "user",
+            ..Default::default()
+        },
         decision: "Allow",
         duration_ns: 100_000,
         tenant: "tenant-b",
@@ -176,7 +225,10 @@ fn test_authz_deny_decision() {
         action: "DeleteOrder",
         resource_type: "Order",
         entity_id: "order-123",
-        principal_kind: "user",
+        principal: AuthzPrincipal {
+            kind: "user",
+            ..Default::default()
+        },
         decision: "Deny",
         duration_ns: 800_000,
         tenant: "tenant-b",
@@ -354,7 +406,10 @@ fn test_emit_span_all_event_kinds() {
             action: "a",
             resource_type: "T",
             entity_id: "id",
-            principal_kind: "user",
+            principal: AuthzPrincipal {
+                kind: "user",
+                ..Default::default()
+            },
             decision: "Allow",
             duration_ns: 0,
             tenant: "t",

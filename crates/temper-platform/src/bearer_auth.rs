@@ -127,14 +127,18 @@ pub async fn bearer_auth_check(
             } else {
                 Some(identity.agent_type_name.as_str())
             };
-            temper_authz::SecurityContext::from_verified_jwt(
+            let context = temper_authz::SecurityContext::from_verified_jwt(
                 &identity.agent_instance_id,
                 kind,
                 agent_type,
                 identity.acting_for.as_deref(),
                 identity.role.as_deref(),
                 verified_session,
-            )
+            );
+            match identity.token.clone() {
+                Some(token) => context.with_verified_token(token),
+                None => context,
+            }
         } else {
             temper_authz::SecurityContext::from_resolved_identity(
                 &identity.agent_instance_id,

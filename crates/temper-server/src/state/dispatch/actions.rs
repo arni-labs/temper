@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 use tracing::{Instrument, instrument};
 
-use crate::entity_actor::{EntityMsg, EntityResponse};
+use crate::entity_actor::{EntityMsg, EntityResponse, MoveOrigin};
 use crate::request_context::AgentContext;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
@@ -483,7 +483,15 @@ impl crate::state::ServerState {
                 .read()
                 .map(|reg| reg.contains_key(&actor_key))
                 .unwrap_or(false);
-            let Some(ar) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
+            // An action on a record with no journal yet creates it: the
+            // `Created` event records this dispatch's origin.
+            let Ok(ar) = self.get_or_spawn_tenant_actor_with_fields(
+                tenant,
+                entity_type,
+                entity_id,
+                serde_json::json!({}),
+                MoveOrigin::of(agent_ctx),
+            ) else {
                 return Err(DispatchError::Internal(format!(
                     "failed to resolve actor for governed entity type '{entity_type}'"
                 )));
@@ -576,6 +584,7 @@ impl crate::state::ServerState {
         let params_for_retry = params;
         let cross_for_retry = related;
         let authorization_precondition_for_retry = expected_authorization_precondition;
+        let origin = MoveOrigin::of(agent_ctx);
         let idempotency_key = Some(agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
             format!(
                 "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
@@ -601,6 +610,7 @@ impl crate::state::ServerState {
                     idempotency_key: idempotency_key.clone(),
                     expected_authorization_precondition: authorization_precondition_for_retry
                         .clone(),
+                    origin: origin.clone(),
                 },
                 &policy,
             )

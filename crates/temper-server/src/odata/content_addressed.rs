@@ -392,7 +392,13 @@ async fn ingest_raw_inner(
     }
 
     let create_result = state
-        .get_or_create_tenant_entity(&tenant, entity_type, &expected_object_id, initial_fields)
+        .get_or_create_tenant_entity_from(
+            &tenant,
+            entity_type,
+            &expected_object_id,
+            initial_fields,
+            crate::entity_actor::MoveOrigin::of(&agent_ctx),
+        )
         .await;
     match create_result {
         Ok(response) => {

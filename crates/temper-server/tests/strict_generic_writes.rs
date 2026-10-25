@@ -75,7 +75,13 @@ async fn static_specs_enforce_strict_generic_write_boundary() {
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .unwrap();
     let actor = state
-        .get_or_spawn_tenant_actor_with_fields(&TenantId::default(), "Order", "static", json!({}))
+        .get_or_spawn_tenant_actor_with_fields(
+            &TenantId::default(),
+            "Order",
+            "static",
+            json!({}),
+            temper_server::entity_actor::MoveOrigin::platform(),
+        )
         .unwrap();
     let _: temper_server::entity_actor::EntityResponse = actor
         .ask(

@@ -313,8 +313,7 @@ async fn expand_authorizes_related_rows_before_blob_hydration() {
                     "field-overflow/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
                     128,
                 ),
-            }),
-        )
+            }))
         .await
         .expect("create order");
     state
@@ -338,6 +337,7 @@ async fn expand_authorizes_related_rows_before_blob_hydration() {
         },
         context_attrs: Default::default(),
         correlation_id: "expand-auth-before-hydration".to_string(),
+        token: None,
     };
     let budget = BlobHydrationBudget::new(1024, 1024, 0, 0);
     let attempts_before = budget.read_attempts_remaining();
@@ -459,6 +459,7 @@ async fn customer_with_one_order() -> (
         },
         context_attrs: Default::default(),
         correlation_id: "expand-depth".to_string(),
+        token: None,
     };
     (state, tenant, security)
 }

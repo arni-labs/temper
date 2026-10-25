@@ -108,6 +108,8 @@ fn envelope(
         } else {
             temper_runtime::persistence::EventKind::Transition
         },
+        made_by: None,
+        source: None,
     };
     PersistenceEnvelope {
         sequence_nr,
@@ -352,6 +354,8 @@ async fn authoritative_replay_rejects_non_object_field_update_payloads() {
         params: serde_json::json!([1, 2, 3]),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        made_by: None,
+        source: None,
     };
     let non_object = PersistenceEnvelope {
         sequence_nr: 1,

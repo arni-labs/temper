@@ -13,7 +13,7 @@ use temper_runtime::tenant::TenantId;
 
 use super::dispatch::retry;
 use super::{ServerState, projection_backfill};
-use crate::entity_actor::{EntityActor, EntityEvent, EntityMsg, EntityResponse};
+use crate::entity_actor::{EntityActor, EntityEvent, EntityMsg, EntityResponse, MoveOrigin};
 use crate::events::EntityStateChange;
 use crate::registry::{VerificationDetail, VerificationStatus};
 use crate::runtime_metrics;
@@ -147,6 +147,17 @@ pub(crate) struct AuthzResourceSnapshot {
     pub(crate) exists: bool,
     pub(crate) current_state: EntityResponse,
     pub(crate) resource_attrs: BTreeMap<String, serde_json::Value>,
+}
+
+/// A field write to one record: the fields, whether they replace the record's
+/// fields or merge into them, and who made the write.
+pub(crate) struct FieldUpdate {
+    /// The fields written.
+    pub(crate) fields: serde_json::Value,
+    /// Whether `fields` replace the record's fields rather than merge.
+    pub(crate) replace: bool,
+    /// Who made the write, recorded on its event.
+    pub(crate) origin: MoveOrigin,
 }
 
 impl ServerState {
@@ -928,11 +939,15 @@ impl ServerState {
             entity_type,
             entity_id,
             serde_json::json!({}),
+            MoveOrigin::default(),
         )
         .ok()
     }
 
     /// Get or spawn an entity actor with initial fields for a specific tenant.
+    ///
+    /// `origin` is recorded on the `Created` event when the actor starts a new
+    /// journal; an existing record keeps the origin it was created with.
     #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
     pub fn get_or_spawn_tenant_actor_with_fields(
         &self,
@@ -940,6 +955,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
+        origin: MoveOrigin,
     ) -> Result<ActorRef<EntityMsg>, String> {
         if !initial_fields
             .as_object()
@@ -1011,6 +1027,7 @@ impl ServerState {
                 .with_blob_store(tenant_blob_store),
         }
         .with_legacy_blob_store(legacy_blob_store)
+        .with_creation_origin(origin)
         .with_on_rehydrated(self.state_timer_rehydrate_hook(tenant, entity_type, entity_id));
 
         // Slow-path: atomically re-check and spawn under write lock.
@@ -1160,11 +1177,23 @@ impl ServerState {
         let trace_id = crate::request_context::current_span_trace_context_ids()
             .map(|(trace_id, _span_id)| trace_id)
             .unwrap_or_default();
+        let principal = &security_ctx.principal;
+        let token = security_ctx.token.as_ref();
         let wide = wide_event::from_authz_decision(wide_event::AuthzDecisionInput {
             action,
             resource_type,
             entity_id,
-            principal_kind: &format!("{:?}", security_ctx.principal.kind),
+            principal: wide_event::AuthzPrincipal {
+                kind: &format!("{:?}", principal.kind),
+                id: &principal.id,
+                issuer: token.map(|token| token.issuer.as_str()),
+                token_kind: token.map(|token| token.kind.as_str()),
+                client_id: token.and_then(|token| token.client_id.as_deref()),
+                grant_id: token.and_then(|token| token.grant_id.as_deref()),
+                acting_for: principal.acting_for.as_deref(),
+                agent_type: principal.agent_type.as_deref(),
+                role: principal.role.as_deref(),
+            },
             decision: decision_str,
             duration_ns,
             tenant,
@@ -1222,6 +1251,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         initial_fields: &serde_json::Value,
+        origin: &MoveOrigin,
     ) -> Result<(), PersistenceError> {
         let Some((store, _)) = self.event_journal() else {
             return Ok(());
@@ -1257,6 +1287,8 @@ impl ServerState {
             params: fields,
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            made_by: origin.made_by.clone(),
+            source: origin.source,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
@@ -1269,8 +1301,8 @@ impl ServerState {
         )
     }
 
-    /// Create a new entity with initial fields and return its state.
-    #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
+    /// Create a new entity with initial fields and return its state, as the
+    /// kernel's own work.
     pub async fn get_or_create_tenant_entity(
         &self,
         tenant: &TenantId,
@@ -1278,13 +1310,35 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<EntityResponse, String> {
-        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
+        self.get_or_create_tenant_entity_from(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+            MoveOrigin::platform(),
+        )
+        .await
+    }
+
+    /// Create a new entity with initial fields and return its state. `origin`
+    /// is recorded on its `Created` event.
+    #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
+    pub async fn get_or_create_tenant_entity_from(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        origin: MoveOrigin,
+    ) -> Result<EntityResponse, String> {
+        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields, &origin)
             .map_err(|e| e.to_string())?;
         let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
             tenant,
             entity_type,
             entity_id,
             initial_fields,
+            origin,
         )?;
 
         let policy = self.dispatch_retry_policy();
@@ -1393,6 +1447,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
+        origin: &MoveOrigin,
     ) -> Result<Option<EntityResponse>, String> {
         if !initial_fields.is_object() {
             return Ok(None);
@@ -1443,6 +1498,8 @@ impl ServerState {
             params: initial_fields,
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            made_by: origin.made_by.clone(),
+            source: origin.source,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;
@@ -1650,7 +1707,7 @@ impl ServerState {
         }))
     }
 
-    /// Update fields on an existing entity.
+    /// Update fields on an existing entity, as the kernel's own work.
     #[instrument(skip_all, fields(otel.name = "entity.update_tenant_entity_fields", tenant = %tenant, entity_type, entity_id))]
     pub async fn update_tenant_entity_fields(
         &self,
@@ -1660,15 +1717,13 @@ impl ServerState {
         fields: serde_json::Value,
         replace: bool,
     ) -> Result<EntityResponse, String> {
+        let update = FieldUpdate {
+            fields,
+            replace,
+            origin: MoveOrigin::platform(),
+        };
         let response = self
-            .update_tenant_entity_fields_checked(
-                tenant,
-                entity_type,
-                entity_id,
-                fields,
-                replace,
-                None,
-            )
+            .update_tenant_entity_fields_checked(tenant, entity_type, entity_id, update, None)
             .await?;
         if response.success {
             Ok(response)
@@ -1688,17 +1743,16 @@ impl ServerState {
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-        fields: serde_json::Value,
-        replace: bool,
+        update: FieldUpdate,
         expected_precondition: String,
     ) -> Result<EntityResponse, String> {
+        let expected_precondition = Some(expected_precondition);
         self.update_tenant_entity_fields_checked(
             tenant,
             entity_type,
             entity_id,
-            fields,
-            replace,
-            Some(expected_precondition),
+            update,
+            expected_precondition,
         )
         .await
     }
@@ -1708,10 +1762,14 @@ impl ServerState {
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-        fields: serde_json::Value,
-        replace: bool,
+        update: FieldUpdate,
         expected_precondition: Option<String>,
     ) -> Result<EntityResponse, String> {
+        let FieldUpdate {
+            fields,
+            replace,
+            origin,
+        } = update;
         if !fields.is_object() {
             return Err("entity field update must be a JSON object".to_string());
         }
@@ -1736,6 +1794,7 @@ impl ServerState {
                 fields: fields_for_retry.clone(),
                 replace,
                 expected_precondition: precondition_for_retry.clone(),
+                origin: origin.clone(),
             },
             &policy,
         )
@@ -1798,7 +1857,7 @@ impl ServerState {
         Ok(response)
     }
 
-    /// Delete an entity.
+    /// Delete an entity, as the kernel's own work.
     #[instrument(skip_all, fields(otel.name = "entity.delete_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn delete_tenant_entity(
         &self,
@@ -1807,7 +1866,13 @@ impl ServerState {
         entity_id: &str,
     ) -> Result<EntityResponse, String> {
         let response = self
-            .delete_tenant_entity_checked(tenant, entity_type, entity_id, None)
+            .delete_tenant_entity_checked(
+                tenant,
+                entity_type,
+                entity_id,
+                None,
+                MoveOrigin::platform(),
+            )
             .await?;
         if response.success {
             Ok(response)
@@ -1826,12 +1891,14 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         expected_authorization_precondition: String,
+        origin: MoveOrigin,
     ) -> Result<EntityResponse, String> {
         self.delete_tenant_entity_checked(
             tenant,
             entity_type,
             entity_id,
             Some(expected_authorization_precondition),
+            origin,
         )
         .await
     }
@@ -1842,6 +1909,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         expected_authorization_precondition: Option<String>,
+        origin: MoveOrigin,
     ) -> Result<EntityResponse, String> {
         let actor_ref = self
             .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
@@ -1858,6 +1926,7 @@ impl ServerState {
             &actor_ref,
             || EntityMsg::Delete {
                 expected_authorization_precondition: precondition_for_retry.clone(),
+                origin: origin.clone(),
             },
             &policy,
         )

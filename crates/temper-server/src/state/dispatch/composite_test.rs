@@ -613,6 +613,7 @@ async fn composite_app_create_sub_write_authorization_can_enforce_owner_scope() 
             },
             context_attrs: std::collections::HashMap::new(),
             correlation_id: "composite-owner-scope".to_string(),
+            token: None,
         }),
         ..Default::default()
     };

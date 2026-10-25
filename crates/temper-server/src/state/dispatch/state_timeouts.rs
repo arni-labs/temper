@@ -754,10 +754,11 @@ impl ArmedTimer {
 /// The identity a timer fires as: the dispatch that armed it, as a new
 /// background action. It does not keep the arming request's idempotency key:
 /// the entity has already recorded that key, so the fire would be answered as
-/// a duplicate and never run.
+/// a duplicate and never run. Its moves record the timer as their source.
 fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
+    agent.source = crate::entity_actor::MoveSource::StateTimer;
     agent
 }
 
@@ -1111,6 +1112,8 @@ mod tests {
             params: serde_json::json!({}),
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            made_by: None,
+            source: None,
         }
     }
 

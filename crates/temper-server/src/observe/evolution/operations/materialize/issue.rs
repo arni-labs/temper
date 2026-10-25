@@ -22,8 +22,9 @@ pub(super) async fn create_issue_for_finding(
     let description = build_issue_description(summary, finding, record_ids);
     let acceptance_criteria = default_acceptance_criteria(finding).join("\n");
 
+    let system_ctx = AgentContext::for_service("evolution-engine");
     state
-        .get_or_create_tenant_entity(
+        .get_or_create_tenant_entity_from(
             tenant,
             "Issue",
             &issue_id,
@@ -36,13 +37,13 @@ pub(super) async fn create_issue_for_finding(
                 "CreatedAt": now,
                 "UpdatedAt": now,
             }),
+            crate::entity_actor::MoveOrigin::of(&system_ctx),
         )
         .await?;
 
     // Walk the issue into Todo. The issue itself is already persisted, so a
     // failed transition leaves it in an earlier state rather than failing
     // materialization — but it must be visible, not silently swallowed.
-    let system_ctx = AgentContext::for_service("evolution-engine");
     let setup_actions = [
         (
             "SetPriority",

@@ -55,6 +55,10 @@ pub struct SecurityContext {
     pub context_attrs: HashMap<String, serde_json::Value>,
     /// Correlation ID for tracing.
     pub correlation_id: String,
+    /// The verified token behind the principal, when a trusted issuer signed
+    /// one. Recorded with the principal's moves; not a Cedar input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<crate::VerifiedToken>,
 }
 
 /// Credential-authenticated authority bound to one tenant.
@@ -154,6 +158,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            token: None,
         }
     }
 
@@ -183,6 +188,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id,
+            token: None,
         }
     }
 
@@ -202,6 +208,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            token: None,
         }
     }
 
@@ -253,6 +260,7 @@ impl SecurityContext {
             },
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            token: None,
         }
     }
 
@@ -318,6 +326,7 @@ impl SecurityContext {
             },
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            token: None,
         }
     }
 
@@ -368,6 +377,13 @@ impl SecurityContext {
             "agentTypeVerified".to_string(),
             serde_json::Value::Bool(false),
         );
+        self
+    }
+
+    /// Attach the verified token behind a trusted-issuer principal.
+    #[must_use]
+    pub fn with_verified_token(mut self, token: crate::VerifiedToken) -> Self {
+        self.token = Some(token);
         self
     }
 

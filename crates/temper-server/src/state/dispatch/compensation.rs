@@ -169,7 +169,8 @@ impl crate::state::ServerState {
             }
         };
         let agent_ctx =
-            AgentContext::for_service_inheriting("integration-compensation", &callback_ctx);
+            AgentContext::for_service_inheriting("integration-compensation", &callback_ctx)
+                .with_source(crate::entity_actor::MoveSource::Module);
         match self
             .dispatch_tenant_action(tenant, entity_type, entity_id, &action, params, &agent_ctx)
             .await

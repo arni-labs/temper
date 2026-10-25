@@ -176,5 +176,8 @@ fn history_event(
         "to_state": event.to_status,
         "timestamp": event.timestamp,
         "params": event.params,
+        // Null on events written before the kernel recorded them.
+        "made_by": event.made_by,
+        "source": event.source,
     }))
 }

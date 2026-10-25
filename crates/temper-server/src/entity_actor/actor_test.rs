@@ -202,6 +202,7 @@ async fn dst_update_fields_preserves_runtime_owned_field_authority() {
                     }),
                     replace,
                     expected_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(1),
             )
@@ -247,6 +248,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 fields: serde_json::json!({"Owner": "mallory"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -261,6 +263,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 fields: serde_json::json!({"Secret": "forged"}),
                 replace: false,
                 expected_precondition: Some(expected),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -278,6 +281,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 fields: serde_json::json!({"Label": "authorized"}),
                 replace: false,
                 expected_precondition: Some(fresh_precondition),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -296,6 +300,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 related: BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -311,6 +316,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 fields: serde_json::json!({"Secret": "still-forged"}),
                 replace: false,
                 expected_precondition: Some(before_status_change),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -323,6 +329,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
         .ask(
             EntityMsg::Delete {
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -335,6 +342,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
                 fields: serde_json::json!({"Secret": "post-delete"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -368,6 +376,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 fields: serde_json::json!({"Owner": "mallory"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -377,6 +386,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
         .ask(
             EntityMsg::Delete {
                 expected_authorization_precondition: Some(stale_precondition.clone()),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -393,6 +403,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 related: BTreeMap::new(),
                 idempotency_key: Some("cancel-request".to_string()),
                 expected_authorization_precondition: Some(stale_precondition),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -411,6 +422,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 related: BTreeMap::new(),
                 idempotency_key: Some("cancel-request".to_string()),
                 expected_authorization_precondition: Some(fresh_precondition.clone()),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -427,6 +439,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 related: BTreeMap::new(),
                 idempotency_key: Some("cancel-request".to_string()),
                 expected_authorization_precondition: Some(fresh_precondition),
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -491,6 +504,8 @@ fn snapshot_keeps_the_status_clock() {
         params: serde_json::json!({}),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        made_by: None,
+        source: None,
     };
     state.push_event_bounded(event("Submit", "Draft", "Submitted", 10));
     state.push_event_bounded(event("Note", "Submitted", "Submitted", 20));
@@ -535,6 +550,7 @@ async fn dst_add_item_then_submit() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -553,6 +569,7 @@ async fn dst_add_item_then_submit() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -587,6 +604,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: Some("same-pack".into()),
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -605,6 +623,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: Some("same-pack".into()),
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -641,6 +660,7 @@ async fn dst_cannot_submit_without_items() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -685,6 +705,7 @@ async fn dst_full_order_lifecycle() {
                     related: std::collections::BTreeMap::new(),
                     idempotency_key: None,
                     expected_authorization_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(1),
             )
@@ -721,6 +742,7 @@ async fn dst_cancel_from_draft() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -753,6 +775,7 @@ async fn dst_cannot_cancel_shipped_order() {
                     related: std::collections::BTreeMap::new(),
                     idempotency_key: None,
                     expected_authorization_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(1),
             )
@@ -769,6 +792,7 @@ async fn dst_cannot_cancel_shipped_order() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -802,6 +826,7 @@ async fn dst_multiple_actors_independent() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -817,6 +842,7 @@ async fn dst_multiple_actors_independent() {
                 related: std::collections::BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(1),
         )
@@ -949,6 +975,7 @@ async fn patched_fields_survive_actor_restart() {
                 fields: serde_json::json!({"Title": "durable title", "Priority": 3}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1025,6 +1052,7 @@ async fn replaced_fields_survive_actor_restart_with_replace_semantics() {
                 fields: serde_json::json!({"Title": "before", "Legacy": "drop me"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1039,6 +1067,7 @@ async fn replaced_fields_survive_actor_restart_with_replace_semantics() {
                 fields: serde_json::json!({"Title": "after"}),
                 replace: true,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1256,6 +1285,7 @@ async fn field_update_with_failed_journal_append_does_not_report_success() {
                 fields: serde_json::json!({"Title": "never durable"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1316,6 +1346,7 @@ async fn field_updates_reject_when_event_budget_exhausted() {
                     fields: serde_json::json!({"counter": i}),
                     replace: false,
                     expected_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(5),
             )
@@ -1507,6 +1538,7 @@ async fn field_update_rejects_non_object_payload_before_journaling() {
                         fields: body.clone(),
                         replace,
                         expected_precondition: None,
+                        origin: Default::default(),
                     },
                     Duration::from_secs(5),
                 )
@@ -1574,6 +1606,7 @@ async fn field_update_sanitization_is_reproduced_by_replay() {
                 }),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1688,6 +1721,7 @@ async fn reserved_field_update_event_names_are_refused_as_actions() {
                     related: BTreeMap::new(),
                     idempotency_key: None,
                     expected_authorization_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(5),
             )
@@ -1749,6 +1783,7 @@ async fn field_update_recovers_from_a_concurrency_violation() {
                 fields: serde_json::json!({"Customer": "Warmup"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1767,6 +1802,7 @@ async fn field_update_recovers_from_a_concurrency_violation() {
                 fields: serde_json::json!({"Customer": "Bob"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1787,6 +1823,7 @@ async fn field_update_recovers_from_a_concurrency_violation() {
                 fields: serde_json::json!({"Customer": "Carol"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1845,6 +1882,7 @@ async fn field_update_fails_closed_when_conflicts_exceed_the_retry_budget() {
                 fields: serde_json::json!({"Customer": "Warmup"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -1868,6 +1906,7 @@ async fn field_update_fails_closed_when_conflicts_exceed_the_retry_budget() {
                 fields: serde_json::json!({"Customer": "Bob"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2013,6 +2052,7 @@ async fn field_update_retry_does_not_double_apply_the_journal() {
                     fields: serde_json::json!({"Customer": customer}),
                     replace: false,
                     expected_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(5),
             )
@@ -2037,6 +2077,7 @@ async fn field_update_retry_does_not_double_apply_the_journal() {
                 fields: serde_json::json!({"Customer": "Fourth"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2115,6 +2156,7 @@ async fn preconditioned_field_update_refuses_rather_than_retrying_a_conflict() {
                 fields: serde_json::json!({"Customer": "Seed"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2148,6 +2190,7 @@ async fn preconditioned_field_update_refuses_rather_than_retrying_a_conflict() {
                 fields: serde_json::json!({"Region": "eu"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2161,6 +2204,7 @@ async fn preconditioned_field_update_refuses_rather_than_retrying_a_conflict() {
                 fields: serde_json::json!({"Customer": "Bob"}),
                 replace: false,
                 expected_precondition: Some(precondition),
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2223,6 +2267,7 @@ async fn field_update_retry_refuses_when_the_race_deleted_the_entity() {
                 fields: serde_json::json!({"Customer": "Seed"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2247,6 +2292,7 @@ async fn field_update_retry_refuses_when_the_race_deleted_the_entity() {
         .ask(
             EntityMsg::Delete {
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2266,6 +2312,7 @@ async fn field_update_retry_refuses_when_the_race_deleted_the_entity() {
                 fields: serde_json::json!({"Customer": "TooLate"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2317,6 +2364,7 @@ async fn field_update_recovers_at_the_full_retry_budget() {
                 fields: serde_json::json!({"Customer": "Warmup"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2335,6 +2383,7 @@ async fn field_update_recovers_at_the_full_retry_budget() {
                 fields: serde_json::json!({"Customer": "Bob"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2424,6 +2473,7 @@ async fn exhausted_field_update_rolls_back_to_the_caught_up_state() {
                 fields: serde_json::json!({"Customer": "Seed"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2449,6 +2499,7 @@ async fn exhausted_field_update_rolls_back_to_the_caught_up_state() {
                 fields: serde_json::json!({"Customer": "Concurrent"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2468,6 +2519,7 @@ async fn exhausted_field_update_rolls_back_to_the_caught_up_state() {
                 fields: serde_json::json!({"Customer": "Loser"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2519,6 +2571,7 @@ async fn field_update_retry_refuses_when_the_race_spent_the_event_budget() {
                 fields: serde_json::json!({"Customer": "Seed"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2545,6 +2598,7 @@ async fn field_update_retry_refuses_when_the_race_spent_the_event_budget() {
                     fields: serde_json::json!({"filler": i}),
                     replace: false,
                     expected_precondition: None,
+                    origin: Default::default(),
                 },
                 Duration::from_secs(5),
             )
@@ -2563,6 +2617,7 @@ async fn field_update_retry_refuses_when_the_race_spent_the_event_budget() {
                 fields: serde_json::json!({"Customer": "TooLate"}),
                 replace: false,
                 expected_precondition: None,
+                origin: Default::default(),
             },
             Duration::from_secs(5),
         )
@@ -2614,6 +2669,8 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         params: serde_json::json!({"Customer": "Alice"}),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        made_by: None,
+        source: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,

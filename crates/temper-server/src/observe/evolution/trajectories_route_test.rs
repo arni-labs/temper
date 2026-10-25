@@ -91,6 +91,7 @@ fn admin_auth() -> SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "ots-admin-test".to_string(),
+        token: None,
     }
 }
 

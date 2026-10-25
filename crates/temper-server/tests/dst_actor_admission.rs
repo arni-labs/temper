@@ -44,6 +44,7 @@ async fn action(actor: &ActorRef<EntityMsg>, name: &str) -> EntityResponse {
                 related: BTreeMap::new(),
                 idempotency_key: None,
                 expected_authorization_precondition: None,
+                origin: Default::default(),
             },
             ASK_BUDGET,
         )
@@ -156,6 +157,7 @@ async fn dst_actor_admission_tombstone_rejects_actions_without_stopping() {
             .ask(
                 EntityMsg::Delete {
                     expected_authorization_precondition: None,
+                    origin: Default::default(),
                 },
                 ASK_BUDGET,
             )

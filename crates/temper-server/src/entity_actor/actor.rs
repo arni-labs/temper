@@ -169,6 +169,9 @@ pub struct EntityActor {
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
     /// Run once with the state this actor rehydrated from stored events.
     on_rehydrated: Option<RehydrateHook>,
+    /// Who made the record and the path that carried the creation, recorded
+    /// on the `Created` event when this actor starts a new journal.
+    creation_origin: super::MoveOrigin,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -310,6 +313,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            creation_origin: super::MoveOrigin::default(),
         }
     }
 
@@ -336,6 +340,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            creation_origin: super::MoveOrigin::default(),
         }
     }
 
@@ -367,6 +372,12 @@ impl EntityActor {
         store: Option<Arc<dyn crate::storage::BlobStore>>,
     ) -> Self {
         self.legacy_blob_store = store;
+        self
+    }
+
+    /// Record `origin` on the `Created` event if this actor starts the journal.
+    pub(crate) fn with_creation_origin(mut self, origin: super::MoveOrigin) -> Self {
+        self.creation_origin = origin;
         self
     }
 
@@ -717,6 +728,8 @@ impl EntityActor {
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
+                                made_by: None,
+                                source: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -1089,6 +1102,8 @@ impl Actor for EntityActor {
                 params: initial_params,
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                made_by: self.creation_origin.made_by.clone(),
+                source: self.creation_origin.source,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -1121,6 +1136,7 @@ impl Actor for EntityActor {
                 related,
                 idempotency_key,
                 expected_authorization_precondition,
+                origin,
             } => {
                 // Capture start time for span duration (DST-safe: sim_now()
                 // returns logical clock in simulation, wall clock in production).
@@ -1297,6 +1313,7 @@ impl Actor for EntityActor {
                         .clone()
                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                     event.idempotency_key = idempotency_key.clone();
+                    origin.stamp(&mut event);
 
                     // An event too large to be written stores no overflow blobs first.
                     if !result.overflow_blobs.is_empty()
@@ -1494,6 +1511,7 @@ impl Actor for EntityActor {
                                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                                     let mut retry_event = retry_event;
                                     retry_event.idempotency_key = idempotency_key.clone();
+                                    origin.stamp(&mut retry_event);
 
                                     // Overflow blobs for the re-evaluated result.
                                     if !retry_result.overflow_blobs.is_empty()
@@ -1796,6 +1814,7 @@ impl Actor for EntityActor {
                 fields,
                 replace,
                 expected_precondition,
+                origin,
             } => {
                 // The whole durable transaction — validation, budget, journal
                 // append, conflict recovery — lives in `field_updates`. This arm
@@ -1806,6 +1825,7 @@ impl Actor for EntityActor {
                     fields,
                     replace,
                     expected_precondition,
+                    &origin,
                 )
                 .await;
                 ctx.reply(EntityResponse {
@@ -1823,6 +1843,7 @@ impl Actor for EntityActor {
 
             EntityMsg::Delete {
                 expected_authorization_precondition,
+                origin,
             } => {
                 if self
                     .table
@@ -1854,6 +1875,8 @@ impl Actor for EntityActor {
                     params: serde_json::json!({}),
                     idempotency_key: None,
                     kind: temper_runtime::persistence::EventKind::Tombstone,
+                    made_by: origin.made_by.clone(),
+                    source: origin.source,
                 };
 
                 if let (Some(store), Some(backend)) =

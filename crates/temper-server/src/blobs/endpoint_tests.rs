@@ -69,6 +69,7 @@ fn claimed_admin_request(method: Method, path: &str, tenant: &str, body: Body) -
                 },
                 context_attrs: Default::default(),
                 correlation_id: "blob-admin-side-channel-test".to_string(),
+                token: None,
             },
         ));
     request

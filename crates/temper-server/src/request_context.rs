@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use crate::entity_actor::MoveSource;
 use axum::http::HeaderMap;
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use temper_authz::SecurityContext;
@@ -89,9 +90,19 @@ pub struct AgentContext {
     /// `workflow.run_id`, `producer.work_item_id`, or `support.ticket_id`.
     /// Temper core treats these keys as opaque correlation metadata.
     pub observation_metadata: BTreeMap<String, String>,
+    /// The kernel's dispatch path carrying this context's moves; recorded on
+    /// each event they write. Runtime-owned, never read from a request.
+    pub source: MoveSource,
 }
 
 impl AgentContext {
+    /// The same identity, carried by another of the kernel's dispatch paths.
+    #[must_use]
+    pub fn with_source(mut self, source: MoveSource) -> Self {
+        self.source = source;
+        self
+    }
+
     /// Admit a callback only within both the inline and cumulative budgets.
     pub(crate) fn for_callback(&self) -> Result<Self, CallbackBudgetExceeded> {
         if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
@@ -137,6 +148,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             observation_metadata: BTreeMap::new(),
+            source: MoveSource::Platform,
         }
     }
 
@@ -174,6 +186,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             observation_metadata: BTreeMap::new(),
+            source: MoveSource::Platform,
         }
     }
 
@@ -310,6 +323,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_run_id,
         idempotency_key,
         observation_metadata: observation_metadata::extract(headers),
+        source: MoveSource::Http,
     }
 }
 
