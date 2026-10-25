@@ -1,5 +1,6 @@
 //! Entity instance endpoints: list, history, wait, and SSE event stream.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -15,7 +16,8 @@ use tracing::instrument;
 
 use crate::authz::{observe_tenant_scope, require_authenticated_context, require_observe_auth};
 use crate::blobs::hydrate_blob_refs_for_tenant;
-use crate::entity_actor::{EntityEvent, EntityMsg, EntityResponse};
+use crate::entity_actor::{EntityMsg, EntityResponse};
+use crate::entity_history::{HistoryPageRequest, read_history_page};
 use crate::state::ServerState;
 
 use super::{EntityInstanceSummary, EventStreamParams};
@@ -70,19 +72,27 @@ pub(crate) async fn handle_list_entities(
 
 /// GET /observe/entities/{entity_type}/{entity_id}/history -- entity event history.
 ///
-/// Returns the full event log for an entity. Checks two sources in order:
-/// 1. In-memory actor state (if the actor is currently loaded).
-/// 2. Postgres event store (if configured, for inactive entities).
+/// One page of the entity's transitions from the durable journal
+/// (`?after=<sequence>&limit=<n>`, answered with `next`), shared with the
+/// record's OData `$history` read. Operator-authorized. When the actor is
+/// loaded, the answer also carries its current state for the observe page.
 pub(crate) async fn handle_get_entity_history(
     State(state): State<ServerState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
     Path((entity_type, entity_id)): Path<(String, String)>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let authenticated = require_authenticated_context(authenticated.as_deref())?;
     require_observe_auth(&state, authenticated, "read", &entity_type)?;
     let tenant = authenticated.tenant().clone();
+    let request = HistoryPageRequest::from_query(&params).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut json = read_history_page(&state, &tenant, &entity_type, &entity_id, request)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error.message(), "observe history read failed");
+            error.status_and_code().0
+        })?;
 
-    // Path 1: If the actor is loaded, read events from in-memory state.
     let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
     let actor_ref = {
         let registry = state
@@ -91,69 +101,30 @@ pub(crate) async fn handle_get_entity_history(
             .unwrap_or_else(|e| e.into_inner());
         registry.get(&actor_key).cloned()
     };
-
     if let Some(actor_ref) = actor_ref
         && let Ok(response) = actor_ref
             .ask::<EntityResponse>(EntityMsg::GetState, state.action_dispatch_timeout)
             .await
+        && let Some(obj) = json.as_object_mut()
     {
-        let mut json = format_history_response(&entity_type, &entity_id, &response.state.events);
-        // Include entity properties from in-memory state.
-        if let Some(obj) = json.as_object_mut() {
-            let mut fields = response.state.fields.clone();
-            hydrate_blob_refs_for_tenant(&state, &tenant, &mut fields).await;
-            obj.insert(
-                "current_state".to_string(),
-                serde_json::json!(response.state.status),
-            );
-            obj.insert("fields".to_string(), fields);
-            obj.insert(
-                "counters".to_string(),
-                serde_json::json!(response.state.counters),
-            );
-            obj.insert(
-                "booleans".to_string(),
-                serde_json::json!(response.state.booleans),
-            );
-            obj.insert("lists".to_string(), serde_json::json!(response.state.lists));
-        }
-        return Ok(Json(json));
+        let mut fields = response.state.fields.clone();
+        hydrate_blob_refs_for_tenant(&state, &tenant, &mut fields).await;
+        obj.insert(
+            "current_state".to_string(),
+            serde_json::json!(response.state.status),
+        );
+        obj.insert("fields".to_string(), fields);
+        obj.insert(
+            "counters".to_string(),
+            serde_json::json!(response.state.counters),
+        );
+        obj.insert(
+            "booleans".to_string(),
+            serde_json::json!(response.state.booleans),
+        );
+        obj.insert("lists".to_string(), serde_json::json!(response.state.lists));
     }
-
-    // Path 2: Query event store directly (for inactive entities).
-    if let Some((store, _backend)) = state.event_journal() {
-        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-        if let Ok(envelopes) = store.read_events(&persistence_id, 0).await {
-            let events: Vec<serde_json::Value> = envelopes
-                .iter()
-                .filter_map(|env| serde_json::from_value::<EntityEvent>(env.payload.clone()).ok())
-                .enumerate()
-                .map(|(i, event)| {
-                    serde_json::json!({
-                        "sequence": i + 1,
-                        "action": event.action,
-                        "from_state": event.from_status,
-                        "to_state": event.to_status,
-                        "timestamp": event.timestamp,
-                        "params": event.params,
-                    })
-                })
-                .collect();
-
-            return Ok(Json(serde_json::json!({
-                "entity_type": entity_type,
-                "entity_id": entity_id,
-                "events": events,
-            })));
-        }
-    }
-
-    // No data sources available.
-    Ok(Json(serde_json::json!({
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "events": [],
-    })))
+    Ok(Json(json))
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,34 +338,6 @@ pub(crate) async fn handle_entity_event_stream(
     });
 
     Ok(Sse::new(replay_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
-}
-
-/// Format entity events into the history API response shape.
-fn format_history_response(
-    entity_type: &str,
-    entity_id: &str,
-    events: &std::collections::VecDeque<EntityEvent>,
-) -> serde_json::Value {
-    let formatted: Vec<serde_json::Value> = events
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            serde_json::json!({
-                "sequence": i + 1,
-                "action": e.action,
-                "from_state": e.from_status,
-                "to_state": e.to_status,
-                "timestamp": e.timestamp,
-                "params": e.params,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "events": formatted,
-    })
 }
 
 // ---------------------------------------------------------------------------

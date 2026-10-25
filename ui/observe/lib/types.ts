@@ -159,6 +159,8 @@ export interface EntityHistory {
   booleans?: Record<string, boolean>;
   lists?: Record<string, string[]>;
   events: EntityEvent[];
+  /** Stored sequence to pass as `after` for the next page; null on the last page. */
+  next?: number | null;
 }
 
 export interface EntityVerificationStatus {

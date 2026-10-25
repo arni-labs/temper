@@ -485,50 +485,18 @@ impl EventStore for TursoEventStore {
         persistence_id: &str,
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
-        let (tenant, entity_type, entity_id) =
-            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
-        let conn = self.configured_connection().await?;
+        self.query_events(persistence_id, from_sequence, None).await
+    }
 
-        let mut rows = conn
-            .query(
-                "SELECT sequence_nr, event_type, payload, metadata
-                 FROM events
-                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND sequence_nr > ?4
-                 ORDER BY sequence_nr ASC",
-                params![tenant, entity_type, entity_id, from_sequence as i64],
-            )
+    #[instrument(skip_all, fields(persistence_id, otel.name = "turso.read_events_page"))]
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        self.query_events(persistence_id, after_sequence, Some(limit))
             .await
-            .map_err(storage_error)?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(storage_error)? {
-            let seq = row.get::<i64>(0).map_err(storage_error)? as u64;
-            let event_type = row.get::<String>(1).map_err(storage_error)?;
-            let payload_json = row.get::<String>(2).map_err(storage_error)?;
-            let metadata_json = row.get::<Option<String>>(3).map_err(storage_error)?;
-
-            let payload = serde_json::from_str(&payload_json).map_err(|e| {
-                tracing::error!(error = %e, "failed to deserialize event payload");
-                PersistenceError::Serialization(e.to_string())
-            })?;
-            let metadata_raw = metadata_json.ok_or_else(|| {
-                tracing::error!("missing event metadata");
-                PersistenceError::Serialization("missing event metadata".to_string())
-            })?;
-            let metadata: EventMetadata = serde_json::from_str(&metadata_raw).map_err(|e| {
-                tracing::error!(error = %e, "failed to deserialize event metadata");
-                PersistenceError::Serialization(e.to_string())
-            })?;
-
-            out.push(PersistenceEnvelope {
-                sequence_nr: seq,
-                event_type,
-                payload,
-                metadata,
-            });
-        }
-
-        Ok(out)
     }
 
     #[instrument(skip_all, fields(persistence_id, otel.name = "turso.save_snapshot"))]
@@ -1326,5 +1294,73 @@ async fn current_sequence(
             .map_err(storage_error)
             .map(|seq| seq as u64),
         None => Ok(0),
+    }
+}
+
+impl TursoEventStore {
+    /// One ascending journal read after `from_sequence`; a `limit` bounds the
+    /// rows inside the query rather than after it.
+    async fn query_events(
+        &self,
+        persistence_id: &str,
+        from_sequence: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let conn = self.configured_connection().await?;
+
+        const SELECT_TAIL: &str = "SELECT sequence_nr, event_type, payload, metadata
+                 FROM events
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND sequence_nr > ?4
+                 ORDER BY sequence_nr ASC";
+        let mut rows = match limit {
+            None => {
+                conn.query(
+                    SELECT_TAIL,
+                    params![tenant, entity_type, entity_id, from_sequence as i64],
+                )
+                .await
+            }
+            Some(limit) => {
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                conn.query(
+                    &format!("{SELECT_TAIL} LIMIT ?5"),
+                    params![tenant, entity_type, entity_id, from_sequence as i64, limit],
+                )
+                .await
+            }
+        }
+        .map_err(storage_error)?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            let seq = row.get::<i64>(0).map_err(storage_error)? as u64;
+            let event_type = row.get::<String>(1).map_err(storage_error)?;
+            let payload_json = row.get::<String>(2).map_err(storage_error)?;
+            let metadata_json = row.get::<Option<String>>(3).map_err(storage_error)?;
+
+            let payload = serde_json::from_str(&payload_json).map_err(|e| {
+                tracing::error!(error = %e, "failed to deserialize event payload");
+                PersistenceError::Serialization(e.to_string())
+            })?;
+            let metadata_raw = metadata_json.ok_or_else(|| {
+                tracing::error!("missing event metadata");
+                PersistenceError::Serialization("missing event metadata".to_string())
+            })?;
+            let metadata: EventMetadata = serde_json::from_str(&metadata_raw).map_err(|e| {
+                tracing::error!(error = %e, "failed to deserialize event metadata");
+                PersistenceError::Serialization(e.to_string())
+            })?;
+
+            out.push(PersistenceEnvelope {
+                sequence_nr: seq,
+                event_type,
+                payload,
+                metadata,
+            });
+        }
+
+        Ok(out)
     }
 }

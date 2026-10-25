@@ -19,6 +19,7 @@ pub mod blobs;
 /// Deterministic conformance checking of a recorded run against its IOA spec.
 pub mod conformance;
 pub mod entity_actor;
+mod entity_history;
 pub mod event_budget_metrics;
 pub mod events;
 pub mod eventual_invariants;
