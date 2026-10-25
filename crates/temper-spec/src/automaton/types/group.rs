@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 /// so the boxes form a tree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct StateGroup {
+pub struct Group {
     /// The group's name, unique among groups and distinct from every state.
     pub name: String,
-    /// What the box says in plain words: one non-empty line.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// What the box says in plain words; a reader shows `name` when absent.
+    #[serde(default)]
     pub says: Option<String>,
-    /// The declared states and groups this group holds, in drawing order.
+    /// The declared states and groups this group holds, in source order.
+    /// Never empty.
     #[serde(default)]
     pub states: Vec<String>,
 }

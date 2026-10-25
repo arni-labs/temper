@@ -1,5 +1,5 @@
-//! Checks on the statechart labels: each `says` is one line of words, and
-//! the `[[group]]` boxes form a tree over the declared states.
+//! Checks on the statechart labels: each `says` holds words, and the
+//! `[[group]]` boxes form a tree over the declared states.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,27 +17,20 @@ pub(super) fn validate_says(automaton: &Automaton) -> Result<(), AutomatonParseE
     Ok(())
 }
 
-/// A label is drawn on one line, so it must hold words and no line break.
+/// A label that holds no words draws as a blank arrow or box; leave `says`
+/// out instead and the reader shows the name.
 fn check_says(scope: &str, says: Option<&str>) -> Result<(), AutomatonParseError> {
-    let Some(says) = says else {
-        return Ok(());
-    };
-    if says.trim().is_empty() {
-        return Err(AutomatonParseError::Validation(format!(
+    match says {
+        Some(says) if says.trim().is_empty() => Err(AutomatonParseError::Validation(format!(
             "{scope}: says must not be empty"
-        )));
+        ))),
+        _ => Ok(()),
     }
-    if says.contains(['\n', '\r']) {
-        return Err(AutomatonParseError::Validation(format!(
-            "{scope}: says must be one line"
-        )));
-    }
-    Ok(())
 }
 
-/// Check that groups are uniquely named apart from states, list only declared
-/// states and groups, give every entry at most one group, and never contain
-/// themselves.
+/// Check that groups are uniquely named apart from states, hold at least one
+/// entry, list only declared states and groups, give every entry at most one
+/// group, and never contain themselves.
 pub(super) fn validate_groups(automaton: &Automaton) -> Result<(), AutomatonParseError> {
     let invalid = |message: String| Err(AutomatonParseError::Validation(message));
     let states: BTreeSet<&str> = automaton
@@ -56,6 +49,12 @@ pub(super) fn validate_groups(automaton: &Automaton) -> Result<(), AutomatonPars
         }
         if !groups.insert(group.name.as_str()) {
             return invalid(format!("group '{}' is declared twice", group.name));
+        }
+        if group.states.is_empty() {
+            return invalid(format!(
+                "group '{}' lists no states; a group boxes at least one state or group",
+                group.name
+            ));
         }
     }
 

@@ -78,8 +78,9 @@ pub struct Action {
     pub constraints: Vec<ActionConstraint>,
     /// Agent hint for this action.
     pub hint: Option<String>,
-    /// What the action does in plain words, for the arrow on a statechart:
-    /// one non-empty line. A label only; nothing runs or verifies on it.
+    /// What the action does in plain words, for this block's arrow on a
+    /// statechart; non-empty when present. A label only: nothing runs or
+    /// verifies on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub says: Option<String>,
     /// Whether a composite action records an audit/idempotency event on the

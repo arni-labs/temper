@@ -92,9 +92,10 @@ pub struct Automaton {
     /// reaching the actor.
     #[serde(default)]
     pub admission: Option<Admission>,
-    /// State groups for drawing the spec as a statechart. Labels only.
+    /// State groups for drawing the spec as a statechart, flat and in source
+    /// order; nesting is by name. Labels only.
     #[serde(default, rename = "group")]
-    pub groups: Vec<StateGroup>,
+    pub groups: Vec<Group>,
 }
 
 /// ADR-0153: a declared unique key (alternate key) on an entity. `properties`
