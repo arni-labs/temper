@@ -26,6 +26,19 @@ pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
 /// Time-to-live for idempotency entries in seconds.
 pub const IDEMPOTENCY_TTL_SECS: i64 = 3600;
 
+/// Response header, set to `true`, on an answer that repeats a move an earlier
+/// request with the same `Idempotency-Key` already made (Stripe's name for
+/// it). A fresh move does not carry it.
+pub const REPLAYED_HEADER: &str = "idempotent-replayed";
+
+/// Say on an HTTP answer that it repeats an earlier move.
+pub(crate) fn mark_replayed(response: &mut axum::response::Response) {
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(REPLAYED_HEADER),
+        axum::http::HeaderValue::from_static("true"),
+    );
+}
+
 /// Bytes counted for every entry on top of its contents: map nodes, the
 /// order index and the reply's fixed fields.
 const ENTRY_OVERHEAD_BYTES: usize = 256;

@@ -97,7 +97,7 @@ async fn dst_replayed_iff_the_key_already_moved() {
 
         for step in 0..STEPS {
             let roll = next(&mut rng);
-            if roll % CRASH_ONE_IN == 0 {
+            if roll.is_multiple_of(CRASH_ONE_IN) {
                 generation += 1;
                 crashes += 1;
                 (_system, actor_ref) = spawn(&store, &table, &entity_id, generation);

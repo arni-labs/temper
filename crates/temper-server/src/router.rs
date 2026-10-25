@@ -146,7 +146,9 @@ pub fn build_routes(state: ServerState) -> Router {
             // request it makes are one trace.
             HeaderName::from_static("traceparent"),
             HeaderName::from_static("tracestate"),
-        ]);
+        ])
+        // Browser callers read whether a move was a replay.
+        .expose_headers([HeaderName::from_static(crate::idempotency::REPLAYED_HEADER)]);
 
     router
         .layer(cors)

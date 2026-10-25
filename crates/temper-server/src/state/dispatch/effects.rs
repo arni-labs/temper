@@ -699,7 +699,7 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
-                            replayed: false,
+                            replayed: response.replayed,
                         };
                     }
                 }
@@ -738,7 +738,7 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
-                            replayed: false,
+                            replayed: response.replayed,
                         };
                     }
                 }
@@ -757,7 +757,11 @@ impl crate::state::ServerState {
                     // handle them twice. The projection and the state-timer
                     // arm ran above, before the integration.
                     self.dispatch_transition_deferred_effects(ctx, &response);
-                    return final_response;
+                    // A replayed move stays a replay after its integration.
+                    return EntityResponse {
+                        replayed: final_response.replayed || response.replayed,
+                        ..final_response
+                    };
                 }
             } else {
                 self.dispatch_wasm_integrations(
