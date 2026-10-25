@@ -8,7 +8,7 @@ use temper_authz::Asker;
 use temper_spec::automaton::{
     ActionConstraint, ActionKind, Automaton, TargetResolver, TriggerKind,
 };
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set};
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, VarKind};
 
 use super::super::senders;
 use super::order::Order;
@@ -175,6 +175,10 @@ pub(super) struct Unchecked {
     pub(super) chosen: BTreeSet<(String, String)>,
     /// Each (entity, action)'s tracked fields a parameter must equal.
     pub(super) equals: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Each (entity, action)'s count parameters that must equal a counter
+    /// the model holds as a value (not as a sequence number), with that
+    /// counter. Decided when a dispatch carries the count, and only then.
+    pub(super) counts: BTreeMap<(String, String), Vec<(String, String)>>,
 }
 
 impl Unchecked {
@@ -192,6 +196,14 @@ impl Unchecked {
         !self
             .chosen
             .contains(&(entity.to_string(), action.to_string()))
+    }
+
+    /// The count parameters of `entity`'s `action` that must equal one of
+    /// its counters, each with the counter.
+    pub(super) fn counts(&self, entity: &str, action: &str) -> &[(String, String)] {
+        self.counts
+            .get(&(entity.to_string(), action.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The fields an `entity` record's module call keeps as it started:
@@ -216,21 +228,32 @@ pub(super) fn unchecked_constraints(
     let mut out = Unchecked::default();
     for (entity, model) in models {
         let tracked = |name: &str| model.tracked_strings.contains(name);
+        let counted = |name: &str| {
+            model.var_kinds.get(name) == Some(&VarKind::Counter)
+                && !order.fields(entity).any(|(field, _)| field == name)
+        };
         for action in &by_name[entity.as_str()].actions {
             let key = (entity.clone(), action.name.clone());
             let decided = |constraint: &ActionConstraint| match constraint {
                 ActionConstraint::ParamGreaterThanField { param, .. } => {
                     order.decides(entity, &action.name, param)
                 }
+                ActionConstraint::ParamEqualsField { field, .. } if counted(field) => true,
                 _ => tracked(constraint.param()) && constraint.field().is_none_or(tracked),
             };
             if !action.constraints.iter().all(decided) {
                 out.taken.insert(key.clone());
             }
             for constraint in &action.constraints {
-                let ActionConstraint::ParamEqualsField { field, .. } = constraint else {
+                let ActionConstraint::ParamEqualsField { param, field } = constraint else {
                     continue;
                 };
+                if counted(field) {
+                    out.counts
+                        .entry(key.clone())
+                        .or_default()
+                        .push((param.clone(), field.clone()));
+                }
                 if tracked(field) {
                     out.equals
                         .entry(key.clone())

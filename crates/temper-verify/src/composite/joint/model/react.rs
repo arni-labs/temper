@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::TargetResolver;
-use temper_spec::predicate::{Arg, Literal, Truth, eval};
+use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
 use super::super::senders::RUNTIME;
@@ -152,8 +152,25 @@ impl JointModel {
         outcomes
     }
 
-    /// The tracked string parameters `reaction` passes, and the counts kept
-    /// as sequence numbers, read from `source` as it holds them.
+    /// The tracked string parameters `reaction` passes, the counts kept as
+    /// sequence numbers, and the counts its target reads (in an effect, or
+    /// compared with a counter) from a counter `source` holds as a value,
+    /// read from `source` as it holds them.
+    /// Whether `reaction`'s target action reads its count parameter
+    /// `param`: an effect reads it, or a constraint compares it with a
+    /// counter.
+    fn reads_count(&self, reaction: &Reaction, param: &str) -> bool {
+        let (to, action) = (&reaction.to, &reaction.target_action);
+        self.unchecked
+            .counts(to, action)
+            .iter()
+            .any(|(counted, _)| counted == param)
+            || self.models[to]
+                .transitions
+                .iter()
+                .any(|t| &t.name == action && matches!(t.params.get(param), Some(ParamKind::Count)))
+    }
+
     fn args(
         &self,
         state: &JointState,
@@ -171,6 +188,16 @@ impl JointModel {
                     .carries(&reaction.to, &reaction.target_action, param)
                 {
                     let Arg::Var(field) = arg else { return None };
+                    let count = source_state.counters.get(field).copied()?;
+                    return Some((param.clone(), ParamValue::Count(count)));
+                }
+                if self.reads_count(reaction, param) {
+                    // Sent only when the source holds it as a value, not as
+                    // a sequence number.
+                    let Arg::Var(field) = arg else { return None };
+                    if self.order.fields(source).any(|(f, _)| f == field) {
+                        return None;
+                    }
                     let count = source_state.counters.get(field).copied()?;
                     return Some((param.clone(), ParamValue::Count(count)));
                 }

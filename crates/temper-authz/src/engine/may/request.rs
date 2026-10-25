@@ -1,6 +1,8 @@
 //! One policy evaluated for a kind of sender: each condition as the set of
 //! results it can have, given what the question leaves unknown.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value as Json;
 
 use super::{Asker, Attr};
@@ -71,6 +73,8 @@ enum Val {
     Context,
     /// The id of the record the request acts on.
     ResourceId,
+    /// A string known only by which others it equals ([`Attr::Same`]).
+    Same(String),
     /// Any value, or an error.
     Unknown,
     /// Certainly an error.
@@ -81,6 +85,8 @@ pub(super) struct Request<'a> {
     pub(super) asker: &'a Asker,
     pub(super) action: &'a str,
     pub(super) resource_type: &'a str,
+    /// The record's attributes the caller knows.
+    pub(super) record: &'a BTreeMap<String, Attr>,
 }
 
 impl Request<'_> {
@@ -234,7 +240,8 @@ impl Request<'_> {
             | Val::Action
             | Val::Resource
             | Val::Context
-            | Val::ResourceId => ERROR,
+            | Val::ResourceId
+            | Val::Same(_) => ERROR,
             Val::Error => ERROR,
             Val::Unknown => ANY,
         }
@@ -319,19 +326,37 @@ impl Request<'_> {
             (Val::Principal, Asker::Service { name, .. }) => {
                 Self::service_attribute(name, attr).map_or(Val::Error, Val::Known)
             }
-            (Val::Context, Asker::Service { .. }) => match self.service_context(attr) {
-                Some(Attr::Value(value)) => Val::Known(value),
-                Some(Attr::ResourceId) => Val::ResourceId,
-                _ => Val::Unknown,
-            },
+            (Val::Context, Asker::Service { .. }) => self
+                .service_context(attr)
+                .map_or(Val::Unknown, |a| self.known(a)),
             // The kernel puts the record's id in its attributes under both
             // names (`build_authz_resource_attrs`).
-            (Val::Resource, _) if matches!(attr, "id" | "Id") => Val::ResourceId,
+            (Val::Resource, _) if matches!(attr, "id" | "Id") => self.known(Attr::ResourceId),
+            (Val::Resource, _) => self
+                .record
+                .get(attr)
+                .cloned()
+                .map_or(Val::Unknown, |a| self.known(a)),
             (Val::Known(Json::Object(record)), _) if !record.contains_key("__entity") => {
                 record.get(attr).cloned().map_or(Val::Error, Val::Known)
             }
-            (Val::Known(_) | Val::Action | Val::Error, _) => Val::Error,
+            (Val::Known(_) | Val::Action | Val::Error | Val::Same(_), _) => Val::Error,
             _ => Val::Unknown,
+        }
+    }
+
+    /// The value of an attribute the kernel sets or the caller knows; the
+    /// record's id is the caller's when it knows it.
+    fn known(&self, attr: Attr) -> Val {
+        match attr {
+            Attr::Value(value) => Val::Known(value),
+            Attr::ResourceId => match self.record.get("id") {
+                Some(Attr::Value(value)) => Val::Known(value.clone()),
+                Some(Attr::Same(name)) => Val::Same(name.clone()),
+                _ => Val::ResourceId,
+            },
+            Attr::Same(name) => Val::Same(name),
+            Attr::Unknown => Val::Unknown,
         }
     }
 
@@ -349,7 +374,8 @@ impl Request<'_> {
             }
             (Val::Action, _) => FALSE,
             (Val::Resource, _) if matches!(attr, "id" | "Id") => TRUE,
-            (Val::Known(_) | Val::Error | Val::ResourceId, _) => ERROR,
+            (Val::Resource, _) if self.record.contains_key(attr) => TRUE,
+            (Val::Known(_) | Val::Error | Val::ResourceId | Val::Same(_), _) => ERROR,
             (Val::Unknown, _) => ANY,
             _ => TRUE_OR_FALSE,
         }
@@ -363,6 +389,16 @@ impl Request<'_> {
             (Val::ResourceId, Val::Known(Json::String(_)))
             | (Val::Known(Json::String(_)), Val::ResourceId) => TRUE_OR_FALSE,
             (Val::ResourceId, Val::Known(_)) | (Val::Known(_), Val::ResourceId) => FALSE,
+            (Val::Same(a), Val::Same(b)) => Results::of(a == b),
+            (Val::Same(_), Val::Known(Json::String(text)))
+            | (Val::Known(Json::String(text)), Val::Same(_)) => {
+                if text.is_empty() {
+                    FALSE
+                } else {
+                    TRUE_OR_FALSE
+                }
+            }
+            (Val::Same(_), Val::Known(_)) | (Val::Known(_), Val::Same(_)) => FALSE,
             (Val::Principal, Val::Known(entity)) | (Val::Known(entity), Val::Principal) => {
                 match (self.asker, entity_parts(entity)) {
                     (Asker::Service { name, .. }, Some((kind, id))) => {

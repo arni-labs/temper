@@ -17,12 +17,23 @@
 //! a module's answer are dispatched without it (`dispatch` keeps
 //! authorization at the entry points), so their sender matters for the
 //! reactions they set off. Without policies every sender may send everything.
+//!
+//! What each sender may send is read from the policies once. A reaction
+//! whose answer depends on the request is decided again when it arrives,
+//! with what the joint state knows of it: its source's id, and its record's
+//! id and tracked fields. A reaction that finds its record through a field
+//! (`resolve_target` `field`) needs this, since only the state says whether
+//! that record is one its source may act on.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
 use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
+
+use super::env::ID;
+use super::state::JointState;
 
 /// Someone outside the kernel.
 pub(super) const OUTSIDE: u32 = 0;
@@ -34,7 +45,24 @@ pub(super) struct Senders {
     askers: Vec<Asker>,
     /// Entity, then action, then each sender's answer.
     may: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
+    /// The policies, to decide again a move whose answer depends on the
+    /// request.
+    policies: Option<SendAnalysis>,
+    /// The answers decided again so far: a walk asks the same few questions
+    /// over and over, and reading the policies takes far longer than a step.
+    decided: RefCell<HashMap<Question, May>>,
 }
+
+/// A move decided again: its sender, record type and action, its source's
+/// id, and the record's tracked strings and booleans.
+type Question = (
+    u32,
+    String,
+    String,
+    Option<String>,
+    BTreeMap<String, String>,
+    BTreeMap<String, bool>,
+);
 
 impl Senders {
     /// The senders of the moves among `entities`, and what `policies` lets
@@ -67,7 +95,9 @@ impl Senders {
                         .map(|action| {
                             let answers = askers
                                 .iter()
-                                .map(|asker| policies.may(asker, &action.name, entity))
+                                .map(|asker| {
+                                    policies.may(asker, &action.name, entity, &BTreeMap::new())
+                                })
                                 .collect();
                             (action.name.clone(), answers)
                         })
@@ -76,7 +106,12 @@ impl Senders {
                 })
                 .collect()
         });
-        Self { askers, may }
+        Self {
+            askers,
+            may,
+            policies: policies.cloned(),
+            decided: RefCell::default(),
+        }
     }
 
     /// Whether Cedar lets sender `by` send `action` to an `entity` record.
@@ -89,6 +124,64 @@ impl Senders {
             .and_then(|answers| answers.get(by as usize))
             .copied()
             .unwrap_or(May::No)
+    }
+
+    /// Whether Cedar lets sender `by` send `action` to the `entity` record
+    /// of `state`: as the policies alone answer, or, when that depends on
+    /// the request, as they answer given the sender's source id and the
+    /// record's id and tracked fields in `state`.
+    pub(super) fn may_in(&self, by: u32, entity: &str, action: &str, state: &JointState) -> May {
+        let may = self.may(by, entity, action);
+        let (May::Maybe, Some(policies), Some(asker), Some(target)) = (
+            may,
+            &self.policies,
+            self.askers.get(by as usize),
+            state.records.get(entity),
+        ) else {
+            return may;
+        };
+        // A declared reaction names its source's type; the kernel adds the
+        // source record's id.
+        let source_id = match asker {
+            Asker::Service { context, .. } => match context.get("triggerSourceEntityType") {
+                Some(Attr::Value(Value::String(source))) => state
+                    .records
+                    .get(source)
+                    .and_then(|record| record.strings.get(ID)),
+                _ => None,
+            },
+            Asker::Outside => None,
+        };
+        let question = (
+            by,
+            entity.to_string(),
+            action.to_string(),
+            source_id.cloned(),
+            target.strings.clone(),
+            target.booleans.clone(),
+        );
+        if let Some(may) = self.decided.borrow().get(&question) {
+            return *may;
+        }
+        let asker = match (asker, source_id) {
+            (Asker::Service { name, context }, Some(id)) => {
+                let mut context = context.clone();
+                context.insert("triggerSourceEntityId".to_string(), symbol(id));
+                service(name, context)
+            }
+            (asker, _) => asker.clone(),
+        };
+        let strings = target.strings.iter().map(|(field, value)| {
+            let field = if field == ID { "id" } else { field.as_str() };
+            (field.to_string(), symbol(value))
+        });
+        let booleans = target
+            .booleans
+            .iter()
+            .map(|(field, value)| (field.clone(), Attr::Value(Value::Bool(*value))));
+        let may = policies.may(&asker, action, entity, &strings.chain(booleans).collect());
+        self.decided.borrow_mut().insert(question, may);
+        may
     }
 
     /// The number of the sender a reaction runs as: its declared principal,
@@ -136,6 +229,16 @@ pub(super) fn declared(
         ),
     ]);
     Some(service(name, context))
+}
+
+/// A tracked string as Cedar may read it: `#n`, a value the model made up,
+/// is known only by which others it equals; any other is the literal itself.
+fn symbol(value: &str) -> Attr {
+    if value.starts_with('#') {
+        Attr::Same(value.to_string())
+    } else {
+        Attr::Value(Value::String(value.to_string()))
+    }
 }
 
 fn service(name: &str, context: BTreeMap<String, Attr>) -> Asker {
