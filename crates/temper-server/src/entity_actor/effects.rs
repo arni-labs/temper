@@ -820,14 +820,21 @@ pub(crate) fn record_effect_outcome<R>(
     apply: impl FnOnce(&mut EntityState) -> R,
 ) -> (R, EffectOutcome) {
     let counters = state.counters.clone();
+    let item_count = state.item_count;
     let booleans = state.booleans.clone();
     let lists = state.lists.clone();
     let fields = state.fields.as_object().cloned().unwrap_or_default();
 
     let applied = apply(state);
 
+    let mut changed_counters = changed_entries(&counters, &state.counters);
+    // Setting an unchanged `items` counter can still synchronize item_count.
+    // Record that write so restore calls set_counter for this case too.
+    if item_count != state.item_count {
+        changed_counters.insert("items".to_string(), state.item_count);
+    }
     let outcome = EffectOutcome {
-        counters: changed_entries(&counters, &state.counters),
+        counters: changed_counters,
         booleans: changed_entries(&booleans, &state.booleans),
         lists: changed_entries(&lists, &state.lists),
         fields: state

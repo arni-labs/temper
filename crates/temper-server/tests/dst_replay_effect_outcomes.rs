@@ -95,14 +95,17 @@ to = "Asked"
 
 /// A server over `store` whose Doc spec adds `asks_step` per `Ask`.
 fn server(store: &SimEventStore, name: &str, asks_step: u32) -> ServerState {
+    server_with_doc(store, name, &doc_ioa(asks_step))
+}
+
+fn server_with_doc(store: &SimEventStore, name: &str, doc: &str) -> ServerState {
     let csdl = parse_csdl(CSDL).expect("CSDL parses");
-    let doc = doc_ioa(asks_step);
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
         csdl,
         CSDL.to_string(),
-        &[("Doc", doc.as_str()), ("Note", NOTE_IOA)],
+        &[("Doc", doc), ("Note", NOTE_IOA)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
     state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
@@ -349,5 +352,64 @@ async fn dst_legacy_events_never_mint_a_child_id() {
         );
         assert_eq!(asks(&rebuilt), 2, "seed {seed}: legacy counters re-derive");
         assert_eq!(rebuilt.state.status, "Asked", "seed {seed}: status");
+    }
+}
+
+/// An unchanged counter can still synchronize the legacy item_count value.
+#[tokio::test]
+async fn dst_replay_keeps_item_count_after_zero_increment() {
+    let doc = r#"
+[automaton]
+strict_action_params = true
+name = "Doc"
+states = ["Open", "Asked"]
+initial = "Open"
+
+[[state]]
+name = "items"
+type = "counter"
+initial = 5
+
+[[action]]
+name = "Ask"
+from = ["Open"]
+to = "Asked"
+effect = ["items += 0"]
+
+[[action]]
+name = "Touch"
+from = ["Asked"]
+to = "Asked"
+"#;
+    for seed in 0..NUM_SEEDS {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let store = SimEventStore::no_faults(seed);
+        let doc_id = format!("doc-item-count-{seed}");
+        let journal = format!("default:Doc:{doc_id}");
+        {
+            let state = server_with_doc(&store, "item-count-live", doc);
+            let initial = read_doc(&state, &doc_id).await;
+            assert_eq!(initial.state.counters.get("items"), Some(&5));
+            assert_eq!(initial.state.item_count, 0);
+            let live = dispatch(&state, &doc_id, "Ask").await;
+            assert_eq!(live.state.item_count, 5, "seed {seed}: live effect");
+
+            store.inject_concurrency_violations(&journal, 1);
+            let retried = dispatch(&state, &doc_id, "Touch").await;
+            assert_eq!(store.pending_concurrency_violations(&journal), 0);
+            assert_eq!(retried.state.item_count, 5, "seed {seed}: conflict replay");
+        }
+        // Copy only events so the restart must rebuild without a snapshot.
+        let replay_store = SimEventStore::no_faults(seed);
+        for (index, envelope) in store.dump_journal(&journal).into_iter().enumerate() {
+            replay_store
+                .append(&journal, index as u64, &[envelope])
+                .await
+                .unwrap();
+        }
+        let state = server_with_doc(&replay_store, "item-count-restart", doc);
+        let rebuilt = read_doc(&state, &doc_id).await;
+        assert_eq!(rebuilt.state.counters.get("items"), Some(&5));
+        assert_eq!(rebuilt.state.item_count, 5, "seed {seed}: journal restart");
     }
 }
