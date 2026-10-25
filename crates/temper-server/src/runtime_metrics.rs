@@ -199,7 +199,7 @@ fn metrics() -> &'static RuntimeMetrics {
             state_timer_record_unreadable_total: meter
                 .u64_counter("temper_state_timer_record_unreadable_total")
                 .with_description(
-                    "Records a timer walk could not read; each is tried again alone.",
+                    "Records a timer walk could not read; each is tried again without its type.",
                 )
                 .build(),
             scheduler_overdue_on_replay_total: meter
@@ -708,7 +708,7 @@ pub fn record_state_timeout_cancelled(tenant: &str, entity_type: &str, state: &s
 }
 
 /// Record a record of a timed type that a timer walk (boot or install) could
-/// not read. The walk finishes its type and tries the record again alone.
+/// not read. The walk finishes its type and tries the record again without it.
 pub fn record_state_timer_record_unreadable(tenant: &str, entity_type: &str) {
     metrics().state_timer_record_unreadable_total.add(
         1,

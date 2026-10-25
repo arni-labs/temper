@@ -142,6 +142,9 @@ struct SimEventStoreInner {
     /// (e.g. proving the key-index backfill treats an unreadable entity as
     /// `LoadFailed` and does not watermark its type). See `fail_next_reads`.
     pending_read_failures: BTreeMap<String, usize>,
+    /// How many times `read_events` was called for each id, failed reads
+    /// included. See `reads`.
+    reads: BTreeMap<String, usize>,
     /// Each entry makes the next N appends that write that id (alone or in a
     /// batch) fail with a storage error, writing nothing. See `fail_next_appends`.
     pending_append_failures: BTreeMap<String, usize>,
@@ -210,6 +213,7 @@ impl SimEventStore {
                 faults,
                 pending_concurrency_violations: BTreeMap::new(),
                 pending_read_failures: BTreeMap::new(),
+                reads: BTreeMap::new(),
                 pending_append_failures: BTreeMap::new(),
                 pending_lost_append_answers: BTreeMap::new(),
                 pending_append_delays: BTreeMap::new(),
@@ -281,6 +285,13 @@ impl SimEventStore {
                 .pending_read_failures
                 .insert(persistence_id.to_string(), count);
         }
+    }
+
+    /// How many times `read_events` was called for `persistence_id`, failed
+    /// reads included, so a test can prove a record is not read again.
+    pub fn reads(&self, persistence_id: &str) -> usize {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner.reads.get(persistence_id).copied().unwrap_or(0)
     }
 
     /// Make the next `count` appends that write `persistence_id`, alone or in a
@@ -1130,6 +1141,7 @@ impl EventStore for SimEventStore {
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        *inner.reads.entry(persistence_id.to_string()).or_default() += 1;
 
         // Deterministic injected read failure (see `fail_next_reads`).
         if let Some(remaining) = inner.pending_read_failures.get_mut(persistence_id) {

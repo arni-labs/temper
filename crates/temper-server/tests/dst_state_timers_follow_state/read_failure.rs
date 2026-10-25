@@ -66,10 +66,10 @@ fn install_retries_unreadable_record_without_a_timer() {
 }
 
 /// One record whose journal never reads must not hold back the boot walk. The
-/// walk finishes its type, the type's other records keep their timers, and
-/// the broken record is tried again alone. Before, the walk walked the whole
-/// type again, up to once a minute, for as long as that record stayed
-/// unreadable, and never finished.
+/// walk finishes its type, the type's other records keep their timers and are
+/// not read again, and the broken record is tried again without its type.
+/// Before, the walk walked the whole type again, up to once a minute, for as
+/// long as that record stayed unreadable, and never finished.
 #[test]
 fn a_record_that_never_reads_does_not_hold_back_the_boot_walk() {
     let seed = 97;
@@ -123,10 +123,24 @@ fn a_record_that_never_reads_does_not_hold_back_the_boot_walk() {
             2,
             "both rows are armed again: re-arming reads rows, not journals"
         );
-        // The broken record stays unreadable for a while, tried alone.
+        // The broken record stays unreadable for a while: it alone is tried
+        // again, and the record that read is left alone.
+        let (steady_reads, broken_reads) = (
+            world.events.reads("beta:Job:steady"),
+            world.events.reads("beta:Job:broken"),
+        );
         for _ in 0..10 {
             advance(Duration::from_secs(30)).await;
         }
+        assert_eq!(
+            world.events.reads("beta:Job:steady"),
+            steady_reads,
+            "a record that read was read again while another stayed unreadable"
+        );
+        assert!(
+            world.events.reads("beta:Job:broken") > broken_reads,
+            "the unreadable record was not tried again"
+        );
         world.events.fail_next_reads("beta:Job:broken", 0);
         advance(Duration::from_secs(60)).await;
         // Nobody acts on the records: their timers alone finish them.
