@@ -139,7 +139,7 @@ fn rejects_malformed_input() {
         "status",
         "len(items",
         "a b",
-        "Parent[pid].name == 'x'",
+        "Parent[pid] == 'x'",
         "empty == 1",
         "x not 1",
         "'unterminated",
