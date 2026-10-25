@@ -37,6 +37,9 @@ mod stack_tests;
 #[cfg(test)]
 mod identity_records_tests;
 
+#[cfg(test)]
+mod cause_context_tests;
+
 /// The result of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzDecision {
@@ -514,8 +517,11 @@ impl AuthzEngine {
             );
         }
 
-        // Add context attributes
+        // Cause keys belong exclusively to the kernel, including when absent.
         for (key, value) in &security_ctx.context_attrs {
+            if crate::cause::MOVE_CAUSE_CONTEXT_KEYS.contains(&key.as_str()) {
+                continue;
+            }
             insert_json_as_cedar(&mut ctx_map, key.clone(), value);
         }
 
