@@ -40,6 +40,8 @@ use temper_server::request_context::AgentContext;
 
 #[path = "dst_runtime_wake/checks.rs"]
 mod checks;
+#[path = "dst_runtime_wake/manual.rs"]
+mod manual;
 #[path = "dst_runtime_wake/refused.rs"]
 mod refused;
 #[path = "dst_runtime_wake/repeating.rs"]
