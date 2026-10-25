@@ -109,6 +109,9 @@ struct Reported {
 struct Inner {
     timers: BTreeMap<TimerRef, Entry>,
     by_due: BTreeSet<(DateTime<Utc>, TimerRef)>,
+    /// Replaced registrations still belong to their tasks: a state timer's
+    /// fire can arm its successor before ending and answering its wakes.
+    superseded: BTreeMap<(TimerRef, u64), Entry>,
     next_id: u64,
     reported: Reported,
     /// How long the sandbox stays awake after an inbound request; None: it
@@ -220,7 +223,9 @@ impl DueTimes {
             inner.next_id += 1;
             let id = inner.next_id;
             if let Some(replaced) = inner.remove(&key) {
-                replaced.answer(false);
+                inner
+                    .superseded
+                    .insert((key.clone(), replaced.id), replaced);
             }
             inner.by_due.insert((at, key.clone()));
             inner.timers.insert(
@@ -272,14 +277,17 @@ impl DueTimes {
     pub(crate) fn end(self: &Arc<Self>, armed: &Armed, fired: bool) {
         let ended = {
             let mut inner = self.lock();
-            if inner
+            if let Some(entry) = inner.superseded.remove(&(armed.key.clone(), armed.id)) {
+                Some(entry)
+            } else if inner
                 .timers
                 .get(&armed.key)
-                .is_none_or(|e| e.id != armed.id)
+                .is_some_and(|e| e.id == armed.id)
             {
+                inner.remove(&armed.key)
+            } else {
                 return;
             }
-            inner.remove(&armed.key)
         };
         if let Some(entry) = ended {
             entry.answer(fired);
@@ -305,6 +313,16 @@ impl DueTimes {
         let mut answers = Vec::with_capacity(overdue.len());
         for key in overdue {
             if let Some(entry) = inner.timers.get_mut(&key) {
+                let (tx, rx) = oneshot::channel();
+                entry.waiters.push(tx);
+                entry.wake.notify_one();
+                answers.push(rx);
+            }
+        }
+        // Replacing a timer changes the next deadline, not the completion
+        // of the old task. Concurrent wakes must still wait for that task.
+        for ((key, _), entry) in &mut inner.superseded {
+            if key.tenant() == tenant && entry.at <= now {
                 let (tx, rx) = oneshot::channel();
                 entry.waiters.push(tx);
                 entry.wake.notify_one();
@@ -468,3 +486,7 @@ impl Armed {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "due/tests.rs"]
+mod tests;

@@ -42,6 +42,8 @@ use temper_server::request_context::AgentContext;
 mod checks;
 #[path = "dst_runtime_wake/refused.rs"]
 mod refused;
+#[path = "dst_runtime_wake/repeating.rs"]
+mod repeating;
 #[path = "dst_runtime_wake/sandbox.rs"]
 mod sandbox;
 #[path = "dst_runtime_wake/world.rs"]
