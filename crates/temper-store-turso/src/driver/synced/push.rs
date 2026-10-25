@@ -9,17 +9,17 @@ use super::{
     CopyState, DriverError, PUSH_ATTEMPT_TIMEOUT, REMOTE_STATEMENT_FAILED, SyncCopy, files,
 };
 
-/// Change log rows one trim deletes at most. A trim holds the database's
-/// write lock and writes the pages it frees to the WAL, so a log that built
-/// up before trimming existed (1.7M rows on one app) is cleared over many
-/// pushes, not in one long transaction.
-const TRIM_ROWS_PER_PUSH: i64 = 10_000;
-
 /// How long the remote may take to say how far it got, under the 10 s its
 /// HTTP client allows, so a hung remote is told from a refusing one.
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl SyncCopy {
+    /// Change log rows one trim deletes at most. A trim holds the database's
+    /// write lock and writes the pages it frees to the WAL, so a log that
+    /// built up before trimming existed (1.7M rows on one app) is cleared
+    /// over many pushes, not in one long transaction.
+    pub const TRIM_ROWS_PER_PUSH: i64 = 10_000;
+
     /// Copy every change committed before this call to the remote database.
     ///
     /// Returns without a network request when another push already carried
@@ -138,7 +138,7 @@ impl SyncCopy {
         drop(rows);
         let through = confirmed
             .min(newest - 1)
-            .min(oldest.saturating_add(TRIM_ROWS_PER_PUSH - 1));
+            .min(oldest.saturating_add(Self::TRIM_ROWS_PER_PUSH - 1));
         if through < oldest {
             return Ok(0);
         }

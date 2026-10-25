@@ -3,7 +3,8 @@
 
 use std::sync::atomic::Ordering;
 
-use temper_store_turso::TursoEventStore;
+use temper_runtime::persistence::EventStore;
+use temper_store_turso::{SyncCopy, TursoEventStore};
 
 use super::support::*;
 
@@ -91,4 +92,67 @@ async fn no_change_is_skipped_across_a_trim_a_restart_and_a_failed_push() {
     let (_b_dir, b_path) = machine();
     let b = server.open(&b_path).await;
     assert_eq!(count(&b, "k1").await, 7, "every change reached the remote");
+}
+
+#[tokio::test]
+async fn a_long_change_log_drains_over_several_pushes() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_dir, path) = machine();
+    let a = server.open(&path).await;
+    let copy = a.sync_copy().expect("copy").clone();
+    let limit = SyncCopy::TRIM_ROWS_PER_PUSH;
+
+    // One append of more events than a trim deletes, like a log that built
+    // up before trimming existed. Small events keep the push within its
+    // time limit.
+    let events = (1..=limit as u64 + 500)
+        .map(|n| {
+            let mut small = event(n);
+            small.payload = serde_json::json!({ "n": n });
+            small
+        })
+        .collect::<Vec<_>>();
+    a.append("default:Note:long", 0, &events)
+        .await
+        .expect("append");
+    let mut rows = copy.change_log_rows().await.expect("rows");
+    assert!(rows > limit + 100, "the log holds only {rows} rows");
+    let mut newest = copy.last_change().await.expect("newest change");
+
+    let mut trimmed = Vec::new();
+    for pushed in 0..4 {
+        if rows <= 5 {
+            break;
+        }
+        if pushed > 0 {
+            // A push with nothing new to send returns before it trims, so
+            // each later push carries one more write.
+            write(&a, "short", pushed - 1).await;
+            rows = copy.change_log_rows().await.expect("rows");
+        }
+        push(&a).await;
+        let left = copy.change_log_rows().await.expect("rows");
+        trimmed.push(rows - left);
+        rows = left;
+        let now = copy.last_change().await.expect("newest change");
+        assert!(
+            now >= newest,
+            "change numbers went back: {now} after {newest}"
+        );
+        newest = now;
+    }
+    assert!(
+        trimmed.iter().all(|rows| *rows <= limit),
+        "each push deletes at most {limit} rows: {trimmed:?}"
+    );
+    assert!(
+        rows <= 5,
+        "the log still holds {rows} rows after pushes that deleted {trimmed:?}"
+    );
+
+    let (_b_dir, b_path) = machine();
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "long").await, limit as usize + 500);
 }
