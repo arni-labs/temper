@@ -199,7 +199,6 @@ fn string_params(
                 nonempty: false,
                 equals: None,
                 not_equals: Vec::new(),
-                equals_related: None,
             };
             for constraint in action.constraints.iter().filter(|c| c.param() == name) {
                 match constraint {
@@ -209,9 +208,6 @@ fn string_params(
                     }
                     ActionConstraint::ParamNotEqualsField { field, .. } => {
                         param.not_equals.push(field.clone());
-                    }
-                    ActionConstraint::ParamEqualsRelatedField { entity, field, .. } => {
-                        param.equals_related = Some((entity.clone(), field.clone()));
                     }
                     _ => {}
                 }

@@ -136,18 +136,6 @@ pub enum ActionConstraint {
     ParamGreaterThanField { param: String, field: String },
     /// Require a nonempty string parameter.
     ParamNonempty { param: String },
-    /// Require the parameter to equal `field` of the related `entity` record
-    /// that this record's `id_field` names (`Id`: the record with this one's
-    /// id). The runtime reads that record when the action is dispatched, on
-    /// every path (requests, reactions, timers, module answers), so a copy of
-    /// another record's value cannot be written wrong; the joint verifier
-    /// models it as that value.
-    ParamEqualsRelatedField {
-        param: String,
-        entity: String,
-        id_field: String,
-        field: String,
-    },
 }
 
 impl ActionConstraint {
@@ -157,22 +145,7 @@ impl ActionConstraint {
             Self::ParamEqualsField { param, .. }
             | Self::ParamNotEqualsField { param, .. }
             | Self::ParamGreaterThanField { param, .. }
-            | Self::ParamNonempty { param }
-            | Self::ParamEqualsRelatedField { param, .. } => param,
-        }
-    }
-
-    /// The related record's `(entity, id_field, field)` a constraint compares
-    /// against.
-    pub fn related_field(&self) -> Option<(&str, &str, &str)> {
-        match self {
-            Self::ParamEqualsRelatedField {
-                entity,
-                id_field,
-                field,
-                ..
-            } => Some((entity, id_field, field)),
-            _ => None,
+            | Self::ParamNonempty { param } => param,
         }
     }
 
@@ -182,7 +155,7 @@ impl ActionConstraint {
             Self::ParamEqualsField { field, .. }
             | Self::ParamNotEqualsField { field, .. }
             | Self::ParamGreaterThanField { field, .. } => Some(field),
-            Self::ParamNonempty { .. } | Self::ParamEqualsRelatedField { .. } => None,
+            Self::ParamNonempty { .. } => None,
         }
     }
 }

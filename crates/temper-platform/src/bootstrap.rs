@@ -136,17 +136,14 @@ pub(crate) fn bootstrap_tenant_specs(
     );
 
     // Validate all specs parse.
-    let mut parsed = BTreeMap::new();
     for (entity_type, ioa_source) in specs {
-        let automaton = automaton::parse_automaton(ioa_source)
+        automaton::parse_automaton(ioa_source)
             .map_err(|e| format!("{label} spec {entity_type} failed to parse: {e}"))?;
-        parsed.insert(entity_type.to_string(), automaton);
     }
 
     // Hash-gated verification: only run the cascade for specs whose
     // content has changed since the last successful verification.
     let mut spec_hashes = Vec::with_capacity(specs.len());
-    let mut changed = false;
     for (entity_type, ioa_source) in specs {
         let hash = spec_content_hash(ioa_source);
         let already_verified = verified_cache
@@ -159,7 +156,6 @@ pub(crate) fn bootstrap_tenant_specs(
                 &hash[..8]
             );
         } else if verification_mode == BootstrapSpecVerificationMode::TrustBundle {
-            changed = true;
             tracing::info!(
                 "Spec {entity_type} changed (hash={}…), trusting prebuilt bundle at bootstrap",
                 &hash[..8]
@@ -169,7 +165,6 @@ pub(crate) fn bootstrap_tenant_specs(
                 "Spec {entity_type} needs verification (hash={}…), running cascade",
                 &hash[..8]
             );
-            changed = true;
             let cascade = VerificationCascade::from_ioa(ioa_source)
                 .with_sim_seeds(3)
                 .with_prop_test_cases(20);
@@ -181,12 +176,6 @@ pub(crate) fn bootstrap_tenant_specs(
             }
         }
         spec_hashes.push((entity_type.to_string(), hash));
-    }
-
-    // Rules over several entities are proven in every mode: a trusted bundle's
-    // CI checks each type alone, and nothing else composes them.
-    if changed {
-        check_joint_invariants(state, tenant, label, parsed)?;
     }
 
     // Parse CSDL schema.
@@ -233,72 +222,6 @@ pub(crate) fn bootstrap_tenant_specs(
     );
 
     Ok(spec_hashes)
-}
-
-/// Time and states the joint check of one install may spend. Anyone who may
-/// install an app can send specs whose joint model never ends, and the check
-/// runs on the install's own thread: unbounded, one install would hold a core
-/// and gigabytes for hours. These are validate-ioa's caps for the same attack
-/// (its `MAX_BUDGET_MS` and `BUDGET_STATES`, about 1.1 GB at the state cap).
-/// A check that runs out refuses the install, since the bundle declared a
-/// rule nobody proved.
-const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
-    time: std::time::Duration::from_secs(120),
-    states: 10_000_000,
-};
-
-/// Prove every `[[invariant]]` of `automatons` (a bundle's types) that reads a
-/// related entity on the joint model of its type and the types it names. A
-/// named type the bundle does not carry is taken from what the tenant already
-/// runs. A bundle that declares no such rule costs one walk over its
-/// invariants.
-fn check_joint_invariants(
-    state: &PlatformState,
-    tenant: &str,
-    label: &str,
-    mut automatons: BTreeMap<String, automaton::Automaton>,
-) -> Result<(), String> {
-    let named: std::collections::BTreeSet<String> = automatons
-        .values()
-        .flat_map(|a| &a.invariants)
-        .flat_map(|inv| inv.assert.related_types())
-        .map(|(entity_type, _)| entity_type)
-        .collect();
-    if named.is_empty() {
-        return Ok(());
-    }
-    {
-        let tenant_id = TenantId::new(tenant);
-        let registry = state
-            .registry
-            .read()
-            .map_err(|_| format!("{label}: the spec registry lock is poisoned"))?;
-        for entity_type in &named {
-            if !automatons.contains_key(entity_type)
-                && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
-            {
-                automatons.insert(entity_type.clone(), spec.automaton.clone());
-            }
-        }
-    }
-    let refs: Vec<&automaton::Automaton> = automatons.values().collect();
-    let results = temper_verify::composite::verify_joint_invariants(&refs, JOINT_INSTALL_BUDGET);
-    let unproven: Vec<String> = results
-        .iter()
-        .filter(|result| !result.holds())
-        .map(ToString::to_string)
-        .collect();
-    for result in results.iter().filter(|result| result.holds()) {
-        tracing::info!("{label}: {result}");
-    }
-    if unproven.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} declares rules over several entities that are not proven:\n{}",
-            unproven.join("\n")
-        ))
-    }
 }
 
 /// Bootstrap the system tenant.

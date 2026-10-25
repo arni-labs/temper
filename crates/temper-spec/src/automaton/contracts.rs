@@ -44,12 +44,6 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
                 .iter()
                 .find(|param| param.name() == constraint.param())
                 .ok_or_else(|| fail("parameter is undeclared"))?;
-            if let Some((_, id_field, _)) = constraint.related_field()
-                && !matches!(id_field, "Id" | "id")
-                && !automaton.state.iter().any(|field| field.name == id_field)
-            {
-                return Err(fail("the related record's id field is undeclared"));
-            }
             let field_type = if let Some(name) = constraint.field() {
                 Some(
                     if let Some(field) = automaton.state.iter().find(|field| field.name == name) {

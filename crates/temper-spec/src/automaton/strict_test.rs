@@ -483,25 +483,3 @@ assert = "status == 'Done' => Owner[owner_id].owner_id == owner_id"
         "only an [[invariant]] may do",
     );
 }
-
-#[test]
-fn a_param_bound_to_a_related_field_names_declared_fields() {
-    let bound = |id_field: &str| {
-        format!(
-            r#"
-[[action.constraints]]
-kind = "param_equals_related_field"
-param = "note"
-entity = "Owner"
-id_field = "{id_field}"
-field = "owner_id"
-"#
-        )
-    };
-    parse(&spec("", &bound("owner_id"), "")).expect("a declared id field");
-    parse(&spec("", &bound("Id"), "")).expect("the record's own id");
-    rejects(
-        &spec("", &bound("missing_id"), ""),
-        "the related record's id field is undeclared",
-    );
-}

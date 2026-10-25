@@ -191,10 +191,6 @@ pub struct StringParam {
     pub equals: Option<String>,
     /// `param_not_equals_field`: never the value of these variables.
     pub not_equals: Vec<String>,
-    /// `param_equals_related_field`: the value of this related entity's
-    /// variable, as `(entity_type, field)`. One entity's model cannot know it
-    /// and leaves the parameter free; the joint model holds it to the value.
-    pub equals_related: Option<(String, String)>,
 }
 
 /// A safety invariant: `assert` must not be false in any reachable state.

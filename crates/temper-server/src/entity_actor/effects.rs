@@ -321,11 +321,6 @@ pub(crate) fn process_action_with_xref_and_field_mode(
     ) {
         return ProcessResult::refused_with(error.message, error.refusal);
     }
-    // Every dispatch path comes through here, so a value copied from another
-    // record is checked whoever sent it.
-    if let Err(error) = table.validate_related_params(action, params, related) {
-        return ProcessResult::refused_with(error.message, error.refusal);
-    }
     // Every dispatch path comes through here: report, or drop, the keys the
     // action does not declare (nerdsane/temper#351).
     let screened = match super::undeclared_params::screen(table, &state.entity_type, action, params)

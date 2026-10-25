@@ -7,6 +7,144 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::ActionConstraint;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strict_initial_identity_is_a_nonempty_string() {
+        let table = TransitionTable::from_ioa_source(
+            r#"
+[automaton]
+name = "Identity"
+states = ["Ready"]
+initial = "Ready"
+strict_action_params = true
+"#,
+        );
+        for invalid in [
+            json!({"x":1}),
+            json!([]),
+            json!(1),
+            json!(false),
+            Value::Null,
+            json!(""),
+        ] {
+            for key in ["Id", "id"] {
+                assert!(
+                    table
+                        .validate_initial_fields(&json!({key:invalid}))
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            table
+                .validate_initial_fields(&json!({"Id":"valid","id":"valid"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn constraints_do_not_recreate_missing_persisted_fields_from_defaults() {
+        let table = TransitionTable::from_ioa_source(
+            r#"
+[automaton]
+name = "PersistedSequence"
+states = ["Active"]
+initial = "Active"
+strict_action_params = true
+[[state]]
+name = "sequence"
+type = "counter"
+initial = 7
+[[action]]
+name = "Advance"
+kind = "input"
+from = ["Active"]
+params = ["expected"]
+[[action.constraints]]
+kind = "param_equals_field"
+param = "expected"
+field = "sequence"
+"#,
+        );
+        let params = json!({"expected":7});
+        let mut fields = json!({});
+        let mut counters = BTreeMap::new();
+        let mut booleans = BTreeMap::new();
+        assert!(
+            table
+                .validate_action_params("Advance", &params, &fields, &counters, &booleans)
+                .is_err()
+        );
+        table.initialize_declared_fields(&mut fields, &mut counters, &mut booleans);
+        assert!(
+            table
+                .validate_action_params("Advance", &params, &fields, &counters, &booleans)
+                .is_ok()
+        );
+        counters.insert("sequence".into(), 8);
+        assert!(
+            table
+                .validate_action_params("Advance", &params, &fields, &counters, &booleans)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn greater_than_requires_a_nonnegative_parameter_even_for_signed_state() {
+        let table = TransitionTable::from_ioa_source(
+            r#"
+[automaton]
+name = "SignedSequence"
+states = ["Active"]
+initial = "Active"
+strict_action_params = true
+[[state]]
+name = "sequence"
+type = "int"
+initial = -3
+[[action]]
+name = "Advance"
+kind = "input"
+from = ["Active"]
+params = ["expected"]
+[[action.constraints]]
+kind = "param_greater_than_field"
+param = "expected"
+field = "sequence"
+"#,
+        );
+        let fields = json!({"sequence":-3});
+        let counters = BTreeMap::new();
+        let booleans = BTreeMap::new();
+        assert!(
+            table
+                .validate_action_params(
+                    "Advance",
+                    &json!({"expected":-2}),
+                    &fields,
+                    &counters,
+                    &booleans
+                )
+                .is_err()
+        );
+        assert!(
+            table
+                .validate_action_params(
+                    "Advance",
+                    &json!({"expected":0}),
+                    &fields,
+                    &counters,
+                    &booleans
+                )
+                .is_ok()
+        );
+    }
+}
+
 /// Allowed parameters and atomic pre-state checks for one action.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActionContract {
@@ -85,76 +223,6 @@ fn matches_field(param: &Value, field: &Value, counter: bool) -> Option<bool> {
 }
 
 impl TransitionTable {
-    /// The related records `action`'s constraints compare against, as
-    /// `(entity_type, id_field, field)`.
-    pub fn constraint_related_refs(&self, action: &str) -> Vec<(String, String, String)> {
-        self.action_contracts
-            .get(action)
-            .into_iter()
-            .flat_map(|contract| &contract.constraints)
-            .filter_map(ActionConstraint::related_field)
-            .map(|(entity, id_field, field)| {
-                (entity.to_string(), id_field.to_string(), field.to_string())
-            })
-            .collect()
-    }
-
-    /// Check `action`'s `param_equals_related_field` constraints against the
-    /// related records read for this dispatch. A record that was not read,
-    /// was not found, or has no such field refuses the action: the value
-    /// cannot be shown to match.
-    pub fn validate_related_params(
-        &self,
-        action: &str,
-        params: &Value,
-        related: &super::RelatedMap,
-    ) -> Result<(), ContractError> {
-        let Some(contract) = self.action_contracts.get(action) else {
-            return Ok(());
-        };
-        for constraint in &contract.constraints {
-            let Some((entity, id_field, field)) = constraint.related_field() else {
-                continue;
-            };
-            let name = constraint.param();
-            let refused = |message: String| ContractError {
-                message,
-                refusal: Some(Refusal::ParameterConstraint {
-                    parameter: name.to_string(),
-                }),
-            };
-            let Some(param) = params.get(name) else {
-                return Err(ContractError {
-                    message: format!("Action '{action}' requires parameter '{name}'"),
-                    refusal: Some(Refusal::MissingParameter {
-                        parameter: name.to_string(),
-                    }),
-                });
-            };
-            let key = (entity.to_string(), id_field.to_string());
-            let records = match related.get(&key) {
-                Some(super::Related::Records(records)) if !records.is_empty() => records,
-                _ => {
-                    return Err(refused(format!(
-                        "Action '{action}' parameter '{name}' must equal {entity}[{id_field}].{field}, and no such record was found"
-                    )));
-                }
-            };
-            let matches = records.iter().all(|record| {
-                record
-                    .as_ref()
-                    .and_then(|record| record.fields.get(field))
-                    .is_some_and(|value| matches_field(param, value, false) == Some(true))
-            });
-            if !matches {
-                return Err(refused(format!(
-                    "Action '{action}' parameter '{name}' must equal {entity}[{id_field}].{field}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Whether any action requires the persisted input-contract semantics.
     pub fn has_input_contracts(&self) -> bool {
         self.strict_action_params
@@ -302,9 +370,6 @@ impl TransitionTable {
                     param.as_u64().is_some()
                         && matches!((integer(param), field.as_ref().and_then(integer)), (Some(a), Some(b)) if a > b)
                 }
-                // Compared with the related record by `validate_related_params`,
-                // which has it.
-                ActionConstraint::ParamEqualsRelatedField { .. } => true,
             };
             if !passed {
                 return Err(ContractError {
@@ -318,7 +383,3 @@ impl TransitionTable {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "action_contract_test.rs"]
-mod tests;

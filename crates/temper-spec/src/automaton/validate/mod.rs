@@ -156,7 +156,12 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
     let invalid =
         |slot: String, error: String| AutomatonParseError::Validation(format!("{slot}: {error}"));
     // A related entity's field is read only by the joint check of several
-    // entity types; the runtime resolves related statuses, not fields.
+    // entity types; the runtime resolves related statuses, not fields. Do not
+    // let a guard or a parameter constraint read one without a commit that
+    // spans both records: the dispatch path would read the field before the
+    // actor writes, and the related record can change in between, so the
+    // write would rest on a stale read (an install pin set from a commit the
+    // install later rolled back is that bug).
     let no_related_field = |expr: &crate::predicate::Expr, slot: String| {
         if expr.reads_related_field() {
             Err(invalid(

@@ -61,11 +61,11 @@ impl Env for ReactionEnv<'_> {
 
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {
         let key = (entity_type.to_string(), id_field.to_string());
-        match self.related.get(&key).map(Related::statuses) {
-            Some(statuses) if !statuses.is_empty() => Some(
+        match self.related.get(&key) {
+            Some(Related::Statuses(statuses)) if !statuses.is_empty() => Some(
                 statuses
-                    .into_iter()
-                    .map(|status| status.map_or(Val::Null, Val::Str))
+                    .iter()
+                    .map(|status| status.as_deref().map_or(Val::Null, Val::Str))
                     .collect(),
             ),
             _ => Some(vec![Val::Null]),

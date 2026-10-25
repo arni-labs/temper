@@ -1,20 +1,17 @@
 use crate::request_context::AgentContext;
-use temper_jit::table::{Related, RelatedMap, RelatedRecord};
+use temper_jit::table::{Related, RelatedMap};
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
 impl crate::state::ServerState {
-    /// Resolve the related entities an action's guards and constraints read.
+    /// Resolve the related entities an action's guards read.
     ///
     /// For each `Type[id_field].status` in the guards of `action`, reads the
     /// id (or list of ids) from the entity's current fields and resolves each
-    /// related entity's status. For each `param_equals_related_field`
-    /// constraint, reads each related record itself (not the status cache),
-    /// with the fields the constraints compare against. An unset reference
-    /// resolves to nothing; an entity that is not found resolves to `None`.
-    /// Every id is resolved: the number of lookups is the number of ids the
-    /// entity's own fields hold, so a guard over all of a list's entities
-    /// sees all of them.
+    /// related entity's status. An unset reference resolves to no statuses;
+    /// an entity that is not found resolves to `None`. Every id is resolved:
+    /// the number of lookups is the number of ids the entity's own fields
+    /// hold, so a guard over all of a list's entities sees all of them.
     pub(super) async fn resolve_cross_entity_guards(
         &self,
         tenant: &TenantId,
@@ -23,34 +20,15 @@ impl crate::state::ServerState {
         action: &str,
     ) -> RelatedMap {
         let mut result = RelatedMap::new();
-        let (refs, constrained) = {
+        let refs: Vec<(String, String)> = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
                 return result;
             };
-            let table = spec.table();
-            (
-                table.guard_related_refs(action),
-                table.constraint_related_refs(action),
-            )
+            spec.table().guard_related_refs(action)
         };
-        if refs.is_empty() && constrained.is_empty() {
+        if refs.is_empty() {
             return result;
-        }
-        // The fields each constrained reference must carry.
-        let mut wanted: std::collections::BTreeMap<(String, String), Vec<String>> =
-            std::collections::BTreeMap::new();
-        for (target_type, id_field, field) in constrained {
-            wanted
-                .entry((target_type, id_field))
-                .or_default()
-                .push(field);
-        }
-        let mut refs = refs;
-        for reference in wanted.keys() {
-            if !refs.contains(reference) {
-                refs.push(reference.clone());
-            }
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -72,52 +50,13 @@ impl crate::state::ServerState {
                 Some(serde_json::Value::String(id)) if !id.is_empty() => vec![id.as_str()],
                 _ => Vec::new(),
             };
-            let reference = (target_type, id_field);
-            let related = match wanted.get(&reference) {
-                Some(fields) => {
-                    let mut records = Vec::with_capacity(ids.len());
-                    for id in ids {
-                        records.push(
-                            self.read_related_record(tenant, &reference.0, id, fields)
-                                .await,
-                        );
-                    }
-                    Related::Records(records)
-                }
-                None => {
-                    let mut statuses = Vec::with_capacity(ids.len());
-                    for id in ids {
-                        statuses.push(self.resolve_entity_status(tenant, &reference.0, id).await);
-                    }
-                    Related::Statuses(statuses)
-                }
-            };
-            result.insert(reference, related);
+            let mut statuses = Vec::with_capacity(ids.len());
+            for id in ids {
+                statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
+            }
+            result.insert((target_type, id_field), Related::Statuses(statuses));
         }
         result
-    }
-
-    /// The related record `entity_type('id')` with `fields`, read from the
-    /// entity itself; `None` when it cannot be read.
-    async fn read_related_record(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        id: &str,
-        fields: &[String],
-    ) -> Option<RelatedRecord> {
-        let response = self
-            .get_tenant_entity_state(tenant, entity_type, id)
-            .await
-            .ok()?;
-        let state = response.state;
-        Some(RelatedRecord {
-            fields: fields
-                .iter()
-                .filter_map(|field| Some((field.clone(), state.fields.get(field)?.clone())))
-                .collect(),
-            status: state.status,
-        })
     }
 
     /// Dispatch entity spawn requests post-transition.
