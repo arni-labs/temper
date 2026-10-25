@@ -9,8 +9,11 @@ use temper_spec::automaton::Automaton;
 use temper_spec::cross_invariant;
 use temper_verify::composite::{Bound, JointOutcome, JointProof, LivenessOutcome};
 
-use super::proofs::{self, Proof, Verdict, Wait, Walked};
+use super::proofs::{self, Keys, Proof, Verdict, Wait, Walked};
 use crate::state::PlatformState;
+
+/// Types by name, each with its spec source and parsed.
+type Sourced = BTreeMap<String, (String, Automaton)>;
 
 /// Refuse an install into a tenant whose stored specs did not load at startup.
 ///
@@ -49,10 +52,11 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// types) or policies: who Cedar lets send each move decides whether a rule
 /// holds and whether a record gets where it should. A named type the bundle
 /// does not carry is taken from what the tenant already runs. Each walk's
-/// verdict is kept by the digest of its model (see [`proofs`]), so a rule
-/// whose cut model the install leaves as it was is not walked again. A
-/// walk still running comes back as the walk to wait for: the install waits
-/// for it without its lock and starts again.
+/// verdict is kept by the digest of its model and by the digest of the specs
+/// and Cedar (see [`proofs`]), so a rule whose cut model the install leaves
+/// as it was is not walked again, nor one whose specs a new kernel starts
+/// with. A walk still running comes back as the walk to wait for: the
+/// install waits for it without its lock and starts again.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -90,10 +94,11 @@ pub(super) async fn prove(
     );
     let policies = temper_authz::SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
+    let sources = sources(&automatons);
     // Composing a model asks Cedar about each sender and action in its
     // scope, so it runs off the async threads too.
     let joint = tokio::task::spawn_blocking(move || {
-        let refs: Vec<&Automaton> = automatons.values().collect();
+        let refs: Vec<&Automaton> = automatons.values().map(|(_, a)| a).collect();
         temper_verify::composite::joint_proofs(&refs, Some(&policies))
     })
     .await
@@ -105,8 +110,11 @@ pub(super) async fn prove(
     let mut running = None;
     for joint_proof in joint {
         let name = joint_proof.name();
-        let digest = joint_proof.digest();
-        let proof = proofs::proof(state, tenant, app_name, name, digest, move |bound| {
+        let keys = Keys {
+            model: joint_proof.digest(),
+            source: proofs::digest(&name, &sources, Some(&policy_text)),
+        };
+        let proof = proofs::proof(state, tenant, app_name, name, keys, move |bound| {
             walk(&joint_proof, bound)
         })
         .await;
@@ -166,25 +174,33 @@ fn walk(proof: &JointProof, bound: Bound<'_>) -> Walked {
     }
 }
 
-/// The bundle's types, parsed, with each type `names` returns for them taken
-/// from what the tenant already runs when the bundle does not carry it.
-/// `None` when no bundle type names one.
+/// Each type's spec source, which a verdict is also kept by.
+fn sources(automatons: &Sourced) -> BTreeMap<String, String> {
+    automatons
+        .iter()
+        .map(|(entity_type, (source, _))| (entity_type.clone(), source.clone()))
+        .collect()
+}
+
+/// The bundle's types, each with its source and parsed, with each type
+/// `names` returns for them taken from what the tenant already runs when the
+/// bundle does not carry it. `None` when no bundle type names one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     specs: &[(String, String)],
     names: impl Fn(&Automaton) -> Vec<(String, String)>,
-) -> Result<Option<BTreeMap<String, Automaton>>, String> {
+) -> Result<Option<Sourced>, String> {
     let mut automatons = BTreeMap::new();
     for (entity_type, ioa_source) in specs {
         let automaton = temper_spec::automaton::parse_automaton(ioa_source)
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
-        automatons.insert(entity_type.clone(), automaton);
+        automatons.insert(entity_type.clone(), (ioa_source.clone(), automaton));
     }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
-        .flat_map(&names)
+        .flat_map(|(_, a)| names(a))
         .map(|(entity_type, _)| entity_type)
         .collect();
     if named.is_empty() {
@@ -199,7 +215,10 @@ fn bundle_with_named(
         if !automatons.contains_key(entity_type)
             && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
         {
-            automatons.insert(entity_type.clone(), spec.automaton.clone());
+            automatons.insert(
+                entity_type.clone(),
+                (spec.ioa_source.clone(), spec.automaton.clone()),
+            );
         }
     }
     Ok(Some(automatons))

@@ -8,16 +8,15 @@
 //! meanwhile: the install waits for it, then starts again under the lock and
 //! finds its verdict.
 //!
-//! A verdict is kept by the digest of what its walk read
-//! ([`JointProof::digest`](temper_verify::composite::JointProof::digest)):
-//! the rules it proves and their joint model, cut to what they read, with
-//! what Cedar lets its senders send. So an install that changes a spec or
-//! the Cedar only where a rule's cut does not reach reads that rule's
-//! verdict instead of walking again. A proven one is kept in the platform's
-//! blob table too, so a start that installs again what an earlier install
-//! proved (a Katagami app's new Temper must serve within 20 s of the old
-//! one's TERM) reads it instead of walking again, whatever checker made it:
-//! those specs already run. A refusal is kept only while this process runs,
+//! A verdict is kept by two digests ([`Keys`]): of what its walk read, and of
+//! the specs and Cedar it was read from. An install that changes a spec or
+//! the Cedar only where a rule's cut does not reach finds the first; a start
+//! on a new kernel, whose models may read differently, finds the second.
+//! Only a change to both walks again. A proven verdict is kept in the
+//! platform's blob table, so a start that installs again what an earlier
+//! install proved (a Katagami app's new Temper must serve within 20 s of the
+//! old one's TERM) reads it instead of walking again, whatever checker made
+//! it: those specs already run. A refusal is kept only while this process runs,
 //! so a later checker decides it again. A walk that did not fit in its
 //! memory says nothing of the specs: the install that waited for it reads it
 //! once, and the next walks again.
@@ -27,6 +26,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use temper_server::ServerState;
 use temper_server::host_room::HOST_ROOM;
 use temper_server::state::DesignTimeEvent;
@@ -54,6 +54,38 @@ pub(super) struct Verdict {
 pub(super) struct Walked {
     pub(super) verdict: Verdict,
     pub(super) fit: bool,
+}
+
+/// The digests a proof's verdict is kept by.
+pub(super) struct Keys {
+    /// Of what its walk reads
+    /// ([`JointProof::digest`](temper_verify::composite::JointProof::digest)):
+    /// the rules and their joint model cut to what they read, with what
+    /// Cedar lets its senders send. It names the walk while this process
+    /// runs.
+    pub(super) model: String,
+    /// Of the proof's name, every type's spec and the Cedar ([`digest`]),
+    /// which a new kernel reads the same.
+    pub(super) source: String,
+}
+
+/// The digest of a proof's sources: its name, every type's spec and the
+/// Cedar. Each part is length-prefixed so no two inputs run together into
+/// the same bytes.
+pub(super) fn digest(
+    proof: &str,
+    sources: &BTreeMap<String, String>,
+    policy: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    let parts = std::iter::once(proof)
+        .chain(sources.iter().flat_map(|(t, s)| [t.as_str(), s.as_str()]))
+        .chain(policy);
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// A proof's verdict, or the walk an install must wait for.
@@ -93,28 +125,43 @@ fn blob_key(digest: &str) -> String {
     format!("joint-verdict/{digest}")
 }
 
-/// The verdict of the walk `digest` names: kept, or reached by a walk that
-/// ended, or the walk to wait for, started here when none is running. The
-/// walk is `walk`, given this host's memory to hold.
+/// The verdict of the proof `keys` name: kept under either key, or reached
+/// by a walk that ended, or the walk to wait for, started here when none is
+/// running. The walk is `walk`, given this host's memory to hold.
 pub(super) async fn proof(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     proof: String,
-    digest: String,
+    keys: Keys,
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
 ) -> Proof {
-    let stored = match state.server.platform_metadata_store() {
-        Some(store) => match store.get_blob(&blob_key(&digest)).await {
-            Ok(Some(bytes)) => serde_json::from_slice::<Verdict>(&bytes).ok(),
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(tenant, app = %app_name, %error, "a kept proof verdict could not be read");
-                None
+    let mut stored = None;
+    if let Some(store) = state.server.platform_metadata_store() {
+        let mut missing = Vec::new();
+        for key in [&keys.model, &keys.source] {
+            match store.get_blob(&blob_key(key)).await {
+                Ok(Some(bytes)) if stored.is_none() => {
+                    stored = serde_json::from_slice::<Verdict>(&bytes).ok();
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => missing.push(key),
+                Err(error) => {
+                    tracing::warn!(tenant, app = %app_name, %error, "a kept proof verdict could not be read");
+                }
             }
-        },
-        None => None,
-    };
+        }
+        // Kept under the key that missed too, so the next change to either
+        // side alone still finds it.
+        if let Some(bytes) = stored.as_ref().and_then(|v| serde_json::to_vec(v).ok()) {
+            for key in missing {
+                if let Err(error) = store.put_blob(&blob_key(key), &bytes).await {
+                    tracing::warn!(tenant, app = %app_name, %error, "a proof verdict could not be kept");
+                }
+            }
+        }
+    }
+    let digest = keys.model;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(verdict) = stored {
         proofs.reached.insert(digest, (verdict.clone(), true));
@@ -138,7 +185,7 @@ pub(super) async fn proof(
         tenant.to_string(),
         app_name.to_string(),
         proof,
-        digest,
+        [digest, keys.source],
         walk,
         ended,
     ));
@@ -146,13 +193,14 @@ pub(super) async fn proof(
 }
 
 /// Walk on a blocking thread, saying how far it got as it goes, then keep
-/// the verdict (in the blob table when proven) and tell whoever waits.
+/// the verdict (in the blob table under both keys when proven) and tell
+/// whoever waits.
 async fn run(
     server: ServerState,
     tenant: String,
     app_name: String,
     proof: String,
-    digest: String,
+    [digest, source]: [String; 2],
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
     ended: watch::Sender<bool>,
 ) {
@@ -186,9 +234,12 @@ async fn run(
         && walked.verdict.refused.is_none()
         && let Some(store) = server.platform_metadata_store()
         && let Ok(bytes) = serde_json::to_vec(&walked.verdict)
-        && let Err(error) = store.put_blob(&blob_key(&digest), &bytes).await
     {
-        tracing::warn!(%tenant, app = %app_name, %error, "a proof verdict could not be kept");
+        for key in [&digest, &source] {
+            if let Err(error) = store.put_blob(&blob_key(key), &bytes).await {
+                tracing::warn!(%tenant, app = %app_name, %error, "a proof verdict could not be kept");
+            }
+        }
     }
     let states = progress.states.load(Ordering::Relaxed);
     let summary = match &walked.verdict.refused {
