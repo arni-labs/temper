@@ -246,6 +246,32 @@ pub(super) async fn load_existing_entity_descriptor_body(
         .map_err(|_| resource_not_found_response(set_name, key))
 }
 
+/// Load a record's descriptor and decide the record's Cedar read on it: the
+/// one authorization every read of a single record goes through. An unknown
+/// record answers 404 and a refused read 403, before any blob is read.
+pub(super) async fn load_readable_entity_descriptor(
+    state: &ServerState,
+    tenant: &TenantId,
+    entity_type: &str,
+    set_name: &str,
+    key: &str,
+    security_ctx: &SecurityContext,
+) -> Result<serde_json::Value, Response> {
+    let body =
+        load_existing_entity_descriptor_body(state, tenant, entity_type, set_name, key).await?;
+    authorize_read(
+        state,
+        tenant,
+        security_ctx,
+        READ_ACTION,
+        entity_type,
+        key,
+        &body,
+    )
+    .map_err(|response| *response)?;
+    Ok(body)
+}
+
 async fn load_authorized_entity_body(
     state: &ServerState,
     tenant: &TenantId,
@@ -259,17 +285,8 @@ async fn load_authorized_entity_body(
     // the inline ownership/relationship metadata Cedar needs without granting
     // an unauthorized caller a storage-I/O amplification primitive.
     let mut body =
-        load_existing_entity_descriptor_body(state, tenant, entity_type, set_name, key).await?;
-    authorize_read(
-        state,
-        tenant,
-        security_ctx,
-        READ_ACTION,
-        entity_type,
-        key,
-        &body,
-    )
-    .map_err(|response| *response)?;
+        load_readable_entity_descriptor(state, tenant, entity_type, set_name, key, security_ctx)
+            .await?;
     hydrate_blob_refs_for_tenant_with_budget(state, tenant, &mut body, hydration_budget).await;
     if let Some(object) = body.as_object_mut() {
         object.insert(
@@ -380,7 +397,7 @@ async fn try_resolve_composite_entity_key(
     }
 }
 
-async fn resolve_entity_request_key(
+pub(super) async fn resolve_entity_request_key(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
@@ -732,6 +749,17 @@ pub(super) async fn handle_odata_get_for_tenant(
 
         ODataPath::Value { ref parent } => {
             handle_stream_get(&state, &tenant, &security_ctx, parent, &hydration_budget).await
+        }
+
+        ODataPath::History { ref parent } => {
+            super::history::handle_entity_history(
+                &state,
+                &tenant,
+                &security_ctx,
+                parent,
+                &query_params,
+            )
+            .await
         }
 
         _ => odata_error(

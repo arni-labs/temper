@@ -9,6 +9,7 @@ mod common;
 pub(crate) mod constraints;
 mod content_addressed;
 mod filter_sql;
+mod history;
 mod nearest;
 mod query_plane_read;
 mod rate_limit;
@@ -22,6 +23,7 @@ mod write;
 
 pub(crate) use common::resolve_entity_type;
 pub use content_addressed::handle_blob_ingest_raw;
+pub(crate) use history::read_page_budget;
 pub use read::handle_hints;
 pub use read::handle_metadata;
 pub use read::handle_odata_get;

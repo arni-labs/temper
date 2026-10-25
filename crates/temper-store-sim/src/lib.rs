@@ -335,6 +335,50 @@ impl SimEventStore {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// One journal read after `from_sequence`, bounded to `limit` events and
+    /// subject to the injected read faults.
+    fn read_journal(
+        &self,
+        persistence_id: &str,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+
+        // Deterministic injected read failure (see `fail_next_reads`).
+        if let Some(remaining) = inner.pending_read_failures.get_mut(persistence_id) {
+            *remaining -= 1;
+            let cleared = *remaining == 0;
+            if cleared {
+                inner.pending_read_failures.remove(persistence_id);
+            }
+            return Err(PersistenceError::Storage(format!(
+                "injected read failure for {persistence_id}"
+            )));
+        }
+
+        let journal = match inner.journals.get(persistence_id) {
+            Some(j) => j,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut events: Vec<PersistenceEnvelope> = journal
+            .iter()
+            .filter(|e| e.sequence_nr > from_sequence)
+            .take(limit)
+            .cloned()
+            .collect();
+
+        // Fault injection: truncate the returned events.
+        let rt_prob = inner.faults.read_truncation_prob;
+        if !events.is_empty() && inner.rng.chance(rt_prob) {
+            let truncate_at = (inner.rng.next_u64() as usize) % events.len();
+            events.truncate(truncate_at.max(1));
+        }
+
+        Ok(events)
+    }
 }
 
 impl std::fmt::Debug for SimEventStore {
@@ -882,39 +926,16 @@ impl EventStore for SimEventStore {
         persistence_id: &str,
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
-        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        self.read_journal(persistence_id, from_sequence, usize::MAX)
+    }
 
-        // Deterministic injected read failure (see `fail_next_reads`).
-        if let Some(remaining) = inner.pending_read_failures.get_mut(persistence_id) {
-            *remaining -= 1;
-            let cleared = *remaining == 0;
-            if cleared {
-                inner.pending_read_failures.remove(persistence_id);
-            }
-            return Err(PersistenceError::Storage(format!(
-                "injected read failure for {persistence_id}"
-            )));
-        }
-
-        let journal = match inner.journals.get(persistence_id) {
-            Some(j) => j,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut events: Vec<PersistenceEnvelope> = journal
-            .iter()
-            .filter(|e| e.sequence_nr > from_sequence)
-            .cloned()
-            .collect();
-
-        // Fault injection: truncate the returned events.
-        let rt_prob = inner.faults.read_truncation_prob;
-        if !events.is_empty() && inner.rng.chance(rt_prob) {
-            let truncate_at = (inner.rng.next_u64() as usize) % events.len();
-            events.truncate(truncate_at.max(1));
-        }
-
-        Ok(events)
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        self.read_journal(persistence_id, after_sequence, limit)
     }
 
     async fn save_snapshot(

@@ -10,6 +10,8 @@
 //! - `/EntitySet('key')/NavProperty` → NavigationProperty
 //! - `/EntitySet('key')/Namespace.Action` → BoundAction
 //! - `/EntitySet('key')/Namespace.Function()` → BoundFunction
+//! - `/EntitySet('key')/$value` → Value (media stream)
+//! - `/EntitySet('key')/$history` → History (the record's transitions)
 
 use crate::error::ODataError;
 
@@ -60,6 +62,9 @@ pub enum ODataPath {
 
     /// The `$value` media stream of an entity, e.g. `/Files('f-1')/$value`.
     Value { parent: Box<ODataPath> },
+
+    /// The transition history of an entity, e.g. `/Orders('o-1')/$history`.
+    History { parent: Box<ODataPath> },
 }
 
 /// Represents an entity key value.
@@ -212,6 +217,13 @@ fn parse_continuation_segment(segment: &str, parent: ODataPath) -> Result<ODataP
     // $value: media stream endpoint
     if segment == "$value" {
         return Ok(ODataPath::Value {
+            parent: Box::new(parent),
+        });
+    }
+
+    // $history: the entity's recorded transitions
+    if segment == "$history" {
+        return Ok(ODataPath::History {
             parent: Box::new(parent),
         });
     }
