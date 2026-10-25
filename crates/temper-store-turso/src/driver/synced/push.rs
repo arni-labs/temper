@@ -136,9 +136,7 @@ impl SyncCopy {
             return Ok(0);
         };
         drop(rows);
-        let through = confirmed
-            .min(newest - 1)
-            .min(oldest.saturating_add(Self::TRIM_ROWS_PER_PUSH - 1));
+        let through = confirmed.min(newest - 1);
         if through < oldest {
             return Ok(0);
         }
