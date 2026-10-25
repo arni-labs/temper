@@ -545,6 +545,13 @@ jobs:
           cargo nextest run -p temper-store-postgres --run-ignored only
           -E 'test(scheduled_action_rows_commit_with_their_events)'
 
+      - name: A journal page reads the newest events below a sequence
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-store-postgres --run-ignored only
+          -E 'test(read_events_page_reads_newest_first_windows)'
+
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
   #
