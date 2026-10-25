@@ -5,14 +5,16 @@
 //! a real ES256 token against a registered `TrustedIssuer` (or an API key
 //! against the `AgentCredential` registry), the move is written to the durable
 //! journal, and the record's `$history` read returns `made_by` and `source`
-//! with each event.
+//! with each event. The Cedar check span names the same principal.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use serde_json::{Value, json};
@@ -265,5 +267,96 @@ async fn a_forged_or_unknown_issuer_token_is_refused_and_records_nothing() {
         history(&app, "untouched").await,
         before,
         "a refused token must not record a move"
+    );
+}
+
+/// Every span the kernel emits through the global tracer, kept in memory. The
+/// global tracer is one per process, so it is installed once for this test
+/// binary and each test reads only the spans of its own record.
+fn exported_spans() -> &'static InMemorySpanExporter {
+    static EXPORTER: OnceLock<InMemorySpanExporter> = OnceLock::new();
+    EXPORTER.get_or_init(|| {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_tracer_provider(provider);
+        exporter
+    })
+}
+
+/// The attributes of the Cedar check span for `action` on record `id`.
+fn authz_span(action: &str, id: &str) -> BTreeMap<String, String> {
+    let name = format!("authz.{action}");
+    exported_spans()
+        .get_finished_spans()
+        .expect("finished spans")
+        .into_iter()
+        .filter(|span| span.name == name)
+        .map(|span| {
+            span.attributes
+                .iter()
+                .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .find(|attrs| attrs.get("entity_id").map(String::as_str) == Some(id))
+        .unwrap_or_else(|| panic!("no {name} span for {id}"))
+}
+
+#[tokio::test]
+async fn the_cedar_check_span_names_the_principal_as_verified() {
+    exported_spans();
+    let sk = SigningKey::from_slice(&[16u8; 32]).unwrap();
+    let app = platform(&sk).await;
+    let token = mint(&sk, access_claims());
+    create_and_claim(&app, "span-by-agent", &token).await;
+    create_and_claim(&app, "span-by-key", OPERATOR_KEY).await;
+
+    let agent = authz_span("Claim", "span-by-agent");
+    let expected = [
+        ("principal_kind", "Agent"),
+        ("principal_id", "kc_agent_provenance"),
+        ("principal_issuer", ISSUER),
+        ("principal_token_kind", "access"),
+        ("principal_client_id", "kc_agent_provenance"),
+        ("principal_grant_id", "grant-provenance"),
+        ("principal_acting_for", "human-rita"),
+        ("principal_agent_type", "contributor"),
+        ("principal_role", "owner"),
+    ];
+    for (key, value) in expected {
+        assert_eq!(
+            agent.get(key).map(String::as_str),
+            Some(value),
+            "{key}: {agent:?}"
+        );
+    }
+    assert!(
+        agent.values().all(|value| !value.contains(&token)),
+        "the bearer token must never reach a span: {agent:?}"
+    );
+
+    let key = authz_span("Claim", "span-by-key");
+    assert_eq!(
+        key.get("principal_id").map(String::as_str),
+        Some("operator"),
+        "{key:?}"
+    );
+    assert_eq!(
+        key.get("principal_agent_type").map(String::as_str),
+        Some("operator"),
+        "{key:?}"
+    );
+    for absent in [
+        "principal_issuer",
+        "principal_token_kind",
+        "principal_client_id",
+        "principal_grant_id",
+    ] {
+        assert!(!key.contains_key(absent), "{absent}: {key:?}");
+    }
+    assert!(
+        key.values().all(|value| !value.contains(OPERATOR_KEY)),
+        "the API key must never reach a span: {key:?}"
     );
 }

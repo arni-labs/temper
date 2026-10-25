@@ -47,5 +47,7 @@ tokio-test = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
 wiremock = { workspace = true }
+# In-memory span export for the Cedar check span test.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # ES256 token minting for the TrustedIssuer resolver integration test.
 p256 = { version = "0.13", features = ["ecdsa"] }
