@@ -20,8 +20,10 @@
 //! other is cancelled.
 //!
 //! State exits and reset signals invalidate the old timer before waiting
-//! for query visibility. Successor timers are armed after that wait, so an
-//! old deadline cannot fire while a committed reset is being projected.
+//! for query visibility, so an old deadline cannot fire while a committed
+//! reset is being projected. Successor timers are armed before that wait
+//! too: a timer fires through the record's actor, not the query plane, and a
+//! projection that lags or fails must not leave a committed record untimed.
 //!
 //! Durability (ADR-0056): every armed timer keeps a durable row with its
 //! clock start, parameters and the identity it fires as, and removes it when

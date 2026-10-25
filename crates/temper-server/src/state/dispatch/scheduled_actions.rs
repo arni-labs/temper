@@ -5,7 +5,7 @@
 //! scheduled actions still waiting. After the commit, and after the
 //! transition's integrations, this process arms each one
 //! ([`ServerState::arm_scheduled_actions`]) on every path where the event was
-//! written; at boot
+//! written, and at once when the transition's projection write fails; at boot
 //! [`ServerState::rearm_scheduled_actions`] arms every row again, through the
 //! boot gate, for the rest of its wait or at once if it fell due while the
 //! server was down. Replay never arms one: the rows are the source of truth.

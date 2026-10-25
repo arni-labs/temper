@@ -111,6 +111,36 @@ deployments paid before ADR-0181. A projection failure is reported in the
 response as before. The queued path remains for composite dispatch, deletes
 and backfill.
 
+**Amendment: a failed projection is retried, not reported (2026-10-25).** The
+idempotent retry this section relied on does not come for most moves: a timer,
+a scheduled action or a reaction has no caller to retry it, and an agent that
+reads "failed" usually moves on. On a user's Temper, 19 moves between
+24 Oct 20:54 and 25 Oct committed, then hit "query projection timed out after
+30 seconds" under Turso write contention, and stayed in their new state with
+no state timer and no follow-on work. A Factory release sat in Making with its
+4500-second Lost timer never armed and its make run never started.
+
+Now the dispatch keeps the work. The state timer the transition entered or
+reset is armed right after the commit, before the projection wait: it fires
+through the record's actor and reads nothing from the query plane, so it is
+bookkeeping for the commit like the cancellation of the old one. If the
+projection write fails, its scheduled actions are armed at once, and the write
+is tried again with a doubling wait (100 ms up to the 30-second budget of one
+try) until it lands. Then dispatch continues down the ordinary path: SSE,
+webhooks, integrations, spawns, and the caller's reactions, each once. The
+response waits for that and reports success. The 30-second budget now bounds
+one try, since a write stuck on a dead connection or a held lock does not
+finish by waiting longer; it no longer bounds the response.
+
+A caller can wait longer than 30 seconds while the store is stalled. A caller
+that hangs up meanwhile loses nothing once dispatch runs in its own task
+(arni-labs/temper #122). A caller that retries with the same idempotency key
+while the first dispatch is still catching up can start the dependents a
+second time, as it can today while any post-dispatch work (an inline
+integration, awaited reactions) outlasts the caller's timeout. arni-labs/temper
+#79 closes that race by giving a key's post-dispatch effects one owner: a
+retry that arrives while they run waits for them.
+
 ### Sub-Decision 3: Session Collection Reads Must Push Down Bounds
 
 Supported Session/OData queries used by Foresight and DSF2 must use the query
