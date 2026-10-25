@@ -161,20 +161,31 @@ async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Va
         .is_ok_and(|response| response.success)
 }
 
-/// Every seed's failure, if any.
-fn failures(seeds: u64, setup: impl Fn() -> Setup) -> Vec<String> {
-    (0..seeds)
-        .filter_map(|seed| sandbox::run(seed, setup()).err())
-        .collect()
+/// Every seed's failure, if any, and how many reports in all landed after
+/// the answer of a wake made after them.
+fn failures(seeds: u64, setup: impl Fn() -> Setup) -> (Vec<String>, u64) {
+    let mut failures = Vec::new();
+    let mut overtaken = 0;
+    for seed in 0..seeds {
+        match sandbox::run(seed, setup()) {
+            Ok(n) => overtaken += n,
+            Err(failure) => failures.push(failure),
+        }
+    }
+    (failures, overtaken)
 }
 
 #[test]
 fn dst_a_sleeping_sandbox_is_woken_for_every_timer() {
-    let failures = failures(48, || Setup {
+    let (failures, overtaken) = failures(48, || Setup {
         awake: Some(AWAKE),
         kind: Kind::Mixed,
     });
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    assert!(
+        overtaken > 0,
+        "no report sent before a wake landed after its answer"
+    );
 }
 
 /// The checks can see a wrong window: told it stays awake longer than the
@@ -182,7 +193,7 @@ fn dst_a_sleeping_sandbox_is_woken_for_every_timer() {
 /// after the suspension, and it is slept through.
 #[test]
 fn dst_a_window_longer_than_the_sandbox_stays_awake_is_caught() {
-    let failures = failures(48, || Setup {
+    let (failures, _) = failures(48, || Setup {
         awake: Some(SUSPEND_AFTER * 2),
         kind: Kind::Mixed,
     });
@@ -196,7 +207,7 @@ fn dst_a_window_longer_than_the_sandbox_stays_awake_is_caught() {
 /// suspension: both fire on time.
 #[test]
 fn dst_a_request_that_resumes_the_sandbox_retimes_its_timers() {
-    let failures = failures(8, || Setup {
+    let (failures, _) = failures(8, || Setup {
         awake: Some(AWAKE),
         kind: Kind::Resumed,
     });
@@ -209,7 +220,7 @@ fn dst_a_request_that_resumes_the_sandbox_retimes_its_timers() {
 #[test]
 fn dst_a_minute_chain_reports_about_once_a_window() {
     for busy in [false, true] {
-        let failures = failures(16, || Setup {
+        let (failures, _) = failures(16, || Setup {
             awake: Some(AWAKE),
             kind: Kind::Chain { busy },
         });

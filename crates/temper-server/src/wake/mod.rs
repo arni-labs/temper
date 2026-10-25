@@ -73,6 +73,11 @@ pub struct WakeOutcome {
     /// The earliest due time left that the process could sleep through, by
     /// the same rule as a report.
     pub next_due_at: Option<DateTime<Utc>>,
+    /// The process's clock when it answered, as a report's.
+    pub reported_at: DateTime<Utc>,
+    /// The next number of the process's reports: the answer is one of them,
+    /// and the control plane orders it with them by `(reported_at, seq)`.
+    pub seq: u64,
 }
 
 impl ServerState {
@@ -107,9 +112,10 @@ impl ServerState {
     /// Fire every timer of `tenant` due by the wall clock now, wait for those
     /// fires, and answer the earliest due time left of `tenant`'s timers that
     /// the process could sleep through, by the same rule as a report. The
-    /// control plane takes the answer as it takes a report, so an early wake
-    /// brings the fresh value; the process reports besides only when another
-    /// tenant's timer is earlier and what the control plane holds differs. A timer that is firing
+    /// answer is a report: it carries the next `seq` and `reported_at`, the
+    /// control plane orders it with the reports, and the process holds it as
+    /// delivered, so an early wake brings the fresh value. The process reports
+    /// besides only when another tenant's timer is earlier. A timer that is firing
     /// already is waited for, not fired again; one whose fire does not commit
     /// keeps its row, tries again on its own and is not counted.
     ///
@@ -121,8 +127,13 @@ impl ServerState {
         for answer in answers {
             fired += usize::from(answer.await.unwrap_or(false));
         }
-        let next_due_at = self.due_times.answer(tenant.as_str());
-        WakeOutcome { fired, next_due_at }
+        let answer = self.due_times.answer(tenant.as_str());
+        WakeOutcome {
+            fired,
+            next_due_at: answer.next_due_at,
+            reported_at: answer.reported_at,
+            seq: answer.seq,
+        }
     }
 }
 

@@ -129,6 +129,10 @@ async fn only_the_permitted_owner_wakes_the_process() {
         answer.get("next_due_at").is_some(),
         "the owner hears when the process next has work: {body}"
     );
+    assert!(
+        answer["reported_at"].is_string() && answer["seq"].is_u64(),
+        "the answer is a report, ordered with the others: {body}"
+    );
 
     let (status, body) = wake(&app, Some(&person_token(&key, "someone-else"))).await;
     assert_eq!(
@@ -137,7 +141,9 @@ async fn only_the_permitted_owner_wakes_the_process() {
         "another person is refused: {body}"
     );
     assert!(
-        !body.contains("next_due_at"),
+        ["next_due_at", "reported_at", "seq"]
+            .iter()
+            .all(|field| !body.contains(field)),
         "a refused caller learns nothing: {body}"
     );
 
@@ -148,7 +154,9 @@ async fn only_the_permitted_owner_wakes_the_process() {
         "no token, no wake: {body}"
     );
     assert!(
-        !body.contains("next_due_at"),
+        ["next_due_at", "reported_at", "seq"]
+            .iter()
+            .all(|field| !body.contains(field)),
         "an unauthenticated caller learns nothing: {body}"
     );
 }

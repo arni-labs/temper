@@ -18,7 +18,9 @@ use crate::state::ServerState;
 const RUNTIME_RESOURCE_ID: &str = "runtime";
 
 /// Fire every timer of the caller's tenant that is due by the wall clock, wait
-/// for those fires, and answer `{"fired": n, "next_due_at": ...}`.
+/// for those fires, and answer `{"fired": n, "next_due_at": ..., "reported_at":
+/// ..., "seq": n}`: a report, ordered with the process's others by
+/// `(reported_at, seq)`.
 ///
 /// An unauthenticated caller gets 401 and one without a Cedar permit for
 /// `wake` on `Runtime::"runtime"` gets 403; neither learns when the process

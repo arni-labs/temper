@@ -148,6 +148,18 @@ fn run_seed(seed: u64) -> Result<(), String> {
         if outcome.fired != 0 || outcome.next_due_at != Some(near) {
             return Err(format!("a wake before any due time answered {outcome:?}"));
         }
+        let last = gate
+            .sent
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(report, _)| report.seq);
+        if last.is_none_or(|last| outcome.seq <= last) || outcome.reported_at != sim_now() {
+            return Err(format!(
+                "a wake's answer is the process's next report: seq {} after {last:?}",
+                outcome.seq
+            ));
+        }
         quiet(&gate, sent, "after the wake").await?;
 
         // The pass comes back.

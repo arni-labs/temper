@@ -326,43 +326,43 @@ impl DueTimes {
     /// one is not reported: the control plane wakes the process early, for
     /// nothing, and that wake brings the fresh value.
     pub(crate) fn report(self: &Arc<Self>) {
-        self.send_when(false);
+        self.send_when();
     }
 
-    /// What a wake of `tenant` answers: the earliest due time at or after the
-    /// horizon of `tenant`'s timers. The control plane takes the answer as it
-    /// takes a report, so when it is also the process's own, that is what the
-    /// control plane holds now and nothing is reported (a report on its way
-    /// is dropped); when another tenant's timer is earlier, the process
-    /// reports if what the control plane holds differs.
-    pub(crate) fn answer(self: &Arc<Self>, tenant: &str) -> Option<DateTime<Utc>> {
-        let (answer, held) = {
+    /// What a wake of `tenant` answers, as a report: the earliest due time at
+    /// or after the horizon of `tenant`'s timers, with the next `seq` and the
+    /// time now, so the control plane orders it with the reports. Delivered
+    /// in the wake's answer, it is what the control plane holds now, and a
+    /// report still on its way is older and dropped. When another tenant's
+    /// timer is earlier, that is reported as any earlier time is.
+    pub(crate) fn answer(self: &Arc<Self>, tenant: &str) -> WakeReport {
+        let answer = {
             let mut inner = self.lock();
-            let horizon = inner.horizon(sim_now());
-            let answer = inner.reportable(horizon, Some(tenant));
-            let held = answer == inner.reportable(horizon, None);
-            if held {
-                inner.reported.in_flight = None;
-                inner.reported.acked = Some(answer);
+            let reported_at = sim_now();
+            let next_due_at = inner.reportable(inner.horizon(reported_at), Some(tenant));
+            inner.reported.seq += 1;
+            inner.reported.in_flight = None;
+            inner.reported.acked = Some(next_due_at);
+            WakeReport {
+                next_due_at,
+                reported_at,
+                seq: inner.reported.seq,
             }
-            (answer, held)
         };
-        if !held {
-            self.send_when(true);
-        }
+        self.report();
         answer
     }
 
     /// Send the due time the process could sleep through to the sink when it
     /// is earlier than what the control plane will hold once what is on its
-    /// way lands, or, when `differs`, when it is not the same. A report that
+    /// way lands, or it holds nothing yet. A report that
     /// is not delivered is sent again, waiting longer after each failure,
     /// until it is delivered or a newer report replaces it: without it the
     /// control plane would not wake the process for that due time. A report
     /// the control plane refuses on purpose ([`SendError::Refused`]) is not
     /// sent again: its pass would be refused on every retry. The report
     /// carries the current span's trace: the move that changed the due time.
-    fn send_when(self: &Arc<Self>, differs: bool) {
+    fn send_when(self: &Arc<Self>) {
         let Some(sink) = self
             .sink
             .lock()
@@ -382,7 +382,6 @@ impl DueTimes {
             };
             let send = match known {
                 None => true,
-                Some(known) if differs => known != earliest,
                 Some(known) => match (earliest, known) {
                     (Some(earliest), Some(known)) => earliest < known,
                     (Some(_), None) => true,
