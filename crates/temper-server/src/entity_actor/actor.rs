@@ -21,6 +21,7 @@
 //! - **Deterministic**: Same input -> same output. No randomness in transition logic.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -82,6 +83,7 @@ fn persistence_failure_reply(state: EntityState, error: &PersistenceError) -> En
         PersistenceError::EventTooLarge { .. } => EntityResponse::refused(state, said),
         PersistenceError::ConcurrencyViolation { .. }
         | PersistenceError::Storage(_)
+        | PersistenceError::OutcomeUnknown(_)
         | PersistenceError::Serialization(_) => EntityResponse::write_failed(state, said),
     }
 }
@@ -182,6 +184,10 @@ pub struct EntityActor {
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
     /// Run once with the state this actor rehydrated from stored events.
     on_rehydrated: Option<RehydrateHook>,
+    /// A write's outcome could not be learned, so the state in memory may not
+    /// be the journal's. Once the message that wrote it is answered, the
+    /// actor restarts and rebuilds from the journal before the next one.
+    rebuild_from_journal: AtomicBool,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -323,6 +329,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            rebuild_from_journal: AtomicBool::new(false),
         }
     }
 
@@ -349,6 +356,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            rebuild_from_journal: AtomicBool::new(false),
         }
     }
 
@@ -566,9 +574,12 @@ impl EntityActor {
                 PersistenceError::ConcurrencyViolation { .. } => Err(error),
                 error => Err(PersistenceError::Storage(format!("not written: {error}"))),
             },
-            WriteOutcome::Unknown(read_error) => Err(PersistenceError::Storage(format!(
-                "outcome unknown: {error}; the journal could not be read: {read_error}"
-            ))),
+            WriteOutcome::Unknown(read_error) => {
+                self.rebuild_from_journal.store(true, Ordering::Release);
+                Err(PersistenceError::OutcomeUnknown(format!(
+                    "{error}; the journal could not be read: {read_error}"
+                )))
+            }
         }
     }
 
@@ -1219,6 +1230,45 @@ impl Actor for EntityActor {
         &self,
         msg: Self::Msg,
         state: &mut Self::State,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), ActorError> {
+        let handled = Box::pin(self.handle_message(msg, state, ctx)).await;
+        // The message is answered. A write whose outcome could not be learned
+        // leaves memory that may not be the journal's: restart, so the next
+        // message is answered from the journal (`pre_start` replays it, and
+        // fails until it can read it).
+        if self.rebuild_from_journal.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id,
+                "rebuilding from the journal: a write's outcome could not be learned"
+            );
+            return Err(ActorError::custom(format!(
+                "{}:{} rebuilds from its journal: a write's outcome could not be learned",
+                self.entity_type, self.entity_id
+            )));
+        }
+        handled
+    }
+
+    async fn post_stop(&self, state: Self::State, _ctx: &mut ActorContext<Self>) {
+        tracing::info!(
+            entity = %state.entity_id,
+            status = %state.status,
+            events_total = state.total_event_count,
+            events_recent = state.events.len(),
+            "entity actor stopped"
+        );
+    }
+}
+
+impl EntityActor {
+    /// Handle one message (`Actor::handle` restarts the actor after it when
+    /// a write's outcome could not be learned).
+    async fn handle_message(
+        &self,
+        msg: EntityMsg,
+        state: &mut EntityState,
         ctx: &mut ActorContext<Self>,
     ) -> Result<(), ActorError> {
         match msg {
@@ -2011,16 +2061,6 @@ impl Actor for EntityActor {
             }
         }
         Ok(())
-    }
-
-    async fn post_stop(&self, state: Self::State, _ctx: &mut ActorContext<Self>) {
-        tracing::info!(
-            entity = %state.entity_id,
-            status = %state.status,
-            events_total = state.total_event_count,
-            events_recent = state.events.len(),
-            "entity actor stopped"
-        );
     }
 }
 

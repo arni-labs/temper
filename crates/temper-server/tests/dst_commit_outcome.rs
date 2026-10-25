@@ -15,8 +15,9 @@
 //! - a successful answer is a move that landed;
 //! - a failed answer is a move that did not land, unless the journal could
 //!   not be read when it was answered;
-//! - the record's state in memory is the state its journal gives, after any
-//!   answer whose outcome could be learned.
+//! - the record's state in memory is the state its journal gives: when a
+//!   write's outcome could not be learned, the record rebuilds from its
+//!   journal before its next answer.
 //!
 //! The server runs in one single-threaded, paused-clock Tokio runtime.
 
@@ -355,8 +356,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 _ => {}
             }
 
-            // The outcome could be learned unless the journal read failed.
-            if fault != Fault::LandThenFailUnreadable {
+            {
                 let (sequence, bumps, journal_status) = journal_state(&store, &id).await;
                 let memory = state
                     .get_tenant_entity_state(&tenant, "Tally", &id)
@@ -375,9 +375,6 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                         ),
                     ));
                 }
-                status.insert(id.clone(), journal_status);
-            } else {
-                let (_, _, journal_status) = journal_state(&store, &id).await;
                 status.insert(id.clone(), journal_status);
             }
         }

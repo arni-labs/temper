@@ -179,8 +179,8 @@ impl TursoEventStore {
         );
         match task.await {
             Ok(answer) => answer,
-            Err(error) => Attempt::Unknown(PersistenceError::Storage(format!(
-                "outcome unknown: the append task ended without an answer: {error}"
+            Err(error) => Attempt::Unknown(PersistenceError::OutcomeUnknown(format!(
+                "the append task ended without an answer: {error}"
             ))),
         }
     }
@@ -322,8 +322,8 @@ impl TursoEventStore {
             Ok(_) => Attempt::NotWritten(PersistenceError::Storage(format!(
                 "not written: the commit failed: {error}"
             ))),
-            Err(read_error) => Attempt::Unknown(PersistenceError::Storage(format!(
-                "outcome unknown: the commit failed ({error}) and the journal could not be read ({read_error})"
+            Err(read_error) => Attempt::Unknown(PersistenceError::OutcomeUnknown(format!(
+                "the commit failed ({error}) and the journal could not be read ({read_error})"
             ))),
         }
     }

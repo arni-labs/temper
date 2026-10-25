@@ -608,6 +608,11 @@ pub enum PersistenceError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// A write failed after its commit began and the journal could not be
+    /// read to learn whether it landed: it may have.
+    #[error("outcome unknown: {0}")]
+    OutcomeUnknown(String),
+
     /// One event is larger than the server's limit for a single change
     /// (`TEMPER_MAX_EVENT_BYTES`). Nothing was written.
     #[error(
