@@ -28,8 +28,8 @@
 //!   sleeps through a timer, and the checks see it;
 //! - a request that resumes the sandbox makes its timers wait again by the
 //!   wall clock, so one armed before the suspension fires on time;
-//! - a chain firing every minute sends about one report per window, idle or
-//!   busy, not one per fire.
+//! - a chain firing every minute costs the control plane about one report and
+//!   one wake per window, idle or busy, not one per fire.
 
 use std::time::Duration;
 
@@ -204,7 +204,8 @@ fn dst_a_request_that_resumes_the_sandbox_retimes_its_timers() {
 }
 
 /// A chain firing every minute keeps the sandbox awake through the control
-/// plane's wakes, and sends about one report per window, not one per fire.
+/// plane's wakes, and costs it about one report and one wake per window, not
+/// one per fire.
 #[test]
 fn dst_a_minute_chain_reports_about_once_a_window() {
     for busy in [false, true] {

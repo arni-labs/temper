@@ -158,6 +158,7 @@ pub(crate) fn run(seed: u64, setup: Setup) -> Result<(), String> {
             plan: None,
             seen: None,
             answered_at: None,
+            wakes: 0,
             recs: Vec::new(),
             trace: Vec::new(),
         };
@@ -184,6 +185,8 @@ struct Sim {
     seen: Option<u64>,
     /// When the control plane took a wake's answer last.
     answered_at: Option<DateTime<Utc>>,
+    /// How many times the control plane woke the process at a time it held.
+    wakes: u64,
     recs: Vec<Rec>,
     trace: Vec<String>,
 }
@@ -280,10 +283,15 @@ impl Sim {
                 .map(|r| r.seq)
                 .collect();
             let windows = RUN as u64 / AWAKE.as_secs();
-            if sent.len() as u64 > windows + 3 {
+            if sent.len() as u64 > windows + 3 || self.wakes > windows + 3 {
                 return Err(self.fail((
-                    "a minute's chain sends about one report per window, not one per fire",
-                    format!("{} reports in {windows} windows, busy {busy}", sent.len()),
+                    "a minute's chain costs the control plane about one report and one wake \
+                     per window, not one per fire",
+                    format!(
+                        "{} reports and {} wakes in {windows} windows, busy {busy}",
+                        sent.len(),
+                        self.wakes
+                    ),
                 )));
             }
         }
@@ -315,6 +323,7 @@ impl Sim {
     /// The control plane wakes the process at the time it holds, sometimes
     /// at once again, and holds each wake's answer.
     async fn wake(&mut self) -> Result<(), (&'static str, String)> {
+        self.wakes += 1;
         for again in [false, true] {
             if again && self.rng.next_bound(3) != 0 {
                 break;
