@@ -1442,6 +1442,7 @@ impl StorageStack {
             Some(store.clone() as Arc<dyn TrajectorySink>),
             Some(Arc::new(SingleMetadataStoreProvider::new_postgres(store))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_turso(store: TursoEventStore) -> Self {

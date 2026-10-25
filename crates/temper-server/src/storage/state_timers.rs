@@ -129,5 +129,5 @@ impl StateTimerStore for MetadataTimerRows {
     }
 }
 
-forward_state_timer_store!(PostgresEventStore);
+forward_state_timer_store!(PostgresEventStore, keyed);
 forward_state_timer_store!(TursoEventStore, keyed);
