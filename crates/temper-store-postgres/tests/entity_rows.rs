@@ -187,7 +187,6 @@ async fn query_plane_and_timer_rows_commit_with_their_events() {
         .expect("drop schema");
     pool.close().await;
 
-    assert!(store_commits_rows, "the store says it commits entity rows");
     let hold_writer = held.event_writer.clone().expect("the hold's event");
     assert_eq!(
         held.catalog,
@@ -221,4 +220,5 @@ async fn query_plane_and_timer_rows_commit_with_their_events() {
 
     assert_eq!(deleted.catalog, None, "the delete removed the catalog row");
     assert!(deleted.field_index.is_empty(), "and its field index");
+    assert!(store_commits_rows, "the store says it commits entity rows");
 }

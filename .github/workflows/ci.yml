@@ -553,6 +553,8 @@ jobs:
           -E 'test(query_plane_and_timer_rows_commit_with_their_events)'
 
       - name: The server on PostgreSQL
+        # Runs even when a store step failed, so one red step does not hide another.
+        if: ${{ !cancelled() }}
         env:
           TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
         run: >-
