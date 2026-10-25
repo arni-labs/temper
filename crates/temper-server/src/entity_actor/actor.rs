@@ -1213,6 +1213,7 @@ impl Actor for EntityActor {
                         spawn_requests: vec![],
                         spec_governed: true,
                         refused: false,
+                        replayed: false,
                     });
                     return Ok(());
                 }
@@ -1747,6 +1748,7 @@ impl Actor for EntityActor {
                         spawn_requests: result.spawn_requests,
                         spec_governed: true,
                         refused: false,
+                        replayed: false,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
@@ -1811,6 +1813,7 @@ impl Actor for EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    replayed: false,
                 });
             }
             EntityMsg::GetField { field } => {
@@ -1847,6 +1850,7 @@ impl Actor for EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    replayed: false,
                 });
             }
 
@@ -1915,6 +1919,7 @@ impl Actor for EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    replayed: false,
                 });
             }
         }

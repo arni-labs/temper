@@ -292,6 +292,12 @@ pub struct EntityResponse {
     /// the same action may have caused.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// Whether an earlier request with the same idempotency key already made
+    /// this move, so this answer repeats it and nothing new was written.
+    /// Callers that count moves count this one as a resend. HTTP answers say
+    /// so with the `Idempotent-Replayed: true` header.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 impl EntityResponse {
@@ -315,6 +321,7 @@ impl EntityResponse {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            replayed: false,
         }
     }
 }
@@ -465,6 +472,7 @@ mod tests {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            replayed: false,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         assert!(!serialized.contains("spec_governed"));

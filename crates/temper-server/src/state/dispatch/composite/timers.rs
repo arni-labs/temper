@@ -85,6 +85,7 @@ impl crate::state::ServerState {
                 spawn_requests: Vec::new(),
                 spec_governed: true,
                 refused: false,
+                replayed: false,
             },
         })
     }

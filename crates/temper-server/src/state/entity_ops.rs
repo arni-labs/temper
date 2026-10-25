@@ -312,6 +312,7 @@ impl ServerState {
                 spawn_requests: vec![],
                 spec_governed: true,
                 refused: false,
+                replayed: false,
             }
         };
 
@@ -1649,6 +1650,7 @@ impl ServerState {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            replayed: false,
         }))
     }
 
