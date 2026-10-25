@@ -48,6 +48,10 @@ pub enum EntityMsg {
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
+        /// Who sent the action. A scheduled action the transition arms keeps
+        /// this identity in its row and fires as it. None: the action arms
+        /// with no identity (internal callers and tests).
+        caller: Option<std::sync::Arc<crate::request_context::AgentContext>>,
     },
     /// Get the current entity state.
     GetState,
