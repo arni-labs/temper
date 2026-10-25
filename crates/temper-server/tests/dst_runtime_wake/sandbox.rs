@@ -361,10 +361,10 @@ impl Sim {
             let woke_at = sim_now();
             self.trace.push(format!("woken at {woke_at}"));
             let horizon = self.awake.map_or(woke_at, |awake| woke_at + awake);
+            let before = self.reports.sent.lock().unwrap().last().cloned();
             let outcome = self.state.wake_runtime(&TenantId::new(TENANT)).await;
             self.hold((outcome.reported_at, outcome.seq), outcome.next_due_at);
-            let before = self.reports.sent.lock().unwrap().last().cloned();
-            if let Some(before) = before.filter(|report| report.seq < outcome.seq)
+            if let Some(before) = before
                 && self.rng.next_bound(2) == 0
             {
                 self.trace
