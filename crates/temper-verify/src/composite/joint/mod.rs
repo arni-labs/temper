@@ -54,6 +54,7 @@ mod room;
 mod senders;
 mod slice;
 mod state;
+mod store;
 
 pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
 pub use room::{Bound, Bytes, Progress, Room};
