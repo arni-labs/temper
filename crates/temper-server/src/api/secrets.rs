@@ -82,11 +82,15 @@ fn is_backend_not_supported_error(err: &str) -> bool {
 
 /// The condition a PUT's `If-None-Match` or `If-Match` header puts on the write.
 ///
-/// `If-None-Match: *` creates only; `If-Match: "<etag>"` replaces only the
-/// version that etag names. A condition this server cannot check (a list of
-/// etags, a weak etag, `If-Match: *`, both headers) is refused rather than
-/// ignored: ignoring it would turn the caller's conditional write into the
-/// unconditional one it was sent to avoid.
+/// The agreed API contract in PR #114 restricts conditional PUTs to
+/// `If-None-Match: *` and one strong `If-Match` etag:
+/// https://github.com/arni-labs/temper/pull/114
+/// That contract explicitly chooses 400 for `If-Match: *`, etag lists, weak
+/// etags, non-wildcard `If-None-Match`, and both headers together. These checks
+/// preserve that settled restriction; supporting existence or version-set
+/// predicates requires an owner decision to expand the contract. Never ignore
+/// a rejected condition, which would turn the request into an unconditional
+/// overwrite.
 fn write_precondition(headers: &HeaderMap) -> Result<SecretPrecondition<'_>, &'static str> {
     fn single(headers: &HeaderMap, name: header::HeaderName) -> Result<Option<&str>, ()> {
         let mut values = headers.get_all(name).iter();
