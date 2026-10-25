@@ -158,7 +158,7 @@ unless {
   context has via && context.via == "timer" &&
   context has armedBy && context.armedBy == "hook-1" &&
   context has armedAction && context.armedAction == "Park" &&
-  context has rule && context.rule == "follows_up" &&
+  context has rule && context.rule == "Direction:Lapse:follows_up" &&
   context has causeAction && context.causeAction == "Lapse" &&
   context has causeEntityType && context.causeEntityType == "Direction" &&
   context has depth && context.depth == 1
@@ -167,7 +167,7 @@ unless {
 forbid(principal, action == Action::"Land", resource)
 unless {
   context has via && context.via == "reaction" &&
-  context has rule && context.rule == "lands" &&
+  context has rule && context.rule == "Direction:AutoGo:lands" &&
   context has causeAction && context.causeAction == "AutoGo" &&
   context has causeEntityType && context.causeEntityType == "Direction" &&
   context has causeEntityId && context.causeEntityId == "d3" &&
@@ -345,7 +345,7 @@ async fn a_hooks_move_sets_off_its_reaction_under_a_request_only_forbid() {
         "the hook still acts for its owner: {go:?}"
     );
     assert_eq!(go["source"], "trigger", "{go:?}");
-    assert_eq!(go["cause"]["rule"], "goes", "{go:?}");
+    assert_eq!(go["cause"]["rule"], "Direction:FindFix:goes", "{go:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -403,7 +403,7 @@ async fn a_timer_armed_by_the_hook_fires_and_its_reaction_runs_as_a_timer_reacti
     let follow = event(&events, "FollowUp");
     assert_eq!(follow["made_by"]["id"], "hook-1", "{follow:?}");
     let cause = &follow["cause"];
-    assert_eq!(cause["rule"], "follows_up", "{follow:?}");
+    assert_eq!(cause["rule"], "Direction:Lapse:follows_up", "{follow:?}");
     assert_eq!(cause["action"], "Lapse", "{follow:?}");
     assert_eq!(cause["entity_type"], "Direction", "{follow:?}");
     assert_eq!(cause["entity_id"], "t1", "{follow:?}");
@@ -439,7 +439,7 @@ async fn a_two_hop_chain_records_each_hops_cause_and_depth() {
 
     let directions = history(&state, "Directions", "d3").await;
     let go = &event(&directions, "AutoGo")["cause"];
-    assert_eq!(go["rule"], "goes", "{go:?}");
+    assert_eq!(go["rule"], "Direction:FindFix:goes", "{go:?}");
     assert_eq!(go["action"], "FindFix", "{go:?}");
     assert_eq!(go["entity_type"], "Direction", "{go:?}");
     assert_eq!(go["entity_id"], "d3", "{go:?}");
@@ -448,7 +448,7 @@ async fn a_two_hop_chain_records_each_hops_cause_and_depth() {
 
     let steps = history(&state, "Steps", "d3").await;
     let land = &event(&steps, "Land")["cause"];
-    assert_eq!(land["rule"], "lands", "{land:?}");
+    assert_eq!(land["rule"], "Direction:AutoGo:lands", "{land:?}");
     assert_eq!(land["action"], "AutoGo", "{land:?}");
     assert_eq!(land["entity_type"], "Direction", "{land:?}");
     assert_eq!(land["entity_id"], "d3", "{land:?}");

@@ -10,7 +10,7 @@
 //! |--------------------|--------|--------------------------------------------|
 //! | `via`              | String | every check: `"request"`, `"reaction"` or `"timer"` |
 //! | `depth`            | Long   | every check: 0 for a request or a timer's fire, +1 per reaction hop |
-//! | `rule`             | String | a reaction: the rule's name                |
+//! | `rule`             | String | a reaction: the kernel's name for its rule, `"<Type>:<Action>:<trigger>"` for a spec's `[[action.triggers]]` |
 //! | `causeAction`      | String | a reaction: the move that set it off       |
 //! | `causeEntityType`  | String | a reaction: that move's entity type        |
 //! | `causeEntityId`    | String | a reaction: that move's entity id          |
@@ -55,7 +55,8 @@ pub struct MoveCause {
 /// The rule that made a reaction and the move that set it off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionHop {
-    /// The reaction rule's name.
+    /// The kernel's name for the reaction rule: `"<Type>:<Action>:<trigger>"`
+    /// for a trigger a spec declares on `<Type>.<Action>`.
     pub rule: String,
     /// The move that set the reaction off.
     pub action: String,
