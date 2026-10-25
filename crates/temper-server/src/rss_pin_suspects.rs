@@ -40,6 +40,7 @@ fn customer() -> SecurityContext {
         },
         context_attrs: HashMap::new(), // determinism-ok: SecurityContext field type
         correlation_id: "rss-pin".to_string(),
+        token: None,
     }
 }
 
