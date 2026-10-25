@@ -11,6 +11,8 @@ use crate::PostgresEventStore;
 pub type PostgresSecretRow = (String, Vec<u8>, Vec<u8>);
 /// A secret's name and the version id of its latest write: `(key_name, version_id)`.
 pub type PostgresSecretVersionRow = (String, Option<String>);
+/// One secret's sealed value: `(ciphertext, nonce)`.
+pub type SealedSecret = (Vec<u8>, Vec<u8>);
 
 impl PostgresEventStore {
     /// Write an encrypted secret if the key's current row meets
@@ -82,6 +84,29 @@ impl PostgresEventStore {
                 .execute(self.pool())
                 .await
             }
+            // A write that commits between the caller's read and this update
+            // holds the row lock first; this update then re-reads the row,
+            // finds the new ciphertext and nonce, and matches nothing.
+            SecretPrecondition::Unchanged {
+                ciphertext: read_ciphertext,
+                nonce: read_nonce,
+            } => {
+                crate::dbm::postgres_query!(
+                    &self.schema,
+                    "UPDATE {schema}tenant_secrets SET \
+                         ciphertext = $3, nonce = $4, version_id = $5, updated_at = now() \
+                     WHERE tenant = $1 AND key_name = $2 AND ciphertext = $6 AND nonce = $7",
+                )
+                .bind(tenant)
+                .bind(key_name)
+                .bind(ciphertext)
+                .bind(nonce)
+                .bind(version_id)
+                .bind(read_ciphertext)
+                .bind(read_nonce)
+                .execute(self.pool())
+                .await
+            }
         }
         .map_err(storage_error)?;
         debug_assert!(
@@ -89,6 +114,25 @@ impl PostgresEventStore {
             "one (tenant, key_name) row at most"
         );
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Read one secret's sealed value: `(ciphertext, nonce)`, or `None` when
+    /// the key has no row.
+    pub async fn read_secret(
+        &self,
+        tenant: &str,
+        key_name: &str,
+    ) -> Result<Option<SealedSecret>, PersistenceError> {
+        crate::dbm::postgres_query_as!(
+            &self.schema,
+            "SELECT ciphertext, nonce FROM {schema}tenant_secrets \
+             WHERE tenant = $1 AND key_name = $2"
+        )
+        .bind(tenant)
+        .bind(key_name)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(storage_error)
     }
 
     pub async fn delete_secret(

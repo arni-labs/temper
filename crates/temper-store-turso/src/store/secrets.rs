@@ -20,6 +20,8 @@ pub type SecretRow = (String, Vec<u8>, Vec<u8>);
 /// release's startup backfill; such a row matches no `If-Match` until it is
 /// written again.
 pub type SecretVersionRow = (String, Option<String>);
+/// One secret's sealed value: `(ciphertext, nonce)`.
+pub type SealedSecret = (Vec<u8>, Vec<u8>);
 use crate::metrics::TursoQueryTimer;
 
 impl TursoEventStore {
@@ -75,10 +77,55 @@ impl TursoEventStore {
                 )
                 .await
             }
+            SecretPrecondition::Unchanged {
+                ciphertext: read_ciphertext,
+                nonce: read_nonce,
+            } => {
+                conn.execute(
+                    "UPDATE tenant_secrets SET \
+                         ciphertext = ?3, nonce = ?4, version_id = ?5, updated_at = datetime('now') \
+                     WHERE tenant = ?1 AND key_name = ?2 AND ciphertext = ?6 AND nonce = ?7",
+                    params![
+                        tenant,
+                        key_name,
+                        ciphertext,
+                        nonce,
+                        version_id,
+                        read_ciphertext,
+                        read_nonce
+                    ],
+                )
+                .await
+            }
         }
         .map_err(storage_error)?;
         debug_assert!(rows_affected <= 1, "one (tenant, key_name) row at most");
         Ok(rows_affected == 1)
+    }
+
+    /// Read one secret's sealed value: `(ciphertext, nonce)`, or `None` when
+    /// the key has no row.
+    #[instrument(skip_all, fields(tenant, key_name, otel.name = "turso.read_secret"))]
+    pub async fn read_secret(
+        &self,
+        tenant: &str,
+        key_name: &str,
+    ) -> Result<Option<SealedSecret>, PersistenceError> {
+        let _query_timer = TursoQueryTimer::start("turso.read_secret");
+        let conn = self.configured_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT ciphertext, nonce FROM tenant_secrets WHERE tenant = ?1 AND key_name = ?2",
+                params![tenant, key_name],
+            )
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(None);
+        };
+        let ciphertext: Vec<u8> = row.get(0).map_err(storage_error)?;
+        let nonce: Vec<u8> = row.get(1).map_err(storage_error)?;
+        Ok(Some((ciphertext, nonce)))
     }
 
     /// Delete a secret by `(tenant, key_name)`.

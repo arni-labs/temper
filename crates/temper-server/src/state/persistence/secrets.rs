@@ -68,6 +68,70 @@ impl ServerState {
         })
     }
 
+    /// Replace a stored secret only while SHA-256 of its stored value equals
+    /// `expected_sha256`.
+    ///
+    /// Reads the row, decrypts it, compares the hash in constant time, then
+    /// writes only if the row still holds the ciphertext and nonce it read
+    /// ([`SecretPrecondition::Unchanged`]), so a write that lands between the
+    /// read and the update wins and this one fails. The hash is computed here
+    /// and dropped; nothing derived from the value is stored or logged.
+    pub async fn replace_secret_if_value(
+        &self,
+        tenant: &str,
+        key_name: &str,
+        expected_sha256: &[u8; 32],
+        ciphertext: &[u8],
+        nonce: &[u8],
+    ) -> Result<SecretWriteOutcome, String> {
+        use sha2::Digest as _;
+        use subtle::ConstantTimeEq as _;
+
+        let Some(vault) = self.secrets_vault.as_ref() else {
+            return Err("secrets vault not configured".into());
+        };
+        let read = match self.tenant_metadata_backend(tenant).await {
+            None => {
+                return Err(
+                    "conditional secret writes are not supported without a metadata store".into(),
+                );
+            }
+            Some(TenantMetadataBackend::Postgres(store)) => store
+                .read_secret(tenant, key_name)
+                .await
+                .map_err(|e| format!("failed to read secret {tenant}/{key_name}: {e}"))?,
+            Some(TenantMetadataBackend::Turso(turso)) => turso
+                .read_secret(tenant, key_name)
+                .await
+                .map_err(|e| format!("failed to read secret {tenant}/{key_name} in turso: {e}"))?,
+            Some(TenantMetadataBackend::Redis) => {
+                return Err(Self::redis_ephemeral_error("Secret persistence"));
+            }
+        };
+        let Some((stored_ciphertext, stored_nonce)) = read else {
+            return Ok(SecretWriteOutcome::PreconditionFailed);
+        };
+        let plaintext = vault
+            .decrypt(&stored_ciphertext, &stored_nonce)
+            .map_err(|e| format!("failed to decrypt secret {tenant}/{key_name}: {e}"))?;
+        let stored_sha256: [u8; 32] = sha2::Sha256::digest(&plaintext).into();
+        drop(plaintext);
+        if !bool::from(stored_sha256.ct_eq(expected_sha256)) {
+            return Ok(SecretWriteOutcome::PreconditionFailed);
+        }
+        self.write_secret(
+            tenant,
+            key_name,
+            ciphertext,
+            nonce,
+            SecretPrecondition::Unchanged {
+                ciphertext: &stored_ciphertext,
+                nonce: &stored_nonce,
+            },
+        )
+        .await
+    }
+
     /// Delete a secret from the persistence backend.
     pub async fn delete_secret(&self, tenant: &str, key_name: &str) -> Result<bool, String> {
         match self.tenant_metadata_backend(tenant).await {

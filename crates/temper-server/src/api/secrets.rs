@@ -30,6 +30,35 @@ impl SecretAuthed {
     }
 }
 
+/// Require Cedar to permit `action` on `Secret::"<resource_id>"` in the
+/// caller's tenant.
+fn authorize_secret(
+    state: &ServerState,
+    authenticated: &AuthenticatedRequestContext,
+    action: &str,
+    resource_id: &str,
+) -> Result<(), StatusCode> {
+    require_resource_authorization(
+        state,
+        authenticated,
+        ResourceAuthorization {
+            action,
+            resource_type: "Secret",
+            resource_id,
+            resource_attrs: BTreeMap::from([
+                (
+                    "tenant".to_string(),
+                    serde_json::Value::String(authenticated.tenant().as_str().to_string()),
+                ),
+                (
+                    "key_name".to_string(),
+                    serde_json::Value::String(resource_id.to_string()),
+                ),
+            ]),
+        },
+    )
+}
+
 impl FromRequestParts<ServerState> for SecretAuthed {
     type Rejection = axum::response::Response;
 
@@ -51,26 +80,8 @@ impl FromRequestParts<ServerState> for SecretAuthed {
             .get("key_name")
             .map(String::as_str)
             .unwrap_or(SECRET_COLLECTION_RESOURCE_ID);
-        require_resource_authorization(
-            state,
-            authenticated,
-            ResourceAuthorization {
-                action: "manage_secrets",
-                resource_type: "Secret",
-                resource_id,
-                resource_attrs: BTreeMap::from([
-                    (
-                        "tenant".to_string(),
-                        serde_json::Value::String(tenant.clone()),
-                    ),
-                    (
-                        "key_name".to_string(),
-                        serde_json::Value::String(resource_id.to_string()),
-                    ),
-                ]),
-            },
-        )
-        .map_err(IntoResponse::into_response)?;
+        authorize_secret(state, authenticated, "manage_secrets", resource_id)
+            .map_err(IntoResponse::into_response)?;
         Ok(Self(authenticated.clone()))
     }
 }
@@ -92,14 +103,6 @@ fn is_backend_not_supported_error(err: &str) -> bool {
 /// a rejected condition, which would turn the request into an unconditional
 /// overwrite.
 fn write_precondition(headers: &HeaderMap) -> Result<SecretPrecondition<'_>, &'static str> {
-    fn single(headers: &HeaderMap, name: header::HeaderName) -> Result<Option<&str>, ()> {
-        let mut values = headers.get_all(name).iter();
-        match (values.next(), values.next()) {
-            (None, _) => Ok(None),
-            (Some(value), None) => value.to_str().map(|v| Some(v.trim())).map_err(|_| ()),
-            (Some(_), Some(_)) => Err(()),
-        }
-    }
     let if_none_match = single(headers, header::IF_NONE_MATCH)
         .map_err(|()| "If-None-Match must be one header holding *")?;
     let if_match = single(headers, header::IF_MATCH)
@@ -118,6 +121,69 @@ fn write_precondition(headers: &HeaderMap) -> Result<SecretPrecondition<'_>, &'s
     }
 }
 
+/// The one value of header `name`, trimmed: `Ok(None)` when absent, `Err`
+/// when repeated or not visible ASCII.
+fn single(headers: &HeaderMap, name: header::HeaderName) -> Result<Option<&str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    match (values.next(), values.next()) {
+        (None, _) => Ok(None),
+        (Some(value), None) => value.to_str().map(|v| Some(v.trim())).map_err(|_| ()),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
+/// `If-Value-Sha256: <64 hex digits>`: replace the key only while SHA-256 of
+/// its stored value is this. For a caller that knows the value it was given
+/// but not the key's etag. It is a header of its own, not an `If-Match` form,
+/// because etags are listed and must never come from the value.
+const IF_VALUE_SHA256: header::HeaderName = header::HeaderName::from_static("if-value-sha256");
+
+/// What a PUT asks of the key before it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutCondition<'a> {
+    /// A condition the store checks in its write statement.
+    Store(SecretPrecondition<'a>),
+    /// `If-Value-Sha256`: the stored value's SHA-256 must be this.
+    ValueSha256([u8; 32]),
+}
+
+impl PutCondition<'_> {
+    fn is_conditional(&self) -> bool {
+        *self != Self::Store(SecretPrecondition::Any)
+    }
+}
+
+/// Read a PUT's condition headers. `If-Value-Sha256` stands alone: combined
+/// with `If-Match` or `If-None-Match` it is refused, since the two conditions
+/// could disagree and neither may be silently dropped.
+fn put_condition(headers: &HeaderMap) -> Result<PutCondition<'_>, &'static str> {
+    let value_sha256 = single(headers, IF_VALUE_SHA256)
+        .map_err(|()| "If-Value-Sha256 must be one header holding 64 hex digits")?;
+    let store = write_precondition(headers)?;
+    match (value_sha256, store) {
+        (None, store) => Ok(PutCondition::Store(store)),
+        (Some(_), SecretPrecondition::Any) => value_sha256
+            .and_then(parse_sha256_hex)
+            .map(PutCondition::ValueSha256)
+            .ok_or("If-Value-Sha256 takes 64 hex digits"),
+        (Some(_), _) => Err("Send If-Value-Sha256 alone, without If-Match or If-None-Match"),
+    }
+}
+
+/// 64 hex digits, either case, as 32 bytes.
+fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// The `ETag` header value for a secret's version id.
 fn etag(version_id: &str) -> String {
     format!("\"{version_id}\"")
@@ -127,7 +193,9 @@ fn etag(version_id: &str) -> String {
 ///
 /// Answers 204 with the new `ETag`. With `If-None-Match: *` the write happens
 /// only if the key does not exist, and with `If-Match: "<etag>"` only if the
-/// key's current etag is that one; otherwise 412, which carries no etag.
+/// key's current etag is that one; with `If-Value-Sha256: <hex>` only if the
+/// key exists and SHA-256 of its stored value is that one. Otherwise 412,
+/// which carries no etag.
 #[instrument(skip_all, fields(tenant, key_name, otel.name = "PUT /api/tenants/{tenant}/secrets/{key_name}"))]
 pub(super) async fn handle_put_secret(
     State(state): State<ServerState>,
@@ -137,13 +205,21 @@ pub(super) async fn handle_put_secret(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let tenant = auth.tenant().as_str();
-    let precondition = match write_precondition(&headers) {
-        Ok(precondition) => precondition,
+    let condition = match put_condition(&headers) {
+        Ok(condition) => condition,
         Err(message) => {
             tracing::warn!(reason = message, "unsupported secret write condition");
             return (StatusCode::BAD_REQUEST, message).into_response();
         }
     };
+    // A value condition also needs permission to read the secret. Without
+    // it, the difference between 204 and 412 would let a caller who may write
+    // but not read test guesses against the stored value.
+    if matches!(condition, PutCondition::ValueSha256(_))
+        && let Err(denied) = authorize_secret(&state, &auth.0, "access_secret", &key_name)
+    {
+        return denied.into_response();
+    }
     let Some(vault) = state.secrets_vault.as_ref() else {
         tracing::warn!("secrets vault not configured");
         return (
@@ -200,26 +276,34 @@ pub(super) async fn handle_put_secret(
 
     // Persist the encrypted secret; the store checks the condition in the
     // same statement that writes.
-    let version_id = match state
-        .write_secret(tenant, &key_name, &ciphertext, &nonce, precondition)
-        .await
-    {
+    let outcome = match condition {
+        PutCondition::Store(precondition) => {
+            state
+                .write_secret(tenant, &key_name, &ciphertext, &nonce, precondition)
+                .await
+        }
+        PutCondition::ValueSha256(expected) => {
+            state
+                .replace_secret_if_value(tenant, &key_name, &expected, &ciphertext, &nonce)
+                .await
+        }
+    };
+    let version_id = match outcome {
         Ok(SecretWriteOutcome::Written { version_id }) => version_id,
         Ok(SecretWriteOutcome::PreconditionFailed) => {
             tracing::info!("secret write precondition failed");
             return (
                 StatusCode::PRECONDITION_FAILED,
-                "The secret does not meet the If-None-Match or If-Match condition",
+                "The secret does not meet the request's condition",
             )
                 .into_response();
         }
         Err(e) => {
-            let status =
-                if precondition != SecretPrecondition::Any && is_backend_not_supported_error(&e) {
-                    StatusCode::NOT_IMPLEMENTED
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
+            let status = if condition.is_conditional() && is_backend_not_supported_error(&e) {
+                StatusCode::NOT_IMPLEMENTED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
             tracing::error!(error = %e, "secret persistence failed");
             return (status, format!("Persistence failed: {e}")).into_response();
         }

@@ -69,6 +69,8 @@ sha1 = "0.10"
 base64 = "0.22"
 lru = { workspace = true }
 sha2 = { workspace = true }
+# Constant-time comparison of a value hash a PUT condition names.
+subtle = "2.6"
 hmac = "0.12"
 libc = { workspace = true }
 tempfile = "3"
