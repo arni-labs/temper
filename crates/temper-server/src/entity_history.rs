@@ -97,6 +97,7 @@ impl HistoryReadError {
 /// the last page. Journal entries that are not transitions of this entity
 /// (a composite parent's audit record) advance the cursor without appearing,
 /// so a page can hold fewer than `limit` events and still have a `next`.
+/// An undecodable transition fails the page rather than advancing past missing history.
 ///
 /// The caller must already have authorized the read.
 #[instrument(skip_all, fields(
@@ -131,10 +132,12 @@ pub(crate) async fn read_history_page(
     } else {
         None
     };
-    let events: Vec<serde_json::Value> = envelopes
-        .iter()
-        .filter_map(|envelope| history_event(&persistence_id, envelope))
-        .collect();
+    let mut events = Vec::with_capacity(envelopes.len());
+    for envelope in &envelopes {
+        if let Some(event) = history_event(&persistence_id, envelope)? {
+            events.push(event);
+        }
+    }
 
     let span = tracing::Span::current();
     span.record("history.returned", events.len());
@@ -152,24 +155,18 @@ pub(crate) async fn read_history_page(
 fn history_event(
     persistence_id: &str,
     envelope: &PersistenceEnvelope,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, HistoryReadError> {
     if envelope.event_type == COMPOSITE_EVENT_TYPE {
-        return None;
+        return Ok(None);
     }
-    let event = match serde_json::from_value::<EntityEvent>(envelope.payload.clone()) {
-        Ok(event) => event,
-        Err(error) => {
-            tracing::warn!(
-                persistence_id,
-                sequence = envelope.sequence_nr,
-                event_type = %envelope.event_type,
-                error = %error,
-                "journal entry is not a readable transition; left out of history"
-            );
-            return None;
-        }
-    };
-    Some(serde_json::json!({
+    let event =
+        serde_json::from_value::<EntityEvent>(envelope.payload.clone()).map_err(|error| {
+            HistoryReadError::Storage(PersistenceError::Serialization(format!(
+                "{persistence_id} sequence {} ({}): {error}",
+                envelope.sequence_nr, envelope.event_type
+            )))
+        })?;
+    Ok(Some(serde_json::json!({
         "sequence": envelope.sequence_nr,
         "action": event.action,
         "from_state": event.from_status,
@@ -179,5 +176,5 @@ fn history_event(
         // Null on events written before the kernel recorded them.
         "made_by": event.made_by,
         "source": event.source,
-    }))
+    })))
 }

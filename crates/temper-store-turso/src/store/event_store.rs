@@ -1308,6 +1308,10 @@ impl TursoEventStore {
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        // Stored sequences are signed BIGINTs; a larger cursor is past the tail.
+        let Ok(from_sequence) = i64::try_from(from_sequence) else {
+            return Ok(Vec::new());
+        };
         let conn = self.configured_connection().await?;
 
         const SELECT_TAIL: &str = "SELECT sequence_nr, event_type, payload, metadata
@@ -1318,7 +1322,7 @@ impl TursoEventStore {
             None => {
                 conn.query(
                     SELECT_TAIL,
-                    params![tenant, entity_type, entity_id, from_sequence as i64],
+                    params![tenant, entity_type, entity_id, from_sequence],
                 )
                 .await
             }
@@ -1326,7 +1330,7 @@ impl TursoEventStore {
                 let limit = i64::try_from(limit).unwrap_or(i64::MAX);
                 conn.query(
                     &format!("{SELECT_TAIL} LIMIT ?5"),
-                    params![tenant, entity_type, entity_id, from_sequence as i64, limit],
+                    params![tenant, entity_type, entity_id, from_sequence, limit],
                 )
                 .await
             }

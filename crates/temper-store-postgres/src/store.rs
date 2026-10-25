@@ -874,6 +874,11 @@ impl EventStore for PostgresEventStore {
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
 
+        // Stored sequences are signed BIGINTs; a larger cursor is past the tail.
+        let Ok(after_sequence) = i64::try_from(after_sequence) else {
+            return Ok(Vec::new());
+        };
+
         let rows: Vec<(i64, String, serde_json::Value, serde_json::Value)> =
             crate::dbm::postgres_query_as!(
                 &self.schema,
@@ -886,7 +891,7 @@ impl EventStore for PostgresEventStore {
             .bind(tenant)
             .bind(entity_type)
             .bind(entity_id)
-            .bind(after_sequence as i64)
+            .bind(after_sequence)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .fetch_all(&self.pool)
             .await
@@ -1165,6 +1170,25 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 actor_id: "store-test".to_string(),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn history_page_beyond_signed_sequence_range_is_empty() {
+        // A closed pool ensures these cursors never reach SQL as negative values.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let store = PostgresEventStore::new(pool);
+        for after in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(
+                store
+                    .read_events_page("default:Order:o-1", after, 2)
+                    .await
+                    .expect("cursor past the stored range")
+                    .is_empty()
+            );
         }
     }
 
