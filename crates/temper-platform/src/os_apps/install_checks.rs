@@ -40,8 +40,10 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// install an app can send specs whose joint model never ends: unbounded,
 /// one install would hold a core and gigabytes for hours. These are
 /// validate-ioa's caps for the same attack (its `MAX_BUDGET_MS` and
-/// `BUDGET_STATES`, about 1.1 GB at the state cap). A check that runs out
-/// refuses the install, since the bundle declared a rule nobody proved.
+/// `BUDGET_STATES`). The time cap comes first: a liveness walk of the
+/// Katagami control specs reached 2.2M states in 120 s and held 1.5 GB on a
+/// Mac. A check that runs out refuses the install, since the bundle declared
+/// a rule nobody proved.
 const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
     time: std::time::Duration::from_secs(120),
     states: 10_000_000,
