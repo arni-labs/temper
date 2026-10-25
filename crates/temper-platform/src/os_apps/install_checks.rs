@@ -35,3 +35,81 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
         .map(|_| ())
         .map_err(|e| format!("Failed to parse cross-invariants for os-app '{app_name}': {e}"))
 }
+
+/// Time and states the joint check of one install may spend. Anyone who may
+/// install an app can send specs whose joint model never ends: unbounded,
+/// one install would hold a core and gigabytes for hours. These are
+/// validate-ioa's caps for the same attack (its `MAX_BUDGET_MS` and
+/// `BUDGET_STATES`, about 1.1 GB at the state cap). A check that runs out
+/// refuses the install, since the bundle declared a rule nobody proved.
+const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
+    time: std::time::Duration::from_secs(120),
+    states: 10_000_000,
+};
+
+/// Prove every `[[invariant]]` of `specs` (a bundle's types) that reads a
+/// related entity, on the joint model of its type and the types it names,
+/// and refuse the install if one is not proven. A named type the bundle does
+/// not carry is taken from what the tenant already runs. It runs before the
+/// install writes or swaps anything, so a refused bundle leaves the tenant as
+/// it was and reads keep serving the old specs meanwhile, and on a blocking
+/// thread, since a large joint model takes seconds. A bundle that declares no
+/// such rule costs one walk over its invariants.
+pub(super) async fn prove_joint_invariants(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    specs: &[(String, String)],
+) -> Result<(), String> {
+    let mut automatons = std::collections::BTreeMap::new();
+    for (entity_type, ioa_source) in specs {
+        let automaton = temper_spec::automaton::parse_automaton(ioa_source)
+            .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
+        automatons.insert(entity_type.clone(), automaton);
+    }
+    let named: std::collections::BTreeSet<String> = automatons
+        .values()
+        .flat_map(|a| &a.invariants)
+        .flat_map(|inv| inv.assert.related_types())
+        .map(|(entity_type, _)| entity_type)
+        .collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    {
+        let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+        for entity_type in &named {
+            if !automatons.contains_key(entity_type)
+                && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
+            {
+                automatons.insert(entity_type.clone(), spec.automaton.clone());
+            }
+        }
+    }
+    let results = tokio::task::spawn_blocking(move || {
+        let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
+        temper_verify::composite::verify_joint_invariants(&refs, JOINT_INSTALL_BUDGET)
+    })
+    .await
+    .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
+    for result in results.iter().filter(|result| result.holds()) {
+        tracing::info!(tenant, app = %app_name, "{result}");
+    }
+    let unproven: Vec<String> = results
+        .iter()
+        .filter(|result| !result.holds())
+        .map(ToString::to_string)
+        .collect();
+    if unproven.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "os-app '{app_name}' declares rules over several entities that are not proven:\n{}",
+            unproven.join("\n")
+        ))
+    }
+}
