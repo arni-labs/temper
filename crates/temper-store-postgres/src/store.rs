@@ -898,18 +898,50 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        rows.into_iter()
-            .map(|(seq, event_type, payload, meta_json)| {
-                let metadata: EventMetadata = serde_json::from_value(meta_json)
-                    .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-                Ok(PersistenceEnvelope {
-                    sequence_nr: seq as u64,
-                    event_type,
-                    payload,
-                    metadata,
-                })
-            })
-            .collect()
+        rows.into_iter().map(envelope_from_row).collect()
+    }
+
+    /// Read the newest `limit` events below `before_sequence`, ascending.
+    ///
+    /// Reads newest first along the `(tenant, entity_type, entity_id,
+    /// sequence_nr)` key, so only the page's rows are read.
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        // Both bounds saturate: a sequence or a row count above i64::MAX is
+        // past every stored row, so it means "no bound".
+        let before = before_sequence.map_or(i64::MAX, |s| i64::try_from(s).unwrap_or(i64::MAX));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let rows: Vec<(i64, String, serde_json::Value, serde_json::Value)> =
+            crate::dbm::postgres_query_as!(
+                &self.schema,
+                "SELECT sequence_nr, event_type, payload, metadata \
+             FROM {schema}events \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND sequence_nr < $4 \
+             ORDER BY sequence_nr DESC \
+             LIMIT $5",
+            )
+            .bind(tenant)
+            .bind(entity_type)
+            .bind(entity_id)
+            .bind(before)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+
+        let mut page = rows
+            .into_iter()
+            .map(envelope_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        page.reverse();
+        Ok(page)
     }
 
     /// Save (upsert) a snapshot for the given entity.
@@ -1136,6 +1168,20 @@ impl EventStore for PostgresEventStore {
 
         Ok(rows)
     }
+}
+
+/// Decode one `SELECT sequence_nr, event_type, payload, metadata` row.
+fn envelope_from_row(
+    (seq, event_type, payload, meta_json): (i64, String, serde_json::Value, serde_json::Value),
+) -> Result<PersistenceEnvelope, PersistenceError> {
+    let metadata: EventMetadata = serde_json::from_value(meta_json)
+        .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+    Ok(PersistenceEnvelope {
+        sequence_nr: seq as u64,
+        event_type,
+        payload,
+        metadata,
+    })
 }
 
 // ---------------------------------------------------------------------------

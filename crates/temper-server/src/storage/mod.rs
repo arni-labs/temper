@@ -86,6 +86,13 @@ pub trait DynEventStore: Send + Sync {
         from_sequence: u64,
     ) -> EventStoreFuture<'a, Result<Vec<PersistenceEnvelope>, PersistenceError>>;
 
+    fn read_events_page<'a>(
+        &'a self,
+        persistence_id: &'a str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> EventStoreFuture<'a, Result<Vec<PersistenceEnvelope>, PersistenceError>>;
+
     fn append_with_keys<'a>(
         &'a self,
         persistence_id: &'a str,
@@ -252,6 +259,20 @@ where
         from_sequence: u64,
     ) -> EventStoreFuture<'a, Result<Vec<PersistenceEnvelope>, PersistenceError>> {
         Box::pin(EventStore::read_events(self, persistence_id, from_sequence))
+    }
+
+    fn read_events_page<'a>(
+        &'a self,
+        persistence_id: &'a str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> EventStoreFuture<'a, Result<Vec<PersistenceEnvelope>, PersistenceError>> {
+        Box::pin(EventStore::read_events_page(
+            self,
+            persistence_id,
+            before_sequence,
+            limit,
+        ))
     }
 
     fn append_with_keys<'a>(
@@ -565,6 +586,19 @@ impl BoxedEventStore {
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
         self.store.read_events(persistence_id, from_sequence).await
+    }
+
+    /// The newest `limit` events below `before_sequence`, ascending
+    /// ([`EventStore::read_events_page`]).
+    pub async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        self.store
+            .read_events_page(persistence_id, before_sequence, limit)
+            .await
     }
 
     pub async fn append_with_keys(

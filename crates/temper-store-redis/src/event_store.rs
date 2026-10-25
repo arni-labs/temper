@@ -350,14 +350,39 @@ impl EventStore for RedisEventStore {
             .await
             .map_err(storage_error)?;
 
-        let mut out = Vec::with_capacity(encoded_events.len());
-        for encoded in encoded_events {
-            let env: PersistenceEnvelope = serde_json::from_str(&encoded)
-                .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-            out.push(env);
-        }
-        out.sort_by_key(|e| e.sequence_nr);
-        Ok(out)
+        decode_envelopes(encoded_events)
+    }
+
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let events_key = Self::events_key(tenant, entity_type, entity_id);
+
+        // The event at list index i has sequence_nr = i + 1, so a page is one
+        // index range ending just below `before_sequence`. Redis clamps a range
+        // that runs past either end of the list.
+        let span = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (start, stop) = match before_sequence {
+            _ if span == 0 => return Ok(Vec::new()),
+            None => (-span, -1),
+            Some(before) if before <= 1 => return Ok(Vec::new()),
+            Some(before) => {
+                let stop = i64::try_from(before - 2).unwrap_or(i64::MAX);
+                (stop.saturating_sub(span - 1).max(0), stop)
+            }
+        };
+        let encoded_events: Vec<String> = self
+            .client
+            .lrange(&events_key, start, stop)
+            .await
+            .map_err(storage_error)?;
+
+        decode_envelopes(encoded_events)
     }
 
     async fn save_snapshot(
@@ -523,6 +548,20 @@ impl EventStore for RedisEventStore {
     }
 }
 
+/// Decode journal list entries into envelopes in ascending sequence order.
+fn decode_envelopes(
+    encoded_events: Vec<String>,
+) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+    let mut out = Vec::with_capacity(encoded_events.len());
+    for encoded in encoded_events {
+        let env: PersistenceEnvelope = serde_json::from_str(&encoded)
+            .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+        out.push(env);
+    }
+    out.sort_by_key(|e| e.sequence_nr);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +635,37 @@ mod tests {
         assert_eq!(partial.len(), 1);
         assert_eq!(partial[0].sequence_nr, 2);
         assert_eq!(partial[0].event_type, "OrderApproved");
+    }
+
+    #[tokio::test]
+    async fn read_events_page_reads_newest_first_windows() {
+        // Runs only where REDIS_URL names a Redis server.
+        let Some(store) = make_store().await else {
+            return;
+        };
+        let pid = unique_persistence_id();
+        assert!(
+            store
+                .read_events_page(&pid, None, 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let events: Vec<_> = (0..7)
+            .map(|i| test_envelope("Moved", serde_json::json!({ "i": i })))
+            .collect();
+        store.append(&pid, 0, &events).await.unwrap();
+
+        let page = async |before: Option<u64>, limit: usize| -> Vec<u64> {
+            let page = store.read_events_page(&pid, before, limit).await.unwrap();
+            page.iter().map(|e| e.sequence_nr).collect()
+        };
+        assert_eq!(page(None, 3).await, [5, 6, 7]);
+        assert_eq!(page(Some(5), 3).await, [2, 3, 4]);
+        assert_eq!(page(Some(2), 3).await, [1]);
+        assert!(page(Some(1), 3).await.is_empty());
+        assert_eq!(page(None, 100).await, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(page(Some(100), 2).await, [6, 7]);
     }
 
     #[tokio::test]

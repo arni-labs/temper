@@ -54,6 +54,30 @@ impl EventStore for StaticEventStore {
             .collect())
     }
 
+    async fn read_events_page(
+        &self,
+        _persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PersistenceError::Storage("injected journal outage".into()));
+        }
+        if let Some(error) = &self.read_error {
+            return Err(PersistenceError::Storage(error.clone()));
+        }
+        let mut page: Vec<_> = self
+            .events
+            .iter()
+            .rev()
+            .filter(|event| before_sequence.is_none_or(|before| event.sequence_nr < before))
+            .take(limit)
+            .cloned()
+            .collect();
+        page.reverse();
+        Ok(page)
+    }
+
     async fn save_snapshot(
         &self,
         _persistence_id: &str,

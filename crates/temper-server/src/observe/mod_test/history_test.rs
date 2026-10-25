@@ -298,6 +298,19 @@ impl EventStore for RowCountingStore {
         Ok(self.counted(rows))
     }
 
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let rows = self
+            .inner
+            .read_events_page(persistence_id, before_sequence, limit)
+            .await?;
+        Ok(self.counted(rows))
+    }
+
     async fn save_snapshot(
         &self,
         persistence_id: &str,

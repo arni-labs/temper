@@ -1,4 +1,4 @@
-//! Entity instance endpoints: list, history, wait, and SSE event stream.
+//! Entity instance endpoints: list, wait, and SSE event stream.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -9,14 +9,13 @@ use axum::response::Json;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::Deserialize;
 use temper_authz::AuthenticatedRequestContext;
-use temper_runtime::persistence::PersistenceEnvelope;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::instrument;
 
 use crate::authz::{observe_tenant_scope, require_authenticated_context, require_observe_auth};
 use crate::blobs::hydrate_blob_refs_for_tenant;
-use crate::entity_actor::{EntityEvent, EntityMsg, EntityResponse, EntityState};
+use crate::entity_actor::EntityResponse;
 use crate::state::ServerState;
 
 use super::{EntityInstanceSummary, EventStreamParams};
@@ -67,138 +66,6 @@ pub(crate) async fn handle_list_entities(
     Ok(Json(
         serde_json::json!({ "entities": entities, "total": total }),
     ))
-}
-
-/// GET /observe/entities/{entity_type}/{entity_id}/history -- entity event history.
-///
-/// `events` is the record's whole trail from sequence 1, each event at its
-/// stored sequence number. With an event journal it is always read from the
-/// journal, whether or not the actor is loaded: a loaded actor holds only a
-/// bounded tail of its events. A journal read failure answers 503 rather than
-/// a partial trail. Only a server without a journal answers `events` from the
-/// loaded actor's memory.
-///
-/// When the actor is loaded the response also carries its live
-/// `current_state`, `fields`, `counters`, `booleans` and `lists`.
-pub(crate) async fn handle_get_entity_history(
-    State(state): State<ServerState>,
-    authenticated: Option<Extension<AuthenticatedRequestContext>>,
-    Path((entity_type, entity_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let authenticated = require_authenticated_context(authenticated.as_deref())?;
-    require_observe_auth(&state, authenticated, "read", &entity_type)?;
-    let tenant = authenticated.tenant().clone();
-    let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-
-    // Live state first: the journal is written before memory changes, so a
-    // journal read that follows holds at least every event the state reflects.
-    let loaded = loaded_entity_state(&state, &persistence_id).await;
-    let events = match state.event_journal() {
-        Some((store, _backend)) => {
-            let envelopes = store
-                .read_events(&persistence_id, 0)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        persistence_id = %persistence_id,
-                        error = %error,
-                        "entity history journal read failed"
-                    );
-                    StatusCode::SERVICE_UNAVAILABLE
-                })?;
-            journal_history_events(&persistence_id, &envelopes)
-        }
-        None => loaded
-            .as_ref()
-            .map(memory_history_events)
-            .unwrap_or_default(),
-    };
-
-    let mut json = serde_json::json!({
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "events": events,
-    });
-    if let (Some(entity), Some(obj)) = (loaded, json.as_object_mut()) {
-        let mut fields = entity.fields;
-        hydrate_blob_refs_for_tenant(&state, &tenant, &mut fields).await;
-        obj.insert(
-            "current_state".to_string(),
-            serde_json::json!(entity.status),
-        );
-        obj.insert("fields".to_string(), fields);
-        obj.insert("counters".to_string(), serde_json::json!(entity.counters));
-        obj.insert("booleans".to_string(), serde_json::json!(entity.booleans));
-        obj.insert("lists".to_string(), serde_json::json!(entity.lists));
-    }
-    Ok(Json(json))
-}
-
-/// The state of the record's actor if it is loaded. Never loads one.
-async fn loaded_entity_state(state: &ServerState, actor_key: &str) -> Option<EntityState> {
-    let actor_ref = {
-        let registry = state
-            .actor_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        registry.get(actor_key).cloned()
-    }?;
-    actor_ref
-        .ask::<EntityResponse>(EntityMsg::GetState, state.action_dispatch_timeout)
-        .await
-        .ok()
-        .map(|response| response.state)
-}
-
-/// History rows for journal envelopes, at their stored sequence numbers.
-fn journal_history_events(
-    persistence_id: &str,
-    envelopes: &[PersistenceEnvelope],
-) -> Vec<serde_json::Value> {
-    envelopes
-        .iter()
-        .filter_map(|envelope| {
-            match serde_json::from_value::<EntityEvent>(envelope.payload.clone()) {
-                Ok(event) => Some(history_event_json(envelope.sequence_nr, &event)),
-                Err(error) => {
-                    tracing::warn!(
-                        persistence_id,
-                        sequence = envelope.sequence_nr,
-                        error = %error,
-                        "journal event is not an entity event; left out of history"
-                    );
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-/// History rows for the events a loaded actor holds, when there is no
-/// journal. They are the newest events, so they end at the actor's sequence.
-fn memory_history_events(entity: &EntityState) -> Vec<serde_json::Value> {
-    let first = entity
-        .event_sequence()
-        .saturating_sub(entity.events.len() as u64)
-        + 1;
-    entity
-        .events
-        .iter()
-        .zip(first..)
-        .map(|(event, sequence)| history_event_json(sequence, event))
-        .collect()
-}
-
-/// One history row. The only place an event's history JSON is built.
-fn history_event_json(sequence: u64, event: &EntityEvent) -> serde_json::Value {
-    serde_json::json!({
-        "sequence": sequence,
-        "action": event.action,
-        "from_state": event.from_status,
-        "to_state": event.to_status,
-        "timestamp": event.timestamp,
-        "params": event.params,
-    })
 }
 
 #[derive(Debug, Deserialize)]

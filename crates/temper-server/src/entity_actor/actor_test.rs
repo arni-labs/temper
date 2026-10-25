@@ -1183,6 +1183,17 @@ impl temper_runtime::persistence::EventStore for AppendFuseStore {
         self.inner.read_events(persistence_id, from_sequence).await
     }
 
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, temper_runtime::persistence::PersistenceError> {
+        self.inner
+            .read_events_page(persistence_id, before_sequence, limit)
+            .await
+    }
+
     async fn save_snapshot(
         &self,
         persistence_id: &str,
