@@ -88,15 +88,29 @@ async fn causal_submit_reaction_wasm_reads_committed_source_under_projection_lag
     }
 }
 
+/// A move whose projection write fails after its commit, as under Turso write
+/// contention, arms the timer of the state it entered at once and starts its
+/// dependents once, after the projection lands. It used to answer with an
+/// error and leave the record in its new state with no timer and no follow-on
+/// work, waiting for a retry that a timer, a reaction or a caller that gave up
+/// never sends (a Factory release sat in Making that way).
 #[tokio::test]
-async fn causal_projection_failure_preserves_commit_without_starting_dependents() {
-    let (state, query, _queue, _temp) = fixture().await;
-    query.fail_source_write.store(true, Ordering::SeqCst);
-    let mut agent = AgentContext::system();
-    agent.idempotency_key = Some("same-committed-submit".into());
-    let response = state
-        .dispatch_tenant_action_ext(
-            &TenantId::default(),
+async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_once() {
+    for seed in 0..4 {
+        let (_guard, _, _) = install_deterministic_context(seed);
+        let (state, query, _queue, _temp) = fixture_test::fixture_entering_timed_state().await;
+        let tenant = TenantId::default();
+        let verifier_before = state
+            .get_tenant_entity_state(&tenant, "Verifier", "verifier")
+            .await
+            .unwrap()
+            .state
+            .sequence_nr;
+        let mut events = state.event_tx.subscribe();
+        query.fail_source_write.store(true, Ordering::SeqCst);
+        let agent = AgentContext::system();
+        let submit = state.dispatch_tenant_action_ext(
+            &tenant,
             "Source",
             "source",
             "Submit",
@@ -106,81 +120,103 @@ async fn causal_projection_failure_preserves_commit_without_starting_dependents(
                 await_integration: true,
                 await_reactions: true,
             },
-        )
-        .await
-        .unwrap();
-    assert!(!response.success);
-    assert!(response.error.as_deref().unwrap().contains("committed"));
-    let source = state
-        .get_tenant_entity_state(&TenantId::default(), "Source", "source")
-        .await
-        .unwrap();
-    assert_eq!(source.state.fields["prompt_template"], "new");
-    let child = state
-        .get_tenant_entity_state(&TenantId::default(), "Verifier", "verifier")
-        .await
-        .unwrap();
-    assert_eq!(child.state.status, "Idle");
-    let initial_child_sequence = child.state.sequence_nr;
-    let mut events = state.event_tx.subscribe();
-    query.fail_source_write.store(false, Ordering::SeqCst);
-    let recovered = state
-        .dispatch_tenant_action_ext(
-            &TenantId::default(),
-            "Source",
-            "source",
-            "Submit",
-            json!({"prompt_template":"new"}),
-            DispatchExtOptions {
-                agent_ctx: &agent,
-                await_integration: true,
-                await_reactions: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(recovered.success, "{recovered:?}");
-    assert_eq!(
-        recovered.state.sequence_nr, source.state.sequence_nr,
-        "retry must not append another source transition"
-    );
+        );
+        let outage = async {
+            query.source_write_refused.notified().await;
+            let source = state
+                .get_tenant_entity_state(&tenant, "Source", "source")
+                .await
+                .unwrap();
+            assert_eq!(source.state.status, "Making", "seed {seed}: committed");
+            assert!(
+                state.has_armed_state_timer(&tenant, "Source", "source"),
+                "seed {seed}: the Making timer is armed while the projection fails"
+            );
+            // Refused again: the write is tried again, and nothing it starts
+            // runs before the source is visible.
+            query.source_write_refused.notified().await;
+            let verifier = state
+                .get_tenant_entity_state(&tenant, "Verifier", "verifier")
+                .await
+                .unwrap();
+            assert_eq!(
+                verifier.state.sequence_nr, verifier_before,
+                "seed {seed}: a dependent started before the projection landed"
+            );
+            let arms = state
+                .state_timeout_tracker
+                .sequence_for_test(&tenant, "Source", "source");
+            query.fail_source_write.store(false, Ordering::SeqCst);
+            arms
+        };
+        let (response, arms_during_outage) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(submit, outage)
+            })
+            .await
+            .expect("the dispatch finishes once the projection lands");
+        let response = response.unwrap();
+        assert!(response.success, "seed {seed}: {response:?}");
+        assert_eq!(response.state.status, "Making");
+        assert_eq!(
+            state
+                .state_timeout_tracker
+                .sequence_for_test(&tenant, "Source", "source"),
+            arms_during_outage,
+            "seed {seed}: the timer is armed once, so its deadline counts from the commit"
+        );
+
+        // The Verifier's WASM trigger reads the source through OData and
+        // answers SawNew only if it sees the committed change.
+        let mut seen = Vec::new();
+        let verified = until_status(&mut events, &["SawNew", "SawOld"], &mut seen).await;
+        assert_eq!(verified, "SawNew", "seed {seed}");
+
+        // The timer fires at its deadline.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(4500)).await;
+        tokio::time::resume();
+        assert_eq!(
+            until_status(&mut events, &["Lost"], &mut seen).await,
+            "Lost"
+        );
+
+        let verifier = state
+            .get_tenant_entity_state(&tenant, "Verifier", "verifier")
+            .await
+            .unwrap();
+        assert_eq!(verifier.state.status, "SawNew");
+        assert_eq!(
+            verifier.state.sequence_nr,
+            verifier_before + 2,
+            "seed {seed}: one Verify and one SawNew, so the reaction and the WASM trigger ran once"
+        );
+        let making = seen
+            .iter()
+            .filter(|(kind, status)| kind == "Source" && status == "Making")
+            .count();
+        assert_eq!(making, 1, "seed {seed}: one broadcast of the move");
+    }
+}
+
+/// Read state changes until one reaches a status in `statuses`, keeping each
+/// `(entity_type, status)` read in `seen`.
+async fn until_status(
+    events: &mut tokio::sync::broadcast::Receiver<crate::events::EntityStateChange>,
+    statuses: &[&str],
+    seen: &mut Vec<(String, String)>,
+) -> String {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
-            if event.entity_type == "Verifier" && event.status == "SawNew" {
-                break;
+            seen.push((event.entity_type.clone(), event.status.clone()));
+            if statuses.contains(&event.status.as_str()) {
+                break event.status;
             }
         }
     })
     .await
-    .unwrap();
-    let replayed = state
-        .dispatch_tenant_action_ext(
-            &TenantId::default(),
-            "Source",
-            "source",
-            "Submit",
-            json!({"prompt_template":"new"}),
-            DispatchExtOptions {
-                agent_ctx: &agent,
-                await_integration: true,
-                await_reactions: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert!(replayed.success);
-    assert_eq!(replayed.state.sequence_nr, source.state.sequence_nr);
-    let child = state
-        .get_tenant_entity_state(&TenantId::default(), "Verifier", "verifier")
-        .await
-        .unwrap();
-    assert_eq!(child.state.status, "SawNew");
-    assert_eq!(
-        child.state.sequence_nr,
-        initial_child_sequence + 2,
-        "one Verify and one WASM callback only"
-    );
+    .unwrap_or_else(|_| panic!("no state change reached {statuses:?}; saw {seen:?}"))
 }
 
 /// ADR-0148 amendment: an ordinary edit is projected before its response, so a
