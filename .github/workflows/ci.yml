@@ -491,7 +491,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────
   # A rollback boots: a release runs on a Postgres schema a newer release
-  # migrated (crates/temper-store-postgres/migrations/README.md).
+  # migrated (crates/temper-store-postgres/migrations/README.md). Store tests
+  # that need a real database run here too.
   # ─────────────────────────────────────────────────────
   postgres-migrations:
     name: Postgres rollback migrations
@@ -547,6 +548,13 @@ jobs:
         run: >-
           cargo nextest run -p temper-server --features observe,sim
           --test secret_conditional_writes --run-ignored only
+
+      - name: Scheduled-action rows commit with their events
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-store-postgres --run-ignored only
+          -E 'test(scheduled_action_rows_commit_with_their_events)'
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)

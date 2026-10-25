@@ -19,6 +19,7 @@ mod inputs;
 mod policy_approval;
 mod policy_replace;
 mod rows;
+mod scheduled_actions;
 mod secrets;
 mod specs;
 mod state_timers;

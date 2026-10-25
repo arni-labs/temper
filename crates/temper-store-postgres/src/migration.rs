@@ -205,11 +205,11 @@ mod tests {
     fn secret_version_id_exists_on_both_schema_paths() {
         // A conditional secret write compares this column; a store missing it
         // refuses every If-Match and fails every write that names it.
-        let migration = include_str!("../migrations/0020_tenant_secret_version_id.sql");
+        let migration = include_str!("../migrations/0021_tenant_secret_version_id.sql");
         assert!(
             migration
                 .contains("ADD COLUMN IF NOT EXISTS version_id TEXT DEFAULT gen_random_uuid()"),
-            "migration 0020 must add a random version id to every secret row"
+            "migration 0021 must add a random version id to every secret row"
         );
         assert!(
             schema::CREATE_TENANT_SECRETS_TABLE
