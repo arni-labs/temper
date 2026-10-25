@@ -34,10 +34,15 @@ use crate::state::ServerState;
 use crate::state::projection_backfill::transition_table_for;
 
 /// The wait before retrying a type whose records the store failed to list,
-/// or one record it failed to read. It doubles up to [`FOLLOW_RETRY_MAX`], so
-/// a store that stays down, or a journal that never replays, is asked about
-/// once a minute, not in a tight loop.
+/// or one record it failed to read. It doubles up to [`FOLLOW_RETRY_MAX`].
 const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between two tries. The reason for the ceiling is the
+/// store: a store that stays down, or a journal that never replays, gets one
+/// read a minute per type or record, not a tight loop of them. The cost is
+/// time: a record whose read failed only briefly gets its timer within a
+/// minute of the store recovering. The retries never stop, because the walk
+/// cannot tell a passing store error from a journal that will never replay,
+/// and a record with no timer row has nothing else that would arm its timer.
 const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Who armed the timer of a record whose row the boot dropped (its state no
