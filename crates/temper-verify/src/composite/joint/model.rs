@@ -15,11 +15,11 @@ use temper_spec::automaton::{Automaton, TargetResolver};
 use temper_spec::predicate::{Arg, Expr, Name, Truth, eval};
 
 use super::env::{Blind, ID, JointEnv};
+use super::room::Bound;
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
-use crate::Budget;
 use crate::model::semantics::string_values;
 use crate::model::{
     ParamValue, ResolvedTransition, TemperModel, TemperModelState, build_model_tracking,
@@ -413,9 +413,9 @@ impl JointModel {
 
     /// Walk every reachable joint state breadth first, checking `invariants`
     /// of `owner` in each settled one (nothing in flight).
-    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], budget: Budget) -> Walk {
+    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], bound: Bound<'_>) -> Walk {
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
-        let explored = self.walk_with(budget, false, |index, state| {
+        let explored = self.walk_with(bound, false, |index, state| {
             if state.settled() {
                 let env = self.env(owner, state);
                 for (i, inv) in invariants.iter().enumerate() {

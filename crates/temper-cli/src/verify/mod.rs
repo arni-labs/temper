@@ -229,13 +229,16 @@ fn verify_ioa_sources(ioa_sources: &std::collections::BTreeMap<String, String>) 
     Ok(())
 }
 
-/// Time and states the joint check of one entity's cross-entity invariants
-/// may spend: a directory check is run by its author or CI, not on a request
-/// thread, so it gets the most a validate-ioa caller may ask for.
-const JOINT_BUDGET: temper_verify::Budget = temper_verify::Budget {
-    time: std::time::Duration::from_secs(120),
-    states: 10_000_000,
-};
+/// Where a joint check takes its memory: what this host leaves free, as a
+/// server's checks do. Its time is not bounded: a walk that fits finishes.
+fn joint_bound(
+    progress: &temper_verify::composite::Progress,
+) -> temper_verify::composite::Bound<'_> {
+    temper_verify::composite::Bound {
+        room: &temper_server::host_room::HOST_ROOM,
+        progress,
+    }
+}
 
 /// Check every `[[invariant]]` that reads a related entity on the joint
 /// model of its entity and the types it names. A broken invariant fails the
@@ -246,7 +249,9 @@ fn run_joint_verification(
 ) -> Result<()> {
     let automaton_refs: Vec<&temper_spec::automaton::Automaton> =
         parsed_automata.values().collect();
-    let results = temper_verify::composite::verify_joint_invariants(&automaton_refs, JOINT_BUDGET);
+    let progress = temper_verify::composite::Progress::default();
+    let results =
+        temper_verify::composite::verify_joint_invariants(&automaton_refs, joint_bound(&progress));
     let rows = results.iter().map(|result| {
         let tag = match result.outcome {
             temper_verify::composite::JointOutcome::Holds => "PASS",
@@ -279,8 +284,12 @@ fn verify_liveness(
     }
     let analysis = temper_authz::SendAnalysis::new(policy_text).context("invalid Cedar policy")?;
     let refs: Vec<&temper_spec::automaton::Automaton> = parsed.iter().collect();
-    let live =
-        temper_verify::composite::verify_joint_liveness(&refs, Some(&analysis), JOINT_BUDGET);
+    let progress = temper_verify::composite::Progress::default();
+    let live = temper_verify::composite::verify_joint_liveness(
+        &refs,
+        Some(&analysis),
+        joint_bound(&progress),
+    );
     let rows = live.iter().map(|result| {
         let tag = match result.outcome {
             temper_verify::composite::LivenessOutcome::Holds => "PASS",

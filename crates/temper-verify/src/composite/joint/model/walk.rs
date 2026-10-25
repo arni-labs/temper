@@ -1,14 +1,13 @@
 //! The breadth-first walk over joint states.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
 
 use super::super::pack::{Packed, Packer};
+use super::super::room::{Bound, Held, MB, block, map_bytes};
 use super::super::state::render;
 use super::super::{JointState, JointStep};
 use super::JointModel;
 use super::step::Certainty;
-use crate::Budget;
 
 /// One move made from a walked state.
 #[derive(Debug, Clone, Copy)]
@@ -33,8 +32,8 @@ pub(in crate::composite::joint) struct Edge {
     pub(in crate::composite::joint) sure: bool,
 }
 
-/// What a walk saw.
-pub(in crate::composite::joint) struct Explored {
+/// What a walk saw, and the memory it holds for it.
+pub(in crate::composite::joint) struct Explored<'a> {
     /// Each state walked, packed, with the state and move (a name in
     /// `packer`) it was first reached by.
     nodes: Vec<(Packed, Option<(u32, u32)>)>,
@@ -47,9 +46,11 @@ pub(in crate::composite::joint) struct Explored {
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
+    /// The memory its tables hold, given back when it is dropped.
+    pub(in crate::composite::joint) held: Held<'a>,
 }
 
-impl Explored {
+impl Explored<'_> {
     /// How many states the walk saw.
     pub(in crate::composite::joint) fn len(&self) -> usize {
         self.nodes.len()
@@ -91,14 +92,14 @@ impl JointModel {
     /// Walk every reachable joint state breadth first, so each state is
     /// first reached by a shortest path. `visit` sees each state as it is
     /// taken from the queue and returns true to stop the walk. With `edges`,
-    /// every move between walked states is kept.
-    pub(in crate::composite::joint) fn walk_with(
+    /// every move between walked states is kept. The walk takes the memory
+    /// it holds from `bound`'s room and stops when the room says no.
+    pub(in crate::composite::joint) fn walk_with<'a>(
         &self,
-        budget: Budget,
+        bound: Bound<'a>,
         edges: bool,
         mut visit: impl FnMut(usize, &JointState) -> bool,
-    ) -> Explored {
-        let started = Instant::now();
+    ) -> Explored<'a> {
         let mut explored = Explored {
             nodes: Vec::new(),
             packer: Packer::default(),
@@ -106,9 +107,11 @@ impl JointModel {
             edges: Vec::new(),
             stopped: None,
             held_back: false,
+            held: Held::new(bound),
         };
         let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
+        let mut tables = Tables::default();
         for init in self.inits() {
             let packed = explored.packer.pack(&init);
             if !seen.contains_key(&packed) {
@@ -122,15 +125,21 @@ impl JointModel {
             if visit(index, &state) {
                 break;
             }
-            let full = explored.nodes.len() >= budget.states;
-            if full || started.elapsed() >= budget.time {
-                explored.stopped = Some(if full {
-                    format!("the walk reached its {} states", budget.states)
-                } else {
-                    format!("the walk ran out of its {} s", budget.time.as_secs())
-                });
+            explored.held.walked(explored.nodes.len());
+            if let Err(reason) = tables.make_room(&mut explored, &mut seen, &mut queue, edges) {
+                explored.stopped = Some(format!(
+                    "the walk does not fit in the memory it may hold: {reason} \
+                     (it held {} MB at {} states)",
+                    explored.held.bytes / MB,
+                    explored.nodes.len()
+                ));
                 break;
             }
+            let before = [
+                explored.nodes.len(),
+                explored.made.len(),
+                explored.edges.len(),
+            ];
             for mv in self.moves(&state) {
                 let (nexts, held) = self.next(&state, &mv);
                 explored.held_back |= held;
@@ -152,6 +161,7 @@ impl JointModel {
                         None => {
                             let at = explored.nodes.len() as u32;
                             let label = explored.packer.id(&next.label);
+                            tables.states += block(size_of::<[usize; 2]>() + 4 * packed.len());
                             seen.insert(packed.clone(), at);
                             explored.nodes.push((packed, Some((index as u32, label))));
                             queue.push_back(at as usize);
@@ -167,7 +177,130 @@ impl JointModel {
                     }
                 }
             }
+            let after = [
+                explored.nodes.len(),
+                explored.made.len(),
+                explored.edges.len(),
+            ];
+            tables.saw([0, 1, 2].map(|i| after[i] - before[i]));
         }
         explored
     }
+}
+
+/// The walk's tables as the memory it holds counts them: each at its
+/// capacity, and each packed state as its own heap block. Before each state
+/// is walked, every table is grown to hold what walking one state has added
+/// at most so far, with the memory of its new copy taken first, so a table
+/// seldom grows on its own while both copies are held.
+#[derive(Default)]
+struct Tables {
+    /// Bytes the packed states take.
+    states: usize,
+    /// The most states, moves and edges walking one state has added.
+    most: [usize; 3],
+}
+
+impl Tables {
+    fn saw(&mut self, added: [usize; 3]) {
+        for (most, added) in self.most.iter_mut().zip(added) {
+            *most = (*most).max(added);
+        }
+    }
+
+    fn make_room(
+        &mut self,
+        explored: &mut Explored<'_>,
+        seen: &mut HashMap<Packed, u32>,
+        queue: &mut VecDeque<usize>,
+        edges: bool,
+    ) -> Result<(), String> {
+        let [states, made, ends] = self.most.map(|most| most.max(1));
+        let held = &mut explored.held;
+        grow(&mut explored.nodes, states, held)?;
+        grow(queue, states, held)?;
+        grow_map(seen, states, held)?;
+        if edges {
+            grow(&mut explored.made, made, held)?;
+            grow(&mut explored.edges, ends, held)?;
+        }
+        let bytes = self.states
+            + explored.packer.bytes()
+            + bytes(&explored.nodes)
+            + bytes(queue)
+            + map_bytes::<Packed, u32>(seen.capacity())
+            + bytes(&explored.made)
+            + bytes(&explored.edges);
+        explored.held.set(bytes)
+    }
+}
+
+/// A list the walk keeps.
+trait List {
+    /// Bytes one entry takes.
+    const ENTRY: usize;
+    fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn reserve_exact(&mut self, more: usize);
+}
+
+impl<T> List for Vec<T> {
+    const ENTRY: usize = size_of::<T>();
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn capacity(&self) -> usize {
+        Vec::capacity(self)
+    }
+    fn reserve_exact(&mut self, more: usize) {
+        Vec::reserve_exact(self, more);
+    }
+}
+
+impl<T> List for VecDeque<T> {
+    const ENTRY: usize = size_of::<T>();
+    fn len(&self) -> usize {
+        VecDeque::len(self)
+    }
+    fn capacity(&self) -> usize {
+        VecDeque::capacity(self)
+    }
+    fn reserve_exact(&mut self, more: usize) {
+        VecDeque::reserve_exact(self, more);
+    }
+}
+
+fn bytes<L: List>(list: &L) -> usize {
+    list.capacity() * L::ENTRY
+}
+
+/// Make `list` hold `spare` more, doubling it when it must grow, with the
+/// memory of its new copy taken while the old one is still held.
+fn grow<L: List>(list: &mut L, spare: usize, held: &mut Held<'_>) -> Result<(), String> {
+    let len = list.len();
+    if list.capacity() - len >= spare {
+        return Ok(());
+    }
+    let wanted = (len + spare).max(list.capacity() * 2);
+    held.add(wanted * L::ENTRY)?;
+    list.reserve_exact(wanted - len);
+    held.sub(wanted * L::ENTRY);
+    Ok(())
+}
+
+/// Make `map` hold `spare` more, as [`grow`] does a list.
+fn grow_map(
+    map: &mut HashMap<Packed, u32>,
+    spare: usize,
+    held: &mut Held<'_>,
+) -> Result<(), String> {
+    let len = map.len();
+    if map.capacity() - len >= spare {
+        return Ok(());
+    }
+    let wanted = (len + spare).max(map.capacity() * 2);
+    held.add(map_bytes::<Packed, u32>(wanted))?;
+    map.reserve(wanted - len);
+    held.sub(map_bytes::<Packed, u32>(wanted));
+    Ok(())
 }

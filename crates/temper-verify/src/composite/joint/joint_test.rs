@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use temper_spec::automaton::{Automaton, parse_automaton};
 
@@ -103,11 +102,12 @@ fn parse(sources: &[&str]) -> Vec<Automaton> {
 fn check(sources: &[&str]) -> JointInvariantResult {
     let automatons = parse(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let budget = Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
     };
-    let mut results = verify_joint_invariants(&refs, budget);
+    let mut results = verify_joint_invariants(&refs, bound);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -203,11 +203,12 @@ fn specs_without_cross_entity_invariants_have_nothing_to_check() {
     let parent = parent(false);
     let automatons = parse(&[&parent, CHILD]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let budget = Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
     };
-    assert!(verify_joint_invariants(&refs, budget).is_empty());
+    assert!(verify_joint_invariants(&refs, bound).is_empty());
 }
 
 #[test]
@@ -290,4 +291,24 @@ fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
             .any(|m| m.starts_with("Parent.Set") && m.contains("'secret'")),
         "{result}"
     );
+}
+
+#[test]
+fn a_walk_its_room_cannot_hold_is_not_checked_and_gives_its_memory_back() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let automatons = parse(&[&parent, &child]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let (room, progress) = (Bytes::new(4 << 10), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    let results = verify_joint_invariants(&refs, bound);
+    assert_eq!(results.len(), 1);
+    let JointOutcome::Incomplete { reason } = &results[0].outcome else {
+        panic!("expected not checked, got {}", results[0]);
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+    assert_eq!(room.held(), 0, "the walk gives back what it took");
 }

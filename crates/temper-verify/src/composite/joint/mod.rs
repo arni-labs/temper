@@ -33,17 +33,20 @@
 //! Records disagree while a dispatch is on its way, so invariants are
 //! checked in settled states: those with nothing in flight. The walk is
 //! breadth first, so each broken invariant's path is a shortest one. A walk
-//! that runs out of its [`Budget`] says so and is never a pass.
+//! that does not fit in the memory its [`Room`] gives it says so and is
+//! never a pass.
 
 mod env;
 mod liveness;
 mod model;
 mod pack;
+mod room;
 mod senders;
 mod slice;
 mod state;
 
 pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
+pub use room::{Bound, Bytes, Progress, Room};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -51,7 +54,6 @@ use std::fmt;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
-use crate::Budget;
 use crate::model::ParamValue;
 
 use model::{JointModel, Move, Sending};
@@ -159,7 +161,7 @@ impl fmt::Display for JointInvariantResult {
 /// on the joint model of its entity and the types it names.
 pub fn verify_joint_invariants(
     automatons: &[&Automaton],
-    budget: Budget,
+    bound: Bound<'_>,
 ) -> Vec<JointInvariantResult> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
@@ -210,7 +212,7 @@ pub fn verify_joint_invariants(
         }
         let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
         let model = JointModel::new(&by_name, scope, name, &exprs, Sending::anyone(), true);
-        let walk = model.walk(name, &exprs, budget);
+        let walk = model.walk(name, &exprs, bound);
         for (inv, outcome) in joint.iter().zip(walk.outcomes) {
             let mut found = result(inv, &model.scope, walk.states, outcome);
             found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);

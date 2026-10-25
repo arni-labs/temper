@@ -22,6 +22,8 @@ pub mod entity_actor;
 pub mod event_budget_metrics;
 pub mod events;
 pub mod eventual_invariants;
+#[cfg(feature = "observe")]
+pub mod host_room;
 pub mod http_endpoint;
 pub mod idempotency;
 pub mod identity;
