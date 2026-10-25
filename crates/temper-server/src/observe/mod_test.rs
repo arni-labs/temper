@@ -1466,80 +1466,136 @@ async fn test_list_entities_empty() {
     assert_eq!(wrapper["total"], 0);
 }
 
+async fn dispatch_order(state: &ServerState, id: &str, action: &str, params: serde_json::Value) {
+    let r = state
+        .dispatch_tenant_action(
+            &TenantId::default(),
+            "Order",
+            id,
+            action,
+            params,
+            &AgentContext::default(),
+        )
+        .await;
+    assert!(r.is_ok(), "{action} failed: {r:?}");
+}
+
+/// Walk the observe history of one Order, following `next`.
+async fn observe_history_pages(
+    state: &ServerState,
+    id: &str,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut pages = Vec::new();
+    let mut after: Option<u64> = None;
+    loop {
+        let uri = match after {
+            Some(after) => {
+                format!("/observe/entities/Order/{id}/history?after={after}&limit={limit}")
+            }
+            None => format!("/observe/entities/Order/{id}/history?limit={limit}"),
+        };
+        let app = Router::new()
+            .nest("/observe", build_observe_router())
+            .with_state(state.clone());
+        let page = observe_json(app, &uri).await;
+        assert!(page["events"].as_array().unwrap().len() <= limit);
+        after = page["next"].as_u64();
+        pages.push(page);
+        if after.is_none() {
+            break;
+        }
+        assert!(pages.len() < 1_000, "history paging did not terminate");
+    }
+    pages
+}
+
 #[tokio::test]
-async fn test_entity_history_returns_events() {
-    let state = test_state_with_registry();
+async fn test_entity_history_reads_the_durable_journal_across_a_snapshot() {
+    let state = test_state_with_turso().await;
+    let id = "order-hist-1";
+    dispatch_order(
+        &state,
+        id,
+        "AddItem",
+        serde_json::json!({"ProductId": "p1"}),
+    )
+    .await;
+    dispatch_order(&state, id, "SubmitOrder", serde_json::json!({})).await;
 
-    // Dispatch actions to build an event log.
-    let r = state
-        .dispatch_tenant_action(
-            &TenantId::default(),
-            "Order",
-            "order-hist-1",
-            "AddItem",
-            serde_json::json!({"ProductId": "p1"}),
-            &AgentContext::default(),
-        )
-        .await;
-    assert!(r.is_ok(), "AddItem failed: {r:?}");
+    // Passivation snapshots and stops the actor; the respawned actor only
+    // holds the events after the snapshot in memory.
+    let actor_key = format!("{}:Order:{id}", TenantId::default());
+    state.last_accessed.write().unwrap().insert(
+        actor_key.clone(),
+        sim_now() - chrono::Duration::seconds(600),
+    );
+    state.passivate_idle_actors().await;
+    dispatch_order(&state, id, "ConfirmOrder", serde_json::json!({})).await;
 
-    let r = state
-        .dispatch_tenant_action(
-            &TenantId::default(),
-            "Order",
-            "order-hist-1",
-            "SubmitOrder",
-            serde_json::json!({}),
-            &AgentContext::default(),
-        )
-        .await;
-    assert!(r.is_ok(), "SubmitOrder failed: {r:?}");
-
-    let app = Router::new()
-        .nest("/observe", build_observe_router())
-        .nest("/api", crate::api::build_api_router())
-        .with_state(state);
-
-    let response = app
-        .oneshot(system_get("/observe/entities/Order/order-hist-1/history"))
+    let (store, _) = state.event_journal().expect("turso journal");
+    let expected: Vec<(u64, String)> = store
+        .read_events(&actor_key, 0)
         .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .unwrap()
+        .into_iter()
+        .map(|envelope| (envelope.sequence_nr, envelope.event_type))
+        .collect();
+    assert!(
+        store.load_snapshot(&actor_key).await.unwrap().is_some(),
+        "precondition: passivation must persist a snapshot"
+    );
+    let in_memory = state
+        .get_tenant_entity_state(&TenantId::default(), "Order", id)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .unwrap()
+        .state
+        .events
+        .len();
+    assert!(
+        in_memory < expected.len(),
+        "precondition: the in-memory list must miss events before the snapshot"
+    );
 
-    assert_eq!(json["entity_type"], "Order");
-    assert_eq!(json["entity_id"], "order-hist-1");
+    let pages = observe_history_pages(&state, id, 2).await;
+    assert_eq!(pages.len(), expected.len().div_ceil(2));
+    assert_eq!(pages[0]["entity_type"], "Order");
+    assert_eq!(pages[0]["entity_id"], id);
+    let walked: Vec<(u64, String)> = pages
+        .iter()
+        .flat_map(|page| page["events"].as_array().unwrap().clone())
+        .map(|event| {
+            (
+                event["sequence"].as_u64().unwrap(),
+                event["action"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(walked, expected);
 
-    let events = json["events"].as_array().expect("events should be array");
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["action"], "AddItem");
-    assert_eq!(events[0]["from_state"], "Draft");
-    assert_eq!(events[0]["to_state"], "Draft");
-    assert_eq!(events[1]["action"], "SubmitOrder");
-    assert_eq!(events[1]["to_state"], "Submitted");
+    let add_item = pages
+        .iter()
+        .flat_map(|page| page["events"].as_array().unwrap().clone())
+        .find(|event| event["action"] == "AddItem")
+        .expect("AddItem in history");
+    assert_eq!(add_item["params"]["ProductId"], "p1");
+    assert_eq!(add_item["from_state"], "Draft");
+    let confirm = walked.last().unwrap();
+    assert_eq!(confirm.1, "ConfirmOrder");
 }
 
 #[tokio::test]
 async fn test_entity_history_empty_for_unknown() {
-    let app = build_test_app();
-    let response = app
-        .oneshot(system_get("/observe/entities/Order/nonexistent/history"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let state = test_state_with_turso().await;
+    let app = Router::new()
+        .nest("/observe", build_observe_router())
+        .with_state(state);
+    let json = observe_json(app, "/observe/entities/Order/nonexistent/history").await;
     assert_eq!(json["entity_type"], "Order");
     assert_eq!(json["entity_id"], "nonexistent");
     let events = json["events"].as_array().expect("events should be array");
     assert!(events.is_empty());
+    assert!(json["next"].is_null());
 }
 
 #[tokio::test]
