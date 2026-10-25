@@ -1,6 +1,8 @@
 //! Conditional writes for tenant secrets: `If-None-Match: *` creates only,
 //! `If-Match: "<etag>"` replaces only an unchanged key, and every successful
-//! write answers with the key's new `ETag`.
+//! write answers with the key's new `ETag`. `If-Value-Sha256: <hex>` replaces
+//! a key only while its stored value still has that SHA-256, for a caller that
+//! knows the value it was given but not the key's etag.
 //!
 //! Every case runs against Turso. The same cases run against Postgres when
 //! `TEMPER_TEST_POSTGRES_URL` names a disposable database (ignored otherwise;
@@ -22,7 +24,10 @@ use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
 
 const TENANT: &str = "default";
+/// May write and read secrets.
 const WRITER: &str = "secret-writer";
+/// May write secrets but not read them (`manage_secrets` without `access_secret`).
+const BLIND_WRITER: &str = "secret-blind-writer";
 const CONCURRENT_WRITERS: usize = 8;
 
 /// A server whose secrets live in a real store. Dropping it drops the store.
@@ -83,6 +88,11 @@ impl Backend {
                     r#"
 permit(
   principal == Customer::"{WRITER}",
+  action in [Action::"manage_secrets", Action::"access_secret"],
+  resource
+);
+permit(
+  principal == Customer::"{BLIND_WRITER}",
   action == Action::"manage_secrets",
   resource
 );
@@ -356,6 +366,16 @@ async fn authorization_comes_before_the_condition(backend: Backend) {
 /// Fires `CONCURRENT_WRITERS` PUTs at once, each with a distinct value and the
 /// same condition, and returns what each one got.
 async fn race(app: &Router, key: &str, headers: Vec<(String, String)>) -> Vec<PutOutcome> {
+    race_values(app, key, headers, "writer").await
+}
+
+/// [`race`], with each writer's value named `<prefix>-<n>`.
+async fn race_values(
+    app: &Router,
+    key: &str,
+    headers: Vec<(String, String)>,
+    prefix: &str,
+) -> Vec<PutOutcome> {
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENT_WRITERS));
     let mut writers = Vec::new();
     for writer in 0..CONCURRENT_WRITERS {
@@ -363,13 +383,14 @@ async fn race(app: &Router, key: &str, headers: Vec<(String, String)>) -> Vec<Pu
         let key = key.to_string();
         let headers = headers.clone();
         let barrier = barrier.clone();
+        let value = format!("{prefix}-{writer}");
         writers.push(tokio::spawn(async move {
             let headers: Vec<(&str, &str)> = headers
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str()))
                 .collect();
             barrier.wait().await;
-            put(&app, &key, &format!("writer-{writer}"), WRITER, &headers).await
+            put(&app, &key, &value, WRITER, &headers).await
         }));
     }
     let mut outcomes = Vec::new();
@@ -422,6 +443,250 @@ async fn concurrent_replacers_have_one_winner(backend: Backend) {
 }
 
 // ---------------------------------------------------------------------------
+// If-Value-Sha256: replace only while the stored value is the one named.
+// ---------------------------------------------------------------------------
+
+const VALUE_HEADER: &str = "if-value-sha256";
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A refusal that also never echoes the hash the caller sent.
+fn refused_by_value(outcome: &PutOutcome, current_etag: &str, sent_hash: &str) {
+    refused(outcome, current_etag);
+    assert!(
+        !outcome.body.to_ascii_lowercase().contains(sent_hash),
+        "a 412 never names a hash: {}",
+        outcome.body
+    );
+}
+
+async fn value_condition_replaces_only_the_value_it_names(backend: Backend) {
+    let app = backend.router();
+    let missing_hash = sha256_hex("never-stored");
+    let missing = put(
+        &app,
+        "signin",
+        "x",
+        WRITER,
+        &[(VALUE_HEADER, &missing_hash)],
+    )
+    .await;
+    refused_by_value(&missing, "\"no-etag-yet\"", &missing_hash);
+    assert_eq!(backend.stored_value("signin").await, None);
+
+    let first = written(&put(&app, "signin", "given-to-run", WRITER, &[]).await);
+
+    let other_hash = sha256_hex("something-else");
+    let wrong = put(
+        &app,
+        "signin",
+        "moved",
+        WRITER,
+        &[(VALUE_HEADER, &other_hash)],
+    )
+    .await;
+    refused_by_value(&wrong, &first, &other_hash);
+    assert_eq!(
+        backend.stored_value("signin").await.as_deref(),
+        Some("given-to-run")
+    );
+
+    // Hex in either case names the same value.
+    let given_hash = sha256_hex("given-to-run").to_ascii_uppercase();
+    let replaced = written(
+        &put(
+            &app,
+            "signin",
+            "moved",
+            WRITER,
+            &[(VALUE_HEADER, &given_hash)],
+        )
+        .await,
+    );
+    assert_ne!(replaced, first, "the replacement gets a new etag");
+    assert_eq!(
+        listed_etag(&app, "signin").await.as_deref(),
+        Some(&*replaced)
+    );
+    assert_eq!(
+        backend.stored_value("signin").await.as_deref(),
+        Some("moved")
+    );
+
+    // The value the run was given is gone now, so the same header is refused.
+    let again = put(
+        &app,
+        "signin",
+        "moved-twice",
+        WRITER,
+        &[(VALUE_HEADER, &given_hash)],
+    )
+    .await;
+    refused_by_value(&again, &replaced, &given_hash.to_ascii_lowercase());
+    assert_eq!(
+        backend.stored_value("signin").await.as_deref(),
+        Some("moved")
+    );
+    backend.finish().await;
+}
+
+async fn value_condition_needs_access_secret(backend: Backend) {
+    let app = backend.router();
+    let etag = written(&put(&app, "signin", "given-to-run", WRITER, &[]).await);
+    // Right and wrong guesses get the same answer, so a caller who may write
+    // but not read learns nothing about the stored value.
+    for guess in ["given-to-run", "wrong-guess"] {
+        let hash = sha256_hex(guess);
+        let denied = put(
+            &app,
+            "signin",
+            "blind",
+            BLIND_WRITER,
+            &[(VALUE_HEADER, &hash)],
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{guess}: {denied:?}");
+        assert_eq!(denied.etag, None);
+        assert!(!denied.body.contains(etag.trim_matches('"')));
+    }
+    // The same caller may still write without the value condition.
+    written(&put(&app, "other", "plain", BLIND_WRITER, &[]).await);
+    assert_eq!(
+        backend.stored_value("signin").await.as_deref(),
+        Some("given-to-run")
+    );
+    backend.finish().await;
+}
+
+async fn value_condition_refuses_malformed_or_combined_headers(backend: Backend) {
+    let app = backend.router();
+    let etag = written(&put(&app, "signin", "given-to-run", WRITER, &[]).await);
+    let hash = sha256_hex("given-to-run");
+    let short = &hash[..63];
+    let long = format!("{hash}0");
+    let not_hex = format!("{}g", &hash[..63]);
+    let cases: Vec<Vec<(&str, &str)>> = vec![
+        vec![(VALUE_HEADER, short)],
+        vec![(VALUE_HEADER, &long)],
+        vec![(VALUE_HEADER, &not_hex)],
+        vec![(VALUE_HEADER, "")],
+        vec![(VALUE_HEADER, &hash), ("if-match", &etag)],
+        vec![(VALUE_HEADER, &hash), ("if-none-match", "*")],
+        vec![(VALUE_HEADER, &hash), (VALUE_HEADER, &hash)],
+    ];
+    for headers in cases {
+        let outcome = put(&app, "signin", "refused", WRITER, &headers).await;
+        assert_eq!(
+            outcome.status,
+            StatusCode::BAD_REQUEST,
+            "{headers:?}: {outcome:?}"
+        );
+        assert_eq!(outcome.etag, None);
+    }
+    assert_eq!(
+        backend.stored_value("signin").await.as_deref(),
+        Some("given-to-run")
+    );
+    backend.finish().await;
+}
+
+/// Writers that all read the same value race to replace it. Whoever reads
+/// before the winner's write lands and updates after it must still lose.
+async fn concurrent_value_replacers_have_one_winner(backend: Backend) {
+    let app = backend.router();
+    written(&put(&app, "signin", "round-start", WRITER, &[]).await);
+    for round in 0..5 {
+        let current = backend
+            .stored_value("signin")
+            .await
+            .expect("a value before each round");
+        let headers = vec![(VALUE_HEADER.to_string(), sha256_hex(&current))];
+        let outcomes = race_values(&app, "signin", headers, &format!("round-{round}")).await;
+        assert_one_winner(&backend, &app, "signin", &outcomes).await;
+    }
+    backend.finish().await;
+}
+
+/// Postgres only: a writer lands between the conditional PUT's read and its
+/// update. The test holds the row with its own uncommitted update, waits until
+/// the PUT is queued behind it, then commits. The PUT read the old value, so
+/// its hash matched, but the row changed before its update and it must lose.
+async fn value_condition_loses_to_a_write_between_read_and_update(backend: Backend) {
+    let app = backend.router();
+    written(&put(&app, "signin", "given-to-run", WRITER, &[]).await);
+    let (pool, schema) = backend.postgres.clone().expect("Postgres backend");
+    let vault = backend.state.secrets_vault.clone().expect("vault");
+    let (ciphertext, nonce) = vault.encrypt(b"landed-between").expect("encrypt");
+
+    let mut landing = pool.begin().await.expect("begin the landing write");
+    let updated = sqlx::query(&format!(
+        "UPDATE \"{schema}\".tenant_secrets SET ciphertext = $1, nonce = $2, \
+         version_id = 'landed', updated_at = now() WHERE tenant = $3 AND key_name = $4"
+    ))
+    .bind(&ciphertext)
+    .bind(&nonce)
+    .bind(TENANT)
+    .bind("signin")
+    .execute(&mut *landing)
+    .await
+    .expect("hold the row");
+    assert_eq!(updated.rows_affected(), 1);
+
+    let hash = sha256_hex("given-to-run");
+    let racer = {
+        let app = app.clone();
+        let hash = hash.clone();
+        tokio::spawn(async move {
+            put(
+                &app,
+                "signin",
+                "from-the-run",
+                WRITER,
+                &[(VALUE_HEADER, &hash)],
+            )
+            .await
+        })
+    };
+
+    // Wait until the PUT waits on the row lock the landing write holds.
+    let mut queued = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read lock waits");
+        if waiting > 0 {
+            queued = true;
+            break;
+        }
+        assert!(
+            !racer.is_finished(),
+            "the PUT finished without queuing behind the row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(queued, "the PUT never queued behind the landing write");
+    landing.commit().await.expect("land the write");
+
+    let outcome = racer.await.expect("racer task");
+    refused_by_value(&outcome, "landed", &hash);
+    assert_eq!(
+        backend.stored_value("signin").await.as_deref(),
+        Some("landed-between")
+    );
+    backend.finish().await;
+}
+
+// ---------------------------------------------------------------------------
 // Turso
 // ---------------------------------------------------------------------------
 
@@ -458,6 +723,27 @@ async fn turso_concurrent_creators_have_one_winner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turso_concurrent_replacers_have_one_winner() {
     concurrent_replacers_have_one_winner(Backend::turso("cas-race-replace").await).await;
+}
+
+#[tokio::test]
+async fn turso_value_condition_replaces_only_the_value_it_names() {
+    value_condition_replaces_only_the_value_it_names(Backend::turso("value-replace").await).await;
+}
+
+#[tokio::test]
+async fn turso_value_condition_needs_access_secret() {
+    value_condition_needs_access_secret(Backend::turso("value-authz").await).await;
+}
+
+#[tokio::test]
+async fn turso_value_condition_refuses_malformed_or_combined_headers() {
+    value_condition_refuses_malformed_or_combined_headers(Backend::turso("value-malformed").await)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turso_concurrent_value_replacers_have_one_winner() {
+    concurrent_value_replacers_have_one_winner(Backend::turso("value-race").await).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,4 +790,41 @@ async fn postgres_concurrent_creators_have_one_winner() {
 #[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
 async fn postgres_concurrent_replacers_have_one_winner() {
     concurrent_replacers_have_one_winner(Backend::postgres("pg-cas-race-replace").await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
+async fn postgres_value_condition_replaces_only_the_value_it_names() {
+    value_condition_replaces_only_the_value_it_names(Backend::postgres("pg-value-replace").await)
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
+async fn postgres_value_condition_needs_access_secret() {
+    value_condition_needs_access_secret(Backend::postgres("pg-value-authz").await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
+async fn postgres_value_condition_refuses_malformed_or_combined_headers() {
+    value_condition_refuses_malformed_or_combined_headers(
+        Backend::postgres("pg-value-malformed").await,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
+async fn postgres_concurrent_value_replacers_have_one_winner() {
+    concurrent_value_replacers_have_one_winner(Backend::postgres("pg-value-race").await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEMPER_TEST_POSTGRES_URL pointing to disposable PostgreSQL"]
+async fn postgres_value_condition_loses_to_a_write_between_read_and_update() {
+    value_condition_loses_to_a_write_between_read_and_update(
+        Backend::postgres("pg-value-between").await,
+    )
+    .await;
 }

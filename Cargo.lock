@@ -7374,6 +7374,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "stacker",
+ "subtle",
  "temper-actor-runtime",
  "temper-authz",
  "temper-evolution",

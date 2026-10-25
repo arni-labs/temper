@@ -12,6 +12,16 @@ pub enum SecretPrecondition<'a> {
     Absent,
     /// Write only if the key's row carries exactly this version id.
     Version(&'a str),
+    /// Write only if the key's row still holds exactly this ciphertext and
+    /// nonce, as an earlier read of the row returned them. Every write seals
+    /// the value with a fresh random nonce, so any write since that read, by
+    /// any release and whether or not it set a version id, fails this check.
+    Unchanged {
+        /// The ciphertext the read returned.
+        ciphertext: &'a [u8],
+        /// The nonce the read returned.
+        nonce: &'a [u8],
+    },
 }
 
 /// An encrypted secret to store under `(tenant, key_name)`.
