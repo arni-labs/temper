@@ -62,8 +62,10 @@ impl ServerState {
     /// sequence and answers this write `Ok`. A delete committed since ends the
     /// tries: it removes the row rather than replacing it, so nothing guards
     /// against this older write landing after the removal and bringing the
-    /// record back. Every failed try is logged, so a store that never takes
-    /// the write is loud, not silent.
+    /// record back. The journal says whether one was committed
+    /// ([`Self::deleted_since`]); a try that cannot read it writes nothing.
+    /// Every failed try is logged, so a store that never takes the write is
+    /// loud, not silent.
     pub(super) async fn project_until_visible(
         &self,
         ctx: &PostDispatchContext<'_>,
@@ -80,16 +82,19 @@ impl ServerState {
                 "Committed transition projection failed; dependents wait for it");
             tokio::time::sleep(wait).await; // determinism-ok: retry backoff
             wait = (wait * 2).min(PROJECTION_BARRIER_BUDGET);
-            if self.deleted_after(
-                ctx.tenant,
-                ctx.entity_type,
-                ctx.entity_id,
-                response.state.event_sequence(),
-            ) {
-                tracing::warn!(tenant = %ctx.tenant, entity_type = ctx.entity_type,
-                    entity_id = ctx.entity_id, action = ctx.action, failed_tries,
-                    "Record deleted while its committed transition's projection failed; starting dependents without it");
-                return;
+            match self.deleted_since(ctx, response).await {
+                Ok(true) => {
+                    tracing::warn!(tenant = %ctx.tenant, entity_type = ctx.entity_type,
+                        entity_id = ctx.entity_id, action = ctx.action, failed_tries,
+                        "Record deleted while its committed transition's projection failed; starting dependents without it");
+                    return;
+                }
+                Ok(false) => {}
+                Err(read_error) => {
+                    error = read_error;
+                    failed_tries += 1;
+                    continue;
+                }
             }
             match self.project_before_dependents(ctx, response).await {
                 Ok(()) => break,
@@ -102,5 +107,47 @@ impl ServerState {
         tracing::info!(tenant = %ctx.tenant, entity_type = ctx.entity_type,
             entity_id = ctx.entity_id, action = ctx.action, failed_tries,
             "Committed transition projected after failed tries; starting dependents");
+    }
+
+    /// Whether the record was deleted after `response`'s transition: whether
+    /// its journal holds an event past that transition's sequence that moved
+    /// it to `Deleted`, the kernel's tombstone or a spec action. That status
+    /// is the one whose row is removed, and the actor takes no action after
+    /// it. The journal is read, not the status cache: during a long outage the
+    /// cache can evict the delete's status, and a retry that missed it would
+    /// bring the deleted record back. An error means the journal could not be
+    /// read, and the try must not write.
+    async fn deleted_since(
+        &self,
+        ctx: &PostDispatchContext<'_>,
+        response: &EntityResponse,
+    ) -> Result<bool, PersistenceError> {
+        // A query plane comes with its storage stack's journal: with no
+        // journal there is no projection to retry.
+        let Some((store, _)) = self.event_journal() else {
+            return Ok(false);
+        };
+        let persistence_id = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
+        let after = tokio::time::timeout(
+            PROJECTION_BARRIER_BUDGET,
+            Box::pin(store.read_events(&persistence_id, response.state.sequence_nr)),
+        )
+        .await
+        .map_err(|_| {
+            PersistenceError::Storage(format!(
+                "journal read for a delete timed out after {} seconds",
+                PROJECTION_BARRIER_BUDGET.as_secs()
+            ))
+        })?
+        .map_err(|read_error| {
+            PersistenceError::Storage(format!("journal read for a delete failed: {read_error}"))
+        })?;
+        Ok(after.iter().any(|event| {
+            event
+                .payload
+                .get("to_status")
+                .and_then(serde_json::Value::as_str)
+                == Some("Deleted")
+        }))
     }
 }

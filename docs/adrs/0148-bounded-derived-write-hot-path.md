@@ -143,11 +143,14 @@ A delete of the record committed while the write is being tried ends the
 tries, and the dependents start without it. The delete removes the record's
 row rather than replacing it, so the sequence guard has nothing to compare
 with, and the older write landing after the removal would bring the deleted
-record back. The status cache holds the delete's tombstone with its sequence,
-and a delete caches it before its row is removed (a dispatched Delete, a
-composite's, and the OData DELETE route), so each try checks it first. A try
-already in flight when the removal lands can still bring the row back, as a
-slow first write could before this change.
+record back. Each try first reads the record's journal after the
+transition's sequence: an event there that moved the record to `Deleted`
+(the kernel's tombstone or a spec action) means a delete was committed since.
+The journal answers, not the status cache, because the cache can evict the
+delete's status during a long outage. A try that cannot read the journal writes
+nothing and waits for the next. A try already in flight when the removal
+lands can still bring the row back, as a slow first write could before this
+change.
 
 The tries do not give up. Nothing else starts this transition's dependents,
 so a limit would drop committed work again, which is the defect. A store
