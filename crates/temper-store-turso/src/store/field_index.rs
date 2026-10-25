@@ -12,6 +12,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
+use super::projection_rows::{ProjectionWrite, remove_projection, write_projection};
 use super::write_gate::WritePriority;
 use super::{TursoEventStore, TursoQueryProjectionRow};
 
@@ -19,7 +20,7 @@ use super::{TursoEventStore, TursoQueryProjectionRow};
 /// `entity_catalog.fields` but are not copied into the filter index.
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
 
-fn projection_hash(status: &str, fields: &serde_json::Value) -> String {
+pub(super) fn projection_hash(status: &str, fields: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(status.as_bytes());
     hasher.update(b"\n");
@@ -43,7 +44,10 @@ fn projection_hash(status: &str, fields: &serde_json::Value) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn canonical_projection_status<'a>(fallback: &'a str, state: &'a serde_json::Value) -> &'a str {
+pub(super) fn canonical_projection_status<'a>(
+    fallback: &'a str,
+    state: &'a serde_json::Value,
+) -> &'a str {
     state
         .get("status")
         .and_then(|value| value.as_str())
@@ -176,95 +180,19 @@ impl TursoEventStore {
         }
 
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
-
-        let existing_sequence = {
-            let mut existing_rows = tx
-                .query(
-                    "SELECT sequence_nr FROM entity_catalog \
-                     WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-                    params![tenant, entity_type, entity_id],
-                )
-                .await
-                .map_err(storage_error)?;
-            if let Some(row) = existing_rows.next().await.map_err(storage_error)? {
-                Some(row.get::<i64>(0).map_err(storage_error)?)
-            } else {
-                None
-            }
-        };
-        if existing_sequence.is_some_and(|existing| existing > sequence_nr) {
-            tx.commit().await.map_err(storage_error)?;
-            return Ok(());
-        }
-
-        tx.execute(
-            "INSERT INTO entity_catalog \
-             (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2, ?9) \
-             ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
-                 status = excluded.status, \
-                 fields = excluded.fields, \
-                 state = excluded.state, \
-                 updated_at = excluded.updated_at, \
-                 sequence_nr = excluded.sequence_nr, \
-                 projection_version = excluded.projection_version, \
-                 projection_hash = excluded.projection_hash",
-            params![
+        write_projection(
+            &tx,
+            &ProjectionWrite {
                 tenant,
                 entity_type,
                 entity_id,
                 status,
-                fields_json.as_str(),
-                state_json.as_str(),
-                updated_at.as_str(),
-                sequence_nr,
-                new_projection_hash.as_str(),
-            ],
+                fields,
+                state,
+                sequence_nr: u64::try_from(sequence_nr).unwrap_or_default(),
+            },
         )
-        .await
-        .map_err(storage_error)?;
-
-        // Delete existing rows for this entity, then re-insert.
-        // This is simpler than tracking individual field changes and handles
-        // field removal correctly.
-        tx.execute(
-            "DELETE FROM entity_field_index WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-
-        let indexed_fields = indexed_projection_fields(status, fields);
-        if !indexed_fields.is_empty() {
-            let mut sql = String::from(
-                "INSERT INTO entity_field_index \
-                 (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
-            );
-            let mut values = Vec::with_capacity(indexed_fields.len() * 6);
-
-            for (index, (field_name, field_value)) in indexed_fields.iter().enumerate() {
-                if index > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str("(?, ?, ?, ?, ?, ?)");
-                values.push(Value::from(tenant.to_string()));
-                values.push(Value::from(entity_type.to_string()));
-                values.push(Value::from(entity_id.to_string()));
-                values.push(Value::from(field_name.clone()));
-                values.push(
-                    field_value
-                        .as_ref()
-                        .map(|value| Value::from(value.clone()))
-                        .unwrap_or(Value::Null),
-                );
-                values.push(Value::from(status.to_string()));
-            }
-
-            tx.execute(&sql, params_from_iter(values))
-                .await
-                .map_err(storage_error)?;
-        }
-
+        .await?;
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -529,18 +457,7 @@ impl TursoEventStore {
             .await?;
         let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
-        tx.execute(
-            "DELETE FROM entity_catalog WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-        tx.execute(
-            "DELETE FROM entity_field_index WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
+        remove_projection(&tx, [tenant, entity_type, entity_id]).await?;
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -847,7 +764,7 @@ fn scalar_to_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn indexed_projection_fields(
+pub(super) fn indexed_projection_fields(
     status: &str,
     fields: &serde_json::Value,
 ) -> Vec<(String, Option<String>)> {

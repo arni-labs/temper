@@ -7,7 +7,9 @@ use std::time::Instant;
 use tracing::{Instrument, instrument};
 
 use temper_observe::wide_event;
-use temper_runtime::persistence::{EventMetadata, PersistenceEnvelope, PersistenceError};
+use temper_runtime::persistence::{
+    CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError, ProjectionRow,
+};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
@@ -1011,7 +1013,8 @@ impl ServerState {
                 .with_blob_store(tenant_blob_store),
         }
         .with_legacy_blob_store(legacy_blob_store)
-        .with_on_rehydrated(self.state_timer_rehydrate_hook(tenant, entity_type, entity_id));
+        .with_on_rehydrated(self.state_timer_rehydrate_hook(tenant, entity_type, entity_id))
+        .with_entity_rows(self.entity_rows_hook(tenant, entity_type));
 
         // Slow-path: atomically re-check and spawn under write lock.
         // This prevents duplicate actors when concurrent requests race to create
@@ -1321,7 +1324,7 @@ impl ServerState {
         );
         let _ = self.event_tx.send(change);
 
-        if let Some(query_plane) = self.query_plane_store() {
+        if let Some(query_plane) = self.query_plane_written_after_commit() {
             let status = response.state.status.clone();
             let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
             let projected_state = self.query_projection_state(&response.state);
@@ -1537,8 +1540,22 @@ impl ServerState {
             }
         } else {
             let append_started_at = Instant::now(); // determinism-ok: production-only append wait metric
+            let rows_follow = self.entity_rows_follow_commits();
+            let projection = rows_follow.then_some(ProjectionRow::Upsert {
+                status: &state.status,
+                fields: &projection_fields,
+                state: &projection_state,
+            });
             let append_result = store
-                .append(&persistence_id, state.sequence_nr, &[envelope])
+                .append_with_rows(
+                    &persistence_id,
+                    state.sequence_nr,
+                    &[envelope],
+                    CommitRows {
+                        projection,
+                        ..CommitRows::default()
+                    },
+                )
                 .await;
             runtime_metrics::record_event_store_append_wait(
                 backend.as_str(),
@@ -1563,17 +1580,18 @@ impl ServerState {
             let source = "data_only_create_fast_path";
             record_projection_update_started(tenant, entity_type, operation, source);
             let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
-            if let Err(e) = query_plane
-                .upsert_projection(
-                    tenant.as_str(),
-                    entity_type,
-                    entity_id,
-                    &state.status,
-                    &projection_fields,
-                    &projection_state,
-                    state.sequence_nr,
-                )
-                .await
+            if !rows_follow
+                && let Err(e) = query_plane
+                    .upsert_projection(
+                        tenant.as_str(),
+                        entity_type,
+                        entity_id,
+                        &state.status,
+                        &projection_fields,
+                        &projection_state,
+                        state.sequence_nr,
+                    )
+                    .await
             {
                 record_projection_update_error(
                     tenant,
@@ -1744,7 +1762,7 @@ impl ServerState {
         .map_err(|e| format!("Actor update failed: {e}"))?;
 
         if response.success
-            && let Some(query_plane) = self.query_plane_store()
+            && let Some(query_plane) = self.query_plane_written_after_commit()
         {
             let status = response.state.status.clone();
             let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
@@ -1866,7 +1884,7 @@ impl ServerState {
         .map_err(|e| format!("Actor delete failed: {e}"))?;
 
         if response.success {
-            if let Some(query_plane) = self.query_plane_store() {
+            if let Some(query_plane) = self.query_plane_written_after_commit() {
                 let operation = "remove";
                 let source = "delete";
                 record_projection_update_started(tenant, entity_type, operation, source);

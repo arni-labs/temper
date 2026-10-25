@@ -33,9 +33,11 @@ macro_rules! tombstone_sql {
     };
 }
 
+mod append_commit;
 mod append_config;
 mod authz;
 mod blobs;
+mod commit_probe;
 mod constraints;
 mod entity_listing;
 mod event_store;
@@ -48,6 +50,7 @@ mod policy;
 mod policy_approval;
 mod policy_replace;
 mod projection_freshness;
+mod projection_rows;
 mod published_artifacts;
 mod query_page;
 mod scheduled_actions;
@@ -59,6 +62,7 @@ pub mod sync_adopt;
 #[cfg(test)]
 mod tests;
 mod trajectory;
+mod trajectory_batch;
 mod trajectory_queries;
 mod wasm;
 mod write_gate;
@@ -72,11 +76,16 @@ pub struct TursoEventStore {
     db: Arc<Database>,
     write_gate: Arc<Semaphore>,
     high_priority_write_waiters: Arc<AtomicUsize>,
+    /// Trajectory rows waiting for their batch's transaction.
+    trajectory_batch: Arc<trajectory_batch::TrajectoryBatch>,
     /// True when connected to a remote Turso Cloud instance (libsql:// URL).
     /// PRAGMAs are skipped for remote connections.
     is_remote: bool,
     /// Set when the local file's commits are copied to Turso Cloud.
     sync_copy: Option<SyncCopy>,
+    /// Pauses appends at a fault point (tests only).
+    #[cfg(test)]
+    commit_probe: Option<commit_probe::CommitProbe>,
 }
 
 impl TursoEventStore {
@@ -138,8 +147,11 @@ impl TursoEventStore {
                 is_remote,
             ))),
             high_priority_write_waiters: Arc::new(AtomicUsize::new(0)),
+            trajectory_batch: Arc::default(),
             is_remote,
             sync_copy,
+            #[cfg(test)]
+            commit_probe: None,
         };
         store.migrate().await?;
         Ok(store)

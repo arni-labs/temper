@@ -23,6 +23,8 @@ use crate::segments;
 
 const EVENT_APPEND_OPERATION: &str = "event_append";
 
+mod entity_rows;
+
 /// A PostgreSQL-backed event store.
 ///
 /// Persistence IDs follow `"tenant:entity_type:entity_id"` (with legacy
@@ -65,6 +67,12 @@ impl PostgresEventStore {
 // ---------------------------------------------------------------------------
 
 impl EventStore for PostgresEventStore {
+    /// A record's catalog, field-index and timer rows are in the journal's
+    /// database, so each append writes them in its transaction.
+    fn commits_entity_rows(&self) -> bool {
+        true
+    }
+
     /// Append one or more events to the journal.
     ///
     /// Events are inserted with consecutive sequence numbers starting from
@@ -102,6 +110,8 @@ impl EventStore for PostgresEventStore {
             reconcile_vectors,
             scheduled_actions,
             fired_scheduled_action,
+            projection,
+            state_timer,
         } = rows;
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
@@ -329,6 +339,22 @@ impl EventStore for PostgresEventStore {
             self.delete_scheduled_action_row(&mut tx, tenant, entity_type, entity_id, arm_id)
                 .await?;
         }
+
+        // The record's query-plane row and timer row as the events leave it,
+        // in THIS transaction (`commits_entity_rows`).
+        self.write_entity_rows(
+            &mut tx,
+            entity_rows::RowsAt {
+                tenant,
+                entity_type,
+                entity_id,
+                sequence_nr: new_seq,
+            },
+            projection,
+            state_timer,
+            EVENT_APPEND_OPERATION,
+        )
+        .await?;
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
