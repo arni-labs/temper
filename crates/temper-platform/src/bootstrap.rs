@@ -269,7 +269,10 @@ fn check_joint_invariants(
     }
     {
         let tenant_id = TenantId::new(tenant);
-        let registry = state.registry.read().unwrap(); // ci-ok: infallible lock
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| format!("{label}: the spec registry lock is poisoned"))?;
         for entity_type in &named {
             if !automatons.contains_key(entity_type)
                 && let Some(spec) = registry.get_spec(&tenant_id, entity_type)

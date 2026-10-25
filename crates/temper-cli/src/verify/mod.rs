@@ -241,7 +241,7 @@ fn run_joint_verification(
     if results.is_empty() {
         return Ok(());
     }
-    println!("\nRunning cross-entity invariants on the joint model...");
+    let mut report = String::from("\nRunning cross-entity invariants on the joint model...\n");
     let mut failed = Vec::new();
     for result in &results {
         let tag = match result.outcome {
@@ -249,15 +249,18 @@ fn run_joint_verification(
             temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
             temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
         };
-        println!("    [{tag}] {result}");
+        report.push_str(&format!("    [{tag}] {result}\n"));
         if !result.holds() {
             failed.push(format!("{}.{}", result.entity, result.invariant));
         }
     }
+    if failed.is_empty() {
+        report.push_str("\nCross-entity invariants: ALL PASSED");
+    }
+    println!("{report}");
     if !failed.is_empty() {
         anyhow::bail!("cross-entity invariants not proven: {}", failed.join(", "));
     }
-    println!("\nCross-entity invariants: ALL PASSED");
     Ok(())
 }
 
