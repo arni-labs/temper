@@ -27,6 +27,7 @@ fn test_security_context() -> temper_authz::SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "router-test".to_string(),
         token: None,
+        cause: None,
     }
 }
 
@@ -43,6 +44,7 @@ fn claimed_admin_security_context() -> temper_authz::SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "router-admin-side-channel-test".to_string(),
         token: None,
+        cause: None,
     }
 }
 

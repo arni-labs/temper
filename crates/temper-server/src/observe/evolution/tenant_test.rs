@@ -48,6 +48,7 @@ fn admin_request(tenant: &str, request: Request<Body>) -> Request<Body> {
         context_attrs: Default::default(),
         correlation_id: "evolution-tenant-test".to_string(),
         token: None,
+        cause: None,
     };
     let mut request = request;
     request

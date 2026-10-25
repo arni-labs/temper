@@ -338,6 +338,7 @@ mod tests {
             context_attrs: HashMap::new(),
             correlation_id: "list-uniformity".to_string(),
             token: None,
+            cause: None,
         }
     }
 

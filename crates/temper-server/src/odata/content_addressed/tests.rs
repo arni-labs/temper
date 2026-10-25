@@ -67,6 +67,7 @@ fn security_context() -> SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "raw-ingest-test".to_string(),
         token: None,
+        cause: None,
     }
 }
 

@@ -730,6 +730,7 @@ impl EntityActor {
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
                                 made_by: None,
                                 source: None,
+                                cause: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -1104,6 +1105,7 @@ impl Actor for EntityActor {
                 kind: temper_runtime::persistence::EventKind::Transition,
                 made_by: self.creation_origin.made_by.clone(),
                 source: self.creation_origin.source,
+                cause: self.creation_origin.cause.clone(),
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -1877,6 +1879,7 @@ impl Actor for EntityActor {
                     kind: temper_runtime::persistence::EventKind::Tombstone,
                     made_by: origin.made_by.clone(),
                     source: origin.source,
+                    cause: origin.cause.clone(),
                 };
 
                 if let (Some(store), Some(backend)) =

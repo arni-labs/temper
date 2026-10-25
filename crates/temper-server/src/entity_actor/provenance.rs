@@ -1,12 +1,13 @@
-//! Who made a move and which of the kernel's dispatch paths carried it,
-//! recorded on every [`EntityEvent`](super::EntityEvent).
+//! Who made a move, which of the kernel's dispatch paths carried it, and how
+//! it came about, recorded on every [`EntityEvent`](super::EntityEvent).
 //!
-//! Both are taken from what the kernel itself knows when it dispatches: the
-//! principal its credential resolution produced, and the path in its own code
-//! the move went through. Nothing a caller declares is recorded.
+//! All three are taken from what the kernel itself knows when it dispatches:
+//! the principal its credential resolution produced, the path in its own code
+//! the move went through, and the reaction or timer that made it. Nothing a
+//! caller declares is recorded.
 
 use serde::{Deserialize, Serialize};
-use temper_authz::{PrincipalKind, SecurityContext, TokenKind};
+use temper_authz::{MoveCause, PrincipalKind, SecurityContext, TokenKind};
 
 /// The principal that made a move, as its [`SecurityContext`] has it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,14 +91,19 @@ pub struct MoveOrigin {
     pub made_by: Option<MadeBy>,
     /// The dispatch path that carried the move.
     pub source: Option<MoveSource>,
+    /// How the move came about, when a reaction or a timer made it: the
+    /// cause its principal's [`SecurityContext`] carries to Cedar.
+    pub cause: Option<MoveCause>,
 }
 
 impl MoveOrigin {
     /// The origin of a move dispatched with `agent_ctx`.
     pub fn of(agent_ctx: &crate::request_context::AgentContext) -> Self {
+        let security_ctx = agent_ctx.security_ctx.as_ref();
         Self {
-            made_by: agent_ctx.security_ctx.as_ref().map(MadeBy::from),
+            made_by: security_ctx.map(MadeBy::from),
             source: Some(agent_ctx.source),
+            cause: security_ctx.and_then(|context| context.cause.clone()),
         }
     }
 
@@ -110,5 +116,6 @@ impl MoveOrigin {
     pub(crate) fn stamp(&self, event: &mut super::EntityEvent) {
         event.made_by.clone_from(&self.made_by);
         event.source = self.source;
+        event.cause.clone_from(&self.cause);
     }
 }

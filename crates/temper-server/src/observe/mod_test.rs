@@ -88,6 +88,7 @@ fn admin_security_context() -> temper_authz::SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "observe-test-admin".to_string(),
         token: None,
+        cause: None,
     }
 }
 
@@ -104,6 +105,7 @@ fn customer_security_context(id: &str) -> temper_authz::SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "observe-test-customer".to_string(),
         token: None,
+        cause: None,
     }
 }
 

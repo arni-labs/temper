@@ -29,6 +29,7 @@ fn test_admin_security_context(principal_id: &str) -> SecurityContext {
         context_attrs: HashMap::new(),
         correlation_id: "test-admin-context".to_string(),
         token: None,
+        cause: None,
     }
 }
 

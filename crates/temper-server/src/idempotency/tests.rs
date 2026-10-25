@@ -50,6 +50,7 @@ fn busy_response(field_bytes: usize) -> EntityResponse {
             kind: temper_runtime::persistence::EventKind::Transition,
             made_by: None,
             source: None,
+            cause: None,
         });
         response
             .state
@@ -265,6 +266,7 @@ fn keyed_events(state: &mut EntityState, keys: &[&str]) {
             idempotency_key: Some((*key).to_string()),
             kind: temper_runtime::persistence::EventKind::Transition,
             source: None,
+            cause: None,
             made_by: None,
         });
         state.total_event_count += 1;

@@ -192,6 +192,7 @@ fn field_event(
         kind: temper_runtime::persistence::EventKind::Transition,
         made_by: origin.made_by.clone(),
         source: origin.source,
+        cause: origin.cause.clone(),
     }
 }
 

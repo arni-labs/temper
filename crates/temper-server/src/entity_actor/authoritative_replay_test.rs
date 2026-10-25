@@ -110,6 +110,7 @@ fn envelope(
         },
         made_by: None,
         source: None,
+        cause: None,
     };
     PersistenceEnvelope {
         sequence_nr,
@@ -356,6 +357,7 @@ async fn authoritative_replay_rejects_non_object_field_update_payloads() {
         kind: temper_runtime::persistence::EventKind::Transition,
         made_by: None,
         source: None,
+        cause: None,
     };
     let non_object = PersistenceEnvelope {
         sequence_nr: 1,

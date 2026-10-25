@@ -1289,6 +1289,7 @@ impl ServerState {
             kind: temper_runtime::persistence::EventKind::Transition,
             made_by: origin.made_by.clone(),
             source: origin.source,
+            cause: origin.cause.clone(),
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
@@ -1500,6 +1501,7 @@ impl ServerState {
             kind: temper_runtime::persistence::EventKind::Transition,
             made_by: origin.made_by.clone(),
             source: origin.source,
+            cause: origin.cause.clone(),
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;

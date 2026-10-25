@@ -535,13 +535,15 @@ impl crate::state::ServerState {
     /// Schedule delayed actions as fire-and-forget background timers.
     ///
     /// Propagates the originating `AgentContext` so that scheduled actions
-    /// retain identity attribution in trajectories and SSE events.
+    /// retain identity attribution in trajectories and SSE events, armed by
+    /// `armed_action`, the move that scheduled them.
     pub(crate) fn dispatch_scheduled_actions(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         scheduled_actions: &[ScheduledAction],
+        armed_action: &str,
         agent_ctx: &AgentContext,
     ) {
         for sched in scheduled_actions {
@@ -550,9 +552,10 @@ impl crate::state::ServerState {
             let et = entity_type.to_string();
             let eid = entity_id.to_string();
             let action = sched.action.clone();
-            let ctx = agent_ctx
-                .clone()
-                .with_source(crate::entity_actor::MoveSource::Scheduled);
+            let ctx = agent_ctx.arming_timer(
+                crate::entity_actor::MoveSource::Scheduled,
+                Some(armed_action),
+            );
             let delay = std::time::Duration::from_secs(sched.delay_seconds);
             let workflow_root_entity_type = ctx
                 .workflow_root_entity_type
@@ -622,6 +625,7 @@ impl crate::state::ServerState {
                 ctx.entity_type,
                 ctx.entity_id,
                 &response.scheduled_actions,
+                ctx.action,
                 ctx.agent_ctx,
             );
         }

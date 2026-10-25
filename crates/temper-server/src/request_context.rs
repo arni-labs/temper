@@ -10,7 +10,7 @@ use std::str::FromStr;
 use crate::entity_actor::MoveSource;
 use axum::http::HeaderMap;
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
-use temper_authz::SecurityContext;
+use temper_authz::{MoveCause, SecurityContext, TimerArm};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod observation_metadata;
@@ -101,6 +101,30 @@ impl AgentContext {
     pub fn with_source(mut self, source: MoveSource) -> Self {
         self.source = source;
         self
+    }
+
+    /// The same identity as a timer it arms fires with, carried by `source`.
+    /// The timer's moves carry a [`MoveCause`] naming the move that armed it,
+    /// `armed_action` when known, and its arming principal. A timer armed by
+    /// a timer's own fire, as a repeating timer re-arms or a restart arms one
+    /// again, keeps that fire's arm. A context with no security context
+    /// carries no cause.
+    #[must_use]
+    pub(crate) fn arming_timer(&self, source: MoveSource, armed_action: Option<&str>) -> Self {
+        let mut timer = self.clone().with_source(source);
+        if let Some(security_ctx) = timer.security_ctx.as_mut() {
+            let own_fire = security_ctx
+                .cause
+                .as_ref()
+                .filter(|cause| cause.reaction.is_none())
+                .and_then(|cause| cause.timer.clone());
+            let arm = own_fire.unwrap_or_else(|| TimerArm {
+                armed_action: armed_action.map(str::to_string),
+                armed_by: security_ctx.principal.id.clone(),
+            });
+            security_ctx.cause = Some(MoveCause::timer_fire(arm));
+        }
+        timer
     }
 
     /// Admit a callback only within both the inline and cumulative budgets.

@@ -233,6 +233,12 @@ pub struct EntityEvent {
     /// written before the kernel recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<super::MoveSource>,
+    /// How the move came about when a reaction or a timer made it: the rule,
+    /// the move that set it off and the chain's depth, and the timer that
+    /// started the chain. None for a direct request and on events written
+    /// before the kernel recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<temper_authz::MoveCause>,
 }
 
 impl EntityEvent {
@@ -249,6 +255,7 @@ impl EntityEvent {
             kind: temper_runtime::persistence::EventKind::Transition,
             made_by: origin.made_by.clone(),
             source: origin.source,
+            cause: origin.cause.clone(),
         }
     }
 }

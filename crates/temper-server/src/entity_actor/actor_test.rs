@@ -506,6 +506,7 @@ fn snapshot_keeps_the_status_clock() {
         kind: temper_runtime::persistence::EventKind::Transition,
         made_by: None,
         source: None,
+        cause: None,
     };
     state.push_event_bounded(event("Submit", "Draft", "Submitted", 10));
     state.push_event_bounded(event("Note", "Submitted", "Submitted", 20));
@@ -2671,6 +2672,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         kind: temper_runtime::persistence::EventKind::Transition,
         made_by: None,
         source: None,
+        cause: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,

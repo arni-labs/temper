@@ -217,6 +217,7 @@ fn build_wasm_security_context(ctx: &WasmAuthzContext) -> SecurityContext {
         context_attrs,
         correlation_id: uuid::Uuid::now_v7().to_string(), // determinism-ok: correlation_id for Cedar tracing only,
         token: None,
+        cause: None,
     }
 }
 

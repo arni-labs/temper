@@ -70,6 +70,7 @@ async fn typed_admin_kind_does_not_bypass_platform_cedar() {
                 context_attrs: Default::default(),
                 correlation_id: "platform-admin-side-channel-test".to_string(),
                 token: None,
+                cause: None,
             },
         ));
     let response = app.oneshot(request).await.expect("request should run");

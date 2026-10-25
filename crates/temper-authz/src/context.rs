@@ -35,12 +35,14 @@ pub struct Principal {
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
-/// Cedar context keys that only a resolved `SecurityContext` may populate.
+/// Cedar context keys that only a resolved `SecurityContext` may populate:
+/// the principal's identity, and how its move came about
+/// ([`MoveCause`](crate::MoveCause)).
 pub fn is_cedar_authority_context_key(name: &str) -> bool {
     matches!(
         name,
         "sessionId" | "agentId" | "agentType" | "agentTypeVerified" | "role" | "actingFor"
-    )
+    ) || crate::cause::MOVE_CAUSE_CONTEXT_KEYS.contains(&name)
 }
 
 /// Security context carried with every actor message dispatch.
@@ -59,6 +61,11 @@ pub struct SecurityContext {
     /// one. Recorded with the principal's moves; not a Cedar input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<crate::VerifiedToken>,
+    /// How the move this context carries came about, when the kernel's
+    /// reaction or timer path made it; None for a direct request. A Cedar
+    /// input (`context.via` and the rest), set only by the kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::MoveCause>,
 }
 
 /// Credential-authenticated authority bound to one tenant.
@@ -159,6 +166,7 @@ impl SecurityContext {
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
             token: None,
+            cause: None,
         }
     }
 
@@ -189,6 +197,7 @@ impl SecurityContext {
             context_attrs: HashMap::new(),
             correlation_id,
             token: None,
+            cause: None,
         }
     }
 
@@ -209,6 +218,7 @@ impl SecurityContext {
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
             token: None,
+            cause: None,
         }
     }
 
@@ -261,6 +271,7 @@ impl SecurityContext {
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
             token: None,
+            cause: None,
         }
     }
 
@@ -327,6 +338,7 @@ impl SecurityContext {
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
             token: None,
+            cause: None,
         }
     }
 

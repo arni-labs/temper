@@ -146,6 +146,7 @@ fn authenticate(mut request: Request<Body>) -> Request<Body> {
         context_attrs: Default::default(),
         correlation_id: "crucible-agent-validation".to_string(),
         token: None,
+        cause: None,
     };
     request
         .extensions_mut()

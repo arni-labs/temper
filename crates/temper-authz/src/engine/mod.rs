@@ -519,6 +519,13 @@ impl AuthzEngine {
             insert_json_as_cedar(&mut ctx_map, key.clone(), value);
         }
 
+        // How the move came about: `via` and `depth` on every check, the
+        // rest on a reaction's or a timer's. Set last, so only the kernel's
+        // own path speaks under these keys.
+        for (key, value) in crate::cause::cause_context(security_ctx.cause.as_ref()) {
+            insert_json_as_cedar(&mut ctx_map, key.to_string(), &value);
+        }
+
         // Resource fields may appear as context.key for domain policies.
         // Authority keys (sessionId, agentType, role, …) stay on SecurityContext.
         for (key, value) in resource_attrs {

@@ -332,6 +332,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
             kind: temper_runtime::persistence::EventKind::Transition,
             made_by: event.made_by.clone(),
             source: event.source,
+            cause: event.cause.clone(),
         })
         .collect();
     EntityResponse {

@@ -85,6 +85,7 @@ async fn send(state: &ServerState, request: Request<Body>) -> (StatusCode, Strin
                 context_attrs: Default::default(),
                 correlation_id: "spec-restart-test".to_string(),
                 token: None,
+                cause: None,
             },
         ));
     let response = build_router(state.clone()).oneshot(request).await.unwrap();

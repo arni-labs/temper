@@ -57,6 +57,7 @@ fn authenticate(mut request: Request<Body>, principal_id: &str) -> Request<Body>
         context_attrs: Default::default(),
         correlation_id: "odata-read-test".to_string(),
         token: None,
+        cause: None,
     };
     request
         .extensions_mut()

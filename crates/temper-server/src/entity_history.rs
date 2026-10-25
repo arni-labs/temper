@@ -176,5 +176,7 @@ fn history_event(
         // Null on events written before the kernel recorded them.
         "made_by": event.made_by,
         "source": event.source,
+        // Null on a direct request's event.
+        "cause": event.cause,
     })))
 }

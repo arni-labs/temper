@@ -186,6 +186,7 @@ async fn authenticate_test_request(mut request: Request, next: Next) -> Response
         context_attrs: Default::default(),
         correlation_id: "crucible-chat-integration".to_string(),
         token: None,
+        cause: None,
     };
     request
         .extensions_mut()

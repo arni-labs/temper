@@ -105,6 +105,7 @@ async fn get_orders(state: &ServerState, tenant: &str) -> StatusCode {
                 context_attrs: Default::default(),
                 correlation_id: "restore-isolation-test".to_string(),
                 token: None,
+                cause: None,
             },
         ));
     build_router(state.clone())

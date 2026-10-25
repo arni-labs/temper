@@ -220,6 +220,7 @@ mod tests {
                     context_attrs: Default::default(),
                     correlation_id: "admin-side-channel-test".to_string(),
                     token: None,
+                    cause: None,
                 },
             ));
         request

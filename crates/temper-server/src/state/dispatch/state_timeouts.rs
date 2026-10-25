@@ -754,11 +754,14 @@ impl ArmedTimer {
 /// The identity a timer fires as: the dispatch that armed it, as a new
 /// background action. It does not keep the arming request's idempotency key:
 /// the entity has already recorded that key, so the fire would be answered as
-/// a duplicate and never run. Its moves record the timer as their source.
-fn timer_agent(armed_by: &AgentContext) -> AgentContext {
-    let mut agent = armed_by.for_background_task();
+/// a duplicate and never run. Its moves record the timer as their source, and
+/// carry its arm: `armed_action`, the record's latest move when the timer was
+/// armed, and the arming principal.
+fn timer_agent(armed_by: &AgentContext, armed_action: Option<&str>) -> AgentContext {
+    let mut agent = armed_by
+        .for_background_task()
+        .arming_timer(crate::entity_actor::MoveSource::StateTimer, armed_action);
     agent.idempotency_key = None;
-    agent.source = crate::entity_actor::MoveSource::StateTimer;
     agent
 }
 
@@ -812,7 +815,12 @@ pub(super) fn declared_timer(
         action: st.on_timeout.clone(),
         params: serde_json::Value::Object(params),
         after_seconds: st.after_seconds,
-        agent_ctx: timer_agent(armed_by),
+        // The move that entered the timed state or reset its clock is the
+        // record's latest when a transition arms the timer.
+        agent_ctx: timer_agent(
+            armed_by,
+            state.events.back().map(|event| event.action.as_str()),
+        ),
         arm_id: sim_uuid().to_string(),
         sequence_nr: state.sequence_nr,
         started_at,
@@ -1114,6 +1122,7 @@ mod tests {
             kind: temper_runtime::persistence::EventKind::Transition,
             made_by: None,
             source: None,
+            cause: None,
         }
     }
 
