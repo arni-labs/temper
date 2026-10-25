@@ -74,7 +74,9 @@ pub(super) struct Sending<'s> {
 }
 
 impl Sending<'_> {
-    /// Anyone sends anything.
+    /// Anyone sends anything, and the kernel makes no moves of its own: what
+    /// the drop check (ADR-0150) assumes, and what a recorded trace replays
+    /// through.
     pub(super) fn anyone() -> Self {
         Self {
             policies: None,

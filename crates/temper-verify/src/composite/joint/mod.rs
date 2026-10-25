@@ -7,8 +7,13 @@
 //! invariant's entity and every type it names, one record of each, run the
 //! way the runtime runs them:
 //!
-//! - every action of every entity in scope is offered, as in the per-entity
-//!   model, with its guard resolved against the joint state;
+//! - each move is made by whoever makes it in the runtime, and the app's
+//!   Cedar decides it as them: an action someone outside may send (with the
+//!   actions a `[[liveness]]` in scope `relies_on`), a reaction as its
+//!   declared principal or its source's sender, and the kernel's own moves
+//!   (state timers, module answers and failures, module calls lost to a
+//!   restart). Without policies, anyone may send anything. Liveness reads
+//!   the same senders (`senders.rs`);
 //! - each record has an id, and a reference finds a record only when its id
 //!   field holds that record's id; walks start from every way the records'
 //!   ids can be equal or differ, so a design that works only when two ids
@@ -53,6 +58,7 @@ pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
@@ -163,9 +169,12 @@ impl fmt::Display for JointInvariantResult {
 }
 
 /// Check every `[[invariant]]` in `automatons` that reads a related entity,
-/// on the joint model of its entity and the types it names.
+/// on the joint model of its entity and the types it names. `policies`
+/// decide each move as its sender, as for liveness; without them every
+/// sender may send everything.
 pub fn verify_joint_invariants(
     automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
     budget: Budget,
 ) -> Vec<JointInvariantResult> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
@@ -216,7 +225,28 @@ pub fn verify_joint_invariants(
             continue;
         }
         let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-        let model = JointModel::new(&by_name, scope, name, &exprs, Sending::anyone(), true);
+        // Code outside the specs sends what a liveness property relies on,
+        // whoever Cedar lets send it; a rule that must always hold has to
+        // hold through those moves too.
+        let relies_on = scope
+            .iter()
+            .flat_map(|entity| {
+                by_name[entity.as_str()]
+                    .liveness
+                    .iter()
+                    .flat_map(move |live| {
+                        live.relies_on
+                            .iter()
+                            .map(move |action| (entity.clone(), action.clone()))
+                    })
+            })
+            .collect();
+        let sending = Sending {
+            policies,
+            kernel_moves: true,
+            relies_on,
+        };
+        let model = JointModel::new(&by_name, scope, name, &exprs, sending, true);
         let walk = model.walk(name, &exprs, budget);
         for (inv, outcome) in joint.iter().zip(walk.outcomes) {
             let mut found = result(inv, &model.scope, walk.states, outcome);
