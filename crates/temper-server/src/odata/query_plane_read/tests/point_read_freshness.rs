@@ -296,10 +296,10 @@ fn flaky_order_state(system_name: &str, seed: u64, qp: Arc<FlakyQueryPlane>) -> 
     state
 }
 
-/// A failed projection write is reported, and the committed state is handed to
-/// the retrying queue, so reads catch up once the store recovers.
+/// A failed projection write is tried again until it lands, so the committed
+/// state is readable when the dispatch answers.
 #[tokio::test]
-async fn a_failed_projection_write_is_retried_through_the_queue() {
+async fn a_failed_projection_write_is_retried_before_the_answer() {
     let qp = Arc::new(FlakyQueryPlane::default());
     let state = flaky_order_state("flaky-projection", 14, qp.clone());
     let tenant = TenantId::default();
@@ -315,29 +315,18 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         )
         .await
         .expect("add item");
-    assert!(
-        !created.success
-            && created
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("query projection failed")),
-        "the projection outage is reported in the response: {:?}",
-        created.error
-    );
+    assert!(created.success, "add item: {:?}", created.error);
 
-    let committed = created.state.sequence_nr;
-    for _ in 0..200 {
-        let rows = qp
-            .load_entity_catalog_rows(tenant.as_str(), "Order", &["o3".to_string()])
-            .await
-            .expect("read catalog")
-            .expect("catalog rows");
-        if rows.first().is_some_and(|row| row.sequence_nr == committed) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    panic!("the queued retry never projected the committed state");
+    let rows = qp
+        .load_entity_catalog_rows(tenant.as_str(), "Order", &["o3".to_string()])
+        .await
+        .expect("read catalog")
+        .expect("catalog rows");
+    assert!(
+        rows.first()
+            .is_some_and(|row| row.sequence_nr == created.state.sequence_nr),
+        "the retried write projected the committed state: {rows:?}"
+    );
 }
 
 /// A transition whose projection write fails is still committed, so a guard
@@ -381,13 +370,8 @@ async fn a_status_committed_behind_a_failed_projection_reaches_the_status_cache(
         .await
         .expect("submit");
     assert!(
-        !submitted.success
-            && submitted
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("query projection failed"))
-            && submitted.state.status == "Submitted",
-        "the submit commits and reports the projection outage: {:?} {}",
+        submitted.success && submitted.state.status == "Submitted",
+        "the submit commits, and its projection lands on a later try: {:?} {}",
         submitted.error,
         submitted.state.status
     );
