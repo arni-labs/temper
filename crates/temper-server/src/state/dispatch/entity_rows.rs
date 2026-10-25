@@ -32,10 +32,13 @@ pub(crate) fn timer_arm_id(state: &str, sequence_nr: u64) -> String {
 
 impl ServerState {
     /// Whether the event store writes each event's query-plane and timer
-    /// rows in its commit. Then nothing writes them after it.
+    /// rows in its commit, and they are the rows this server reads
+    /// ([`crate::storage::StorageStack::entity_rows_in_commit`]). Then
+    /// nothing writes them after it.
     pub(crate) fn entity_rows_follow_commits(&self) -> bool {
-        self.event_journal()
-            .is_some_and(|(store, _)| store.commits_entity_rows())
+        self.storage_stack
+            .as_ref()
+            .is_some_and(|stack| stack.entity_rows_in_commit())
     }
 
     /// The query plane, when the server writes a record's row after its

@@ -1540,7 +1540,7 @@ impl ServerState {
             }
         } else {
             let append_started_at = Instant::now(); // determinism-ok: production-only append wait metric
-            let rows_follow = store.commits_entity_rows();
+            let rows_follow = self.entity_rows_follow_commits();
             let projection = rows_follow.then_some(ProjectionRow::Upsert {
                 status: &state.status,
                 fields: &projection_fields,

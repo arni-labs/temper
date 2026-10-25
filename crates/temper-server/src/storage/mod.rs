@@ -38,6 +38,7 @@ use crate::platform_store::PlatformStore;
 use crate::platform_store::SimPlatformStore;
 use crate::state::trajectory::TrajectoryEntry;
 
+mod commit_writes;
 mod event_size;
 mod metadata_impls;
 mod observe_read;
@@ -1379,6 +1380,9 @@ pub struct StorageStack {
     pub data_only_create: Option<Arc<dyn DataOnlyCreateStore>>,
     pub trajectory: Option<Arc<dyn TrajectorySink>>,
     pub metadata: Option<Arc<dyn MetadataStoreProvider>>,
+    /// Which of this stack's rows the event store's commit writes
+    /// ([`StorageStack::entity_rows_in_commit`]).
+    commit_writes: commit_writes::CommitWrites,
 }
 
 impl StorageStack {
@@ -1406,6 +1410,7 @@ impl StorageStack {
             data_only_create,
             trajectory,
             metadata,
+            commit_writes: commit_writes::CommitWrites::Nothing,
         }
     }
 
@@ -1453,6 +1458,7 @@ impl StorageStack {
             Some(store.clone() as Arc<dyn TrajectorySink>),
             Some(Arc::new(SingleMetadataStoreProvider::new(store))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_tenant_router(router: TenantStoreRouter) -> Self {
@@ -1474,6 +1480,7 @@ impl StorageStack {
                 router.as_ref().clone(),
             ))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_redis(store: temper_store_redis::RedisEventStore) -> Self {
