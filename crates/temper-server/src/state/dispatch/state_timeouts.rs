@@ -412,7 +412,7 @@ impl crate::state::ServerState {
             );
         }
         let now = sim_now();
-        let timer = declared_timer(
+        let mut timer = declared_timer(
             ctx.tenant,
             ctx.entity_type,
             ctx.entity_id,
@@ -421,6 +421,11 @@ impl crate::state::ServerState {
             ctx.agent_ctx,
             now,
         );
+        if self.entity_rows_follow_commits() {
+            // The event that entered or reset the state committed this
+            // timer's row under this id (`committed_timer_row`).
+            timer.arm_id = super::entity_rows::timer_arm_id(&st.state, response.state.sequence_nr);
+        }
         let delay = Duration::from_secs(st.after_seconds);
         self.start_armed_timer(timer, delay, Reservation::Fresh)
             .await;
@@ -709,7 +714,17 @@ impl crate::state::ServerState {
                             .await;
                     }
                 }
-                state.forget_state_timer(&timer).await;
+                // A newer arm can hold this timer's row under the same id:
+                // a dispatch's arm that replaced a reconcile's for the same
+                // event. That row is the newer timer's to end.
+                let row_moved_on = state.state_timeout_tracker.current(&key) != armed_seq
+                    && state
+                        .state_timeout_tracker
+                        .armed(&key)
+                        .is_some_and(|armed| armed.arm_id == timer.arm_id);
+                if !row_moved_on {
+                    state.forget_state_timer(&timer).await;
+                }
                 state.state_timeout_tracker.dec_pending(&timer.entity_type);
             }
             .instrument(span)
@@ -757,7 +772,7 @@ impl ArmedTimer {
 /// background action. It does not keep the arming request's idempotency key:
 /// the entity has already recorded that key, so the fire would be answered as
 /// a duplicate and never run.
-fn timer_agent(armed_by: &AgentContext) -> AgentContext {
+pub(super) fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
     agent

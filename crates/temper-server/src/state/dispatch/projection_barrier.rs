@@ -25,7 +25,7 @@ impl ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) -> Result<(), PersistenceError> {
-        let Some(query_plane) = self.query_plane_store() else {
+        let Some(query_plane) = self.query_plane_written_after_commit() else {
             return Ok(());
         };
         let fields =

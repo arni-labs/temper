@@ -21,6 +21,7 @@
 //! - **Deterministic**: Same input -> same output. No randomness in transition logic.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -33,12 +34,14 @@ use temper_runtime::persistence::{
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 pub(super) use tokio::time::sleep as sleep_persistence_retry; // determinism-ok: production persistence retry backoff
 
+use crate::request_context::AgentContext;
 use crate::storage::{BackendLabel, BoxedEventStore};
 
 use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::entity_rows::{EntityRows, EntityRowsHook, RowsInput};
 use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
@@ -71,18 +74,31 @@ pub(super) fn persistence_failure(error: &PersistenceError) -> String {
 }
 
 /// The answer to an action whose event the store did not take. Only an event
-/// too large to write is a refusal: nothing was written. After any other
-/// failure the write may have landed. That includes a concurrency violation,
-/// which a store that retries a write whose answer was lost reports for a
-/// write that landed (the Turso store does).
+/// too large to write is a refusal. `persist_event` has already read the
+/// journal after any other failure: a write that landed is not answered
+/// here, a concurrency violation or a `not written` error did not land, and
+/// only an `outcome unknown` error may have. None of them is a refusal: the
+/// action itself was allowed, and a caller may try it again.
 fn persistence_failure_reply(state: EntityState, error: &PersistenceError) -> EntityResponse {
     let said = persistence_failure(error);
     match error {
         PersistenceError::EventTooLarge { .. } => EntityResponse::refused(state, said),
         PersistenceError::ConcurrencyViolation { .. }
         | PersistenceError::Storage(_)
+        | PersistenceError::OutcomeUnknown(_)
         | PersistenceError::Serialization(_) => EntityResponse::write_failed(state, said),
     }
+}
+
+/// What a write that answered with an error did, as the journal shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WriteOutcome {
+    /// The journal holds the event at `sequence_nr`.
+    Landed { sequence_nr: u64 },
+    /// The journal does not hold it, and never will.
+    NotWritten,
+    /// The journal could not be read: why.
+    Unknown(String),
 }
 
 /// Why a concurrency retry (ADR-0046) gave up without writing the action.
@@ -170,6 +186,13 @@ pub struct EntityActor {
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
     /// Run once with the state this actor rehydrated from stored events.
     on_rehydrated: Option<RehydrateHook>,
+    /// A write's outcome could not be learned, so the state in memory may not
+    /// be the journal's. Once the message that wrote it is answered, the
+    /// actor restarts and rebuilds from the journal before the next one.
+    rebuild_from_journal: AtomicBool,
+    /// Says which query-plane and timer rows an event writes, for a store
+    /// that keeps them in the journal's transaction.
+    entity_rows: Option<EntityRowsHook>,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -311,6 +334,8 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            rebuild_from_journal: AtomicBool::new(false),
+            entity_rows: None,
         }
     }
 
@@ -337,6 +362,8 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            rebuild_from_journal: AtomicBool::new(false),
+            entity_rows: None,
         }
     }
 
@@ -374,6 +401,12 @@ impl EntityActor {
     /// Attach the hook run when this actor rehydrates from stored events.
     pub(crate) fn with_on_rehydrated(mut self, hook: Option<RehydrateHook>) -> Self {
         self.on_rehydrated = hook;
+        self
+    }
+
+    /// Attach what says which query-plane and timer rows an event writes.
+    pub(crate) fn with_entity_rows(mut self, hook: Option<EntityRowsHook>) -> Self {
+        self.entity_rows = hook;
         self
     }
 
@@ -415,7 +448,16 @@ impl EntityActor {
 
     /// Persist an event to the configured event store, with the rows of the
     /// scheduled actions it arms and the removal of the one it fires in the
-    /// same commit.
+    /// same commit, and, for a store that keeps them there, the record's
+    /// query-plane row and timer row as the event leaves it (`caller` is who
+    /// a timer it arms fires as). `state` is the record after the event, at
+    /// the sequence before it.
+    ///
+    /// The answer is what the write did. `Ok` is the event's sequence: it
+    /// landed, also when the store answered an error and the journal, read
+    /// again, holds the event. A concurrency violation or a `not written`
+    /// storage error: it did not land. An `outcome unknown` error: the store
+    /// failed and the journal could not be read, so it may have.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
@@ -423,8 +465,29 @@ impl EntityActor {
         state: &mut EntityState,
         event: &EntityEvent,
         scheduled: &ScheduledRows,
+        caller: Option<&AgentContext>,
     ) -> Result<u64, PersistenceError> {
         let persistence_id = self.persistence_id();
+        let event_id = sim_uuid();
+        let entity_rows = match &self.entity_rows {
+            Some(hook) if store.commits_entity_rows() => {
+                // The record as the event leaves it. A delete sets its status
+                // only once its tombstone is written, so the status is the
+                // event's.
+                let mut after = state.clone();
+                after.sequence_nr = state.sequence_nr + 1;
+                if !event.to_status.is_empty() {
+                    after.status = event.to_status.clone();
+                }
+                after.push_event_bounded(event.clone());
+                hook(&RowsInput {
+                    state: &after,
+                    event,
+                    caller,
+                })
+            }
+            _ => EntityRows::default(),
+        };
         let payload = super::bootstrap::event_payload(event, state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
         let envelope = PersistenceEnvelope {
@@ -432,7 +495,7 @@ impl EntityActor {
             event_type: event.action.clone(),
             payload,
             metadata: EventMetadata {
-                event_id: sim_uuid(),
+                event_id,
                 causation_id: sim_uuid(),
                 correlation_id: sim_uuid(),
                 timestamp: event.timestamp,
@@ -502,13 +565,15 @@ impl EntityActor {
                 &persistence_id,
                 state.sequence_nr,
                 &[envelope],
-                CommitRows {
+                entity_rows.commit_rows(CommitRows {
                     key_rows: &key_rows,
                     vector_rows: &vector_rows,
                     reconcile_vectors,
                     scheduled_actions: &scheduled.armed,
                     fired_scheduled_action: scheduled.fired.as_deref(),
-                },
+                    projection: None,
+                    state_timer: None,
+                }),
             )
             .await;
         crate::runtime_metrics::record_event_store_append_wait(
@@ -516,21 +581,95 @@ impl EntityActor {
             "append",
             append_start.elapsed(),
         );
-        match result {
+        let error = match result {
             Ok(new_seq) => {
                 state.sequence_nr = new_seq;
                 tracing::debug!(entity = %state.entity_id, seq = new_seq, "event persisted");
-                Ok(new_seq)
+                return Ok(new_seq);
             }
-            // Refused for its size: the event store logged it once, with its words.
-            Err(e @ PersistenceError::EventTooLarge { .. }) => Err(e),
-            Err(e) => {
-                tracing::error!(
-                    entity = %state.entity_id, error = %e,
-                    "failed to persist event — state advanced but not durable"
-                );
-                Err(e)
+            // Refused before writing: nothing to learn. The event store logged
+            // a refusal for size once, with its words.
+            Err(
+                e @ (PersistenceError::EventTooLarge { .. } | PersistenceError::Serialization(_)),
+            ) => {
+                return Err(e);
             }
+            Err(e) => e,
+        };
+        // Any other answer can hide a write that landed: a commit whose answer
+        // was lost, or a store that retried one and met its own event as a
+        // concurrency violation. The store finished the write before it
+        // answered, so the journal says what it did.
+        let outcome =
+            Self::learn_write_outcome(store, &persistence_id, state.sequence_nr, event_id).await;
+        self.log_write_outcome(&event.action, &outcome, &error);
+        match outcome {
+            WriteOutcome::Landed { sequence_nr } => {
+                state.sequence_nr = sequence_nr;
+                Ok(sequence_nr)
+            }
+            WriteOutcome::NotWritten => match error {
+                PersistenceError::ConcurrencyViolation { .. } => Err(error),
+                error => Err(PersistenceError::Storage(format!("not written: {error}"))),
+            },
+            WriteOutcome::Unknown(read_error) => {
+                self.rebuild_from_journal.store(true, Ordering::Release);
+                Err(PersistenceError::OutcomeUnknown(format!(
+                    "{error}; the journal could not be read: {read_error}"
+                )))
+            }
+        }
+    }
+
+    /// What a write of `event_id` after `from_sequence` that answered with an
+    /// error did, read from the journal.
+    async fn learn_write_outcome(
+        store: &BoxedEventStore,
+        persistence_id: &str,
+        from_sequence: u64,
+        event_id: uuid::Uuid,
+    ) -> WriteOutcome {
+        match store.read_events(persistence_id, from_sequence).await {
+            Ok(events) => match events
+                .iter()
+                .find(|event| event.metadata.event_id == event_id)
+            {
+                Some(event) => WriteOutcome::Landed {
+                    sequence_nr: event.sequence_nr,
+                },
+                None => WriteOutcome::NotWritten,
+            },
+            Err(error) => WriteOutcome::Unknown(error.to_string()),
+        }
+    }
+
+    /// Log what a write whose store answered `error` did, once it is known:
+    /// the entity, its type and the action, never the action's parameters.
+    fn log_write_outcome(&self, action: &str, outcome: &WriteOutcome, error: &PersistenceError) {
+        let conflict = matches!(error, PersistenceError::ConcurrencyViolation { .. });
+        match outcome {
+            WriteOutcome::Landed { sequence_nr } => tracing::warn!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, sequence_nr, error = %error,
+                "event landed: its write answered an error, and the journal holds it"
+            ),
+            // A conflict is the record moving on; the caller replays it.
+            WriteOutcome::NotWritten if conflict => tracing::debug!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, error = %error,
+                "event not written: the journal moved on"
+            ),
+            WriteOutcome::NotWritten => tracing::error!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, error = %error,
+                "event rolled back: not written, the record keeps its state"
+            ),
+            WriteOutcome::Unknown(read_error) => tracing::error!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, error = %error,
+                read_error = %read_error,
+                "event outcome unknown: the write failed and the journal could not be read"
+            ),
         }
     }
 
@@ -1110,6 +1249,7 @@ impl Actor for EntityActor {
                     &mut state,
                     &created,
                     &ScheduledRows::default(),
+                    None,
                 )
                 .await
                 .map_err(|e| {
@@ -1129,6 +1269,45 @@ impl Actor for EntityActor {
         &self,
         msg: Self::Msg,
         state: &mut Self::State,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), ActorError> {
+        let handled = Box::pin(self.handle_message(msg, state, ctx)).await;
+        // The message is answered. A write whose outcome could not be learned
+        // leaves memory that may not be the journal's: restart, so the next
+        // message is answered from the journal (`pre_start` replays it, and
+        // fails until it can read it).
+        if self.rebuild_from_journal.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id,
+                "rebuilding from the journal: a write's outcome could not be learned"
+            );
+            return Err(ActorError::custom(format!(
+                "{}:{} rebuilds from its journal: a write's outcome could not be learned",
+                self.entity_type, self.entity_id
+            )));
+        }
+        handled
+    }
+
+    async fn post_stop(&self, state: Self::State, _ctx: &mut ActorContext<Self>) {
+        tracing::info!(
+            entity = %state.entity_id,
+            status = %state.status,
+            events_total = state.total_event_count,
+            events_recent = state.events.len(),
+            "entity actor stopped"
+        );
+    }
+}
+
+impl EntityActor {
+    /// Handle one message (`Actor::handle` restarts the actor after it when
+    /// a write's outcome could not be learned).
+    async fn handle_message(
+        &self,
+        msg: EntityMsg,
+        state: &mut EntityState,
         ctx: &mut ActorContext<Self>,
     ) -> Result<(), ActorError> {
         match msg {
@@ -1367,7 +1546,14 @@ impl Actor for EntityActor {
                         (self.event_journal.as_ref(), self.event_backend)
                     {
                         let first_persist = self
-                            .persist_event(store, backend, state, &event, &scheduled)
+                            .persist_event(
+                                store,
+                                backend,
+                                state,
+                                &event,
+                                &scheduled,
+                                caller.as_deref(),
+                            )
                             .await;
 
                         match first_persist {
@@ -1454,13 +1640,12 @@ impl Actor for EntityActor {
                                     state_before = state.clone();
                                     event_count_before = state.total_event_count;
 
-                                    // A store that retries a write whose answer
-                                    // was lost reports that write as a
-                                    // concurrency violation. If the journal now
-                                    // holds this action's key, an earlier attempt
-                                    // landed: writing it again would apply it
-                                    // twice, and its guard refusing it now is
-                                    // not a refusal.
+                                    // This attempt's own write did not land
+                                    // (`persist_event` read the journal). If the
+                                    // journal holds this action's key, another
+                                    // ask carrying the same key wrote it: writing
+                                    // it again would apply it twice, and its
+                                    // guard refusing it now is not a refusal.
                                     if let Some(key) = idempotency_key.as_deref()
                                         && state.has_processed_idempotency_key(key)
                                     {
@@ -1558,6 +1743,7 @@ impl Actor for EntityActor {
                                             state,
                                             &retry_event,
                                             &retry_scheduled,
+                                            caller.as_deref(),
                                         )
                                         .await
                                     {
@@ -1592,8 +1778,9 @@ impl Actor for EntityActor {
                                             continue;
                                         }
                                         Err(PersistenceError::ConcurrencyViolation { .. }) => {
-                                            // The last attempt is not replayed,
-                                            // so it may have landed.
+                                            // The last attempt did not land
+                                            // either (`persist_event` read the
+                                            // journal); the record kept moving.
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
                                                 Some(RetryGaveUp::WriteFailed(
@@ -1891,7 +2078,14 @@ impl Actor for EntityActor {
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
                     && let Err(e) = self
-                        .persist_event(store, backend, state, &deleted, &ScheduledRows::default())
+                        .persist_event(
+                            store,
+                            backend,
+                            state,
+                            &deleted,
+                            &ScheduledRows::default(),
+                            None,
+                        )
                         .await
                 {
                     ctx.reply(persistence_failure_reply(state.clone(), &e));
@@ -1921,16 +2115,6 @@ impl Actor for EntityActor {
             }
         }
         Ok(())
-    }
-
-    async fn post_stop(&self, state: Self::State, _ctx: &mut ActorContext<Self>) {
-        tracing::info!(
-            entity = %state.entity_id,
-            status = %state.status,
-            events_total = state.total_event_count,
-            events_recent = state.events.len(),
-            "entity actor stopped"
-        );
     }
 }
 

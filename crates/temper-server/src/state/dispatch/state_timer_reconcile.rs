@@ -150,12 +150,24 @@ impl ServerState {
             return TimerFollow::Settled;
         };
         let armed = self.armed_state_timer(tenant, entity_type, entity_id);
-        if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() {
+        // Rows that follow commits are the timers the journal armed: one the
+        // record's events left for this state is the timer it has, even when
+        // the process never armed it (the move's answer was lost, or the
+        // actor rebuilt from its journal).
+        let row = match armed {
+            Some(_) => None,
+            None => self
+                .committed_state_timer_row(tenant, entity_type, entity_id)
+                .await
+                .filter(|row| row.state == st.state),
+        };
+        if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() && row.is_none() {
             return TimerFollow::WaitsForRow;
         }
         let known = armed_by
             .cloned()
-            .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()));
+            .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
+            .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
         let identity = match known {
             Some(identity) => identity,
             None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
@@ -172,6 +184,9 @@ impl ServerState {
             &identity,
             started_at,
         );
+        if let Some(row) = row {
+            timer.arm_id = row.arm_id;
+        }
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
         let delay = remaining_budget(started_at, st.after_seconds, now);
         if self
