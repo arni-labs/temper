@@ -10,6 +10,7 @@ pub(crate) mod bootstrap;
 pub mod effects;
 mod field_updates;
 mod replay_validation;
+mod scheduled_rows;
 pub mod sim_handler;
 mod snapshot_queue;
 pub mod types;

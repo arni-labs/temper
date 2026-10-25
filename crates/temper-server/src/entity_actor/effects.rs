@@ -80,6 +80,11 @@ pub struct ScheduledAction {
     pub action: String,
     /// Delay in seconds before dispatching the action.
     pub delay_seconds: u64,
+    /// The arming event's journal sequence and this action's place among the
+    /// event's schedules, `<seq>.<index>`. The actor sets it when it writes
+    /// that event; empty until then.
+    #[serde(default)]
+    pub arm_id: String,
 }
 
 /// A request to spawn a child entity (executed post-transition by dispatch pipeline).
@@ -710,6 +715,7 @@ pub fn apply_effects(
                 scheduled_actions.push(ScheduledAction {
                     action: action.clone(),
                     delay_seconds: *delay_seconds,
+                    arm_id: String::new(),
                 });
                 tracing::info!(
                     entity_type = %state.entity_type,
@@ -838,6 +844,7 @@ pub fn resolve_schedule_at_requests(
             Some(ScheduledAction {
                 action: req.action.clone(),
                 delay_seconds,
+                arm_id: String::new(),
             })
         })
         .collect()

@@ -635,6 +635,7 @@ impl crate::state::ServerState {
         );
 
         let state = self.clone();
+        let armed_by = crate::trace_context::cause();
         tokio::spawn(async move {
             // determinism-ok: wall-clock timer fires a side-effect action;
             // the action itself is deterministic under DST via sim_now().
@@ -644,7 +645,8 @@ impl crate::state::ServerState {
                 None => None,
             };
 
-            let span = tracing::info_span!(
+            let span = crate::trace_context::runtime_work_span!(
+                armed_by,
                 "dispatch.state_timeout.fire",
                 tenant = %timer.tenant,
                 entity_type = %timer.entity_type,

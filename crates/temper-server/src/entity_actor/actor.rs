@@ -28,7 +28,7 @@ use temper_jit::table::{Effect, TransitionTable};
 use temper_observe::wide_event;
 use temper_runtime::actor::{Actor, ActorContext, ActorError};
 use temper_runtime::persistence::{
-    COMPOSITE_EVENT_TYPE, EventMetadata, PersistenceEnvelope, PersistenceError,
+    COMPOSITE_EVENT_TYPE, CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError,
 };
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 pub(super) use tokio::time::sleep as sleep_persistence_retry; // determinism-ok: production persistence retry backoff
@@ -39,6 +39,7 @@ use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
@@ -412,15 +413,18 @@ impl EntityActor {
         }
     }
 
-    /// Persist an event to the configured event store.
+    /// Persist an event to the configured event store, with the rows of the
+    /// scheduled actions it arms and the removal of the one it fires in the
+    /// same commit.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
         backend: BackendLabel,
-        persistence_id: &str,
         state: &mut EntityState,
         event: &EntityEvent,
+        scheduled: &ScheduledRows,
     ) -> Result<u64, PersistenceError> {
+        let persistence_id = self.persistence_id();
         let payload = super::bootstrap::event_payload(event, state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
         let envelope = PersistenceEnvelope {
@@ -432,7 +436,7 @@ impl EntityActor {
                 causation_id: sim_uuid(),
                 correlation_id: sim_uuid(),
                 timestamp: event.timestamp,
-                actor_id: persistence_id.to_string(),
+                actor_id: persistence_id.clone(),
             },
         };
 
@@ -494,13 +498,17 @@ impl EntityActor {
         };
         let append_start = Instant::now(); // determinism-ok: production-only event-store wait metric
         let result = store
-            .append_with_index_rows(
-                persistence_id,
+            .append_with_rows(
+                &persistence_id,
                 state.sequence_nr,
                 &[envelope],
-                &key_rows,
-                &vector_rows,
-                reconcile_vectors,
+                CommitRows {
+                    key_rows: &key_rows,
+                    vector_rows: &vector_rows,
+                    reconcile_vectors,
+                    scheduled_actions: &scheduled.armed,
+                    fired_scheduled_action: scheduled.fired.as_deref(),
+                },
             )
             .await;
         crate::runtime_metrics::record_event_store_append_wait(
@@ -852,6 +860,9 @@ impl EntityActor {
                             {
                                 let effects = effects.to_vec();
                                 // Shared effect application — same code as handle() and simulation.
+                                // Its scheduled actions are not armed again here:
+                                // their rows, written with the event, are the
+                                // source of truth (`rearm_scheduled_actions`).
                                 let (
                                     _custom_effects,
                                     _scheduled_actions,
@@ -1100,14 +1111,20 @@ impl Actor for EntityActor {
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
             {
-                self.persist_event(store, backend, &self.persistence_id(), &mut state, &created)
-                    .await
-                    .map_err(|e| {
-                        ActorError::custom(format!(
-                            "failed to persist bootstrap Created event for {}:{}: {}",
-                            self.entity_type, self.entity_id, e
-                        ))
-                    })?;
+                self.persist_event(
+                    store,
+                    backend,
+                    &mut state,
+                    &created,
+                    &ScheduledRows::default(),
+                )
+                .await
+                .map_err(|e| {
+                    ActorError::custom(format!(
+                        "failed to persist bootstrap Created event for {}:{}: {}",
+                        self.entity_type, self.entity_id, e
+                    ))
+                })?;
             }
             state.push_event_bounded(created);
         }
@@ -1128,6 +1145,7 @@ impl Actor for EntityActor {
                 related,
                 idempotency_key,
                 expected_authorization_precondition,
+                caller,
             } => {
                 // Capture start time for span duration (DST-safe: sim_now()
                 // returns logical clock in simulation, wall clock in production).
@@ -1344,11 +1362,19 @@ impl Actor for EntityActor {
                     // replay events, re-evaluate the action against the caught-up
                     // state, and retry the persist up to two more times. Other
                     // error variants fail immediately (same as before).
+                    // The rows of the scheduled actions it arms are written
+                    // with the event, so a restart arms them again.
+                    let scheduled = self.arm_scheduled_actions(
+                        &mut result.scheduled_actions,
+                        state,
+                        &event,
+                        caller.as_deref(),
+                    );
                     if let (Some(store), Some(backend)) =
                         (self.event_journal.as_ref(), self.event_backend)
                     {
                         let first_persist = self
-                            .persist_event(store, backend, &self.persistence_id(), state, &event)
+                            .persist_event(store, backend, state, &event, &scheduled)
                             .await;
 
                         match first_persist {
@@ -1459,7 +1485,7 @@ impl Actor for EntityActor {
                                     // terminal state during the race) — if so,
                                     // surface that error rather than silently
                                     // dropping the caller.
-                                    let retry_result = process_action_with_blob_prestate(
+                                    let mut retry_result = process_action_with_blob_prestate(
                                         state,
                                         &table,
                                         &name,
@@ -1526,13 +1552,19 @@ impl Actor for EntityActor {
                                     ))
                                     .await;
 
+                                    let retry_scheduled = self.arm_scheduled_actions(
+                                        &mut retry_result.scheduled_actions,
+                                        state,
+                                        &retry_event,
+                                        caller.as_deref(),
+                                    );
                                     match self
                                         .persist_event(
                                             store,
                                             backend,
-                                            &self.persistence_id(),
                                             state,
                                             &retry_event,
+                                            &retry_scheduled,
                                         )
                                         .await
                                     {
@@ -1866,7 +1898,7 @@ impl Actor for EntityActor {
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
                     && let Err(e) = self
-                        .persist_event(store, backend, &self.persistence_id(), state, &deleted)
+                        .persist_event(store, backend, state, &deleted, &ScheduledRows::default())
                         .await
                 {
                     ctx.reply(persistence_failure_reply(state.clone(), &e));

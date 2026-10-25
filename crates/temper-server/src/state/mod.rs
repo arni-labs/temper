@@ -342,6 +342,12 @@ fn state_cache_budget() -> usize {
     *STATE_CACHE_BUDGET.get_or_init(|| env_usize("TEMPER_STATE_CACHE_BUDGET", 10_000))
 }
 
+/// A `[[state]]` declared `query_indexed = false` stays in entity state but is
+/// kept out of the durable query projection and its field index.
+fn left_out_of_query_projection(state_var: &temper_spec::automaton::StateVar) -> bool {
+    state_var.query_indexed == Some(false)
+}
+
 /// Summary of a query-projection replay parity verification run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct QueryProjectionReplayParityReport {
@@ -518,6 +524,12 @@ pub struct ServerState {
     /// Where armed timer rows are kept when the storage stack has no metadata
     /// store to keep them, as under simulation. None: the metadata store.
     pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
+    /// The scheduled actions armed in this process: how many live timers
+    /// each row has. A row is armed only while it has none, however many
+    /// replies hand it back (a cached reply to a retried fire carries the
+    /// schedules it armed), and leaves the map when its fire ends.
+    pub(crate) scheduled_armed:
+        Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
@@ -619,8 +631,6 @@ pub struct ServerState {
     /// receive a clone of this Arc via `with_shared_streams` so
     /// FFI calls from the guest resolve to the same handle IDs.
     pub http_stream_registry: Arc<temper_wasm::http_stream::HttpStreamRegistry>,
-    /// Long-lived workflow root spans keyed by workflow.run_id.
-    pub(crate) workflow_spans: Arc<crate::workflow_tracing::WorkflowSpanRegistry>,
     /// Public hostnames owned by this process that may use in-process TData
     /// dispatch from WASM guests instead of leaving through the public edge.
     pub(crate) local_tdata_hosts: Arc<BTreeSet<String>>,
@@ -822,6 +832,7 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
@@ -855,7 +866,6 @@ impl ServerState {
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
-            workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
@@ -1102,6 +1112,7 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
@@ -1135,7 +1146,6 @@ impl ServerState {
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
-            workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
@@ -1179,12 +1189,30 @@ impl ServerState {
 
         let mut projected = obj.clone();
         for state_var in &spec.automaton.state {
-            if state_var.query_indexed == Some(false) {
+            if left_out_of_query_projection(state_var) {
                 projected.remove(&state_var.name);
             }
         }
 
         serde_json::Value::Object(projected)
+    }
+
+    /// Whether the query projection's field index can hold `field_name` for
+    /// `entity_type`: false when the spec declares that field
+    /// `query_indexed = false`, which [`Self::query_projection_fields`] drops.
+    pub(crate) fn query_projection_indexes_field(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        field_name: &str,
+    ) -> bool {
+        let registry = self.registry.read().unwrap();
+        let Some(spec) = registry.get_spec(tenant, entity_type) else {
+            return true;
+        };
+        !spec.automaton.state.iter().any(|state_var| {
+            state_var.name == field_name && left_out_of_query_projection(state_var)
+        })
     }
 
     pub(crate) fn query_projection_state(
