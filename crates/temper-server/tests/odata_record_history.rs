@@ -400,5 +400,68 @@ async fn history_pages_a_turso_journal() {
         .flat_map(|page| sequences_and_actions(page))
         .collect();
     assert_eq!(walked, expected);
+    for after in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let page = store
+            .read_events_page("default:Order:ord-history-turso", after, 2)
+            .await
+            .expect("cursor beyond stored range");
+        assert!(page.is_empty(), "cursor {after} returned old events");
+        let (status, body) = get_json(
+            &state,
+            &format!("/tdata/Orders('{id}')/$history?after={after}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["events"], serde_json::json!([]));
+        assert!(body["next"].is_null());
+    }
     let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test]
+async fn history_reports_corrupt_transitions_but_excludes_composite_audits() {
+    let (state, store) = common::build_default_state(5006, "history-corrupt");
+    install_policy(&state, ORDER_READ_POLICY);
+    let id = "ord-history-corrupt";
+    create_order(&state, id).await;
+    let persistence_id = format!("default:Order:{id}");
+    let mut envelope = store
+        .read_events(&persistence_id, 0)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let previous = envelope.sequence_nr;
+    envelope.sequence_nr += 1;
+    envelope.event_type = temper_runtime::persistence::COMPOSITE_EVENT_TYPE.to_string();
+    envelope.payload = serde_json::json!({"audit": true});
+    store
+        .append(&persistence_id, previous, &[envelope.clone()])
+        .await
+        .unwrap();
+
+    let (status, body) = get_json(
+        &state,
+        &format!("/tdata/Orders('{id}')/$history?after={previous}&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["events"], serde_json::json!([]));
+
+    let previous = envelope.sequence_nr;
+    envelope.sequence_nr += 1;
+    envelope.event_type = "AddItem".to_string();
+    store
+        .append(&persistence_id, previous, &[envelope])
+        .await
+        .unwrap();
+    let (status, body) = get_json(
+        &state,
+        &format!("/tdata/Orders('{id}')/$history?after={previous}&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert_eq!(body["error"]["code"], "HistoryReadError");
+    assert!(body.get("events").is_none());
+    assert!(body.get("next").is_none());
 }
