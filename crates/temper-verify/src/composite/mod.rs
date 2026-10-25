@@ -23,7 +23,6 @@ pub use joint::{
 };
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,
-    verify_composite_with_budget,
 };
 
 use std::collections::BTreeMap;

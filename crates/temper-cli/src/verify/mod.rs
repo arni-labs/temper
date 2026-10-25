@@ -329,7 +329,8 @@ fn print_joint_report(check: &str, rows: Vec<(&str, String, String)>) -> Result<
 /// of the entity trigger graph (so every entity is covered), checks the
 /// `no_dropped_reaction` property, and reports every dropped reaction with
 /// enough detail to name it. A dropped reaction GATES — it fails the command.
-/// An INCOMPLETE run (budget exhausted) fails complete-application verification.
+/// An INCOMPLETE run (the walk did not fit in the memory this host leaves it)
+/// fails complete-application verification.
 fn run_composite_verification(
     parsed_automata: &std::collections::BTreeMap<String, temper_spec::automaton::Automaton>,
 ) -> Result<()> {
@@ -339,7 +340,8 @@ fn run_composite_verification(
         parsed_automata.values().collect();
 
     println!("\nRunning composite cross-entity verification (ADR-0150)...");
-    let results = verify_all(&automaton_refs);
+    let progress = temper_verify::composite::Progress::default();
+    let results = verify_all(&automaton_refs, joint_bound(&progress));
     report_composite_results(&results)
 }
 
