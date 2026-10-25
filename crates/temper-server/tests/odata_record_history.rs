@@ -349,9 +349,12 @@ async fn history_of_a_deleted_record_answers_as_the_record_read() {
     let id = "ord-history-deleted";
     create_order(&state, id).await;
     add_item(&state, id, 1).await;
-    let (status, body) =
-        request_json(&state, Method::DELETE, &format!("/tdata/Orders('{id}')")).await;
-    assert!(status.is_success(), "delete failed: {status} {body:?}");
+    // The kernel's delete writes the tombstone; the OData DELETE in front of
+    // it is not what this test is about.
+    state
+        .delete_tenant_entity(&TenantId::default(), "Order", id)
+        .await
+        .expect("delete order");
 
     let (record_status, record) = get_json(&state, &format!("/tdata/Orders('{id}')")).await;
     let (history_status, history) =
