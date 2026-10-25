@@ -57,7 +57,7 @@ temper_module! {
             .config
             .get("sandbox_url")
             .cloned()
-            .ok_or_else(|| "sandbox_url missing from the gepa-proposer-agent config".to_string())?;
+            .unwrap_or_else(|| "http://127.0.0.1:9999".to_string());
         let model = ctx
             .config
             .get("model")

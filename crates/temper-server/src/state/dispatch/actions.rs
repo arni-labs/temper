@@ -585,8 +585,7 @@ impl crate::state::ServerState {
                     &response.state.booleans,
                 ) {
                     response.success = false;
-                    response.error = Some(error.message);
-                    response.refusal = error.refusal;
+                    response.error = Some(error);
                     let ctx = PostDispatchContext {
                         tenant,
                         entity_type,

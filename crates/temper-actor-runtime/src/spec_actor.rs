@@ -320,7 +320,7 @@ impl Actor for SpecDrivenActor {
                 &actor_state.counters,
                 &actor_state.booleans,
             )
-            .map_err(|error| ActorError::Rejected(error.message))?;
+            .map_err(ActorError::Rejected)?;
         let eval_ctx = actor_state.to_eval_context();
         let result = self
             .table

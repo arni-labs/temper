@@ -335,7 +335,6 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
         .collect();
     EntityResponse {
         success: response.success,
-        refusal: response.refusal.clone(),
         state: EntityState {
             entity_type: state.entity_type.clone(),
             entity_id: state.entity_id.clone(),

@@ -236,7 +236,6 @@ impl ServerState {
 
         let response = EntityResponse {
             success: true,
-            refusal: None,
             state,
             error: None,
             custom_effects: vec![],

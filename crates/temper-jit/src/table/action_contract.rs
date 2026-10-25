@@ -1,7 +1,6 @@
 //! Pure validation shared by native execution and deterministic simulation.
 
 use super::TransitionTable;
-use super::refusal::{ContractError, Refusal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,27 +294,24 @@ impl TransitionTable {
         fields: &Value,
         counters: &BTreeMap<String, usize>,
         booleans: &BTreeMap<String, bool>,
-    ) -> Result<(), ContractError> {
+    ) -> Result<(), String> {
         let contract = self.action_contracts.get(action);
         if !self.strict_action_params
             && contract.is_none_or(|contract| contract.constraints.is_empty())
         {
             return Ok(());
         }
-        let object = params.as_object().ok_or_else(|| {
-            ContractError::message("Action parameters must be a JSON object".into())
-        })?;
-        let contract = contract.ok_or_else(|| {
-            ContractError::message(format!(
-                "Action '{action}' has no declared parameter contract"
-            ))
-        })?;
+        let object = params
+            .as_object()
+            .ok_or_else(|| "Action parameters must be a JSON object".to_owned())?;
+        let contract = contract
+            .ok_or_else(|| format!("Action '{action}' has no declared parameter contract"))?;
         if self.strict_action_params {
             for key in object.keys() {
                 if !contract.params.contains(key) {
-                    return Err(ContractError::message(format!(
+                    return Err(format!(
                         "Action '{action}' does not accept parameter '{key}'"
-                    )));
+                    ));
                 }
             }
         }
@@ -332,20 +328,17 @@ impl TransitionTable {
                         .is_some_and(|items| items.iter().all(Value::is_string)),
                 };
                 if !valid {
-                    return Err(ContractError::message(format!(
+                    return Err(format!(
                         "Action '{action}' parameter '{name}' has an invalid type"
-                    )));
+                    ));
                 }
             }
         }
         for constraint in &contract.constraints {
             let name = constraint.param();
-            let param = object.get(name).ok_or_else(|| ContractError {
-                message: format!("Action '{action}' requires parameter '{name}'"),
-                refusal: Some(Refusal::MissingParameter {
-                    parameter: name.to_string(),
-                }),
-            })?;
+            let param = object
+                .get(name)
+                .ok_or_else(|| format!("Action '{action}' requires parameter '{name}'"))?;
             let field = constraint.field().and_then(|name| {
                 counters
                     .get(name)
@@ -372,12 +365,9 @@ impl TransitionTable {
                 }
             };
             if !passed {
-                return Err(ContractError {
-                    message: format!("Action '{action}' constraint failed for parameter '{name}'"),
-                    refusal: Some(Refusal::ParameterConstraint {
-                        parameter: name.to_string(),
-                    }),
-                });
+                return Err(format!(
+                    "Action '{action}' constraint failed for parameter '{name}'"
+                ));
             }
         }
         Ok(())

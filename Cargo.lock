@@ -7103,7 +7103,6 @@ dependencies = [
  "temper-store-turso",
  "temper-transport",
  "temper-verify",
- "temper-wasm",
  "tempfile",
  "termimad",
  "tikv-jemallocator",

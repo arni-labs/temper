@@ -17,9 +17,8 @@ use super::response::annotate_entity;
 use crate::authz::{DenialInput, record_authz_denial};
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::AgentContext;
-use crate::response::{ODataResponse, odata_denial, odata_error, odata_refusal};
+use crate::response::{ODataResponse, odata_denial, odata_error};
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
-use temper_jit::table::ContractError;
 
 /// Notes for the request's handler span: OpenTelemetry attributes and status set
 /// on the current tracing span.
@@ -236,7 +235,7 @@ pub(super) async fn dispatch_bound_action(
     if !authz_snapshot.exists {
         let validation = state
             .transition_table_for_dispatch(tenant, entity_type)
-            .map_err(|error| ContractError::message(error.to_string()))
+            .map_err(|error| error.to_string())
             .and_then(|table| {
                 table.validate_action_params(
                     action.rsplit('.').next().unwrap_or(action),
@@ -248,13 +247,8 @@ pub(super) async fn dispatch_bound_action(
             });
         if let Err(error) = validation {
             action_span.set_status(Status::error("StrictActionContract"));
-            return odata_refusal(
-                StatusCode::CONFLICT,
-                "StrictActionContract",
-                &error.message,
-                error.refusal.as_ref(),
-            )
-            .into_response();
+            return odata_error(StatusCode::CONFLICT, "StrictActionContract", &error)
+                .into_response();
         }
     }
     // After Cedar: when enforcing, a body with params the action does not
@@ -387,11 +381,10 @@ pub(super) async fn dispatch_bound_action(
                 .into_response()
             } else {
                 action_span.set_status(Status::error(response.error.clone().unwrap_or_default()));
-                odata_refusal(
+                odata_error(
                     StatusCode::CONFLICT,
                     "ActionFailed",
-                    response.error.as_deref().unwrap_or("Action failed"),
-                    response.refusal.as_ref(),
+                    &response.error.unwrap_or_else(|| "Action failed".into()),
                 )
                 .into_response()
             }

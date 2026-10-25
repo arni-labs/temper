@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, VecDeque};
 fn make_response(status: &str) -> EntityResponse {
     EntityResponse {
         success: true,
-        refusal: None,
         state: EntityState {
             entity_type: String::new(),
             entity_id: String::new(),
