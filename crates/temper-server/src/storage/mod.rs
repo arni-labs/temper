@@ -102,6 +102,8 @@ pub trait DynEventStore: Send + Sync {
         rows: temper_runtime::persistence::CommitRows<'a>,
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
 
+    fn commits_entity_rows(&self) -> bool;
+
     fn list_scheduled_actions<'a>(
         &'a self,
         tenant: &'a str,
@@ -284,6 +286,10 @@ where
             events,
             rows,
         ))
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        EventStore::commits_entity_rows(self)
     }
 
     fn list_scheduled_actions<'a>(
@@ -591,6 +597,12 @@ impl BoxedEventStore {
         self.store
             .append_with_rows(persistence_id, expected_sequence, events, rows)
             .await
+    }
+
+    /// Whether an append writes the entity's query-plane row and timer row
+    /// in its own transaction (`EventStore::commits_entity_rows`).
+    pub fn commits_entity_rows(&self) -> bool {
+        self.store.commits_entity_rows()
     }
 
     /// Every pending scheduled action of `tenant`, kept with its journal.

@@ -17,9 +17,19 @@
 //!   not be read when it was answered;
 //! - the record's state in memory is the state its journal gives: when a
 //!   write's outcome could not be learned, the record rebuilds from its
-//!   journal before its next answer.
+//!   journal before its next answer;
+//! - a move takes one commit;
+//! - the record's query-plane row and its timer row are what its journal
+//!   says (`rows::rows_follow_journal`), whatever the answer and whether
+//!   the caller hung up.
+//!
+//! And once the moves are done: a day later every timer has fired, so no
+//! record is still `Busy`, however its move that entered `Busy` was answered.
 //!
 //! The server runs in one single-threaded, paused-clock Tokio runtime.
+
+#[path = "dst_commit_outcome/rows.rs"]
+mod rows;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -164,6 +174,9 @@ enum Answer {
 struct Run {
     seed: u64,
     trace: Vec<String>,
+    /// Broken invariants the run goes on past, so the ones after them are
+    /// checked too: the first break of each.
+    noted: BTreeMap<&'static str, String>,
 }
 
 impl Run {
@@ -173,6 +186,14 @@ impl Run {
             self.seed,
             self.trace.join("\n  ")
         )
+    }
+
+    /// Note a broken invariant and go on.
+    fn note(&mut self, invariant: &'static str, detail: String) {
+        if !self.noted.contains_key(invariant) {
+            let report = self.fail(invariant, detail);
+            self.noted.insert(invariant, report);
+        }
     }
 }
 
@@ -194,6 +215,7 @@ fn server(store: &SimEventStore, seed: u64) -> ServerState {
     let mut state =
         ServerState::from_registry(ActorSystem::new(format!("commit-{seed}")), registry);
     state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
+    state.state_timer_rows = Some(std::sync::Arc::new(rows::SimTimerRows(store.clone())));
     state.action_dispatch_timeout = Duration::from_millis(25);
     state
 }
@@ -258,6 +280,12 @@ async fn move_once(
 
 /// The record's journal, replayed: (sequence, bumps, status).
 async fn journal_state(store: &SimEventStore, id: &str) -> (u64, i64, String) {
+    let (journal, bumps) = journal(store, id).await;
+    (journal.sequence, bumps, journal.status)
+}
+
+/// The record's journal, replayed, and its bumps.
+async fn journal(store: &SimEventStore, id: &str) -> (rows::Journal, i64) {
     let events = store
         .read_events(&journal_of(id), 0)
         .await
@@ -265,18 +293,38 @@ async fn journal_state(store: &SimEventStore, id: &str) -> (u64, i64, String) {
     let sequence = events.last().map(|event| event.sequence_nr).unwrap_or(0);
     let mut bumps = 0;
     let mut status = "Open".to_string();
+    let mut busy_since = None;
     for event in &events {
         match event.event_type.as_str() {
             "Bump" => bumps += 1,
-            "Hold" => status = "Busy".to_string(),
-            "Release" | "Expire" => status = "Open".to_string(),
+            "Hold" => {
+                status = "Busy".to_string();
+                busy_since = Some(event.sequence_nr);
+            }
+            "Release" | "Expire" => {
+                status = "Open".to_string();
+                busy_since = None;
+            }
             _ => {}
         }
     }
-    (sequence, bumps, status)
+    let journal = rows::Journal {
+        sequence,
+        status,
+        busy_since,
+    };
+    (journal, bumps)
 }
 
-fn run_seed(seed: u64) -> Result<usize, String> {
+/// Note it when `id`'s rows do not say what its journal says.
+async fn check_rows(run: &mut Run, store: &SimEventStore, id: &str) {
+    let (journal, _) = journal(store, id).await;
+    if let Err((invariant, detail)) = rows::rows_follow_journal(store, id, &journal) {
+        run.note(invariant, detail);
+    }
+}
+
+fn run_seed(seed: u64) -> Result<usize, Vec<String>> {
     let (_guard, _clock, _ids) = install_deterministic_context(seed);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -288,8 +336,9 @@ fn run_seed(seed: u64) -> Result<usize, String> {
     let mut run = Run {
         seed,
         trace: Vec::new(),
+        noted: BTreeMap::new(),
     };
-    runtime.block_on(async {
+    let ended = runtime.block_on(async {
         let state = server(&store, seed);
         let tenant = TenantId::new(TENANT);
         let mut status: BTreeMap<String, String> = BTreeMap::new();
@@ -321,6 +370,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             fault.apply(&store, &journal);
             faulted += usize::from(fault != Fault::None);
 
+            let commits_before = store.commits(&journal);
             let answer = move_once(&state, &id, action, &mark, hang_up_after).await;
             // A hung-up move's actor keeps going; let its late writes land.
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -337,6 +387,14 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                     format!("{mark} landed {landings} times"),
                 ));
             }
+            let commits = store.commits(&journal) - commits_before;
+            if commits > 1 {
+                run.note(
+                    "a move takes one commit",
+                    format!("{mark} took {commits} commits"),
+                );
+            }
+            check_rows(&mut run, &store, &id).await;
             match &answer {
                 Answer::Success if landings != 1 => {
                     return Err(run.fail(
@@ -378,8 +436,33 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                 status.insert(id.clone(), journal_status);
             }
         }
+
+        // A day later every timer has fired: no record waits in `Busy`.
+        tokio::time::sleep(Duration::from_secs(86_400 + 60)).await;
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        settle().await;
+        for id in (0..RECORDS).map(|i| format!("t-{i}")) {
+            let (_, _, journal_status) = journal_state(&store, &id).await;
+            if journal_status == "Busy" {
+                return Err(run.fail(
+                    "every timer fires, whoever hung up",
+                    format!("{id} is still Busy a day later"),
+                ));
+            }
+            check_rows(&mut run, &store, &id).await;
+        }
         Ok(faulted)
-    })
+    });
+    let mut broken: Vec<String> = run.noted.into_values().collect();
+    match ended {
+        Ok(faulted) if broken.is_empty() => Ok(faulted),
+        Ok(_) => Err(broken),
+        Err(report) => {
+            broken.insert(0, report);
+            Err(broken)
+        }
+    }
 }
 
 #[test]
@@ -389,12 +472,14 @@ fn dst_a_moves_answer_is_what_its_commit_did() {
     for seed in 0..SEEDS {
         match run_seed(seed) {
             Ok(moves) => faulted += moves,
-            Err(report) => {
-                let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
-                let entry = broken
-                    .entry(invariant)
-                    .or_insert_with(|| (Vec::new(), report));
-                entry.0.push(seed);
+            Err(reports) => {
+                for report in reports {
+                    let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
+                    let entry = broken
+                        .entry(invariant)
+                        .or_insert_with(|| (Vec::new(), report));
+                    entry.0.push(seed);
+                }
             }
         }
     }

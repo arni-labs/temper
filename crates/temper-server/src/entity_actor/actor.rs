@@ -535,6 +535,8 @@ impl EntityActor {
                     reconcile_vectors,
                     scheduled_actions: &scheduled.armed,
                     fired_scheduled_action: scheduled.fired.as_deref(),
+                    projection: None,
+                    state_timer: None,
                 },
             )
             .await;
