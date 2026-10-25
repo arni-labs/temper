@@ -211,6 +211,7 @@ impl JointModel {
             .map(|(entity, model)| {
                 let mut keep = read.get(&entity).cloned().unwrap_or_default();
                 keep.extend(order.fields(&entity).map(|(field, _)| field.to_string()));
+                keep.extend(deciding(by_name[entity.as_str()], &reactions, &entity));
                 let mut model = if cut { slice(model, keep) } else { model };
                 order.bound(&entity, &mut model);
                 (entity, model)
@@ -467,4 +468,30 @@ fn partitions(n: usize) -> Vec<Vec<usize>> {
             .collect();
     }
     out
+}
+
+/// The fields of an `entity` record that decide whether a move happens
+/// without being a guard: those a constraint compares a parameter with, and
+/// those the guard of a trigger it fires reads. A cut keeps them, so a
+/// record refusing a dispatch for a stale count, or a reaction it does not
+/// send, stays decided.
+fn deciding(automaton: &Automaton, reactions: &[Reaction], entity: &str) -> BTreeSet<String> {
+    let mut fields: BTreeSet<String> = automaton
+        .actions
+        .iter()
+        .flat_map(|action| &action.constraints)
+        .filter_map(|constraint| constraint.field().map(str::to_string))
+        .collect();
+    for guard in reactions
+        .iter()
+        .filter(|r| r.from == entity)
+        .filter_map(|r| r.guard.as_ref())
+    {
+        guard.for_each_name(&mut |name| {
+            if let Name::Var(var) = name {
+                fields.insert(var.to_string());
+            }
+        });
+    }
+    fields
 }

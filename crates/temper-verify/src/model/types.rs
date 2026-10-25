@@ -174,17 +174,22 @@ pub struct ResolvedTransition {
     pub effects: Vec<ModelEffect>,
     /// The action parameters the effects read, by kind.
     pub params: BTreeMap<String, ParamKind>,
-    /// The action parameters that write a tracked string variable of the
-    /// same name (the runtime writes every parameter into its field).
+    /// The string parameters the model gives a value: those that write a
+    /// tracked string variable of the same name (the runtime writes every
+    /// parameter into its field), and those a constraint ties to a tracked
+    /// one.
     pub string_params: Vec<StringParam>,
 }
 
-/// An action parameter that writes the tracked string variable of its name,
-/// with what the action's constraints allow it to be.
+/// A string parameter of an action, with what the action's constraints allow
+/// it to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StringParam {
-    /// The parameter, and the variable it writes.
+    /// The parameter.
     pub name: String,
+    /// Whether it writes the tracked string variable of its name. One that
+    /// does not is modelled only so its constraints are decided.
+    pub writes: bool,
     /// `param_nonempty`: never `''`.
     pub nonempty: bool,
     /// `param_equals_field`: the value of this variable.
@@ -308,6 +313,14 @@ impl ExploreLimit {
 }
 
 impl TemperModel {
+    /// Whether the model gives `action`'s string parameter `param` a value.
+    pub fn models_string(&self, action: &str, param: &str) -> bool {
+        self.transitions
+            .iter()
+            .filter(|t| t.name == action)
+            .any(|t| t.string_params.iter().any(|p| p.name == param))
+    }
+
     /// Whether the time this model may be explored for is spent.
     pub fn out_of_time(&self) -> bool {
         self.limit.as_ref().is_some_and(|limit| {

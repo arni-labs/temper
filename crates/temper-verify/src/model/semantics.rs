@@ -227,7 +227,12 @@ fn string_assignments(
 ) -> Vec<BTreeMap<String, String>> {
     let mut assignments = vec![BTreeMap::new()];
     for param in &t.string_params {
-        let candidates = string_candidates(model, param, state, values);
+        let mut candidates = string_candidates(model, param, state, values);
+        // A parameter that writes nothing leads to the same state with any
+        // value its constraints allow: one is enough.
+        if !param.writes {
+            candidates.truncate(1);
+        }
         assignments = assignments
             .into_iter()
             .flat_map(|assignment| {
@@ -242,14 +247,14 @@ fn string_assignments(
     assignments
 }
 
-/// Write each string parameter into its tracked variable, as the runtime
-/// writes every parameter into the field of its name.
+/// Write each string parameter that writes a tracked variable into it, as
+/// the runtime writes every parameter into the field of its name.
 pub fn apply_string_params(
     string_params: &[StringParam],
     state: &mut TemperModelState,
     params: &BTreeMap<String, ParamValue>,
 ) {
-    for param in string_params {
+    for param in string_params.iter().filter(|p| p.writes) {
         if let Some(ParamValue::Str(value)) = params.get(&param.name) {
             state.strings.insert(param.name.clone(), value.clone());
         }

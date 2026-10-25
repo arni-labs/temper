@@ -182,20 +182,36 @@ fn resolve_transitions(
         .collect()
 }
 
-/// The parameters of `action` that write a tracked string variable, with the
-/// action's constraints on each.
+/// The parameters of `action` that write a tracked string variable, or that
+/// a constraint ties to one (`failed_commit` must equal `commit`), with the
+/// action's constraints on each. The model needs the value of the second
+/// kind to decide whether the record takes the action, though it writes
+/// nothing it tracks.
 fn string_params(
     action: &temper_spec::automaton::Action,
     tracked_strings: &BTreeSet<String>,
 ) -> Vec<StringParam> {
+    let tied = |name: &str| {
+        action.constraints.iter().any(|c| {
+            c.param() == name
+                && matches!(
+                    c,
+                    ActionConstraint::ParamEqualsField { .. }
+                        | ActionConstraint::ParamNotEqualsField { .. }
+                )
+                && c.field()
+                    .is_some_and(|field| tracked_strings.contains(field))
+        })
+    };
     action
         .params
         .iter()
         .map(|param| param.name())
-        .filter(|name| tracked_strings.contains(*name))
+        .filter(|name| tracked_strings.contains(*name) || tied(name))
         .map(|name| {
             let mut param = StringParam {
                 name: name.to_string(),
+                writes: tracked_strings.contains(name),
                 nonempty: false,
                 equals: None,
                 not_equals: Vec::new(),

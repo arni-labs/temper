@@ -349,3 +349,125 @@ fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
         "{result}"
     );
 }
+
+/// A parent that tells its child each value it is set to, then seals the
+/// child with the value it ended on. The child takes the seal only while it
+/// holds that value: `sealed_with` must equal `value`, and the child has no
+/// field of that name.
+const SEALING_PARENT: &str = r#"
+[automaton]
+name = "Parent"
+states = ["Open", "Closed"]
+initial = "Open"
+
+[[state]]
+name = "value"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Set"
+kind = "input"
+from = ["Open"]
+to = "Open"
+params = [{ name = "value", type = "string" }]
+
+[[action.triggers]]
+name = "tell"
+kind = "entity"
+principal = "tell"
+target_entity = "Child"
+target_action = "Copy"
+
+[action.triggers.args]
+value = "value"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[action]]
+name = "Close"
+kind = "input"
+from = ["Open"]
+to = "Closed"
+
+[[action.triggers]]
+name = "seal"
+kind = "entity"
+principal = "tell"
+target_entity = "Child"
+target_action = "Seal"
+
+[action.triggers.args]
+sealed_with = "value"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+
+const SEALED_CHILD: &str = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Done", "Sealed"]
+initial = "Waiting"
+
+[[state]]
+name = "value"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Copy"
+kind = "internal"
+from = ["Waiting", "Done"]
+to = "Done"
+params = [{ name = "value", type = "string" }]
+
+[[action]]
+name = "Seal"
+kind = "internal"
+from = ["Done"]
+to = "Sealed"
+params = [{ name = "sealed_with", type = "string" }]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "sealed_with"
+field = "value"
+
+[[invariant]]
+name = "sealed_with_the_parents_value"
+assert = "status == 'Sealed' => Parent[Id].value == value"
+"#;
+
+const ONLY_TELL_REACHES_THE_CHILD: &str = r#"
+permit(principal, action in [Action::"Set", Action::"Close"], resource is Parent);
+permit(principal == Agent::"service:tell", action in [Action::"Copy", Action::"Seal"], resource is Child);
+"#;
+
+#[test]
+fn a_constraint_on_a_parameter_that_writes_no_field_is_decided() {
+    // Set A, Set B, Close: Copy(A), Copy(B) and Seal(B) are in flight. If
+    // Copy(A) lands last of the copies, the child holds A and refuses
+    // Seal(B). A model that cannot read `sealed_with` lets the seal land
+    // and reports the child sealed with A while the parent ended on B.
+    let result = check_under(
+        &[SEALING_PARENT, SEALED_CHILD],
+        Some(ONLY_TELL_REACHES_THE_CHILD),
+    );
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn a_seal_sent_without_its_value_is_refused() {
+    // The runtime refuses a constrained parameter nobody passed, so a seal
+    // that does not carry `sealed_with` never lands. A seal comes only once
+    // the parent is Closed, so this rule breaks if one ever lands.
+    let parent = SEALING_PARENT.replace("sealed_with = \"value\"", "");
+    let child = SEALED_CHILD.replace(
+        "assert = \"status == 'Sealed' => Parent[Id].value == value\"",
+        "assert = \"status == 'Sealed' => Parent[Id].value == value && Parent[Id].status == 'Open'\"",
+    );
+    let result = check_under(&[&parent, &child], Some(ONLY_TELL_REACHES_THE_CHILD));
+    assert!(result.holds(), "{result}");
+}

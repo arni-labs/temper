@@ -86,7 +86,7 @@ pub(super) fn tracked(
             }
             for (param, arg) in &reaction.args {
                 if let Arg::Var(field) = arg
-                    && models[&reaction.to].tracked_strings.contains(param)
+                    && models[&reaction.to].models_string(&reaction.target_action, param)
                     && !models[&reaction.from].tracked_strings.contains(field)
                 {
                     grew |= track(&reaction.from, field);
@@ -235,7 +235,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
 #[derive(Default)]
 pub(super) struct Unchecked {
     /// Sent as a dispatch or a request: one on a counter the order does not
-    /// keep, or on a string the model does not track.
+    /// keep, or on a string parameter or field the model gives no value.
     pub(super) taken: BTreeSet<(String, String)>,
     /// Sent with parameters its sender chooses (a module's answer, or a
     /// request from outside): one that ties a parameter to a field the model
@@ -250,7 +250,7 @@ pub(super) struct Unchecked {
     /// counter. Decided when a dispatch carries the count, and only then.
     pub(super) counts: BTreeMap<(String, String), Vec<(String, String)>>,
     /// Each (entity, action)'s string parameters that must not be empty and
-    /// that the model does not track. Decided when a dispatch carries the
+    /// that the model gives no value. Decided when a dispatch carries the
     /// value, and only then.
     pub(super) nonempty: BTreeMap<(String, String), Vec<String>>,
 }
@@ -280,8 +280,8 @@ impl Unchecked {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// The string parameters of `entity`'s `action` the model does not
-    /// track that must not be empty.
+    /// The string parameters of `entity`'s `action` the model gives no value
+    /// that must not be empty.
     pub(super) fn nonempty(&self, entity: &str, action: &str) -> &[String] {
         self.nonempty
             .get(&(entity.to_string(), action.to_string()))
@@ -316,20 +316,21 @@ pub(super) fn unchecked_constraints(
         };
         for action in &by_name[entity.as_str()].actions {
             let key = (entity.clone(), action.name.clone());
+            let modelled = |param: &str| model.models_string(&action.name, param);
             let decided = |constraint: &ActionConstraint| match constraint {
                 ActionConstraint::ParamGreaterThanField { param, .. } => {
                     order.decides(entity, &action.name, param)
                 }
                 ActionConstraint::ParamEqualsField { field, .. } if counted(field) => true,
                 ActionConstraint::ParamNonempty { .. } => true,
-                _ => tracked(constraint.param()) && constraint.field().is_none_or(tracked),
+                _ => modelled(constraint.param()) && constraint.field().is_none_or(tracked),
             };
             if !action.constraints.iter().all(decided) {
                 out.taken.insert(key.clone());
             }
             for constraint in &action.constraints {
                 if let ActionConstraint::ParamNonempty { param } = constraint
-                    && !tracked(param)
+                    && !modelled(param)
                 {
                     out.nonempty
                         .entry(key.clone())
