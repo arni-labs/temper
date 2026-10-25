@@ -427,29 +427,31 @@ fn run_seed(seed: u64) -> Result<usize, Vec<String>> {
         settle().await;
         for id in (0..RECORDS).map(|i| format!("t-{i}")) {
             let (_, _, journal_status) = journal_state(&store, &id).await;
+            // Each end check is noted and the others still run, so one broken
+            // invariant does not hide another.
             if journal_status == "Busy" {
-                return Err(run.fail(
+                run.note(
                     "every timer fires, whoever hung up",
                     format!("{id} is still Busy a day later"),
-                ));
+                );
             }
             check_rows(&mut run, &store, &id).await;
             let (landed_holds, unknown) = holds.get(&id).copied().unwrap_or_default();
             let notes = noted(&store, &id).await;
             if notes != landed_holds && notes != landed_holds - unknown {
-                return Err(run.fail(
+                run.note(
                     "every landed hold has its scheduled note, whoever hung up",
                     format!("{id}: {landed_holds} holds landed ({unknown} unknown), {notes} notes"),
-                ));
+                );
             }
             let counted = ledger_count(&state, &id).await;
             if counted != landed_holds - unknown {
-                return Err(run.fail(
+                run.note(
                     "every landed hold has its reaction, whoever hung up",
                     format!(
                         "{id}: {landed_holds} holds landed ({unknown} unknown), ledger counts {counted}"
                     ),
-                ));
+                );
             }
         }
         Ok(faulted)
