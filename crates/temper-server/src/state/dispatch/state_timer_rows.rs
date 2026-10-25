@@ -331,3 +331,6 @@ fn armed_timer(
         started_at,
     })
 }
+
+#[cfg(test)]
+mod tests;

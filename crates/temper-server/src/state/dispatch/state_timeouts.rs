@@ -659,6 +659,7 @@ impl crate::state::ServerState {
             );
 
             async move {
+                let mut timer = timer;
                 // Sequence-based cancellation check. A newer arm (or a state
                 // change that bumped the seq on exit) renders this timer a
                 // no-op. Then the timer fires only on a record still in its
@@ -676,6 +677,7 @@ impl crate::state::ServerState {
                         )
                         .await
                 {
+                    timer.normalize_cause(&current.state);
                     let belongs =
                         current.state.status == timer.state && state.declares_state_timer(&timer);
                     if !belongs {
@@ -742,6 +744,19 @@ pub(super) struct ArmedTimer {
 }
 
 impl ArmedTimer {
+    /// Restore timer provenance for rows saved before causes were recorded.
+    /// Use the retained move at the arm's sequence, never a later move, and
+    /// keep an existing timer arm (including its original arming principal).
+    pub(super) fn normalize_cause(&mut self, state: &EntityState) {
+        let armed_action = state
+            .sequence_nr
+            .checked_sub(self.sequence_nr)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| state.events.iter().rev().nth(offset))
+            .map(|event| event.action.as_str());
+        self.agent_ctx = timer_agent(&self.agent_ctx, armed_action);
+    }
+
     /// Whether `other` is the same declared timer: the same state, action and
     /// budget.
     fn is_declared_as(&self, other: &ArmedTimer) -> bool {
