@@ -32,7 +32,7 @@ use super::storage_guardrails::enforce_commons_storage_cap;
 use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_target};
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
-use crate::response::{ODataResponse, odata_error};
+use crate::response::{ODataResponse, odata_error, odata_refusal};
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 
@@ -916,10 +916,11 @@ pub async fn handle_odata_post(
                             &actor_state.booleans,
                         )
                     {
-                        return odata_error(
+                        return odata_refusal(
                             StatusCode::BAD_REQUEST,
                             "StrictActionContract",
-                            &error,
+                            &error.message,
+                            error.refusal.as_ref(),
                         )
                         .into_response();
                     }

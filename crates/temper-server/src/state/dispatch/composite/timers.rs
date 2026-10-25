@@ -78,6 +78,7 @@ impl crate::state::ServerState {
                 .for_dispatch_root(&write.entity_type, &write.entity_id),
             response: EntityResponse {
                 success: true,
+                refusal: None,
                 state: state.clone(),
                 error: None,
                 custom_effects: Vec::new(),
