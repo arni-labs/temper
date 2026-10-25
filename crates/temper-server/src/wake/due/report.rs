@@ -115,6 +115,11 @@ impl DueTimes {
         let send = async move {
             let mut wait = FIRST_RETRY_WAIT;
             loop {
+                // A report replaced while it waited to be tried again is not
+                // sent: what replaced it is newer.
+                if due.lock().reported.in_flight.map(|(seq, _)| seq) != Some(report.seq) {
+                    return;
+                }
                 let result = sink.send(&report, traceparent.as_deref()).await;
                 let error = {
                     let mut inner = due.lock();
@@ -123,7 +128,7 @@ impl DueTimes {
                         .in_flight
                         .is_none_or(|(seq, _)| seq != report.seq)
                     {
-                        // A newer report replaced this one.
+                        // A newer report replaced this one while it was sent.
                         return;
                     }
                     match result {

@@ -212,8 +212,14 @@ async fn only_the_permitted_owner_wakes_the_process() {
     );
 }
 
-/// The reports sent after one wake by `token`, on a fresh process.
-async fn reports_after_wake(key: &SigningKey, token: &str) -> Vec<WakeReport> {
+/// Longer than the first wait before a report that did not get through is
+/// tried again (1 s).
+const RETRY: Duration = Duration::from_millis(2500);
+
+/// The reports sent again after one wake by `token`, on a fresh process whose
+/// control plane takes none. The wake is an inbound request, so the process
+/// reports as it starts, before the wake answers.
+async fn retried_after_wake(key: &SigningKey, token: &str) -> Vec<WakeReport> {
     let sink = Arc::new(Down::default());
     let app = router_reporting(key, sink.clone()).await;
     assert!(
@@ -227,22 +233,22 @@ async fn reports_after_wake(key: &SigningKey, token: &str) -> Vec<WakeReport> {
         answer["reported_at"].is_string() && answer["seq"].is_u64(),
         "every permitted caller gets the same answer: {body}"
     );
-    // Let the report's send run.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    sink.sent.lock().unwrap().clone()
+    let answered = sink.sent.lock().unwrap().len();
+    tokio::time::sleep(RETRY).await;
+    sink.sent.lock().unwrap()[answered..].to_vec()
 }
 
 #[tokio::test]
 async fn only_the_control_planes_wake_stands_for_a_report() {
     let key = SigningKey::from_slice(&[11u8; 32]).unwrap();
-    let sent = reports_after_wake(&key, &control_plane_token(&key)).await;
+    let retried = retried_after_wake(&key, &control_plane_token(&key)).await;
     assert!(
-        sent.is_empty(),
-        "the control plane holds its wake's answer, so nothing is left to report: {sent:?}"
+        retried.is_empty(),
+        "the control plane holds its wake's answer, so the report before it is not retried: {retried:?}"
     );
-    let sent = reports_after_wake(&key, &person_token(&key, OWNER)).await;
+    let retried = retried_after_wake(&key, &person_token(&key, OWNER)).await;
     assert!(
-        !sent.is_empty(),
-        "the owner's wake never reaches the control plane, so the process still reports"
+        !retried.is_empty(),
+        "the owner's wake never reaches the control plane, so the report before it is retried"
     );
 }
