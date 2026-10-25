@@ -7,13 +7,10 @@ use std::collections::BTreeMap;
 
 use temper_spec::automaton::Automaton;
 use temper_spec::cross_invariant;
-use temper_verify::composite::{JointOutcome, LivenessOutcome};
+use temper_verify::composite::{Bound, JointOutcome, JointProof, LivenessOutcome};
 
 use super::proofs::{self, Proof, Verdict, Wait, Walked};
 use crate::state::PlatformState;
-
-/// Types by name, each with its spec source and parsed.
-type Sourced = BTreeMap<String, (String, Automaton)>;
 
 /// Refuse an install into a tenant whose stored specs did not load at startup.
 ///
@@ -51,9 +48,11 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// anything. Both run when the install brings `new_specs` (added or changed
 /// types) or policies: who Cedar lets send each move decides whether a rule
 /// holds and whether a record gets where it should. A named type the bundle
-/// does not carry is taken from what the tenant already runs. A proof that is
-/// still walking comes back as the walk to wait for (see [`proofs`]): the
-/// install waits for it without its lock and starts again.
+/// does not carry is taken from what the tenant already runs. Each walk's
+/// verdict is kept by the digest of its model (see [`proofs`]), so a rule
+/// whose cut model the install leaves as it was is not walked again. A
+/// walk still running comes back as the walk to wait for: the install waits
+/// for it without its lock and starts again.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -91,98 +90,101 @@ pub(super) async fn prove(
     );
     let policies = temper_authz::SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
-    const PROOF: &str = "rules over several records";
-    let digest = proofs::digest(PROOF, &sources(&automatons), Some(&policy_text));
-    let app = app_name.to_string();
-    let proof = proofs::proof(state, tenant, app_name, PROOF, digest, move |bound| {
-        let refs: Vec<&Automaton> = automatons.values().map(|(_, a)| a).collect();
-        let invariants =
-            temper_verify::composite::verify_joint_invariants(&refs, Some(&policies), bound);
-        let liveness =
-            temper_verify::composite::verify_joint_liveness(&refs, Some(&policies), bound);
-        let fit = !invariants
-            .iter()
-            .any(|r| matches!(r.outcome, JointOutcome::Incomplete { .. }))
-            && !liveness
-                .iter()
-                .any(|r| matches!(r.outcome, LivenessOutcome::Incomplete { .. }));
-        let results: Vec<(bool, String)> = invariants
-            .iter()
-            .map(|r| (r.holds(), r.to_string()))
-            .chain(liveness.iter().map(|r| (r.holds(), r.to_string())))
-            .collect();
-        walked(
-            results.iter().filter(|(holds, _)| *holds).map(|(_, text)| text.clone()),
-            results.iter().filter(|(holds, _)| !*holds).map(|(_, text)| text.clone()),
-            fit,
-            |unproven| {
-                format!("os-app '{app}' declares rules over several records that are not proven:\n{unproven}")
-            },
-        )
+    // Composing a model asks Cedar about each sender and action in its
+    // scope, so it runs off the async threads too.
+    let joint = tokio::task::spawn_blocking(move || {
+        let refs: Vec<&Automaton> = automatons.values().collect();
+        temper_verify::composite::joint_proofs(&refs, Some(&policies))
     })
-    .await;
-    decided(tenant, app_name, proof)
+    .await
+    .map_err(|e| {
+        format!("os-app '{app_name}': its rules over several records could not be read: {e}")
+    })?;
+    let mut held = Vec::new();
+    let mut unproven = Vec::new();
+    let mut running = None;
+    for joint_proof in joint {
+        let name = joint_proof.name();
+        let digest = joint_proof.digest();
+        let proof = proofs::proof(state, tenant, app_name, name, digest, move |bound| {
+            walk(&joint_proof, bound)
+        })
+        .await;
+        match proof {
+            Proof::Done(verdict) => {
+                held.extend(verdict.held);
+                unproven.extend(verdict.refused);
+            }
+            Proof::Running(wait) => {
+                running.get_or_insert(wait);
+            }
+        }
+    }
+    if !unproven.is_empty() {
+        return Err(format!(
+            "os-app '{app_name}' declares rules over several records that are not proven:\n{}",
+            unproven.join("\n")
+        ));
+    }
+    if running.is_some() {
+        return Ok(running);
+    }
+    for line in &held {
+        tracing::info!(tenant, app = %app_name, "{line}");
+    }
+    Ok(None)
 }
 
-/// A walk's verdict from the results that held and those that did not, and
-/// whether the walk `fit` in its memory: one that did not says nothing of
-/// the specs, and may fit when the host has more room.
-fn walked(
-    held: impl Iterator<Item = String>,
-    unproven: impl Iterator<Item = String>,
-    fit: bool,
-    refusal: impl FnOnce(String) -> String,
-) -> Walked {
-    let unproven: Vec<String> = unproven.collect();
+/// Walk one proof: the results that held, those that did not, and whether
+/// the walk fit in its memory. One that did not says nothing of the specs,
+/// and may fit when the host has more room.
+fn walk(proof: &JointProof, bound: Bound<'_>) -> Walked {
+    let results: Vec<(bool, bool, String)> = match proof {
+        JointProof::Invariants(invariants) => invariants
+            .check(bound)
+            .iter()
+            .map(|r| {
+                let fit = !matches!(r.outcome, JointOutcome::Incomplete { .. });
+                (r.holds(), fit, r.to_string())
+            })
+            .collect(),
+        JointProof::Liveness(liveness) => {
+            let r = liveness.check(bound);
+            let fit = !matches!(r.outcome, LivenessOutcome::Incomplete { .. });
+            vec![(r.holds(), fit, r.to_string())]
+        }
+    };
+    let fit = results.iter().all(|(_, fit, _)| *fit);
+    let (held, unproven): (Vec<_>, Vec<_>) = results.into_iter().partition(|(holds, ..)| *holds);
+    let unproven: Vec<String> = unproven.into_iter().map(|(.., text)| text).collect();
     Walked {
         verdict: Verdict {
-            held: held.collect(),
-            refused: (!unproven.is_empty()).then(|| refusal(unproven.join("\n"))),
+            held: held.into_iter().map(|(.., text)| text).collect(),
+            refused: (!unproven.is_empty()).then(|| unproven.join("\n")),
         },
         fit,
     }
 }
 
-/// The install goes on, is refused, or waits for the walk.
-fn decided(tenant: &str, app_name: &str, proof: Proof) -> Result<Option<Wait>, String> {
-    match proof {
-        Proof::Running(wait) => Ok(Some(wait)),
-        Proof::Done(verdict) => {
-            for line in &verdict.held {
-                tracing::info!(tenant, app = %app_name, "{line}");
-            }
-            verdict.refused.map_or(Ok(None), Err)
-        }
-    }
-}
-
-/// Each type's spec source, which a verdict is kept by.
-fn sources(automatons: &Sourced) -> BTreeMap<String, String> {
-    automatons
-        .iter()
-        .map(|(entity_type, (source, _))| (entity_type.clone(), source.clone()))
-        .collect()
-}
-
-/// The bundle's types, each with its source and parsed, with each type
-/// `names` returns for them taken from what the tenant already runs when the
-/// bundle does not carry it. `None` when no bundle type names one.
+/// The bundle's types, parsed, with each type `names` returns for them taken
+/// from what the tenant already runs when the bundle does not carry it.
+/// `None` when no bundle type names one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     specs: &[(String, String)],
     names: impl Fn(&Automaton) -> Vec<(String, String)>,
-) -> Result<Option<Sourced>, String> {
+) -> Result<Option<BTreeMap<String, Automaton>>, String> {
     let mut automatons = BTreeMap::new();
     for (entity_type, ioa_source) in specs {
         let automaton = temper_spec::automaton::parse_automaton(ioa_source)
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
-        automatons.insert(entity_type.clone(), (ioa_source.clone(), automaton));
+        automatons.insert(entity_type.clone(), automaton);
     }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
-        .flat_map(|(_, a)| names(a))
+        .flat_map(&names)
         .map(|(entity_type, _)| entity_type)
         .collect();
     if named.is_empty() {
@@ -197,10 +199,7 @@ fn bundle_with_named(
         if !automatons.contains_key(entity_type)
             && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
         {
-            automatons.insert(
-                entity_type.clone(),
-                (spec.ioa_source.clone(), spec.automaton.clone()),
-            );
+            automatons.insert(entity_type.clone(), spec.automaton.clone());
         }
     }
     Ok(Some(automatons))

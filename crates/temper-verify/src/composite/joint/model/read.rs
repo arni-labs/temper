@@ -116,7 +116,7 @@ pub(in crate::composite::joint) struct Timeout {
 }
 
 /// What the kernel sends, read once from the specs.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct Kernel {
     /// Each entity's state timers.
     pub(super) timers: BTreeMap<String, Vec<Timeout>>,
@@ -232,7 +232,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
 
 /// The actions (entity, action) with a constraint the model cannot decide,
 /// and what a module call keeps to decide its answer's.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct Unchecked {
     /// Sent as a dispatch or a request: one on a counter the order does not
     /// keep, or on a string the model does not track.

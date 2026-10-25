@@ -17,8 +17,9 @@ pub mod joint;
 pub mod verify;
 
 pub use joint::{
-    Bound, Bytes, DroppedReaction, JointInvariantResult, JointLivenessResult, JointOutcome,
-    JointReplay, JointStep, LivenessOutcome, Progress, Room, StuckCase, TraceMove,
+    Bound, Bytes, DroppedReaction, InvariantProof, JointInvariantResult, JointLivenessResult,
+    JointOutcome, JointProof, JointReplay, JointStep, LivenessOutcome, LivenessProof, Progress,
+    Room, StuckCase, TraceMove, invariant_proofs, joint_proofs, liveness_proofs,
     replay_joint_invariants, verify_joint_invariants, verify_joint_liveness,
 };
 pub use verify::{

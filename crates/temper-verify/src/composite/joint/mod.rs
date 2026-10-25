@@ -50,19 +50,24 @@ mod env;
 mod liveness;
 mod model;
 mod pack;
+mod proof;
 mod room;
 mod senders;
 mod slice;
 mod state;
 
-pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
+pub use liveness::{
+    JointLivenessResult, LivenessOutcome, LivenessProof, StuckCase, liveness_proofs,
+    verify_joint_liveness,
+};
+pub use proof::{JointProof, joint_proofs};
 pub use room::{Bound, Bytes, Progress, Room};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use temper_authz::SendAnalysis;
-use temper_spec::automaton::Automaton;
+use temper_spec::automaton::{Automaton, Invariant};
 use temper_spec::predicate::{Expr, Truth, eval};
 
 use crate::model::ParamValue;
@@ -170,32 +175,91 @@ impl fmt::Display for JointInvariantResult {
     }
 }
 
-/// Check every `[[invariant]]` in `automatons` that reads a related entity,
-/// on the joint model of its entity and the types it names. `policies`
-/// decide each move as its sender, as for liveness; without them every
-/// sender may send everything.
-pub fn verify_joint_invariants(
+/// The walk that checks one entity's invariants that read related records,
+/// with all it reads: those invariants and the joint model of their entity
+/// and the types they name, cut to what they read. Its
+/// [`JointProof::digest`] is of this value.
+#[derive(Debug)]
+pub struct InvariantProof {
+    pub(super) entity: String,
+    invariants: Vec<Invariant>,
+    scope: BTreeSet<String>,
+    /// The model, or why there is none: a type the invariants read that the
+    /// app does not declare.
+    model: Result<JointModel, String>,
+}
+
+impl InvariantProof {
+    /// Walk the model, one result per invariant.
+    pub fn check(&self, bound: Bound<'_>) -> Vec<JointInvariantResult> {
+        let result = |inv: &Invariant, states, outcome| JointInvariantResult {
+            entity: self.entity.clone(),
+            invariant: inv.name.clone(),
+            assert: inv.assert.to_string(),
+            scope: self.scope.iter().cloned().collect(),
+            states,
+            in_flight_bound: None,
+            outcome,
+        };
+        let model = match &self.model {
+            Ok(model) => model,
+            Err(reason) => {
+                let reason = reason.clone();
+                return self
+                    .invariants
+                    .iter()
+                    .map(|inv| {
+                        result(
+                            inv,
+                            0,
+                            JointOutcome::Incomplete {
+                                reason: reason.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+            }
+        };
+        let exprs: Vec<&Expr> = self.invariants.iter().map(|inv| &inv.assert).collect();
+        let walk = model.walk(&self.entity, &exprs, bound);
+        self.invariants
+            .iter()
+            .zip(walk.outcomes)
+            .map(|(inv, outcome)| {
+                let mut found = result(inv, walk.states, outcome);
+                found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+                found
+            })
+            .collect()
+    }
+}
+
+/// The walks that check every `[[invariant]]` in `automatons` that reads a
+/// related entity: one per entity, on the joint model of it and the types
+/// its invariants name. `policies` decide each move as its sender, as for
+/// liveness; without them every sender may send everything.
+pub fn invariant_proofs(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    bound: Bound<'_>,
-) -> Vec<JointInvariantResult> {
+) -> Vec<InvariantProof> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
         .map(|a| (a.automaton.name.as_str(), *a))
         .collect();
-    let mut results = Vec::new();
+    let mut proofs = Vec::new();
     for (name, automaton) in &by_name {
-        let joint: Vec<&temper_spec::automaton::Invariant> = automaton
+        let invariants: Vec<Invariant> = automaton
             .invariants
             .iter()
             .filter(|inv| !inv.assert.related_types().is_empty())
+            .cloned()
             .collect();
-        if joint.is_empty() {
+        if invariants.is_empty() {
             continue;
         }
         let mut scope: BTreeSet<String> = BTreeSet::from([name.to_string()]);
         let mut missing = Vec::new();
-        for inv in &joint {
+        for inv in &invariants {
             for (entity_type, _) in inv.assert.related_types() {
                 if by_name.contains_key(entity_type.as_str()) {
                     scope.insert(entity_type);
@@ -204,59 +268,60 @@ pub fn verify_joint_invariants(
                 }
             }
         }
-        let result =
-            |inv: &temper_spec::automaton::Invariant, scope: &BTreeSet<String>, states, outcome| {
-                JointInvariantResult {
-                    entity: name.to_string(),
-                    invariant: inv.name.clone(),
-                    assert: inv.assert.to_string(),
-                    scope: scope.iter().cloned().collect(),
-                    states,
-                    in_flight_bound: None,
-                    outcome,
-                }
+        let model = if missing.is_empty() {
+            let exprs: Vec<&Expr> = invariants.iter().map(|inv| &inv.assert).collect();
+            // Code outside the specs sends what a liveness property relies
+            // on, whoever Cedar lets send it; a rule that must always hold
+            // has to hold through those moves too.
+            let relies_on = scope
+                .iter()
+                .flat_map(|entity| {
+                    by_name[entity.as_str()]
+                        .liveness
+                        .iter()
+                        .flat_map(move |live| {
+                            live.relies_on
+                                .iter()
+                                .map(move |action| (entity.clone(), action.clone()))
+                        })
+                })
+                .collect();
+            let sending = Sending {
+                policies,
+                kernel_moves: true,
+                relies_on,
             };
-        if !missing.is_empty() {
-            for inv in &joint {
-                let reason = format!(
-                    "it reads {}, which this app does not declare",
-                    missing.join(", ")
-                );
-                results.push(result(inv, &scope, 0, JointOutcome::Incomplete { reason }));
-            }
-            continue;
-        }
-        let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-        // Code outside the specs sends what a liveness property relies on,
-        // whoever Cedar lets send it; a rule that must always hold has to
-        // hold through those moves too.
-        let relies_on = scope
-            .iter()
-            .flat_map(|entity| {
-                by_name[entity.as_str()]
-                    .liveness
-                    .iter()
-                    .flat_map(move |live| {
-                        live.relies_on
-                            .iter()
-                            .map(move |action| (entity.clone(), action.clone()))
-                    })
-            })
-            .collect();
-        let sending = Sending {
-            policies,
-            kernel_moves: true,
-            relies_on,
+            Ok(JointModel::new(
+                &by_name, &scope, name, &exprs, sending, true,
+            ))
+        } else {
+            Err(format!(
+                "it reads {}, which this app does not declare",
+                missing.join(", ")
+            ))
         };
-        let model = JointModel::new(&by_name, scope, name, &exprs, sending, true);
-        let walk = model.walk(name, &exprs, bound);
-        for (inv, outcome) in joint.iter().zip(walk.outcomes) {
-            let mut found = result(inv, &model.scope, walk.states, outcome);
-            found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
-            results.push(found);
-        }
+        proofs.push(InvariantProof {
+            entity: name.to_string(),
+            invariants,
+            scope,
+            model,
+        });
     }
-    results
+    proofs
+}
+
+/// Check every `[[invariant]]` in `automatons` that reads a related entity,
+/// on the joint model of its entity and the types it names
+/// ([`invariant_proofs`]).
+pub fn verify_joint_invariants(
+    automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
+    bound: Bound<'_>,
+) -> Vec<JointInvariantResult> {
+    invariant_proofs(automatons, policies)
+        .iter()
+        .flat_map(|proof| proof.check(bound))
+        .collect()
 }
 
 /// One move of a trace: an entity's action with the string parameters it
@@ -322,7 +387,7 @@ pub fn replay_joint_invariants(
         }
     }
     let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-    let model = JointModel::new(&by_name, scope, entity, &exprs, Sending::anyone(), true);
+    let model = JointModel::new(&by_name, &scope, entity, &exprs, Sending::anyone(), true);
     let (mut state, mut names) = model.init_with_ids(ids);
     let mut steps = vec![JointStep {
         action: None,

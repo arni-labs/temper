@@ -370,3 +370,63 @@ fn a_walk_its_room_cannot_hold_is_not_checked_and_gives_its_memory_back() {
     assert!(reason.contains("does not fit"), "{reason}");
     assert_eq!(room.held(), 0, "the walk gives back what it took");
 }
+
+/// The digest of each joint proof of `sources`, with `policies` (Cedar)
+/// deciding each move as its sender.
+fn digests(sources: &[&str], policies: Option<&str>) -> Vec<String> {
+    let automatons = parse(sources);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
+    joint_proofs(&refs, analysis.as_ref())
+        .iter()
+        .map(JointProof::digest)
+        .collect()
+}
+
+#[test]
+fn a_proof_keeps_its_digest_through_a_change_its_cut_leaves_out() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let before = digests(&[&parent, &child], None);
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before,
+        digests(&[&parent, &child], None),
+        "the same specs, the same digest"
+    );
+    // A counter the rule never reads, counted by an action the cut keeps.
+    let counted = parent
+        .replace(
+            "[[action]]\nname = \"Close\"",
+            "[[state]]\nname = \"closings\"\ntype = \"counter\"\ninitial = 0\n\n[[action]]\nname = \"Close\"",
+        )
+        .replace("to = \"Closed\"\n", "to = \"Closed\"\neffect = [\"closings += 1\"]\n");
+    assert!(counted.contains("closings += 1"));
+    assert_eq!(before, digests(&[&counted, &child], None));
+    // Cedar about an action no type in scope has.
+    let more = format!(
+        "{ONLY_TELL_COPIES}\npermit(principal, action == Action::\"Elsewhere\", resource);\n"
+    );
+    assert_eq!(
+        digests(&[&parent, &child], Some(ONLY_TELL_COPIES)),
+        digests(&[&parent, &child], Some(&more))
+    );
+}
+
+#[test]
+fn a_proof_gets_a_new_digest_from_a_change_its_walk_reads() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let before = digests(&[&parent(false), &child], None);
+    assert_ne!(
+        before,
+        digests(&[&parent(true), &child], None),
+        "a parent that reopens"
+    );
+    let child = child_with("status == 'Done' => Parent[Id].value == value");
+    let parent = parent_told_once();
+    assert_ne!(
+        digests(&[&parent, &child], None),
+        digests(&[&parent, &child], Some(ONLY_TELL_COPIES)),
+        "Cedar that decides who may send Copy"
+    );
+}

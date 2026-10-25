@@ -8,8 +8,12 @@
 //! meanwhile: the install waits for it, then starts again under the lock and
 //! finds its verdict.
 //!
-//! A verdict is kept by the digest of what its walk read: which proof, every
-//! spec and, for liveness, the Cedar. A proven one is kept in the platform's
+//! A verdict is kept by the digest of what its walk read
+//! ([`JointProof::digest`](temper_verify::composite::JointProof::digest)):
+//! the rules it proves and their joint model, cut to what they read, with
+//! what Cedar lets its senders send. So an install that changes a spec or
+//! the Cedar only where a rule's cut does not reach reads that rule's
+//! verdict instead of walking again. A proven one is kept in the platform's
 //! blob table too, so a start that installs again what an earlier install
 //! proved (a Katagami app's new Temper must serve within 20 s of the old
 //! one's TERM) reads it instead of walking again, whatever checker made it:
@@ -23,7 +27,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use temper_server::ServerState;
 use temper_server::host_room::HOST_ROOM;
 use temper_server::state::DesignTimeEvent;
@@ -71,25 +74,6 @@ impl Wait {
     }
 }
 
-/// The digest of what a walk reads: which proof, every type's spec and, for
-/// liveness, the Cedar. Each part is length-prefixed so no two inputs run
-/// together into the same bytes.
-pub(super) fn digest(
-    proof: &str,
-    sources: &BTreeMap<String, String>,
-    policy: Option<&str>,
-) -> String {
-    let mut hasher = Sha256::new();
-    let parts = std::iter::once(proof)
-        .chain(sources.iter().flat_map(|(t, s)| [t.as_str(), s.as_str()]))
-        .chain(policy);
-    for part in parts {
-        hasher.update((part.len() as u64).to_le_bytes());
-        hasher.update(part.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 /// Verdicts this process reached, each with whether its walk fit, and walks
 /// running now, by digest.
 #[derive(Default)]
@@ -116,7 +100,7 @@ pub(super) async fn proof(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
-    proof: &'static str,
+    proof: String,
     digest: String,
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
 ) -> Proof {
@@ -148,7 +132,7 @@ pub(super) async fn proof(
     let (ended, wait) = watch::channel(false);
     proofs.running.insert(digest.clone(), wait.clone());
     drop(proofs);
-    tracing::info!(tenant, app = %app_name, proof, %digest, "a proof starts");
+    tracing::info!(tenant, app = %app_name, %proof, %digest, "a proof starts");
     tokio::spawn(run(
         state.server.clone(),
         tenant.to_string(),
@@ -167,7 +151,7 @@ async fn run(
     server: ServerState,
     tenant: String,
     app_name: String,
-    proof: &'static str,
+    proof: String,
     digest: String,
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
     ended: watch::Sender<bool>,
@@ -177,7 +161,7 @@ async fn run(
         server.clone(),
         tenant.clone(),
         app_name.clone(),
-        proof,
+        proof.clone(),
         Arc::clone(&progress),
     ));
     let walking = Arc::clone(&progress);
@@ -192,7 +176,7 @@ async fn run(
         verdict: Verdict {
             held: Vec::new(),
             refused: Some(format!(
-                "os-app '{app_name}': the {proof} check stopped: {error}"
+                "os-app '{app_name}': the check of {proof} stopped: {error}"
             )),
         },
         fit: false,
@@ -208,10 +192,10 @@ async fn run(
     }
     let states = progress.states.load(Ordering::Relaxed);
     let summary = match &walked.verdict.refused {
-        None => format!("os-app '{app_name}': its {proof} hold ({states} joint states)"),
-        Some(why) => format!("os-app '{app_name}': its {proof} are not proven: {why}"),
+        None => format!("os-app '{app_name}': {proof}: proven ({states} joint states)"),
+        Some(why) => format!("os-app '{app_name}': {proof}: not proven: {why}"),
     };
-    tracing::info!(%tenant, app = %app_name, proof, %digest, states, "{summary}");
+    tracing::info!(%tenant, app = %app_name, %proof, %digest, states, "{summary}");
     emit(
         &server,
         &tenant,
@@ -234,7 +218,7 @@ async fn report(
     server: ServerState,
     tenant: String,
     app_name: String,
-    proof: &'static str,
+    proof: String,
     progress: Arc<Progress>,
 ) {
     let mut every = tokio::time::interval(PROGRESS_EVERY); // determinism-ok: progress reports of a production proof
@@ -244,9 +228,9 @@ async fn report(
         let states = progress.states.load(Ordering::Relaxed);
         let mb = progress.bytes.load(Ordering::Relaxed) / MB;
         let summary = format!(
-            "os-app '{app_name}': proving its {proof}: {states} joint states so far, holding {mb} MB"
+            "os-app '{app_name}': proving {proof}: {states} joint states so far, holding {mb} MB"
         );
-        tracing::info!(%tenant, app = %app_name, proof, states, mb, "{summary}");
+        tracing::info!(%tenant, app = %app_name, %proof, states, mb, "{summary}");
         emit(&server, &tenant, &app_name, "proof_progress", summary, None).await;
     }
 }
