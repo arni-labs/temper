@@ -27,7 +27,10 @@ async fn replaced_registration_keeps_its_completion_and_successor_deadline() {
     due.end(&firing, true);
     assert!(first.await.unwrap());
     assert!(concurrent.await.unwrap());
-    assert_eq!(due.answer("alpha").next_due_at, Some(next));
+    assert_eq!(
+        due.answer("alpha", Waker::ControlPlane).next_due_at,
+        Some(next)
+    );
     assert!(due.wake_overdue("alpha", now).is_empty());
     assert!(due.lock().superseded.is_empty());
     due.end(&successor, false);

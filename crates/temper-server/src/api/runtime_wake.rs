@@ -22,6 +22,10 @@ const RUNTIME_RESOURCE_ID: &str = "runtime";
 /// ..., "seq": n}`: a report, ordered with the process's others by
 /// `(reported_at, seq)`.
 ///
+/// Only a wake by the control plane's own verified principal stands for a
+/// report delivered; anyone else gets the same answer and the process's
+/// reports go on as they were.
+///
 /// An unauthenticated caller gets 401 and one without a Cedar permit for
 /// `wake` on `Runtime::"runtime"` gets 403; neither learns when the process
 /// acts next. A caller's `traceparent` makes this request's span its child
@@ -47,6 +51,7 @@ pub(super) async fn handle_wake(
     ) {
         return status.into_response();
     }
-    let outcome = state.wake_runtime(authenticated.tenant()).await;
+    let waker = state.waker(&authenticated.security_context().principal);
+    let outcome = state.wake_runtime(authenticated.tenant(), waker).await;
     (StatusCode::OK, Json(outcome)).into_response()
 }

@@ -29,7 +29,7 @@ use temper_runtime::scheduler::{
 };
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
-use temper_server::wake::{SendError, WakeReport, WakeSink};
+use temper_server::wake::{SendError, WakeReport, WakeSink, Waker};
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -73,7 +73,9 @@ impl WakeSink for Outage {
 
 /// The owner wakes the process by hand.
 async fn owner_wakes(state: &ServerState) -> temper_server::wake::WakeOutcome {
-    state.wake_runtime(&TenantId::new(TENANT)).await
+    state
+        .wake_runtime(&TenantId::new(TENANT), Waker::Other)
+        .await
 }
 
 fn secs(rng: &mut DeterministicRng, from: u64, to: u64) -> Duration {

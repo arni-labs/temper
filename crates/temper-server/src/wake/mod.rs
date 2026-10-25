@@ -65,6 +65,17 @@ pub enum SendError {
     Refused(u16),
 }
 
+/// Who woke the process, which decides whether the wake's answer stands for
+/// a report delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waker {
+    /// The control plane, which holds the answer as it holds a report.
+    ControlPlane,
+    /// Anyone else Cedar lets wake the process, the app's owner by hand among
+    /// them. The control plane never sees this answer.
+    Other,
+}
+
 /// A wake's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WakeOutcome {
@@ -85,6 +96,19 @@ impl ServerState {
     /// [`Self::start_runtime`], which reports once the boot's timers are armed.
     pub fn set_wake_sink(&self, sink: std::sync::Arc<dyn WakeSink>) {
         self.due_times.set_sink(sink);
+    }
+
+    /// The control plane wakes the process as the agent principal `id`: a
+    /// wake by that verified principal is [`Waker::ControlPlane`]. Unset, no
+    /// wake is the control plane's, and a wake's answer never stands for a
+    /// report delivered.
+    pub fn set_wake_control_plane(&self, id: String) {
+        self.due_times.set_control_plane(id);
+    }
+
+    /// Who a wake by the verified `principal` is from.
+    pub fn waker(&self, principal: &temper_authz::Principal) -> Waker {
+        self.due_times.waker(principal)
     }
 
     /// The sandbox stays awake for `awake` after each inbound request, so a
@@ -112,22 +136,24 @@ impl ServerState {
     /// Fire every timer of `tenant` due by the wall clock now, wait for those
     /// fires, and answer the earliest due time left of `tenant`'s timers that
     /// the process could sleep through, by the same rule as a report. The
-    /// answer is a report: it carries the next `seq` and `reported_at`, the
-    /// control plane orders it with the reports, and the process holds it as
-    /// delivered, so an early wake brings the fresh value. The process reports
+    /// answer is a report: it carries the next `seq` and `reported_at`, and
+    /// the control plane orders it with the reports. Woken by the control
+    /// plane, the process holds the answer as delivered, so an early wake
+    /// brings the fresh value; woken by anyone else, it leaves what it
+    /// reported, and what is on its way, as they are. The process reports
     /// besides only when another tenant's timer is earlier. A timer that is firing
     /// already is waited for, not fired again; one whose fire does not commit
     /// keeps its row, tries again on its own and is not counted.
     ///
     /// Scoped to one tenant because a wake is authorized in one: a caller of
     /// one tenant neither fires another's timers nor learns when they are due.
-    pub async fn wake_runtime(&self, tenant: &TenantId) -> WakeOutcome {
+    pub async fn wake_runtime(&self, tenant: &TenantId, waker: Waker) -> WakeOutcome {
         let answers = self.due_times.wake_overdue(tenant.as_str(), sim_now());
         let mut fired = 0;
         for answer in answers {
             fired += usize::from(answer.await.unwrap_or(false));
         }
-        let answer = self.due_times.answer(tenant.as_str());
+        let answer = self.due_times.answer(tenant.as_str(), waker);
         WakeOutcome {
             fired,
             next_due_at: answer.next_due_at,

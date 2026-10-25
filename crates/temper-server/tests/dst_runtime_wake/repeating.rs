@@ -8,6 +8,7 @@ use temper_runtime::scheduler::{DeterministicIdGen, install_sim_context, sim_now
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::storage::StateTimerStore;
+use temper_server::wake::Waker;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -85,8 +86,11 @@ fn dst_repeating_state_timeout_wake_waits_for_its_own_completion() {
             settle().await;
             clock.suspend(std::time::Duration::from_secs(TIMEOUT as u64 + seed + 1));
             let wake_state = state.clone();
-            let wake =
-                tokio::spawn(async move { wake_state.wake_runtime(&TenantId::new(TENANT)).await });
+            let wake = tokio::spawn(async move {
+                wake_state
+                    .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
+                    .await
+            });
             rows.deleting.notified().await;
             settle().await;
             assert!(
@@ -97,8 +101,11 @@ fn dst_repeating_state_timeout_wake_waits_for_its_own_completion() {
             assert_eq!(state.next_due_at(), Some(successor));
             // A second wake arriving after replacement must also wait for the old fire.
             let wake_state = state.clone();
-            let concurrent =
-                tokio::spawn(async move { wake_state.wake_runtime(&TenantId::new(TENANT)).await });
+            let concurrent = tokio::spawn(async move {
+                wake_state
+                    .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
+                    .await
+            });
             settle().await;
             assert!(
                 !concurrent.is_finished(),
@@ -110,7 +117,13 @@ fn dst_repeating_state_timeout_wake_waits_for_its_own_completion() {
                 assert_eq!(outcome.fired, 1, "seed {seed}: {outcome:?}");
                 assert_eq!(outcome.next_due_at, Some(successor));
             }
-            assert_eq!(state.wake_runtime(&TenantId::new(TENANT)).await.fired, 0);
+            assert_eq!(
+                state
+                    .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
+                    .await
+                    .fired,
+                0
+            );
         });
     }
 }

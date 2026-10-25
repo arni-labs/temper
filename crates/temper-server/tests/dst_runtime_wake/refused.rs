@@ -27,7 +27,7 @@ use temper_runtime::scheduler::{
 };
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
-use temper_server::wake::{SendError, WakeReport, WakeSink};
+use temper_server::wake::{SendError, WakeReport, WakeSink, Waker};
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -143,7 +143,9 @@ fn run_seed(seed: u64) -> Result<(), String> {
 
         // The wake's answer tells the control plane the due time, so nothing
         // is reported for it.
-        let outcome = state.wake_runtime(&TenantId::new(TENANT)).await;
+        let outcome = state
+            .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
+            .await;
         settle().await;
         if outcome.fired != 0 || outcome.next_due_at != Some(near) {
             return Err(format!("a wake before any due time answered {outcome:?}"));

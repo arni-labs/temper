@@ -24,6 +24,7 @@ use temper_runtime::scheduler::{
 };
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
+use temper_server::wake::Waker;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -362,7 +363,10 @@ impl Sim {
             self.trace.push(format!("woken at {woke_at}"));
             let horizon = self.awake.map_or(woke_at, |awake| woke_at + awake);
             let before = self.reports.sent.lock().unwrap().last().cloned();
-            let outcome = self.state.wake_runtime(&TenantId::new(TENANT)).await;
+            let outcome = self
+                .state
+                .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
+                .await;
             self.hold((outcome.reported_at, outcome.seq), outcome.next_due_at);
             if let Some(before) = before
                 && self.rng.next_bound(2) == 0

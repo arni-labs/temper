@@ -19,19 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use temper_authz::{Principal, PrincipalKind};
 use temper_runtime::scheduler::sim_now;
 use tokio::sync::{Notify, oneshot};
 
-use super::{SendError, WakeReport, WakeSink};
+use super::{SendError, WakeReport, WakeSink, Waker};
 use crate::request_context::ScheduledFire;
-
-/// The wait before an undelivered report is sent again; it doubles with each
-/// try, up to [`LAST_RETRY_WAIT`].
-const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
-
-/// The longest wait between tries: a control plane that is down for long is
-/// tried about once an hour, not hammered.
-const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 /// How far the wall clock may run ahead of the process's monotonic clock
 /// between two inbound requests before the process counts itself resumed
@@ -155,6 +148,9 @@ impl Inner {
 pub(crate) struct DueTimes {
     inner: Mutex<Inner>,
     sink: Mutex<Option<Arc<dyn WakeSink>>>,
+    /// The agent principal id the control plane wakes the process as; None:
+    /// no wake is the control plane's.
+    control_plane: Mutex<Option<String>>,
     /// Tells every waiting timer to compute its wait again from the wall
     /// clock, after a resume.
     retime: Arc<Notify>,
@@ -173,6 +169,31 @@ impl DueTimes {
             .sink
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    /// The control plane wakes the process as the agent principal `id`.
+    pub(crate) fn set_control_plane(&self, id: String) {
+        *self
+            .control_plane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
+    }
+
+    /// Who woke the process: the control plane only when `principal` is the
+    /// agent it wakes the process as. The control plane is never a person: a
+    /// person's token names the app's owner, and the owner may wake the
+    /// process by hand, so an id of a person could not tell the two apart.
+    pub(crate) fn waker(&self, principal: &Principal) -> Waker {
+        let control_plane = self
+            .control_plane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match control_plane.as_deref() {
+            Some(id) if principal.kind == PrincipalKind::Agent && principal.id == id => {
+                Waker::ControlPlane
+            }
+            _ => Waker::Other,
+        }
     }
 
     /// The sandbox stays awake for `awake` after each inbound request.
@@ -331,138 +352,6 @@ impl DueTimes {
         }
         answers
     }
-
-    /// The earliest due time at or after the horizon, of `tenant`'s timers
-    /// or of every timer: what a report or a wake's answer names.
-    pub(crate) fn reportable(&self, tenant: Option<&str>) -> Option<DateTime<Utc>> {
-        let inner = self.lock();
-        inner.reportable(inner.horizon(sim_now()), tenant)
-    }
-
-    /// Report when the due time the process could sleep through is earlier
-    /// than what the control plane holds, or it holds nothing yet. A later
-    /// one is not reported: the control plane wakes the process early, for
-    /// nothing, and that wake brings the fresh value.
-    pub(crate) fn report(self: &Arc<Self>) {
-        self.send_when();
-    }
-
-    /// What a wake of `tenant` answers, as a report: the earliest due time at
-    /// or after the horizon of `tenant`'s timers, with the next `seq` and the
-    /// time now, so the control plane orders it with the reports. Delivered
-    /// in the wake's answer, it is what the control plane holds now, and a
-    /// report still on its way is older and dropped. When another tenant's
-    /// timer is earlier, that is reported as any earlier time is.
-    pub(crate) fn answer(self: &Arc<Self>, tenant: &str) -> WakeReport {
-        let answer = {
-            let mut inner = self.lock();
-            let reported_at = sim_now();
-            let next_due_at = inner.reportable(inner.horizon(reported_at), Some(tenant));
-            inner.reported.seq += 1;
-            inner.reported.in_flight = None;
-            inner.reported.acked = Some(next_due_at);
-            WakeReport {
-                next_due_at,
-                reported_at,
-                seq: inner.reported.seq,
-            }
-        };
-        self.report();
-        answer
-    }
-
-    /// Send the due time the process could sleep through to the sink when it
-    /// is earlier than what the control plane will hold once what is on its
-    /// way lands, or it holds nothing yet. A report that
-    /// is not delivered is sent again, waiting longer after each failure,
-    /// until it is delivered or a newer report replaces it: without it the
-    /// control plane would not wake the process for that due time. A report
-    /// the control plane refuses on purpose ([`SendError::Refused`]) is not
-    /// sent again: its pass would be refused on every retry. The report
-    /// carries the current span's trace: the move that changed the due time.
-    fn send_when(self: &Arc<Self>) {
-        let Some(sink) = self
-            .sink
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
-            return;
-        };
-        let report = {
-            let mut inner = self.lock();
-            let earliest = inner.reportable(inner.horizon(sim_now()), None);
-            // What the control plane will hold once what is on its way lands:
-            // the report in flight, or the last one acknowledged.
-            let known = match inner.reported.in_flight {
-                Some((_, at)) => Some(at),
-                None => inner.reported.acked,
-            };
-            let send = match known {
-                None => true,
-                Some(known) => match (earliest, known) {
-                    (Some(earliest), Some(known)) => earliest < known,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                },
-            };
-            if !send {
-                return;
-            }
-            inner.reported.seq += 1;
-            let seq = inner.reported.seq;
-            inner.reported.in_flight = Some((seq, earliest));
-            WakeReport {
-                next_due_at: earliest,
-                reported_at: sim_now(),
-                seq,
-            }
-        };
-        let traceparent = crate::trace_context::traceparent(&tracing::Span::current());
-        let due = self.clone();
-        let send = async move {
-            let mut wait = FIRST_RETRY_WAIT;
-            loop {
-                let result = sink.send(&report, traceparent.as_deref()).await;
-                let error = {
-                    let mut inner = due.lock();
-                    if inner
-                        .reported
-                        .in_flight
-                        .is_none_or(|(seq, _)| seq != report.seq)
-                    {
-                        // A newer report replaced this one.
-                        return;
-                    }
-                    match result {
-                        Ok(()) => {
-                            inner.reported.in_flight = None;
-                            inner.reported.acked = Some(report.next_due_at);
-                            return;
-                        }
-                        Err(SendError::Refused(status)) => {
-                            // Nothing acknowledged, nothing on its way: the
-                            // next change or wake sends a new report.
-                            inner.reported.in_flight = None;
-                            drop(inner);
-                            tracing::warn!(
-                                seq = report.seq,
-                                status,
-                                "wake report refused by the control plane; not sent again"
-                            );
-                            return;
-                        }
-                        Err(SendError::Undelivered(error)) => error,
-                    }
-                };
-                tracing::warn!(seq = report.seq, %error, retry_in_ms = wait.as_millis() as u64,
-                    "wake report not delivered; retrying");
-                tokio::time::sleep(wait).await; // determinism-ok: retry backoff
-                wait = (wait * 2).min(LAST_RETRY_WAIT);
-            }
-        };
-        tokio::spawn(send); // determinism-ok: a report's delivery runs beside the commit
-    }
 }
 
 impl Armed {
@@ -487,6 +376,8 @@ impl Armed {
     }
 }
 
+#[path = "due/report.rs"]
+mod report;
 #[cfg(test)]
 #[path = "due/tests.rs"]
 mod tests;
