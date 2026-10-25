@@ -6,7 +6,9 @@
 //! process's clock runs and its timers fire on their own. Suspended, nothing
 //! of the process runs and only the wall clock moves on, until the next
 //! request: one from the workload, or the control plane's wake at the due
-//! time it was told last. A wake is inbound like any request.
+//! time it holds. It holds the newest of what it was told: a report, ordered
+//! by `reported_at`, or a wake's answer, as of the wake. A wake is inbound
+//! like any request.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -153,7 +155,9 @@ pub(crate) fn run(seed: u64, setup: Setup) -> Result<(), String> {
                 .awake
                 .map(|awake| chrono::Duration::from_std(awake).unwrap()),
             awake_until: sim_now(),
-            handled: None,
+            plan: None,
+            seen: None,
+            answered_at: None,
             recs: Vec::new(),
             trace: Vec::new(),
         };
@@ -174,8 +178,12 @@ struct Sim {
     awake: Option<chrono::Duration>,
     /// When the sandbox is suspended, unless a request comes first.
     awake_until: DateTime<Utc>,
-    /// The report the control plane woke the process for last.
-    handled: Option<u64>,
+    /// When the control plane will wake the process next.
+    plan: Option<DateTime<Utc>>,
+    /// The newest report the control plane has taken.
+    seen: Option<u64>,
+    /// When the control plane took a wake's answer last.
+    answered_at: Option<DateTime<Utc>>,
     recs: Vec<Rec>,
     trace: Vec<String>,
 }
@@ -196,14 +204,19 @@ impl Sim {
         self.awake_until = sim_now() + after + secs(self.rng.next_bound(JITTER as usize) as u64);
     }
 
-    /// The wake the control plane has yet to make: for the newest report it
-    /// took, at the time it names.
-    fn pending_wake(&self) -> Option<(u64, DateTime<Utc>)> {
-        let told = self.reports.told()?;
-        if self.handled == Some(told.seq) {
-            return None;
+    /// The control plane takes the newest report delivered to it, unless a
+    /// wake's answer came after it was made.
+    fn take_reports(&mut self) {
+        let Some(told) = self.reports.told() else {
+            return;
+        };
+        if self.seen == Some(told.seq) {
+            return;
         }
-        Some((told.seq, told.next_due_at?))
+        self.seen = Some(told.seq);
+        if self.answered_at.is_none_or(|at| told.reported_at >= at) {
+            self.plan = told.next_due_at;
+        }
     }
 
     async fn go(&mut self, arrivals: Vec<Arrival>, kind: &Kind) -> Result<(), String> {
@@ -211,12 +224,13 @@ impl Sim {
         let mut next = 0;
         loop {
             let now = sim_now();
-            let wake = self.pending_wake();
+            self.take_reports();
+            let wake = self.plan;
             let arrival = arrivals.get(next).map(|a| a.at);
-            if let Some((seq, at)) = wake
+            if let Some(at) = wake
                 && at <= now
             {
-                self.wake(seq).await.map_err(|failure| self.fail(failure))?;
+                self.wake().await.map_err(|failure| self.fail(failure))?;
                 continue;
             }
             if let Some(at) = arrival
@@ -230,7 +244,7 @@ impl Sim {
             if now >= end {
                 break;
             }
-            let resume = [wake.map(|(_, at)| at), arrival, Some(end)]
+            let resume = [wake, arrival, Some(end)]
                 .into_iter()
                 .flatten()
                 .min()
@@ -298,10 +312,9 @@ impl Sim {
         Ok(())
     }
 
-    /// The control plane wakes the process for report `seq`, and sometimes
-    /// at once again.
-    async fn wake(&mut self, seq: u64) -> Result<(), (&'static str, String)> {
-        self.handled = Some(seq);
+    /// The control plane wakes the process at the time it holds, sometimes
+    /// at once again, and holds each wake's answer.
+    async fn wake(&mut self) -> Result<(), (&'static str, String)> {
         for again in [false, true] {
             if again && self.rng.next_bound(3) != 0 {
                 break;
@@ -311,6 +324,8 @@ impl Sim {
             self.trace.push(format!("woken at {woke_at}"));
             let horizon = self.awake.map_or(woke_at, |awake| woke_at + awake);
             let outcome = self.state.wake_runtime(&TenantId::new(TENANT)).await;
+            self.plan = outcome.next_due_at;
+            self.answered_at = Some(woke_at);
             checks::wake(&self.events, &self.rows, woke_at, horizon, &outcome).await?;
             if again && outcome.fired != 0 {
                 return Err((

@@ -13,8 +13,9 @@
 //! (`Expire`) or starts a chain repeating every two hours (`Tick`), or only
 //! keeps the sandbox awake. The sandbox is suspended exactly 900 s plus up to
 //! a minute after the last inbound request; the process is told it stays awake
-//! 600 s. The control plane wakes it at the due time it was told last,
-//! sometimes twice at once, and fails up to three report sends in a row.
+//! 600 s. The control plane wakes it at the due time it was told last, by a
+//! report or a wake's answer, sometimes twice at once, and fails up to three
+//! report sends in a row.
 //!
 //! Invariants (`checks.rs`):
 //! - every timer fires at most 10 s after it is due, and none is slept
