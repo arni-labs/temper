@@ -10,34 +10,17 @@
 //! 2. Builds a [`TemperModel`] for each participating entity.
 //! 3. Materialises a [`CompositeVerificationPlan`] describing what the
 //!    joint state-machine verifier would check.
-//! 4. (Slice 8d) Implements [`stateright::Model`] over the composition
-//!    ([`CompositeTemperModel`]), so the verifier can BFS the joint
-//!    state space with cross-entity cascades applied within each step.
-//!
-//! Example:
-//!
-//! ```ignore
-//! use temper_verify::composite::{CompositeVerificationPlan, CompositeTemperModel};
-//! use temper_spec::automaton::parse_automaton;
-//!
-//! let order = parse_automaton(order_ioa)?;
-//! let payment = parse_automaton(payment_ioa)?;
-//! let plan = CompositeVerificationPlan::new(&[&order, &payment], "Order")?;
-//! let model = CompositeTemperModel::from_plan(plan);
-//! // Model is Stateright-checkable from here.
-//! ```
+//! 4. Walks the joint model of that set ([`joint`]) for reactions a
+//!    target refuses when they land ([`verify`], ADR-0150).
 
-pub mod invariant_eval;
 pub mod joint;
-pub mod model;
 pub mod verify;
 
 pub use joint::{
-    Bound, Bytes, JointInvariantResult, JointLivenessResult, JointOutcome, JointReplay, JointStep,
-    LivenessOutcome, Progress, Room, StuckCase, TraceMove, replay_joint_invariants,
-    verify_joint_invariants, verify_joint_liveness,
+    Bound, Bytes, DroppedReaction, JointInvariantResult, JointLivenessResult, JointOutcome,
+    JointReplay, JointStep, LivenessOutcome, Progress, Room, StuckCase, TraceMove,
+    replay_joint_invariants, verify_joint_invariants, verify_joint_liveness,
 };
-pub use model::{CompositeAction, CompositeState, CompositeTemperModel, DroppedReaction};
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,
     verify_composite_with_budget,

@@ -35,6 +35,11 @@
 //! breadth first, so each broken invariant's path is a shortest one. A walk
 //! that does not fit in the memory its [`Room`] gives it says so and is
 //! never a pass.
+//!
+//! The drop check (ADR-0150, [`dropped_reactions`]) walks the same model over
+//! a whole trigger-graph component, unsliced, one record of each type that
+//! every reference finds, with a move's dispatches landing before the next
+//! move from outside, and names each reaction a target refuses.
 
 mod env;
 mod liveness;
@@ -56,6 +61,8 @@ use temper_spec::predicate::{Expr, Truth, eval};
 
 use crate::model::ParamValue;
 
+pub use model::DroppedReaction;
+pub(crate) use model::dropped_reactions;
 use model::{JointModel, Move, Sending};
 use state::render;
 pub use state::{Call, Dispatch, JointState};

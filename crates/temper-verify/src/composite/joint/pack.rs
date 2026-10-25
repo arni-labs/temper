@@ -202,6 +202,7 @@ impl Pack for Dispatch {
         self.params.put(packer, out);
         self.read.put(packer, out);
         self.depth.put(packer, out);
+        self.via.put(packer, out);
         self.by.put(packer, out);
         self.inline.put(packer, out);
     }
@@ -213,6 +214,7 @@ impl Pack for Dispatch {
             params: Pack::take(packer, input),
             read: Pack::take(packer, input),
             depth: Pack::take(packer, input),
+            via: Pack::take(packer, input),
             by: Pack::take(packer, input),
             inline: Pack::take(packer, input),
         }

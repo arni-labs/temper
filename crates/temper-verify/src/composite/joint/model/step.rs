@@ -12,7 +12,7 @@ use super::super::senders::OUTSIDE;
 use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
-use super::{JointModel, MAX_IN_FLIGHT};
+use super::{Delivery, JointModel, MAX_IN_FLIGHT};
 use crate::model::semantics::successors_among;
 use crate::model::{ParamValue, TemperModelAction};
 
@@ -98,12 +98,14 @@ pub(in crate::composite::joint) struct Next {
 impl JointModel {
     /// Every move from `state`: each record's enabled actions someone
     /// outside may send, with string parameters chosen among the values held
-    /// anywhere in the joint state; each state timer due; each module call's
+    /// anywhere in the joint state, and each state timer due (when its
+    /// delivery lets a move from outside come now); each module call's
     /// answers and failure; and each dispatch in flight.
     pub(in crate::composite::joint) fn moves(&self, state: &JointState) -> Vec<Move> {
         let values = self.values(state);
         let mut out = Vec::new();
-        for (entity, model) in &self.models {
+        let asked = self.delivery == Delivery::Any || state.inflight.is_empty();
+        for (entity, model) in self.models.iter().filter(|_| asked) {
             let local = &state.records[entity];
             for t in &model.transitions {
                 if !self.sendable(entity, &t.name)
@@ -296,7 +298,8 @@ impl JointModel {
         let nexts = outcomes
             .into_iter()
             .filter(|(outcome, _, _)| {
-                let fits = outcome.inflight.len() + outcome.calls.len() <= MAX_IN_FLIGHT;
+                let fits = self.delivery == Delivery::BeforeNextRequest
+                    || outcome.inflight.len() + outcome.calls.len() <= MAX_IN_FLIGHT;
                 held_back |= !fits;
                 fits
             })
@@ -319,7 +322,7 @@ impl JointModel {
     /// take. Its own record is read later, by its actor. True when a guard
     /// holds outright, false when the related records refuse every one, and
     /// unknown when the model cannot tell.
-    fn read_allows(&self, dispatch: &Dispatch, state: &JointState) -> Truth {
+    pub(super) fn read_allows(&self, dispatch: &Dispatch, state: &JointState) -> Truth {
         let full = self.env(&dispatch.to, state);
         let related = self.env_blind(&dispatch.to, state, Blind::Own);
         let mut refused = true;
@@ -449,12 +452,13 @@ fn sent(entity: &str, action: &TemperModelAction, by: u32, inline: bool) -> Disp
         params: action.params.clone(),
         read: true,
         depth: 0,
+        via: None,
         by,
         inline,
     }
 }
 
-fn remove(state: &mut JointState, dispatch: &Dispatch) {
+pub(super) fn remove(state: &mut JointState, dispatch: &Dispatch) {
     if let Some(at) = state.inflight.iter().position(|d| d == dispatch) {
         state.inflight.remove(at);
     }
