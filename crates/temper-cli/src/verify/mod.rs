@@ -50,7 +50,7 @@ pub fn run(specs_dir: &str) -> Result<()> {
     // would find.
     match (
         verify_ioa_sources(&ioa_sources),
-        verify_liveness(&ioa_sources, &policy_text),
+        verify_joint(&ioa_sources, &policy_text),
     ) {
         (Err(ioa), Err(senders)) => anyhow::bail!("{ioa}\n{senders}"),
         (Err(failed), Ok(())) | (Ok(()), Err(failed)) => return Err(failed),
@@ -211,18 +211,10 @@ fn verify_ioa_sources(ioa_sources: &std::collections::BTreeMap<String, String>) 
         // reaction is dropped (target not in its required from-state). This is
         // only meaningful with two or more entities — a single spec has nothing
         // to compose (and stdin verification stays per-entity by design).
-        // Each check reports on its own: one that fails does not hide what
-        // the next would find.
-        let composite = if parsed_automata.len() >= 2 {
-            run_composite_verification(&parsed_automata)
-        } else {
-            Ok(())
-        };
-        let joint = run_joint_verification(&parsed_automata);
-        match (composite, joint) {
-            (Err(composite), Err(joint)) => anyhow::bail!("{composite}\n{joint}"),
-            (Err(failed), Ok(())) | (Ok(()), Err(failed)) => return Err(failed),
-            (Ok(()), Ok(())) => {}
+        // The rules over several records are checked with the app's Cedar
+        // (`verify_joint`).
+        if parsed_automata.len() >= 2 {
+            run_composite_verification(&parsed_automata)?;
         }
     }
 
@@ -240,38 +232,14 @@ fn joint_bound(
     }
 }
 
-/// Check every `[[invariant]]` that reads a related entity on the joint
-/// model of its entity and the types it names. A broken invariant fails the
-/// command with its shortest path; one the walk could not finish fails too,
-/// since a partial walk proves nothing.
-fn run_joint_verification(
-    parsed_automata: &std::collections::BTreeMap<String, temper_spec::automaton::Automaton>,
-) -> Result<()> {
-    let automaton_refs: Vec<&temper_spec::automaton::Automaton> =
-        parsed_automata.values().collect();
-    let progress = temper_verify::composite::Progress::default();
-    let results =
-        temper_verify::composite::verify_joint_invariants(&automaton_refs, joint_bound(&progress));
-    let rows = results.iter().map(|result| {
-        let tag = match result.outcome {
-            temper_verify::composite::JointOutcome::Holds => "PASS",
-            temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
-            temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
-        };
-        (
-            tag,
-            result.to_string(),
-            format!("{}.{}", result.entity, result.invariant),
-        )
-    });
-    print_joint_report("Cross-entity invariants", rows.collect())
-}
-
-/// Check every `[[liveness]]` with `eventually` on the joint model, with the
-/// app's Cedar deciding each move as its sender: the condition must be
-/// reached by the system's own moves. A spec that does not parse is reported
-/// by the IOA cascade, so it is skipped here.
-fn verify_liveness(
+/// Check every `[[invariant]]` that reads a related record and every
+/// `[[liveness]]` with `eventually` on the joint model, with the app's Cedar
+/// deciding each move as its sender. A broken invariant fails the command
+/// with its shortest path, a condition the system's own moves do not reach
+/// fails with how it comes to rest short of it, and a walk that could not
+/// finish fails too, since a partial walk proves nothing. A spec that does
+/// not parse is reported by the IOA cascade, so it is skipped here.
+fn verify_joint(
     ioa_sources: &std::collections::BTreeMap<String, String>,
     policy_text: &str,
 ) -> Result<()> {
@@ -285,12 +253,31 @@ fn verify_liveness(
     let analysis = temper_authz::SendAnalysis::new(policy_text).context("invalid Cedar policy")?;
     let refs: Vec<&temper_spec::automaton::Automaton> = parsed.iter().collect();
     let progress = temper_verify::composite::Progress::default();
+    let invariants = temper_verify::composite::verify_joint_invariants(
+        &refs,
+        Some(&analysis),
+        joint_bound(&progress),
+    );
+    let invariant_rows = invariants.iter().map(|result| {
+        let tag = match result.outcome {
+            temper_verify::composite::JointOutcome::Holds => "PASS",
+            temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
+            temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
+        };
+        (
+            tag,
+            result.to_string(),
+            format!("{}.{}", result.entity, result.invariant),
+        )
+    });
+    let invariants = print_joint_report("Cross-entity invariants", invariant_rows.collect());
+    let progress = temper_verify::composite::Progress::default();
     let live = temper_verify::composite::verify_joint_liveness(
         &refs,
         Some(&analysis),
         joint_bound(&progress),
     );
-    let rows = live.iter().map(|result| {
+    let live_rows = live.iter().map(|result| {
         let tag = match result.outcome {
             temper_verify::composite::LivenessOutcome::Holds => "PASS",
             temper_verify::composite::LivenessOutcome::Stuck { .. } => "FAIL",
@@ -302,7 +289,13 @@ fn verify_liveness(
             format!("{}.{}", result.entity, result.name),
         )
     });
-    print_joint_report("Liveness", rows.collect())
+    let liveness = print_joint_report("Liveness", live_rows.collect());
+    // Each reports on its own: one that fails does not hide the other.
+    match (invariants, liveness) {
+        (Err(invariants), Err(liveness)) => anyhow::bail!("{invariants}\n{liveness}"),
+        (Err(failed), Ok(())) | (Ok(()), Err(failed)) => Err(failed),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// Print one joint check's results, each row its tag, the result in words

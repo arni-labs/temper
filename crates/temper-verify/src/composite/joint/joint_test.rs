@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
 
 use super::*;
@@ -100,14 +101,21 @@ fn parse(sources: &[&str]) -> Vec<Automaton> {
 }
 
 fn check(sources: &[&str]) -> JointInvariantResult {
+    check_under(sources, None)
+}
+
+/// The one result for `sources`, with `policies` (Cedar) deciding each move
+/// as its sender.
+fn check_under(sources: &[&str], policies: Option<&str>) -> JointInvariantResult {
     let automatons = parse(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
     let (room, progress) = (Bytes::new(1 << 30), Progress::default());
     let bound = Bound {
         room: &room,
         progress: &progress,
     };
-    let mut results = verify_joint_invariants(&refs, bound);
+    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), bound);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -153,6 +161,56 @@ fn a_copy_anyone_may_write_breaks_the_invariant_with_the_move_that_wrote_it() {
             .action
             .as_deref()
             .is_some_and(|a| a.starts_with("Child.Copy")),
+        "{result}"
+    );
+}
+
+/// A parent set once, whose `tell` runs as its own service, and Cedar that
+/// lets only that service send the child's Copy.
+fn parent_told_once() -> String {
+    parent(false)
+        .replace(
+            "from = [\"Open\"]\nto = \"Open\"\nparams",
+            "from = [\"Open\"]\nto = \"Closed\"\nparams",
+        )
+        .replace(
+            "name = \"tell\"\nkind = \"entity\"",
+            "name = \"tell\"\nkind = \"entity\"\nprincipal = \"tell\"",
+        )
+}
+
+const ONLY_TELL_COPIES: &str = r#"
+permit(principal, action in [Action::"Set", Action::"Close", Action::"Finish"], resource);
+permit(principal == Agent::"service:tell", action == Action::"Copy", resource is Child);
+"#;
+
+#[test]
+fn a_copy_only_the_parents_service_may_send_holds_under_its_cedar() {
+    let child = child_with("status == 'Done' => Parent[Id].value == value");
+    let parent = parent_told_once();
+    assert!(
+        !check(&[&parent, &child]).holds(),
+        "without Cedar anyone may send Copy"
+    );
+    let result = check_under(&[&parent, &child], Some(ONLY_TELL_COPIES));
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn an_action_a_liveness_relies_on_is_sent_whatever_cedar_says() {
+    let child = format!(
+        "{}\n[[liveness]]\nname = \"moves_on\"\neventually = \"status != 'Waiting'\"\nrelies_on = [\"Copy\"]\n",
+        child_with("status == 'Done' => Parent[Id].value == value")
+    );
+    let parent = parent_told_once();
+    let result = check_under(&[&parent, &child], Some(ONLY_TELL_COPIES));
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("expected a broken invariant, got {result}");
+    };
+    assert!(
+        path.iter()
+            .filter_map(|step| step.action.as_deref())
+            .any(|a| a.starts_with("Child.Copy")),
         "{result}"
     );
 }
@@ -208,7 +266,7 @@ fn specs_without_cross_entity_invariants_have_nothing_to_check() {
         room: &room,
         progress: &progress,
     };
-    assert!(verify_joint_invariants(&refs, bound).is_empty());
+    assert!(verify_joint_invariants(&refs, None, bound).is_empty());
 }
 
 #[test]
@@ -304,7 +362,7 @@ fn a_walk_its_room_cannot_hold_is_not_checked_and_gives_its_memory_back() {
         room: &room,
         progress: &progress,
     };
-    let results = verify_joint_invariants(&refs, bound);
+    let results = verify_joint_invariants(&refs, None, bound);
     assert_eq!(results.len(), 1);
     let JointOutcome::Incomplete { reason } = &results[0].outcome else {
         panic!("expected not checked, got {}", results[0]);
