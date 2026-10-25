@@ -37,6 +37,7 @@ fn parses_every_operand_form() {
         "len(tags) > 0",
         "'urgent' in tags",
         "Workspace[workspace_id].status not in ['Frozen']",
+        "Install[app_id].commit == commit",
         "kind == 'external' => !empty(url)",
         "url == null",
         "retries == -1",

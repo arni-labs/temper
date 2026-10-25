@@ -469,3 +469,39 @@ params=[{name="owner",type="string",source="authenticated_subject"}]
     let json = serde_json::to_value(&auto.actions[0].params[0]).unwrap();
     assert_eq!(json["source"], "authenticated_subject");
 }
+
+#[test]
+fn a_related_record_s_field_is_read_only_by_an_invariant() {
+    let invariant = r#"
+[[invariant]]
+name = "same_note"
+assert = "status == 'Done' => Owner[owner_id].owner_id == owner_id"
+"#;
+    parse(&spec("", "", invariant)).expect("an invariant may read a related field");
+    rejects(
+        &spec("", "guard = \"Owner[owner_id].owner_id == owner_id\"", ""),
+        "only an [[invariant]] may do",
+    );
+}
+
+#[test]
+fn a_param_bound_to_a_related_field_names_declared_fields() {
+    let bound = |id_field: &str| {
+        format!(
+            r#"
+[[action.constraints]]
+kind = "param_equals_related_field"
+param = "note"
+entity = "Owner"
+id_field = "{id_field}"
+field = "owner_id"
+"#
+        )
+    };
+    parse(&spec("", &bound("owner_id"), "")).expect("a declared id field");
+    parse(&spec("", &bound("Id"), "")).expect("the record's own id");
+    rejects(
+        &spec("", &bound("missing_id"), ""),
+        "the related record's id field is undeclared",
+    );
+}

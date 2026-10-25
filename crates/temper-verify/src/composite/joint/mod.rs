@@ -378,3 +378,7 @@ pub(super) fn label(
     }
     format!("{entity}.{action}")
 }
+
+#[cfg(test)]
+#[path = "joint_test.rs"]
+mod tests;
