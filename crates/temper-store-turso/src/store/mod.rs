@@ -33,6 +33,7 @@ macro_rules! tombstone_sql {
     };
 }
 
+mod append_commit;
 mod append_config;
 mod authz;
 mod blobs;
