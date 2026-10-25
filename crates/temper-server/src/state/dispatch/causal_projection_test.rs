@@ -347,6 +347,18 @@ async fn causal_delete_keeps_older_queued_writes_before_removal() {
 /// write landing after the removal would bring the deleted record back.
 #[tokio::test]
 async fn a_delete_during_a_failed_projection_is_not_undone_by_its_retry() {
+    delete_during_failed_projection(false).await;
+}
+
+/// As above, after the status cache has evicted the delete's tombstone, as a
+/// long outage with other records' traffic does: the retry must still see the
+/// delete.
+#[tokio::test]
+async fn a_delete_whose_tombstone_left_the_cache_is_not_undone_by_a_retry() {
+    delete_during_failed_projection(true).await;
+}
+
+async fn delete_during_failed_projection(evict_tombstone: bool) {
     let (state, query, queue, _temp) = fixture().await;
     let tenant = TenantId::default();
     let agent = AgentContext::system();
@@ -382,6 +394,18 @@ async fn a_delete_during_a_failed_projection_is_not_undone_by_its_retry() {
             .unwrap()
             .unwrap();
         assert!(rows.is_empty(), "the delete removed the row");
+        if evict_tombstone {
+            let evicted = state
+                .entity_state_cache
+                .lock()
+                .unwrap()
+                .pop("default:Source:source");
+            assert_eq!(
+                evicted.map(|held| held.status).as_deref(),
+                Some("Deleted"),
+                "the delete cached its tombstone"
+            );
+        }
         // The store recovers while the edit is still being tried.
         query.fail_source_write.store(false, Ordering::SeqCst);
     };
