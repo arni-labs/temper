@@ -48,12 +48,38 @@ pub struct EvalContext {
 /// Related entities' statuses keyed by `(entity_type, id_field)`.
 pub type RelatedMap = BTreeMap<(String, String), Related>;
 
-/// The statuses of the entities one reference field points at.
+/// The entities one reference field points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Related {
     /// One status per id; `None` for an id whose entity was not found. Empty
     /// when the reference is unset.
     Statuses(Vec<Option<String>>),
+    /// One record per id, with the fields an action constraint compares
+    /// against (`param_equals_related_field`); `None` for an id whose entity
+    /// was not found. Empty when the reference is unset.
+    Records(Vec<Option<RelatedRecord>>),
+}
+
+impl Related {
+    /// The status of each entity the reference points at.
+    pub fn statuses(&self) -> Vec<Option<&str>> {
+        match self {
+            Related::Statuses(statuses) => statuses.iter().map(Option::as_deref).collect(),
+            Related::Records(records) => records
+                .iter()
+                .map(|record| record.as_ref().map(|record| record.status.as_str()))
+                .collect(),
+        }
+    }
+}
+
+/// A related entity read when an action is dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedRecord {
+    /// Its status.
+    pub status: String,
+    /// The fields an action constraint compares against.
+    pub fields: BTreeMap<String, serde_json::Value>,
 }
 
 struct GuardEnv<'a> {
@@ -97,11 +123,11 @@ impl Env for GuardEnv<'_> {
 
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {
         let key = (entity_type.to_string(), id_field.to_string());
-        match self.ctx.related.get(&key) {
-            Some(Related::Statuses(statuses)) if !statuses.is_empty() => Some(
+        match self.ctx.related.get(&key).map(Related::statuses) {
+            Some(statuses) if !statuses.is_empty() => Some(
                 statuses
-                    .iter()
-                    .map(|status| status.as_deref().map_or(Val::Null, Val::Str))
+                    .into_iter()
+                    .map(|status| status.map_or(Val::Null, Val::Str))
                     .collect(),
             ),
             _ => Some(vec![Val::Null]),
@@ -160,6 +186,15 @@ pub fn check_detailed(
                     .map(render)
                     .collect::<Vec<_>>()
                     .join(", "),
+            ),
+            // Refused in guards at load (validate_predicates).
+            Name::CrossField {
+                entity_type,
+                id_field,
+                field,
+            } => (
+                format!("{entity_type}[{id_field}].{field}"),
+                "?".to_string(),
             ),
         };
         if !found.iter().any(|(existing, _)| *existing == label) {

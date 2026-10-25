@@ -94,6 +94,18 @@ pub trait Env {
     /// related entity that cannot be found, contributes one `Val::Null`, so
     /// the result is never empty. `None` when the evaluator cannot know.
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>>;
+    /// The value of `field` on the related entities of `entity_type` whose
+    /// ids are in `id_field`, like [`Env::cross_statuses`]. `None` (the
+    /// default) when the evaluator cannot know: only the joint verifier
+    /// reads related fields.
+    fn cross_fields(
+        &self,
+        _entity_type: &str,
+        _id_field: &str,
+        _field: &str,
+    ) -> Option<Vec<Val<'_>>> {
+        None
+    }
 }
 
 /// Evaluate `expr` against `env`.
@@ -169,11 +181,20 @@ fn for_each_value(operand: &Operand, env: &dyn Env, test: impl Fn(Val<'_>) -> Tr
                 .map_or(Val::Null, |len| Val::Num(len as f64)),
         },
         Operand::Lit(lit) => literal(lit),
-        Operand::CrossStatus {
-            entity_type,
-            id_field,
-        } => {
-            let Some(statuses) = env.cross_statuses(entity_type, id_field) else {
+        Operand::CrossStatus { .. } | Operand::CrossField { .. } => {
+            let related = match operand {
+                Operand::CrossStatus {
+                    entity_type,
+                    id_field,
+                } => env.cross_statuses(entity_type, id_field),
+                Operand::CrossField {
+                    entity_type,
+                    id_field,
+                    field,
+                } => env.cross_fields(entity_type, id_field, field),
+                _ => unreachable!("matched above"),
+            };
+            let Some(statuses) = related else {
                 return Truth::Unknown;
             };
             debug_assert!(!statuses.is_empty(), "cross_statuses is never empty");

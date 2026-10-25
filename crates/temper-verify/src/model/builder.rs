@@ -9,11 +9,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{Automaton, Initial, ResolvedEffect, translate_actions};
-use temper_spec::predicate::{Arg, Literal, ParamKind};
+use temper_spec::automaton::{
+    ActionConstraint, ActionKind, Automaton, Initial, ResolvedEffect, translate_actions,
+};
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, ParamKind, Set, VarKind};
 
 use super::types::{
-    LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition, TemperModel,
+    LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
+    StringParam, TemperModel,
 };
 
 /// Build a `TemperModel` from I/O Automaton TOML source.
@@ -30,6 +33,17 @@ pub fn build_model_from_ioa(ioa_toml: &str, max_counter: usize) -> Result<Temper
 
 /// Build a `TemperModel` directly from a parsed [`Automaton`].
 pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> TemperModel {
+    build_model_tracking(automaton, max_counter, &BTreeSet::new())
+}
+
+/// [`build_model_from_automaton`], also tracking the string variables in
+/// `also_tracked`: those another entity's invariant reads through
+/// `Type[id].field`, or a reaction copies into a tracked variable.
+pub fn build_model_tracking(
+    automaton: &Automaton,
+    max_counter: usize,
+    also_tracked: &BTreeSet<String>,
+) -> TemperModel {
     let states = automaton.automaton.states.clone();
     let initial_status = automaton.automaton.initial.clone();
 
@@ -56,7 +70,20 @@ pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> 
         }
     }
 
-    let transitions = resolve_transitions(automaton);
+    let tracked_strings = tracked_strings(automaton, also_tracked);
+    let initial_strings: BTreeMap<String, String> = automaton
+        .state
+        .iter()
+        .filter(|sv| tracked_strings.contains(&sv.name))
+        .map(|sv| {
+            let value = match &sv.initial {
+                Initial::String(text) => text.clone(),
+                _ => String::new(),
+            };
+            (sv.name.clone(), value)
+        })
+        .collect();
+    let transitions = resolve_transitions(automaton, &tracked_strings);
     // A counter written with a literal larger than the exploration bound is
     // explored up to that literal, so the write is not pruned away.
     for t in &transitions {
@@ -99,6 +126,9 @@ pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> 
         initial_counters,
         initial_booleans,
         initial_lists,
+        string_literals: string_literals(automaton, &tracked_strings),
+        initial_strings,
+        tracked_strings,
         counter_bounds,
         default_max_counter: max_counter,
         list_literals: list_literals(automaton),
@@ -123,10 +153,19 @@ fn list_literals(automaton: &Automaton) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 /// Translate IOA actions into resolved transitions using the shared translation layer.
-fn resolve_transitions(automaton: &Automaton) -> Vec<ResolvedTransition> {
+fn resolve_transitions(
+    automaton: &Automaton,
+    tracked_strings: &BTreeSet<String>,
+) -> Vec<ResolvedTransition> {
+    // `translate_actions` keeps every action but outputs, in order.
+    let declared = automaton
+        .actions
+        .iter()
+        .filter(|a| a.kind != ActionKind::Output);
     translate_actions(automaton)
         .into_iter()
-        .map(|a| {
+        .zip(declared)
+        .map(|(a, action)| {
             let effects: Vec<ModelEffect> =
                 a.effects.into_iter().filter_map(convert_effect).collect();
             let params = effect_params(&effects);
@@ -137,9 +176,152 @@ fn resolve_transitions(automaton: &Automaton) -> Vec<ResolvedTransition> {
                 guard: a.guard,
                 effects,
                 params,
+                string_params: string_params(action, tracked_strings),
             }
         })
         .collect()
+}
+
+/// The parameters of `action` that write a tracked string variable, with the
+/// action's constraints on each.
+fn string_params(
+    action: &temper_spec::automaton::Action,
+    tracked_strings: &BTreeSet<String>,
+) -> Vec<StringParam> {
+    action
+        .params
+        .iter()
+        .map(|param| param.name())
+        .filter(|name| tracked_strings.contains(*name))
+        .map(|name| {
+            let mut param = StringParam {
+                name: name.to_string(),
+                nonempty: false,
+                equals: None,
+                not_equals: Vec::new(),
+                equals_related: None,
+            };
+            for constraint in action.constraints.iter().filter(|c| c.param() == name) {
+                match constraint {
+                    ActionConstraint::ParamNonempty { .. } => param.nonempty = true,
+                    ActionConstraint::ParamEqualsField { field, .. } => {
+                        param.equals = Some(field.clone());
+                    }
+                    ActionConstraint::ParamNotEqualsField { field, .. } => {
+                        param.not_equals.push(field.clone());
+                    }
+                    ActionConstraint::ParamEqualsRelatedField { entity, field, .. } => {
+                        param.equals_related = Some((entity.clone(), field.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            param
+        })
+        .collect()
+}
+
+/// The string variables the verifier tracks: those `[[invariant]]`s read,
+/// plus `also_tracked`, plus every string variable a constraint ties the
+/// parameter of a tracked one to (its value decides what the tracked one may
+/// become). Strings no invariant can see stay unmodeled, so a spec whose
+/// invariants read none explores exactly as before.
+fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BTreeSet<String> {
+    let kinds: BTreeMap<&str, VarKind> = automaton
+        .state
+        .iter()
+        .map(|sv| (sv.name.as_str(), sv.var_type.kind()))
+        .collect();
+    let is_string = |name: &str| kinds.get(name) == Some(&VarKind::Str);
+    let mut tracked: BTreeSet<String> = also_tracked
+        .iter()
+        .filter(|name| is_string(name))
+        .cloned()
+        .collect();
+    for inv in &automaton.invariants {
+        inv.assert.for_each_name(&mut |name| {
+            if let Name::Var(var) = name
+                && is_string(var)
+            {
+                tracked.insert(var.to_string());
+            }
+        });
+    }
+    loop {
+        let before = tracked.len();
+        for action in &automaton.actions {
+            for constraint in &action.constraints {
+                if !tracked.contains(constraint.param()) {
+                    continue;
+                }
+                if let Some(field) = constraint.field()
+                    && is_string(field)
+                {
+                    tracked.insert(field.to_string());
+                }
+            }
+        }
+        if tracked.len() == before {
+            return tracked;
+        }
+    }
+}
+
+/// For each tracked string variable, the literals a guard or invariant
+/// compares it with (`v == 'x'`, `v in ['x', 'y']`).
+fn string_literals(
+    automaton: &Automaton,
+    tracked: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    fn visit(
+        expr: &Expr,
+        tracked: &BTreeSet<String>,
+        out: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        match expr {
+            Expr::Not(inner) => visit(inner, tracked, out),
+            Expr::And(parts) | Expr::Or(parts) => {
+                parts.iter().for_each(|part| visit(part, tracked, out));
+            }
+            Expr::Implies(a, b) => {
+                visit(a, tracked, out);
+                visit(b, tracked, out);
+            }
+            Expr::Compare {
+                lhs,
+                op: CmpOp::Eq | CmpOp::Ne,
+                rhs,
+            } => {
+                for (var, lit) in [(lhs, rhs), (rhs, lhs)] {
+                    if let (Operand::Var(var), Operand::Lit(Literal::Str(text))) = (var, lit)
+                        && tracked.contains(var)
+                    {
+                        out.entry(var.clone()).or_default().insert(text.clone());
+                    }
+                }
+            }
+            Expr::In {
+                value: Operand::Var(var),
+                set: Set::List(items),
+                ..
+            } if tracked.contains(var) => {
+                for item in items {
+                    if let Literal::Str(text) = item {
+                        out.entry(var.clone()).or_default().insert(text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    for action in &automaton.actions {
+        visit(&action.guard, tracked, &mut out);
+    }
+    for inv in &automaton.invariants {
+        visit(&inv.assert, tracked, &mut out);
+    }
+    out
 }
 
 /// Convert a state [`ResolvedEffect`] to the verification [`ModelEffect`];
@@ -160,7 +342,7 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
 }
 
 /// The kind of every `params.p` the effects read (checked consistent at load).
-fn effect_params(effects: &[ModelEffect]) -> BTreeMap<String, ParamKind> {
+pub(crate) fn effect_params(effects: &[ModelEffect]) -> BTreeMap<String, ParamKind> {
     let mut params = BTreeMap::new();
     for effect in effects {
         let (arg, kind) = match effect {
@@ -259,6 +441,7 @@ mod tests {
             counters: BTreeMap::from([("items".to_string(), 0)]),
             booleans: BTreeMap::from([("has_address".to_string(), false)]),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         let mut actions = Vec::new();
         model.actions(&state, &mut actions);
@@ -277,6 +460,7 @@ mod tests {
             counters: BTreeMap::from([("items".to_string(), 1)]),
             booleans: BTreeMap::from([("has_address".to_string(), true)]),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         let mut actions = Vec::new();
         model.actions(&state, &mut actions);
@@ -295,6 +479,7 @@ mod tests {
             counters: BTreeMap::from([("items".to_string(), 1)]),
             booleans: BTreeMap::from([("has_address".to_string(), false)]),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         let action = super::super::types::TemperModelAction {
             name: "SubmitOrder".to_string(),
@@ -316,6 +501,7 @@ mod tests {
             counters: BTreeMap::from([("items".to_string(), 0)]),
             booleans: BTreeMap::from([("has_address".to_string(), false)]),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         let action = super::super::types::TemperModelAction {
             name: "AddItem".to_string(),

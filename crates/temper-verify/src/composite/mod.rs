@@ -28,9 +28,14 @@
 //! ```
 
 pub mod invariant_eval;
+pub mod joint;
 pub mod model;
 pub mod verify;
 
+pub use joint::{
+    JointInvariantResult, JointOutcome, JointReplay, JointStep, TraceMove, replay_joint_invariants,
+    verify_joint_invariants,
+};
 pub use model::{CompositeAction, CompositeState, CompositeTemperModel, DroppedReaction};
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,

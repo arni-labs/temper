@@ -38,6 +38,7 @@ mod tests {
             counters: BTreeMap::new(),
             booleans: BTreeMap::new(),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         }
     }
 

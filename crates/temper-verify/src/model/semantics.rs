@@ -6,16 +6,19 @@ use temper_spec::predicate::{
     Arg, Env, Expr, Literal, Operand, ParamKind, Set, Truth, Val, VarKind, eval,
 };
 
-use super::types::{ModelEffect, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
+use super::types::{
+    ModelEffect, ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelState,
+};
 
 /// Parameter assignments explored per step for one transition, at most
 /// (TigerStyle budget: `successors` materializes every assignment).
 pub const MAX_PARAM_ASSIGNMENTS: usize = 4096;
 
-/// A model state as a predicate environment. Status, counters, booleans and
-/// lists are modeled; declared counters, booleans and lists missing from the
-/// state read as their zero value. String and numeric variables, entity
-/// fields and related-entity statuses are not modeled and read as unknown.
+/// A model state as a predicate environment. Status, counters, booleans,
+/// lists and tracked strings are modeled; declared counters, booleans and
+/// lists missing from the state read as their zero value. Untracked string
+/// and numeric variables, entity fields and related entities are not modeled
+/// and read as unknown.
 pub struct ModelEnv<'a> {
     /// Declared state variable types.
     pub kinds: &'a BTreeMap<String, VarKind>,
@@ -41,7 +44,12 @@ impl Env for ModelEnv<'_> {
                 .lists
                 .get(name)
                 .map_or(Val::Strs(&[]), |items| Val::Strs(items)),
-            Some(VarKind::Str | VarKind::Num) | None => Val::Unknown,
+            Some(VarKind::Str) => self
+                .state
+                .strings
+                .get(name)
+                .map_or(Val::Unknown, |value| Val::Str(value)),
+            Some(VarKind::Num) | None => Val::Unknown,
         }
     }
 
@@ -97,18 +105,174 @@ pub fn successors(
     t: &ResolvedTransition,
     state: &TemperModelState,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    successors_among(model, t, state, &string_values(std::iter::once(state)))
+}
+
+/// [`successors`], with `values` the tracked strings in scope: the state's
+/// own, or every entity's in a joint state. A string parameter may take any
+/// of them (a value copied from somewhere), `''`, a literal the spec
+/// compares its variable with, or one value new to the scope, as far as the
+/// action's constraints allow.
+pub fn successors_among(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<String>,
+) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
+    let strings = string_assignments(model, t, state, values);
     for params in param_assignments(model, t) {
-        let mut next = state.clone();
-        if let Some(to) = &t.to_state {
-            next.status = to.clone();
-        }
-        apply_effects(&t.effects, &mut next, &t.name, &params);
-        if within_bounds(model, state, &next) {
-            out.push((params, next));
+        for chosen in &strings {
+            let mut params = params.clone();
+            params.extend(
+                chosen
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ParamValue::Str(v.clone()))),
+            );
+            let mut next = state.clone();
+            if let Some(to) = &t.to_state {
+                next.status = to.clone();
+            }
+            apply_effects(&t.effects, &mut next, &t.name, &params);
+            apply_string_params(&t.string_params, &mut next, &params);
+            canonical_strings(&mut [&mut next.strings]);
+            if within_bounds(model, state, &next) {
+                out.push((params, next));
+            }
         }
     }
     out
+}
+
+/// `state` after the transition named `name` with `params`, with no
+/// renumbering of new strings (the caller renumbers, over one entity or a
+/// joint state). `None` when the model has no such transition.
+pub fn step(
+    model: &TemperModel,
+    name: &str,
+    target_state: Option<&str>,
+    state: &TemperModelState,
+    params: &BTreeMap<String, ParamValue>,
+) -> Option<TemperModelState> {
+    let resolved = model.transitions.iter().find(|t| t.name == name)?;
+    let mut next = state.clone();
+    if let Some(to) = target_state {
+        next.status = to.to_string();
+    }
+    apply_effects(&resolved.effects, &mut next, name, params);
+    apply_string_params(&resolved.string_params, &mut next, params);
+    Some(next)
+}
+
+/// The tracked string values held by `states`, `''` left out.
+pub fn string_values<'a>(
+    states: impl IntoIterator<Item = &'a TemperModelState>,
+) -> BTreeSet<String> {
+    states
+        .into_iter()
+        .flat_map(|state| state.strings.values())
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect()
+}
+
+/// A value equal to none of `values`: `#n` past the largest `#n` in use.
+fn fresh_string(values: &BTreeSet<String>) -> String {
+    let largest = values
+        .iter()
+        .filter_map(|value| value.strip_prefix('#')?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("#{}", largest + 1)
+}
+
+/// The values one string parameter may take in `state`.
+fn string_candidates(
+    model: &TemperModel,
+    param: &StringParam,
+    state: &TemperModelState,
+    values: &BTreeSet<String>,
+) -> Vec<String> {
+    let tracked = |var: &str| state.strings.get(var).cloned();
+    let mut candidates: BTreeSet<String> = match param.equals.as_deref().and_then(tracked) {
+        Some(value) => BTreeSet::from([value]),
+        None => {
+            let mut all: BTreeSet<String> = values.clone();
+            all.insert(String::new());
+            all.insert(fresh_string(values));
+            if let Some(literals) = model.string_literals.get(&param.name) {
+                all.extend(literals.iter().cloned());
+            }
+            all
+        }
+    };
+    if param.nonempty {
+        candidates.remove("");
+    }
+    for var in &param.not_equals {
+        if let Some(value) = tracked(var) {
+            candidates.remove(&value);
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+/// Every choice of values for `t`'s string parameters (one empty choice when
+/// it has none; none when a constraint leaves a parameter no value).
+fn string_assignments(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<String>,
+) -> Vec<BTreeMap<String, String>> {
+    let mut assignments = vec![BTreeMap::new()];
+    for param in &t.string_params {
+        let candidates = string_candidates(model, param, state, values);
+        assignments = assignments
+            .into_iter()
+            .flat_map(|assignment| {
+                candidates.iter().map(move |value| {
+                    let mut next = assignment.clone();
+                    next.insert(param.name.clone(), value.clone());
+                    next
+                })
+            })
+            .collect();
+    }
+    assignments
+}
+
+/// Write each string parameter into its tracked variable, as the runtime
+/// writes every parameter into the field of its name.
+pub fn apply_string_params(
+    string_params: &[StringParam],
+    state: &mut TemperModelState,
+    params: &BTreeMap<String, ParamValue>,
+) {
+    for param in string_params {
+        if let Some(ParamValue::Str(value)) = params.get(&param.name) {
+            state.strings.insert(param.name.clone(), value.clone());
+        }
+    }
+}
+
+/// Renumber the `#n` values of `maps`, in order, by first use: two states
+/// that differ only in which new values they made up are one state. Equality
+/// between values is all an invariant can see of them, so nothing is lost.
+/// Returns each value's new name.
+pub fn canonical_strings(maps: &mut [&mut BTreeMap<String, String>]) -> BTreeMap<String, String> {
+    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+    for map in maps.iter_mut() {
+        for value in map.values_mut() {
+            if !value.starts_with('#') {
+                continue;
+            }
+            let next = format!("#{}", renamed.len() + 1);
+            let name = renamed.entry(value.clone()).or_insert(next).clone();
+            *value = name;
+        }
+    }
+    renamed
 }
 
 /// The transition with more parameter assignments than one step explores
@@ -342,6 +506,7 @@ mod tests {
             counters: BTreeMap::new(),
             booleans: BTreeMap::new(),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         }
     }
 

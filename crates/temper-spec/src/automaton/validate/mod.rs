@@ -155,9 +155,25 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
         .collect();
     let invalid =
         |slot: String, error: String| AutomatonParseError::Validation(format!("{slot}: {error}"));
+    // A related entity's field is read only by the joint check of several
+    // entity types; the runtime resolves related statuses, not fields.
+    let no_related_field = |expr: &crate::predicate::Expr, slot: String| {
+        if expr.reads_related_field() {
+            Err(invalid(
+                slot,
+                format!(
+                    "`{expr}` reads a related entity's field, which only an \
+                     [[invariant]] may do"
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    };
     for action in &automaton.actions {
         check(&action.guard, Scope::State(&vars))
             .map_err(|e| invalid(format!("action '{}' guard", action.name), e))?;
+        no_related_field(&action.guard, format!("action '{}' guard", action.name))?;
         check_effects(&action.effect, &vars)
             .map_err(|e| invalid(format!("action '{}' effect", action.name), e))?;
         for effect in &action.effect {
@@ -175,35 +191,33 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
         }
         for trigger in &action.triggers {
             if let Some(guard) = &trigger.guard {
-                check(guard, Scope::Fields).map_err(|e| {
-                    invalid(
-                        format!(
-                            "trigger '{}' on action '{}' guard",
-                            trigger.name, action.name
-                        ),
-                        e,
-                    )
-                })?;
+                let slot = format!(
+                    "trigger '{}' on action '{}' guard",
+                    trigger.name, action.name
+                );
+                check(guard, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;
+                no_related_field(guard, slot)?;
             }
         }
     }
     for inv in &automaton.invariants {
         let slot = format!("invariant '{}'", inv.name);
         check(&inv.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
-        if let Some(culprit) = crate::predicate::unmodelable(&inv.assert, &vars) {
+        if let Some(culprit) = crate::predicate::unverifiable(&inv.assert, &vars) {
             return Err(invalid(
                 slot,
                 format!(
                     "`{culprit}` reads a value the verification cascade cannot model \
-                     (a string, number, field or related entity); state it as a \
-                     [[field_invariant]], which is checked on writes"
+                     (a number that is not a counter, an undeclared field, or null); \
+                     state it as a [[field_invariant]], which is checked on writes"
                 ),
             ));
         }
     }
     for inv in &automaton.field_invariants {
-        check(&inv.assert, Scope::Fields)
-            .map_err(|e| invalid(format!("field_invariant '{}'", inv.name), e))?;
+        let slot = format!("field_invariant '{}'", inv.name);
+        check(&inv.assert, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;
+        no_related_field(&inv.assert, slot)?;
     }
     for state in &automaton.automaton.terminal {
         if !automaton.automaton.states.contains(state) {
