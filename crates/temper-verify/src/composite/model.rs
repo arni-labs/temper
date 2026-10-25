@@ -185,9 +185,16 @@ impl CompositeTemperModel {
             .filter(|e| e.from == source_entity && e.source_action == source_action)
             .collect();
         for edge in edges {
-            // The trigger's guard pins the source statuses it fires in.
+            // The trigger fires when its guard can hold on the source as it
+            // committed: its status and its own variables, not only the
+            // statuses the guard names.
             if let Some(statuses) = &edge.status_filter
                 && !statuses.iter().any(|status| status == source_to_state)
+            {
+                continue;
+            }
+            if let Some(guard) = &edge.guard
+                && !self.guard_may_hold(source_entity, guard, state)
             {
                 continue;
             }
@@ -299,6 +306,23 @@ impl CompositeTemperModel {
             in_scope_refs: in_scope_ref_fields(&transition.guard, state),
         };
         eval(&transition.guard, &env).may_hold()
+    }
+
+    /// Whether `guard`, read on `entity`'s record in `state`, can hold.
+    fn guard_may_hold(&self, entity: &str, guard: &Expr, state: &CompositeState) -> bool {
+        let (Some(model), Some(local)) = (self.models.get(entity), state.entities.get(entity))
+        else {
+            return true;
+        };
+        let env = CompositeEnv {
+            local: ModelEnv {
+                kinds: &model.var_kinds,
+                state: local,
+            },
+            joint: state,
+            in_scope_refs: in_scope_ref_fields(guard, state),
+        };
+        eval(guard, &env).may_hold()
     }
 
     /// Enumerate **every distinct** dropped reaction reachable in the joint
