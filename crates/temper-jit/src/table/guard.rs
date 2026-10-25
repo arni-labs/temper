@@ -9,9 +9,12 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use temper_spec::predicate::{Env, Expr, Name, Truth, Val, eval, explain};
+use temper_spec::predicate::{
+    CmpOp, Env, Expr, Literal, Name, Operand, Set, Truth, Val, eval, explain,
+};
 
 use super::action_contract::InitialValues;
+use super::refusal::GuardCondition;
 
 /// The failing part of a rejected guard (ADR-0151).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,6 +23,9 @@ pub struct GuardFailure {
     pub expr: String,
     /// Each name that sub-expression reads, with the value found.
     pub found: Vec<(String, String)>,
+    /// Each comparison in that sub-expression that splits into a field, an
+    /// operator and a wanted value, with the typed value read.
+    pub conditions: Vec<GuardCondition>,
 }
 
 /// Runtime values a guard can read.
@@ -160,10 +166,129 @@ pub fn check_detailed(
             found.push((label, value));
         }
     });
+    let mut conditions = Vec::new();
+    split_conditions(failing, &env, &mut conditions);
     Some(GuardFailure {
         expr: failing.to_string(),
         found,
+        conditions,
     })
+}
+
+/// Push one [`GuardCondition`] per comparison of `expr` between a field and a
+/// literal, descending through `&&`. Anything else (`||`, `=>`, a call such as
+/// `len` or `empty`, a comparison of two fields, a cross-entity status) has no
+/// single field and wanted value, so it adds nothing.
+fn split_conditions(expr: &Expr, env: &GuardEnv<'_>, out: &mut Vec<GuardCondition>) {
+    let mut push = |field: &str, op: &str, wants: serde_json::Value, value: serde_json::Value| {
+        out.push(GuardCondition {
+            field: field.to_string(),
+            op: op.to_string(),
+            wants,
+            value,
+        });
+    };
+    match expr {
+        Expr::And(parts) => {
+            for part in parts {
+                split_conditions(part, env, out);
+            }
+        }
+        Expr::Var(name) => push(name, "==", true.into(), condition_var(name, env)),
+        Expr::Not(inner) => {
+            if let Expr::Var(name) = inner.as_ref() {
+                push(name, "==", false.into(), condition_var(name, env));
+            }
+        }
+        Expr::Compare { lhs, op, rhs } => match (lhs, rhs) {
+            (Operand::Lit(lit), operand) => {
+                if let Some((field, value)) = field_operand(operand, env) {
+                    push(field, flip(*op).as_str(), literal_json(lit), value);
+                }
+            }
+            (operand, Operand::Lit(lit)) => {
+                if let Some((field, value)) = field_operand(operand, env) {
+                    push(field, op.as_str(), literal_json(lit), value);
+                }
+            }
+            _ => {}
+        },
+        Expr::In {
+            value,
+            set: Set::List(items),
+            negated,
+        } => {
+            if let Some((field, read)) = field_operand(value, env) {
+                let op = if *negated { "not in" } else { "in" };
+                let wants = items.iter().map(literal_json).collect();
+                push(field, op, serde_json::Value::Array(wants), read);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The name and value of an operand that reads one field of this entity.
+fn field_operand<'e>(
+    operand: &'e Operand,
+    env: &'e GuardEnv<'_>,
+) -> Option<(&'e str, serde_json::Value)> {
+    match operand {
+        Operand::Status => Some(("status", env.status.into())),
+        Operand::Var(name) => Some((name, condition_var(name, env))),
+        _ => None,
+    }
+}
+
+/// Read stored values without the evaluator's floating-point conversion.
+fn condition_var(name: &str, env: &GuardEnv<'_>) -> serde_json::Value {
+    let ctx = env.ctx;
+    if let Some(value) = ctx.counters.get(name) {
+        return (*value).into();
+    }
+    if let Some(value) = ctx.booleans.get(name) {
+        return (*value).into();
+    }
+    if let Some(value) = ctx.lists.get(name) {
+        return value.clone().into();
+    }
+    if let Some(value) = ctx.fields.get(name) {
+        return value.clone();
+    }
+    to_json(env.var(name))
+}
+
+/// `lit op x` read as `x op' lit`.
+fn flip(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+        same => same,
+    }
+}
+
+fn literal_json(lit: &Literal) -> serde_json::Value {
+    match lit {
+        Literal::Int(value) => (*value).into(),
+        Literal::Str(value) => value.as_str().into(),
+        Literal::Bool(value) => (*value).into(),
+        Literal::Null => serde_json::Value::Null,
+    }
+}
+
+/// A read value as JSON. Counters are whole numbers and answer as integers.
+fn to_json(value: Val<'_>) -> serde_json::Value {
+    match value {
+        Val::Unknown | Val::Null => serde_json::Value::Null,
+        Val::Bool(b) => b.into(),
+        Val::Num(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 => (n as i64).into(),
+        Val::Num(n) => serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, Into::into),
+        Val::Str(s) => s.into(),
+        Val::Strs(items) => items.to_vec().into(),
+        Val::Json(json) => json.clone(),
+    }
 }
 
 fn render(value: Val<'_>) -> String {

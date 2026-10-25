@@ -447,6 +447,7 @@ pub(super) async fn load_specs_from_directory(
             })?;
     }
     state.rebuild_reaction_dispatcher();
+    state.spawn_follow_spec_changes();
 
     if !state.data_dir.as_os_str().is_empty() {
         let registry_path = state.data_dir.join("specs-registry.json");

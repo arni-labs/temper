@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use temper_jit::table::{Effect, EvalContext, GuardFailure, TransitionTable, effect_args};
+use temper_jit::table::{Effect, EvalContext, GuardFailure, Refusal, TransitionTable, effect_args};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, OverflowBlobWrite, blob_ref_value};
@@ -80,6 +80,11 @@ pub struct ScheduledAction {
     pub action: String,
     /// Delay in seconds before dispatching the action.
     pub delay_seconds: u64,
+    /// The arming event's journal sequence and this action's place among the
+    /// event's schedules, `<seq>.<index>`. The actor sets it when it writes
+    /// that event; empty until then.
+    #[serde(default)]
+    pub arm_id: String,
 }
 
 /// A request to spawn a child entity (executed post-transition by dispatch pipeline).
@@ -170,11 +175,18 @@ pub struct ProcessResult {
     pub overflow_blobs: Vec<OverflowBlobWrite>,
     /// Error message (if action failed).
     pub error: Option<String>,
+    /// Why the action was refused, as typed data beside `error`.
+    pub refusal: Option<Refusal>,
 }
 
 impl ProcessResult {
     /// Refuse before creating any event, integration effect, or overflow write.
     pub(crate) fn refused(error: String) -> Self {
+        Self::refused_with(error, None)
+    }
+
+    /// Refuse with the typed reason beside the message.
+    pub(crate) fn refused_with(error: String, refusal: Option<Refusal>) -> Self {
         Self {
             success: false,
             event: None,
@@ -183,6 +195,7 @@ impl ProcessResult {
             spawn_requests: vec![],
             overflow_blobs: vec![],
             error: Some(error),
+            refusal,
         }
     }
 }
@@ -294,17 +307,9 @@ pub(crate) fn process_action_with_xref_and_field_mode(
     comparison_fields: Option<&serde_json::Value>,
 ) -> ProcessResult {
     if state.events_since_snapshot >= MAX_EVENTS_SINCE_SNAPSHOT {
-        return ProcessResult {
-            success: false,
-            event: None,
-            custom_effects: vec![],
-            scheduled_actions: vec![],
-            spawn_requests: vec![],
-            overflow_blobs: vec![],
-            error: Some(format!(
-                "Event budget exhausted ({MAX_EVENTS_SINCE_SNAPSHOT} max since snapshot)"
-            )),
-        };
+        return ProcessResult::refused(format!(
+            "Event budget exhausted ({MAX_EVENTS_SINCE_SNAPSHOT} max since snapshot)"
+        ));
     }
 
     if let Err(error) = table.validate_action_params(
@@ -314,32 +319,14 @@ pub(crate) fn process_action_with_xref_and_field_mode(
         &state.counters,
         &state.booleans,
     ) {
-        return ProcessResult {
-            success: false,
-            event: None,
-            custom_effects: vec![],
-            scheduled_actions: vec![],
-            spawn_requests: vec![],
-            overflow_blobs: vec![],
-            error: Some(error),
-        };
+        return ProcessResult::refused_with(error.message, error.refusal);
     }
     // Every dispatch path comes through here: report, or drop, the keys the
     // action does not declare (nerdsane/temper#351).
     let screened = match super::undeclared_params::screen(table, &state.entity_type, action, params)
     {
         Ok(screened) => screened,
-        Err(error) => {
-            return ProcessResult {
-                success: false,
-                event: None,
-                custom_effects: vec![],
-                scheduled_actions: vec![],
-                spawn_requests: vec![],
-                overflow_blobs: vec![],
-                error: Some(error),
-            };
-        }
+        Err(error) => return ProcessResult::refused(error),
     };
     let params: &serde_json::Value = &screened;
 
@@ -374,15 +361,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
             let to_status = transition_result.new_state.clone();
 
             if let Some(error) = validate_ref_action_contract(state, action, params) {
-                return ProcessResult {
-                    success: false,
-                    event: None,
-                    custom_effects: vec![],
-                    scheduled_actions: vec![],
-                    spawn_requests: vec![],
-                    overflow_blobs: vec![],
-                    error: Some(error),
-                };
+                return ProcessResult::refused(error);
             }
 
             let effective_params = normalize_ref_action_params(state, action, params);
@@ -426,37 +405,34 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 spawn_requests,
                 overflow_blobs,
                 error: None,
+                refusal: None,
             }
         }
-        Some(rejected) => ProcessResult {
-            success: false,
-            event: None,
-            custom_effects: vec![],
-            scheduled_actions: vec![],
-            spawn_requests: vec![],
-            overflow_blobs: vec![],
-            // ADR-0151: when a sub-guard failed (rule matched by name and
-            // state, but a precondition did not hold) name the specific guard,
-            // field/ref, and required-vs-found so an in-session agent can
-            // self-heal. A from-state miss carries no guard failure and keeps
-            // the generic message.
-            error: Some(match &rejected.guard_failure {
-                Some(failure) => render_guard_failure(action, &state.status, failure),
-                None => format!(
+        // ADR-0151: when a sub-guard failed (rule matched by name and state,
+        // but a precondition did not hold) name the specific guard,
+        // field/ref, and required-vs-found so an in-session agent can
+        // self-heal. A from-state miss carries no guard failure and keeps the
+        // generic message. Both carry the same facts as a typed refusal.
+        Some(rejected) => match rejected.guard_failure {
+            Some(failure) => ProcessResult::refused_with(
+                render_guard_failure(action, &state.status, &failure),
+                Some(Refusal::GuardFailed {
+                    guard: failure.expr,
+                    conditions: failure.conditions,
+                }),
+            ),
+            None => ProcessResult::refused_with(
+                format!(
                     "Action '{}' not valid from state '{}'",
                     action, state.status
                 ),
-            }),
+                Some(Refusal::InvalidState {
+                    state: state.status.clone(),
+                    from: table.source_states(action),
+                }),
+            ),
         },
-        None => ProcessResult {
-            success: false,
-            event: None,
-            custom_effects: vec![],
-            scheduled_actions: vec![],
-            spawn_requests: vec![],
-            overflow_blobs: vec![],
-            error: Some(format!("Unknown action: {}", action)),
-        },
+        None => ProcessResult::refused(format!("Unknown action: {}", action)),
     }
 }
 
@@ -744,6 +720,7 @@ pub fn apply_effects(
                 scheduled_actions.push(ScheduledAction {
                     action: action.clone(),
                     delay_seconds: *delay_seconds,
+                    arm_id: String::new(),
                 });
                 tracing::info!(
                     entity_type = %state.entity_type,
@@ -989,6 +966,7 @@ pub fn resolve_schedule_at_requests(
             Some(ScheduledAction {
                 action: req.action.clone(),
                 delay_seconds,
+                arm_id: String::new(),
             })
         })
         .collect()

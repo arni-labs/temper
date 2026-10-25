@@ -268,7 +268,6 @@ pub async fn run(
     }
     spawn_optimization_loop(&state);
     spawn_actor_passivation_loop(&state);
-    state.server.spawn_runtime_metrics_loop();
     temper_server::profiling::spawn_continuous_profiler();
     let _pg_actor_runtime_cancel = pg_actor_runtime_cancel;
 
@@ -318,9 +317,9 @@ pub async fn run(
         }
     }
 
-    // ADR-0056: arm again the state timers the last process left waiting,
-    // before the first request can act on their records.
-    state.server.rearm_state_timers().await;
+    // The kernel runtime: state timers re-armed from their rows (ADR-0056)
+    // before the first request can act on their records, and runtime metrics.
+    let _boot_timers = state.server.start_runtime().await;
 
     println!("Listening on http://{bind}:{actual_port}");
     axum::serve(listener, router)

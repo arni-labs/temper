@@ -10,12 +10,14 @@ pub(crate) mod bootstrap;
 pub mod effects;
 mod field_updates;
 mod replay_validation;
+mod scheduled_rows;
 pub mod sim_handler;
 mod snapshot_queue;
 pub mod types;
 pub(crate) mod undeclared_params;
 
 pub use actor::EntityActor;
+pub(crate) use actor::RehydrateHook;
 #[cfg(test)]
 pub(crate) use actor::recover_authoritative_entity_state_from_store;
 pub(crate) use actor::recover_entity_state_from_store;

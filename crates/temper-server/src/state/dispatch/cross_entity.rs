@@ -61,7 +61,7 @@ impl crate::state::ServerState {
 
     /// Dispatch entity spawn requests post-transition.
     ///
-    /// This is a **sync** method (like `dispatch_scheduled_actions`) so that
+    /// This is a **sync** method (like `arm_scheduled_actions`) so that
     /// `tokio::spawn` inside it does not cause async recursion.
     /// Creates child entities and optionally dispatches initial actions.
     ///
@@ -99,7 +99,8 @@ impl crate::state::ServerState {
                 .workflow_run_id
                 .clone()
                 .unwrap_or_else(|| format!("{parent_t}:{parent_i}"));
-            let span = tracing::info_span!(
+            let span = crate::trace_context::runtime_work_span!(
+                crate::trace_context::cause(),
                 "dispatch.background_spawn_entity",
                 workflow.root_entity_type = %workflow_root_entity_type,
                 workflow.root_entity_id = %workflow_root_entity_id,
@@ -212,13 +213,15 @@ impl crate::state::ServerState {
                                         table,
                                         &initial_fields,
                                     );
-                                table.validate_action_params(
-                                    action,
-                                    params,
-                                    &prestate.fields,
-                                    &prestate.counters,
-                                    &prestate.booleans,
-                                )
+                                table
+                                    .validate_action_params(
+                                        action,
+                                        params,
+                                        &prestate.fields,
+                                        &prestate.counters,
+                                        &prestate.booleans,
+                                    )
+                                    .map_err(String::from)
                             });
                         if let Err(error) = validation {
                             state.record_generated_callback_refusal(
