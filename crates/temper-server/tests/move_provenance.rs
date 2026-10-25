@@ -403,3 +403,63 @@ async fn an_event_written_before_provenance_replays_unchanged() {
         temper_runtime::persistence::EventKind::Transition
     );
 }
+
+#[tokio::test]
+async fn an_event_cause_round_trips_and_events_without_one_replay() {
+    let store = SimEventStore::no_faults(79);
+    let pid = "default:Order:ord-cause";
+    let cause = json!({
+        "rule": "submits",
+        "action": "AddItem",
+        "entity_type": "Order",
+        "entity_id": "ord-cause",
+        "depth": 1,
+        "timer": {"armed_action": "AddItem", "armed_by": "agent-1"},
+    });
+    // Two events as an earlier release wrote them, then one a reaction made
+    // after the kernel recorded causes.
+    let journal = [
+        json!({"action": "Created", "from_status": "", "to_status": "Draft",
+               "timestamp": "2026-09-01T00:00:00Z", "params": {}}),
+        json!({"action": "AddItem", "from_status": "Draft", "to_status": "Draft",
+               "timestamp": "2026-09-01T00:00:01Z",
+               "params": {"ProductId": "p-1", "Quantity": 1}}),
+        json!({"action": "SubmitOrder", "from_status": "Draft", "to_status": "Submitted",
+               "timestamp": "2026-09-01T00:00:02Z",
+               "params": {"ShippingAddressId": "a-1", "PaymentMethod": "card"},
+               "source": "trigger", "cause": cause}),
+    ];
+    let envelopes: Vec<_> = journal
+        .iter()
+        .enumerate()
+        .map(|(i, payload)| old_envelope(i as u64 + 1, payload.clone()))
+        .collect();
+    store
+        .append(pid, 0, &envelopes)
+        .await
+        .expect("seed journal");
+
+    let state = common::build_default_state_with_store(store.clone(), "provenance-cause");
+    state
+        .authz
+        .reload_tenant_policies("default", PERMIT_ALL)
+        .expect("policy should load");
+    let replayed = state
+        .get_tenant_entity_state(&TenantId::default(), "Order", "ord-cause")
+        .await
+        .expect("replay the journal");
+    assert_eq!(replayed.state.status, "Submitted");
+    assert_eq!(replayed.state.counters.get("items"), Some(&1));
+
+    let events = history(&state, "Orders", "ord-cause").await;
+    assert_eq!(events.len(), 3, "{events:?}");
+    for old_event in &events[..2] {
+        assert_eq!(old_event["cause"], Value::Null, "{old_event:?}");
+    }
+    assert_eq!(events[2]["cause"], cause, "the cause reads back unchanged");
+
+    // An earlier release reads the event that carries it.
+    let previous: PreviousReleaseEvent = serde_json::from_value(journal[2].clone())
+        .expect("an earlier release reads an event with a cause");
+    assert_eq!(previous.action, "SubmitOrder");
+}
