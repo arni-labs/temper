@@ -14,8 +14,9 @@
 //! - a timeout bounds only waiting, for a write permit and for the write lock
 //!   (`BEGIN IMMEDIATE`). Once the transaction began it runs to its answer;
 //! - when `COMMIT` answers an error, the journal says what it did (the first
-//!   event's id is there or not). Only when that read fails too is the outcome
-//!   unknown, and the error says so. Such an append is never retried.
+//!   event's id proves it landed). Absence cannot prove rollback while a
+//!   remote commit may still be running. Such an outcome stays unknown and
+//!   is never retried.
 //!
 //! An append that ended in [`Attempt::NotWritten`] with a transient error is
 //! retried: nothing of it landed. The store is not a simulation-visible crate,
@@ -79,7 +80,7 @@ pub(super) enum Attempt<T> {
     Written(T),
     /// Nothing of it landed.
     NotWritten(PersistenceError),
-    /// Its commit failed and the journal could not be read.
+    /// Its commit failed and the journal cannot yet establish its outcome.
     Unknown(PersistenceError),
 }
 
@@ -319,8 +320,8 @@ impl TursoEventStore {
                 );
                 Attempt::Written(())
             }
-            Ok(_) => Attempt::NotWritten(PersistenceError::Storage(format!(
-                "not written: the commit failed: {error}"
+            Ok(_) => Attempt::Unknown(PersistenceError::OutcomeUnknown(format!(
+                "the commit failed ({error}); its event is absent, but the transaction may still finish"
             ))),
             Err(read_error) => Attempt::Unknown(PersistenceError::OutcomeUnknown(format!(
                 "the commit failed ({error}) and the journal could not be read ({read_error})"
