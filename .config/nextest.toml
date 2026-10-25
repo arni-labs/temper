@@ -3,3 +3,7 @@
 [[profile.default.overrides]]
 filter = 'binary(turso_sync)'
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Scratch red proof only: show every failure.
+[profile.default]
+fail-fast = false
