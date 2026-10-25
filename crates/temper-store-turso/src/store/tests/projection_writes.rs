@@ -326,3 +326,41 @@ async fn a_catalog_read_reports_the_newest_unchanged_projection() {
         .collect::<Vec<_>>();
     assert_eq!(sequences, [(run, 20), (batched, 9)]);
 }
+
+#[tokio::test]
+async fn a_batch_keeps_only_each_entitys_newest_projection() {
+    let store = make_store("projection-repeated-batch").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let original = fields("Waiting", &["started"]);
+    let intermediate = fields("Checking", &["started"]);
+
+    for (run, reverse) in [("forward", false), ("reverse", true)] {
+        project(&store, &tenant, run, "Waiting", &original, 10).await;
+        let written = stored(&store, &tenant, run).await;
+        let index_row = title_index_rowid(&store, &tenant, run).await;
+        let mut batch = vec![
+            batch_entry(run, "Checking", &intermediate, 11),
+            batch_entry(run, "Waiting", &original, 12),
+        ];
+        if reverse {
+            batch.reverse();
+        }
+        store
+            .upsert_query_projections(&tenant, &batch)
+            .await
+            .expect("batch upsert");
+
+        assert_eq!(stored(&store, &tenant, run).await, written);
+        assert_eq!(title_index_rowid(&store, &tenant, run).await, index_row);
+        let rows = store
+            .load_entity_catalog_rows(&tenant, ENTITY_TYPE, &[run.to_string()])
+            .await
+            .expect("catalog rows");
+        assert_eq!(rows[0].sequence_nr, 12);
+        assert_eq!(rows[0].fields, original);
+        assert_eq!(
+            rows[0].state.as_ref().expect("state"),
+            &actor_state(run, "Waiting", &original, 12)
+        );
+    }
+}

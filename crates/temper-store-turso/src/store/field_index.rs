@@ -261,6 +261,19 @@ impl TursoEventStore {
             return Ok(());
         }
 
+        // Decide once per entity, against its newest projection. Comparing each
+        // entry with the original row can stage older content while a newer,
+        // unchanged entry advances only the counters.
+        let mut newest = BTreeMap::new();
+        for projection in projections {
+            let key = (&projection.entity_type, &projection.entity_id);
+            let current = newest.entry(key).or_insert(projection);
+            if projection.sequence_nr >= current.sequence_nr {
+                *current = projection;
+            }
+        }
+        let projections = newest.into_values().collect::<Vec<_>>();
+
         let _write_permit = self
             .acquire_write_permit("turso.upsert_query_projections", WritePriority::Low)
             .await?;
@@ -319,7 +332,7 @@ impl TursoEventStore {
 
         let mut catalog_upserts = Vec::new();
         let mut changed_indexes = Vec::new();
-        for projection in projections {
+        for projection in &projections {
             let fields_json = serde_json::to_string(&projection.fields)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
             let state_json = serde_json::to_string(&projection.state)
