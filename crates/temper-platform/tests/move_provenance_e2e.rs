@@ -132,29 +132,27 @@ fn post(path: &str, bearer: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
-/// Create an AgentType and move it to Active, both as `bearer`.
-async fn create_and_define(app: &axum::Router, id: &str, bearer: &str) {
-    let (status, body) = send(app, post("/tdata/AgentTypes", bearer, json!({ "id": id }))).await;
+/// Create a Task and claim it, both as `bearer`. A Task, not one of the
+/// identity types the platform keeps to itself, so any principal may move it.
+async fn create_and_claim(app: &axum::Router, id: &str, bearer: &str) {
+    let body = json!({ "Id": id, "title": "provenance" });
+    let (status, body) = send(app, post("/tdata/Tasks", bearer, body)).await;
     assert_eq!(status, StatusCode::CREATED, "create {id}: {body:?}");
-    let (status, body) = send(app, define(id, bearer)).await;
-    assert_eq!(status, StatusCode::OK, "define {id}: {body:?}");
+    let (status, body) = send(app, claim(id, bearer)).await;
+    assert_eq!(status, StatusCode::OK, "claim {id}: {body:?}");
 }
 
-fn define(id: &str, bearer: &str) -> Request<Body> {
+fn claim(id: &str, bearer: &str) -> Request<Body> {
     post(
-        &format!("/tdata/AgentTypes('{id}')/Temper.Agent.Define"),
+        &format!("/tdata/Tasks('{id}')/Temper.Claim"),
         bearer,
-        json!({
-            "name": format!("type-{id}"), "system_prompt": "test", "tool_set": "local",
-            "model": "claude-sonnet-4-6", "max_turns": "200", "adapter_config": "{}",
-            "default_budget_cents": "0",
-        }),
+        json!({}),
     )
 }
 
 /// The record's history, read by the operator.
 async fn history(app: &axum::Router, id: &str) -> Vec<Value> {
-    let request = Request::get(format!("/tdata/AgentTypes('{id}')/$history"))
+    let request = Request::get(format!("/tdata/Tasks('{id}')/$history"))
         .header("Authorization", format!("Bearer {OPERATOR_KEY}"))
         .header("X-Tenant-Id", TENANT)
         .body(Body::empty())
@@ -176,10 +174,10 @@ async fn a_human_token_records_the_human_and_its_issuer() {
     let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
     let app = platform(&sk).await;
     let token = mint(&sk, human_claims());
-    create_and_define(&app, "made-by-human", &token).await;
+    create_and_claim(&app, "made-by-human", &token).await;
 
     let events = history(&app, "made-by-human").await;
-    for action in ["Created", "Define"] {
+    for action in ["Created", "Claim"] {
         let event = event(&events, action);
         assert_eq!(event["source"], "http", "{event:?}");
         let made_by = &event["made_by"];
@@ -200,40 +198,40 @@ async fn an_access_token_records_the_agent_its_client_and_its_grant() {
     let sk = SigningKey::from_slice(&[12u8; 32]).unwrap();
     let app = platform(&sk).await;
     let token = mint(&sk, access_claims());
-    create_and_define(&app, "made-by-agent", &token).await;
+    create_and_claim(&app, "made-by-agent", &token).await;
 
     let events = history(&app, "made-by-agent").await;
-    let define = event(&events, "Define");
-    assert_eq!(define["source"], "http", "{define:?}");
-    let made_by = &define["made_by"];
-    assert_eq!(made_by["id"], "kc_agent_provenance", "{define:?}");
-    assert_eq!(made_by["kind"], "Agent", "{define:?}");
-    assert_eq!(made_by["agent_type"], "contributor", "{define:?}");
-    assert_eq!(made_by["agent_type_verified"], true, "{define:?}");
-    assert_eq!(made_by["acting_for"], "human-rita", "{define:?}");
-    assert_eq!(made_by["role"], "owner", "{define:?}");
-    assert_eq!(made_by["issuer"], ISSUER, "{define:?}");
-    assert_eq!(made_by["token"], "access", "{define:?}");
-    assert_eq!(made_by["client_id"], "kc_agent_provenance", "{define:?}");
-    assert_eq!(made_by["grant_id"], "grant-provenance", "{define:?}");
+    let claim = event(&events, "Claim");
+    assert_eq!(claim["source"], "http", "{claim:?}");
+    let made_by = &claim["made_by"];
+    assert_eq!(made_by["id"], "kc_agent_provenance", "{claim:?}");
+    assert_eq!(made_by["kind"], "Agent", "{claim:?}");
+    assert_eq!(made_by["agent_type"], "contributor", "{claim:?}");
+    assert_eq!(made_by["agent_type_verified"], true, "{claim:?}");
+    assert_eq!(made_by["acting_for"], "human-rita", "{claim:?}");
+    assert_eq!(made_by["role"], "owner", "{claim:?}");
+    assert_eq!(made_by["issuer"], ISSUER, "{claim:?}");
+    assert_eq!(made_by["token"], "access", "{claim:?}");
+    assert_eq!(made_by["client_id"], "kc_agent_provenance", "{claim:?}");
+    assert_eq!(made_by["grant_id"], "grant-provenance", "{claim:?}");
 }
 
 #[tokio::test]
 async fn an_api_key_records_its_agent_and_no_token() {
     let sk = SigningKey::from_slice(&[13u8; 32]).unwrap();
     let app = platform(&sk).await;
-    create_and_define(&app, "made-by-key", OPERATOR_KEY).await;
+    create_and_claim(&app, "made-by-key", OPERATOR_KEY).await;
 
     let events = history(&app, "made-by-key").await;
-    let define = event(&events, "Define");
-    assert_eq!(define["source"], "http", "{define:?}");
-    let made_by = &define["made_by"];
-    assert_eq!(made_by["id"], "operator", "{define:?}");
-    assert_eq!(made_by["kind"], "Agent", "{define:?}");
-    assert_eq!(made_by["agent_type"], "operator", "{define:?}");
-    assert_eq!(made_by["agent_type_verified"], true, "{define:?}");
+    let claim = event(&events, "Claim");
+    assert_eq!(claim["source"], "http", "{claim:?}");
+    let made_by = &claim["made_by"];
+    assert_eq!(made_by["id"], "operator", "{claim:?}");
+    assert_eq!(made_by["kind"], "Agent", "{claim:?}");
+    assert_eq!(made_by["agent_type"], "operator", "{claim:?}");
+    assert_eq!(made_by["agent_type_verified"], true, "{claim:?}");
     for field in ["issuer", "token", "client_id", "grant_id"] {
-        assert_eq!(made_by[field], Value::Null, "{field}: {define:?}");
+        assert_eq!(made_by[field], Value::Null, "{field}: {claim:?}");
     }
 }
 
@@ -244,9 +242,9 @@ async fn a_forged_or_unknown_issuer_token_is_refused_and_records_nothing() {
     let (status, body) = send(
         &app,
         post(
-            "/tdata/AgentTypes",
+            "/tdata/Tasks",
             OPERATOR_KEY,
-            json!({ "id": "untouched" }),
+            json!({ "Id": "untouched", "title": "provenance" }),
         ),
     )
     .await;
@@ -260,7 +258,7 @@ async fn a_forged_or_unknown_issuer_token_is_refused_and_records_nothing() {
     let unknown = mint(&sk, unknown_claims);
 
     for token in [forged, unknown] {
-        let (status, _) = send(&app, define("untouched", &token)).await;
+        let (status, _) = send(&app, claim("untouched", &token)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
     assert_eq!(
