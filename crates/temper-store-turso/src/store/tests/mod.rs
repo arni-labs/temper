@@ -10,6 +10,7 @@ use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
 mod commit_outcome;
+mod commit_transport;
 mod evolution_tenant;
 mod policy_approval;
 mod scheduled_actions;
