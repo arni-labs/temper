@@ -1,0 +1,200 @@
+use std::time::Duration;
+
+use temper_authz::SendAnalysis;
+use temper_spec::automaton::{Automaton, parse_automaton};
+
+use super::*;
+
+/// An app installed once at a commit, which its place is told to bring as
+/// the service `place`.
+const APP: &str = r#"
+[automaton]
+name = "App"
+states = ["Unmade", "Live"]
+initial = "Unmade"
+
+[[state]]
+name = "commit"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Install"
+kind = "input"
+from = ["Unmade"]
+to = "Live"
+params = [{ name = "commit", type = "string" }]
+
+[[action.constraints]]
+kind = "param_nonempty"
+param = "commit"
+
+[[action.triggers]]
+name = "place"
+kind = "entity"
+target_entity = "Place"
+target_action = "Bring"
+principal = "place"
+
+[action.triggers.args]
+commit = "commit"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+
+/// The place: a module brings the commit, may make it wait or give up, and
+/// gives up by itself after a while. `nudge_from` is where outside code may
+/// ask again.
+fn place(nudge_from: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Place"
+states = ["Unplaced", "Bringing", "Waiting", "Placed", "Stuck"]
+initial = "Unplaced"
+
+[[state]]
+name = "commit"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Bring"
+kind = "input"
+from = ["Unplaced"]
+to = "Bringing"
+params = [{{ name = "commit", type = "string" }}]
+
+[[action.triggers]]
+name = "place"
+kind = "wasm"
+module = "steps"
+on_failure = "Waiting"
+
+[[action]]
+name = "Nudge"
+kind = "input"
+from = {nudge_from}
+to = "Bringing"
+
+[[action.triggers]]
+name = "place"
+kind = "wasm"
+module = "steps"
+on_failure = "Waiting"
+
+[[action]]
+name = "Placed"
+kind = "internal"
+from = ["Bringing"]
+to = "Placed"
+
+[[action]]
+name = "Waiting"
+kind = "internal"
+from = ["Bringing"]
+to = "Waiting"
+
+[[action]]
+name = "GaveUp"
+kind = "internal"
+from = ["Bringing"]
+to = "Stuck"
+
+[[state_timeout]]
+state = "Bringing"
+after_seconds = 90
+on_timeout = "GaveUp"
+
+[[liveness]]
+name = "placed"
+eventually = "App[Id].status == 'Live' => (status == 'Placed' && App[Id].commit == commit)"
+relies_on = ["Nudge"]
+"#
+    )
+}
+
+/// Anyone outside may install and nudge; `bring` is the condition under
+/// which Cedar lets a Bring through.
+fn policies(bring: &str) -> String {
+    format!(
+        r#"
+permit(principal, action in [Action::"Install", Action::"Nudge"], resource);
+permit(principal, action == Action::"Bring", resource is Place) when {{ {bring} }};
+"#
+    )
+}
+
+/// The place's service, bringing for the app with its own id.
+const SAME_RECORD: &str = r#"principal == Agent::"service:place" &&
+    context has triggerSourceEntityId && resource has id &&
+    context.triggerSourceEntityId == resource.id"#;
+
+fn check(nudge_from: &str, bring: &str) -> JointLivenessResult {
+    let automatons: Vec<Automaton> = [APP, &place(nudge_from)]
+        .iter()
+        .map(|source| parse_automaton(source).expect("fixture parses"))
+        .collect();
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = SendAnalysis::new(&policies(bring)).expect("fixture policies parse");
+    let budget = Budget {
+        time: Duration::from_secs(30),
+        states: 100_000,
+    };
+    let mut results = verify_joint_liveness(&refs, Some(&analysis), budget);
+    assert_eq!(results.len(), 1);
+    results.remove(0)
+}
+
+/// The record statuses each stuck case comes to rest in, in words.
+fn resting(result: &JointLivenessResult) -> Vec<String> {
+    let LivenessOutcome::Stuck { cases, .. } = &result.outcome else {
+        panic!("expected a stuck outcome, got {result}");
+    };
+    cases
+        .iter()
+        .map(|case| case.path.last().expect("a path has a start").state.clone())
+        .collect()
+}
+
+#[test]
+fn a_place_that_gave_up_with_no_way_back_never_settles() {
+    let result = check(r#"["Waiting"]"#, SAME_RECORD);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Place=Stuck")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_nudge_relied_on_from_where_it_gives_up_settles() {
+    let result = check(r#"["Waiting", "Stuck"]"#, SAME_RECORD);
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn a_reaction_cedar_may_refuse_is_not_counted_on() {
+    let bring = r#"principal == Agent::"service:place" && resource.owner == "someone""#;
+    let result = check(r#"["Waiting", "Stuck"]"#, bring);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Place=Unplaced")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_reaction_cedar_refuses_its_service_leaves_the_place_behind() {
+    let bring = r#"principal == Agent::"service:someone-else""#;
+    let result = check(r#"["Waiting", "Stuck"]"#, bring);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Place=Unplaced")),
+        "{result}"
+    );
+}

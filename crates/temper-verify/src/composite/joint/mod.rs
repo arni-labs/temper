@@ -36,8 +36,13 @@
 //! that runs out of its [`Budget`] says so and is never a pass.
 
 mod env;
+mod liveness;
 mod model;
+mod senders;
 mod slice;
+mod state;
+
+pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -46,52 +51,11 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
 use crate::Budget;
-use crate::model::{ParamValue, TemperModelAction, TemperModelState};
+use crate::model::ParamValue;
 
-use model::{JointModel, Move};
-
-/// The records in scope, one per type, and the dispatches on their way.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct JointState {
-    /// Each type's record.
-    pub records: BTreeMap<String, TemperModelState>,
-    /// Dispatches sent and not yet taken, sorted; the same dispatch may be
-    /// in flight twice.
-    pub inflight: Vec<Dispatch>,
-}
-
-/// A dispatch on its way to a record's actor.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Dispatch {
-    /// The target entity type.
-    pub to: String,
-    /// The action.
-    pub action: String,
-    /// The transition's target status, when the sender chose one.
-    pub target_state: Option<String>,
-    /// The parameters sent; a reaction's are its `args` as the source
-    /// committed them.
-    pub params: BTreeMap<String, ParamValue>,
-    /// Whether the dispatch path has read the related records it needs.
-    pub read: bool,
-    /// The reaction depth that sent it (0 for a request from outside).
-    pub depth: u32,
-}
-
-impl fmt::Display for Dispatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let action = TemperModelAction {
-            name: self.action.clone(),
-            target_state: None,
-            params: self.params.clone(),
-        };
-        write!(f, "{}.{action}", self.to)?;
-        if !self.read {
-            f.write_str(" (unread)")?;
-        }
-        Ok(())
-    }
-}
+use model::{JointModel, Move, Sending};
+use state::render;
+pub use state::{Call, Dispatch, JointState};
 
 /// What the joint check found for one invariant.
 #[derive(Debug, Clone)]
@@ -243,8 +207,8 @@ pub fn verify_joint_invariants(
             }
             continue;
         }
-        let model = JointModel::new(&by_name, scope, name, &joint);
         let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
+        let model = JointModel::new(&by_name, scope, name, &exprs, Sending::anyone(), true);
         let walk = model.walk(name, &exprs, budget);
         for (inv, outcome) in joint.iter().zip(walk.outcomes) {
             let mut found = result(inv, &model.scope, walk.states, outcome);
@@ -317,7 +281,8 @@ pub fn replay_joint_invariants(
             scope.insert(entity_type);
         }
     }
-    let model = JointModel::new(&by_name, scope, entity, &joint);
+    let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
+    let model = JointModel::new(&by_name, scope, entity, &exprs, Sending::anyone(), true);
     let (mut state, mut names) = model.init_with_ids(ids);
     let mut steps = vec![JointStep {
         action: None,
@@ -454,20 +419,6 @@ pub(super) fn path_to(
     }
     steps.reverse();
     steps
-}
-
-pub(super) fn render(state: &JointState) -> String {
-    let mut text = state
-        .records
-        .iter()
-        .map(|(entity, s)| format!("{entity}={s}"))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    if !state.inflight.is_empty() {
-        let inflight: Vec<String> = state.inflight.iter().map(ToString::to_string).collect();
-        text.push_str(&format!(" | in flight: {}", inflight.join(", ")));
-    }
-    text
 }
 
 #[cfg(test)]

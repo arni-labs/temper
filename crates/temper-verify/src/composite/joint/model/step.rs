@@ -1,19 +1,19 @@
-//! The moves of the joint model and the states they lead to: actions taken
-//! or sent, dispatches read on the dispatch path, and dispatches their
-//! records take or refuse.
+//! The moves of the joint model and the states they lead to: actions sent
+//! from outside, state timers, module answers, dispatches read on the
+//! dispatch path, and dispatches their records take or refuse.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::TargetResolver;
-use temper_spec::predicate::{Arg, Literal, Truth, eval};
+use temper_authz::May;
+use temper_spec::predicate::{Truth, eval};
 
-use super::super::env::{Blind, Found, ID, resolve};
-use super::super::{Dispatch, JointState};
-use super::{JointModel, MAX_IN_FLIGHT, MAX_REACTION_DEPTH, Reaction, canonical};
-use crate::model::semantics::{step, successors_among};
-use crate::model::{
-    ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
-};
+use super::super::env::Blind;
+use super::super::senders::OUTSIDE;
+use super::super::{Call, Dispatch, JointState};
+use super::commit::add;
+use super::{JointModel, MAX_IN_FLIGHT, canonical};
+use crate::model::TemperModelAction;
+use crate::model::semantics::successors_among;
 
 /// One move of the walk.
 #[derive(Debug, Clone)]
@@ -25,10 +25,36 @@ pub(in crate::composite::joint) enum Move {
     /// dispatch path read them and they allowed it; its actor takes it
     /// later.
     Send(String, TemperModelAction),
+    /// A record's state timer fires its action, with no parameters, as
+    /// whoever armed it.
+    Timer(String, String),
+    /// A module answers the call a record's trigger started.
+    Answer(Call, TemperModelAction),
+    /// A module's call fails: its `on_failure` action, if any, is sent.
+    Fail(Call),
+    /// A module's call is lost: the server restarts while it runs, and
+    /// nothing answers it.
+    Lost(Call),
     /// The dispatch path reads the related records a reaction needs.
     Read(Dispatch),
     /// The target's actor takes a dispatch, or refuses it.
     Arrive(Dispatch),
+}
+
+impl Move {
+    /// Whether the system makes this move (a timer, a module, or the
+    /// kernel's dispatches) rather than someone outside or a restart.
+    pub(in crate::composite::joint) fn by_system(&self) -> bool {
+        !matches!(self, Move::Take(..) | Move::Send(..) | Move::Lost(..))
+    }
+
+    /// The entity and action an outside move sends.
+    pub(in crate::composite::joint) fn outside_action(&self) -> Option<(&str, &str)> {
+        match self {
+            Move::Take(entity, action) | Move::Send(entity, action) => Some((entity, &action.name)),
+            _ => None,
+        }
+    }
 }
 
 /// A state a move leads to.
@@ -38,19 +64,25 @@ pub(in crate::composite::joint) struct Next {
     pub(in crate::composite::joint) renamed: BTreeMap<String, String>,
     /// The move, named as in the new state.
     pub(in crate::composite::joint) label: String,
+    /// Whether the model knows the move leads here: false when it took a
+    /// guard it could not decide as allowing it.
+    pub(in crate::composite::joint) certain: bool,
 }
 
 impl JointModel {
-    /// Every move from `state`: each record's enabled actions, with string
-    /// parameters chosen among the values held anywhere in the joint state,
-    /// and each dispatch in flight.
+    /// Every move from `state`: each record's enabled actions someone
+    /// outside may send, with string parameters chosen among the values held
+    /// anywhere in the joint state; each state timer due; each module call's
+    /// answers and failure; and each dispatch in flight.
     pub(in crate::composite::joint) fn moves(&self, state: &JointState) -> Vec<Move> {
         let values = self.values(state);
         let mut out = Vec::new();
         for (entity, model) in &self.models {
             let local = &state.records[entity];
             for t in &model.transitions {
-                if !self.enabled(entity, t, state, Blind::Nothing) {
+                if !self.sendable(entity, &t.name)
+                    || !self.enabled(entity, t, state, Blind::Nothing)
+                {
                     continue;
                 }
                 let reads = self.reads_related(t);
@@ -66,6 +98,17 @@ impl JointModel {
                         Move::Take(entity.clone(), action)
                     });
                 }
+            }
+            if let Some(timeout) = self.timeout(entity, &local.status) {
+                out.push(Move::Timer(entity.clone(), timeout.action.clone()));
+            }
+        }
+        let mut calls = BTreeSet::new();
+        for call in &state.calls {
+            if calls.insert(call) {
+                self.answers(state, call, &values, &mut out);
+                out.push(Move::Fail(call.clone()));
+                out.push(Move::Lost(call.clone()));
             }
         }
         let mut seen = BTreeSet::new();
@@ -90,40 +133,72 @@ impl JointModel {
         state: &JointState,
         mv: &Move,
     ) -> (Vec<Next>, bool) {
-        let mut outcomes: Vec<(JointState, String)> = Vec::new();
+        let mut outcomes: Vec<(JointState, String, bool)> = Vec::new();
         match mv {
             Move::Take(entity, action) => {
-                let model = &self.models[entity];
-                let Some(moved) = step(
-                    model,
-                    &action.name,
-                    action.target_state.as_deref(),
-                    &state.records[entity],
-                    &action.params,
-                ) else {
-                    return (Vec::new(), false);
-                };
-                let mut next = state.clone();
-                next.records.insert(entity.clone(), moved);
+                let certain = self.truth(entity, action, state) == Truth::True
+                    && self.outside_may(entity, &action.name) == May::Yes;
                 let text = format!("{entity}.{action}");
-                for outcome in self.react(next, entity, &action.name, 0) {
-                    outcomes.push((outcome, text.clone()));
+                for (outcome, sure) in self.commit(state.clone(), entity, action, 0, OUTSIDE, true)
+                {
+                    outcomes.push((outcome, text.clone(), certain && sure));
                 }
             }
             Move::Send(entity, action) => {
+                let certain = self.truth(entity, action, state) == Truth::True
+                    && self.outside_may(entity, &action.name) == May::Yes;
                 let mut next = state.clone();
-                add(
-                    &mut next,
-                    Dispatch {
-                        to: entity.clone(),
-                        action: action.name.clone(),
-                        target_state: action.target_state.clone(),
-                        params: action.params.clone(),
-                        read: true,
-                        depth: 0,
-                    },
+                add(&mut next, sent(entity, action, OUTSIDE, true));
+                outcomes.push((next, format!("{entity}.{action} sent"), certain));
+            }
+            Move::Timer(entity, name) => {
+                let by = state.armed.get(entity).copied().unwrap_or(OUTSIDE);
+                let text = if self.sender_matters.contains(entity) {
+                    format!("{entity}.{name} (timer, as {})", self.senders.name(by))
+                } else {
+                    format!("{entity}.{name} (timer)")
+                };
+                outcomes.extend(self.fire(state.clone(), entity, name, &text, by));
+            }
+            Move::Answer(call, action) => {
+                let certain = self.truth(&call.to, action, state) == Truth::True;
+                let mut next = state.clone();
+                remove_call(&mut next, call);
+                let text = format!(
+                    "{}.{action} (answer from {}, as {})",
+                    call.to,
+                    call.module,
+                    self.senders.name(call.by)
                 );
-                outcomes.push((next, format!("{entity}.{action} sent")));
+                let inline = call.by == OUTSIDE;
+                if self.action_reads_related(&call.to, &action.name) {
+                    add(&mut next, sent(&call.to, action, call.by, inline));
+                    outcomes.push((next, format!("{text} sent"), certain));
+                } else {
+                    for (outcome, sure) in self.commit(next, &call.to, action, 0, call.by, inline) {
+                        outcomes.push((outcome, text.clone(), certain && sure));
+                    }
+                }
+            }
+            Move::Fail(call) => {
+                let mut next = state.clone();
+                remove_call(&mut next, call);
+                let text = format!("{call} fails");
+                match &call.on_failure {
+                    Some(name) => outcomes.extend(self.fire(
+                        next,
+                        &call.to,
+                        name,
+                        &format!("{text}: {}.{name}", call.to),
+                        call.by,
+                    )),
+                    None => outcomes.push((next, text, true)),
+                }
+            }
+            Move::Lost(call) => {
+                let mut next = state.clone();
+                remove_call(&mut next, call);
+                outcomes.push((next, format!("{call} is lost: the server restarts"), true));
             }
             Move::Read(dispatch) => {
                 let mut next = state.clone();
@@ -132,40 +207,53 @@ impl JointModel {
                     let mut read = dispatch.clone();
                     read.read = true;
                     add(&mut next, read);
-                    outcomes.push((next, format!("{dispatch}: related records read")));
+                    outcomes.push((next, format!("{dispatch}: related records read"), true));
                 } else {
-                    outcomes.push((next, format!("{dispatch} refused when read")));
+                    outcomes.push((next, format!("{dispatch} refused when read"), true));
                 }
             }
             Move::Arrive(dispatch) => {
                 let mut next = state.clone();
                 remove(&mut next, dispatch);
-                match self.arrive(&next, dispatch) {
-                    Some((moved, name)) => {
-                        let text = format!("{dispatch} arrives -> {}", moved.status);
-                        next.records.insert(dispatch.to.clone(), moved);
-                        for outcome in self.react(next, &dispatch.to, &name, dispatch.depth) {
-                            outcomes.push((outcome, text.clone()));
-                        }
-                    }
-                    None => outcomes.push((next, format!("{dispatch} refused by its record"))),
+                // Cedar decides a reaction as its sender; every other
+                // dispatch was decided at its entry point, or is the kernel's.
+                let may = if dispatch.depth > 0 {
+                    self.senders
+                        .may(dispatch.by, &dispatch.to, &dispatch.action)
+                } else {
+                    May::Yes
+                };
+                if may != May::Yes {
+                    let text = format!(
+                        "{dispatch} refused by Cedar for {}",
+                        self.senders.name(dispatch.by)
+                    );
+                    outcomes.push((next.clone(), text, may == May::No));
+                }
+                if may != May::No {
+                    outcomes.extend(
+                        self.deliver(next, dispatch, &dispatch.to_string())
+                            .into_iter()
+                            .map(|(s, t, sure)| (s, t, sure && may == May::Yes)),
+                    );
                 }
             }
         }
         let mut held_back = false;
         let nexts = outcomes
             .into_iter()
-            .filter(|(outcome, _)| {
-                let fits = outcome.inflight.len() <= MAX_IN_FLIGHT;
+            .filter(|(outcome, _, _)| {
+                let fits = outcome.inflight.len() + outcome.calls.len() <= MAX_IN_FLIGHT;
                 held_back |= !fits;
                 fits
             })
-            .map(|(mut outcome, text)| {
+            .map(|(mut outcome, text, certain)| {
                 let renamed = canonical(&mut outcome);
                 Next {
                     state: outcome,
                     label: rename_label(&text, &renamed),
                     renamed,
+                    certain,
                 }
             })
             .collect();
@@ -180,149 +268,99 @@ impl JointModel {
             .any(|t| eval(&t.guard, &self.env_blind(&dispatch.to, state, Blind::Own)).may_hold())
     }
 
-    fn transitions_for<'a>(
-        &'a self,
-        dispatch: &'a Dispatch,
-    ) -> impl Iterator<Item = &'a ResolvedTransition> + 'a {
-        self.models[&dispatch.to]
+    /// Whether someone outside may send `action` to an `entity` record.
+    fn sendable(&self, entity: &str, action: &str) -> bool {
+        self.outside_may(entity, action) != May::No
+    }
+
+    /// What Cedar lets someone outside send; an action outside code is
+    /// relied on to send is taken as allowed for whoever sends it.
+    fn outside_may(&self, entity: &str, action: &str) -> May {
+        if self
+            .relies_on
+            .contains(&(entity.to_string(), action.to_string()))
+        {
+            return May::Yes;
+        }
+        self.senders.may(OUTSIDE, entity, action)
+    }
+
+    /// Whether the guard of the transition `action` names holds on `state`,
+    /// as far as the model knows.
+    fn truth(&self, entity: &str, action: &TemperModelAction, state: &JointState) -> Truth {
+        let status = &state.records[entity].status;
+        self.models[entity]
             .transitions
             .iter()
-            .filter(move |t| {
-                t.name == dispatch.action
-                    && dispatch
-                        .target_state
-                        .as_ref()
-                        .is_none_or(|target| t.to_state.as_ref() == Some(target))
+            .find(|t| {
+                t.name == action.name
+                    && t.to_state == action.target_state
+                    && (t.from_states.is_empty() || t.from_states.contains(status))
             })
+            .map_or(Truth::Unknown, |t| eval(&t.guard, &self.env(entity, state)))
     }
 
-    /// The target's record after its actor takes `dispatch`, and the action
-    /// it took; `None` when it refuses. The actor checks its own state; the
-    /// related records were read on the dispatch path.
-    fn arrive(
+    /// The answers a module may give the call `call`: its trigger's
+    /// `on_success`, or else any internal action of its record. The module
+    /// itself is not modelled: it may give each of these answers, and gives
+    /// each it keeps being able to give at some point.
+    fn answers(
         &self,
         state: &JointState,
-        dispatch: &Dispatch,
-    ) -> Option<(TemperModelState, String)> {
-        let model = &self.models[&dispatch.to];
-        let target = &state.records[&dispatch.to];
-        let t = self
-            .transitions_for(dispatch)
-            .find(|t| self.enabled(&dispatch.to, t, state, Blind::Related))?;
-        // Counts and booleans an effect reads and the dispatch does not
-        // carry: the first choice, as the composite check takes. A string
-        // parameter it does not carry leaves the field as it is.
-        let values = self.values(state);
-        let mut params: BTreeMap<String, ParamValue> = successors_among(model, t, target, &values)
-            .into_iter()
-            .next()
-            .map(|(params, _)| params)
-            .unwrap_or_default();
-        for param in &t.string_params {
-            params.remove(&param.name);
-        }
-        params.extend(dispatch.params.clone());
-        if !constraints_hold(&t.string_params, target, &params) {
-            return None;
-        }
-        let moved = step(model, &t.name, t.to_state.as_deref(), target, &params)?;
-        Some((moved, t.name.clone()))
-    }
-
-    /// Send the reactions of `source.action` between types in scope, in
-    /// declaration order, as the runtime does after the source commits:
-    /// each is a dispatch carrying its `args` as the source holds them now.
-    /// A reaction fires when its guard holds on the source; one whose guard
-    /// the model cannot decide (related records are read later) may go
-    /// either way, so both outcomes are kept. A reaction whose target
-    /// reference finds no record goes nowhere.
-    fn react(&self, state: JointState, source: &str, action: &str, depth: u32) -> Vec<JointState> {
-        let mut outcomes = vec![state];
-        if depth >= MAX_REACTION_DEPTH {
-            return outcomes;
-        }
-        for reaction in self
-            .reactions
-            .iter()
-            .filter(|r| r.from == source && r.source_action == action)
-        {
-            let mut after = Vec::new();
-            for state in outcomes {
-                let fires = match &reaction.guard {
-                    Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
-                    None => Truth::True,
-                };
-                if fires != Truth::True {
-                    after.push(state.clone());
-                }
-                if fires == Truth::False {
-                    continue;
-                }
-                let reaches = match &reaction.resolve {
-                    Some(TargetResolver::SameId) => {
-                        resolve(&self.models, &state, source, ID, &reaction.to)
-                    }
-                    Some(TargetResolver::Field { id_field }) => {
-                        resolve(&self.models, &state, source, id_field, &reaction.to)
-                    }
-                    _ => Found::Unknown,
-                };
-                if reaches == Found::Missing {
-                    after.push(state);
-                    continue;
-                }
-                let dispatch = Dispatch {
-                    to: reaction.to.clone(),
-                    action: reaction.target_action.clone(),
-                    target_state: None,
-                    params: self.args(&state, source, reaction),
-                    read: !self.action_reads_related(&reaction.to, &reaction.target_action),
-                    depth: depth + 1,
-                };
-                let mut next = state;
-                add(&mut next, dispatch);
-                after.push(next);
+        call: &Call,
+        values: &BTreeSet<String>,
+        out: &mut Vec<Move>,
+    ) {
+        let model = &self.models[&call.to];
+        let local = &state.records[&call.to];
+        for t in &model.transitions {
+            let answers = match &call.on_success {
+                Some(name) => &t.name == name,
+                None => self
+                    .kernel
+                    .internal
+                    .get(&call.to)
+                    .is_some_and(|names| names.contains(&t.name)),
+            };
+            if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
+                continue;
             }
-            outcomes = after;
+            for (params, _) in successors_among(model, t, local, values) {
+                let action = TemperModelAction {
+                    name: t.name.clone(),
+                    target_state: t.to_state.clone(),
+                    params,
+                };
+                out.push(Move::Answer(call.clone(), action));
+            }
         }
-        outcomes
-    }
-
-    /// The tracked string parameters `reaction` passes, read from `source`
-    /// as it holds them.
-    fn args(
-        &self,
-        state: &JointState,
-        source: &str,
-        reaction: &Reaction,
-    ) -> BTreeMap<String, ParamValue> {
-        let source_state = &state.records[source];
-        let tracked = &self.models[&reaction.to].tracked_strings;
-        reaction
-            .args
-            .iter()
-            .filter(|(param, _)| tracked.contains(*param))
-            .filter_map(|(param, arg)| {
-                let value = match arg {
-                    Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone()),
-                    Arg::Lit(Literal::Null) => Some(String::new()),
-                    _ => None,
-                }?;
-                Some((param.clone(), ParamValue::Str(value)))
-            })
-            .collect()
     }
 }
 
-fn add(state: &mut JointState, dispatch: Dispatch) {
-    let at = state.inflight.partition_point(|d| d < &dispatch);
-    state.inflight.insert(at, dispatch);
+/// The dispatch an outside sender, or a module's answer, makes after the
+/// dispatch path read the related records and they allowed it.
+fn sent(entity: &str, action: &TemperModelAction, by: u32, inline: bool) -> Dispatch {
+    Dispatch {
+        to: entity.to_string(),
+        action: action.name.clone(),
+        target_state: action.target_state.clone(),
+        params: action.params.clone(),
+        read: true,
+        depth: 0,
+        by,
+        inline,
+    }
 }
 
 fn remove(state: &mut JointState, dispatch: &Dispatch) {
     if let Some(at) = state.inflight.iter().position(|d| d == dispatch) {
         state.inflight.remove(at);
+    }
+}
+
+fn remove_call(state: &mut JointState, call: &Call) {
+    if let Some(at) = state.calls.iter().position(|c| c == call) {
+        state.calls.remove(at);
     }
 }
 
@@ -340,32 +378,4 @@ fn rename_label(text: &str, renamed: &BTreeMap<String, String>) -> String {
     }
     out.push_str(rest);
     out
-}
-
-/// Whether the string parameters `params` passes satisfy the action's
-/// constraints on its own record, which its actor checks as it writes.
-fn constraints_hold(
-    string_params: &[StringParam],
-    target: &TemperModelState,
-    params: &BTreeMap<String, ParamValue>,
-) -> bool {
-    string_params.iter().all(|param| {
-        // A string parameter nobody passed is absent, which only a
-        // non-empty constraint refuses.
-        let Some(ParamValue::Str(value)) = params.get(&param.name) else {
-            return !param.nonempty;
-        };
-        let tracked = |var: &String| target.strings.get(var);
-        !(param.nonempty && value.is_empty())
-            && param
-                .equals
-                .as_ref()
-                .and_then(tracked)
-                .is_none_or(|v| v == value)
-            && param
-                .not_equals
-                .iter()
-                .filter_map(tracked)
-                .all(|v| v != value)
-    })
 }

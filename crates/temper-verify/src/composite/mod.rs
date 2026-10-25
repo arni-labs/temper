@@ -33,8 +33,9 @@ pub mod model;
 pub mod verify;
 
 pub use joint::{
-    JointInvariantResult, JointOutcome, JointReplay, JointStep, TraceMove, replay_joint_invariants,
-    verify_joint_invariants,
+    JointInvariantResult, JointLivenessResult, JointOutcome, JointReplay, JointStep,
+    LivenessOutcome, StuckCase, TraceMove, replay_joint_invariants, verify_joint_invariants,
+    verify_joint_liveness,
 };
 pub use model::{CompositeAction, CompositeState, CompositeTemperModel, DroppedReaction};
 pub use verify::{

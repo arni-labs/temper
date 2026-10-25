@@ -1,15 +1,20 @@
 //! The joint model: the records in scope, their reactions, the dispatches
-//! on their way between them, and the walk.
+//! and module calls on their way, who may send what, and the walk.
 
+mod commit;
+mod react;
+mod read;
 mod step;
+mod walk;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
+use temper_authz::SendAnalysis;
+use temper_spec::automaton::{Automaton, TargetResolver};
 use temper_spec::predicate::{Arg, Expr, Name, Truth, eval};
 
 use super::env::{Blind, ID, JointEnv};
+use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::{JointOutcome, JointState, path_to};
 use crate::Budget;
@@ -18,7 +23,10 @@ use crate::model::{
     ParamValue, ResolvedTransition, TemperModel, TemperModelState, build_model_tracking,
 };
 
+pub(super) use read::Timeout;
+use read::{Kernel, Reaction, reactions_in};
 pub(super) use step::Move;
+pub(super) use walk::Explored;
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
@@ -26,23 +34,36 @@ const JOINT_MAX_COUNTER: usize = 3;
 /// Reaction depth followed: the runtime's own bound.
 const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 
-/// Dispatches in flight at once. The runtime has no such bound: each request
-/// and each reaction is its own task. The model needs one to stay finite;
-/// three lets a late dispatch land after two later ones. A walk that held a
-/// move back for it says so, and then proves only up to this many.
+/// Dispatches and module calls in flight at once. The runtime has no such
+/// bound: each request, reaction and module call is its own task. The model
+/// needs one to stay finite; three lets a late dispatch land after two later
+/// ones. A walk that held a move back for it says so, and then proves only
+/// up to this many.
 pub(super) const MAX_IN_FLIGHT: usize = 3;
 
-/// An entity reaction between two types in scope, with the arguments it
-/// passes (target parameter to a source field or a literal).
-#[derive(Debug, Clone)]
-struct Reaction {
-    from: String,
-    source_action: String,
-    to: String,
-    target_action: String,
-    guard: Option<Expr>,
-    args: BTreeMap<String, Arg>,
-    resolve: Option<TargetResolver>,
+/// Who sends what in the model.
+pub(super) struct Sending<'s> {
+    /// The policies that decide each move as its sender; `None` lets every
+    /// sender send everything.
+    pub(super) policies: Option<&'s SendAnalysis>,
+    /// Whether the model makes the kernel's own moves: state timers, module
+    /// answers and failures, and module calls lost to a restart. Without
+    /// them anyone may send any action, which covers what they do.
+    pub(super) kernel_moves: bool,
+    /// Actions (entity, action) that code outside the specs sends, offered
+    /// and allowed whatever the policies say.
+    pub(super) relies_on: BTreeSet<(String, String)>,
+}
+
+impl Sending<'_> {
+    /// Anyone sends anything.
+    pub(super) fn anyone() -> Self {
+        Self {
+            policies: None,
+            kernel_moves: false,
+            relies_on: BTreeSet::new(),
+        }
+    }
 }
 
 /// What a walk found.
@@ -55,22 +76,38 @@ pub(super) struct Walk {
     pub(super) held_back: bool,
 }
 
-/// The joint model of one entity's invariants that read related entities.
+/// The joint model of one entity's properties that read related entities.
 pub(super) struct JointModel {
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
-    /// The types composed: those the invariants name.
+    /// The types composed: those the properties name.
     pub(super) scope: BTreeSet<String>,
+    /// Whether the kernel's own moves are made as the kernel makes them.
+    kernel_moves: bool,
+    kernel: Kernel,
+    relies_on: BTreeSet<(String, String)>,
+    /// Who sends each move, and what Cedar lets them send.
+    senders: Senders,
+    /// The entities whose moves' senders matter: those with a reaction that
+    /// runs as whoever sent its source action, which Cedar decides as them.
+    /// Elsewhere who armed a timer or answers a call changes nothing, so the
+    /// model does not tell them apart.
+    sender_matters: BTreeSet<String>,
 }
 
 impl JointModel {
+    /// The model of `owner`'s properties `reads` over `scope`. With `cut`,
+    /// each entity is cut down to what `reads` depends on, which only adds
+    /// behaviour.
     pub(super) fn new(
         by_name: &BTreeMap<&str, &Automaton>,
         scope: BTreeSet<String>,
         owner: &str,
-        invariants: &[&temper_spec::automaton::Invariant],
+        reads: &[&Expr],
+        sending: Sending<'_>,
+        cut: bool,
     ) -> Self {
-        // What the invariants read: the owner's variables and the id fields
+        // What the properties read: the owner's variables and the id fields
         // its references use, and the related types' fields.
         let mut read: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut owned = |entity: &str, field: &str| {
@@ -80,8 +117,8 @@ impl JointModel {
                     .insert(field.to_string());
             }
         };
-        for inv in invariants {
-            inv.assert.for_each_name(&mut |n| match n {
+        for expr in reads {
+            expr.for_each_name(&mut |n| match n {
                 Name::Var(var) => owned(owner, var),
                 Name::CrossStatus { id_field, .. } => owned(owner, id_field),
                 Name::CrossField {
@@ -148,14 +185,33 @@ impl JointModel {
         let models = models
             .into_iter()
             .map(|(entity, model)| {
+                if !cut {
+                    return (entity, model);
+                }
                 let keep = read.get(&entity).cloned().unwrap_or_default();
                 (entity, slice(model, keep))
             })
+            .collect();
+        let kernel = if sending.kernel_moves {
+            Kernel::read(by_name, &scope)
+        } else {
+            Kernel::default()
+        };
+        let senders = Senders::new(by_name, &scope, sending.policies);
+        let sender_matters = reactions
+            .iter()
+            .filter(|r| r.principal.is_none())
+            .map(|r| r.from.clone())
             .collect();
         Self {
             models,
             reactions,
             scope,
+            kernel_moves: sending.kernel_moves,
+            kernel,
+            relies_on: sending.relies_on,
+            senders,
+            sender_matters,
         }
     }
 
@@ -189,7 +245,10 @@ impl JointModel {
                 let mut state = JointState {
                     records,
                     inflight: Vec::new(),
+                    calls: Vec::new(),
+                    armed: BTreeMap::new(),
                 };
+                self.arm_at_start(&mut state);
                 canonical(&mut state);
                 state
             })
@@ -217,7 +276,10 @@ impl JointModel {
         let mut state = JointState {
             records,
             inflight: Vec::new(),
+            calls: Vec::new(),
+            armed: BTreeMap::new(),
         };
+        self.arm_at_start(&mut state);
         let renamed = canonical(&mut state);
         for value in names.values_mut() {
             if let Some(new) = renamed.get(value) {
@@ -225,6 +287,27 @@ impl JointModel {
             }
         }
         (state, names)
+    }
+
+    /// A record that starts in a state with a timer was made by someone
+    /// outside, who armed it.
+    fn arm_at_start(&self, state: &mut JointState) {
+        for (entity, record) in &state.records {
+            if self.sender_matters.contains(entity)
+                && self.timeout(entity, &record.status).is_some()
+            {
+                state.armed.insert(entity.clone(), OUTSIDE);
+            }
+        }
+    }
+
+    /// `entity`'s timer in `status`, when the model makes timers fire.
+    pub(super) fn timeout(&self, entity: &str, status: &str) -> Option<&Timeout> {
+        self.kernel
+            .timers
+            .get(entity)?
+            .iter()
+            .find(|timeout| timeout.state == status)
     }
 
     /// The strings `state` holds, in records and in dispatches.
@@ -293,62 +376,25 @@ impl JointModel {
     /// Walk every reachable joint state breadth first, checking `invariants`
     /// of `owner` in each settled one (nothing in flight).
     pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], budget: Budget) -> Walk {
-        let started = Instant::now();
-        let mut nodes: Vec<(JointState, Option<(usize, String)>)> = Vec::new();
-        let mut seen: HashMap<JointState, usize> = HashMap::new();
-        let mut queue = VecDeque::new();
-        for init in self.inits() {
-            if !seen.contains_key(&init) {
-                seen.insert(init.clone(), nodes.len());
-                queue.push_back(nodes.len());
-                nodes.push((init, None));
-            }
-        }
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
-        let mut stopped = None;
-        let mut held_back = false;
-        while let Some(index) = queue.pop_front() {
-            let state = nodes[index].0.clone();
-            if state.inflight.is_empty() {
-                let env = self.env(owner, &state);
+        let explored = self.walk_with(budget, false, |index, state| {
+            if state.settled() {
+                let env = self.env(owner, state);
                 for (i, inv) in invariants.iter().enumerate() {
                     if broken[i].is_none() && eval(inv, &env) == Truth::False {
                         broken[i] = Some(index);
                     }
                 }
             }
-            if broken.iter().all(Option::is_some) {
-                break;
-            }
-            if nodes.len() >= budget.states || started.elapsed() >= budget.time {
-                stopped = Some(if nodes.len() >= budget.states {
-                    format!("the walk reached its {} states", budget.states)
-                } else {
-                    format!("the walk ran out of its {} s", budget.time.as_secs())
-                });
-                break;
-            }
-            for mv in self.moves(&state) {
-                let (nexts, held) = self.next(&state, &mv);
-                held_back |= held;
-                for next in nexts {
-                    if seen.contains_key(&next.state) {
-                        continue;
-                    }
-                    let at = nodes.len();
-                    seen.insert(next.state.clone(), at);
-                    nodes.push((next.state, Some((index, next.label))));
-                    queue.push_back(at);
-                }
-            }
-        }
+            broken.iter().all(Option::is_some)
+        });
         let outcomes = broken
             .iter()
             .map(|found| match found {
                 Some(index) => JointOutcome::Broken {
-                    path: path_to(&nodes, *index),
+                    path: path_to(&explored.nodes, *index),
                 },
-                None => match &stopped {
+                None => match &explored.stopped {
                     Some(reason) => JointOutcome::Incomplete {
                         reason: reason.clone(),
                     },
@@ -357,9 +403,9 @@ impl JointModel {
             })
             .collect();
         Walk {
-            states: nodes.len(),
+            states: explored.nodes.len(),
             outcomes,
-            held_back,
+            held_back: explored.held_back,
         }
     }
 }
@@ -416,37 +462,6 @@ fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
     }
     dispatches.sort();
     state.inflight = dispatches;
+    state.calls.sort();
     renamed
-}
-
-/// The entity reactions whose source and target are both in `scope`.
-fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) -> Vec<Reaction> {
-    let mut reactions = Vec::new();
-    for from in scope {
-        for action in &by_name[from.as_str()].actions {
-            for trigger in &action.triggers {
-                if trigger.kind != TriggerKind::Entity {
-                    continue;
-                }
-                let (Some(to), Some(target_action)) =
-                    (&trigger.target_entity, &trigger.target_action)
-                else {
-                    continue;
-                };
-                if !scope.contains(to) {
-                    continue;
-                }
-                reactions.push(Reaction {
-                    from: from.clone(),
-                    source_action: action.name.clone(),
-                    to: to.clone(),
-                    target_action: target_action.clone(),
-                    guard: trigger.guard.clone(),
-                    args: trigger.args.clone(),
-                    resolve: trigger.resolve_target.clone(),
-                });
-            }
-        }
-    }
-    reactions
 }
