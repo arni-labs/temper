@@ -170,16 +170,24 @@ impl JointModel {
         if !constraints_hold(&t.string_params, target, &params) || newer == Truth::False {
             return Arrival::Refused;
         }
-        // A count that must equal one of the record's counters: decided when
-        // the dispatch carries it.
-        let mut counted = true;
+        // A count that must equal one of the record's counters, and a
+        // string the record does not track that must not be empty: decided
+        // when the dispatch carries it.
+        let mut carried = true;
         for (param, field) in self.unchecked.counts(&dispatch.to, &t.name) {
             match (dispatch.params.get(param), target.counters.get(field)) {
                 (Some(ParamValue::Count(sent)), Some(held)) if sent != held => {
                     return Arrival::Refused;
                 }
                 (Some(ParamValue::Count(_)), Some(_)) => {}
-                _ => counted = false,
+                _ => carried = false,
+            }
+        }
+        for param in self.unchecked.nonempty(&dispatch.to, &t.name) {
+            match dispatch.params.get(param) {
+                Some(ParamValue::Str(sent)) if sent.is_empty() => return Arrival::Refused,
+                Some(ParamValue::Str(_)) => {}
+                _ => carried = false,
             }
         }
         let Some(moved) = step(model, &t.name, t.to_state.as_deref(), target, &params) else {
@@ -190,7 +198,7 @@ impl JointModel {
         // a count behind its family's newest moves up by an unknown amount.
         let decided = eval(&t.guard, &self.env(&dispatch.to, state)) == Truth::True
             && self.unchecked.decides(&dispatch.to, &t.name)
-            && counted
+            && carried
             && newer == Truth::True;
         let certainty =
             if enabled.len() > 1 || chose || !self.order.exact(&dispatch.to, &t.effects, state) {

@@ -257,3 +257,86 @@ fn an_answer_carrying_another_count_is_refused() {
         "{result}"
     );
 }
+
+/// An app whose ask has its probe look, naming itself by `name` (a quoted
+/// literal), which the probe requires not empty and does not keep.
+fn naming_app(name: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "App"
+states = ["Idle", "Asked"]
+initial = "Idle"
+
+[[action]]
+name = "Ask"
+kind = "input"
+from = ["Idle"]
+to = "Asked"
+
+[[action.triggers]]
+name = "look"
+kind = "entity"
+target_entity = "Probe"
+target_action = "Look"
+principal = "app"
+
+[action.triggers.args]
+by = "{name}"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#
+    )
+}
+
+/// The probe, which its app is not left waiting on once it asked.
+const NAMED_PROBE: &str = r#"
+[automaton]
+name = "Probe"
+states = ["Idle", "Looked"]
+initial = "Idle"
+
+[[state]]
+name = "by"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Look"
+kind = "input"
+from = ["Idle"]
+to = "Looked"
+params = [{ name = "by", type = "string" }]
+
+[[action.constraints]]
+kind = "param_nonempty"
+param = "by"
+
+[[liveness]]
+name = "looked"
+eventually = "App[Id].status == 'Asked' => status == 'Looked'"
+"#;
+
+/// Anyone outside may ask; only the app's service looks.
+const ASK_AND_LOOK: &str = r#"
+permit(principal, action == Action::"Ask", resource);
+permit(principal == Agent::"service:app", action == Action::"Look", resource);
+"#;
+
+#[test]
+fn a_reaction_naming_its_sender_is_counted_on() {
+    let result = check([&naming_app("'app'"), NAMED_PROBE], ASK_AND_LOOK);
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn a_reaction_sending_an_empty_name_is_refused() {
+    let result = check([&naming_app("''"), NAMED_PROBE], ASK_AND_LOOK);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Probe=Idle")),
+        "{result}"
+    );
+}

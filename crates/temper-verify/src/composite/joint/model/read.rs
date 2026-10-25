@@ -179,6 +179,10 @@ pub(super) struct Unchecked {
     /// the model holds as a value (not as a sequence number), with that
     /// counter. Decided when a dispatch carries the count, and only then.
     pub(super) counts: BTreeMap<(String, String), Vec<(String, String)>>,
+    /// Each (entity, action)'s string parameters that must not be empty and
+    /// that the model does not track. Decided when a dispatch carries the
+    /// value, and only then.
+    pub(super) nonempty: BTreeMap<(String, String), Vec<String>>,
 }
 
 impl Unchecked {
@@ -202,6 +206,14 @@ impl Unchecked {
     /// its counters, each with the counter.
     pub(super) fn counts(&self, entity: &str, action: &str) -> &[(String, String)] {
         self.counts
+            .get(&(entity.to_string(), action.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The string parameters of `entity`'s `action` the model does not
+    /// track that must not be empty.
+    pub(super) fn nonempty(&self, entity: &str, action: &str) -> &[String] {
+        self.nonempty
             .get(&(entity.to_string(), action.to_string()))
             .map_or(&[], Vec::as_slice)
     }
@@ -239,12 +251,21 @@ pub(super) fn unchecked_constraints(
                     order.decides(entity, &action.name, param)
                 }
                 ActionConstraint::ParamEqualsField { field, .. } if counted(field) => true,
+                ActionConstraint::ParamNonempty { .. } => true,
                 _ => tracked(constraint.param()) && constraint.field().is_none_or(tracked),
             };
             if !action.constraints.iter().all(decided) {
                 out.taken.insert(key.clone());
             }
             for constraint in &action.constraints {
+                if let ActionConstraint::ParamNonempty { param } = constraint
+                    && !tracked(param)
+                {
+                    out.nonempty
+                        .entry(key.clone())
+                        .or_default()
+                        .push(param.clone());
+                }
                 let ActionConstraint::ParamEqualsField { param, field } = constraint else {
                     continue;
                 };
