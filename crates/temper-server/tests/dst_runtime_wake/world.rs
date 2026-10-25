@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
-use temper_runtime::scheduler::{DeterministicRng, SimClock, sim_now};
+use temper_runtime::scheduler::{DeterministicRng, SimClock};
 use temper_server::storage::StateTimerStore;
 use temper_server::wake::{SendError, WakeReport, WakeSink};
 
@@ -114,20 +114,13 @@ impl StateTimerStore for TimerRows {
 /// Most sends in a row the control plane refuses.
 pub(crate) const MOST_REFUSED: u64 = 3;
 
-/// The most a report the control plane takes may land late.
-pub(crate) const MOST_LATE: u64 = 20;
-
 /// The control plane's end of the reports: it keeps every report it was sent
 /// and every one it took. After a send it takes, it fails the next 1 to
 /// [`MOST_REFUSED`] sends a quarter of the time, as a control plane that
-/// answers 5xx does. A quarter of the reports it takes land up to
-/// [`MOST_LATE`] seconds late, as a slow network delivers them: after
-/// whatever the control plane did meanwhile, a wake's answer included.
+/// answers 5xx does.
 pub(crate) struct Reports {
     pub(crate) sent: Mutex<Vec<WakeReport>>,
     pub(crate) delivered: Mutex<Vec<WakeReport>>,
-    /// Every report taken, with when it landed.
-    pub(crate) landed: Mutex<Vec<(WakeReport, DateTime<Utc>)>>,
     /// Signalled when a report is delivered.
     pub(crate) changed: tokio::sync::Notify,
     rng: Mutex<DeterministicRng>,
@@ -139,7 +132,6 @@ impl Reports {
         Self {
             sent: Mutex::new(Vec::new()),
             delivered: Mutex::new(Vec::new()),
-            landed: Mutex::new(Vec::new()),
             changed: tokio::sync::Notify::new(),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x3a7e)),
             refusing: Mutex::new(0),
@@ -156,32 +148,30 @@ impl Reports {
             .max_by_key(|report| (report.reported_at, report.seq))
             .cloned()
     }
+
+    /// A copy of `report` lands now, late: a request that timed out at the
+    /// process and that the control plane still took, after whatever it did
+    /// meanwhile.
+    pub(crate) fn land_late(&self, report: WakeReport) {
+        self.delivered.lock().unwrap().push(report);
+        self.changed.notify_one();
+    }
 }
 
 #[async_trait::async_trait]
 impl WakeSink for Reports {
     async fn send(&self, report: &WakeReport, _traceparent: Option<&str>) -> Result<(), SendError> {
         self.sent.lock().unwrap().push(report.clone());
-        let late = {
-            let mut refusing = self.refusing.lock().unwrap();
-            if *refusing > 0 {
-                *refusing -= 1;
-                return Err(SendError::Undelivered("simulated 503".to_string()));
-            }
-            let mut rng = self.rng.lock().unwrap();
-            if rng.next_bound(4) == 0 {
-                *refusing = rng.next_bound(MOST_REFUSED as usize) as u64 + 1;
-            }
-            (rng.next_bound(4) == 0).then(|| 1 + rng.next_bound(MOST_LATE as usize) as u64)
-        };
-        if let Some(late) = late {
-            tokio::time::sleep(Duration::from_secs(late)).await;
+        let mut refusing = self.refusing.lock().unwrap();
+        if *refusing > 0 {
+            *refusing -= 1;
+            return Err(SendError::Undelivered("simulated 503".to_string()));
+        }
+        let mut rng = self.rng.lock().unwrap();
+        if rng.next_bound(4) == 0 {
+            *refusing = rng.next_bound(MOST_REFUSED as usize) as u64 + 1;
         }
         self.delivered.lock().unwrap().push(report.clone());
-        self.landed
-            .lock()
-            .unwrap()
-            .push((report.clone(), sim_now()));
         self.changed.notify_one();
         Ok(())
     }

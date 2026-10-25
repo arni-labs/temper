@@ -8,7 +8,8 @@
 //! request: one from the workload, or the control plane's wake at the due
 //! time it holds, which reaches the process up to [`MOST_LAG`] seconds after
 //! it is sent. It holds the newest of what it was told, reports and wakes'
-//! answers alike, ordered by `(reported_at, seq)` only, whenever each lands.
+//! answers alike, ordered by `(reported_at, seq)` only, whenever each lands:
+//! a report sent before a wake may land after that wake's answer.
 //! A wake is inbound like any request.
 
 use std::collections::BTreeSet;
@@ -125,8 +126,8 @@ fn arrivals(kind: &Kind, rng: &mut DeterministicRng, from: DateTime<Utc>) -> Vec
     out
 }
 
-/// One seed's run. Ok: how many reports landed after the answer of a wake
-/// made after them. Err: the invariant it broke, with its trace.
+/// One seed's run. Ok: how many reports sent before a wake landed after its
+/// answer. Err: the invariant it broke, with its trace.
 pub(crate) fn run(seed: u64, setup: Setup) -> Result<u64, String> {
     let clock = Arc::new(Clock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
@@ -169,7 +170,7 @@ pub(crate) fn run(seed: u64, setup: Setup) -> Result<u64, String> {
             woke_for: None,
             lag: 0,
             wakes: 0,
-            answers: Vec::new(),
+            stale: 0,
             recs: Vec::new(),
             trace: Vec::new(),
         };
@@ -200,8 +201,8 @@ struct Sim {
     lag: u64,
     /// How many times the control plane woke the process at a time it held.
     wakes: u64,
-    /// Each wake's answer, by `(reported_at, seq)`, and when it was taken.
-    answers: Vec<(Order, DateTime<Utc>)>,
+    /// How many reports sent before a wake landed after its answer.
+    stale: u64,
     recs: Vec<Rec>,
     trace: Vec<String>,
 }
@@ -319,16 +320,7 @@ impl Sim {
                 )));
             }
         }
-        let landed = self.reports.landed.lock().unwrap();
-        let overtaken = landed
-            .iter()
-            .filter(|(report, at)| {
-                self.answers
-                    .iter()
-                    .any(|(key, taken)| (report.reported_at, report.seq) < *key && at > taken)
-            })
-            .count();
-        Ok(overtaken as u64)
+        Ok(self.stale)
     }
 
     async fn arrive(&mut self, n: usize, start: Option<Start>) -> Result<(), String> {
@@ -354,7 +346,9 @@ impl Sim {
     }
 
     /// The control plane wakes the process at the time it holds, sometimes
-    /// at once again, and holds each wake's answer as it holds a report.
+    /// at once again, and holds each wake's answer as it holds a report. Half
+    /// the time, a late copy of the newest report sent before the wake then
+    /// lands.
     async fn wake(&mut self) -> Result<(), (&'static str, String)> {
         self.wakes += 1;
         self.woke_for = self.held;
@@ -369,8 +363,16 @@ impl Sim {
             let horizon = self.awake.map_or(woke_at, |awake| woke_at + awake);
             let outcome = self.state.wake_runtime(&TenantId::new(TENANT)).await;
             self.hold((outcome.reported_at, outcome.seq), outcome.next_due_at);
-            self.answers
-                .push(((outcome.reported_at, outcome.seq), sim_now()));
+            let before = self.reports.sent.lock().unwrap().last().cloned();
+            if let Some(before) = before.filter(|report| report.seq < outcome.seq)
+                && self.rng.next_bound(2) == 0
+            {
+                self.trace
+                    .push(format!("report {} lands after the answer", before.seq));
+                self.reports.land_late(before);
+                self.stale += 1;
+                self.take_reports();
+            }
             checks::wake(&self.events, &self.rows, woke_at, horizon, &outcome).await?;
             if again && outcome.fired != 0 {
                 return Err((

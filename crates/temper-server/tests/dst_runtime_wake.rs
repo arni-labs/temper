@@ -161,29 +161,29 @@ async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Va
         .is_ok_and(|response| response.success)
 }
 
-/// Every seed's failure, if any, and how many reports in all landed after
-/// the answer of a wake made after them.
+/// Every seed's failure, if any, and how many reports in all that were sent
+/// before a wake landed after its answer.
 fn failures(seeds: u64, setup: impl Fn() -> Setup) -> (Vec<String>, u64) {
     let mut failures = Vec::new();
-    let mut overtaken = 0;
+    let mut stale = 0;
     for seed in 0..seeds {
         match sandbox::run(seed, setup()) {
-            Ok(n) => overtaken += n,
+            Ok(n) => stale += n,
             Err(failure) => failures.push(failure),
         }
     }
-    (failures, overtaken)
+    (failures, stale)
 }
 
 #[test]
 fn dst_a_sleeping_sandbox_is_woken_for_every_timer() {
-    let (failures, overtaken) = failures(48, || Setup {
+    let (failures, stale) = failures(48, || Setup {
         awake: Some(AWAKE),
         kind: Kind::Mixed,
     });
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     assert!(
-        overtaken > 0,
+        stale > 0,
         "no report sent before a wake landed after its answer"
     );
 }
