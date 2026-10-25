@@ -1375,9 +1375,10 @@ mod tests {
         let _ = PostgresEventStore::get_blob;
         let _ = PostgresEventStore::sweep_expired_blobs;
 
-        let _ = PostgresEventStore::upsert_secret;
+        let _ = PostgresEventStore::write_secret;
         let _ = PostgresEventStore::delete_secret;
         let _ = PostgresEventStore::load_secrets_for_tenant;
+        let _ = PostgresEventStore::list_secret_versions;
 
         let _ = PostgresEventStore::upsert_policy_denial_pattern;
         let _ = PostgresEventStore::load_policy_denial_patterns;

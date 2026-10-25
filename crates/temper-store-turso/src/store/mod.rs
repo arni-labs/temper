@@ -387,6 +387,14 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_TENANT_SECRETS_TABLE, ())
             .await
             .map_err(storage_error)?;
+        migration_support::add_column_if_missing(
+            &conn,
+            schema::ALTER_TENANT_SECRETS_ADD_VERSION_ID,
+        )
+        .await?;
+        conn.execute(schema::BACKFILL_TENANT_SECRETS_VERSION_ID, ())
+            .await
+            .map_err(storage_error)?;
         conn.execute(schema::CREATE_STATE_TIMERS_TABLE, ())
             .await
             .map_err(storage_error)?;

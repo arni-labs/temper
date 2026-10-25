@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod secret;
 mod tombstone;
+pub use secret::{SecretPrecondition, SecretWrite};
 pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
 
 /// Event type used for the parent-journal record of a Composite action.
