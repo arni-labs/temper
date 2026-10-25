@@ -326,15 +326,18 @@ fn report_composite_results(
                     println!("           - {line}");
                     dropped_lines.push(line);
                 }
-                for other in &result.other_violations {
-                    println!("           - other violated property: {other}");
-                }
             }
             CompositeOutcome::Incomplete => {
                 any_incomplete = true;
                 println!(
-                    "    [INCOMPLETE] seed={} scope=[{}] — explored {} joint states; BFS budget exhausted, proof is PARTIAL (not a pass)",
-                    result.seed, scope, result.states_explored,
+                    "    [INCOMPLETE] seed={} scope=[{}] — explored {} joint states; {}, proof is PARTIAL (not a pass)",
+                    result.seed,
+                    scope,
+                    result.states_explored,
+                    result
+                        .incomplete
+                        .as_deref()
+                        .unwrap_or("not every state was walked"),
                 );
             }
         }
@@ -348,7 +351,7 @@ fn report_composite_results(
         );
     }
     if any_incomplete {
-        anyhow::bail!("composite verification incomplete: state exploration budget exhausted");
+        anyhow::bail!("composite verification incomplete: not every joint state was walked");
     }
     println!("\nComposite cross-entity verification: ALL PASSED");
 

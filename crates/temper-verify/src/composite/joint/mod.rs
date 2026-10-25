@@ -34,6 +34,11 @@
 //! checked in settled states: those with nothing in flight. The walk is
 //! breadth first, so each broken invariant's path is a shortest one. A walk
 //! that runs out of its [`Budget`] says so and is never a pass.
+//!
+//! The drop check (ADR-0150, [`dropped_reactions`]) walks the same model over
+//! a whole trigger-graph component, unsliced, one record of each type that
+//! every reference finds, with a move's dispatches landing before the next
+//! move from outside, and names each reaction a target refuses.
 
 mod env;
 mod model;
@@ -48,6 +53,8 @@ use temper_spec::predicate::{Expr, Truth, eval};
 use crate::Budget;
 use crate::model::{ParamValue, TemperModelAction, TemperModelState};
 
+pub use model::DroppedReaction;
+pub(crate) use model::dropped_reactions;
 use model::{JointModel, Move};
 
 /// The records in scope, one per type, and the dispatches on their way.
@@ -76,6 +83,9 @@ pub struct Dispatch {
     pub read: bool,
     /// The reaction depth that sent it (0 for a request from outside).
     pub depth: u32,
+    /// The reaction that sent it, by its place among the model's reactions;
+    /// `None` for a request from outside.
+    pub via: Option<usize>,
 }
 
 impl fmt::Display for Dispatch {

@@ -9,7 +9,7 @@ use temper_spec::predicate::{Arg, Literal, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
 use super::super::{Dispatch, JointState};
-use super::{JointModel, MAX_IN_FLIGHT, MAX_REACTION_DEPTH, Reaction, canonical};
+use super::{Delivery, JointModel, MAX_IN_FLIGHT, MAX_REACTION_DEPTH, Reaction, canonical};
 use crate::model::semantics::{step, successors_among};
 use crate::model::{
     ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
@@ -42,12 +42,14 @@ pub(in crate::composite::joint) struct Next {
 
 impl JointModel {
     /// Every move from `state`: each record's enabled actions, with string
-    /// parameters chosen among the values held anywhere in the joint state,
-    /// and each dispatch in flight.
+    /// parameters chosen among the values held anywhere in the joint state
+    /// (when its delivery lets a move from outside come now), and each
+    /// dispatch in flight.
     pub(in crate::composite::joint) fn moves(&self, state: &JointState) -> Vec<Move> {
         let values = self.values(state);
         let mut out = Vec::new();
-        for (entity, model) in &self.models {
+        let asked = self.delivery == Delivery::Any || state.inflight.is_empty();
+        for (entity, model) in self.models.iter().filter(|_| asked) {
             let local = &state.records[entity];
             for t in &model.transitions {
                 if !self.enabled(entity, t, state, Blind::Nothing) {
@@ -121,6 +123,7 @@ impl JointModel {
                         params: action.params.clone(),
                         read: true,
                         depth: 0,
+                        via: None,
                     },
                 );
                 outcomes.push((next, format!("{entity}.{action} sent")));
@@ -156,7 +159,8 @@ impl JointModel {
         let nexts = outcomes
             .into_iter()
             .filter(|(outcome, _)| {
-                let fits = outcome.inflight.len() <= MAX_IN_FLIGHT;
+                let fits = self.delivery == Delivery::BeforeNextRequest
+                    || outcome.inflight.len() <= MAX_IN_FLIGHT;
                 held_back |= !fits;
                 fits
             })
@@ -175,7 +179,7 @@ impl JointModel {
     /// Whether the dispatch path lets `dispatch` through: the related
     /// records its guard reads allow it. Its own record is read later, by
     /// its actor.
-    fn read_allows(&self, dispatch: &Dispatch, state: &JointState) -> bool {
+    pub(super) fn read_allows(&self, dispatch: &Dispatch, state: &JointState) -> bool {
         self.transitions_for(dispatch)
             .any(|t| eval(&t.guard, &self.env_blind(&dispatch.to, state, Blind::Own)).may_hold())
     }
@@ -199,7 +203,7 @@ impl JointModel {
     /// The target's record after its actor takes `dispatch`, and the action
     /// it took; `None` when it refuses. The actor checks its own state; the
     /// related records were read on the dispatch path.
-    fn arrive(
+    pub(super) fn arrive(
         &self,
         state: &JointState,
         dispatch: &Dispatch,
@@ -241,10 +245,11 @@ impl JointModel {
         if depth >= MAX_REACTION_DEPTH {
             return outcomes;
         }
-        for reaction in self
+        for (index, reaction) in self
             .reactions
             .iter()
-            .filter(|r| r.from == source && r.source_action == action)
+            .enumerate()
+            .filter(|(_, r)| r.from == source && r.source_action == action)
         {
             let mut after = Vec::new();
             for state in outcomes {
@@ -260,11 +265,16 @@ impl JointModel {
                 }
                 let reaches = match &reaction.resolve {
                     Some(TargetResolver::SameId) => {
-                        resolve(&self.models, &state, source, ID, &reaction.to)
+                        resolve(&self.models, self.records, &state, source, ID, &reaction.to)
                     }
-                    Some(TargetResolver::Field { id_field }) => {
-                        resolve(&self.models, &state, source, id_field, &reaction.to)
-                    }
+                    Some(TargetResolver::Field { id_field }) => resolve(
+                        &self.models,
+                        self.records,
+                        &state,
+                        source,
+                        id_field,
+                        &reaction.to,
+                    ),
                     _ => Found::Unknown,
                 };
                 if reaches == Found::Missing {
@@ -278,6 +288,7 @@ impl JointModel {
                     params: self.args(&state, source, reaction),
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
                     depth: depth + 1,
+                    via: Some(index),
                 };
                 let mut next = state;
                 add(&mut next, dispatch);
@@ -320,7 +331,7 @@ fn add(state: &mut JointState, dispatch: Dispatch) {
     state.inflight.insert(at, dispatch);
 }
 
-fn remove(state: &mut JointState, dispatch: &Dispatch) {
+pub(super) fn remove(state: &mut JointState, dispatch: &Dispatch) {
     if let Some(at) = state.inflight.iter().position(|d| d == dispatch) {
         state.inflight.remove(at);
     }

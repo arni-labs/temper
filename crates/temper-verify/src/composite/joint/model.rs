@@ -1,23 +1,26 @@
 //! The joint model: the records in scope, their reactions, the dispatches
 //! on their way between them, and the walk.
 
+mod drops;
+mod read;
 mod step;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
-use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
-use temper_spec::predicate::{Arg, Expr, Name, Truth, eval};
+use temper_spec::automaton::Automaton;
+use temper_spec::predicate::{Expr, Name, Truth, eval};
 
-use super::env::{Blind, ID, JointEnv};
+use super::env::{Blind, ID, JointEnv, Records};
 use super::slice::slice;
 use super::{JointOutcome, JointState, path_to};
 use crate::Budget;
 use crate::model::semantics::{canonical_strings, string_values};
-use crate::model::{
-    ParamValue, ResolvedTransition, TemperModel, TemperModelState, build_model_tracking,
-};
+use crate::model::{ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
+pub use drops::DroppedReaction;
+pub(crate) use drops::dropped_reactions;
+use read::{Reaction, tracked};
 pub(super) use step::Move;
 
 /// Counter ceiling for the joint models, as for the composite plans.
@@ -32,17 +35,18 @@ const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 /// move back for it says so, and then proves only up to this many.
 pub(super) const MAX_IN_FLIGHT: usize = 3;
 
-/// An entity reaction between two types in scope, with the arguments it
-/// passes (target parameter to a source field or a literal).
-#[derive(Debug, Clone)]
-struct Reaction {
-    from: String,
-    source_action: String,
-    to: String,
-    target_action: String,
-    guard: Option<Expr>,
-    args: BTreeMap<String, Arg>,
-    resolve: Option<TargetResolver>,
+/// When a dispatch lands, against moves from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Whenever: other dispatches and moves from outside can come first, as
+    /// in the runtime, where each request and each reaction is its own task.
+    /// At most [`MAX_IN_FLIGHT`] at once.
+    Any,
+    /// Before the next move from outside: the dispatches a move sends all
+    /// land, in any order, before anything else is asked. That is what the
+    /// drop check claims (ADR-0150); with it, the dispatches in flight are
+    /// bounded by the reactions' fan-out and depth.
+    BeforeNextRequest,
 }
 
 /// What a walk found.
@@ -59,7 +63,13 @@ pub(super) struct Walk {
 pub(super) struct JointModel {
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
-    /// The types composed: those the invariants name.
+    records: Records,
+    /// With one record of a type, each entity's id fields that references
+    /// use: each holds that record's id.
+    refs: BTreeMap<String, BTreeSet<String>>,
+    delivery: Delivery,
+    /// The types composed: those the invariants name, or a trigger-graph
+    /// component for the drop check.
     pub(super) scope: BTreeSet<String>,
 }
 
@@ -95,56 +105,7 @@ impl JointModel {
                 Name::Status => {}
             });
         }
-        // Tracked strings: what is read, the id fields references use, and
-        // what a reaction copies into a tracked variable, until nothing more
-        // reaches one.
-        let mut also: BTreeMap<String, BTreeSet<String>> = read.clone();
-        let (models, reactions) = loop {
-            let reactions = reactions_in(by_name, &scope);
-            let models: BTreeMap<String, TemperModel> = scope
-                .iter()
-                .map(|entity| {
-                    let extra = also.get(entity).cloned().unwrap_or_default();
-                    (
-                        entity.clone(),
-                        build_model_tracking(by_name[entity.as_str()], JOINT_MAX_COUNTER, &extra),
-                    )
-                })
-                .collect();
-            let mut grew = false;
-            let mut track = |entity: &str, field: &str| {
-                !matches!(field, "Id" | "id")
-                    && also
-                        .entry(entity.to_string())
-                        .or_default()
-                        .insert(field.to_string())
-            };
-            for (entity, model) in &models {
-                for t in &model.transitions {
-                    for (related, id_field) in t.guard.related_types() {
-                        if scope.contains(&related) {
-                            grew |= track(entity, &id_field);
-                        }
-                    }
-                }
-            }
-            for reaction in &reactions {
-                if let Some(TargetResolver::Field { id_field }) = &reaction.resolve {
-                    grew |= track(&reaction.from, id_field);
-                }
-                for (param, arg) in &reaction.args {
-                    if let Arg::Var(field) = arg
-                        && models[&reaction.to].tracked_strings.contains(param)
-                        && !models[&reaction.from].tracked_strings.contains(field)
-                    {
-                        grew |= track(&reaction.from, field);
-                    }
-                }
-            }
-            if !grew {
-                break (models, reactions);
-            }
-        };
+        let (models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
         let models = models
             .into_iter()
             .map(|(entity, model)| {
@@ -155,6 +116,9 @@ impl JointModel {
         Self {
             models,
             reactions,
+            records: Records::ById,
+            refs: BTreeMap::new(),
+            delivery: Delivery::Any,
             scope,
         }
     }
@@ -174,9 +138,15 @@ impl JointModel {
     }
 
     /// The starting states: one per way the records' ids can be equal or
-    /// differ.
+    /// differ, or the one start when there is one record of a type.
     fn inits(&self) -> Vec<JointState> {
         let blank = self.blank();
+        if self.records == Records::One {
+            return vec![JointState {
+                records: blank,
+                inflight: Vec::new(),
+            }];
+        }
         partitions(blank.len())
             .into_iter()
             .map(|blocks| {
@@ -284,6 +254,8 @@ impl JointModel {
     ) -> JointEnv<'a> {
         JointEnv {
             models: &self.models,
+            records: self.records,
+            refs: &self.refs,
             state,
             owner,
             blind,
@@ -417,36 +389,4 @@ fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
     dispatches.sort();
     state.inflight = dispatches;
     renamed
-}
-
-/// The entity reactions whose source and target are both in `scope`.
-fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) -> Vec<Reaction> {
-    let mut reactions = Vec::new();
-    for from in scope {
-        for action in &by_name[from.as_str()].actions {
-            for trigger in &action.triggers {
-                if trigger.kind != TriggerKind::Entity {
-                    continue;
-                }
-                let (Some(to), Some(target_action)) =
-                    (&trigger.target_entity, &trigger.target_action)
-                else {
-                    continue;
-                };
-                if !scope.contains(to) {
-                    continue;
-                }
-                reactions.push(Reaction {
-                    from: from.clone(),
-                    source_action: action.name.clone(),
-                    to: to.clone(),
-                    target_action: target_action.clone(),
-                    guard: trigger.guard.clone(),
-                    args: trigger.args.clone(),
-                    resolve: trigger.resolve_target.clone(),
-                });
-            }
-        }
-    }
-    reactions
 }
