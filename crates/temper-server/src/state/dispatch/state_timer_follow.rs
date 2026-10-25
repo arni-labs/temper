@@ -16,7 +16,9 @@
 //!
 //! A record in memory is reconciled with its actor's state. One that is not is
 //! replayed from the store without starting an actor, so a walk over many
-//! records does not leave them all resident.
+//! records does not leave them all resident. A record that cannot be read
+//! does not hold its type back: the walk finishes the type, reports the
+//! record, and tries it again alone until it reads.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,9 +33,10 @@ use crate::request_context::AgentContext;
 use crate::state::ServerState;
 use crate::state::projection_backfill::transition_table_for;
 
-/// The wait before retrying a type after the store failed to list or read
-/// its records. It doubles up to [`FOLLOW_RETRY_MAX`], so a store that stays
-/// down is asked about once a minute, not in a tight loop.
+/// The wait before retrying a type whose records the store failed to list,
+/// or one record it failed to read. It doubles up to [`FOLLOW_RETRY_MAX`], so
+/// a store that stays down, or a journal that never replays, is asked about
+/// once a minute, not in a tight loop.
 const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
 const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
 
@@ -181,10 +184,11 @@ impl ServerState {
 
     /// Reconcile every record of each of `types` as `arming` allows, and
     /// return how many records of each type wait for their next action. A type
-    /// whose records the store cannot list or read is tried again after a
-    /// wait. Repeating a successful reconcile is idempotent; an unreadable
-    /// record may have no timer at all, so the walk must retain responsibility
-    /// for retrying it.
+    /// whose records the store cannot list is tried again after a wait. A
+    /// record it cannot read is reported and tried again alone
+    /// ([`Self::retry_unreadable_record`]): an unreadable record may have no
+    /// timer at all, so the walk keeps responsibility for it, but one broken
+    /// journal must not make the whole type be walked again.
     async fn follow_types(
         &self,
         mut types: Vec<(TenantId, String)>,
@@ -218,17 +222,21 @@ impl ServerState {
                         .await;
                     for_caller += usize::from(followed == TimerFollow::WaitsForCaller);
                     for_row += usize::from(followed == TimerFollow::WaitsForRow);
-                    unreadable += usize::from(followed == TimerFollow::RetryRead);
-                }
-                if unreadable > 0 {
-                    tracing::warn!(tenant = %tenant, entity_type, unreadable,
-                        retry_in_secs = wait.as_secs(),
-                        "records of a timed type could not be read; trying again");
-                    pending.push((tenant, entity_type));
-                    continue;
+                    if followed == TimerFollow::RetryRead {
+                        unreadable += 1;
+                        crate::runtime_metrics::record_state_timer_record_unreadable(
+                            tenant.as_str(),
+                            &entity_type,
+                        );
+                        tracing::warn!(tenant = %tenant, entity_type, entity_id,
+                            retry_in_secs = FOLLOW_RETRY_FIRST.as_secs(),
+                            "record of a timed type could not be read; trying it again alone");
+                        let armed_by = callers.get(&key).cloned();
+                        self.retry_unreadable_record(key, armed_by, gate.clone(), arming);
+                    }
                 }
                 tracing::info!(tenant = %tenant, entity_type, records = ids.len(),
-                    waiting_for_caller = for_caller, waiting_for_row = for_row,
+                    waiting_for_caller = for_caller, waiting_for_row = for_row, unreadable,
                     "state timers follow the records' states");
                 if for_caller > 0 {
                     tracing::warn!(tenant = %tenant, entity_type, waiting = for_caller,
@@ -243,6 +251,45 @@ impl ServerState {
             wait = (wait * 2).min(FOLLOW_RETRY_MAX);
             types = pending;
         }
+    }
+
+    /// Try one record the walk could not read again, alone and in the
+    /// background, until it reads, then reconcile it as the walk would have.
+    /// The wait doubles up to [`FOLLOW_RETRY_MAX`], so a journal that never
+    /// replays costs one read a minute, and each failed read is logged where
+    /// it fails. A read can fail for a passing store error, and the record may
+    /// have no timer to come back to it, so this does not give up.
+    fn retry_unreadable_record(
+        &self,
+        (tenant, entity_type, entity_id): (TenantId, String, String),
+        armed_by: Option<AgentContext>,
+        gate: Option<Arc<Semaphore>>,
+        arming: Arming,
+    ) {
+        let server = self.clone();
+        let retry = async move {
+            let mut wait = FOLLOW_RETRY_FIRST;
+            let mut failed_reads: u32 = 1;
+            loop {
+                tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
+                wait = (wait * 2).min(FOLLOW_RETRY_MAX);
+                let follow = Follow {
+                    armed_by: armed_by.as_ref(),
+                    gate: gate.clone(),
+                    arming,
+                };
+                let followed = server
+                    .reconcile_stored_record(&tenant, &entity_type, &entity_id, follow)
+                    .await;
+                if followed != TimerFollow::RetryRead {
+                    tracing::info!(tenant = %tenant, entity_type, entity_id, failed_reads,
+                        "record of a timed type read again; its timer follows its state");
+                    return;
+                }
+                failed_reads += 1;
+            }
+        };
+        tokio::spawn(retry); // determinism-ok: a record's read retry runs in the background
     }
 
     /// Reconcile one record: with its actor's state when it is in memory,
