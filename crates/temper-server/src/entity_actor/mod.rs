@@ -7,6 +7,7 @@
 pub(crate) mod action_input;
 mod actor;
 pub(crate) mod bootstrap;
+mod effect_outcome;
 pub mod effects;
 pub(crate) mod entity_rows;
 mod field_updates;
@@ -28,4 +29,4 @@ pub use effects::{
 };
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
-pub use types::{EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};
+pub use types::{EffectOutcome, EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};

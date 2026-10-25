@@ -729,10 +729,11 @@ impl EntityActor {
 
     /// Replay events from the configured store to rebuild state (called in pre_start).
     ///
-    /// Re-evaluates each event through the `TransitionTable` to reconstruct
-    /// all state variables (status, counters, booleans). This is option 2 from
-    /// the replay design: the TransitionTable is the authoritative source of
-    /// effects, so replay produces the same state as the original execution.
+    /// Each event restores what it committed: its stored `to_status`, the
+    /// outcome its effects recorded (counters, booleans, lists, and fields such
+    /// as a spawned child's id), and its params. Replay mints, spawns, schedules
+    /// and calls out nothing. Events journaled before outcomes were recorded
+    /// re-derive their effects from the `TransitionTable`, minting nothing.
     pub(super) async fn replay_events(
         table: &TransitionTable,
         store: &BoxedEventStore,
@@ -864,6 +865,7 @@ impl EntityActor {
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
+                                outcome: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -973,43 +975,37 @@ impl EntityActor {
                             event.params =
                                 super::effects::sanitize_action_params(&event.params).into_owned();
                             // A persisted event is a historical fact: its guard
-                            // already passed at commit time and its `to_status`
-                            // is authoritative. Replay therefore re-derives the
-                            // transition's EFFECTS from the table but never
-                            // re-gates it — guards (especially cross-entity ones,
-                            // whose related-entity context is not reconstructed
-                            // here) must not silently drop committed history.
-                            // `replay_effects` returns the matching rule's
-                            // effects ignoring guards; `None` means the table no
-                            // longer knows this action/from-state, in which case
-                            // the stored `to_status` alone carries the state.
-                            let from_status = event.from_status.clone();
-                            if !frozen_bootstrap
+                            // already passed, and its stored outcome and target
+                            // status are authoritative. Never re-run recorded
+                            // effects against the active spec or mint child ids.
+                            // Legacy events select effects using the stored
+                            // from-status so earlier replay drift cannot prevent
+                            // later events from matching their original rule.
+                            let rule_from = if event.from_status.is_empty() {
+                                state.status.as_str()
+                            } else {
+                                event.from_status.as_str()
+                            };
+                            if !frozen_bootstrap && let Some(outcome) = event.outcome.as_ref() {
+                                outcome.restore(state);
+                            } else if !frozen_bootstrap
                                 && let Some(effects) =
-                                    table.replay_effects(&state.status, &event.action)
+                                    table.replay_effects(rule_from, &event.action)
                             {
+                                // Events predating outcomes re-derive effects,
+                                // ignoring guards and never minting child ids.
                                 let effects = effects.to_vec();
-                                // Shared effect application — same code as handle() and simulation.
-                                // Its scheduled actions are not armed again here:
-                                // their rows, written with the event, are the
-                                // source of truth (`rearm_scheduled_actions`).
-                                let (
-                                    _custom_effects,
-                                    _scheduled_actions,
-                                    _spawn_requests,
-                                    _schedule_at_requests,
-                                ) = super::effects::apply_effects(state, &effects, &event.params);
+                                super::effects::apply_legacy_replay_effects(
+                                    state,
+                                    &effects,
+                                    &event.params,
+                                );
                             }
-                            // Always honor the durably-stored target status. This
-                            // is safe (status is always persisted on the event)
-                            // and is the single source of truth for the post-
-                            // transition state across both the known-action and
-                            // unknown-action cases.
-                            super::effects::apply_new_state_fallback(
-                                state,
-                                &from_status,
-                                &event.to_status,
-                            );
+                            // The stored target always wins over the active
+                            // spec's SetState, including for legacy events.
+                            if !event.to_status.is_empty() {
+                                state.status.clone_from(&event.to_status);
+                            }
 
                             // Sync action params into fields — mirrors the live
                             // process_action() path (effects.rs:155) so data fields
@@ -1239,6 +1235,7 @@ impl Actor for EntityActor {
                 params: initial_params,
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                outcome: None,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -2073,6 +2070,7 @@ impl EntityActor {
                     params: serde_json::json!({}),
                     idempotency_key: None,
                     kind: temper_runtime::persistence::EventKind::Tombstone,
+                    outcome: None,
                 };
 
                 if let (Some(store), Some(backend)) =

@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use temper_runtime::actor::Message;
 
+pub use super::effect_outcome::EffectOutcome;
+
 // Runtime resource budgets. Domain counter constraints belong to the spec.
 
 /// Maximum unsnapshotted events an actor may replay/hot-hold before refusing new transitions.
@@ -222,6 +224,12 @@ pub struct EntityEvent {
     /// tombstone, whatever a spec names its actions.
     #[serde(default)]
     pub kind: temper_runtime::persistence::EventKind,
+    /// What the transition's effects wrote, recorded when it ran. Replay
+    /// restores it instead of running the effects again. `None` on events
+    /// that run no effects (creation, field updates, tombstones) and on
+    /// transitions journaled before outcomes were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<EffectOutcome>,
 }
 
 impl EntityEvent {
@@ -235,6 +243,7 @@ impl EntityEvent {
             params: serde_json::json!({}),
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         }
     }
 }
