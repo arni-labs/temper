@@ -528,6 +528,10 @@ fn parse_bool(option: &str, value: &str) -> Result<bool, ODataError> {
 mod expand_depth_tests;
 
 #[cfg(test)]
+#[path = "query_options_test.rs"]
+mod query_options_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
