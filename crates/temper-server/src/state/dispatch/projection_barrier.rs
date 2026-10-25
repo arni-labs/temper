@@ -59,8 +59,11 @@ impl ServerState {
     /// Try the projection write again, after `first_error`, until it lands.
     ///
     /// A newer transition's row counts as landed: the store keeps the higher
-    /// sequence and answers this write `Ok`. Every failed try is logged, so a
-    /// store that never takes the write is loud, not silent.
+    /// sequence and answers this write `Ok`. A delete committed since ends the
+    /// tries: it removes the row rather than replacing it, so nothing guards
+    /// against this older write landing after the removal and bringing the
+    /// record back. Every failed try is logged, so a store that never takes
+    /// the write is loud, not silent.
     pub(super) async fn project_until_visible(
         &self,
         ctx: &PostDispatchContext<'_>,
@@ -77,6 +80,17 @@ impl ServerState {
                 "Committed transition projection failed; dependents wait for it");
             tokio::time::sleep(wait).await; // determinism-ok: retry backoff
             wait = (wait * 2).min(PROJECTION_BARRIER_BUDGET);
+            if self.deleted_after(
+                ctx.tenant,
+                ctx.entity_type,
+                ctx.entity_id,
+                response.state.event_sequence(),
+            ) {
+                tracing::warn!(tenant = %ctx.tenant, entity_type = ctx.entity_type,
+                    entity_id = ctx.entity_id, action = ctx.action, failed_tries,
+                    "Record deleted while its committed transition's projection failed; starting dependents without it");
+                return;
+            }
             match self.project_before_dependents(ctx, response).await {
                 Ok(()) => break,
                 Err(next) => {

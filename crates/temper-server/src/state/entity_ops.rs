@@ -1866,6 +1866,21 @@ impl ServerState {
         .map_err(|e| format!("Actor delete failed: {e}"))?;
 
         if response.success {
+            // With a journal the tombstone is the record's last event, so its
+            // status replaces the cached one: a guard no longer finds the
+            // record in its last live status, and an older write still in
+            // flight cannot bring that status back. It is cached before the
+            // row is removed, so a projection retry that checks for it does
+            // not write the row back after the removal. Without a journal
+            // nothing keeps the tombstone, and a record created later under
+            // the same id starts its count again, so the entry goes with the
+            // record.
+            if self.event_journal().is_some() {
+                self.cache_entity_status(tenant, &response.state);
+            } else if let Ok(mut cache) = self.entity_state_cache.lock() {
+                cache.pop(&format!("{tenant}:{entity_type}:{entity_id}"));
+            }
+
             if let Some(query_plane) = self.query_plane_store() {
                 let operation = "remove";
                 let source = "delete";
@@ -1904,18 +1919,6 @@ impl ServerState {
                         projection_started_at,
                     );
                 }
-            }
-
-            // With a journal the tombstone is the record's last event, so its
-            // status replaces the cached one: a guard no longer finds the
-            // record in its last live status, and an older write still in
-            // flight cannot bring that status back. Without one nothing keeps
-            // the tombstone, and a record created later under the same id
-            // starts its count again, so the entry goes with the record.
-            if self.event_journal().is_some() {
-                self.cache_entity_status(tenant, &response.state);
-            } else if let Ok(mut cache) = self.entity_state_cache.lock() {
-                cache.pop(&format!("{tenant}:{entity_type}:{entity_id}"));
             }
 
             // Tombstone persisted successfully; now it is safe to remove actor

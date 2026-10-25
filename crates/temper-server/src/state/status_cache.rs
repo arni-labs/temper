@@ -65,6 +65,24 @@ impl ServerState {
         cache.put(key, incoming);
     }
 
+    /// Whether the cache holds a delete of the record committed after
+    /// `sequence`. A deleted record's query row is removed, not replaced, so a
+    /// write of an older state that lands after the removal brings it back.
+    pub(crate) fn deleted_after(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        sequence: u64,
+    ) -> bool {
+        let key = format!("{tenant}:{entity_type}:{entity_id}");
+        self.entity_state_cache.lock().is_ok_and(|cache| {
+            cache
+                .peek(&key)
+                .is_some_and(|held| held.status == "Deleted" && held.sequence > sequence)
+        })
+    }
+
     /// The record's status: the cached one, or else its actor's, which is
     /// then cached.
     #[instrument(skip_all, fields(otel.name = "entity.resolve_entity_status", tenant = %tenant, entity_type, entity_id))]

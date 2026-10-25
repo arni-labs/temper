@@ -89,11 +89,12 @@ async fn causal_submit_reaction_wasm_reads_committed_source_under_projection_lag
 }
 
 /// A move whose projection write fails after its commit, as under Turso write
-/// contention, arms the timer of the state it entered at once and starts its
-/// dependents once, after the projection lands. It used to answer with an
-/// error and leave the record in its new state with no timer and no follow-on
-/// work, waiting for a retry that a timer, a reaction or a caller that gave up
-/// never sends (a Factory release sat in Making that way).
+/// contention, arms the timer of the state it entered and its scheduled
+/// action at once, and starts its dependents once, after the projection lands.
+/// It used to answer with an error and leave the record in its new state with
+/// no timer and no follow-on work, waiting for a retry that a timer, a
+/// reaction or a caller that gave up never sends (a Factory release sat in
+/// Making that way).
 #[tokio::test]
 async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_once() {
     for seed in 0..4 {
@@ -106,7 +107,18 @@ async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_onc
             .unwrap()
             .state
             .sequence_nr;
+        let source_before = state
+            .get_tenant_entity_state(&tenant, "Source", "source")
+            .await
+            .unwrap()
+            .state
+            .sequence_nr;
         let mut events = state.event_tx.subscribe();
+        let mut pings = state.event_tx.subscribe();
+        // Only the Submit's write is refused: the Ping it schedules lands.
+        query
+            .refused_sequence
+            .store(source_before + 1, Ordering::SeqCst);
         query.fail_source_write.store(true, Ordering::SeqCst);
         let agent = AgentContext::system();
         let submit = state.dispatch_tenant_action_ext(
@@ -132,6 +144,17 @@ async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_onc
                 state.has_armed_state_timer(&tenant, "Source", "source"),
                 "seed {seed}: the Making timer is armed while the projection fails"
             );
+            // The scheduled Ping fires while the Submit's projection fails,
+            // and its timer is gone once it has.
+            loop {
+                let event = pings.recv().await.unwrap();
+                if event.action == "Ping" {
+                    break;
+                }
+            }
+            while !state.armed_scheduled_actions().is_empty() {
+                tokio::task::yield_now().await;
+            }
             // Refused again: the write is tried again, and nothing it starts
             // runs before the source is visible.
             query.source_write_refused.notified().await;
@@ -191,25 +214,39 @@ async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_onc
             verifier_before + 2,
             "seed {seed}: one Verify and one SawNew, so the reaction and the WASM trigger ran once"
         );
-        let making = seen
-            .iter()
-            .filter(|(kind, status)| kind == "Source" && status == "Making")
-            .count();
-        assert_eq!(making, 1, "seed {seed}: one broadcast of the move");
+        let broadcasts = |action: &str| {
+            seen.iter()
+                .filter(|(kind, done, _)| kind == "Source" && done == action)
+                .count()
+        };
+        assert_eq!(
+            broadcasts("Submit"),
+            1,
+            "seed {seed}: one broadcast of the move"
+        );
+        assert_eq!(
+            broadcasts("Ping"),
+            1,
+            "seed {seed}: the scheduled Ping fires once, not again when the move finishes"
+        );
     }
 }
 
 /// Read state changes until one reaches a status in `statuses`, keeping each
-/// `(entity_type, status)` read in `seen`.
+/// `(entity_type, action, status)` read in `seen`.
 async fn until_status(
     events: &mut tokio::sync::broadcast::Receiver<crate::events::EntityStateChange>,
     statuses: &[&str],
-    seen: &mut Vec<(String, String)>,
+    seen: &mut Vec<(String, String, String)>,
 ) -> String {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
-            seen.push((event.entity_type.clone(), event.status.clone()));
+            seen.push((
+                event.entity_type.clone(),
+                event.action.clone(),
+                event.status.clone(),
+            ));
             if statuses.contains(&event.status.as_str()) {
                 break event.status;
             }
@@ -302,6 +339,67 @@ async fn causal_delete_keeps_older_queued_writes_before_removal() {
     assert!(
         rows.is_empty(),
         "older queued write must not resurrect deleted projection"
+    );
+}
+
+/// A delete committed while an older move's projection write keeps failing
+/// ends that move's tries. The delete removes the record's row, so the older
+/// write landing after the removal would bring the deleted record back.
+#[tokio::test]
+async fn a_delete_during_a_failed_projection_is_not_undone_by_its_retry() {
+    let (state, query, queue, _temp) = fixture().await;
+    let tenant = TenantId::default();
+    let agent = AgentContext::system();
+    query.fail_source_write.store(true, Ordering::SeqCst);
+    let edit = state.dispatch_tenant_action(
+        &tenant,
+        "Source",
+        "source",
+        "Edit",
+        json!({"prompt_template":"new"}),
+        &agent,
+    );
+    let delete = async {
+        query.source_write_refused.notified().await;
+        // The delete's own write carries other fields, so it lands, and its
+        // queued removal takes the row away.
+        let deleted = state
+            .dispatch_tenant_action(
+                &tenant,
+                "Source",
+                "source",
+                "Delete",
+                json!({"prompt_template":"gone"}),
+                &agent,
+            )
+            .await
+            .unwrap();
+        assert!(deleted.success, "{deleted:?}");
+        queue.drain_once_for_test().await;
+        let rows = query
+            .load_entity_catalog_rows("default", "Source", &["source".into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rows.is_empty(), "the delete removed the row");
+        // The store recovers while the edit is still being tried.
+        query.fail_source_write.store(false, Ordering::SeqCst);
+    };
+    let (edited, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(edit, delete)
+    })
+    .await
+    .expect("the edit finishes once the record is deleted");
+    let edited = edited.unwrap();
+    assert!(edited.success, "{edited:?}");
+    let rows = query
+        .load_entity_catalog_rows("default", "Source", &["source".into()])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "the edit's retried write brought the deleted record back: {rows:?}"
     );
 }
 

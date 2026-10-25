@@ -567,7 +567,7 @@ impl crate::state::ServerState {
     pub(crate) async fn run_post_dispatch_effects(
         &self,
         ctx: &PostDispatchContext<'_>,
-        response: EntityResponse,
+        mut response: EntityResponse,
     ) -> EntityResponse {
         // 1. Record metrics
         self.metrics
@@ -611,9 +611,11 @@ impl crate::state::ServerState {
         // does not establish visibility.
         if let Err(error) = self.project_before_dependents(ctx, &response).await {
             // Its scheduled actions were committed with its event: arm them
-            // now, not after a wait of unknown length. Arming them again after
-            // the integrations below finds them armed.
+            // now, not after a wait of unknown length, and take them out of
+            // the response so the arms after the integrations below find
+            // none. A second arm of a row that already fired fires it again.
             self.arm_scheduled_actions(ctx, &response);
+            response.scheduled_actions.clear();
             // Nothing else starts this transition's dependents: a timer, a
             // reaction or a caller that gave up never retries it. So the
             // dispatch keeps them until the projection lands.
