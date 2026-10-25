@@ -49,11 +49,17 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
     states: 10_000_000,
 };
 
-/// Prove what `specs` (a bundle's types) declare, before the install writes
-/// anything: their cross-entity invariants when it brings `new_specs` (added
-/// or changed types), and their liveness then too or when it brings
-/// `policies` (the tenant's Cedar as it leaves it), since who Cedar lets send
-/// each move decides whether a record gets where it should.
+/// Prove every `[[invariant]]` and `[[liveness]]` of `specs` (a bundle's
+/// types) that reads a related record, on the joint model of its type and
+/// the types it names, with `policies` (the tenant's Cedar as the install
+/// leaves it) deciding each move as its sender, and refuse the install if one
+/// is not proven. Both run when the install brings `new_specs` (added or
+/// changed types) or policies: who Cedar lets send each move decides whether
+/// a rule holds and whether a record gets where it should. A named type the
+/// bundle does not carry is taken from what the tenant already runs. It runs
+/// before the install writes or swaps anything, so a refused bundle leaves
+/// the tenant as it was and reads keep serving the old specs meanwhile, and
+/// on a blocking thread, since a large joint model takes seconds.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -62,120 +68,73 @@ pub(super) async fn prove(
     new_specs: bool,
     policies: Option<&str>,
 ) -> Result<(), String> {
-    if new_specs {
-        prove_joint_invariants(state, tenant, app_name, specs).await?;
-    }
-    if new_specs || policies.is_some() {
-        let policy_text = policies.map_or_else(
-            || super::cached_or_active_tenant_policy_text(state, tenant),
-            str::to_string,
-        );
-        prove_liveness(state, tenant, app_name, specs, &policy_text).await?;
-    }
-    Ok(())
-}
-
-/// Prove every `[[invariant]]` of `specs` (a bundle's types) that reads a
-/// related entity, on the joint model of its type and the types it names,
-/// and refuse the install if one is not proven. A named type the bundle does
-/// not carry is taken from what the tenant already runs. It runs before the
-/// install writes or swaps anything, so a refused bundle leaves the tenant as
-/// it was and reads keep serving the old specs meanwhile, and on a blocking
-/// thread, since a large joint model takes seconds. A bundle that declares no
-/// such rule costs one walk over its invariants.
-async fn prove_joint_invariants(
-    state: &PlatformState,
-    tenant: &str,
-    app_name: &str,
-    specs: &[(String, String)],
-) -> Result<(), String> {
-    let Some(automatons) = bundle_with_named(state, tenant, app_name, specs, |a| {
-        a.invariants
-            .iter()
-            .flat_map(|inv| inv.assert.related_types())
-            .collect()
-    })?
-    else {
+    if !new_specs && policies.is_none() {
         return Ok(());
-    };
-    let results = tokio::task::spawn_blocking(move || {
-        let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
-        temper_verify::composite::verify_joint_invariants(&refs, JOINT_INSTALL_BUDGET)
-    })
-    .await
-    .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
-    for result in results.iter().filter(|result| result.holds()) {
-        tracing::info!(tenant, app = %app_name, "{result}");
     }
-    let unproven: Vec<String> = results
-        .iter()
-        .filter(|result| !result.holds())
-        .map(ToString::to_string)
-        .collect();
-    if unproven.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "os-app '{app_name}' declares rules over several entities that are not proven:\n{}",
-            unproven.join("\n")
-        ))
-    }
-}
-
-/// Check every `[[liveness]]` with `eventually` of `specs` (a bundle's
-/// types) on the joint model of its type and the types it names, with
-/// `policy_text` (the tenant's Cedar as this install leaves it) deciding each
-/// move as its sender, and refuse the install if one is not proven. Like the
-/// invariant check, it runs before any write, on a blocking thread, with the
-/// same budget; a bundle that declares no such property costs one walk over
-/// its liveness.
-async fn prove_liveness(
-    state: &PlatformState,
-    tenant: &str,
-    app_name: &str,
-    specs: &[(String, String)],
-    policy_text: &str,
-) -> Result<(), String> {
-    // Its own type counts as named, so a property that reads no other type
-    // is still checked.
+    // A liveness property's own type counts as named, so one that reads no
+    // other type is still checked.
     let Some(automatons) = bundle_with_named(state, tenant, app_name, specs, |a| {
-        a.liveness
+        let invariants = a
+            .invariants
+            .iter()
+            .flat_map(|inv| inv.assert.related_types());
+        let liveness = a
+            .liveness
             .iter()
             .filter_map(|live| live.eventually.as_ref())
             .flat_map(|goal| {
                 let own = (a.automaton.name.clone(), String::new());
                 goal.related_types().into_iter().chain(std::iter::once(own))
-            })
-            .collect()
+            });
+        invariants.chain(liveness).collect()
     })?
     else {
         return Ok(());
     };
-    let policies = temper_authz::SendAnalysis::new(policy_text)
+    let policy_text = policies.map_or_else(
+        || super::cached_or_active_tenant_policy_text(state, tenant),
+        str::to_string,
+    );
+    let policies = temper_authz::SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
-    let results = tokio::task::spawn_blocking(move || {
+    let (invariants, liveness) = tokio::task::spawn_blocking(move || {
         let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
-        temper_verify::composite::verify_joint_liveness(
-            &refs,
-            Some(&policies),
-            JOINT_INSTALL_BUDGET,
+        (
+            temper_verify::composite::verify_joint_invariants(
+                &refs,
+                Some(&policies),
+                JOINT_INSTALL_BUDGET,
+            ),
+            temper_verify::composite::verify_joint_liveness(
+                &refs,
+                Some(&policies),
+                JOINT_INSTALL_BUDGET,
+            ),
         )
     })
     .await
-    .map_err(|e| format!("os-app '{app_name}': the liveness check stopped: {e}"))?;
-    for result in results.iter().filter(|result| result.holds()) {
-        tracing::info!(tenant, app = %app_name, "{result}");
-    }
-    let unproven: Vec<String> = results
+    .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
+    let results = invariants
         .iter()
-        .filter(|result| !result.holds())
-        .map(ToString::to_string)
-        .collect();
+        .map(|result| (result.holds(), result.to_string()))
+        .chain(
+            liveness
+                .iter()
+                .map(|result| (result.holds(), result.to_string())),
+        );
+    let mut unproven = Vec::new();
+    for (holds, text) in results {
+        if holds {
+            tracing::info!(tenant, app = %app_name, "{text}");
+        } else {
+            unproven.push(text);
+        }
+    }
     if unproven.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "os-app '{app_name}' declares liveness that is not proven:\n{}",
+            "os-app '{app_name}' declares rules over several records that are not proven:\n{}",
             unproven.join("\n")
         ))
     }
