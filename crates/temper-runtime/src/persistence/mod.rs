@@ -179,6 +179,53 @@ pub struct StateTimerRecord {
     pub armed_by: String,
 }
 
+/// One pending `schedule(...)` or `schedule_at(...)` action, kept so that a
+/// restarted server arms it again. An entity can have many; each row is
+/// removed in the commit of the event its action fires, or after a fire that
+/// wrote no event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledActionRecord {
+    pub tenant: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    /// Names this schedule: the arming event's journal sequence and the
+    /// effect's place among that event's schedules, so a repeated write of
+    /// the same arm lands on the same row.
+    pub arm_id: String,
+    /// The action to dispatch.
+    pub action: String,
+    /// When it is due, RFC 3339.
+    pub due_at: String,
+    /// The identity it fires as: the dispatch that armed it (JSON).
+    pub armed_by: String,
+}
+
+/// The rows an append commits in the same transaction as its events.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommitRows<'a> {
+    /// Declared key-index rows (ADR-0153).
+    pub key_rows: &'a [EntityKeyRow],
+    /// Derived vector-index rows (ADR-0155).
+    pub vector_rows: &'a [EntityVectorRow],
+    /// The type declares vector paths: the entity's vector rows become
+    /// exactly `vector_rows`, so a delete or a cleared property purges them.
+    pub reconcile_vectors: bool,
+    /// The scheduled actions the appended transition armed: they exist if and
+    /// only if its event does.
+    pub scheduled_actions: &'a [ScheduledActionRecord],
+    /// The arm id of this entity's scheduled action that the appended
+    /// transition fired: its row is removed in the same commit, so a row
+    /// never outlives its fire's event and a restart cannot fire it again.
+    pub fired_scheduled_action: Option<&'a str>,
+}
+
+impl CommitRows<'_> {
+    /// Whether the commit writes or removes a scheduled-action row.
+    pub fn changes_scheduled_actions(&self) -> bool {
+        !self.scheduled_actions.is_empty() || self.fired_scheduled_action.is_some()
+    }
+}
+
 /// Trait for the event store backend (implemented by temper-store-postgres).
 /// Uses desugared async-in-trait to enforce Send bounds on futures.
 pub trait EventStore: Send + Sync + 'static {
@@ -192,9 +239,9 @@ pub trait EventStore: Send + Sync + 'static {
 
     /// Append events and co-commit declared key-index rows (ADR-0153) in the
     /// **same transaction** as the journal append. A thin forwarder to
-    /// [`EventStore::append_with_index_rows`] with no vector rows and no vector
-    /// reconcile, so callers that only maintain keys are unchanged. The co-commit
-    /// logic lives in `append_with_index_rows`, which query-plane backends override.
+    /// [`EventStore::append_with_rows`] with only key rows, so callers that
+    /// only maintain keys are unchanged. The co-commit logic lives in
+    /// `append_with_rows`, which backends override.
     fn append_with_keys(
         &self,
         persistence_id: &str,
@@ -202,39 +249,68 @@ pub trait EventStore: Send + Sync + 'static {
         events: &[PersistenceEnvelope],
         key_rows: &[EntityKeyRow],
     ) -> impl std::future::Future<Output = Result<u64, PersistenceError>> + Send {
-        self.append_with_index_rows(
+        self.append_with_rows(
             persistence_id,
             expected_sequence,
             events,
-            key_rows,
-            &[],
-            false,
+            CommitRows {
+                key_rows,
+                ..CommitRows::default()
+            },
         )
     }
 
-    /// Append events and co-commit BOTH declared key-index rows (ADR-0153) and
-    /// derived vector-index rows (ADR-0155) in the **same transaction** as the
-    /// journal append. This is the single co-commit entry point the entity actor
-    /// calls. The default ignores the index kinds and delegates to
-    /// [`EventStore::append`] — stores with a query plane that co-commit (postgres,
-    /// sim) override it; Turso also overrides it to maintain the vector index
-    /// write-behind (event first, index follows). When `reconcile_vectors` is true
-    /// (the entity's type declares ≥1 `[[vector]]` path) the store first DELETES all
-    /// of the entity's vector rows, then inserts `vector_rows` — so a delete
-    /// transition or a cleared vector/model property purges the stale rows instead of
-    /// leaving them to be ranked forever. The sequence and atomicity contract is
+    /// Append events and commit `rows` with them: declared key-index rows
+    /// (ADR-0153), derived vector-index rows (ADR-0155) and the scheduled
+    /// actions the transition armed. This is the single co-commit entry point
+    /// the entity actor calls. Postgres and the sim store commit every kind in
+    /// the journal's transaction; Turso commits the scheduled actions there and
+    /// maintains the vector index write-behind (event first, index follows).
+    /// When `reconcile_vectors` is true (the entity's type declares ≥1
+    /// `[[vector]]` path) the store first DELETES all of the entity's vector
+    /// rows, then inserts `vector_rows`. The sequence and atomicity contract is
     /// identical to `append`.
-    fn append_with_index_rows(
+    ///
+    /// The default keeps only the events: a store without a timer table cannot
+    /// keep scheduled actions, so it logs that a restart loses them.
+    fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[EntityKeyRow],
-        vector_rows: &[EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: CommitRows<'_>,
     ) -> impl std::future::Future<Output = Result<u64, PersistenceError>> + Send {
-        let _ = (key_rows, vector_rows, reconcile_vectors);
+        if rows.changes_scheduled_actions() {
+            tracing::error!(
+                persistence_id,
+                scheduled = rows.scheduled_actions.len(),
+                "this event store keeps no scheduled actions; a restart loses them"
+            );
+        }
         self.append(persistence_id, expected_sequence, events)
+    }
+
+    /// Every pending scheduled action of `tenant`: what a restart arms again.
+    /// The default store keeps none.
+    fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<ScheduledActionRecord>, PersistenceError>> + Send
+    {
+        let _ = tenant;
+        async { Ok(Vec::new()) }
+    }
+
+    /// Remove one scheduled action's row once it has fired. Idempotent.
+    fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> impl std::future::Future<Output = Result<(), PersistenceError>> + Send {
+        let _ = (tenant, entity_type, entity_id, arm_id);
+        async { Ok(()) }
     }
 
     /// Reconcile the derived vector-index rows for an **existing** entity to exactly
