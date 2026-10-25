@@ -4,16 +4,25 @@
 //! (`Type[id].status`) or a field (`Type[id].field`). One entity's model
 //! cannot know those values, so the per-entity cascade reads them as unknown
 //! and never fails on them. They are checked here, on the joint state of the
-//! invariant's entity and every type it names, one instance of each (the
-//! records an id field points at):
+//! invariant's entity and every type it names, one record of each, run the
+//! way the runtime runs them:
 //!
 //! - every action of every entity in scope is offered, as in the per-entity
 //!   model, with its guard resolved against the joint state;
-//! - an entity reaction between two types in scope fires inside the step
-//!   that caused it, and carries its `args`: a tracked string copied from
-//!   the source reaches the target's variable of the parameter's name;
+//! - each record has an id, and a reference finds a record only when its id
+//!   field holds that record's id; walks start from every way the records'
+//!   ids can be equal or differ, so a design that works only when two ids
+//!   happen to match is found;
+//! - an action whose guard reads a related record (`Type[id].status`)
+//!   reads it on the dispatch path and is written later by its record's
+//!   actor, which checks only its own state; other moves can land in
+//!   between;
+//! - an entity reaction is a dispatch of its own, sent after its source
+//!   commits with `args` copied from the source as committed, and taken by
+//!   its target later, in any order with other dispatches;
 //! - string variables are tracked as symbols (equality only) when an
-//!   invariant reads them, or when their value reaches one that is read
+//!   invariant reads them, when a reference uses them as an id, or when
+//!   their value reaches one that is read
 //!   ([`crate::model::build_model_tracking`]);
 //! - each entity is sliced to what the invariants depend on: a counter,
 //!   boolean or list nothing read can be influenced by is dropped, and a
@@ -21,8 +30,10 @@
 //!   an invariant that holds here holds in the full model; a broken one
 //!   comes with the path that breaks it, to read against the spec.
 //!
-//! The walk is breadth first, so each broken invariant's path is a shortest
-//! one. A walk that runs out of its [`Budget`] says so and is never a pass.
+//! Records disagree while a dispatch is on its way, so invariants are
+//! checked in settled states: those with nothing in flight. The walk is
+//! breadth first, so each broken invariant's path is a shortest one. A walk
+//! that runs out of its [`Budget`] says so and is never a pass.
 
 mod env;
 mod model;
@@ -35,13 +46,52 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
 use crate::Budget;
-use crate::model::semantics::string_values;
 use crate::model::{ParamValue, TemperModelAction, TemperModelState};
 
-use model::JointModel;
+use model::{JointModel, Move};
 
-/// One entity type's state per type in scope.
-pub type JointState = BTreeMap<String, TemperModelState>;
+/// The records in scope, one per type, and the dispatches on their way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JointState {
+    /// Each type's record.
+    pub records: BTreeMap<String, TemperModelState>,
+    /// Dispatches sent and not yet taken, sorted; the same dispatch may be
+    /// in flight twice.
+    pub inflight: Vec<Dispatch>,
+}
+
+/// A dispatch on its way to a record's actor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Dispatch {
+    /// The target entity type.
+    pub to: String,
+    /// The action.
+    pub action: String,
+    /// The transition's target status, when the sender chose one.
+    pub target_state: Option<String>,
+    /// The parameters sent; a reaction's are its `args` as the source
+    /// committed them.
+    pub params: BTreeMap<String, ParamValue>,
+    /// Whether the dispatch path has read the related records it needs.
+    pub read: bool,
+    /// The reaction depth that sent it (0 for a request from outside).
+    pub depth: u32,
+}
+
+impl fmt::Display for Dispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let action = TemperModelAction {
+            name: self.action.clone(),
+            target_state: None,
+            params: self.params.clone(),
+        };
+        write!(f, "{}.{action}", self.to)?;
+        if !self.read {
+            f.write_str(" (unread)")?;
+        }
+        Ok(())
+    }
+}
 
 /// What the joint check found for one invariant.
 #[derive(Debug, Clone)]
@@ -56,6 +106,9 @@ pub struct JointInvariantResult {
     pub scope: Vec<String>,
     /// Distinct joint states walked.
     pub states: usize,
+    /// When the walk held a move back because it would have put more than
+    /// this many dispatches in flight: what it found holds only up to that.
+    pub in_flight_bound: Option<usize>,
     /// Holds, broken (with a shortest path), or not fully checked.
     pub outcome: JointOutcome,
 }
@@ -99,11 +152,17 @@ impl fmt::Display for JointInvariantResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let scope = self.scope.join(" + ");
         match &self.outcome {
-            JointOutcome::Holds => write!(
-                f,
-                "{}.{} HOLDS over {} joint states ({scope})",
-                self.entity, self.invariant, self.states
-            ),
+            JointOutcome::Holds => {
+                write!(
+                    f,
+                    "{}.{} HOLDS over {} joint states ({scope}",
+                    self.entity, self.invariant, self.states
+                )?;
+                match self.in_flight_bound {
+                    Some(bound) => write!(f, "; with at most {bound} dispatches in flight)"),
+                    None => f.write_str(")"),
+                }
+            }
             JointOutcome::Broken { path } => {
                 writeln!(
                     f,
@@ -170,6 +229,7 @@ pub fn verify_joint_invariants(
                     assert: inv.assert.to_string(),
                     scope: scope.iter().cloned().collect(),
                     states,
+                    in_flight_bound: None,
                     outcome,
                 }
             };
@@ -185,9 +245,11 @@ pub fn verify_joint_invariants(
         }
         let model = JointModel::new(&by_name, scope, name, &joint);
         let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-        let (states, outcomes) = model.walk(name, &exprs, budget);
-        for (inv, outcome) in joint.iter().zip(outcomes) {
-            results.push(result(inv, &model.scope, states, outcome));
+        let walk = model.walk(name, &exprs, budget);
+        for (inv, outcome) in joint.iter().zip(walk.outcomes) {
+            let mut found = result(inv, &model.scope, walk.states, outcome);
+            found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+            results.push(found);
         }
     }
     results
@@ -211,7 +273,7 @@ pub struct TraceMove {
 /// invariants.
 #[derive(Debug, Clone)]
 pub struct JointReplay {
-    /// The start and the state after each move.
+    /// The start and the state after each step.
     pub steps: Vec<JointStep>,
     /// The invariants false in the last state.
     pub broken: Vec<String>,
@@ -219,12 +281,17 @@ pub struct JointReplay {
 
 /// Walk `trace` through the joint model of `entity`'s invariants that read
 /// related entities, as the check does: whether the spec allows each move,
-/// and which invariants the last state breaks. A reaction whose guard the
-/// model cannot decide is taken as not firing. Use it to ask whether what
-/// happened in production is a path of the spec.
+/// and which invariants the last state breaks. `ids` names each record's id
+/// in the trace's names (equal names, equal ids); a type left out gets an
+/// id of its own. A move the trace names takes a dispatch in flight to that
+/// action when there is one, and is otherwise sent from outside; when it is
+/// not allowed yet, dispatches in flight land first, oldest first. A
+/// reaction whose guard the model cannot decide is taken as not firing. Use
+/// it to ask whether what happened in production is a path of the spec.
 pub fn replay_joint_invariants(
     automatons: &[&Automaton],
     entity: &str,
+    ids: &BTreeMap<String, String>,
     trace: &[TraceMove],
 ) -> Result<JointReplay, String> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
@@ -251,24 +318,26 @@ pub fn replay_joint_invariants(
         }
     }
     let model = JointModel::new(&by_name, scope, entity, &joint);
-    let mut state = model.init();
+    let (mut state, mut names) = model.init_with_ids(ids);
     let mut steps = vec![JointStep {
         action: None,
         state: render(&state),
     }];
-    // Each trace name's value in the current state.
-    let mut names: BTreeMap<String, String> = BTreeMap::new();
     for (i, wanted) in trace.iter().enumerate() {
-        let held = string_values(state.values());
-        let fresh = format!(
-            "#{}",
-            held.iter().filter(|v| v.starts_with('#')).count() + 1
-        );
-        let fits = |action: &TemperModelAction| {
-            action.name == wanted.action
-                && wanted.params.iter().all(|(param, name)| {
+        loop {
+            let fresh = format!(
+                "#{}",
+                model
+                    .values(&state)
+                    .iter()
+                    .filter(|v| v.starts_with('#'))
+                    .count()
+                    + 1
+            );
+            let fits = |params: &BTreeMap<String, ParamValue>| {
+                wanted.params.iter().all(|(param, name)| {
                     // A parameter the model does not track takes any value.
-                    let Some(ParamValue::Str(value)) = action.params.get(param) else {
+                    let Some(ParamValue::Str(value)) = params.get(param) else {
                         return true;
                     };
                     match names.get(name) {
@@ -277,52 +346,85 @@ pub fn replay_joint_invariants(
                         None => *value == fresh,
                     }
                 })
-        };
-        let Some((_, action)) = model
-            .moves(&state)
-            .into_iter()
-            .find(|(e, action)| e == &wanted.entity && fits(action))
-        else {
-            return Err(format!(
-                "move {} ({}.{}) is not allowed in {}",
-                i + 1,
-                wanted.entity,
-                wanted.action,
-                render(&state)
-            ));
-        };
-        for (param, name) in &wanted.params {
-            if let Some(ParamValue::Str(value)) = action.params.get(param)
-                && !name.is_empty()
-            {
-                names.entry(name.clone()).or_insert_with(|| value.clone());
+            };
+            let wanted_dispatch = |d: &Dispatch| {
+                d.to == wanted.entity && d.action == wanted.action && fits(&d.params)
+            };
+            let moves = model.moves(&state);
+            let named = moves
+                .iter()
+                .find(|mv| match mv {
+                    Move::Read(d) | Move::Arrive(d) => wanted_dispatch(d),
+                    _ => false,
+                })
+                .or_else(|| {
+                    moves.iter().find(|mv| match mv {
+                        Move::Take(e, action) | Move::Send(e, action) => {
+                            e == &wanted.entity
+                                && action.name == wanted.action
+                                && fits(&action.params)
+                        }
+                        _ => false,
+                    })
+                });
+            let (mv, done) = match named {
+                Some(mv @ (Move::Take(..) | Move::Arrive(_))) => (mv.clone(), true),
+                Some(mv) => (mv.clone(), false),
+                None => match moves
+                    .iter()
+                    .find(|mv| matches!(mv, Move::Read(_) | Move::Arrive(_)))
+                {
+                    Some(mv) => (mv.clone(), false),
+                    None => {
+                        return Err(format!(
+                            "move {} ({}.{}) is not allowed in {}",
+                            i + 1,
+                            wanted.entity,
+                            wanted.action,
+                            render(&state)
+                        ));
+                    }
+                },
+            };
+            if let Move::Take(_, action) | Move::Send(_, action) = &mv {
+                for (param, name) in &wanted.params {
+                    if let Some(ParamValue::Str(value)) = action.params.get(param)
+                        && !name.is_empty()
+                    {
+                        names.entry(name.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            let next = model
+                .next(&state, &mv)
+                .0
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "move {} ({}.{}) cannot be taken",
+                        i + 1,
+                        wanted.entity,
+                        wanted.action
+                    )
+                })?;
+            names = names
+                .into_iter()
+                .filter_map(|(name, value)| match next.renamed.get(&value) {
+                    Some(new) => Some((name, new.clone())),
+                    None if !value.starts_with('#') => Some((name, value)),
+                    None => None,
+                })
+                .collect();
+            steps.push(JointStep {
+                action: Some(next.label),
+                state: render(&next.state),
+            });
+            state = next.state;
+            if done {
+                break;
             }
         }
-        let (next, renamed) = model
-            .next(&state, &wanted.entity, &action)
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                format!(
-                    "move {} ({}.{}) cannot be taken",
-                    i + 1,
-                    wanted.entity,
-                    wanted.action
-                )
-            })?;
-        names = names
-            .into_iter()
-            .filter_map(|(name, value)| match renamed.get(&value) {
-                Some(new) => Some((name, new.clone())),
-                None if !value.starts_with('#') => Some((name, value)),
-                None => None,
-            })
-            .collect();
-        steps.push(JointStep {
-            action: Some(label(&wanted.entity, &action, &renamed)),
-            state: render(&next),
-        });
-        state = next;
     }
     let env = model.env(entity, &state);
     let broken = joint
@@ -355,28 +457,17 @@ pub(super) fn path_to(
 }
 
 pub(super) fn render(state: &JointState) -> String {
-    state
+    let mut text = state
+        .records
         .iter()
         .map(|(entity, s)| format!("{entity}={s}"))
         .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-/// `entity.action`, its string parameters named as in the state it reached.
-pub(super) fn label(
-    entity: &str,
-    action: &TemperModelAction,
-    renamed: &BTreeMap<String, String>,
-) -> String {
-    let mut action = action.clone();
-    for value in action.params.values_mut() {
-        if let ParamValue::Str(text) = value
-            && let Some(name) = renamed.get(text)
-        {
-            *text = name.clone();
-        }
+        .join(" | ");
+    if !state.inflight.is_empty() {
+        let inflight: Vec<String> = state.inflight.iter().map(ToString::to_string).collect();
+        text.push_str(&format!(" | in flight: {}", inflight.join(", ")));
     }
-    format!("{entity}.{action}")
+    text
 }
 
 #[cfg(test)]

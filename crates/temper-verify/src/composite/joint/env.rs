@@ -1,4 +1,5 @@
-//! One entity of a joint state as a predicate environment.
+//! One entity of a joint state as a predicate environment, and how a
+//! reference finds its record.
 
 use std::collections::BTreeMap;
 
@@ -7,13 +8,71 @@ use temper_spec::predicate::{Env, Val, VarKind};
 use super::JointState;
 use crate::model::{TemperModel, TemperModelState};
 
+/// The key under which each record keeps its own id among its strings.
+pub(super) const ID: &str = "Id";
+
+/// What an evaluation may not see. The runtime reads related records on the
+/// dispatch path and the record's own state in its actor, at different
+/// moments, so each step sees only its own half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Blind {
+    /// Everything is read from the joint state.
+    Nothing,
+    /// The record's own status and variables are unknown (the dispatch path).
+    Own,
+    /// Related records are unknown (the actor, which uses what the dispatch
+    /// path read earlier).
+    Related,
+}
+
+/// Whether a reference finds its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Found {
+    /// The id field holds the related record's id.
+    Yes,
+    /// It holds another id, or none: no such record.
+    Missing,
+    /// The model does not track the id field.
+    Unknown,
+}
+
+/// The record of type `related` that `owner`'s `id_field` names: found when
+/// the field holds that record's id (`Id` reads `owner`'s own id, which is
+/// how `same_id` resolves).
+pub(super) fn resolve(
+    models: &BTreeMap<String, TemperModel>,
+    state: &JointState,
+    owner: &str,
+    id_field: &str,
+    related: &str,
+) -> Found {
+    let (Some(source), Some(target)) = (state.records.get(owner), state.records.get(related))
+    else {
+        return Found::Unknown;
+    };
+    let id = if matches!(id_field, "Id" | "id") {
+        source.strings.get(ID)
+    } else if models[owner].tracked_strings.contains(id_field) {
+        source.strings.get(id_field)
+    } else {
+        return Found::Unknown;
+    };
+    match (id, target.strings.get(ID)) {
+        (Some(id), Some(target_id)) if id == target_id => Found::Yes,
+        (Some(_), Some(_)) => Found::Missing,
+        _ => Found::Unknown,
+    }
+}
+
 /// One entity of a joint state as a predicate environment: its own
 /// variables as the per-entity model reads them, and the related entities'
-/// statuses and tracked variables from the joint state.
+/// statuses and tracked variables from the joint state, when the reference
+/// finds them.
 pub(super) struct JointEnv<'a> {
     pub(super) models: &'a BTreeMap<String, TemperModel>,
     pub(super) state: &'a JointState,
     pub(super) owner: &'a str,
+    pub(super) blind: Blind,
 }
 
 fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> Val<'a> {
@@ -32,29 +91,48 @@ fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> V
     }
 }
 
+impl JointEnv<'_> {
+    /// The related record `id_field` names, if the reference finds one;
+    /// `None` when it cannot be known here.
+    fn related(&self, entity_type: &str, id_field: &str) -> Option<Option<&TemperModelState>> {
+        if self.blind == Blind::Related {
+            return None;
+        }
+        match resolve(self.models, self.state, self.owner, id_field, entity_type) {
+            Found::Yes => Some(self.state.records.get(entity_type)),
+            Found::Missing => Some(None),
+            Found::Unknown => None,
+        }
+    }
+}
+
 impl Env for JointEnv<'_> {
     fn status(&self) -> Val<'_> {
-        Val::Str(&self.state[self.owner].status)
+        if self.blind == Blind::Own {
+            return Val::Unknown;
+        }
+        Val::Str(&self.state.records[self.owner].status)
     }
 
     fn var(&self, name: &str) -> Val<'_> {
-        var_of(&self.models[self.owner], &self.state[self.owner], name)
+        if self.blind == Blind::Own {
+            return Val::Unknown;
+        }
+        var_of(
+            &self.models[self.owner],
+            &self.state.records[self.owner],
+            name,
+        )
     }
 
-    fn cross_statuses(&self, entity_type: &str, _id_field: &str) -> Option<Vec<Val<'_>>> {
-        self.state
-            .get(entity_type)
-            .map(|s| vec![Val::Str(&s.status)])
+    fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {
+        let record = self.related(entity_type, id_field)?;
+        Some(vec![record.map_or(Val::Null, |s| Val::Str(&s.status))])
     }
 
-    fn cross_fields(
-        &self,
-        entity_type: &str,
-        _id_field: &str,
-        field: &str,
-    ) -> Option<Vec<Val<'_>>> {
-        let state = self.state.get(entity_type)?;
+    fn cross_fields(&self, entity_type: &str, id_field: &str, field: &str) -> Option<Vec<Val<'_>>> {
+        let record = self.related(entity_type, id_field)?;
         let model = self.models.get(entity_type)?;
-        Some(vec![var_of(model, state, field)])
+        Some(vec![record.map_or(Val::Null, |s| var_of(model, s, field))])
     }
 }

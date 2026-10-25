@@ -1,26 +1,36 @@
-//! The joint model: the entities in scope, their reactions, and the walk.
+//! The joint model: the records in scope, their reactions, the dispatches
+//! on their way between them, and the walk.
+
+mod step;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
-use temper_spec::automaton::{Automaton, TriggerKind};
-use temper_spec::predicate::{Arg, Expr, Literal, Name, Truth, eval};
+use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
+use temper_spec::predicate::{Arg, Expr, Name, Truth, eval};
 
-use super::env::JointEnv;
+use super::env::{Blind, ID, JointEnv};
 use super::slice::slice;
-use super::{JointOutcome, JointState, label, path_to};
+use super::{JointOutcome, JointState, path_to};
 use crate::Budget;
-use crate::model::semantics::{canonical_strings, step, string_values, successors_among};
+use crate::model::semantics::{canonical_strings, string_values};
 use crate::model::{
-    ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelAction, TemperModelState,
-    build_model_tracking,
+    ParamValue, ResolvedTransition, TemperModel, TemperModelState, build_model_tracking,
 };
+
+pub(super) use step::Move;
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
 
-/// Reaction depth followed inside one step: the runtime's own bound.
+/// Reaction depth followed: the runtime's own bound.
 const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
+
+/// Dispatches in flight at once. The runtime has no such bound: each request
+/// and each reaction is its own task. The model needs one to stay finite;
+/// three lets a late dispatch land after two later ones. A walk that held a
+/// move back for it says so, and then proves only up to this many.
+pub(super) const MAX_IN_FLIGHT: usize = 3;
 
 /// An entity reaction between two types in scope, with the arguments it
 /// passes (target parameter to a source field or a literal).
@@ -32,47 +42,62 @@ struct Reaction {
     target_action: String,
     guard: Option<Expr>,
     args: BTreeMap<String, Arg>,
+    resolve: Option<TargetResolver>,
+}
+
+/// What a walk found.
+pub(super) struct Walk {
+    /// Distinct joint states walked.
+    pub(super) states: usize,
+    /// One per invariant.
+    pub(super) outcomes: Vec<JointOutcome>,
+    /// Whether a move was held back for [`MAX_IN_FLIGHT`].
+    pub(super) held_back: bool,
 }
 
 /// The joint model of one entity's invariants that read related entities.
 pub(super) struct JointModel {
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
-    /// The types composed: those the invariants name, and those a
-    /// `param_equals_related_field` of a tracked parameter reads.
+    /// The types composed: those the invariants name.
     pub(super) scope: BTreeSet<String>,
 }
 
 impl JointModel {
     pub(super) fn new(
         by_name: &BTreeMap<&str, &Automaton>,
-        mut scope: BTreeSet<String>,
+        scope: BTreeSet<String>,
         owner: &str,
         invariants: &[&temper_spec::automaton::Invariant],
     ) -> Self {
-        // What the invariants read: the owner's variables, and the related
-        // types' fields.
+        // What the invariants read: the owner's variables and the id fields
+        // its references use, and the related types' fields.
         let mut read: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut owned = |entity: &str, field: &str| {
+            if !matches!(field, "Id" | "id") {
+                read.entry(entity.to_string())
+                    .or_default()
+                    .insert(field.to_string());
+            }
+        };
         for inv in invariants {
             inv.assert.for_each_name(&mut |n| match n {
-                Name::Var(var) => {
-                    read.entry(owner.to_string())
-                        .or_default()
-                        .insert(var.to_string());
-                }
+                Name::Var(var) => owned(owner, var),
+                Name::CrossStatus { id_field, .. } => owned(owner, id_field),
                 Name::CrossField {
-                    entity_type, field, ..
+                    entity_type,
+                    id_field,
+                    field,
                 } => {
-                    read.entry(entity_type.to_string())
-                        .or_default()
-                        .insert(field.to_string());
+                    owned(owner, id_field);
+                    owned(entity_type, field);
                 }
-                Name::Status | Name::CrossStatus { .. } => {}
+                Name::Status => {}
             });
         }
-        // Tracked strings: what is read, what a reaction copies into a
-        // tracked variable, and the related field a tracked parameter must
-        // equal (whose type joins the scope), until nothing more reaches one.
+        // Tracked strings: what is read, the id fields references use, and
+        // what a reaction copies into a tracked variable, until nothing more
+        // reaches one.
         let mut also: BTreeMap<String, BTreeSet<String>> = read.clone();
         let (models, reactions) = loop {
             let reactions = reactions_in(by_name, &scope);
@@ -87,33 +112,32 @@ impl JointModel {
                 })
                 .collect();
             let mut grew = false;
-            for model in models.values() {
+            let mut track = |entity: &str, field: &str| {
+                !matches!(field, "Id" | "id")
+                    && also
+                        .entry(entity.to_string())
+                        .or_default()
+                        .insert(field.to_string())
+            };
+            for (entity, model) in &models {
                 for t in &model.transitions {
-                    for (entity, field) in t
-                        .string_params
-                        .iter()
-                        .filter_map(|p| p.equals_related.as_ref())
-                    {
-                        if by_name.contains_key(entity.as_str()) {
-                            grew |= scope.insert(entity.clone());
-                            grew |= also
-                                .entry(entity.clone())
-                                .or_default()
-                                .insert(field.clone());
+                    for (related, id_field) in t.guard.related_types() {
+                        if scope.contains(&related) {
+                            grew |= track(entity, &id_field);
                         }
                     }
                 }
             }
             for reaction in &reactions {
+                if let Some(TargetResolver::Field { id_field }) = &reaction.resolve {
+                    grew |= track(&reaction.from, id_field);
+                }
                 for (param, arg) in &reaction.args {
                     if let Arg::Var(field) = arg
                         && models[&reaction.to].tracked_strings.contains(param)
                         && !models[&reaction.from].tracked_strings.contains(field)
                     {
-                        grew |= also
-                            .entry(reaction.from.clone())
-                            .or_default()
-                            .insert(field.clone());
+                        grew |= track(&reaction.from, field);
                     }
                 }
             }
@@ -135,9 +159,9 @@ impl JointModel {
         }
     }
 
-    pub(super) fn init(&self) -> JointState {
-        let mut state: JointState = self
-            .models
+    /// The records as they start, without their ids.
+    fn blank(&self) -> BTreeMap<String, TemperModelState> {
+        self.models
             .iter()
             .map(|(entity, model)| {
                 let init = stateright::Model::init_states(model)
@@ -146,224 +170,146 @@ impl JointModel {
                     .expect("a model has one initial state");
                 (entity.clone(), init)
             })
-            .collect();
-        canonical(&mut state);
-        state
+            .collect()
     }
 
-    /// Every move from `state`: each entity's enabled actions, with string
-    /// parameters chosen among the values held anywhere in the joint state.
-    pub(super) fn moves(&self, state: &JointState) -> Vec<(String, TemperModelAction)> {
-        let values = string_values(state.values());
-        let mut out = Vec::new();
-        for (entity, model) in &self.models {
-            let local = &state[entity];
-            for t in &model.transitions {
-                if !self.enabled(entity, t, state) {
-                    continue;
-                }
-                for (params, _) in successors_among(model, t, local, &values) {
-                    if !self.related_hold(t, &params, state) {
-                        continue;
-                    }
-                    out.push((
-                        entity.clone(),
-                        TemperModelAction {
-                            name: t.name.clone(),
-                            target_state: t.to_state.clone(),
-                            params,
-                        },
-                    ));
-                }
-            }
-        }
-        out
-    }
-
-    /// Whether `params` meets `t`'s `param_equals_related_field` constraints
-    /// on `state`, as the runtime checks them when the action is dispatched.
-    /// A related type outside the scope, or a field not tracked, leaves the
-    /// parameter free.
-    fn related_hold(
-        &self,
-        t: &ResolvedTransition,
-        params: &BTreeMap<String, ParamValue>,
-        state: &JointState,
-    ) -> bool {
-        t.string_params.iter().all(|param| {
-            let Some((entity, field)) = &param.equals_related else {
-                return true;
-            };
-            let Some(related) = state.get(entity) else {
-                return true;
-            };
-            if !self.models[entity].tracked_strings.contains(field) {
-                return true;
-            }
-            match params.get(&param.name) {
-                Some(ParamValue::Str(value)) => {
-                    related.strings.get(field).is_some_and(|held| held == value)
-                }
-                _ => false,
-            }
-        })
-    }
-
-    fn enabled(&self, entity: &str, t: &ResolvedTransition, state: &JointState) -> bool {
-        let local = &state[entity];
-        let status_ok =
-            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
-        status_ok && eval(&t.guard, &self.env(entity, state)).may_hold()
-    }
-
-    pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {
-        JointEnv {
-            models: &self.models,
-            state,
-            owner,
-        }
-    }
-
-    /// The states after `entity` takes `action`, with the reactions it
-    /// causes: one per way the reactions' guards can go, the ones where a
-    /// guard the model cannot decide does not fire first. Each comes with
-    /// the new names of the values `state` held.
-    pub(super) fn next(
-        &self,
-        state: &JointState,
-        entity: &str,
-        action: &TemperModelAction,
-    ) -> Vec<(JointState, BTreeMap<String, String>)> {
-        let model = &self.models[entity];
-        let Some(moved) = step(
-            model,
-            &action.name,
-            action.target_state.as_deref(),
-            &state[entity],
-            &action.params,
-        ) else {
-            return Vec::new();
-        };
-        let mut next = state.clone();
-        next.insert(entity.to_string(), moved);
-        self.react(next, entity, &action.name, 0)
+    /// The starting states: one per way the records' ids can be equal or
+    /// differ.
+    fn inits(&self) -> Vec<JointState> {
+        let blank = self.blank();
+        partitions(blank.len())
             .into_iter()
-            .map(|mut outcome| {
-                let renamed = canonical(&mut outcome);
-                (outcome, renamed)
+            .map(|blocks| {
+                let mut records = blank.clone();
+                for (record, block) in records.values_mut().zip(blocks) {
+                    record
+                        .strings
+                        .insert(ID.to_string(), format!("#{}", block + 1));
+                }
+                let mut state = JointState {
+                    records,
+                    inflight: Vec::new(),
+                };
+                canonical(&mut state);
+                state
             })
             .collect()
     }
 
-    /// Fire the reactions of `source.action` between types in scope, in
-    /// declaration order, as the runtime does after the source commits. A
-    /// reaction fires when its guard holds on the source; a guard that reads
-    /// what the model does not track may go either way, so both outcomes are
-    /// kept. A reaction whose target cannot take it is dropped (the ADR-0150
-    /// check reports those).
-    fn react(&self, state: JointState, source: &str, action: &str, depth: u32) -> Vec<JointState> {
-        let mut outcomes = vec![state];
-        if depth >= MAX_REACTION_DEPTH {
-            return outcomes;
+    /// The starting state whose ids are `ids` (entity type to a trace name;
+    /// equal names, equal ids; a type left out gets an id of its own), and
+    /// each trace name's value in it.
+    pub(super) fn init_with_ids(
+        &self,
+        ids: &BTreeMap<String, String>,
+    ) -> (JointState, BTreeMap<String, String>) {
+        let mut names: BTreeMap<String, String> = BTreeMap::new();
+        let mut records = self.blank();
+        for (entity, record) in &mut records {
+            let name = ids
+                .get(entity)
+                .cloned()
+                .unwrap_or_else(|| format!("{entity}#id"));
+            let next = format!("#{}", names.len() + 1);
+            let value = names.entry(name).or_insert(next).clone();
+            record.strings.insert(ID.to_string(), value);
         }
-        for reaction in self
-            .reactions
-            .iter()
-            .filter(|r| r.from == source && r.source_action == action)
-        {
-            let mut after = Vec::new();
-            for state in outcomes {
-                let fires = match &reaction.guard {
-                    Some(guard) => eval(guard, &self.env(source, &state)),
-                    None => Truth::True,
-                };
-                if fires != Truth::True {
-                    after.push(state.clone());
-                }
-                if fires == Truth::False {
-                    continue;
-                }
-                match self.deliver(&state, source, reaction) {
-                    Some((moved, name)) => {
-                        let mut next = state;
-                        next.insert(reaction.to.clone(), moved);
-                        after.extend(self.react(next, &reaction.to, &name, depth + 1));
-                    }
-                    None => after.push(state),
-                }
+        let mut state = JointState {
+            records,
+            inflight: Vec::new(),
+        };
+        let renamed = canonical(&mut state);
+        for value in names.values_mut() {
+            if let Some(new) = renamed.get(value) {
+                *value = new.clone();
             }
-            outcomes = after;
         }
-        outcomes
+        (state, names)
     }
 
-    /// The target's state after it takes `reaction` from `source`, and the
-    /// action it took; `None` when it cannot take it.
-    fn deliver(
-        &self,
-        state: &JointState,
-        source: &str,
-        reaction: &Reaction,
-    ) -> Option<(TemperModelState, String)> {
-        let source_state = &state[source];
-        let model = &self.models[&reaction.to];
-        let t = model
-            .transitions
-            .iter()
-            .find(|t| t.name == reaction.target_action && self.enabled(&reaction.to, t, state))?;
-        let target = &state[&reaction.to];
-        let values = string_values(state.values());
-        // Counts and booleans an effect reads: the first choice, as the
-        // composite check takes. Strings: what the reaction passes, and a
-        // parameter it does not pass leaves the field as it is.
-        let mut params: BTreeMap<String, ParamValue> = successors_among(model, t, target, &values)
-            .into_iter()
-            .next()
-            .map(|(params, _)| params)
-            .unwrap_or_default();
-        for param in &t.string_params {
-            params.remove(&param.name);
-            let passed = match reaction.args.get(&param.name) {
-                Some(Arg::Var(field)) => source_state.strings.get(field).cloned(),
-                Some(Arg::Lit(Literal::Str(text))) => Some(text.clone()),
-                Some(Arg::Lit(Literal::Null)) => Some(String::new()),
-                _ => None,
-            };
-            if let Some(value) = passed {
-                params.insert(param.name.clone(), ParamValue::Str(value));
+    /// The strings `state` holds, in records and in dispatches.
+    pub(super) fn values(&self, state: &JointState) -> BTreeSet<String> {
+        let mut values = string_values(state.records.values());
+        for dispatch in &state.inflight {
+            for value in dispatch.params.values() {
+                if let ParamValue::Str(text) = value
+                    && !text.is_empty()
+                {
+                    values.insert(text.clone());
+                }
             }
         }
-        if !constraints_hold(&t.string_params, target, &params)
-            || !self.related_hold(t, &params, state)
-        {
-            return None;
+        values
+    }
+
+    /// Whether `t`'s guard reads a related record in scope.
+    fn reads_related(&self, t: &ResolvedTransition) -> bool {
+        t.guard
+            .related_types()
+            .iter()
+            .any(|(entity, _)| self.models.contains_key(entity))
+    }
+
+    /// Whether some transition named `action` of `entity` reads a related
+    /// record.
+    fn action_reads_related(&self, entity: &str, action: &str) -> bool {
+        self.models[entity]
+            .transitions
+            .iter()
+            .any(|t| t.name == action && self.reads_related(t))
+    }
+
+    fn enabled(
+        &self,
+        entity: &str,
+        t: &ResolvedTransition,
+        state: &JointState,
+        blind: Blind,
+    ) -> bool {
+        let local = &state.records[entity];
+        let status_ok =
+            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
+        status_ok && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+    }
+
+    pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {
+        self.env_blind(owner, state, Blind::Nothing)
+    }
+
+    fn env_blind<'a>(
+        &'a self,
+        owner: &'a str,
+        state: &'a JointState,
+        blind: Blind,
+    ) -> JointEnv<'a> {
+        JointEnv {
+            models: &self.models,
+            state,
+            owner,
+            blind,
         }
-        let moved = step(model, &t.name, t.to_state.as_deref(), target, &params)?;
-        Some((moved, t.name.clone()))
     }
 
     /// Walk every reachable joint state breadth first, checking `invariants`
-    /// of `owner` in each. Returns the states walked and one outcome per
-    /// invariant.
-    pub(super) fn walk(
-        &self,
-        owner: &str,
-        invariants: &[&Expr],
-        budget: Budget,
-    ) -> (usize, Vec<JointOutcome>) {
+    /// of `owner` in each settled one (nothing in flight).
+    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], budget: Budget) -> Walk {
         let started = Instant::now();
         let mut nodes: Vec<(JointState, Option<(usize, String)>)> = Vec::new();
         let mut seen: HashMap<JointState, usize> = HashMap::new();
         let mut queue = VecDeque::new();
-        let init = self.init();
-        seen.insert(init.clone(), 0);
-        nodes.push((init, None));
-        queue.push_back(0usize);
+        for init in self.inits() {
+            if !seen.contains_key(&init) {
+                seen.insert(init.clone(), nodes.len());
+                queue.push_back(nodes.len());
+                nodes.push((init, None));
+            }
+        }
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
         let mut stopped = None;
+        let mut held_back = false;
         while let Some(index) = queue.pop_front() {
             let state = nodes[index].0.clone();
-            {
+            if state.inflight.is_empty() {
                 let env = self.env(owner, &state);
                 for (i, inv) in invariants.iter().enumerate() {
                     if broken[i].is_none() && eval(inv, &env) == Truth::False {
@@ -382,14 +328,16 @@ impl JointModel {
                 });
                 break;
             }
-            for (entity, action) in self.moves(&state) {
-                for (next, renamed) in self.next(&state, &entity, &action) {
-                    if seen.contains_key(&next) {
+            for mv in self.moves(&state) {
+                let (nexts, held) = self.next(&state, &mv);
+                held_back |= held;
+                for next in nexts {
+                    if seen.contains_key(&next.state) {
                         continue;
                     }
                     let at = nodes.len();
-                    seen.insert(next.clone(), at);
-                    nodes.push((next, Some((index, label(&entity, &action, &renamed)))));
+                    seen.insert(next.state.clone(), at);
+                    nodes.push((next.state, Some((index, next.label))));
                     queue.push_back(at);
                 }
             }
@@ -408,44 +356,67 @@ impl JointModel {
                 },
             })
             .collect();
-        (nodes.len(), outcomes)
+        Walk {
+            states: nodes.len(),
+            outcomes,
+            held_back,
+        }
     }
 }
 
-/// Renumber new strings over the whole joint state; returns each value's new
-/// name.
-fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
-    let mut maps: Vec<&mut BTreeMap<String, String>> =
-        state.values_mut().map(|s| &mut s.strings).collect();
-    canonical_strings(&mut maps)
+/// Every way to split `n` items into blocks, as each item's block number,
+/// blocks numbered in order of first use.
+fn partitions(n: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = vec![Vec::new()];
+    for _ in 0..n {
+        out = out
+            .into_iter()
+            .flat_map(|blocks| {
+                let used = blocks.iter().max().map_or(0, |most| most + 1);
+                (0..=used).map(move |block| {
+                    let mut more = blocks.clone();
+                    more.push(block);
+                    more
+                })
+            })
+            .collect();
+    }
+    out
 }
 
-/// Whether the string parameters `params` passes satisfy the action's
-/// constraints, which the runtime checks on every dispatch.
-fn constraints_hold(
-    string_params: &[StringParam],
-    target: &TemperModelState,
-    params: &BTreeMap<String, ParamValue>,
-) -> bool {
-    string_params.iter().all(|param| {
-        // A string parameter nobody passed is absent, which only a
-        // non-empty constraint refuses.
-        let Some(ParamValue::Str(value)) = params.get(&param.name) else {
-            return !param.nonempty;
-        };
-        let tracked = |var: &String| target.strings.get(var);
-        !(param.nonempty && value.is_empty())
-            && param
-                .equals
-                .as_ref()
-                .and_then(tracked)
-                .is_none_or(|v| v == value)
-            && param
-                .not_equals
+/// Renumber new strings over the whole joint state, records first, then
+/// the dispatches in flight; returns each value's new name.
+fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
+    let mut dispatches = std::mem::take(&mut state.inflight);
+    let mut strings: Vec<BTreeMap<String, String>> = dispatches
+        .iter()
+        .map(|d| {
+            d.params
                 .iter()
-                .filter_map(tracked)
-                .all(|v| v != value)
-    })
+                .filter_map(|(name, value)| match value {
+                    ParamValue::Str(text) => Some((name.clone(), text.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let renamed = {
+        let mut maps: Vec<&mut BTreeMap<String, String>> = state
+            .records
+            .values_mut()
+            .map(|s| &mut s.strings)
+            .chain(strings.iter_mut())
+            .collect();
+        canonical_strings(&mut maps)
+    };
+    for (dispatch, renamed_strings) in dispatches.iter_mut().zip(strings) {
+        for (name, text) in renamed_strings {
+            dispatch.params.insert(name, ParamValue::Str(text));
+        }
+    }
+    dispatches.sort();
+    state.inflight = dispatches;
+    renamed
 }
 
 /// The entity reactions whose source and target are both in `scope`.
@@ -472,6 +443,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
                     target_action: target_action.clone(),
                     guard: trigger.guard.clone(),
                     args: trigger.args.clone(),
+                    resolve: trigger.resolve_target.clone(),
                 });
             }
         }
