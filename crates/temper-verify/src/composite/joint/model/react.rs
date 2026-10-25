@@ -1,7 +1,7 @@
 //! What a record's commit sets off: its reactions, as dispatches, and the
 //! module calls its triggers start.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Literal, Truth, eval};
@@ -10,6 +10,7 @@ use super::super::env::{Blind, Found, ID, resolve};
 use super::super::senders::RUNTIME;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
+use super::step::Certainty;
 use super::{JointModel, MAX_REACTION_DEPTH, Reaction};
 use crate::model::ParamValue;
 
@@ -18,8 +19,8 @@ impl JointModel {
     /// reactions, then the module calls its triggers start (when the model
     /// makes the kernel's moves). The calls run in the background and answer
     /// as the runtime, or, when `inline` (the sender waits for them), may
-    /// instead run inline and answer as `by`. Each outcome says whether the
-    /// model knows it happens.
+    /// instead run inline and answer as `by`. Each outcome says what the
+    /// model knows of it.
     pub(super) fn after_commit(
         &self,
         state: JointState,
@@ -28,7 +29,7 @@ impl JointModel {
         depth: u32,
         by: u32,
         inline: bool,
-    ) -> Vec<(JointState, bool)> {
+    ) -> Vec<(JointState, Certainty)> {
         let outcomes = self.react(state, source, action, depth, by);
         let key = (source.to_string(), action.to_string());
         let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
@@ -39,22 +40,38 @@ impl JointModel {
         } else {
             vec![RUNTIME]
         };
+        let internal = self.kernel.internal.get(source);
+        let asked: Vec<BTreeSet<String>> = specs
+            .iter()
+            .map(|spec| {
+                self.unchecked
+                    .asked(source, |action| match &spec.on_success {
+                        Some(name) => name == action,
+                        None => internal.is_some_and(|names| names.contains(action)),
+                    })
+            })
+            .collect();
         let mut started = Vec::new();
-        for (outcome, sure) in outcomes {
+        for (outcome, known) in outcomes {
             for &answer_as in &answering {
                 let mut outcome = outcome.clone();
-                for spec in specs {
+                for (spec, asked) in specs.iter().zip(&asked) {
+                    let strings = &outcome.records[source].strings;
                     let call = Call {
                         to: source.to_string(),
                         module: spec.module.clone(),
                         on_success: spec.on_success.clone(),
                         on_failure: spec.on_failure.clone(),
                         by: answer_as,
+                        asked: asked
+                            .iter()
+                            .filter_map(|field| Some((field.clone(), strings.get(field)?.clone())))
+                            .collect(),
                     };
                     let at = outcome.calls.partition_point(|c| c < &call);
                     outcome.calls.insert(at, call);
                 }
-                started.push((outcome, sure));
+                started.push((outcome, known));
             }
         }
         started
@@ -64,9 +81,10 @@ impl JointModel {
     /// declaration order, as the runtime does after the source commits:
     /// each is a dispatch carrying its `args` as the source holds them now.
     /// A reaction fires when its guard holds on the source; one whose guard
-    /// the model cannot decide (related records are read later) may go
-    /// either way, so both outcomes are kept, neither of them certain. A
-    /// reaction whose target reference finds no record goes nowhere.
+    /// the model cannot decide (related records are read later) goes one of
+    /// the two ways. A reaction whose target reference finds no record goes
+    /// nowhere, and one whose reference the model cannot resolve goes one of
+    /// those two ways too.
     fn react(
         &self,
         state: JointState,
@@ -74,8 +92,8 @@ impl JointModel {
         action: &str,
         depth: u32,
         by: u32,
-    ) -> Vec<(JointState, bool)> {
-        let mut outcomes = vec![(state, true)];
+    ) -> Vec<(JointState, Certainty)> {
+        let mut outcomes = vec![(state, Certainty::Sure)];
         if depth >= MAX_REACTION_DEPTH {
             return outcomes;
         }
@@ -85,14 +103,15 @@ impl JointModel {
             .filter(|r| r.from == source && r.source_action == action)
         {
             let mut after = Vec::new();
-            for (state, certain) in outcomes {
+            for (state, known) in outcomes {
                 let fires = match &reaction.guard {
                     Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
                     None => Truth::True,
                 };
-                let decided = fires != Truth::Unknown;
+                let known =
+                    known.then(Certainty::unless(fires != Truth::Unknown, Certainty::OneOf));
                 if fires != Truth::True {
-                    after.push((state.clone(), certain && decided));
+                    after.push((state.clone(), known));
                 }
                 if fires == Truth::False {
                     continue;
@@ -107,8 +126,12 @@ impl JointModel {
                     _ => Found::Unknown,
                 };
                 if reaches == Found::Missing {
-                    after.push((state, certain && decided));
+                    after.push((state, known));
                     continue;
+                }
+                let known = known.then(Certainty::unless(reaches == Found::Yes, Certainty::OneOf));
+                if reaches == Found::Unknown {
+                    after.push((state.clone(), known));
                 }
                 let dispatch = Dispatch {
                     to: reaction.to.clone(),
@@ -122,15 +145,15 @@ impl JointModel {
                 };
                 let mut next = state;
                 add(&mut next, dispatch);
-                after.push((next, certain && decided && reaches == Found::Yes));
+                after.push((next, known));
             }
             outcomes = after;
         }
         outcomes
     }
 
-    /// The tracked string parameters `reaction` passes, read from `source`
-    /// as it holds them.
+    /// The tracked string parameters `reaction` passes, and the counts kept
+    /// as sequence numbers, read from `source` as it holds them.
     fn args(
         &self,
         state: &JointState,
@@ -142,8 +165,18 @@ impl JointModel {
         reaction
             .args
             .iter()
-            .filter(|(param, _)| tracked.contains(*param))
             .filter_map(|(param, arg)| {
+                if self
+                    .order
+                    .carries(&reaction.to, &reaction.target_action, param)
+                {
+                    let Arg::Var(field) = arg else { return None };
+                    let count = source_state.counters.get(field).copied()?;
+                    return Some((param.clone(), ParamValue::Count(count)));
+                }
+                if !tracked.contains(param) {
+                    return None;
+                }
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
                     Arg::Lit(Literal::Str(text)) => Some(text.clone()),

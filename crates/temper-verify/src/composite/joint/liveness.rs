@@ -18,10 +18,23 @@
 //! Three choices keep a pass sound. The walk offers an outside move wherever
 //! Cedar may let someone outside the kernel send it, which only adds starting
 //! states. Each entity is cut down to what the condition depends on, which
-//! only adds behaviour too. And a system move counts only when the model
-//! knows it can happen: one that took a guard the model could not decide
-//! (one that reads a related record not yet read, or a variable the cut
-//! dropped) is not used.
+//! only adds behaviour too. And the model counts on a system move only for
+//! what it knows of it. Where it cannot decide a guard, a constraint or
+//! Cedar, the move leads to one of the ways it can go (taken or refused),
+//! and it counts only when every one of them gets there. Where the model
+//! does not know all the ways (it filled in a value nobody sent, or more
+//! than one transition may be taken), it does not count on the move at all.
+//! A sender that picks its own parameters (a module's answer, or a request
+//! outside code is relied on to send) is taken to send ones that pass,
+//! unless a parameter must equal a field the model does not track.
+//!
+//! Two readings let the model decide constraints that guard against stale
+//! messages. A module answers about the record as it was when the call
+//! started: a call keeps the fields its answers' parameters must equal, and
+//! the record refuses the answer once they have moved on. And a count a
+//! reaction carries, which the receiver takes only when it is greater than
+//! its own, is kept as a sequence number: the newest, or behind it
+//! (`model/order.rs`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -30,8 +43,8 @@ use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Truth, eval};
 
+use super::JointStep;
 use super::model::{self, JointModel, Sending};
-use super::{JointStep, path_to};
 use crate::Budget;
 
 /// What the joint check found for one `eventually` property.
@@ -222,7 +235,7 @@ pub fn verify_joint_liveness(
             };
             let model = JointModel::new(&by_name, scope, name, &[goal], sending, true);
             let explored = model.walk_with(budget, true, |_, _| false);
-            result.states = explored.nodes.len();
+            result.states = explored.len();
             result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
             result.outcome = match &explored.stopped {
                 Some(reason) => LivenessOutcome::Incomplete {
@@ -240,34 +253,70 @@ pub fn verify_joint_liveness(
 /// and if not, each way the stuck states come to rest: the first stuck state
 /// with nothing in flight (in walk order, so with a shortest path) for each
 /// set of record statuses.
+///
+/// A state reaches it when it holds there with nothing in flight, or when a
+/// move the system makes there either can lead to a state that reaches it,
+/// or always ends in one of a few states that all do (a guard the model
+/// cannot decide, taken or refused).
 fn settle(
     model: &JointModel,
     owner: &str,
     goal: &temper_spec::predicate::Expr,
     explored: &model::Explored,
 ) -> LivenessOutcome {
-    let count = explored.nodes.len();
+    let count = explored.len();
     let mut good = vec![false; count];
     let mut failing = vec![false; count];
     let mut queue = VecDeque::new();
-    for (index, (state, _)) in explored.nodes.iter().enumerate() {
-        let truth = eval(goal, &model.env(owner, state));
+    for index in 0..count {
+        let state = explored.state(index);
+        let truth = eval(goal, &model.env(owner, &state));
         failing[index] = truth != Truth::True;
         if truth == Truth::True && state.settled() {
             good[index] = true;
             queue.push_back(index);
         }
     }
-    let mut back: Vec<Vec<u32>> = vec![Vec::new(); count];
+    let usable: Vec<bool> = explored
+        .made
+        .iter()
+        .map(|made| made.by_system || (made.relied && failing[made.from as usize]))
+        .collect();
+    // For each state, the states with a sure move to it, and the covered
+    // moves that may end in it; for each covered move, how many of the
+    // states it may end in do not reach the goal yet.
+    let mut sure_from: Vec<Vec<u32>> = vec![Vec::new(); count];
+    let mut covering: Vec<Vec<u32>> = vec![Vec::new(); count];
+    let mut open = vec![0u32; explored.made.len()];
+    // A move's edges are walked one after another, so the states it ends in
+    // are told apart with a short list.
+    let mut ends: (u32, Vec<u32>) = (u32::MAX, Vec::new());
     for edge in &explored.edges {
-        let usable =
-            edge.certain && (edge.by_system || (edge.relied && failing[edge.from as usize]));
-        if usable {
-            back[edge.to as usize].push(edge.from);
+        let made = &explored.made[edge.made as usize];
+        if !usable[edge.made as usize] {
+            continue;
+        }
+        if edge.sure {
+            sure_from[edge.to as usize].push(made.from);
+        }
+        if ends.0 != edge.made {
+            ends = (edge.made, Vec::new());
+        }
+        if made.covered && !ends.1.contains(&edge.to) {
+            ends.1.push(edge.to);
+            covering[edge.to as usize].push(edge.made);
+            open[edge.made as usize] += 1;
         }
     }
     while let Some(index) = queue.pop_front() {
-        for &from in &back[index] {
+        let mut reached: Vec<u32> = sure_from[index].clone();
+        for &made in &covering[index] {
+            open[made as usize] -= 1;
+            if open[made as usize] == 0 {
+                reached.push(explored.made[made as usize].from);
+            }
+        }
+        for from in reached {
             if !good[from as usize] {
                 good[from as usize] = true;
                 queue.push_back(from as usize);
@@ -283,8 +332,8 @@ fn settle(
         .iter()
         .copied()
         .filter(|&index| {
-            let state = &explored.nodes[index].0;
-            let statuses: Vec<&str> = state.records.values().map(|r| r.status.as_str()).collect();
+            let state = explored.state(index);
+            let statuses: Vec<String> = state.records.values().map(|r| r.status.clone()).collect();
             state.settled() && seen.insert(statuses)
         })
         .collect();
@@ -294,7 +343,7 @@ fn settle(
     let cases = resting
         .into_iter()
         .map(|index| {
-            let state = &explored.nodes[index].0;
+            let state = &explored.state(index);
             let mut moves = BTreeSet::new();
             for mv in model.moves(state) {
                 let relied = failing[index] && model.relies(&mv);
@@ -306,7 +355,7 @@ fn settle(
                 }
             }
             StuckCase {
-                path: path_to(&explored.nodes, index),
+                path: explored.path(index),
                 moves: moves.into_iter().collect(),
             }
         })

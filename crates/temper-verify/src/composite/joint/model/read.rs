@@ -1,14 +1,18 @@
 //! What the joint model reads once from the specs: the reactions between
 //! the types in scope, the module calls their actions start, their internal
-//! actions and their state timers.
+//! actions and state timers, and the constraints it does not check.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::Asker;
-use temper_spec::automaton::{ActionKind, Automaton, TargetResolver, TriggerKind};
-use temper_spec::predicate::{Arg, Expr};
+use temper_spec::automaton::{
+    ActionConstraint, ActionKind, Automaton, TargetResolver, TriggerKind,
+};
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set};
 
 use super::super::senders;
+use super::order::Order;
+use crate::model::TemperModel;
 
 /// An entity reaction between two types in scope, with the arguments it
 /// passes (target parameter to a source field or a literal).
@@ -54,6 +58,25 @@ pub(super) struct Kernel {
 }
 
 impl Kernel {
+    /// Whether the kernel sends `entity`'s `action` with parameters of its
+    /// own choosing or none: a module's answer or failure, or a timer.
+    pub(super) fn chooses(&self, entity: &str, action: &str) -> bool {
+        let named = |name: &Option<String>| name.as_deref() == Some(action);
+        self.internal
+            .get(entity)
+            .is_some_and(|names| names.contains(action))
+            || self
+                .timers
+                .get(entity)
+                .is_some_and(|timers| timers.iter().any(|t| t.action == action))
+            || self.calls_on.iter().any(|((e, _), specs)| {
+                e == entity
+                    && specs
+                        .iter()
+                        .any(|spec| named(&spec.on_success) || named(&spec.on_failure))
+            })
+    }
+
     /// The timers and module calls of the types in `scope`.
     pub(super) fn read(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) -> Self {
         let mut kernel = Kernel::default();
@@ -135,4 +158,165 @@ pub(super) fn reactions_in(
         }
     }
     reactions
+}
+
+/// The actions (entity, action) with a constraint the model cannot decide,
+/// and what a module call keeps to decide its answer's.
+#[derive(Default)]
+pub(super) struct Unchecked {
+    /// Sent as a dispatch or a request: one on a counter the order does not
+    /// keep, or on a string the model does not track.
+    pub(super) taken: BTreeSet<(String, String)>,
+    /// Sent with parameters its sender chooses (a module's answer, or a
+    /// request from outside): one that ties a parameter to a field the model
+    /// does not track. Any other constraint the sender can meet. A module
+    /// answers about the record as it was when the call started, so a call
+    /// keeps the tracked fields its answers are tied to (`asked`).
+    pub(super) chosen: BTreeSet<(String, String)>,
+    /// Each (entity, action)'s tracked fields a parameter must equal.
+    pub(super) equals: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+impl Unchecked {
+    /// Whether the model decides every constraint of `entity`'s `action`,
+    /// sent as a dispatch or a request.
+    pub(super) fn decides(&self, entity: &str, action: &str) -> bool {
+        !self
+            .taken
+            .contains(&(entity.to_string(), action.to_string()))
+    }
+
+    /// Whether a sender choosing the parameters of `entity`'s `action` can
+    /// meet its constraints, as far as the model knows.
+    pub(super) fn meets(&self, entity: &str, action: &str) -> bool {
+        !self
+            .chosen
+            .contains(&(entity.to_string(), action.to_string()))
+    }
+
+    /// The fields an `entity` record's module call keeps as it started:
+    /// those the actions it may answer with (`answers`) tie a parameter to.
+    pub(super) fn asked(&self, entity: &str, answers: impl Fn(&str) -> bool) -> BTreeSet<String> {
+        self.equals
+            .iter()
+            .filter(|((e, action), _)| e == entity && answers(action))
+            .flat_map(|(_, fields)| fields.iter().cloned())
+            .collect()
+    }
+}
+
+/// What the model cannot decide of each action's constraints. Taking such
+/// an action as allowed only adds behaviour for an invariant; for liveness it
+/// is one of allowed and refused.
+pub(super) fn unchecked_constraints(
+    by_name: &BTreeMap<&str, &Automaton>,
+    models: &BTreeMap<String, TemperModel>,
+    order: &Order,
+) -> Unchecked {
+    let mut out = Unchecked::default();
+    for (entity, model) in models {
+        let tracked = |name: &str| model.tracked_strings.contains(name);
+        for action in &by_name[entity.as_str()].actions {
+            let key = (entity.clone(), action.name.clone());
+            let decided = |constraint: &ActionConstraint| match constraint {
+                ActionConstraint::ParamGreaterThanField { param, .. } => {
+                    order.decides(entity, &action.name, param)
+                }
+                _ => tracked(constraint.param()) && constraint.field().is_none_or(tracked),
+            };
+            if !action.constraints.iter().all(decided) {
+                out.taken.insert(key.clone());
+            }
+            for constraint in &action.constraints {
+                let ActionConstraint::ParamEqualsField { field, .. } = constraint else {
+                    continue;
+                };
+                if tracked(field) {
+                    out.equals
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(field.clone());
+                } else {
+                    out.chosen.insert(key.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The string literals the properties (`reads`, about `owner`) and the
+/// guards in scope compare a field with, by (entity, field). The model offers
+/// them as values a parameter may carry: a value only another spec names is
+/// still one a request may send.
+pub(super) fn named_literals(
+    owner: &str,
+    reads: &[&Expr],
+    models: &BTreeMap<String, TemperModel>,
+    reactions: &[Reaction],
+) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut out: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let exprs = reads
+        .iter()
+        .map(|expr| (owner, *expr))
+        .chain(models.iter().flat_map(|(entity, model)| {
+            model
+                .transitions
+                .iter()
+                .map(move |t| (entity.as_str(), &t.guard))
+        }))
+        .chain(
+            reactions
+                .iter()
+                .filter_map(|r| Some((r.from.as_str(), r.guard.as_ref()?))),
+        );
+    for (entity, expr) in exprs {
+        literals_in(entity, expr, &mut out);
+    }
+    out
+}
+
+fn literals_in(entity: &str, expr: &Expr, out: &mut BTreeMap<(String, String), BTreeSet<String>>) {
+    let field = |operand: &Operand| match operand {
+        Operand::Var(var) => Some((entity.to_string(), var.clone())),
+        Operand::CrossField {
+            entity_type, field, ..
+        } => Some((entity_type.clone(), field.clone())),
+        _ => None,
+    };
+    match expr {
+        Expr::Not(inner) => literals_in(entity, inner, out),
+        Expr::And(parts) | Expr::Or(parts) => {
+            parts.iter().for_each(|part| literals_in(entity, part, out));
+        }
+        Expr::Implies(a, b) => {
+            literals_in(entity, a, out);
+            literals_in(entity, b, out);
+        }
+        Expr::Compare {
+            lhs,
+            op: CmpOp::Eq | CmpOp::Ne,
+            rhs,
+        } => {
+            for (side, other) in [(lhs, rhs), (rhs, lhs)] {
+                if let (Some(key), Operand::Lit(Literal::Str(text))) = (field(side), other) {
+                    out.entry(key).or_default().insert(text.clone());
+                }
+            }
+        }
+        Expr::In {
+            value,
+            set: Set::List(items),
+            ..
+        } => {
+            if let Some(key) = field(value) {
+                for item in items {
+                    if let Literal::Str(text) = item {
+                        out.entry(key.clone()).or_default().insert(text.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }

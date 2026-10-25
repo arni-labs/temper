@@ -8,6 +8,7 @@ use temper_spec::predicate::{Truth, eval};
 use super::super::env::Blind;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
+use super::step::Certainty;
 use crate::model::semantics::{step, successors_among};
 use crate::model::{
     ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
@@ -24,7 +25,7 @@ impl JointModel {
         name: &str,
         text: &str,
         by: u32,
-    ) -> Vec<(JointState, String, bool)> {
+    ) -> Vec<(JointState, String, Certainty)> {
         let dispatch = Dispatch {
             to: entity.to_string(),
             action: name.to_string(),
@@ -38,7 +39,7 @@ impl JointModel {
         if !dispatch.read {
             let mut next = state;
             add(&mut next, dispatch);
-            return vec![(next, format!("{text} sent"), true)];
+            return vec![(next, format!("{text} sent"), Certainty::Sure)];
         }
         self.deliver(state, &dispatch, text)
     }
@@ -50,25 +51,37 @@ impl JointModel {
         mut state: JointState,
         dispatch: &Dispatch,
         text: &str,
-    ) -> Vec<(JointState, String, bool)> {
-        match self.arrive(&state, dispatch) {
-            Some((moved, name, certain)) => {
-                let text = format!("{text} arrives -> {}", moved.status);
-                self.place(&mut state, &dispatch.to, moved, &name, dispatch.by);
-                self.after_commit(
-                    state,
-                    &dispatch.to,
-                    &name,
-                    dispatch.depth,
-                    dispatch.by,
-                    dispatch.inline,
-                )
-                .into_iter()
-                .map(|(outcome, sure)| (outcome, text.clone(), certain && sure))
-                .collect()
-            }
-            None => vec![(state, format!("{text} refused by its record"), true)],
+    ) -> Vec<(JointState, String, Certainty)> {
+        let refused = format!("{text} refused by its record");
+        let Arrival::Took {
+            moved,
+            action,
+            certainty,
+        } = self.arrive(&state, dispatch)
+        else {
+            return vec![(state, refused, Certainty::Sure)];
+        };
+        // A take the model cannot decide may be a refusal instead.
+        let mut outcomes = Vec::new();
+        if certainty != Certainty::Sure {
+            outcomes.push((state.clone(), refused, certainty));
         }
+        let text = format!("{text} arrives -> {}", moved.status);
+        self.place(&mut state, &dispatch.to, moved, &action, dispatch.by);
+        let after = self.after_commit(
+            state,
+            &dispatch.to,
+            &action,
+            dispatch.depth,
+            dispatch.by,
+            dispatch.inline,
+        );
+        outcomes.extend(
+            after
+                .into_iter()
+                .map(|(outcome, then)| (outcome, text.clone(), certainty.then(then))),
+        );
+        outcomes
     }
 
     /// `entity`'s record takes `action` from `by` now; what it does next
@@ -81,7 +94,7 @@ impl JointModel {
         depth: u32,
         by: u32,
         inline: bool,
-    ) -> Vec<(JointState, bool)> {
+    ) -> Vec<(JointState, Certainty)> {
         let Some(moved) = step(
             &self.models[entity],
             &action.name,
@@ -123,21 +136,19 @@ impl JointModel {
         state.records.insert(entity.to_string(), moved);
     }
 
-    /// The target's record after its actor takes `dispatch`, the action it
-    /// took, and whether the model knows the guard allowed it; `None` when it
-    /// refuses. The actor checks its own state; the related records were read
-    /// on the dispatch path.
-    pub(super) fn arrive(
-        &self,
-        state: &JointState,
-        dispatch: &Dispatch,
-    ) -> Option<(TemperModelState, String, bool)> {
+    /// What the target's actor does with `dispatch`: refuses it, or takes a
+    /// transition, with what the model knows of that. The actor checks its
+    /// own state; the related records were read on the dispatch path.
+    pub(super) fn arrive(&self, state: &JointState, dispatch: &Dispatch) -> Arrival {
         let model = &self.models[&dispatch.to];
         let target = &state.records[&dispatch.to];
-        let t = self
+        let enabled: Vec<&ResolvedTransition> = self
             .transitions_for(dispatch)
-            .find(|t| self.enabled(&dispatch.to, t, state, Blind::Related))?;
-        let certain = eval(&t.guard, &self.env(&dispatch.to, state)) == Truth::True;
+            .filter(|t| self.enabled(&dispatch.to, t, state, Blind::Related))
+            .collect();
+        let Some(&t) = enabled.first() else {
+            return Arrival::Refused;
+        };
         // Counts and booleans an effect reads and the dispatch does not
         // carry: the first choice, as the composite check takes. A string
         // parameter it does not carry leaves the field as it is.
@@ -150,12 +161,35 @@ impl JointModel {
         for param in &t.string_params {
             params.remove(&param.name);
         }
+        let chose = t
+            .params
+            .keys()
+            .any(|name| !dispatch.params.contains_key(name));
         params.extend(dispatch.params.clone());
-        if !constraints_hold(&t.string_params, target, &params) {
-            return None;
+        let newer = self.order.holds(&dispatch.to, &t.name, &params, target);
+        if !constraints_hold(&t.string_params, target, &params) || newer == Truth::False {
+            return Arrival::Refused;
         }
-        let moved = step(model, &t.name, t.to_state.as_deref(), target, &params)?;
-        Some((moved, t.name.clone(), certain))
+        let Some(moved) = step(model, &t.name, t.to_state.as_deref(), target, &params) else {
+            return Arrival::Refused;
+        };
+        // Taken or refused, and nothing else, unless another transition
+        // might be the one taken, the model chose a value it was not sent, or
+        // a count behind its family's newest moves up by an unknown amount.
+        let decided = eval(&t.guard, &self.env(&dispatch.to, state)) == Truth::True
+            && self.unchecked.decides(&dispatch.to, &t.name)
+            && newer == Truth::True;
+        let certainty =
+            if enabled.len() > 1 || chose || !self.order.exact(&dispatch.to, &t.effects, state) {
+                Certainty::Unsure
+            } else {
+                Certainty::unless(decided, Certainty::OneOf)
+            };
+        Arrival::Took {
+            moved,
+            action: t.name.clone(),
+            certainty,
+        }
     }
 
     /// The transitions `dispatch` may take on its record.
@@ -176,6 +210,21 @@ impl JointModel {
     }
 }
 
+/// What a record's actor does with a dispatch.
+pub(super) enum Arrival {
+    /// It refuses it: no transition from its state allows it.
+    Refused,
+    /// It takes a transition.
+    Took {
+        /// The record after it.
+        moved: TemperModelState,
+        /// The transition's action.
+        action: String,
+        /// Sure, or one of taking and refusing, or unsure.
+        certainty: Certainty,
+    },
+}
+
 /// Put `dispatch` in flight, kept in order.
 pub(super) fn add(state: &mut JointState, dispatch: Dispatch) {
     let at = state.inflight.partition_point(|d| d < &dispatch);
@@ -190,10 +239,10 @@ fn constraints_hold(
     params: &BTreeMap<String, ParamValue>,
 ) -> bool {
     string_params.iter().all(|param| {
-        // A string parameter nobody passed is absent, which only a
-        // non-empty constraint refuses.
+        // A string parameter nobody passed is absent, which any constraint
+        // on it refuses (`validate_action_params`).
         let Some(ParamValue::Str(value)) = params.get(&param.name) else {
-            return !param.nonempty;
+            return !param.nonempty && param.equals.is_none() && param.not_equals.is_empty();
         };
         let tracked = |var: &String| target.strings.get(var);
         !(param.nonempty && value.is_empty())

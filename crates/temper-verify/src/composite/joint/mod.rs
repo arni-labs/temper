@@ -38,6 +38,7 @@
 mod env;
 mod liveness;
 mod model;
+mod pack;
 mod senders;
 mod slice;
 mod state;
@@ -398,27 +399,6 @@ pub fn replay_joint_invariants(
         .map(|inv| inv.name.clone())
         .collect();
     Ok(JointReplay { steps, broken })
-}
-
-/// The moves from the start to `nodes[index]`.
-pub(super) fn path_to(
-    nodes: &[(JointState, Option<(usize, String)>)],
-    mut index: usize,
-) -> Vec<JointStep> {
-    let mut steps = Vec::new();
-    loop {
-        let (state, parent) = &nodes[index];
-        steps.push(JointStep {
-            action: parent.as_ref().map(|(_, action)| action.clone()),
-            state: render(state),
-        });
-        match parent {
-            Some((from, _)) => index = *from,
-            None => break,
-        }
-    }
-    steps.reverse();
-    steps
 }
 
 #[cfg(test)]

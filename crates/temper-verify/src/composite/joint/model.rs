@@ -2,6 +2,7 @@
 //! and module calls on their way, who may send what, and the walk.
 
 mod commit;
+mod order;
 mod react;
 mod read;
 mod step;
@@ -9,22 +10,24 @@ mod walk;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_authz::SendAnalysis;
+use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::{Automaton, TargetResolver};
 use temper_spec::predicate::{Arg, Expr, Name, Truth, eval};
 
 use super::env::{Blind, ID, JointEnv};
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
-use super::{JointOutcome, JointState, path_to};
+use super::state::canonical;
+use super::{JointOutcome, JointState};
 use crate::Budget;
-use crate::model::semantics::{canonical_strings, string_values};
+use crate::model::semantics::string_values;
 use crate::model::{
     ParamValue, ResolvedTransition, TemperModel, TemperModelState, build_model_tracking,
 };
 
+use order::{Order, Specs};
 pub(super) use read::Timeout;
-use read::{Kernel, Reaction, reactions_in};
+use read::{Kernel, Reaction, Unchecked, named_literals, reactions_in, unchecked_constraints};
 pub(super) use step::Move;
 pub(super) use walk::Explored;
 
@@ -86,6 +89,10 @@ pub(super) struct JointModel {
     kernel_moves: bool,
     kernel: Kernel,
     relies_on: BTreeSet<(String, String)>,
+    /// The actions with a constraint the model does not decide.
+    unchecked: Unchecked,
+    /// The counts kept as sequence numbers.
+    order: Order,
     /// Who sends each move, and what Cedar lets them send.
     senders: Senders,
     /// The entities whose moves' senders matter: those with a reaction that
@@ -136,7 +143,7 @@ impl JointModel {
         // what a reaction copies into a tracked variable, until nothing more
         // reaches one.
         let mut also: BTreeMap<String, BTreeSet<String>> = read.clone();
-        let (models, reactions) = loop {
+        let (mut models, reactions) = loop {
             let reactions = reactions_in(by_name, &scope);
             let models: BTreeMap<String, TemperModel> = scope
                 .iter()
@@ -182,22 +189,46 @@ impl JointModel {
                 break (models, reactions);
             }
         };
-        let models = models
-            .into_iter()
-            .map(|(entity, model)| {
-                if !cut {
-                    return (entity, model);
-                }
-                let keep = read.get(&entity).cloned().unwrap_or_default();
-                (entity, slice(model, keep))
-            })
-            .collect();
+        for ((entity, field), literals) in named_literals(owner, reads, &models, &reactions) {
+            if let Some(model) = models.get_mut(&entity) {
+                model
+                    .string_literals
+                    .entry(field)
+                    .or_default()
+                    .extend(literals);
+            }
+        }
         let kernel = if sending.kernel_moves {
             Kernel::read(by_name, &scope)
         } else {
             Kernel::default()
         };
         let senders = Senders::new(by_name, &scope, sending.policies);
+        let chosen = |entity: &str, action: &str| {
+            sending
+                .relies_on
+                .contains(&(entity.to_string(), action.to_string()))
+                || senders.may(OUTSIDE, entity, action) != May::No
+                || kernel.chooses(entity, action)
+        };
+        let order = Order::read(&Specs {
+            by_name,
+            models: &models,
+            reactions: &reactions,
+            read: &read,
+            chosen: &chosen,
+        });
+        let models: BTreeMap<String, TemperModel> = models
+            .into_iter()
+            .map(|(entity, model)| {
+                let mut keep = read.get(&entity).cloned().unwrap_or_default();
+                keep.extend(order.fields(&entity).map(|(field, _)| field.to_string()));
+                let mut model = if cut { slice(model, keep) } else { model };
+                order.bound(&entity, &mut model);
+                (entity, model)
+            })
+            .collect();
+        let unchecked = unchecked_constraints(by_name, &models, &order);
         let sender_matters = reactions
             .iter()
             .filter(|r| r.principal.is_none())
@@ -210,6 +241,8 @@ impl JointModel {
             kernel_moves: sending.kernel_moves,
             kernel,
             relies_on: sending.relies_on,
+            unchecked,
+            order,
             senders,
             sender_matters,
         }
@@ -249,6 +282,7 @@ impl JointModel {
                     armed: BTreeMap::new(),
                 };
                 self.arm_at_start(&mut state);
+                self.order.normalize(&mut state);
                 canonical(&mut state);
                 state
             })
@@ -280,6 +314,7 @@ impl JointModel {
             armed: BTreeMap::new(),
         };
         self.arm_at_start(&mut state);
+        self.order.normalize(&mut state);
         let renamed = canonical(&mut state);
         for value in names.values_mut() {
             if let Some(new) = renamed.get(value) {
@@ -321,6 +356,9 @@ impl JointModel {
                     values.insert(text.clone());
                 }
             }
+        }
+        for call in &state.calls {
+            values.extend(call.asked.values().filter(|v| !v.is_empty()).cloned());
         }
         values
     }
@@ -392,7 +430,7 @@ impl JointModel {
             .iter()
             .map(|found| match found {
                 Some(index) => JointOutcome::Broken {
-                    path: path_to(&explored.nodes, *index),
+                    path: explored.path(*index),
                 },
                 None => match &explored.stopped {
                     Some(reason) => JointOutcome::Incomplete {
@@ -403,7 +441,7 @@ impl JointModel {
             })
             .collect();
         Walk {
-            states: explored.nodes.len(),
+            states: explored.len(),
             outcomes,
             held_back: explored.held_back,
         }
@@ -428,40 +466,4 @@ fn partitions(n: usize) -> Vec<Vec<usize>> {
             .collect();
     }
     out
-}
-
-/// Renumber new strings over the whole joint state, records first, then
-/// the dispatches in flight; returns each value's new name.
-fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
-    let mut dispatches = std::mem::take(&mut state.inflight);
-    let mut strings: Vec<BTreeMap<String, String>> = dispatches
-        .iter()
-        .map(|d| {
-            d.params
-                .iter()
-                .filter_map(|(name, value)| match value {
-                    ParamValue::Str(text) => Some((name.clone(), text.clone())),
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect();
-    let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, String>> = state
-            .records
-            .values_mut()
-            .map(|s| &mut s.strings)
-            .chain(strings.iter_mut())
-            .collect();
-        canonical_strings(&mut maps)
-    };
-    for (dispatch, renamed_strings) in dispatches.iter_mut().zip(strings) {
-        for (name, text) in renamed_strings {
-            dispatch.params.insert(name, ParamValue::Str(text));
-        }
-    }
-    dispatches.sort();
-    state.inflight = dispatches;
-    state.calls.sort();
-    renamed
 }

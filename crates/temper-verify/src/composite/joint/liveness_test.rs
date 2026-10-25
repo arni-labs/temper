@@ -132,7 +132,11 @@ const SAME_RECORD: &str = r#"principal == Agent::"service:place" &&
     context.triggerSourceEntityId == resource.id"#;
 
 fn check(nudge_from: &str, bring: &str) -> JointLivenessResult {
-    let automatons: Vec<Automaton> = [APP, &place(nudge_from)]
+    check_specs(APP, &place(nudge_from), bring)
+}
+
+fn check_specs(app: &str, place: &str, bring: &str) -> JointLivenessResult {
+    let automatons: Vec<Automaton> = [app, place]
         .iter()
         .map(|source| parse_automaton(source).expect("fixture parses"))
         .collect();
@@ -176,6 +180,23 @@ fn a_nudge_relied_on_from_where_it_gives_up_settles() {
 }
 
 #[test]
+fn a_relied_on_request_whose_sender_fills_its_parameters_settles() {
+    let nudge = r#"from = ["Waiting", "Stuck"]
+to = "Bringing"
+"#;
+    let place = place(r#"["Waiting", "Stuck"]"#).replacen(
+        nudge,
+        &format!(
+            "{nudge}params = [{{ name = \"why\", type = \"string\" }}]\n\n\
+             [[action.constraints]]\nkind = \"param_nonempty\"\nparam = \"why\"\n"
+        ),
+        1,
+    );
+    let result = check_specs(APP, &place, SAME_RECORD);
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
 fn a_reaction_cedar_may_refuse_is_not_counted_on() {
     let bring = r#"principal == Agent::"service:place" && resource.owner == "someone""#;
     let result = check(r#"["Waiting", "Stuck"]"#, bring);
@@ -195,6 +216,144 @@ fn a_reaction_cedar_refuses_its_service_leaves_the_place_behind() {
         resting(&result)
             .iter()
             .any(|state| state.contains("Place=Unplaced")),
+        "{result}"
+    );
+}
+
+/// An app installed again and again, which counts each install and sends
+/// the count with the commit for its place to bring.
+const COUNTING_APP: &str = r#"
+[automaton]
+name = "App"
+states = ["Unmade", "Live"]
+initial = "Unmade"
+
+[[state]]
+name = "commit"
+type = "string"
+initial = ""
+
+[[state]]
+name = "brought"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Install"
+kind = "input"
+from = ["Unmade", "Live"]
+to = "Live"
+params = [{ name = "commit", type = "string" }]
+effect = ["brought += 1"]
+
+[[action.constraints]]
+kind = "param_nonempty"
+param = "commit"
+
+[[action.triggers]]
+name = "place"
+kind = "entity"
+target_entity = "Place"
+target_action = "Bring"
+principal = "place"
+
+[action.triggers.args]
+commit = "commit"
+brought = "brought"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+
+/// A place that brings whatever it is sent, or with `newer` only a count
+/// greater than the last it took. Its module answers for the commit it was
+/// asked to bring, and a timer asks again.
+fn counting_place(newer: bool) -> String {
+    let newer = if newer {
+        "[[action.constraints]]\nkind = \"param_greater_than_field\"\nparam = \"brought\"\nfield = \"brought\"\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+[automaton]
+name = "Place"
+states = ["Unplaced", "Bringing", "Placed"]
+initial = "Unplaced"
+
+[[state]]
+name = "commit"
+type = "string"
+initial = ""
+
+[[state]]
+name = "brought"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Bring"
+kind = "input"
+from = ["Unplaced", "Bringing", "Placed"]
+to = "Bringing"
+params = [{{ name = "commit", type = "string" }}, {{ name = "brought", type = "counter" }}]
+effect = ["brought = params.brought"]
+
+{newer}
+[[action.triggers]]
+name = "place"
+kind = "wasm"
+module = "steps"
+
+[[action]]
+name = "Again"
+kind = "internal"
+from = ["Bringing"]
+to = "Bringing"
+
+[[action.triggers]]
+name = "place"
+kind = "wasm"
+module = "steps"
+on_success = "Placed"
+
+[[action]]
+name = "Placed"
+kind = "internal"
+from = ["Bringing"]
+to = "Placed"
+params = [{{ name = "placed_commit", type = "string" }}]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "placed_commit"
+field = "commit"
+
+[[state_timeout]]
+state = "Bringing"
+after_seconds = 60
+on_timeout = "Again"
+
+[[liveness]]
+name = "placed"
+eventually = "App[Id].status == 'Live' => (status == 'Placed' && App[Id].commit == commit)"
+"#
+    )
+}
+
+#[test]
+fn a_place_that_takes_only_newer_counts_settles() {
+    let result = check_specs(COUNTING_APP, &counting_place(true), SAME_RECORD);
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn a_late_bring_for_an_older_commit_leaves_the_place_behind() {
+    let result = check_specs(COUNTING_APP, &counting_place(false), SAME_RECORD);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Place=Placed")),
         "{result}"
     );
 }

@@ -275,3 +275,19 @@ fn a_same_id_reaction_reaches_no_record_with_another_id() {
         "the reaction found no child: {last}"
     );
 }
+
+#[test]
+fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
+    let child = child_with("Parent[Id].value == 'secret' => status == 'Waiting'");
+    let parent = parent(false);
+    let result = check(&[&parent, &child]);
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("expected a broken invariant, got {result}");
+    };
+    assert!(
+        path.iter()
+            .filter_map(|s| s.action.as_deref())
+            .any(|m| m.starts_with("Parent.Set") && m.contains("'secret'")),
+        "{result}"
+    );
+}

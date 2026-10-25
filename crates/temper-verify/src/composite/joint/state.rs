@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use super::senders;
+use crate::model::semantics::canonical_strings;
 use crate::model::{ParamValue, TemperModelAction, TemperModelState};
 
 /// The records in scope, one per type, and the dispatches and module calls
@@ -46,11 +47,17 @@ pub struct Call {
     /// Who its answer runs as, by sender number: the runtime when the call
     /// runs in the background, the caller when it runs inline.
     pub by: u32,
+    /// The tracked fields its answers are tied to, as the record held them
+    /// when the call started: the module answers about that record.
+    pub asked: BTreeMap<String, String>,
 }
 
 impl fmt::Display for Call {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {} call", self.to, self.module)?;
+        for (field, value) in &self.asked {
+            write!(f, " for {field}='{value}'")?;
+        }
         if self.by != senders::RUNTIME {
             f.write_str(" (inline)")?;
         }
@@ -113,4 +120,41 @@ pub(super) fn render(state: &JointState) -> String {
         text.push_str(&format!(" | calls: {}", calls.join(", ")));
     }
     text
+}
+
+/// Renumber new strings over the whole joint state, records first, then
+/// the dispatches in flight; returns each value's new name.
+pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
+    let mut dispatches = std::mem::take(&mut state.inflight);
+    let mut strings: Vec<BTreeMap<String, String>> = dispatches
+        .iter()
+        .map(|d| {
+            d.params
+                .iter()
+                .filter_map(|(name, value)| match value {
+                    ParamValue::Str(text) => Some((name.clone(), text.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let renamed = {
+        let mut maps: Vec<&mut BTreeMap<String, String>> = state
+            .records
+            .values_mut()
+            .map(|s| &mut s.strings)
+            .chain(strings.iter_mut())
+            .chain(state.calls.iter_mut().map(|c| &mut c.asked))
+            .collect();
+        canonical_strings(&mut maps)
+    };
+    for (dispatch, renamed_strings) in dispatches.iter_mut().zip(strings) {
+        for (name, text) in renamed_strings {
+            dispatch.params.insert(name, ParamValue::Str(text));
+        }
+    }
+    dispatches.sort();
+    state.inflight = dispatches;
+    state.calls.sort();
+    renamed
 }

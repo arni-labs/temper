@@ -3,33 +3,80 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use super::super::JointState;
+use super::super::pack::{Packed, Packer};
+use super::super::state::render;
+use super::super::{JointState, JointStep};
 use super::JointModel;
+use super::step::Certainty;
 use crate::Budget;
 
-/// A move between two walked states.
+/// One move made from a walked state.
 #[derive(Debug, Clone, Copy)]
-pub(in crate::composite::joint) struct Edge {
+pub(in crate::composite::joint) struct Made {
     pub(in crate::composite::joint) from: u32,
-    pub(in crate::composite::joint) to: u32,
     /// The system made it: a timer, a module, or the kernel's dispatches.
     pub(in crate::composite::joint) by_system: bool,
     /// It sends an action outside code is relied on to send.
     pub(in crate::composite::joint) relied: bool,
-    /// The model knows it can happen: it took no guard it could not decide.
-    pub(in crate::composite::joint) certain: bool,
+    /// It always ends in one of the states its edges reach: it leads
+    /// somewhere, none of its states is unsure, and none was held back.
+    pub(in crate::composite::joint) covered: bool,
+}
+
+/// A move's way from one walked state to another.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::composite::joint) struct Edge {
+    /// The move, an index into [`Explored::made`].
+    pub(in crate::composite::joint) made: u32,
+    pub(in crate::composite::joint) to: u32,
+    /// The move can lead here.
+    pub(in crate::composite::joint) sure: bool,
 }
 
 /// What a walk saw.
 pub(in crate::composite::joint) struct Explored {
-    /// Each state walked, with the state and move it was first reached by.
-    pub(in crate::composite::joint) nodes: Vec<(JointState, Option<(usize, String)>)>,
-    /// Every move between walked states, when asked for.
+    /// Each state walked, packed, with the state and move (a name in
+    /// `packer`) it was first reached by.
+    nodes: Vec<(Packed, Option<(u32, u32)>)>,
+    packer: Packer,
+    /// Every move made from a walked state, when asked for.
+    pub(in crate::composite::joint) made: Vec<Made>,
+    /// Every way those moves lead between walked states.
     pub(in crate::composite::joint) edges: Vec<Edge>,
     /// Why the walk stopped before seeing every state.
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
+}
+
+impl Explored {
+    /// How many states the walk saw.
+    pub(in crate::composite::joint) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The state walked `index`th.
+    pub(in crate::composite::joint) fn state(&self, index: usize) -> JointState {
+        self.packer.unpack(&self.nodes[index].0)
+    }
+
+    /// The moves from the start to the state walked `index`th.
+    pub(in crate::composite::joint) fn path(&self, mut index: usize) -> Vec<JointStep> {
+        let mut steps = Vec::new();
+        loop {
+            let parent = self.nodes[index].1;
+            steps.push(JointStep {
+                action: parent.map(|(_, label)| self.packer.name(label).to_string()),
+                state: render(&self.state(index)),
+            });
+            match parent {
+                Some((from, _)) => index = from as usize,
+                None => break,
+            }
+        }
+        steps.reverse();
+        steps
+    }
 }
 
 impl JointModel {
@@ -54,21 +101,24 @@ impl JointModel {
         let started = Instant::now();
         let mut explored = Explored {
             nodes: Vec::new(),
+            packer: Packer::default(),
+            made: Vec::new(),
             edges: Vec::new(),
             stopped: None,
             held_back: false,
         };
-        let mut seen: HashMap<JointState, usize> = HashMap::new();
+        let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {
-            if !seen.contains_key(&init) {
-                seen.insert(init.clone(), explored.nodes.len());
+            let packed = explored.packer.pack(&init);
+            if !seen.contains_key(&packed) {
+                seen.insert(packed.clone(), explored.nodes.len() as u32);
                 queue.push_back(explored.nodes.len());
-                explored.nodes.push((init, None));
+                explored.nodes.push((packed, None));
             }
         }
         while let Some(index) = queue.pop_front() {
-            let state = explored.nodes[index].0.clone();
+            let state = explored.state(index);
             if visit(index, &state) {
                 break;
             }
@@ -84,25 +134,35 @@ impl JointModel {
             for mv in self.moves(&state) {
                 let (nexts, held) = self.next(&state, &mv);
                 explored.held_back |= held;
-                let relied = self.relies(&mv);
+                if edges {
+                    explored.made.push(Made {
+                        from: index as u32,
+                        by_system: mv.by_system(),
+                        relied: self.relies(&mv),
+                        covered: !held
+                            && !nexts.is_empty()
+                            && nexts.iter().all(|n| n.certainty != Certainty::Unsure),
+                    });
+                }
+                let made = explored.made.len().saturating_sub(1) as u32;
                 for next in nexts {
-                    let at = match seen.get(&next.state) {
+                    let packed = explored.packer.pack(&next.state);
+                    let at = match seen.get(&packed) {
                         Some(&at) => at,
                         None => {
-                            let at = explored.nodes.len();
-                            seen.insert(next.state.clone(), at);
-                            explored.nodes.push((next.state, Some((index, next.label))));
-                            queue.push_back(at);
+                            let at = explored.nodes.len() as u32;
+                            let label = explored.packer.id(&next.label);
+                            seen.insert(packed.clone(), at);
+                            explored.nodes.push((packed, Some((index as u32, label))));
+                            queue.push_back(at as usize);
                             at
                         }
                     };
                     if edges {
                         explored.edges.push(Edge {
-                            from: index as u32,
-                            to: at as u32,
-                            by_system: mv.by_system(),
-                            relied,
-                            certain: next.certain,
+                            made,
+                            to: at,
+                            sure: next.certainty == Certainty::Sure,
                         });
                     }
                 }
