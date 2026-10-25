@@ -3,9 +3,9 @@
 use crate::driver::{Value, params, params_from_iter};
 use std::time::Duration;
 use temper_runtime::persistence::{
-    EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore, PersistenceAppend,
-    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, pack_f32_le, storage_error,
-    unpack_f32_le,
+    CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
+    PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
+    ScheduledActionRecord, pack_f32_le, storage_error, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 use tracing::{error, instrument, warn};
@@ -101,77 +101,31 @@ impl EventStore for TursoEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        if events.is_empty() {
-            return Ok(expected_sequence);
-        }
+        self.append_retrying(
+            persistence_id,
+            expected_sequence,
+            events,
+            CommitRows::default(),
+        )
+        .await
+    }
 
-        // Retry transient Hrana BLOCKED / stream errors with backoff (ADR-0056).
-        // Each attempt is a complete append unit. Single-event appends use an
-        // atomic conditional insert; multi-event appends open a transaction.
-        // Event-store's UNIQUE (entity_type, entity_id, sequence_nr) makes
-        // retries safe — if a prior attempt partially committed before erroring,
-        // the retry's pre-check detects it as ConcurrencyViolation
-        // (non-transient, propagates to caller via normal event-store contract).
-        let attempt_timeout = append_attempt_timeout();
-        let total_attempts = append_max_attempts();
-        let mut last_err: Option<PersistenceError> = None;
-        let bypass_write_gate = events.len() == 1;
-        for attempt in 0..total_attempts {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(retry_delay_ms(attempt - 1))).await;
-            }
-            let _high_priority_marker = if bypass_write_gate {
-                Some(self.mark_high_priority_write("turso.append"))
-            } else {
-                None
-            };
-            let _write_permit = if bypass_write_gate {
-                None
-            } else {
-                Some(
-                    self.acquire_write_permit("turso.append", WritePriority::High)
-                        .await?,
-                )
-            };
-            let attempt_result = tokio::time::timeout(
-                attempt_timeout,
-                self.append_inner(persistence_id, expected_sequence, events),
-            )
+    async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        self.scheduled_action_rows(tenant).await
+    }
+
+    async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        self.remove_scheduled_action(tenant, entity_type, entity_id, arm_id)
             .await
-            .unwrap_or_else(|_| {
-                warn!(
-                    persistence_id,
-                    attempt,
-                    timeout_ms = attempt_timeout.as_millis() as u64,
-                    "turso.append attempt timed out"
-                );
-                Err(PersistenceError::Storage(format!(
-                    "turso.append timed out after {}ms",
-                    attempt_timeout.as_millis()
-                )))
-            });
-
-            match attempt_result {
-                Ok(seq) => {
-                    if attempt > 0 {
-                        record_turso_write_retry("turso.append", attempt as u64, "succeeded");
-                    }
-                    return Ok(seq);
-                }
-                Err(err) => {
-                    let transient = match &err {
-                        PersistenceError::Storage(msg) => is_transient_write_error(msg),
-                        _ => false,
-                    };
-                    if !transient {
-                        return Err(err);
-                    }
-                    last_err = Some(err);
-                }
-            }
-        }
-        record_turso_write_retry("turso.append", total_attempts as u64, "exhausted");
-        Err(last_err.expect("retry loop captured at least one error"))
     }
 
     async fn lookup_by_key(
@@ -217,19 +171,30 @@ impl EventStore for TursoEventStore {
     // carries no uniqueness constraint and a lagging index write only makes a ranking
     // temporarily incomplete; it can never corrupt a keyed absence. So Turso implements
     // the full vector surface below.
-    async fn append_with_index_rows(
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        _key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
-        // The journal append is the durable event (keys are not maintained on Turso,
-        // per the note above).
+        let CommitRows {
+            vector_rows,
+            reconcile_vectors,
+            scheduled_actions,
+            fired_scheduled_action,
+            ..
+        } = rows;
+        // The journal append is the durable event, with the scheduled actions
+        // it armed and fired (keys are not maintained on Turso, per the note
+        // above).
+        let scheduled = CommitRows {
+            scheduled_actions,
+            fired_scheduled_action,
+            ..CommitRows::default()
+        };
         let new_seq = self
-            .append(persistence_id, expected_sequence, events)
+            .append_retrying(persistence_id, expected_sequence, events, scheduled)
             .await?;
         // Write-behind vector maintenance: reconcile the entity's rows (delete stale,
         // insert current — an empty `vector_rows` purges a deleted/cleared entity),
@@ -827,12 +792,15 @@ impl TursoEventStore {
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
+        scheduled: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         if events.is_empty() {
             return Ok(expected_sequence);
         }
 
-        if let [event] = events {
+        if let [event] = events
+            && !scheduled.changes_scheduled_actions()
+        {
             return self
                 .append_single_event_inner(persistence_id, expected_sequence, event)
                 .await;
@@ -996,8 +964,123 @@ impl TursoEventStore {
             .map_err(storage_error)?;
         }
 
+        // The scheduled actions these events armed, and the one they fired, in
+        // THIS transaction: a row exists exactly while its action waits. A
+        // repeated arm keeps its row.
+        for action in scheduled.scheduled_actions {
+            tx.execute(
+                "INSERT INTO scheduled_actions \
+                     (tenant, entity_type, entity_id, arm_id, action, due_at, armed_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT (tenant, entity_type, entity_id, arm_id) DO NOTHING",
+                params![
+                    action.tenant.as_str(),
+                    action.entity_type.as_str(),
+                    action.entity_id.as_str(),
+                    action.arm_id.as_str(),
+                    action.action.as_str(),
+                    action.due_at.as_str(),
+                    action.armed_by.as_str(),
+                ],
+            )
+            .await
+            .map_err(storage_error)?;
+        }
+        if let Some(arm_id) = scheduled.fired_scheduled_action {
+            tx.execute(
+                "DELETE FROM scheduled_actions \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND arm_id = ?4",
+                params![tenant, entity_type, entity_id, arm_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        }
+
         tx.commit().await.map_err(storage_error)?;
         Ok(new_seq)
+    }
+
+    /// Append `events`, and the scheduled-action rows they arm and fire
+    /// (`scheduled`; other rows are ignored) in the same transaction, retrying
+    /// transient errors (ADR-0056).
+    async fn append_retrying(
+        &self,
+        persistence_id: &str,
+        expected_sequence: u64,
+        events: &[PersistenceEnvelope],
+        scheduled: CommitRows<'_>,
+    ) -> Result<u64, PersistenceError> {
+        if events.is_empty() {
+            return Ok(expected_sequence);
+        }
+
+        // Retry transient Hrana BLOCKED / stream errors with backoff (ADR-0056).
+        // Each attempt is a complete append unit. Single-event appends use an
+        // atomic conditional insert; multi-event appends open a transaction.
+        // Event-store's UNIQUE (entity_type, entity_id, sequence_nr) makes
+        // retries safe — if a prior attempt partially committed before erroring,
+        // the retry's pre-check detects it as ConcurrencyViolation
+        // (non-transient, propagates to caller via normal event-store contract).
+        let attempt_timeout = append_attempt_timeout();
+        let total_attempts = append_max_attempts();
+        let mut last_err: Option<PersistenceError> = None;
+        let bypass_write_gate = events.len() == 1 && !scheduled.changes_scheduled_actions();
+        for attempt in 0..total_attempts {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(retry_delay_ms(attempt - 1))).await;
+            }
+            let _high_priority_marker = if bypass_write_gate {
+                Some(self.mark_high_priority_write("turso.append"))
+            } else {
+                None
+            };
+            let _write_permit = if bypass_write_gate {
+                None
+            } else {
+                Some(
+                    self.acquire_write_permit("turso.append", WritePriority::High)
+                        .await?,
+                )
+            };
+            let attempt_result = tokio::time::timeout(
+                attempt_timeout,
+                self.append_inner(persistence_id, expected_sequence, events, scheduled),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                warn!(
+                    persistence_id,
+                    attempt,
+                    timeout_ms = attempt_timeout.as_millis() as u64,
+                    "turso.append attempt timed out"
+                );
+                Err(PersistenceError::Storage(format!(
+                    "turso.append timed out after {}ms",
+                    attempt_timeout.as_millis()
+                )))
+            });
+
+            match attempt_result {
+                Ok(seq) => {
+                    if attempt > 0 {
+                        record_turso_write_retry("turso.append", attempt as u64, "succeeded");
+                    }
+                    return Ok(seq);
+                }
+                Err(err) => {
+                    let transient = match &err {
+                        PersistenceError::Storage(msg) => is_transient_write_error(msg),
+                        _ => false,
+                    };
+                    if !transient {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+        record_turso_write_retry("turso.append", total_attempts as u64, "exhausted");
+        Err(last_err.expect("retry loop captured at least one error"))
     }
 
     async fn append_batch_inner(

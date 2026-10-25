@@ -50,6 +50,7 @@ mod policy_replace;
 mod projection_freshness;
 mod published_artifacts;
 mod query_page;
+mod scheduled_actions;
 mod secrets;
 mod spec_versions;
 mod specs;
@@ -388,6 +389,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_STATE_TIMERS_TABLE, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_SCHEDULED_ACTIONS_TABLE, ())
             .await
             .map_err(storage_error)?;
 
