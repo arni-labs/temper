@@ -497,9 +497,9 @@ jobs:
   postgres-migrations:
     name: Postgres rollback migrations
     needs: changes
-    if: needs.changes.outputs.lane == 'full' || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-store-postgres ')
+    if: needs.changes.outputs.lane == 'full' || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-store-postgres ') || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-server ')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:18
@@ -544,6 +544,22 @@ jobs:
         run: >-
           cargo nextest run -p temper-store-postgres --run-ignored only
           -E 'test(scheduled_action_rows_commit_with_their_events)'
+
+      - name: Query-plane and timer rows commit with their events
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-store-postgres --run-ignored only
+          -E 'test(query_plane_and_timer_rows_commit_with_their_events)'
+
+      - name: The server on PostgreSQL
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-server --run-ignored only
+          -E 'test(a_move_on_postgres_commits_its_event_catalog_and_timer_rows_together)
+          | test(postgres_timers_survive_restart)
+          | test(cold_postgres_backfill_recovers_snapshot_tail)'
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
