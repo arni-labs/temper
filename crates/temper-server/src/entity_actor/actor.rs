@@ -97,7 +97,7 @@ enum WriteOutcome {
     Landed { sequence_nr: u64 },
     /// The journal does not hold it, and never will.
     NotWritten,
-    /// The journal could not be read: why.
+    /// The journal cannot establish the outcome yet: why.
     Unknown(String),
 }
 
@@ -456,8 +456,8 @@ impl EntityActor {
     /// The answer is what the write did. `Ok` is the event's sequence: it
     /// landed, also when the store answered an error and the journal, read
     /// again, holds the event. A concurrency violation or a `not written`
-    /// storage error: it did not land. An `outcome unknown` error: the store
-    /// failed and the journal could not be read, so it may have.
+    /// storage error: it did not land. An `outcome unknown` error: the
+    /// journal cannot yet establish whether the failed commit landed.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
@@ -598,10 +598,11 @@ impl EntityActor {
         };
         // Any other answer can hide a write that landed: a commit whose answer
         // was lost, or a store that retried one and met its own event as a
-        // concurrency violation. The store finished the write before it
-        // answered, so the journal says what it did.
+        // concurrency violation. An unknown commit may still be running;
+        // journal absence cannot turn that into a definite failure.
         let outcome =
-            Self::learn_write_outcome(store, &persistence_id, state.sequence_nr, event_id).await;
+            Self::learn_write_outcome(store, &persistence_id, state.sequence_nr, event_id, &error)
+                .await;
         self.log_write_outcome(&event.action, &outcome, &error);
         match outcome {
             WriteOutcome::Landed { sequence_nr } => {
@@ -612,10 +613,10 @@ impl EntityActor {
                 PersistenceError::ConcurrencyViolation { .. } => Err(error),
                 error => Err(PersistenceError::Storage(format!("not written: {error}"))),
             },
-            WriteOutcome::Unknown(read_error) => {
+            WriteOutcome::Unknown(reason) => {
                 self.rebuild_from_journal.store(true, Ordering::Release);
                 Err(PersistenceError::OutcomeUnknown(format!(
-                    "{error}; the journal could not be read: {read_error}"
+                    "{error}; the journal cannot establish the outcome: {reason}"
                 )))
             }
         }
@@ -628,6 +629,7 @@ impl EntityActor {
         persistence_id: &str,
         from_sequence: u64,
         event_id: uuid::Uuid,
+        append_error: &PersistenceError,
     ) -> WriteOutcome {
         match store.read_events(persistence_id, from_sequence).await {
             Ok(events) => match events
@@ -637,6 +639,11 @@ impl EntityActor {
                 Some(event) => WriteOutcome::Landed {
                     sequence_nr: event.sequence_nr,
                 },
+                None if matches!(append_error, PersistenceError::OutcomeUnknown(_)) => {
+                    WriteOutcome::Unknown(
+                        "the event is absent but its commit may still finish".into(),
+                    )
+                }
                 None => WriteOutcome::NotWritten,
             },
             Err(error) => WriteOutcome::Unknown(error.to_string()),
@@ -664,11 +671,11 @@ impl EntityActor {
                 entity_id = %self.entity_id, action, error = %error,
                 "event rolled back: not written, the record keeps its state"
             ),
-            WriteOutcome::Unknown(read_error) => tracing::error!(
+            WriteOutcome::Unknown(reason) => tracing::error!(
                 tenant = %self.tenant, entity_type = %self.entity_type,
                 entity_id = %self.entity_id, action, error = %error,
-                read_error = %read_error,
-                "event outcome unknown: the write failed and the journal could not be read"
+                reason = %reason,
+                "event outcome unknown: the journal cannot establish whether the write landed"
             ),
         }
     }

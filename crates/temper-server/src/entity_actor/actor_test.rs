@@ -2693,3 +2693,43 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         "a skipped field-update event must be counted, not only logged"
     );
 }
+
+#[tokio::test]
+async fn reconciliation_preserves_unknown_until_the_event_lands() {
+    use temper_runtime::persistence::{EventMetadata, EventStore};
+    let store = Arc::new(temper_store_sim::SimEventStore::no_faults(120));
+    let boxed = crate::storage::BoxedEventStore::from_arc(store.clone());
+    let id = "default:Order:delayed-commit";
+    let event = PersistenceEnvelope {
+        sequence_nr: 0,
+        event_type: "Created".into(),
+        payload: serde_json::json!({}),
+        metadata: EventMetadata {
+            event_id: sim_uuid(),
+            causation_id: sim_uuid(),
+            correlation_id: sim_uuid(),
+            timestamp: sim_now(),
+            actor_id: "test".into(),
+        },
+    };
+    let error = PersistenceError::OutcomeUnknown("COMMIT transport failed".into());
+    let outcome =
+        EntityActor::learn_write_outcome(&boxed, id, 0, event.metadata.event_id, &error).await;
+    assert!(matches!(outcome, WriteOutcome::Unknown(_)));
+    // Definitive errors retain the existing absent-event behavior.
+    let refused = PersistenceError::ConcurrencyViolation {
+        expected: 0,
+        actual: 1,
+    };
+    let outcome =
+        EntityActor::learn_write_outcome(&boxed, id, 0, event.metadata.event_id, &refused).await;
+    assert!(matches!(outcome, WriteOutcome::NotWritten));
+    // The same remote transaction can finish after both recovery reads.
+    store
+        .append(id, 0, std::slice::from_ref(&event))
+        .await
+        .unwrap();
+    let outcome =
+        EntityActor::learn_write_outcome(&boxed, id, 0, event.metadata.event_id, &error).await;
+    assert!(matches!(outcome, WriteOutcome::Landed { sequence_nr: 1 }));
+}
