@@ -97,10 +97,11 @@ impl JointModel {
         if depth >= MAX_REACTION_DEPTH {
             return outcomes;
         }
-        for reaction in self
+        for (index, reaction) in self
             .reactions
             .iter()
-            .filter(|r| r.from == source && r.source_action == action)
+            .enumerate()
+            .filter(|(_, r)| r.from == source && r.source_action == action)
         {
             let mut after = Vec::new();
             for (state, known) in outcomes {
@@ -118,11 +119,16 @@ impl JointModel {
                 }
                 let reaches = match &reaction.resolve {
                     Some(TargetResolver::SameId) => {
-                        resolve(&self.models, &state, source, ID, &reaction.to)
+                        resolve(&self.models, self.records, &state, source, ID, &reaction.to)
                     }
-                    Some(TargetResolver::Field { id_field }) => {
-                        resolve(&self.models, &state, source, id_field, &reaction.to)
-                    }
+                    Some(TargetResolver::Field { id_field }) => resolve(
+                        &self.models,
+                        self.records,
+                        &state,
+                        source,
+                        id_field,
+                        &reaction.to,
+                    ),
                     _ => Found::Unknown,
                 };
                 if reaches == Found::Missing {
@@ -140,6 +146,7 @@ impl JointModel {
                     params: self.args(&state, source, reaction),
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
                     depth: depth + 1,
+                    via: Some(index),
                     by: self.senders.reaction(reaction.principal.as_ref(), by),
                     inline: false,
                 };

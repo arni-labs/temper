@@ -447,3 +447,75 @@ effect = ["n += 1"]
     );
     assert!(!result.passed(), "incomplete is never a pass");
 }
+
+/// An entity whose action sends itself the next step.
+fn self_starting_agent() -> &'static str {
+    r#"
+[automaton]
+name = "Agent"
+states = ["Idle", "Assigned", "Working"]
+initial = "Idle"
+allow_indefinite_states = ["Idle", "Assigned", "Working"]
+
+[[action]]
+name = "Assign"
+from = ["Idle"]
+to = "Assigned"
+
+[[action.triggers]]
+name = "auto_start"
+kind = "entity"
+target_entity = "Agent"
+target_action = "Start"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[action]]
+name = "Start"
+from = ["Assigned"]
+to = "Working"
+"#
+}
+
+/// The check claims what ADR-0150 claims: a move's reactions land before the
+/// next request from outside. A `Start` asked from outside while
+/// `auto_start` is on its way would drop it in the runtime; the check does
+/// not walk that order.
+#[test]
+fn reactions_land_before_the_next_request() {
+    let agent = parse_automaton(self_starting_agent()).unwrap();
+    let result = verify_composite(&[&agent], "Agent").unwrap();
+    assert_eq!(result.outcome, CompositeOutcome::Verified, "{result:?}");
+    assert!(result.dropped_reactions.is_empty());
+}
+
+/// A reaction that sends its own action again stops at the runtime's
+/// reaction depth, so the walk ends.
+#[test]
+fn a_reaction_that_sends_itself_ends_at_the_reaction_depth() {
+    let looping = r#"
+[automaton]
+name = "Loop"
+states = ["On"]
+initial = "On"
+allow_indefinite_states = ["On"]
+
+[[action]]
+name = "Go"
+from = ["On"]
+to = "On"
+
+[[action.triggers]]
+name = "again"
+kind = "entity"
+target_entity = "Loop"
+target_action = "Go"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+    let looping = parse_automaton(looping).unwrap();
+    let result = verify_composite(&[&looping], "Loop").unwrap();
+    assert_eq!(result.outcome, CompositeOutcome::Verified, "{result:?}");
+}
