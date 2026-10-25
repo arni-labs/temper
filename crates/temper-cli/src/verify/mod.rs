@@ -44,9 +44,18 @@ pub fn run(specs_dir: &str) -> Result<()> {
     let ioa_sources = read_ioa_sources(specs_path)?;
     let tla_sources = read_tla_sources(specs_path)?;
     input::validate_ioa_entities(&csdl, &ioa_sources)?;
-    package::validate(specs_path)?;
+    let policy_text = package::validate(specs_path)?;
 
-    verify_ioa_sources(&ioa_sources)?;
+    // Each reports on its own: one that fails does not hide what the other
+    // would find.
+    match (
+        verify_ioa_sources(&ioa_sources),
+        verify_liveness(&ioa_sources, &policy_text),
+    ) {
+        (Err(ioa), Err(senders)) => anyhow::bail!("{ioa}\n{senders}"),
+        (Err(failed), Ok(())) | (Ok(()), Err(failed)) => return Err(failed),
+        (Ok(()), Ok(())) => {}
+    }
 
     // Build spec model (which includes cross-validation)
     let spec = build_spec_model(csdl, tla_sources);
@@ -238,28 +247,75 @@ fn run_joint_verification(
     let automaton_refs: Vec<&temper_spec::automaton::Automaton> =
         parsed_automata.values().collect();
     let results = temper_verify::composite::verify_joint_invariants(&automaton_refs, JOINT_BUDGET);
-    if results.is_empty() {
-        return Ok(());
-    }
-    let mut report = String::from("\nRunning cross-entity invariants on the joint model...\n");
-    let mut failed = Vec::new();
-    for result in &results {
+    let rows = results.iter().map(|result| {
         let tag = match result.outcome {
             temper_verify::composite::JointOutcome::Holds => "PASS",
             temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
             temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
         };
+        (
+            tag,
+            result.to_string(),
+            format!("{}.{}", result.entity, result.invariant),
+        )
+    });
+    print_joint_report("Cross-entity invariants", rows.collect())
+}
+
+/// Check every `[[liveness]]` with `eventually` on the joint model, with the
+/// app's Cedar deciding each move as its sender: the condition must be
+/// reached by the system's own moves. A spec that does not parse is reported
+/// by the IOA cascade, so it is skipped here.
+fn verify_liveness(
+    ioa_sources: &std::collections::BTreeMap<String, String>,
+    policy_text: &str,
+) -> Result<()> {
+    let mut parsed = Vec::new();
+    for ioa_source in ioa_sources.values() {
+        let Ok(automaton) = temper_spec::automaton::parse_automaton(ioa_source) else {
+            return Ok(());
+        };
+        parsed.push(automaton);
+    }
+    let analysis = temper_authz::SendAnalysis::new(policy_text).context("invalid Cedar policy")?;
+    let refs: Vec<&temper_spec::automaton::Automaton> = parsed.iter().collect();
+    let live =
+        temper_verify::composite::verify_joint_liveness(&refs, Some(&analysis), JOINT_BUDGET);
+    let rows = live.iter().map(|result| {
+        let tag = match result.outcome {
+            temper_verify::composite::LivenessOutcome::Holds => "PASS",
+            temper_verify::composite::LivenessOutcome::Stuck { .. } => "FAIL",
+            temper_verify::composite::LivenessOutcome::Incomplete { .. } => "INCOMPLETE",
+        };
+        (
+            tag,
+            result.to_string(),
+            format!("{}.{}", result.entity, result.name),
+        )
+    });
+    print_joint_report("Liveness", rows.collect())
+}
+
+/// Print one joint check's results, each row its tag, the result in words
+/// and the property's name, and fail when a row did not pass.
+fn print_joint_report(check: &str, rows: Vec<(&str, String, String)>) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut report = format!("\nRunning {} on the joint model...\n", check.to_lowercase());
+    let mut failed = Vec::new();
+    for (tag, result, name) in &rows {
         report.push_str(&format!("    [{tag}] {result}\n"));
-        if !result.holds() {
-            failed.push(format!("{}.{}", result.entity, result.invariant));
+        if *tag != "PASS" {
+            failed.push(name.as_str());
         }
     }
     if failed.is_empty() {
-        report.push_str("\nCross-entity invariants: ALL PASSED");
+        report.push_str(&format!("\n{check}: ALL PASSED"));
     }
     println!("{report}");
     if !failed.is_empty() {
-        anyhow::bail!("cross-entity invariants not proven: {}", failed.join(", "));
+        anyhow::bail!("{} not proven: {}", check.to_lowercase(), failed.join(", "));
     }
     Ok(())
 }
