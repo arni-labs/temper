@@ -9,6 +9,7 @@ use temper_runtime::persistence::{
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
+mod commit_outcome;
 mod evolution_tenant;
 mod policy_approval;
 mod scheduled_actions;

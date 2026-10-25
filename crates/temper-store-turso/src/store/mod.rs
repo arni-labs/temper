@@ -36,6 +36,7 @@ macro_rules! tombstone_sql {
 mod append_config;
 mod authz;
 mod blobs;
+mod commit_probe;
 mod constraints;
 mod entity_listing;
 mod event_store;
@@ -77,6 +78,9 @@ pub struct TursoEventStore {
     is_remote: bool,
     /// Set when the local file's commits are copied to Turso Cloud.
     sync_copy: Option<SyncCopy>,
+    /// Pauses appends at a fault point (tests only).
+    #[cfg(test)]
+    commit_probe: Option<commit_probe::CommitProbe>,
 }
 
 impl TursoEventStore {
@@ -140,6 +144,8 @@ impl TursoEventStore {
             high_priority_write_waiters: Arc::new(AtomicUsize::new(0)),
             is_remote,
             sync_copy,
+            #[cfg(test)]
+            commit_probe: None,
         };
         store.migrate().await?;
         Ok(store)

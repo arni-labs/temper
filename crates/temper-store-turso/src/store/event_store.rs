@@ -11,7 +11,8 @@ use temper_runtime::tenant::parse_persistence_id_parts;
 use tracing::{error, instrument, warn};
 
 use super::TursoEventStore;
-use super::append_config::{append_attempt_timeout, append_max_attempts};
+use super::append_config::append_max_attempts;
+use super::commit_probe::CommitPoint;
 use super::instrumentation::record_turso_query_duration;
 use super::write_gate::WritePriority;
 use crate::metrics::record_turso_write_retry;
@@ -399,7 +400,7 @@ impl EventStore for TursoEventStore {
             }]);
         }
 
-        let attempt_timeout = append_attempt_timeout();
+        let attempt_timeout = self.append_attempt_timeout();
         let total_attempts = append_max_attempts();
         let mut last_err: Option<PersistenceError> = None;
         for attempt in 0..total_attempts {
@@ -810,6 +811,7 @@ impl TursoEventStore {
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
         let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
+        self.commit_point(CommitPoint::Began).await;
 
         let select_start = std::time::Instant::now();
         let rows_result = tx
@@ -996,7 +998,9 @@ impl TursoEventStore {
             .map_err(storage_error)?;
         }
 
+        self.commit_point(CommitPoint::Wrote).await;
         tx.commit().await.map_err(storage_error)?;
+        self.commit_point(CommitPoint::Committed).await;
         Ok(new_seq)
     }
 
@@ -1021,7 +1025,7 @@ impl TursoEventStore {
         // retries safe — if a prior attempt partially committed before erroring,
         // the retry's pre-check detects it as ConcurrencyViolation
         // (non-transient, propagates to caller via normal event-store contract).
-        let attempt_timeout = append_attempt_timeout();
+        let attempt_timeout = self.append_attempt_timeout();
         let total_attempts = append_max_attempts();
         let mut last_err: Option<PersistenceError> = None;
         let bypass_write_gate = events.len() == 1 && !scheduled.changes_scheduled_actions();
@@ -1315,6 +1319,7 @@ impl TursoEventStore {
                 idx
             }
         };
+        self.commit_point(CommitPoint::Began).await;
         let insert_result = conn
             .execute(
                 "INSERT INTO events
@@ -1356,6 +1361,7 @@ impl TursoEventStore {
         };
 
         if affected == 1 {
+            self.commit_point(CommitPoint::Wrote).await;
             conn.execute(
                 "UPDATE event_segments
                  SET end_sequence_nr = ?5, event_count = MAX(?5 - start_sequence_nr + 1, 0)
@@ -1370,6 +1376,7 @@ impl TursoEventStore {
             )
             .await
             .map_err(storage_error)?;
+            self.commit_point(CommitPoint::Committed).await;
             return Ok(new_seq);
         }
 
