@@ -5,10 +5,10 @@
 //! each edge represents "when the source entity's action X commits, the
 //! target entity's action Y fires with a specific resolver".
 //!
-//! The graph is the input to a future [`CompositeTemperModel`] in
-//! `temper-verify`: the verifier composes exactly the entities reachable
-//! from a seed entity via this graph, avoiding unnecessary state-space
-//! explosion for unrelated entities.
+//! The graph is the input to the drop check in `temper-verify`
+//! (`composite::verify`): it composes exactly the entities in a seed's
+//! weakly-connected component, avoiding unnecessary state-space explosion
+//! for unrelated entities.
 //!
 //! Only `kind = "entity"` triggers appear here. `kind = "wasm"` and
 //! `kind = "webhook"` triggers are opaque to joint verification (their

@@ -33,6 +33,7 @@ impl JointModel {
             params: BTreeMap::new(),
             read: !self.action_reads_related(entity, name),
             depth: 0,
+            via: None,
             by,
             inline: false,
         };

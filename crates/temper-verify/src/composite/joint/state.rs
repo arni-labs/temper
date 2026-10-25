@@ -81,6 +81,9 @@ pub struct Dispatch {
     pub read: bool,
     /// The reaction depth that sent it (0 for a request from outside).
     pub depth: u32,
+    /// The reaction that sent it, by its place among the model's reactions;
+    /// `None` for a request from outside.
+    pub via: Option<usize>,
     /// Who sends it, by sender number; Cedar decides it as them.
     pub by: u32,
     /// Its sender waits for the module calls it starts, so they run inline

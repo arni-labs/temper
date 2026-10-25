@@ -2,6 +2,7 @@
 //! and module calls on their way, who may send what, and the walk.
 
 mod commit;
+mod drops;
 mod order;
 mod react;
 mod read;
@@ -11,23 +12,23 @@ mod walk;
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::{May, SendAnalysis};
-use temper_spec::automaton::{Automaton, TargetResolver};
-use temper_spec::predicate::{Arg, Expr, Name, Truth, eval};
+use temper_spec::automaton::Automaton;
+use temper_spec::predicate::{Expr, Name, Truth, eval};
 
-use super::env::{Blind, ID, JointEnv};
+use super::env::{Blind, ID, JointEnv, Records};
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
 use crate::Budget;
 use crate::model::semantics::string_values;
-use crate::model::{
-    ParamValue, ResolvedTransition, TemperModel, TemperModelState, build_model_tracking,
-};
+use crate::model::{ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
+pub use drops::DroppedReaction;
+pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
-use read::{Kernel, Reaction, Unchecked, named_literals, reactions_in, unchecked_constraints};
+use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
 pub(super) use step::Move;
 pub(super) use walk::Explored;
 
@@ -43,6 +44,20 @@ const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 /// ones. A walk that held a move back for it says so, and then proves only
 /// up to this many.
 pub(super) const MAX_IN_FLIGHT: usize = 3;
+
+/// When a dispatch lands, against moves from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Whenever: other dispatches and moves from outside can come first, as
+    /// in the runtime, where each request and each reaction is its own task.
+    /// At most [`MAX_IN_FLIGHT`] at once.
+    Any,
+    /// Before the next move from outside: the dispatches a move sends all
+    /// land, in any order, before anything else is asked. That is what the
+    /// drop check claims (ADR-0150); with it, the dispatches in flight are
+    /// bounded by the reactions' fan-out and depth.
+    BeforeNextRequest,
+}
 
 /// Who sends what in the model.
 pub(super) struct Sending<'s> {
@@ -83,7 +98,13 @@ pub(super) struct Walk {
 pub(super) struct JointModel {
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
-    /// The types composed: those the properties name.
+    records: Records,
+    /// With one record of a type, each entity's id fields that references
+    /// use: each holds that record's id.
+    refs: BTreeMap<String, BTreeSet<String>>,
+    delivery: Delivery,
+    /// The types composed: those the properties name, or a trigger-graph
+    /// component for the drop check.
     pub(super) scope: BTreeSet<String>,
     /// Whether the kernel's own moves are made as the kernel makes them.
     kernel_moves: bool,
@@ -139,56 +160,7 @@ impl JointModel {
                 Name::Status => {}
             });
         }
-        // Tracked strings: what is read, the id fields references use, and
-        // what a reaction copies into a tracked variable, until nothing more
-        // reaches one.
-        let mut also: BTreeMap<String, BTreeSet<String>> = read.clone();
-        let (mut models, reactions) = loop {
-            let reactions = reactions_in(by_name, &scope);
-            let models: BTreeMap<String, TemperModel> = scope
-                .iter()
-                .map(|entity| {
-                    let extra = also.get(entity).cloned().unwrap_or_default();
-                    (
-                        entity.clone(),
-                        build_model_tracking(by_name[entity.as_str()], JOINT_MAX_COUNTER, &extra),
-                    )
-                })
-                .collect();
-            let mut grew = false;
-            let mut track = |entity: &str, field: &str| {
-                !matches!(field, "Id" | "id")
-                    && also
-                        .entry(entity.to_string())
-                        .or_default()
-                        .insert(field.to_string())
-            };
-            for (entity, model) in &models {
-                for t in &model.transitions {
-                    for (related, id_field) in t.guard.related_types() {
-                        if scope.contains(&related) {
-                            grew |= track(entity, &id_field);
-                        }
-                    }
-                }
-            }
-            for reaction in &reactions {
-                if let Some(TargetResolver::Field { id_field }) = &reaction.resolve {
-                    grew |= track(&reaction.from, id_field);
-                }
-                for (param, arg) in &reaction.args {
-                    if let Arg::Var(field) = arg
-                        && models[&reaction.to].tracked_strings.contains(param)
-                        && !models[&reaction.from].tracked_strings.contains(field)
-                    {
-                        grew |= track(&reaction.from, field);
-                    }
-                }
-            }
-            if !grew {
-                break (models, reactions);
-            }
-        };
+        let (mut models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
         for ((entity, field), literals) in named_literals(owner, reads, &models, &reactions) {
             if let Some(model) = models.get_mut(&entity) {
                 model
@@ -198,6 +170,20 @@ impl JointModel {
                     .extend(literals);
             }
         }
+        Self::compose(by_name, scope, (models, reactions), &read, sending, cut)
+    }
+
+    /// The model of `models` and `reactions` over `scope`, one record per
+    /// id, its dispatches landing whenever. `read` is what its properties
+    /// read; with `cut`, each entity is cut down to that.
+    fn compose(
+        by_name: &BTreeMap<&str, &Automaton>,
+        scope: BTreeSet<String>,
+        (models, reactions): (BTreeMap<String, TemperModel>, Vec<Reaction>),
+        read: &BTreeMap<String, BTreeSet<String>>,
+        sending: Sending<'_>,
+        cut: bool,
+    ) -> Self {
         let kernel = if sending.kernel_moves {
             Kernel::read(by_name, &scope)
         } else {
@@ -215,7 +201,7 @@ impl JointModel {
             by_name,
             models: &models,
             reactions: &reactions,
-            read: &read,
+            read,
             chosen: &chosen,
         });
         let models: BTreeMap<String, TemperModel> = models
@@ -237,6 +223,9 @@ impl JointModel {
         Self {
             models,
             reactions,
+            records: Records::ById,
+            refs: BTreeMap::new(),
+            delivery: Delivery::Any,
             scope,
             kernel_moves: sending.kernel_moves,
             kernel,
@@ -263,9 +252,17 @@ impl JointModel {
     }
 
     /// The starting states: one per way the records' ids can be equal or
-    /// differ.
+    /// differ, or the one start when there is one record of a type.
     fn inits(&self) -> Vec<JointState> {
         let blank = self.blank();
+        if self.records == Records::One {
+            return vec![JointState {
+                records: blank,
+                inflight: Vec::new(),
+                calls: Vec::new(),
+                armed: BTreeMap::new(),
+            }];
+        }
         partitions(blank.len())
             .into_iter()
             .map(|blocks| {
@@ -405,6 +402,8 @@ impl JointModel {
     ) -> JointEnv<'a> {
         JointEnv {
             models: &self.models,
+            records: self.records,
+            refs: &self.refs,
             state,
             owner,
             blind,

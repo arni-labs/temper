@@ -1,7 +1,7 @@
 //! One entity of a joint state as a predicate environment, and how a
 //! reference finds its record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::predicate::{Env, Val, VarKind};
 
@@ -10,6 +10,10 @@ use crate::model::{TemperModel, TemperModelState};
 
 /// The key under which each record keeps its own id among its strings.
 pub(super) const ID: &str = "Id";
+
+/// What a reference's id field holds when there is one record of a type: the
+/// id of that record, which every reference finds.
+const ONE_ID: &str = "#1";
 
 /// What an evaluation may not see. The runtime reads related records on the
 /// dispatch path and the record's own state in its actor, at different
@@ -25,6 +29,18 @@ pub(super) enum Blind {
     Related,
 }
 
+/// Which record a reference finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Records {
+    /// The one whose id its id field holds. Each record has an id, and walks
+    /// start from every way the ids can be equal or differ.
+    ById,
+    /// The one record of its type, always. The drop check walks a whole
+    /// trigger-graph component, where the ways a dozen ids can be equal or
+    /// differ are too many to start from.
+    One,
+}
+
 /// Whether a reference finds its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Found {
@@ -38,9 +54,10 @@ pub(super) enum Found {
 
 /// The record of type `related` that `owner`'s `id_field` names: found when
 /// the field holds that record's id (`Id` reads `owner`'s own id, which is
-/// how `same_id` resolves).
+/// how `same_id` resolves), or always when there is one record of a type.
 pub(super) fn resolve(
     models: &BTreeMap<String, TemperModel>,
+    records: Records,
     state: &JointState,
     owner: &str,
     id_field: &str,
@@ -50,6 +67,9 @@ pub(super) fn resolve(
     else {
         return Found::Unknown;
     };
+    if records == Records::One {
+        return Found::Yes;
+    }
     let id = if matches!(id_field, "Id" | "id") {
         source.strings.get(ID)
     } else if models[owner].tracked_strings.contains(id_field) {
@@ -70,6 +90,10 @@ pub(super) fn resolve(
 /// finds them.
 pub(super) struct JointEnv<'a> {
     pub(super) models: &'a BTreeMap<String, TemperModel>,
+    pub(super) records: Records,
+    /// With one record of a type, each entity's id fields that references
+    /// use; empty otherwise.
+    pub(super) refs: &'a BTreeMap<String, BTreeSet<String>>,
     pub(super) state: &'a JointState,
     pub(super) owner: &'a str,
     pub(super) blind: Blind,
@@ -98,7 +122,14 @@ impl JointEnv<'_> {
         if self.blind == Blind::Related {
             return None;
         }
-        match resolve(self.models, self.state, self.owner, id_field, entity_type) {
+        match resolve(
+            self.models,
+            self.records,
+            self.state,
+            self.owner,
+            id_field,
+            entity_type,
+        ) {
             Found::Yes => Some(self.state.records.get(entity_type)),
             Found::Missing => Some(None),
             Found::Unknown => None,
@@ -117,6 +148,13 @@ impl Env for JointEnv<'_> {
     fn var(&self, name: &str) -> Val<'_> {
         if self.blind == Blind::Own {
             return Val::Unknown;
+        }
+        if self
+            .refs
+            .get(self.owner)
+            .is_some_and(|fields| fields.contains(name))
+        {
+            return Val::Str(ONE_ID);
         }
         var_of(
             &self.models[self.owner],
