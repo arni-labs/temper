@@ -12,7 +12,8 @@ use temper_runtime::persistence::ScheduledActionRecord;
 
 use super::actor::EntityActor;
 use super::effects::ScheduledAction;
-use super::types::{EntityEvent, EntityState};
+use super::event::EntityEvent;
+use super::types::EntityState;
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::encode_armed_by;
 

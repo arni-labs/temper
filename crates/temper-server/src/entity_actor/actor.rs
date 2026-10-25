@@ -39,11 +39,10 @@ use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::event::EntityEvent;
 use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
-use super::types::{
-    EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
-};
+use super::types::{EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReplayPolicy {

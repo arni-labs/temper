@@ -17,7 +17,8 @@ use temper_runtime::scheduler::sim_now;
 
 use super::actor::{EntityActor, ReplayPolicy};
 use super::effects;
-use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
+use super::event::EntityEvent;
+use super::types::{EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 /// Attempts allowed after the first, matching the `Action` arm's ADR-0046 budget.
 const MAX_RETRIES: u32 = 2;

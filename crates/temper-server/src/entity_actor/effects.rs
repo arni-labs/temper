@@ -13,7 +13,8 @@ use temper_runtime::scheduler::{sim_now, sim_uuid};
 
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, OverflowBlobWrite, blob_ref_value};
 
-use super::types::{EffectOutcome, EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
+use super::event::{EffectOutcome, EntityEvent};
+use super::types::{EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 /// Journal event type for a PATCH-style field merge (ARN-189).
 pub(crate) const FIELDS_UPDATED_EVENT: &str = "FieldsUpdated";

@@ -4,7 +4,8 @@ use temper_jit::table::{Effect, TransitionTable};
 use temper_runtime::actor::ActorError;
 use temper_runtime::persistence::{CompositeEvent, PersistenceEnvelope, TOMBSTONE_EVENT_TYPE};
 
-use super::types::{EntityEvent, EntityState};
+use super::event::EntityEvent;
+use super::types::EntityState;
 
 pub(super) fn validate_strict_composite_event(
     tenant: &str,

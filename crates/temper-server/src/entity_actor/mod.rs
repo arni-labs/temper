@@ -8,6 +8,7 @@ pub(crate) mod action_input;
 mod actor;
 pub(crate) mod bootstrap;
 pub mod effects;
+pub mod event;
 mod field_updates;
 mod replay_validation;
 mod scheduled_rows;
@@ -25,6 +26,7 @@ pub use effects::{
     ProcessResult, ScheduledAction, apply_effects, apply_new_state_fallback, build_eval_context,
     process_action, process_action_with_xref, sync_fields,
 };
+pub use event::{EffectOutcome, EntityEvent};
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
-pub use types::{EffectOutcome, EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};
+pub use types::{EntityMsg, EntityResponse, EntityState, StatusClock};
