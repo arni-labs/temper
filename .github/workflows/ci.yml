@@ -498,7 +498,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.lane == 'full' || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-store-postgres ')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Building temper-server for the secret-write step takes longer than the
+    # store crate alone.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:18
@@ -536,6 +538,15 @@ jobs:
         run: >-
           cargo nextest run -p temper-store-postgres --run-ignored only
           -E 'test(a_release_boots_on_a_schema_a_newer_release_migrated)'
+
+      # A conditional secret write checks and writes in one statement; only a
+      # real Postgres shows that two racing writers cannot both succeed.
+      - name: Conditional secret writes on Postgres
+        env:
+          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: >-
+          cargo nextest run -p temper-server --features observe,sim
+          --test secret_conditional_writes --run-ignored only
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
