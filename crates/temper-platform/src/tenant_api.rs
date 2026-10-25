@@ -255,6 +255,8 @@ pub(crate) async fn delete_tenant(
     State(state): State<PlatformState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
     admitted: Option<Extension<temper_server::state::TenantStamp>>,
+    credential: Option<Extension<crate::deletion_retries::DeletionCredential>>,
+    retry: Option<Extension<crate::deletion_retries::AuthorizedDeletionRetry>>,
     axum::extract::Path(tenant_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let authenticated = match require_authenticated(authenticated.as_deref()) {
@@ -262,6 +264,9 @@ pub(crate) async fn delete_tenant(
         Err(status) => return authorization_error(status),
     };
     if let Err(status) = require_same_tenant(authenticated, &tenant_id).and_then(|_| {
+        if retry.is_some() {
+            return Ok(());
+        }
         require_resource_authorization(
             &state,
             authenticated,
@@ -302,11 +307,19 @@ pub(crate) async fn delete_tenant(
             Json(serde_json::json!({"error": "the delete was not admitted for its tenant"})),
         );
     };
-    match state
+    if let Some(Extension(credential)) = credential {
+        state
+            .deletion_retries
+            .remember(&stamp, credential, authenticated);
+    }
+    let result = state
         .server
         .remove_tenant(&stamp, || provider.remove_tenant(tid))
-        .await
-    {
+        .await;
+    if result.is_ok() {
+        state.deletion_retries.forget(&stamp);
+    }
+    match result {
         Ok(true) => (
             StatusCode::OK,
             Json(serde_json::json!({

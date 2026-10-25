@@ -8,6 +8,7 @@
 
 pub mod bearer_auth;
 pub mod bootstrap;
+mod deletion_retries;
 pub mod deploy;
 pub mod genesis_install;
 pub mod genesis_install_verify;

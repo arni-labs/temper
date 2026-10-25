@@ -172,3 +172,66 @@ async fn dst_capture_loss_survives_an_unfinished_deletion() {
     }
     assert!(violations.is_empty(), "{violations:#?}");
 }
+
+/// An ordinary queued row refused during an unfinished deletion must degrade capture health,
+/// just as a failed write does. A completed deletion retires it, and late old rows stay retired.
+#[tokio::test(start_paused = true)]
+async fn dst_queued_entry_refused_during_deletion_records_capture_loss() {
+    for seed in 0..SEEDS {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let state = state(seed);
+        let tenant = TenantId::new(format!("queued-loss-deletion-{seed}"));
+        let generation = state.generation_ref(&tenant);
+        let stamp = generation.stamp().clone();
+        let sink = Arc::new(RecordingSink::default());
+        let mut entry = super::tests::entry("entry");
+        entry.tenant = tenant.to_string();
+        entry.session_id = Some(format!("queued-loss-session-{seed}"));
+        let queued = || super::QueuedTrajectory {
+            sink: Some(sink.clone()),
+            backend: "test",
+            entry: entry.clone(),
+            generation: Some(generation.clone()),
+            health: state.capture_health.clone(),
+            parent: opentelemetry::Context::new(),
+        };
+        // The seed chooses a failed storage deletion or a timeout waiting for admitted work.
+        let held = (pick(seed, 1, 2) == 1).then(|| state.tenant_generations.lease(&stamp).unwrap());
+        assert!(
+            state
+                .remove_tenant(&stamp, || async {
+                    Err(PersistenceError::Storage("unavailable".into()))
+                })
+                .await
+                .is_err()
+        );
+        super::persist_drained(queued()).await;
+        assert_eq!(
+            state.capture_health.unconfirmed_losses(),
+            1,
+            "seed {seed}: refused ordinary row must count"
+        );
+        assert!(
+            sink.written.lock().unwrap().is_empty(),
+            "seed {seed}: closed generation cannot write"
+        );
+        drop(held);
+        assert!(
+            state
+                .remove_tenant(&stamp, || async { Ok(true) })
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            state.capture_health.unconfirmed_losses(),
+            0,
+            "seed {seed}: deletion retires loss"
+        );
+        super::persist_drained(queued()).await;
+        assert_eq!(
+            state.capture_health.unconfirmed_losses(),
+            0,
+            "seed {seed}: late deleted row stays retired"
+        );
+    }
+}

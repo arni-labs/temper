@@ -6,7 +6,7 @@
 //! special runtime fallback or deployment-wide Admin authority.
 
 use crate::state::PlatformState;
-use axum::extract::{Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -33,11 +33,26 @@ pub async fn bearer_auth_check(
 ) -> Result<Response, StatusCode> {
     let bearer = bearer_credential(&req);
     let tenant = requested_tenant(&req)?;
-
-    if bearer
+    let internal_invocation = bearer
         .as_deref()
-        .is_some_and(temper_server::internal_invocation::is_internal_invocation_bearer)
-    {
+        .is_some_and(temper_server::internal_invocation::is_internal_invocation_bearer);
+    if !internal_invocation && is_public_request(&req) {
+        if !req.uri().path().starts_with("/webhooks/") {
+            req.headers_mut().remove("authorization");
+        }
+        return Ok(next.run(req).await);
+    }
+
+    // Credential and session resolution may wait across deletion and recreation.
+    // Authority resolved here can only be admitted to this original generation.
+    let stamp = state.server.tenant_generations.stamp(&tenant);
+    let self_delete = is_self_delete(&mut req, &tenant).await;
+    let deletion_credential = self_delete
+        .then(|| request_credential(&req))
+        .flatten()
+        .map(crate::deletion_retries::DeletionCredential::new);
+
+    if internal_invocation {
         let token = bearer.as_deref().ok_or(StatusCode::UNAUTHORIZED)?;
         let authenticated = state
             .server
@@ -48,14 +63,7 @@ pub async fn bearer_auth_check(
         // downstream handlers, logs, or accidental forwarding.
         req.headers_mut().remove("authorization");
         req.extensions_mut().insert(authenticated);
-        let _lease = lease_tenant_request(&state, &mut req, &tenant)?;
-        return Ok(next.run(req).await);
-    }
-
-    if is_public_request(&req) {
-        if !req.uri().path().starts_with("/webhooks/") {
-            req.headers_mut().remove("authorization");
-        }
+        let _lease = lease_tenant_request(&state, &mut req, &stamp, self_delete)?;
         return Ok(next.run(req).await);
     }
 
@@ -65,6 +73,17 @@ pub async fn bearer_auth_check(
         temper_server::odata::unavailable_tenant_response(&state.server, &tenant)
     {
         return Ok(response);
+    }
+
+    if let Some(credential) = deletion_credential.as_ref() {
+        if let Some(authenticated) = state.deletion_retries.resolve(&stamp, credential) {
+            req.headers_mut().remove("authorization");
+            req.extensions_mut().insert(authenticated);
+            req.extensions_mut()
+                .insert(crate::deletion_retries::AuthorizedDeletionRetry);
+            let _lease = lease_tenant_request(&state, &mut req, &stamp, self_delete)?;
+            return Ok(next.run(req).await);
+        }
     }
 
     let matched_endpoint = match state.server.http_endpoint_tables.get(&tenant).await {
@@ -149,6 +168,9 @@ pub async fn bearer_auth_check(
                 .with_session_id(session_id);
 
         req.extensions_mut().insert(authenticated);
+        if let Some(credential) = deletion_credential {
+            req.extensions_mut().insert(credential);
+        }
         let route_resolves_its_own_credential = matched_endpoint
             .as_ref()
             .is_some_and(|matched| matched.route.forwards_credential);
@@ -193,7 +215,7 @@ pub async fn bearer_auth_check(
             );
         }
         req.headers_mut().remove("authorization");
-        let _lease = lease_tenant_request(&state, &mut req, &tenant)?;
+        let _lease = lease_tenant_request(&state, &mut req, &stamp, self_delete)?;
         return Ok(next.run(req).await);
     }
 
@@ -239,7 +261,7 @@ pub async fn bearer_auth_check(
                 &request_path,
                 matched,
             ));
-        let _lease = lease_tenant_request(&state, &mut req, &tenant)?;
+        let _lease = lease_tenant_request(&state, &mut req, &stamp, self_delete)?;
         return Ok(next.run(req).await);
     }
 
@@ -259,28 +281,45 @@ pub async fn bearer_auth_check(
 
 /// A request that acts with a tenant's authority is work of the tenant's live generation: it holds a lease of it
 /// until its handler returns, so a removal of the tenant waits for it and a request that arrives while the tenant is
-/// being removed is refused with 410. The lease is taken only once a credential or route of the tenant matched, so a
-/// made-up tenant id never starts a generation. The request that deletes its own tenant holds none: it ends the
+/// being removed is refused with 410. The generation was captured before resolving credentials, and the lease is
+/// taken only once a credential or route matched. The request that deletes its own tenant holds none: it ends the
 /// generation, and could not wait for its own lease. It carries the generation's stamp instead, and removes only that
 /// generation, never a tenant created again under the id after it was admitted.
 fn lease_tenant_request(
     state: &PlatformState,
     req: &mut Request,
-    tenant: &TenantId,
+    stamp: &temper_server::state::TenantStamp,
+    self_delete: bool,
 ) -> Result<Option<temper_server::state::GenerationLease>, StatusCode> {
-    if req.method() == Method::DELETE
-        && req.uri().path().strip_prefix("/api/tenants/") == Some(tenant.as_str())
-    {
-        let stamp = state.server.tenant_generations.stamp(tenant);
-        req.extensions_mut().insert(stamp);
+    if self_delete {
+        if state.server.tenant_generations.stamp(stamp.tenant()) != *stamp {
+            return Err(StatusCode::GONE);
+        }
+        req.extensions_mut().insert(stamp.clone());
         return Ok(None);
     }
     state
         .server
         .tenant_generations
-        .lease_live(tenant)
+        .lease(stamp)
         .map(Some)
         .ok_or(StatusCode::GONE)
+}
+
+/// Match the kernel delete route and its decoded parameter, including percent-encoded spellings.
+async fn is_self_delete(req: &mut Request, tenant: &TenantId) -> bool {
+    if req.method() != Method::DELETE
+        || req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str)
+            != Some("/api/tenants/{id}")
+    {
+        return false;
+    }
+    crate::tenant_access::tenant_from_request(req)
+        .await
+        .is_ok_and(|id| id.as_deref() == Some(tenant.as_str()))
 }
 
 fn authorization_parts(req: &Request) -> Option<(&str, &str)> {
@@ -349,3 +388,7 @@ fn requested_tenant(req: &Request) -> Result<TenantId, StatusCode> {
 #[cfg(test)]
 #[path = "bearer_auth/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bearer_auth/generation_tests.rs"]
+mod generation_tests;

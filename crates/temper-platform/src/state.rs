@@ -35,6 +35,8 @@ pub struct PlatformState {
     pub api_token: Option<String>,
     /// In-memory spec storage for pending tenant deployments.
     pub spec_store: Arc<RwLock<SpecStore>>,
+    /// Authority restricted to finishing an already authorized generation's deletion.
+    pub(crate) deletion_retries: Arc<crate::deletion_retries::DeletionRetries>,
 }
 
 /// Default broadcast channel capacity.
@@ -98,6 +100,7 @@ impl PlatformState {
             api_key,
             api_token: None,
             spec_store,
+            deletion_retries: Arc::default(),
         };
         state.server.bound_action_hook = Some(Arc::new(
             crate::genesis_install::GenesisInstallHook::new(state.clone()),
@@ -141,6 +144,7 @@ impl PlatformState {
             api_key,
             api_token: None,
             spec_store,
+            deletion_retries: Arc::default(),
         };
         state.server.bound_action_hook = Some(Arc::new(
             crate::genesis_install::GenesisInstallHook::new(state.clone()),

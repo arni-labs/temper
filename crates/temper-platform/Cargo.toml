@@ -36,6 +36,8 @@ futures = { workspace = true }
 tempfile = "3.27.0"
 
 [dev-dependencies]
+# Inject a failure in platform cleanup after the tenant database has been removed.
+turso = { version = "=0.7.2", default-features = false }
 tower-http = { workspace = true }
 tracing-subscriber = { workspace = true }
 temper-wasm = { workspace = true, features = ["test-shared-compilation"] }

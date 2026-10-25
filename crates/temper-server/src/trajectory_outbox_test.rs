@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 
-fn entry(id: &str) -> TrajectoryEntry {
+pub(super) fn entry(id: &str) -> TrajectoryEntry {
     TrajectoryEntry {
         timestamp: "2026-04-28T00:00:00Z".to_string(),
         tenant: "tenant".to_string(),

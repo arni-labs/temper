@@ -21,6 +21,10 @@ const PERMIT_ALL: &str = "permit(principal, action, resource);";
 
 /// `acme` on routed local storage under `dir`, with an operator credential and a policy permitting everything.
 async fn acme(dir: &std::path::Path) -> PlatformState {
+    acme_with_router(dir).await.0
+}
+
+async fn acme_with_router(dir: &std::path::Path) -> (PlatformState, TenantStoreRouter) {
     let router = TenantStoreRouter::new(
         &format!("file:{}", dir.join("platform.db").display()),
         None,
@@ -35,7 +39,7 @@ async fn acme(dir: &std::path::Path) -> PlatformState {
     let mut state = PlatformState::new(None);
     state
         .server
-        .set_storage_stack(StorageStack::from_tenant_router(router));
+        .set_storage_stack(StorageStack::from_tenant_router(router.clone()));
     // How long a delete waits for the tenant's work to finish before it stops and asks to be retried.
     state.server.action_dispatch_timeout = Duration::from_millis(200);
     bootstrap_agent_specs(&state, "acme", false, &BTreeMap::new());
@@ -47,7 +51,7 @@ async fn acme(dir: &std::path::Path) -> PlatformState {
         .authz
         .reload_tenant_policies("acme", PERMIT_ALL)
         .expect("policy");
-    state
+    (state, router)
 }
 
 async fn send(
@@ -122,5 +126,118 @@ async fn a_delete_that_stops_part_way_refuses_the_tenants_writes_and_its_caller_
         send(&app, "DELETE", "/api/tenants/acme", None).await,
         StatusCode::UNAUTHORIZED,
         "the deleted tenant's credential went with it"
+    );
+}
+
+/// Encoded spellings reach the same decoded tenant and must carry a deletion stamp, not a lease.
+#[tokio::test]
+async fn an_encoded_tenant_delete_is_admitted_without_a_lease() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = acme(dir.path()).await;
+    let app = build_platform_router(state);
+    assert_eq!(
+        send(&app, "DELETE", "/api/tenants/%62eta", None).await,
+        StatusCode::FORBIDDEN,
+        "decoding never permits another tenant's deletion"
+    );
+    assert_eq!(
+        send(&app, "DELETE", "/api/tenants/%61cme", None).await,
+        StatusCode::OK
+    );
+    assert!(!dir.path().join("tenants/acme.db").exists());
+}
+
+/// Failure after database removal leaves no readable credentials. Only the already-authorized
+/// deletion may be retried, and its capability must end with that generation.
+#[tokio::test]
+async fn a_delete_retry_survives_storage_removal_but_cannot_authorize_other_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut state, _router) = acme_with_router(dir.path()).await;
+    let platform = turso::Builder::new_local(dir.path().join("platform.db").to_str().unwrap())
+        .build()
+        .await
+        .expect("platform database");
+    let conn = platform.connect().expect("platform connection");
+    conn.execute("DROP TABLE tenant_users", ())
+        .await
+        .expect("inject platform failure");
+    let app = build_platform_router(state.clone());
+    assert_eq!(
+        send(&app, "DELETE", "/api/tenants/acme", None).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        !dir.path().join("tenants/acme.db").exists(),
+        "database removal succeeded before the platform failure"
+    );
+    // Reopen the routing connections so no unlinked local SQLite handle can still serve credentials.
+    // This models the cloud database disappearing independently of existing client connections.
+    let router = TenantStoreRouter::new(
+        &format!("file:{}", dir.path().join("platform.db").display()),
+        None,
+        Some(dir.path().join("tenants").to_string_lossy().into_owned()),
+    )
+    .await
+    .unwrap();
+    state
+        .server
+        .set_storage_stack(StorageStack::from_tenant_router(router.clone()));
+    let app = build_platform_router(state.clone());
+    // Prove that retry authority is necessary: the underlying identity authority is unreadable/absent.
+    let identity = temper_server::identity::IdentityResolver::new()
+        .resolve(&state.server, &TenantId::new("acme"), KEY)
+        .await;
+    assert!(
+        identity.is_err(),
+        "the deleted database cannot resolve the caller"
+    );
+    assert_ne!(
+        put_policy(&app).await,
+        StatusCode::OK,
+        "saved deletion authority cannot authorize a write"
+    );
+    let wrong_key = Request::delete("/api/tenants/acme")
+        .header("authorization", "Bearer wrong-key")
+        .header("x-tenant-id", "acme")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(wrong_key).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "a different credential cannot reach deletion cleanup"
+    );
+    conn.execute(
+        "CREATE TABLE tenant_users (tenant_id TEXT, user_id TEXT, role TEXT)",
+        (),
+    )
+    .await
+    .expect("repair platform");
+    assert_eq!(
+        send(&app, "DELETE", "/api/tenants/%61cme", None).await,
+        StatusCode::OK,
+        "the same caller finishes cleanup without credential storage"
+    );
+
+    // Reuse the id with policies that even allow the old principal: the saved credential must not follow it.
+    router
+        .register_tenant(&TenantId::new("acme"))
+        .await
+        .expect("recreate tenant");
+    bootstrap_agent_specs(&state, "acme", false, &BTreeMap::new());
+    bootstrap_operator_credential(&state, "replacement-key", "acme")
+        .await
+        .expect("replacement credential");
+    state
+        .server
+        .authz
+        .reload_tenant_policies("acme", PERMIT_ALL)
+        .unwrap();
+    assert_eq!(
+        send(&app, "DELETE", "/api/tenants/acme", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        dir.path().join("tenants/acme.db").exists(),
+        "the replacement is untouched"
     );
 }

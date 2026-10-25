@@ -243,4 +243,50 @@ mod tests {
         );
         server.verify().await;
     }
+    #[cfg(feature = "cloud")]
+    #[tokio::test]
+    async fn cloud_deletion_retries_after_a_later_platform_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let cloud_path = "/v1/organizations/acme-org/databases/temper-alpha";
+        Mock::given(method("DELETE"))
+            .and(path(cloud_path))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut router =
+            router(dir.path())
+                .await
+                .with_cloud_config("api-token".into(), "acme-org".into(), None);
+        router.turso_api_base_url = server.uri();
+        let conn = router.platform_store().connection().await.unwrap();
+        conn.execute("INSERT INTO tenant_registry (tenant_id, turso_db_url, turso_auth_token) VALUES (?1, ?2, ?3)",
+            params!["alpha", "libsql://alpha.db.turso.io", Some("token")]).await.unwrap();
+        conn.execute("DROP TABLE tenant_users", ()).await.unwrap();
+        let tenant = TenantId::new("alpha");
+        assert!(
+            router.remove_tenant(&tenant).await.is_err(),
+            "platform failure after successful cloud delete"
+        );
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("DELETE"))
+            .and(path(cloud_path))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        conn.execute(
+            "CREATE TABLE tenant_users (tenant_id TEXT, user_id TEXT, role TEXT)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(router.remove_tenant(&tenant).await.unwrap());
+        assert!(router.load_tenant_registry().await.unwrap().is_empty());
+        server.verify().await;
+    }
 }

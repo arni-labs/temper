@@ -292,7 +292,17 @@ async fn persist_drained(item: QueuedTrajectory) {
         // Held through the write: an entry of a deleted tenant generation is dropped, never written into the tenant
         // created again under its id.
         let lease = match generation.as_ref().map(GenerationRef::lease) {
-            Some(None) => return,
+            Some(None) => {
+                record_capture_loss(
+                    Some(Arc::clone(&sink)),
+                    backend,
+                    &entry,
+                    generation,
+                    "tenant_closed",
+                    &health,
+                );
+                return;
+            }
             Some(lease) => lease,
             None => None,
         };
