@@ -189,9 +189,12 @@ async fn move_once(
                     }
                 }
                 HangUp::AfterCommit => {
-                    let before = landed(store, id, mark).await;
+                    // Watch the store's commit count, not the journal: a
+                    // read here would use up a read fault meant for the move.
+                    let journal = journal_of(id);
+                    let before = store.commits(&journal);
                     for _ in 0..2_000 {
-                        if handle.is_finished() || landed(store, id, mark).await > before {
+                        if handle.is_finished() || store.commits(&journal) > before {
                             break;
                         }
                         tokio::task::yield_now().await;
