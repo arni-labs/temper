@@ -202,6 +202,16 @@ pub trait DynEventStore: Send + Sync {
         persistence_id: &'a str,
     ) -> EventStoreFuture<'a, Result<Option<(u64, Vec<u8>)>, PersistenceError>>;
 
+    fn latest_sequence_nr<'a>(
+        &'a self,
+        persistence_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
+
+    fn journal_heads<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<'a, Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError>>;
+
     fn list_entity_ids<'a>(
         &'a self,
         tenant: &'a str,
@@ -466,6 +476,21 @@ where
         persistence_id: &'a str,
     ) -> EventStoreFuture<'a, Result<Option<(u64, Vec<u8>)>, PersistenceError>> {
         Box::pin(EventStore::load_snapshot(self, persistence_id))
+    }
+
+    fn latest_sequence_nr<'a>(
+        &'a self,
+        persistence_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<u64, PersistenceError>> {
+        Box::pin(EventStore::latest_sequence_nr(self, persistence_id))
+    }
+
+    fn journal_heads<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<'a, Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError>>
+    {
+        Box::pin(EventStore::journal_heads(self, tenant))
     }
 
     fn list_entity_ids<'a>(
@@ -735,6 +760,19 @@ impl BoxedEventStore {
         persistence_id: &str,
     ) -> Result<Option<(u64, Vec<u8>)>, PersistenceError> {
         self.store.load_snapshot(persistence_id).await
+    }
+
+    /// The journal's last sequence without loading entity bodies on SQL stores.
+    pub async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        self.store.latest_sequence_nr(persistence_id).await
+    }
+
+    /// Every durable record's sequence in a single metadata read.
+    pub async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        self.store.journal_heads(tenant).await
     }
 
     pub async fn list_entity_ids(
@@ -1409,6 +1447,15 @@ impl StorageStack {
         }
         self.events = self.events.with_event_size_limits(limits);
         self
+    }
+
+    /// Whether the query plane and journal are the very same store allocation.
+    /// A wrapper or a separately supplied store must use the batch comparison
+    /// against this stack's actual journal, never its own unrelated events.
+    pub(crate) fn query_plane_is_journal(&self) -> bool {
+        self.query_plane.as_ref().is_some_and(|plane| {
+            std::ptr::addr_eq(Arc::as_ptr(&self.events.store), Arc::as_ptr(plane))
+        })
     }
 
     pub fn from_postgres(store: PostgresEventStore) -> Self {

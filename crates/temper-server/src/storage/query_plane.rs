@@ -87,6 +87,27 @@ pub struct QueryProjectionUpsert {
 /// Durable query-plane capability.
 #[async_trait::async_trait]
 pub trait QueryPlaneStore: Send + Sync {
+    /// Compare catalog checkpoints with the co-located journal in one query.
+    /// Called only when the stack verifies this is the journal itself.
+    async fn lagging_projections(
+        &self,
+        _tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        Ok(None)
+    }
+
+    /// All catalog checkpoints, without entity bodies, for a query plane that
+    /// lives outside the journal. Combined with a batched journal-head read.
+    async fn projection_checkpoints(
+        &self,
+        _tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        Err(PersistenceError::Storage(
+            "batched projection checkpoints unsupported".into(),
+        ))
+    }
+
     #[expect(clippy::too_many_arguments, reason = "projection upsert boundary")]
     async fn upsert_projection(
         &self,

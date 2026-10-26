@@ -721,6 +721,26 @@ impl EventStore for TenantStoreRouter {
         store.load_snapshot(persistence_id).await
     }
 
+    async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        let (tenant, _, _) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        self.store_for_tenant(tenant)
+            .await?
+            .latest_sequence_nr(persistence_id)
+            .await
+    }
+
+    #[instrument(skip_all, fields(tenant, otel.name = "router.journal_heads"))]
+    async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        self.store_for_tenant(tenant)
+            .await?
+            .journal_heads(tenant)
+            .await
+    }
+
     #[instrument(skip_all, fields(tenant, otel.name = "router.list_entity_ids"))]
     async fn list_entity_ids(
         &self,

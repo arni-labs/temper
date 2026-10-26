@@ -50,6 +50,7 @@ mod policy;
 mod policy_approval;
 mod policy_replace;
 mod projection_freshness;
+mod projection_repair;
 mod published_artifacts;
 mod query_page;
 mod scheduled_actions;

@@ -96,12 +96,13 @@ impl ServerState {
     /// declares no timeout now is removed. Then, in the background, each
     /// record that had a row follows the state it is in now (as whoever armed
     /// its row), through the same gate. A record in a timed state with no row
-    /// is not armed: it waits for its next action. The scheduled actions left
+    /// is armed from its recorded state clock (unless it needs a caller). The scheduled actions left
     /// waiting are armed again from their rows through the same gate
     /// (`rearm_scheduled_actions`). Returns that background walk, which ends
     /// with the boot's counts per tenant and type, and logs them as
     /// `state timers after boot`.
     pub(crate) async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<BootTimers> {
+        let repaired = self.repair_query_projections_at_boot().await;
         let started = Instant::now();
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
         let mut callers = BootCallers::new();
@@ -181,6 +182,29 @@ impl ServerState {
                 armed += 1;
             }
         }
+        // Restore saved identities first, then reconcile repaired records with
+        // their replayed state through the same eight-fire boot gate. A restart
+        // during repair is safe: the rowless boot walk also recovers any timer
+        // whose projection landed before its timer row.
+        for (tenant, current) in repaired {
+            let key = (
+                tenant.clone(),
+                current.entity_type.clone(),
+                current.entity_id.clone(),
+            );
+            self.follow_state_timer(
+                &tenant,
+                &current.entity_type,
+                &current.entity_id,
+                &current,
+                super::state_timer_reconcile::Follow {
+                    armed_by: callers.get(&key),
+                    gate: Some(gate.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
         tracing::info!(
             armed,
             overdue,
@@ -191,7 +215,7 @@ impl ServerState {
         {
             // Serialize with install walks so none can consume startup changes
             // before saved identities and gates have been restored. The boot
-            // walk covers all timed types, with rows-only arming at startup.
+            // walk covers all timed types, including missing rows at startup.
             let mut registry = self.registry.write().expect("registry lock poisoned");
             registry.take_changed_types();
             self.timer_recovery_complete

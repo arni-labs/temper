@@ -163,6 +163,16 @@ fn restart(seed: u64, cut: usize) {
         clock.begin();
         let state = server(&events, qp.clone(), rows.clone());
         state.start_runtime().await.unwrap().await.unwrap();
+        let catalog = qp
+            .load_entity_catalog_rows(TENANT, "Order", &["release".to_string()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            catalog[0].status, "Checked",
+            "seed {seed}, cut {cut}: boot repairs the stored row itself"
+        );
+        assert_eq!(catalog[0].sequence_nr, 2);
         assert!(
             state
                 .resident_entity_sequence(&tenant, "Order", "release")
@@ -177,6 +187,13 @@ fn restart(seed: u64, cut: usize) {
         assert_eq!(
             body["status"], "Checked",
             "seed {seed}, cut {cut}: cold point read must match journal"
+        );
+        assert!(
+            state
+                .resident_entity_sequence(&tenant, "Order", "release")
+                .await
+                .is_none(),
+            "the repaired point read stays on the catalog"
         );
         assert_eq!(
             state.state_timeout_tracker.pending_snapshot(),
@@ -213,7 +230,11 @@ fn a_cold_installed_app_record_and_timer_recover_after_exit() {
 fn dst_exits_between_event_commit_and_last_row_write() {
     let mut failures = Vec::new();
     for seed in 0..64 {
-        let cut = DeterministicRng::new(seed).next_bound(3);
+        let mut rng = DeterministicRng::new(seed ^ 0xfac7_0154);
+        for _ in 0..8 {
+            rng.next_u64();
+        }
+        let cut = rng.next_bound(3);
         if std::panic::catch_unwind(|| restart(seed, cut)).is_err() {
             failures.push((seed, cut));
         }
@@ -272,5 +293,106 @@ async fn a_cold_point_read_checks_the_journal_even_without_boot_repair() {
             .await
             .is_none(),
         "the check itself must not load an actor"
+    );
+}
+
+#[tokio::test]
+async fn a_single_turso_store_repairs_an_installed_app_before_serving() {
+    use temper_runtime::persistence::EventStore;
+    let (_guard, _clock, _ids) = temper_runtime::scheduler::install_deterministic_context(201);
+    let tenant = TenantId::new(TENANT);
+    let events = SimEventStore::no_faults(201);
+    let source = server(
+        &events,
+        Arc::new(FlakyQueryPlane {
+            fail_write: usize::MAX,
+            ..Default::default()
+        }),
+        Arc::new(Rows::default()),
+    );
+    let before = source
+        .get_or_create_tenant_entity(&tenant, "Order", "native", serde_json::json!({}))
+        .await
+        .unwrap();
+    let moved = source
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "native",
+            "Review",
+            serde_json::json!({}),
+            &AgentContext::for_service("native-boot"),
+        )
+        .await
+        .unwrap();
+    assert!(moved.success);
+    let journal = events
+        .read_events(&format!("{TENANT}:Order:native"), 0)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = TursoEventStore::new(
+        &format!("file:{}", dir.path().join("repair.db").display()),
+        None,
+    )
+    .await
+    .unwrap();
+    store
+        .append(&format!("{TENANT}:Order:native"), 0, &journal)
+        .await
+        .unwrap();
+    store
+        .upsert_query_projection_with_state(
+            TENANT,
+            "Order",
+            "native",
+            &before.state.status,
+            &before.state.fields,
+            &serde_json::to_value(&before.state).unwrap(),
+            before.state.sequence_nr,
+        )
+        .await
+        .unwrap();
+    let mut restarted = server(
+        &events,
+        Arc::new(FlakyQueryPlane::default()),
+        Arc::new(Rows::default()),
+    );
+    restarted.set_storage_stack(StorageStack::from_turso(store.clone()));
+    restarted.state_timer_rows = None;
+    assert!(
+        restarted
+            .storage_stack
+            .as_ref()
+            .unwrap()
+            .query_plane_is_journal()
+    );
+    restarted.start_runtime().await.unwrap().await.unwrap();
+    assert!(
+        restarted
+            .resident_entity_sequence(&tenant, "Order", "native")
+            .await
+            .is_none()
+    );
+    let body =
+        try_load_entity_body_from_catalog(&restarted, &tenant, "Order", "Orders", "native", true)
+            .await
+            .unwrap();
+    assert_eq!(body["status"], "Checked");
+    assert_eq!(body["sequence_nr"], moved.state.sequence_nr);
+    let timers = store.list_state_timers(TENANT).await.unwrap();
+    assert_eq!(timers.len(), 1);
+    assert_eq!(timers[0].state, "Checked");
+    assert_eq!(
+        restarted.state_timeout_tracker.pending_snapshot(),
+        vec![("Order".to_string(), 1)]
+    );
+    assert!(
+        store
+            .lagging_query_projections(TENANT)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a second comparison needs no repairs"
     );
 }

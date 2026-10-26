@@ -397,13 +397,15 @@ fn run_seed(seed: u64) -> Result<(), String> {
     run.note(format!("restart after {}s down", downtime.as_secs()));
     first.kill(&world, downtime);
 
+    // Boot now recovers service-safe missing timers as well as saved rows.
+    run.unarmed.clear();
     let second = Process::start(&world, &v2, JOB_V1, &format!("follow-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
         check_boot_counts(&second.booted, &jobs, &run)?;
         check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
         // A read rehydrates a record: one with a row follows its state, one
-        // without stays unarmed.
+        // without a row is recovered by the boot walk.
         let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
         run.note(format!(
             "rehydrated {:?}",

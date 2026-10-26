@@ -13,6 +13,7 @@ mod commit_outcome;
 mod commit_transport;
 mod evolution_tenant;
 mod policy_approval;
+mod projection_repair;
 mod projection_writes;
 mod scheduled_actions;
 

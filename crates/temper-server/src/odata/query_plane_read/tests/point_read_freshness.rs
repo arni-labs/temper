@@ -151,6 +151,16 @@ struct FlakyQueryPlane {
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for FlakyQueryPlane {
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<
+        Vec<temper_runtime::persistence::ProjectionCheckpoint>,
+        temper_runtime::persistence::PersistenceError,
+    > {
+        self.inner.projection_checkpoints(tenant).await
+    }
+
     async fn upsert_projection(
         &self,
         tenant: &str,

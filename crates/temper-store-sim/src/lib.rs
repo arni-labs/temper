@@ -1284,6 +1284,62 @@ impl EventStore for SimEventStore {
         Ok(inner.snapshots.get(persistence_id).cloned())
     }
 
+    async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let journal = inner
+            .journals
+            .get(persistence_id)
+            .and_then(|j| j.last())
+            .map_or(0, |e| e.sequence_nr);
+        let snapshot = inner
+            .snapshots
+            .get(persistence_id)
+            .map_or(0, |(seq, _)| *seq);
+        Ok(journal.max(snapshot))
+    }
+
+    async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let mut heads = BTreeMap::new();
+        for (pid, journal) in &inner.journals {
+            if let Ok((t, ty, id)) = parse_persistence_id_parts(pid)
+                && t == tenant
+            {
+                heads.insert(
+                    (ty.to_string(), id.to_string()),
+                    (
+                        journal.last().map_or(0, |e| e.sequence_nr),
+                        journal.iter().any(|e| e.is_tombstone()),
+                    ),
+                );
+            }
+        }
+        for (pid, (seq, _)) in &inner.snapshots {
+            if let Ok((t, ty, id)) = parse_persistence_id_parts(pid)
+                && t == tenant
+            {
+                let head = heads
+                    .entry((ty.to_string(), id.to_string()))
+                    .or_insert((0, false));
+                head.0 = head.0.max(*seq);
+            }
+        }
+        Ok(heads
+            .into_iter()
+            .map(|((entity_type, entity_id), (sequence_nr, deleted))| {
+                temper_runtime::persistence::JournalHead {
+                    entity_type,
+                    entity_id,
+                    sequence_nr,
+                    deleted,
+                }
+            })
+            .collect())
+    }
+
     async fn list_entity_ids(
         &self,
         tenant: &str,

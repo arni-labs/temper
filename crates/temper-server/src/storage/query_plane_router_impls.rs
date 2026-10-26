@@ -11,6 +11,26 @@ use super::{
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for TenantStoreRouter {
+    async fn lagging_projections(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        self.store_for_tenant(tenant)
+            .await?
+            .lagging_query_projections(tenant)
+            .await
+            .map(Some)
+    }
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        self.store_for_tenant(tenant)
+            .await?
+            .query_projection_checkpoints(tenant)
+            .await
+    }
     async fn upsert_projection(
         &self,
         tenant: &str,
