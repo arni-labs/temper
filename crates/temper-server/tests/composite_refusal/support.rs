@@ -368,7 +368,12 @@ pub(super) async fn notice_took(state: &ServerState, action: &str) -> bool {
             .get_tenant_entity_state(&TenantId::default(), "Notice", NOTICE)
             .await
             .expect("record should exist");
-        if entity.state.events.iter().any(|event| event.action == action) {
+        if entity
+            .state
+            .events
+            .iter()
+            .any(|event| event.action == action)
+        {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
