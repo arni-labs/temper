@@ -1433,12 +1433,10 @@ impl EntityActor {
                     return Ok(());
                 }
 
-                debug_assert!(
-                    table.states.contains(&state.status),
-                    "PRECONDITION: status '{}' not in valid states {:?}",
-                    state.status,
-                    table.states
-                );
+                // The status need not be a state of the spec: a record waits in
+                // a state a new version dropped until its `[[carry]]` moves it
+                // (temper-server's `spec_change`). Only a rule that starts from
+                // the status can move it, so every other action is refused.
 
                 // Exhaustion is a normal refusal in both debug and release.
                 if state.events_since_snapshot >= MAX_EVENTS_SINCE_SNAPSHOT {

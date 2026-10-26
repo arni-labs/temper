@@ -318,8 +318,17 @@ async fn a_carry_moves_stored_records_out_of_a_dropped_state() {
           until then they wait in their old state"
         ]
     );
-    // The install answered before carrying: p1 waits where it was.
+    // The install answered before carrying: p1 waits where it was, in a state
+    // the version dropped, and no caller move starts there.
     assert_eq!(places.status("p1").await, "Placed");
+    let waiting = places
+        .act("p1", "Bring", serde_json::json!({ "commit": "c2" }))
+        .await;
+    assert_eq!(
+        waiting,
+        (false, "Placed".to_string()),
+        "p1 waits for its carry"
+    );
 
     let report = places.carry().await;
     assert_eq!((report.carried, report.failed), (1, Vec::new()));
