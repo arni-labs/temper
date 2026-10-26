@@ -61,10 +61,7 @@ impl Vocab<'_> {
 
     /// The senders that may bring `entity`'s record into `state`.
     fn armers(&self, entity: &str, state: &str, seen: &mut BTreeSet<String>, out: &mut Vec<Asker>) {
-        let Some(policies) = self.policies else {
-            return;
-        };
-        if !seen.insert(state.to_string()) {
+        if self.policies.is_none() || !seen.insert(state.to_string()) {
             return;
         }
         let automaton = self.automaton(entity);
@@ -94,7 +91,7 @@ impl Vocab<'_> {
         for action in enters {
             if action.kind == ActionKind::Input && self.outside_may(entity, &action.name) != May::No
             {
-                out.push(policies.caller(&action.name, entity));
+                out.push(Asker::Outside);
             }
             if answered.contains(action.name.as_str()) {
                 out.push(runtime());

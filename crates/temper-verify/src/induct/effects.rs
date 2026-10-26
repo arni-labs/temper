@@ -43,20 +43,38 @@ impl Moves<'_, '_, '_> {
                     let Some(sort) = v.var(entity, var) else {
                         continue;
                     };
-                    let value = match value {
-                        Arg::Param(p) => self.passed(action, params, p, sort),
-                        other => self.arg(entity, other, sort, "pre", &terms),
+                    let (value, passed) = match value {
+                        Arg::Param(p) => (
+                            self.passed(action, params, p, sort),
+                            params
+                                .get(p)
+                                .map_or("false".to_string(), |p| p.passed.clone()),
+                        ),
+                        other => (
+                            self.arg(entity, other, sort, "pre", &terms),
+                            "true".to_string(),
+                        ),
+                    };
+                    // The kernel writes a number only when the value is a
+                    // count, a non-negative integer, and a bool only when it
+                    // is one; otherwise a set is skipped and an add or
+                    // subtract adds nothing (`effect_args::count`).
+                    let ok = match sort {
+                        Sort::Int { .. } => format!("(and {passed} (>= {value} 0))"),
+                        _ => passed,
                     };
                     let now = terms[var].clone();
+                    let by = || format!("(ite {ok} {value} 0)");
                     let next = match op {
-                        AssignOp::Set => value,
-                        AssignOp::Add => format!("(+ {now} {value})"),
+                        AssignOp::Set => format!("(ite {ok} {value} {now})"),
+                        AssignOp::Add => format!("(+ {now} {})", by()),
                         AssignOp::Sub => {
                             // Bound once, so a chain of subtractions grows
                             // the term by a step each, not twice over.
-                            let (was, by) = (self.enc.local(), self.enc.local());
+                            let (was, less) = (self.enc.local(), self.enc.local());
                             format!(
-                                "(let (({was} {now}) ({by} {value})) (ite (>= {was} {by}) (- {was} {by}) 0))"
+                                "(let (({was} {now}) ({less} {})) (ite (>= {was} {less}) (- {was} {less}) 0))",
+                                by()
                             )
                         }
                     };
