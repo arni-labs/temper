@@ -578,6 +578,38 @@ async fn a_carry_is_tried_with_the_related_records_its_rules_read() {
     assert_eq!(places.status("p2").await, "Unplaced");
 }
 
+/// The check tries one record for each group of records that hold the same
+/// values of what it reads, and a value only a new invariant reads still
+/// splits a group: carried to Settled, the big place breaks the rule and the
+/// small one does not.
+#[tokio::test]
+async fn records_that_differ_only_in_what_an_invariant_reads_are_tried_apart() {
+    let places = Fixture::new("grouped").await;
+    places.install(PLACE).await.expect("first version");
+    places
+        .placed_with("p1", serde_json::json!({ "size": "small" }))
+        .await;
+    places
+        .placed_with("p2", serde_json::json!({ "size": "big" }))
+        .await;
+
+    let refused = places
+        .install(&format!(
+            "{}\n[[state]]\nname = \"size\"\ntype = \"string\"\ninitial = \"\"\n\n\
+             [[invariant]]\nname = \"OnlySmallSettles\"\n\
+             assert = \"status == 'Settled' => size != 'big'\"\n\n\
+             [[carry]]\nfrom = \"Placed\"\nto = \"Settled\"\n",
+            settles()
+        ))
+        .await
+        .expect_err("p2 is big, so carried to Settled it would break the rule");
+    assert!(
+        refused.contains("OnlySmallSettles") && refused.contains("p2"),
+        "{refused}"
+    );
+    assert!(!refused.contains("p1"), "p1 is small: {refused}");
+}
+
 /// katagami #1130's shape: a new counter, and a constraint on an existing
 /// action that reads it. A missing declared counter reads as its initial
 /// value (temper #167), so the stored place can still Bring.

@@ -31,10 +31,10 @@ mod records;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
-use temper_jit::table::{Standing, TransitionTable};
+use temper_jit::table::{Effect, Standing, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use temper_spec::automaton::{Automaton, Carry, parse_automaton};
-use temper_spec::predicate::Name;
+use temper_spec::predicate::{Arg, Name};
 
 use crate::entity_actor::{
     broken_invariant, build_eval_context_with_xref, process_action_with_xref,
@@ -76,12 +76,13 @@ pub struct SpecChangePlan {
     pub warnings: Vec<String>,
 }
 
-/// The records of one type in one state that a carry applies to.
+/// The records of one type in one state that a carry applies to, in groups
+/// that hold the same values of every name the check reads.
 struct Carried<'a> {
     status: String,
     action: String,
     carry: &'a Carry,
-    ids: Vec<String>,
+    groups: Vec<Vec<String>>,
 }
 
 impl ServerState {
@@ -250,10 +251,10 @@ impl ServerState {
                         status: group.status.clone(),
                         action: action.clone(),
                         carry,
-                        ids: Vec::new(),
+                        groups: Vec::new(),
                     })
-                    .ids
-                    .extend(group.ids);
+                    .groups
+                    .push(group.ids);
             } else if newly_stuck {
                 stuck
                     .entry(group.status.clone())
@@ -282,10 +283,19 @@ impl ServerState {
         }
     }
 
-    /// Try one carry on each record it applies to, as it is stored now, with
-    /// the move code every move runs and the related records it reads, as a
-    /// move resolves them. Each record it moves must hold to the new
+    /// Try one carry on the records it applies to, as they are stored now,
+    /// with the move code every move runs and the related records it reads,
+    /// as a move resolves them. Each record it moves must hold to the new
     /// version's invariants and have a way forward.
+    ///
+    /// One record is tried for each group. The records of a group share
+    /// their state and the values of every name the carry, the new version's
+    /// moves and invariants, and its related records' references read
+    /// ([`read_names`]), so the dry run ends the same way for each of them.
+    /// A record is read whole from its journal, and a store read took 0.35
+    /// to 0.8 s on a busy app drive (the Factory, 26 Oct 2026): one read
+    /// per record would hold an install for minutes. A group whose first
+    /// record cannot be read is tried with the next.
     async fn try_carry(
         &self,
         tenant: &TenantId,
@@ -305,14 +315,25 @@ impl ServerState {
             }
         }
         let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for id in carried.ids {
-            let Some(mut record) = self.current_record_state(tenant, entity_type, &id).await else {
-                failures
-                    .entry("it could not be read".to_string())
-                    .or_default()
-                    .push(id);
+        for group in carried.groups {
+            let mut ids = group.into_iter();
+            let mut tried = None;
+            for id in ids.by_ref() {
+                match self.current_record_state(tenant, entity_type, &id).await {
+                    Some(record) => {
+                        tried = Some((id, record));
+                        break;
+                    }
+                    None => failures
+                        .entry("it could not be read".to_string())
+                        .or_default()
+                        .push(id),
+                }
+            }
+            let Some((id, mut record)) = tried else {
                 continue;
             };
+            let group: Vec<String> = std::iter::once(id).chain(ids).collect();
             let related = self
                 .related_statuses_of(tenant, refs.clone(), &record.fields)
                 .await;
@@ -341,13 +362,15 @@ impl ServerState {
                 }
             };
             match why {
-                Some(why) => failures.entry(why).or_default().push(id),
-                None => plan.carries.push(CarryMove {
-                    entity_type: entity_type.to_string(),
-                    entity_id: id,
-                    action: carried.action.clone(),
-                    params: params.clone(),
-                }),
+                Some(why) => failures.entry(why).or_default().extend(group),
+                None => plan
+                    .carries
+                    .extend(group.into_iter().map(|entity_id| CarryMove {
+                        entity_type: entity_type.to_string(),
+                        entity_id,
+                        action: carried.action.clone(),
+                        params: params.clone(),
+                    })),
             }
         }
         for (why, ids) in failures {
@@ -400,8 +423,12 @@ fn affected_states(
     states
 }
 
-/// The names the moves of either version and the carries' guards read from
-/// a record.
+/// The names the check reads from a record, which group the stored records:
+/// what the moves of either version read, and under the new version what
+/// each carry's guard and effects read, what its invariants read, and the
+/// fields naming the related records its moves and invariants read. Records
+/// in one state that agree on all of them end the same way in a carry's dry
+/// run, so [`ServerState::try_carry`] reads one record per group.
 fn read_names(
     old: &TransitionTable,
     new: &TransitionTable,
@@ -413,12 +440,46 @@ fn read_names(
             names.extend(table.move_reads(action));
         }
     }
+    let mut read = |name: Name<'_>| {
+        if let Name::Var(var) = name {
+            names.insert(var.to_string());
+        }
+    };
     for (_, carry) in carries {
-        carry.guard.for_each_name(&mut |name| {
-            if let Name::Var(var) = name {
-                names.insert(var.to_string());
+        carry.guard.for_each_name(&mut read);
+    }
+    for invariant in &new.invariants {
+        invariant.assert.for_each_name(&mut read);
+    }
+    for (action, _) in carries {
+        names.extend(new.move_reads(action));
+        let effects = new
+            .rules
+            .iter()
+            .filter(|rule| rule.name == *action)
+            .flat_map(|rule| &rule.effects);
+        for effect in effects {
+            let (var, value) = match effect {
+                Effect::SetCounter { var, value }
+                | Effect::AddCounter { var, value }
+                | Effect::SubCounter { var, value }
+                | Effect::SetBool { var, value }
+                | Effect::ListAppend { var, value } => (var, value),
+                Effect::ListRemoveAt { var, index } => (var, index),
+                _ => continue,
+            };
+            names.insert(var.clone());
+            if let Arg::Var(read) = value {
+                names.insert(read.clone());
             }
-        });
+        }
+    }
+    let actions = carries
+        .iter()
+        .map(|(action, _)| action.as_str())
+        .chain(new.caller_moves());
+    for action in actions {
+        names.extend(new.related_refs(action).into_iter().map(|(_, field)| field));
     }
     names.into_iter().collect()
 }
