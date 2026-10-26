@@ -194,3 +194,7 @@ pub(super) fn fall_back(
     out.extend(specific);
     Ok((out, refused))
 }
+
+#[cfg(test)]
+#[path = "general_test.rs"]
+mod tests;
