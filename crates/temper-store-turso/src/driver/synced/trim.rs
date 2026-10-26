@@ -69,7 +69,7 @@ impl SyncCopy {
     ) -> Result<u64, PersistenceError> {
         self.require_copying()?;
         let started = Instant::now();
-        let confirmed = self.last_pushed_hint().map_err(storage_error)?;
+        let confirmed = self.last_pushed_hint().await.map_err(storage_error)?;
         let conn = self.connect().await.map_err(storage_error)?;
         let mut trimmed = 0u64;
         let mut batches = 0u32;
