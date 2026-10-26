@@ -11,7 +11,11 @@
 //!
 //! A rule whose premise no run meets says nothing, proved or not
 //! ([`vacuity`](super::vacuity)): the solver rules that out first, and a
-//! walk to the first state that meets the premise is the fallback. Each
+//! walk to the first state that meets the premise is the fallback. An
+//! invariant whose premise no run meets only because Cedar lets nobody send
+//! a move is checked again with every sender allowed: when a run meets the
+//! premise there and the rule still holds, its premise waits on Cedar the
+//! app has yet to write, and the verdict names the moves Cedar refuses. Each
 //! rule is proved on its own ([`JointProof`]), so an install keeps each
 //! verdict by what that rule reads.
 
@@ -52,6 +56,10 @@ pub enum JointVerdict {
     Invariant(JointInvariantResult, Option<RuleProof>),
     /// Walked, with the proof that was tried and did not hold.
     Liveness(JointLivenessResult, Option<RuleProof>),
+    /// An invariant whose premise no run meets as Cedar stands, which holds
+    /// with every sender allowed and whose premise a run meets there: that
+    /// verdict, and the moves in scope Cedar lets nobody outside send.
+    WaitsOnCedar(Box<JointVerdict>, Vec<String>),
 }
 
 impl JointVerdict {
@@ -61,6 +69,7 @@ impl JointVerdict {
             JointVerdict::Proved(_, premise) => premise.met(),
             JointVerdict::Invariant(walked, _) => walked.holds(),
             JointVerdict::Liveness(walked, _) => walked.holds(),
+            JointVerdict::WaitsOnCedar(open, _) => open.holds(),
         }
     }
 
@@ -70,6 +79,7 @@ impl JointVerdict {
             JointVerdict::Proved(proof, _) => format!("{}.{}", proof.owner, proof.rule),
             JointVerdict::Invariant(walked, _) => format!("{}.{}", walked.entity, walked.invariant),
             JointVerdict::Liveness(walked, _) => format!("{}.{}", walked.entity, walked.name),
+            JointVerdict::WaitsOnCedar(open, _) => open.rule(),
         }
     }
 
@@ -91,6 +101,7 @@ impl JointVerdict {
                 LivenessOutcome::Vacuous { .. } => "VACUOUS",
                 LivenessOutcome::Incomplete { .. } => "INCOMPLETE",
             },
+            JointVerdict::WaitsOnCedar(open, _) => open.tag(),
         }
     }
 }
@@ -101,6 +112,17 @@ impl fmt::Display for JointVerdict {
             JointVerdict::Proved(proof, premise) => return proved(f, &self.rule(), proof, premise),
             JointVerdict::Invariant(walked, tried) => (walked.to_string(), tried),
             JointVerdict::Liveness(walked, tried) => (walked.to_string(), tried),
+            JointVerdict::WaitsOnCedar(open, unsent) => {
+                write!(
+                    f,
+                    "{open}\n  as the app's Cedar stands no run meets its premise; with every \
+                     sender allowed a run meets it and the rule still holds"
+                )?;
+                return match unsent.is_empty() {
+                    true => Ok(()),
+                    false => write!(f, ". Cedar lets nobody send {}", unsent.join(", ")),
+                };
+            }
         };
         f.write_str(walked.trim_end())?;
         match tried.as_ref().and_then(RuleProof::shortfall) {
@@ -159,7 +181,31 @@ impl JointProof {
     /// without end. A rule that reads a type the app does not declare is
     /// left to the walk, which says so, and so is an `eventually` rule
     /// without a measure, which nothing guesses.
+    ///
+    /// An invariant whose premise no run meets as Cedar stands is checked
+    /// again with every sender allowed ([`JointVerdict::WaitsOnCedar`]).
+    /// One that breaks there holds only because Cedar refuses a move, and
+    /// one whose premise no run meets there is dead in its spec: both keep
+    /// the verdict as Cedar stands.
     pub fn check(&self, bound: Bound<'_>, proof_time: Duration) -> JointVerdict {
+        let verdict = self.decide(bound, proof_time);
+        if verdict.tag() != "VACUOUS" {
+            return verdict;
+        }
+        let Some(open) = self.open() else {
+            return verdict;
+        };
+        let open = open.decide(bound, proof_time);
+        match (open.holds(), self) {
+            (true, JointProof::Invariant(rule)) => {
+                JointVerdict::WaitsOnCedar(Box::new(open), rule.unsent())
+            }
+            _ => verdict,
+        }
+    }
+
+    /// The verdict with the app's Cedar deciding each move.
+    fn decide(&self, bound: Bound<'_>, proof_time: Duration) -> JointVerdict {
         let deadline = Instant::now().checked_add(proof_time);
         match self {
             JointProof::Invariant(rule) => {

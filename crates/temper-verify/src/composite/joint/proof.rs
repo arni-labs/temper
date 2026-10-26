@@ -45,6 +45,22 @@ impl JointProof {
         let text = format!("{self:?}");
         format!("{:x}", Sha256::digest(text.as_bytes()))
     }
+
+    /// The same invariant's proof with every sender allowed, when Cedar
+    /// decides this one. None for an `eventually` rule: more senders may
+    /// keep a record from its goal, so its verdict there says nothing of
+    /// the app's Cedar.
+    pub(super) fn open(&self) -> Option<JointProof> {
+        let JointProof::Invariant(rule) = self else {
+            return None;
+        };
+        let open = rule.app.open()?;
+        invariant_proofs(&open, |owner, name| {
+            owner == rule.entity && name == rule.invariant.name
+        })
+        .pop()
+        .map(JointProof::Invariant)
+    }
 }
 
 /// The proof of every invariant and `eventually` rule of `automatons`, with
@@ -52,7 +68,7 @@ impl JointProof {
 /// liveness properties'.
 pub fn joint_proofs(automatons: &[&Automaton], policies: Option<&SendAnalysis>) -> Vec<JointProof> {
     let app = App::new(automatons, policies);
-    invariant_proofs(&app)
+    invariant_proofs(&app, |_, _| true)
         .into_iter()
         .map(JointProof::Invariant)
         .chain(liveness_proofs(&app).into_iter().map(JointProof::Liveness))
@@ -98,6 +114,16 @@ impl App {
             .iter()
             .map(|a| (a.automaton.name.as_str(), a))
             .collect()
+    }
+
+    /// The app with every sender allowed, when it has Cedar.
+    fn open(&self) -> Option<Self> {
+        self.0.policies.as_ref()?;
+        Some(Self(Arc::new(Parts {
+            automatons: self.0.automatons.clone(),
+            policies: None,
+            answered: Answered::default(),
+        })))
     }
 
     pub(super) fn policies(&self) -> Option<&SendAnalysis> {

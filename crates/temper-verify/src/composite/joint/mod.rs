@@ -85,7 +85,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use temper_authz::SendAnalysis;
-use temper_spec::automaton::{Automaton, Invariant};
+use temper_spec::automaton::{ActionKind, Automaton, Invariant};
 use temper_spec::predicate::Expr;
 
 pub use model::DroppedReaction;
@@ -252,19 +252,46 @@ impl InvariantProof {
         }
         result
     }
+
+    /// The actions of the types in scope meant to come from outside (input
+    /// and composite) that Cedar lets nobody outside send, as `Type.Action`.
+    pub(super) fn unsent(&self) -> Vec<String> {
+        let Ok(model) = &self.model else {
+            return Vec::new();
+        };
+        let by_name = self.app.by_name();
+        self.scope
+            .iter()
+            .flat_map(|entity| {
+                by_name[entity.as_str()]
+                    .actions
+                    .iter()
+                    .filter(|action| {
+                        matches!(action.kind, ActionKind::Input | ActionKind::Composite)
+                    })
+                    .filter(|action| !model.sendable(entity, &action.name))
+                    .map(move |action| format!("{entity}.{}", action.name))
+            })
+            .collect()
+    }
 }
 
-/// The proofs of every `[[invariant]]` of `app`: one per invariant, on the
+/// The proofs of each `[[invariant]]` of `app` that `wanted` picks by its
+/// type and name: one per invariant, on the
 /// joint model of its entity and the types it names, with what a
 /// `[[liveness]]` there relies on sent from outside by whoever Cedar lets,
 /// since a rule must hold through those moves too. One that names no other
 /// type is proved on its entity alone, by the same proof and walk, with the
 /// kernel's moves and Cedar that the per-entity cascade does not read.
-fn invariant_proofs(app: &App) -> Vec<InvariantProof> {
+fn invariant_proofs(app: &App, wanted: impl Fn(&str, &str) -> bool) -> Vec<InvariantProof> {
     let by_name = app.by_name();
     let mut proofs = Vec::new();
     for (name, automaton) in &by_name {
-        for invariant in &automaton.invariants {
+        for invariant in automaton
+            .invariants
+            .iter()
+            .filter(|invariant| wanted(name, &invariant.name))
+        {
             let relies_on = |scope: &BTreeSet<String>| {
                 scope
                     .iter()
@@ -302,7 +329,7 @@ pub fn verify_joint_invariants(
     policies: Option<&SendAnalysis>,
     bound: Bound<'_>,
 ) -> Vec<JointInvariantResult> {
-    invariant_proofs(&App::new(automatons, policies))
+    invariant_proofs(&App::new(automatons, policies), |_, _| true)
         .iter()
         .map(|proof| proof.walk(bound))
         .collect()
