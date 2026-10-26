@@ -131,15 +131,36 @@ impl<'v, 'a> Enc<'v, 'a> {
 
     /// `expr`, read on `owner`'s record in `frame`.
     pub(super) fn expr(&self, expr: &Expr, owner: &str, frame: &str) -> String {
+        self.read(expr, owner, frame, &BTreeMap::new())
+    }
+
+    /// An action's guard, read on `owner`'s record before the move, with
+    /// `params` the terms of the move's parameters by name (`params.p`).
+    pub(super) fn guard(
+        &self,
+        expr: &Expr,
+        owner: &str,
+        params: &BTreeMap<String, (String, Sort)>,
+    ) -> String {
+        self.read(expr, owner, "pre", params)
+    }
+
+    fn read(
+        &self,
+        expr: &Expr,
+        owner: &str,
+        frame: &str,
+        params: &BTreeMap<String, (String, Sort)>,
+    ) -> String {
         match expr {
             Expr::Const(b) => b.to_string(),
-            Expr::Not(e) => format!("(not {})", self.expr(e, owner, frame)),
-            Expr::And(es) => self.join("and", es, owner, frame),
-            Expr::Or(es) => self.join("or", es, owner, frame),
+            Expr::Not(e) => format!("(not {})", self.read(e, owner, frame, params)),
+            Expr::And(es) => self.join("and", es, owner, frame, params),
+            Expr::Or(es) => self.join("or", es, owner, frame, params),
             Expr::Implies(a, b) => format!(
                 "(=> {} {})",
-                self.expr(a, owner, frame),
-                self.expr(b, owner, frame)
+                self.read(a, owner, frame, params),
+                self.read(b, owner, frame, params)
             ),
             Expr::Var(name) => match self.v.var(owner, name) {
                 Some(Sort::Bool) => Self::var(frame, owner, name),
@@ -148,8 +169,8 @@ impl<'v, 'a> Enc<'v, 'a> {
             },
             Expr::Compare { lhs, op, rhs } => {
                 let terms = self
-                    .operand(lhs, owner, frame)
-                    .and_then(|l| Ok((l, self.operand(rhs, owner, frame)?)));
+                    .operand(lhs, owner, frame, params)
+                    .and_then(|l| Ok((l, self.operand(rhs, owner, frame, params)?)));
                 match terms {
                     Ok((l, r)) => self.compare(l, *op, r).unwrap_or_else(|| {
                         self.unknown(format!(
@@ -164,7 +185,7 @@ impl<'v, 'a> Enc<'v, 'a> {
                 set: Set::List(items),
                 negated,
             } => {
-                let value = match self.operand(value, owner, frame) {
+                let value = match self.operand(value, owner, frame, params) {
                     Ok(value) => value,
                     Err(reason) => return self.unknown(reason),
                 };
@@ -195,8 +216,18 @@ impl<'v, 'a> Enc<'v, 'a> {
         }
     }
 
-    fn join(&self, op: &str, es: &[Expr], owner: &str, frame: &str) -> String {
-        let parts: Vec<String> = es.iter().map(|e| self.expr(e, owner, frame)).collect();
+    fn join(
+        &self,
+        op: &str,
+        es: &[Expr],
+        owner: &str,
+        frame: &str,
+        params: &BTreeMap<String, (String, Sort)>,
+    ) -> String {
+        let parts: Vec<String> = es
+            .iter()
+            .map(|e| self.read(e, owner, frame, params))
+            .collect();
         format!("({op} {})", parts.join(" "))
     }
 
@@ -209,7 +240,13 @@ impl<'v, 'a> Enc<'v, 'a> {
     }
 
     /// An operand's term, or why the proof does not hold it.
-    fn operand(&self, operand: &Operand, owner: &str, frame: &str) -> Result<Term, String> {
+    fn operand(
+        &self,
+        operand: &Operand,
+        owner: &str,
+        frame: &str,
+        params: &BTreeMap<String, (String, Sort)>,
+    ) -> Result<Term, String> {
         let same_id = |id_field: &str| matches!(id_field, "Id" | "id");
         match operand {
             Operand::Status => Ok(Term::Status(owner.to_string(), Self::status(frame, owner))),
@@ -248,6 +285,10 @@ impl<'v, 'a> Enc<'v, 'a> {
             } else {
                 format!("a record found through a field ({entity_type}[{id_field}])")
             }),
+            Operand::Param(name) => params
+                .get(name)
+                .map(|(term, sort)| Term::Val(term.clone(), *sort))
+                .ok_or_else(|| format!("a parameter of a move (params.{name})")),
             Operand::Lit(l) => Ok(Term::Lit(l.clone())),
         }
     }

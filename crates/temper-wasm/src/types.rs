@@ -104,6 +104,12 @@ pub struct WasmInvocationResult {
     pub error: Option<String>,
     /// Execution duration in milliseconds.
     pub duration_ms: u64,
+    /// The module answered empty (`"empty": true`): it has nothing to
+    /// report, and the kernel moves nothing, whatever the trigger's
+    /// `on_success` names. `"action": ""` is not empty: modules have long
+    /// written it to mean "send `on_success`".
+    #[serde(default)]
+    pub empty_answer: bool,
 }
 
 /// Resource limits for WASM module execution (TigerStyle budgets).
@@ -300,6 +306,7 @@ mod tests {
             success: true,
             error: None,
             duration_ms: 250,
+            empty_answer: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: WasmInvocationResult = serde_json::from_str(&json).unwrap();

@@ -258,9 +258,10 @@ pub struct Integration {
     /// WASM module name (required when `type = "wasm"`).
     #[serde(default)]
     pub module: Option<String>,
-    /// Action to dispatch on successful WASM execution (required when `type = "wasm"`).
-    #[serde(default)]
-    pub on_success: Option<String>,
+    /// The actions a successful call may take, in the order the kernel tries
+    /// them (see [`ActionTrigger::on_success`]).
+    #[serde(default, with = "trigger::one_or_many")]
+    pub on_success: Vec<String>,
     /// Action to dispatch on failed WASM execution (required when `type = "wasm"`).
     #[serde(default)]
     pub on_failure: Option<String>,

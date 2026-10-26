@@ -43,6 +43,9 @@ pub struct EvalContext {
     /// Related entities' statuses, keyed by `(entity_type, id_field)`.
     /// A reference absent from the map is unset.
     pub related: RelatedMap,
+    /// The parameters of the move being taken, which its guard reads as
+    /// `params.p`. An absent parameter reads as `null`.
+    pub params: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Related entities' statuses keyed by `(entity_type, id_field)`.
@@ -107,6 +110,10 @@ impl Env for GuardEnv<'_> {
             _ => Some(vec![Val::Null]),
         }
     }
+
+    fn param(&self, name: &str) -> Val<'_> {
+        self.ctx.params.get(name).map_or(Val::Null, Val::json)
+    }
 }
 
 /// Whether `guard` holds (hot path).
@@ -161,6 +168,7 @@ pub fn check_detailed(
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
+            Name::Param(param) => (format!("params.{param}"), render(env.param(param))),
             // Refused in guards at load (validate_predicates).
             Name::CrossField {
                 entity_type,

@@ -78,7 +78,7 @@ impl JointModel {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            if !call_may_answer(call.on_success.as_deref(), &t.name)
+            if !call_may_answer(&call.on_success, &t.name)
                 || !self.enabled(&call.to, t, state, Blind::Nothing)
             {
                 continue;

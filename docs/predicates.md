@@ -39,7 +39,7 @@ unary   = "!" unary | atom
 atom    = "(" expr ")" | "empty" "(" name ")" | name | operand cmp operand
         | operand [ "not" ] "in" ( "[" literal, ... "]" | name )
 cmp     = "==" | "!=" | "<" | "<=" | ">" | ">="
-operand = "status" | name | "len" "(" name ")" | Type "[" name "]" "." "status" | literal
+operand = "status" | name | "params" "." name | "len" "(" name ")" | Type "[" name "]" "." "status" | literal
 literal = integer | 'string' | true | false | null
 ```
 
@@ -52,6 +52,7 @@ literal = integer | 'string' | true | false | null
   - required: `Workspace[workspace_id].status in ['Active']`
   - optional: `empty(workspace_id) || Workspace[workspace_id].status in ['Active']`
   - only a bad state blocks: `Workspace[workspace_id].status not in ['Frozen', 'Archived']`
+- **`params.p`** is the parameter `p` of the move being taken. Only an action's guard reads one, and only a parameter its action declares; that is how the `on_success` actions a module's answer lists choose between its values (see the agent guide).
 - **`=>`** is implication: `status in ['Done'] => approved`.
 
 ## Effects
@@ -121,7 +122,7 @@ Effects that read `params.p` are verified with `p` unknown: a counter takes ever
 
 ## Proof hints
 
-Every `[[invariant]]`, over one record or several (one that reads `Type[...]`), and every `[[liveness]]` with `eventually`, is checked when an app is installed, and by `temper verify`. Each rule is proved by induction first, for every run, and walked on the joint model of its type and the types it names, which covers the runs a bounded walk reaches, only when the proof does not hold. Both read the kernel's own moves and the app's Cedar, which the per-entity cascade does not. A WASM module's or adapter's answer is a kernel move: the trigger's `on_success` when it names one, and otherwise any action of the record, since the module's result names it and the kernel dispatches it with no Cedar check. The proof and the walk take exactly those answers. The callee chooses returned parameters independently of call-time fields; constraints compare them with the record when the answer arrives. Background WASM answers run as `service:wasm-runtime`, and adapter answers as `service:platform-dispatch`; an entity reaction without an explicit principal inherits that sender. An invariant with no lemmas is tried at every state, then with the prover's own guesses about the flags it reads. Hints written beside the rule give the proof what it cannot guess:
+Every `[[invariant]]`, over one record or several (one that reads `Type[...]`), and every `[[liveness]]` with `eventually`, is checked when an app is installed, and by `temper verify`. Each rule is proved by induction first, for every run, and walked on the joint model of its type and the types it names, which covers the runs a bounded walk reaches, only when the proof does not hold. Both read the kernel's own moves and the app's Cedar, which the per-entity cascade does not. A WASM module's or adapter's answer is a kernel move: one of the trigger's `on_success` actions when it names any (the first the record takes with the module's values; the proof and the walk take any of them whose guard may hold with some values, since the record decides again when the answer commits), and otherwise any action of the record, since the module's result names it and the kernel dispatches it with no Cedar check. The proof and the walk take exactly those answers. The callee chooses returned parameters independently of call-time fields; constraints compare them with the record when the answer arrives. Background WASM answers run as `service:wasm-runtime`, and adapter answers as `service:platform-dispatch`; an entity reaction without an explicit principal inherits that sender. An invariant with no lemmas is tried at every state, then with the prover's own guesses about the flags it reads. Hints written beside the rule give the proof what it cannot guess:
 
 ```toml
 [[invariant]]

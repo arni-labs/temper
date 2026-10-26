@@ -414,7 +414,14 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                 .collect();
             out.push(format!("(or {})", from.join(" ")));
         }
-        out.push(self.enc.expr(&action.guard, entity, "pre"));
+        let terms: BTreeMap<String, (String, Sort)> = params
+            .iter()
+            .map(|(name, p)| {
+                let sort = self.enc.v.param(action, name).unwrap_or(Sort::Str);
+                (name.clone(), (p.term.clone(), sort))
+            })
+            .collect();
+        out.push(self.enc.guard(&action.guard, entity, &terms));
         for constraint in &action.constraints {
             let (param, field, rel) = match constraint {
                 ActionConstraint::ParamNonempty { param } => (param, None, ""),

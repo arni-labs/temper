@@ -167,7 +167,8 @@ impl JointModel {
                     owned(owner, id_field);
                     owned(entity_type, field);
                 }
-                Name::Status => {}
+                // A move's parameter is no field of a record.
+                Name::Status | Name::Param(_) => {}
             });
         }
         let (mut models, reactions) = tracked(by_name, scope, read.clone(), Records::ById);
