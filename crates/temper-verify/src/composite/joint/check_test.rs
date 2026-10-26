@@ -382,6 +382,16 @@ fn a_scheduled_action_fires_in_the_proof() {
     };
     let why = tried.shortfall().expect("not proved");
     assert!(why.contains("after Parent.Unlock.scheduled fires"), "{why}");
+    // A lemma that the unlock never waits does not get round it: closing
+    // arms it.
+    let never_waits = "(not ($has.Parent.Unlock.scheduled mk/Parent.Unlock.scheduled))";
+    let rule = child(&[LOCKED_PAST_OPEN, never_waits]);
+    let verdict = invariant(&[&unlocks, &rule], budget());
+    let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
+        panic!("proved with a lemma that the unlock never waits: {verdict}");
+    };
+    let why = tried.shortfall().expect("not proved");
+    assert!(why.contains("lemma1 fails after Parent.Close"), "{why}");
 }
 
 /// An action nothing outside may send: a sealing or closed parent locks.
