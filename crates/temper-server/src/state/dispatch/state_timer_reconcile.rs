@@ -203,6 +203,10 @@ impl ServerState {
         );
         let reservation = if let Some(committed) = committed {
             timer = committed;
+            // Keep the durable arm's clock, payload, caller and row identity,
+            // but fence its replacement at the record we just reconciled.
+            // Non-resetting actions advance the journal without a new arm.
+            timer.sequence_nr = current.sequence_nr;
             Reservation::Committed
         } else {
             Reservation::Missing
