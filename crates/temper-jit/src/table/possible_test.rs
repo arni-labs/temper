@@ -122,6 +122,22 @@ fn a_guard_on_the_callers_parameters_blocks_only_through_its_other_parts() {
         ),
         "ready is false whatever the call"
     );
+
+    // The parts that read no parameter decide in every branch.
+    let place = retire_when("(ready && params.rain >= 50) || brought > 2");
+    let neither = place.stored_context(&values(json!({ "brought": 1 })));
+    assert!(
+        matches!(
+            place.blocked("Placed", &neither, "Retire"),
+            Some(Blocked::Guard(_))
+        ),
+        "neither branch can hold whatever the call"
+    );
+    assert_eq!(place.blocked("Placed", &ready, "Retire"), None);
+    let brought = place.stored_context(&values(json!({ "brought": 3 })));
+    assert_eq!(place.blocked("Placed", &brought, "Retire"), None);
+    let place = retire_when("!(params.rain >= 50 && ready)");
+    assert_eq!(place.blocked("Placed", &ready, "Retire"), None);
 }
 
 #[test]

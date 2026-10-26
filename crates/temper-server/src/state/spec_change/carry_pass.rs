@@ -16,11 +16,20 @@
 //! again. A carry that cannot be made is logged and its record stays where it
 //! is.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use temper_jit::swap::SwapController;
+use temper_jit::table::TransitionTable;
 use temper_runtime::tenant::TenantId;
 
 use super::{CarryMove, SpecChange, SpecChangePlan, SpecChangeRefused};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
+
+/// The version a type is served from: the controller that swaps its table,
+/// and how many swaps it has made.
+type Served = (Arc<SwapController>, u64);
 
 /// What one carry pass did in one tenant.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,10 +47,7 @@ impl ServerState {
     /// [`Self::spawn_carry_stranded`].
     pub async fn carry_stranded(&self, tenant: &TenantId) -> CarryReport {
         let _pass = self.carry_pass.lock().await;
-        let installed: Vec<(
-            SpecChange,
-            std::sync::Arc<temper_jit::table::TransitionTable>,
-        )> = {
+        let installed: Vec<(SpecChange, Arc<TransitionTable>, Served)> = {
             let registry = self.registry.read().expect("registry lock poisoned");
             registry
                 .entity_types(tenant)
@@ -53,22 +59,38 @@ impl ServerState {
                             entity_type: entity_type.to_string(),
                             proposed: spec.automaton.clone(),
                         };
-                        (change, spec.table())
+                        let swap = spec.swap_controller();
+                        (change, spec.table(), (Arc::clone(swap), swap.version()))
                     })
                 })
                 .collect()
         };
         let mut plan = SpecChangePlan::default();
         let mut refused = SpecChangeRefused::default();
-        for (change, table) in &installed {
+        let mut planned: BTreeMap<&str, &Served> = BTreeMap::new();
+        for (change, table, served) in &installed {
             self.check_type(tenant, change, (table, table), &mut plan, &mut refused)
                 .await;
+            planned.insert(&change.entity_type, served);
         }
         let mut report = CarryReport {
             carried: 0,
             failed: refused.reasons,
         };
         for carry in &plan.carries {
+            // A carry's values are its move's parameters, so it is made only
+            // under the version that planned it. An install that swapped the
+            // type since starts its own pass, which waits for this one and
+            // plans from the version it installed.
+            if !self.still_serves(
+                tenant,
+                &carry.entity_type,
+                planned[carry.entity_type.as_str()],
+            ) {
+                tracing::info!(tenant = %tenant, entity_type = %carry.entity_type,
+                    "a newer version was installed during the carry pass; its pass makes the rest");
+                break;
+            }
             match self.make_carry(tenant, carry).await {
                 Ok(()) => report.carried += 1,
                 Err(error) => report.failed.push(error),
@@ -127,6 +149,16 @@ impl ServerState {
             })
             .cloned()
             .collect()
+    }
+
+    /// Whether `tenant` still serves `entity_type` from the version `served`
+    /// names.
+    fn still_serves(&self, tenant: &TenantId, entity_type: &str, served: &Served) -> bool {
+        let registry = self.registry.read().expect("registry lock poisoned");
+        registry.get_spec(tenant, entity_type).is_some_and(|spec| {
+            let swap = spec.swap_controller();
+            Arc::ptr_eq(swap, &served.0) && swap.version() == served.1
+        })
     }
 
     /// Make one carry as a move of the platform.

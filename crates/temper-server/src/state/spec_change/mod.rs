@@ -14,9 +14,10 @@
 //!
 //! Records are read once per type, and only in the states a change can
 //! affect: those the version drops, those a move with changed conditions
-//! starts from ([`TransitionTable::move_conditions`]), and those a carry
-//! starts from. One grouped catalog query covers each record whose catalog
-//! row is current; each other record is read on its own.
+//! starts from ([`TransitionTable::move_conditions`]), and those a carry of
+//! either version starts from ([`reads`]). One grouped catalog query covers
+//! each record whose catalog row is current; each other record is read on
+//! its own. A carry is tried on one record of each group.
 //!
 //! Reported, not refused: records the installed version already leaves with
 //! no way forward, moves that are no longer possible for records that keep
@@ -26,20 +27,21 @@
 
 mod answer;
 mod carry_pass;
+mod reads;
 mod records;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
-use temper_jit::table::{Effect, Standing, TransitionTable};
+use temper_jit::table::{Standing, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use temper_spec::automaton::{Automaton, Carry, parse_automaton};
-use temper_spec::predicate::{Arg, Name};
 
 use crate::entity_actor::{
     broken_invariant, build_eval_context_with_xref, process_action_with_xref,
 };
 use crate::state::ServerState;
+use reads::{affected_states, carry_moves, read_names, reads_related};
 
 pub use answer::{SpecChangeRefused, StuckRecords};
 pub use carry_pass::CarryReport;
@@ -205,10 +207,21 @@ impl ServerState {
         let mut carried: BTreeMap<String, Carried<'_>> = BTreeMap::new();
         let mut stuck: BTreeMap<String, (Standing, Vec<String>)> = BTreeMap::new();
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let waits_for = carry_moves(old);
         for group in groups {
             let before = old.stored_context(&group.values);
             let after = new.stored_context(&group.values);
-            let was = old.standing(&group.status, &before);
+            // A record a carry of the installed version selects waits for
+            // it: the carry is its way forward, so a new version must carry
+            // it too.
+            let was = if waits_for
+                .iter()
+                .any(|action| old.blocked(&group.status, &before, action).is_none())
+            {
+                Standing::Free
+            } else {
+                old.standing(&group.status, &before)
+            };
             let now = new.standing(&group.status, &after);
             let newly_stuck = match (&was, &now) {
                 (_, Standing::Free | Standing::Rests) => {
@@ -347,6 +360,19 @@ impl ServerState {
             } else if let Some(broken) = broken_invariant(&record, new) {
                 Some(format!("once carried it would break {broken}"))
             } else {
+                // A carry that sets a field naming a related record points
+                // the record at another one, which its next moves read.
+                let repointed = carried
+                    .carry
+                    .set
+                    .keys()
+                    .any(|name| refs.iter().any(|(_, field)| field == name));
+                let related = if repointed {
+                    self.related_statuses_of(tenant, refs.clone(), &record.fields)
+                        .await
+                } else {
+                    related
+                };
                 let ctx = build_eval_context_with_xref(&record, &related, new, None);
                 match new.standing(&record.status, &ctx) {
                     Standing::Free | Standing::Rests => None,
@@ -383,111 +409,4 @@ impl ServerState {
             ));
         }
     }
-}
-
-/// The states whose records a change can leave with no way forward, or a
-/// carry moves: those `new` drops, those a move whose conditions changed
-/// starts from under either version, and those a carry starts from.
-fn affected_states(
-    old: &TransitionTable,
-    new: &TransitionTable,
-    carries: &[(String, &Carry)],
-) -> BTreeSet<String> {
-    let mut states: BTreeSet<String> = old
-        .states
-        .iter()
-        .filter(|state| !new.states.contains(state))
-        .cloned()
-        .collect();
-    let moves: BTreeSet<&str> = old
-        .caller_moves()
-        .into_iter()
-        .chain(new.caller_moves())
-        .collect();
-    for action in moves {
-        if old.move_conditions(action) == new.move_conditions(action) {
-            continue;
-        }
-        for rule in old.rules.iter().chain(&new.rules) {
-            if rule.name != action {
-                continue;
-            }
-            if rule.from_states.is_empty() {
-                states.extend(old.states.iter().cloned());
-            } else {
-                states.extend(rule.from_states.iter().cloned());
-            }
-        }
-    }
-    states.extend(carries.iter().map(|(_, carry)| carry.from.clone()));
-    states
-}
-
-/// The names the check reads from a record, which group the stored records:
-/// what the moves of either version read, and under the new version what
-/// each carry's guard and effects read, what its invariants read, and the
-/// fields naming the related records its moves and invariants read. Records
-/// in one state that agree on all of them end the same way in a carry's dry
-/// run, so [`ServerState::try_carry`] reads one record per group.
-fn read_names(
-    old: &TransitionTable,
-    new: &TransitionTable,
-    carries: &[(String, &Carry)],
-) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    for table in [old, new] {
-        for action in table.caller_moves() {
-            names.extend(table.move_reads(action));
-        }
-    }
-    let mut read = |name: Name<'_>| {
-        if let Name::Var(var) = name {
-            names.insert(var.to_string());
-        }
-    };
-    for (_, carry) in carries {
-        carry.guard.for_each_name(&mut read);
-    }
-    for invariant in &new.invariants {
-        invariant.assert.for_each_name(&mut read);
-    }
-    for (action, _) in carries {
-        names.extend(new.move_reads(action));
-        let effects = new
-            .rules
-            .iter()
-            .filter(|rule| rule.name == *action)
-            .flat_map(|rule| &rule.effects);
-        for effect in effects {
-            let (var, value) = match effect {
-                Effect::SetCounter { var, value }
-                | Effect::AddCounter { var, value }
-                | Effect::SubCounter { var, value }
-                | Effect::SetBool { var, value }
-                | Effect::ListAppend { var, value } => (var, value),
-                Effect::ListRemoveAt { var, index } => (var, index),
-                _ => continue,
-            };
-            names.insert(var.clone());
-            if let Arg::Var(read) = value {
-                names.insert(read.clone());
-            }
-        }
-    }
-    let actions = carries
-        .iter()
-        .map(|(action, _)| action.as_str())
-        .chain(new.caller_moves());
-    for action in actions {
-        names.extend(new.related_refs(action).into_iter().map(|(_, field)| field));
-    }
-    names.into_iter().collect()
-}
-
-/// Whether a guard of `action` reads a related record.
-fn reads_related(table: &TransitionTable, action: &str) -> bool {
-    table
-        .rules
-        .iter()
-        .any(|rule| rule.name == action && !rule.guard.related_types().is_empty())
 }
