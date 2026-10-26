@@ -44,11 +44,13 @@ impl JointModel {
         let asked: Vec<BTreeSet<String>> = specs
             .iter()
             .map(|spec| {
-                self.unchecked
-                    .asked(source, |action| match &spec.on_success {
-                        Some(name) => name == action,
-                        None => internal.is_some_and(|names| names.contains(action)),
-                    })
+                self.unchecked.asked(source, |action| {
+                    if spec.on_success.is_empty() {
+                        internal.is_some_and(|names| names.contains(action))
+                    } else {
+                        spec.on_success.iter().any(|name| name == action)
+                    }
+                })
             })
             .collect();
         let mut started = Vec::new();

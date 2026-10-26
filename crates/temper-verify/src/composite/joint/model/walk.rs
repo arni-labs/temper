@@ -244,7 +244,7 @@ impl JointModel {
                         check(owner, id_field);
                         check(entity_type, field);
                     }
-                    Name::Status => {}
+                    Name::Status | Name::Param(_) => {}
                 }
             });
         }

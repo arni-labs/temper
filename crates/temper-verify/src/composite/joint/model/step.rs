@@ -420,13 +420,13 @@ impl JointModel {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            let answers = match &call.on_success {
-                Some(name) => &t.name == name,
-                None => self
-                    .kernel
+            let answers = if call.on_success.is_empty() {
+                self.kernel
                     .internal
                     .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name)),
+                    .is_some_and(|names| names.contains(&t.name))
+            } else {
+                call.on_success.contains(&t.name)
             };
             if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
                 continue;
