@@ -92,6 +92,9 @@ pub struct RuleProof {
     pub obligations: Vec<Obligation>,
     /// What the encoding could not express.
     pub limits: Vec<String>,
+    /// What the rule itself reads that the proof does not hold, each read
+    /// as an unknown.
+    pub unheld: BTreeSet<String>,
     /// What the solver refused, such as a lemma naming an unknown kind.
     pub errors: Vec<String>,
     /// Wall time, from reading the specs to the last check.
@@ -187,25 +190,13 @@ fn prove_one(
     let lemmas: Vec<&Lemma> = hints.lemma.iter().filter(|l| l.rule == rule).collect();
     let regions: Vec<&Region> = hints.region.iter().filter(|r| r.rule == rule).collect();
     let measure = hints.measure.iter().find(|m| m.rule == rule);
-    let texts = lemmas
-        .iter()
-        .map(|l| l.assert.as_str())
-        .chain(regions.iter().map(|r| r.region.as_str()))
-        .chain(
-            regions
-                .iter()
-                .flat_map(|r| r.params.values().map(String::as_str)),
-        )
-        .chain(
-            measure
-                .iter()
-                .flat_map(|m| m.terms.iter().map(String::as_str)),
-        );
-    let literals: Vec<String> = texts.flat_map(quoted_literals).collect();
-    let v = Vocab::new(by_name.clone(), scope.clone(), policies, literals);
+    let v = Vocab::new(by_name.clone(), scope.clone(), policies);
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);
     let moves = builder.all();
+    let read_by_moves = enc.take_unheld();
+    enc.expr(expr, owner, "pre");
+    let unheld = enc.take_unheld();
     // The clauses of J, by name, as functions of the frame.
     let clause = |frame: &str| -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -265,20 +256,38 @@ fn prove_one(
         live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
     }
     let solvers = solvers.clamp(1, asks.len().max(1));
-    let (obligations, mut refused) = run(rule, &prelude(&v), &few_in_flight(&v), &asks, solvers)?;
+    // The string literals the obligations name, each distinct from the
+    // others, and the empty string a parameter is checked against.
+    let mut literals = BTreeSet::from([String::new()]);
+    for ask in &asks {
+        literals.extend(quoted_literals(&ask.text));
+        for (_, c) in &ask.goal {
+            literals.extend(quoted_literals(c));
+        }
+    }
+    let prelude = prelude(&v, &literals);
+    let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
+    let (obligations, mut refused) =
+        run(rule, &prelude, &few_in_flight(&v), &shown, &asks, solvers)?;
     errors.append(&mut refused);
-    let limits = builder.limits.into_inner().into_iter().collect();
+    let mut limits: Vec<String> = builder.limits.into_inner().into_iter().collect();
+    limits.extend(
+        read_by_moves
+            .into_iter()
+            .map(|reason| format!("a guard, effect or reaction reads {reason}")),
+    );
     Ok(RuleProof {
         rule: rule.to_string(),
         scope,
         obligations,
         limits,
+        unheld,
         errors,
         took: start.elapsed(),
     })
 }
 
-/// The string literals a lemma names, as `|'x'|`.
+/// The string literals `text` names, as `|'x'|`.
 fn quoted_literals(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;

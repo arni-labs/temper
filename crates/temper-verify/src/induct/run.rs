@@ -44,6 +44,7 @@ pub(super) fn run(
     rule: &str,
     prelude: &str,
     few: &str,
+    literals: &[String],
     asks: &[Ask],
     solvers: usize,
 ) -> std::io::Result<(Vec<Obligation>, Vec<String>)> {
@@ -65,7 +66,7 @@ pub(super) fn run(
                             let Some(ask) = asks.get(at) else {
                                 break;
                             };
-                            let obligation = check(&mut z3, few, ask)?;
+                            let obligation = check(&mut z3, few, literals, ask)?;
                             if !matches!(obligation.outcome, Outcome::Holds) {
                                 stop.store(true, Ordering::Relaxed);
                             }
@@ -111,7 +112,8 @@ pub(super) fn run(
 
 /// Check that `ask`'s goal holds given what it assumes; on a failure, which
 /// clauses fail and the state it shows.
-fn check(z3: &mut Z3, few: &str, ask: &Ask) -> std::io::Result<Obligation> {
+fn check(z3: &mut Z3, few: &str, literals: &[String], ask: &Ask) -> std::io::Result<Obligation> {
+    let show = [ask.show.as_slice(), literals].concat();
     let all: Vec<&str> = ask.goal.iter().map(|(_, c)| c.as_str()).collect();
     let negated = format!("(assert (not (and true {})))\n", all.join(" "));
     z3.send(&ask.text)?;
@@ -126,7 +128,7 @@ fn check(z3: &mut Z3, few: &str, ask: &Ask) -> std::io::Result<Obligation> {
         let (fails, also) = z3.check()?;
         took += also;
         if fails == Sat::Sat {
-            let cti = z3.values(&ask.show)?;
+            let cti = z3.values(&show)?;
             z3.send(&format!("(pop 1)\n(push 1)\n{few}"))?;
             let clauses = failing(z3, &ask.goal)?;
             z3.send("(pop 1)\n(pop 1)\n")?;
@@ -151,7 +153,7 @@ fn check(z3: &mut Z3, few: &str, ask: &Ask) -> std::io::Result<Obligation> {
         Sat::Unsat => Outcome::Holds,
         Sat::Unknown => Outcome::Unknown,
         Sat::Sat => {
-            let cti = z3.values(&ask.show)?;
+            let cti = z3.values(&show)?;
             z3.send("(pop 1)\n")?;
             z3.send(&ask.text)?;
             let clauses = failing(z3, &ask.goal)?;
@@ -201,7 +203,8 @@ pub(super) fn few_in_flight(v: &Vocab<'_>) -> String {
 }
 
 /// The terms a counterexample shows: the records' statuses, the variables
-/// the clauses read, and the dispatches in flight, before and after.
+/// the clauses read, and the dispatches in flight, before and after; the
+/// literals are added when it is checked.
 fn shown(v: &Vocab<'_>, before: &[(String, String)], after: &[(String, String)]) -> Vec<String> {
     let text: String = before
         .iter()
@@ -229,6 +232,5 @@ fn shown(v: &Vocab<'_>, before: &[(String, String)], after: &[(String, String)])
             out.push(format!("{frame}.pend.{}", flight.name));
         }
     }
-    out.extend(v.literals.iter().map(|l| Enc::lit(l)));
     out
 }

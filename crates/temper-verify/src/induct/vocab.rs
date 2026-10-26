@@ -10,7 +10,7 @@ use temper_spec::automaton::{
     Action, ActionConstraint, ActionKind, ActionParam, ActionTrigger, Automaton, TriggerKind,
     VarType,
 };
-use temper_spec::predicate::{Arg, Expr, Literal, Operand, Set};
+use temper_spec::predicate::{Arg, Literal};
 
 /// A value's sort in the proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +93,6 @@ pub(super) struct Vocab<'a> {
     pub(super) vars: BTreeMap<String, BTreeMap<String, Sort>>,
     pub(super) kinds: Vec<Kind>,
     pub(super) calls: Vec<Call>,
-    /// Every string literal the specs, the rule and its lemmas name.
-    pub(super) literals: BTreeSet<String>,
     pub(super) policies: Option<&'a SendAnalysis>,
     /// Cedar's answers so far, by question: the moves of each region ask
     /// the same ones again.
@@ -106,11 +104,8 @@ impl<'a> Vocab<'a> {
         by_name: BTreeMap<&'a str, &'a Automaton>,
         scope: BTreeSet<String>,
         policies: Option<&'a SendAnalysis>,
-        lemma_literals: impl IntoIterator<Item = String>,
     ) -> Self {
         let mut vars = BTreeMap::new();
-        let mut literals: BTreeSet<String> = lemma_literals.into_iter().collect();
-        literals.insert(String::new());
         for entity in &scope {
             let automaton = by_name[entity.as_str()];
             let held: BTreeMap<String, Sort> = automaton
@@ -119,7 +114,6 @@ impl<'a> Vocab<'a> {
                 .filter_map(|var| Sort::of(&var.var_type).map(|sort| (var.name.clone(), sort)))
                 .collect();
             vars.insert(entity.clone(), held);
-            collect_literals(automaton, &mut literals);
         }
         let mut vocab = Self {
             by_name,
@@ -127,7 +121,6 @@ impl<'a> Vocab<'a> {
             vars,
             kinds: Vec::new(),
             calls: Vec::new(),
-            literals,
             policies,
             answered: RefCell::default(),
         };
@@ -362,67 +355,5 @@ impl<'a> Vocab<'a> {
             fields: c.asked.iter().map(|f| (f.clone(), Sort::Str)).collect(),
         });
         dispatches.chain(calls).collect()
-    }
-}
-
-fn collect_literals(automaton: &Automaton, literals: &mut BTreeSet<String>) {
-    let mut lit = |l: &Literal| {
-        if let Literal::Str(s) = l {
-            literals.insert(s.clone());
-        }
-    };
-    let expr_lits = |e: &Expr, lit: &mut dyn FnMut(&Literal)| walk_expr(e, lit);
-    for action in &automaton.actions {
-        expr_lits(&action.guard, &mut lit);
-        for effect in &action.effect {
-            if let temper_spec::predicate::Effect::Assign {
-                value: Arg::Lit(l), ..
-            } = effect
-            {
-                lit(l);
-            }
-        }
-        for trigger in &action.triggers {
-            for arg in trigger.args.values() {
-                if let Arg::Lit(l) = arg {
-                    lit(l);
-                }
-            }
-        }
-    }
-    for invariant in &automaton.invariants {
-        expr_lits(&invariant.assert, &mut lit);
-    }
-    for var in &automaton.state {
-        if let temper_spec::automaton::Initial::String(s) = &var.initial {
-            lit(&Literal::Str(s.clone()));
-        }
-    }
-}
-
-fn walk_expr(expr: &Expr, lit: &mut dyn FnMut(&Literal)) {
-    match expr {
-        Expr::Not(e) => walk_expr(e, lit),
-        Expr::And(es) | Expr::Or(es) => es.iter().for_each(|e| walk_expr(e, lit)),
-        Expr::Implies(a, b) => {
-            walk_expr(a, lit);
-            walk_expr(b, lit);
-        }
-        Expr::Compare { lhs, rhs, .. } => {
-            for side in [lhs, rhs] {
-                if let Operand::Lit(l) = side {
-                    lit(l);
-                }
-            }
-        }
-        Expr::In { value, set, .. } => {
-            if let Operand::Lit(l) = value {
-                lit(l);
-            }
-            if let Set::List(items) = set {
-                items.iter().for_each(|l| lit(l));
-            }
-        }
-        Expr::Const(_) | Expr::Empty(_) | Expr::Var(_) => {}
     }
 }
