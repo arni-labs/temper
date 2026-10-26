@@ -79,7 +79,7 @@ fn inherited_scheduled_fire(parent: &str, maker: &str, source: &str, allowed: bo
     let unlock = if allowed { "pusher" } else { "another" };
     let policies = SendAnalysis::new(&format!(r#"
 permit(principal, action == Action::"Start", resource);
-permit(principal == Agent::"service:pusher", action == Action::"Init", resource);
+permit(principal == Agent::"service:pusher", action in [Action::"Init", Action::"Tick"], resource);
 permit(principal == Agent::"service:{unlock}", action == Action::"Unlock", resource) when {{ {guard} }};
 "#)).expect("fixture policies parse");
     let mut proofs = prove(&refs, Some(&policies), &Hints::default());
@@ -114,6 +114,30 @@ fn a_spawn_preserves_the_service_that_arms_a_scheduled_fire() {
     // their entity type. Only the declared service may initialize or unlock.
     inherited_scheduled_fire(PARENT, MAKER, SOURCE, true, "true");
     inherited_scheduled_fire(PARENT, MAKER, SOURCE, false, "true");
+}
+
+#[test]
+fn an_initial_state_timer_preserves_its_initializers_service() {
+    // Init stays in the initial state without resetting its timer. Runtime
+    // reconciliation still arms it as the service that sent Init.
+    let parent = PARENT.replace("effect = [\"schedule('Unlock', 60)\"]", "")
+        + r#"
+[[action]]
+name = "Tick"
+kind = "input"
+from = ["Closed"]
+to = "Closed"
+effect = ["schedule('Unlock', 60)"]
+
+[[state_timeout]]
+state = "Closed"
+after_seconds = 1
+on_timeout = "Tick"
+"#;
+    for parent in [parent.clone(), parent.replace("to = \"Closed\"\n", "")] {
+        inherited_scheduled_fire(&parent, MAKER, SOURCE, true, "true");
+        inherited_scheduled_fire(&parent, MAKER, SOURCE, false, "true");
+    }
 }
 
 #[test]

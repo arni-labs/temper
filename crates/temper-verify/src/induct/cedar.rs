@@ -42,8 +42,9 @@ impl Vocab<'_> {
 
     /// Whether Cedar lets `entity`'s timer in `state` fire `action`. A
     /// timer fires as whoever armed it: whoever made the record in its
-    /// initial state, or sent an action that brought it into `state` or
-    /// resets the timer (the joint walk's reading).
+    /// initial state, or sent an action that brought it into `state`,
+    /// resets the timer, or leaves it there when reconciliation arms a
+    /// missing timer.
     pub(super) fn timer_may(&self, entity: &str, state: &str, action: &str) -> May {
         let Some(policies) = self.policies else {
             return May::Yes;
@@ -79,7 +80,7 @@ impl Vocab<'_> {
         }
     }
 
-    /// The senders that may bring `entity`'s record into `state`.
+    /// The senders that may arm `entity`'s timer in `state`.
     fn armers(
         &self,
         entity: &str,
@@ -103,11 +104,13 @@ impl Vocab<'_> {
             .filter(|t| t.state == state)
             .flat_map(|t| t.reset_on.iter().map(String::as_str))
             .collect();
-        let enters = automaton.actions.iter().filter(|a| {
-            let from_elsewhere = a.from.is_empty() || a.from.iter().any(|f| f != state);
-            (a.to.as_deref() == Some(state) && from_elsewhere) || resets.contains(a.name.as_str())
+        let arms = automaton.actions.iter().filter(|a| {
+            // Reconciliation can arm a missing timer even without an entry
+            // or reset, including a new record's same-state initializer.
+            let stays = a.to.is_none() && (a.from.is_empty() || a.from.iter().any(|f| f == state));
+            a.to.as_deref() == Some(state) || stays || resets.contains(a.name.as_str())
         });
-        for action in enters {
+        for action in arms {
             self.senders(entity, &action.name, same_id, seen, out);
         }
     }
