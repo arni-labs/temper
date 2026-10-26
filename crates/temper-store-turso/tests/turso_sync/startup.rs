@@ -1,10 +1,10 @@
-//! Starting a synced database: without the remote, from an older copy, and
-//! from a database that was never synced.
+//! Starting a synced database: without the remote, from an older copy, from
+//! a restore cut short, by fetching, and from a database that was never synced.
 
 use std::path::PathBuf;
 
 use super::support::*;
-use temper_store_turso::{CopyState, TursoEventStore};
+use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 #[tokio::test]
 async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_answers() {
@@ -138,6 +138,43 @@ async fn a_restore_cut_short_is_kept_aside_and_run_again_at_the_next_start() {
         std::fs::metadata(kept.join("app.db")).expect("kept").len(),
         64 * 1024
     );
+}
+
+#[tokio::test]
+async fn a_fetch_downloads_the_remote_beside_and_never_over_a_database() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_a_dir, a_path) = machine();
+    let a = server.open(&a_path).await;
+    write(&a, "fetched", 0).await;
+    push(&a).await;
+    drop(a);
+
+    let (b_dir, b_path) = machine();
+    let b = b_path.to_str().expect("utf-8");
+    let report = SyncCopy::fetch(b, &server.url, TOKEN).await.expect("fetch");
+    assert!(report.contains("synced: client"), "{report}");
+    assert!(b_dir.path().join("app.db-info").exists(), "{report}");
+    assert!(
+        !b_dir.path().join("app.db-sync-restoring").exists(),
+        "a finished fetch is not a partial restore"
+    );
+
+    let error = SyncCopy::fetch(b, &server.url, TOKEN)
+        .await
+        .expect_err("a second fetch would land on the first");
+    assert!(error.to_string().contains("already exists"), "{error}");
+
+    // Moved into place by hand, the fetched file opens as it is.
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "fetched").await, 1);
+    assert_eq!(b.sync_copy().expect("copy").state(), CopyState::Copying);
+    let aside = std::fs::read_dir(b_dir.path())
+        .expect("read dir")
+        .filter(|entry| entry.as_ref().expect("entry").path().is_dir())
+        .count();
+    assert_eq!(aside, 0, "nothing was restored again");
 }
 
 #[tokio::test]

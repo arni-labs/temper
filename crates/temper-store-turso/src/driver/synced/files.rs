@@ -172,6 +172,12 @@ pub(super) fn restored(path: &Path) {
     let _ = std::fs::remove_file(sidecar(path, RESTORING_SUFFIX));
 }
 
+/// Refuse a fetch into `path` when the database or any file kept beside it is
+/// already there: a fetch never overwrites.
+pub(super) fn refuse_existing(_path: &Path) -> Result<(), DriverError> {
+    Ok(())
+}
+
 pub(super) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -257,5 +263,27 @@ mod tests {
         std::fs::write(sidecar(&path, "-info"), b"{}").expect("write info");
         check_local_files(&path).expect("a finished restore opens as it is");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_fetch_never_lands_on_an_existing_database_or_its_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        std::fs::write(dir.path().join("other.db"), b"x").expect("write other");
+        std::fs::create_dir(dir.path().join("app.db.behind-1")).expect("aside dir");
+        refuse_existing(&path).expect("nothing of app.db is here");
+
+        for file in [
+            "app.db",
+            "app.db-info",
+            "app.db-wal",
+            "app.db-sync-restoring",
+        ] {
+            let there = dir.path().join(file);
+            std::fs::write(&there, b"").expect("write");
+            let error = refuse_existing(&path).expect_err(file);
+            assert!(error.to_string().contains(file), "{error}");
+            std::fs::remove_file(&there).expect("remove");
+        }
     }
 }

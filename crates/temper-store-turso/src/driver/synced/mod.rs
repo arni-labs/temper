@@ -368,6 +368,22 @@ impl SyncCopy {
             .map_err(storage_error)
     }
 
+    /// With the app stopped: download the remote copy into `path`, which must
+    /// not exist yet, the way a start restores it, without serving, pushing or
+    /// changing the remote. Returns [`Self::describe`] of the result.
+    pub async fn fetch(
+        path: &str,
+        remote_url: &str,
+        auth_token: &str,
+    ) -> Result<String, PersistenceError> {
+        let local = path.strip_prefix("file:").unwrap_or(path);
+        files::refuse_existing(Path::new(local)).map_err(storage_error)?;
+        let _ = (remote_url, auth_token);
+        Err(PersistenceError::Storage(
+            "fetch is not built yet".to_string(),
+        ))
+    }
+
     /// What is on disk for `path`: the stop, if any, and how far the file and
     /// its last push got. For an operator; the app may be running.
     pub fn describe(path: &str) -> Result<String, PersistenceError> {
