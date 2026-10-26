@@ -71,6 +71,18 @@ pub struct CatalogRowFreshness {
     pub wrapped_fields: Option<serde_json::Value>,
 }
 
+/// Entities of one type whose journal holds an event their catalog row has
+/// not projected, as a backend reports them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalAheadOfCatalog {
+    /// Live entity ids with no catalog row, or with a row projected from an
+    /// older event than the journal's newest. Empty when every row is current.
+    Ids(Vec<String>),
+    /// The backend cannot compare its journal with its catalog, so it cannot
+    /// say which rows are behind.
+    Unsupported,
+}
+
 /// Backend-neutral durable projection upsert.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryProjectionUpsert {
@@ -205,5 +217,15 @@ pub trait QueryPlaneStore: Send + Sync {
         _entity_type: &str,
     ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
         Ok(None)
+    }
+
+    /// Live ids of `entity_type` whose journal is ahead of their catalog row,
+    /// read in one statement. Tombstoned entities are left out.
+    async fn entity_ids_ahead_of_catalog(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+    ) -> Result<JournalAheadOfCatalog, PersistenceError> {
+        Ok(JournalAheadOfCatalog::Unsupported)
     }
 }

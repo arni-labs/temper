@@ -247,6 +247,15 @@ pub async fn run(
             .await?,
         );
     }
+    // Phase 8c: bring catalog rows the journal is ahead of up to it, for every
+    // tenant the registry now holds (runtime-installed apps included). Off the
+    // boot path: it replays only the drifted records.
+    {
+        let server = state.server.clone();
+        tokio::spawn(async move {
+            server.repair_catalog_rows_behind_journal().await;
+        });
+    }
 
     // Phase 9: Bind, start background tasks, serve
     let router =

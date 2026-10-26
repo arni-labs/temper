@@ -3,8 +3,9 @@ use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::{QueryProjectionUpsert as TursoQueryProjectionUpsert, TursoEventStore};
 
 use super::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
-    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogRowFreshness, EntityCatalogRow, JournalAheadOfCatalog, QueryFieldIndexOrder,
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    QueryProjectionUpsert,
 };
 
 pub(super) fn catalog_freshness(
@@ -345,6 +346,16 @@ impl QueryPlaneStore for TursoEventStore {
         TursoEventStore::projection_catalog_freshness(self, tenant, entity_type)
             .await
             .map(|rows| Some(catalog_freshness(rows)))
+    }
+
+    async fn entity_ids_ahead_of_catalog(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<JournalAheadOfCatalog, PersistenceError> {
+        TursoEventStore::entity_ids_ahead_of_catalog(self, tenant, entity_type)
+            .await
+            .map(JournalAheadOfCatalog::Ids)
     }
 }
 

@@ -5,8 +5,8 @@ use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
 use super::query_plane_impls::{catalog_freshness, storage_order_by, to_turso_projection};
 use super::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogRowFreshness, EntityCatalogRow, JournalAheadOfCatalog, QueryFieldIndexOrder,
+    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 
 #[async_trait::async_trait]
@@ -181,5 +181,17 @@ impl QueryPlaneStore for TenantStoreRouter {
             .projection_catalog_freshness(tenant, entity_type)
             .await
             .map(|rows| Some(catalog_freshness(rows)))
+    }
+
+    async fn entity_ids_ahead_of_catalog(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+    ) -> Result<JournalAheadOfCatalog, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .entity_ids_ahead_of_catalog(tenant, entity_type)
+            .await
+            .map(JournalAheadOfCatalog::Ids)
     }
 }

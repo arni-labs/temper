@@ -44,6 +44,7 @@ mod event_store;
 mod evolution;
 pub mod field_index;
 mod instrumentation;
+mod journal_ahead;
 mod migration_support;
 pub mod ots;
 mod policy;

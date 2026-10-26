@@ -12,6 +12,7 @@ use crate::TursoSpecVerificationUpdate;
 mod commit_outcome;
 mod commit_transport;
 mod evolution_tenant;
+mod journal_ahead;
 mod policy_approval;
 mod projection_writes;
 mod scheduled_actions;
