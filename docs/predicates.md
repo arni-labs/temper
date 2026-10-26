@@ -121,7 +121,7 @@ Effects that read `params.p` are verified with `p` unknown: a counter takes ever
 
 ## Proof hints
 
-A rule over several records (an `[[invariant]]` that reads `Type[...]`, or a `[[liveness]]` with `eventually`) is checked when an app is installed, and by `temper verify`, by walking the joint model of its types, which covers the runs a bounded walk reaches. Hints written beside the rule let the check prove it by induction instead, for every run:
+A rule over several records (an `[[invariant]]` that reads `Type[...]`, or a `[[liveness]]` with `eventually`) is checked when an app is installed, and by `temper verify`. Each such rule is proved by induction first, for every run, and walked on the joint model of its types, which covers the runs a bounded walk reaches, only when the proof does not hold. An invariant with no lemmas is tried at every state, then with the prover's own guesses about the flags it reads. Hints written beside the rule give the proof what it cannot guess:
 
 ```toml
 [[invariant]]
@@ -137,7 +137,7 @@ assert = "(=> (not (= $Parent.status Parent/Open)) $Parent.locked)"
 - `measure`, on a `[[liveness]]` with `eventually`: integer terms over the same names, compared in order, that each helpful move lowers.
 - `[[liveness.region]]`: `name`; `region`, the states it covers; `step`, the move the system makes there, by its label (such as `Type.Action arrives` or `Type.Action (answer to Type@trigger)`); `witness`, the kind of the dispatch or call `w` names, when the step takes one; and `params` for the step's parameters. The regions cover every state short of the goal, and each step reaches the goal or lowers the measure.
 
-A rule with no hints is walked as before, and so is one whose proof does not hold; its verdict then says why, such as the move after which a clause fails, so the lemma it lacked can be added. `cargo run -p temper-verify --example induct <spec dir>` prints each failing move with a counterexample (`CTI=<move>`), and for an invariant with no lemmas, the guesses that prove it. A proof does not count while its scope holds a move it does not make: a `schedule` or `schedule_at` effect, or a spawn of a type in scope. The proofs share the check's time budget. A rule proved by induction is not checked for a premise no run meets.
+A rule proved with the prover's guesses lists them in its verdict, as lemmas that can be written beside it so the next check proves it without guessing. A `[[liveness]]` is tried only when it carries a `measure`, which nothing guesses. A rule whose proof does not hold is walked as before, and its verdict says why, such as the move after which a clause fails, so the lemma it lacked can be added. `cargo run -p temper-verify --example induct <spec dir>` prints each failing move with a counterexample (`CTI=<move>`). A proof does not count while its scope holds a move it does not make: a `schedule` or `schedule_at` effect, or a spawn of a type in scope. The proofs share the check's time budget. A proved rule is walked only until a state meets its premise; one whose premise no run meets proves nothing and fails like a vacuous walk.
 
 ## Converting old specs
 

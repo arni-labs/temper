@@ -236,9 +236,10 @@ const JOINT_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// fails with how it comes to rest short of it, and a walk that could not
 /// finish fails too, since a partial walk proves nothing. So do a walk that
 /// never took an answer a module may give and a rule whose premise no walked
-/// state meets. A rule whose spec gives lemmas or a measure is proved by
-/// induction first, for every run, and walked only when the proof does not
-/// hold. A spec that does not parse is reported by the IOA cascade, so it is
+/// state meets. Each rule is proved by induction first, for every run (an
+/// invariant with its lemmas or the prover's guesses, an `eventually` rule
+/// with its measure), and walked only when the proof does not hold; a proved
+/// rule whose premise no run meets fails as well. A spec that does not parse is reported by the IOA cascade, so it is
 /// skipped here.
 fn verify_joint(
     ioa_sources: &std::collections::BTreeMap<String, String>,

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use temper_spec::predicate::{Expr, Name};
 
+use super::Lemma;
 use super::encode::Enc;
 use super::vocab::{Sort, Vocab};
 
@@ -100,4 +101,32 @@ impl Guess {
             }
         }
     }
+
+    /// The guess as a lemma the agent can write beside `rule`, whose clause
+    /// before a move is `holds`.
+    pub(super) fn lemma(&self, rule: &str, holds: &str) -> Lemma {
+        Lemma {
+            rule: rule.to_string(),
+            name: self.name(rule),
+            assert: dollar_framed(&self.read("pre", holds)),
+        }
+    }
+}
+
+/// `text` with each name framed `pre.` framed `$` instead, as lemmas are
+/// written.
+fn dollar_framed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("pre.") {
+        out.push_str(&rest[..at]);
+        let starts = out
+            .chars()
+            .next_back()
+            .is_none_or(|c| c == '(' || c.is_whitespace());
+        out.push_str(if starts { "$" } else { "pre." });
+        rest = &rest[at + 4..];
+    }
+    out.push_str(rest);
+    out
 }

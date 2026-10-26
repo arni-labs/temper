@@ -122,11 +122,10 @@ fn main() -> std::io::Result<()> {
             )?;
         }
         if !proof.found.is_empty() {
-            writeln!(
-                out,
-                "  kept the prover's guesses: {}",
-                proof.found.join("; ")
-            )?;
+            writeln!(out, "  kept the prover's guesses, as lemmas:")?;
+            for lemma in &proof.found {
+                writeln!(out, "    {}: {}", lemma.name, lemma.assert)?;
+            }
         }
         for reason in &proof.unheld {
             writeln!(out, "  the rule reads {reason}")?;

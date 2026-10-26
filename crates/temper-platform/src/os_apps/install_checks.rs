@@ -53,9 +53,10 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// types) that reads a related record, on the joint model of its type and
 /// the types it names, with `policies` (the tenant's Cedar as the install
 /// leaves it) deciding each move as its sender, and refuse the install if one
-/// is not proven. A rule whose spec gives lemmas or a measure is proved by
-/// induction first, for every run, and walked only when the proof does not
-/// hold (`check_joint`). Both run when the install brings `new_specs` (added or
+/// is not proven. Each rule is proved by induction first, for every run (an
+/// invariant with its lemmas or the prover's guesses, an `eventually` rule
+/// with its measure), and walked only when the proof does not hold
+/// (`check_joint`). Both run when the install brings `new_specs` (added or
 /// changed types) or policies: who Cedar lets send each move decides whether
 /// a rule holds and whether a record gets where it should. A named type the
 /// bundle does not carry is taken from what the tenant already runs. It runs

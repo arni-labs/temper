@@ -84,8 +84,8 @@ pub struct RuleProof {
     /// as an unknown.
     pub unheld: BTreeSet<String>,
     /// The prover's own guesses the proof kept, when the agent gave no
-    /// lemmas.
-    pub found: Vec<String>,
+    /// lemmas, written as lemmas the agent can pin beside the rule.
+    pub found: Vec<Lemma>,
     /// What the solver refused, such as a lemma naming an unknown kind.
     pub errors: Vec<String>,
     /// Wall time, from reading the specs to the last check.
@@ -123,7 +123,7 @@ impl RuleProof {
 struct Attempt {
     obligations: Vec<Obligation>,
     errors: Vec<String>,
-    kept: Vec<String>,
+    kept: Vec<Lemma>,
 }
 
 impl Attempt {
@@ -282,6 +282,15 @@ fn prove_one(
     let read_by_moves = enc.take_unheld();
     enc.expr(expr, owner, "pre");
     let unheld = enc.take_unheld();
+    // A kept guess, as a lemma the agent can write beside the rule: its
+    // clause before a move, over `$`-framed names.
+    let pinned = |guess: &Guess| {
+        let holds = match kind {
+            Rule::Always(assert) => enc.expr(assert, owner, "pre"),
+            Rule::Eventually(..) => String::new(),
+        };
+        guess.lemma(rule, &holds)
+    };
     // One attempt with `guesses`, dropping those a move breaks until the
     // rest hold or the rule fails; `None` once every guess is dropped,
     // unless the attempt may go on with none.
@@ -395,7 +404,7 @@ fn prove_one(
                 return Ok(Some(Attempt {
                     obligations,
                     errors,
-                    kept: guesses.iter().map(|g| g.name(rule)).collect(),
+                    kept: guesses.iter().map(pinned).collect(),
                 }));
             }
             guesses.retain(|g| !dropped.contains(&g.name(rule)));
