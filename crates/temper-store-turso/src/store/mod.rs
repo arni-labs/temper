@@ -11,9 +11,7 @@
 
 use crate::driver::{Database, SyncCopy};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use temper_runtime::persistence::{PersistenceError, storage_error};
-use tokio::sync::Semaphore;
 use tracing::instrument;
 
 use crate::schema;
@@ -73,8 +71,7 @@ pub use published_artifacts::{PublishedArtifactRow, PublishedArtifactUpsert};
 #[derive(Clone, Debug)]
 pub struct TursoEventStore {
     db: Arc<Database>,
-    write_gate: Arc<Semaphore>,
-    high_priority_write_waiters: Arc<AtomicUsize>,
+    write_gate: Arc<write_gate::WriteGate>,
     /// True when connected to a remote Turso Cloud instance (libsql:// URL).
     /// PRAGMAs are skipped for remote connections.
     is_remote: bool,
@@ -140,10 +137,9 @@ impl TursoEventStore {
     ) -> Result<Self, PersistenceError> {
         let store = Self {
             db: Arc::new(db),
-            write_gate: Arc::new(Semaphore::new(write_gate::configured_write_concurrency(
-                is_remote,
-            ))),
-            high_priority_write_waiters: Arc::new(AtomicUsize::new(0)),
+            write_gate: Arc::new(write_gate::WriteGate::new(
+                write_gate::configured_write_concurrency(is_remote),
+            )),
             is_remote,
             sync_copy,
             #[cfg(test)]
@@ -189,6 +185,25 @@ impl TursoEventStore {
     /// The Turso Cloud copy of this database, when it has one.
     pub fn sync_copy(&self) -> Option<&SyncCopy> {
         self.sync_copy.as_ref()
+    }
+
+    /// Delete the change log rows the remote copy has confirmed, for about
+    /// `budget`, keeping the newest. Returns the rows deleted; a database
+    /// with no copy has none to delete.
+    ///
+    /// Each batch takes the whole write gate, and only while no writer waits
+    /// for it, so a waiting write always goes before the next batch; one that
+    /// arrives during a batch waits for that batch alone, which is planned
+    /// to end within a write's wait for the lock. The batching and why the
+    /// deleted rows are safe to lose are on `SyncCopy::trim_pushed`.
+    pub async fn trim_change_log(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<u64, PersistenceError> {
+        match &self.sync_copy {
+            Some(copy) => copy.trim_pushed(budget, &write_gate::TrimTurns(self)).await,
+            None => Ok(0),
+        }
     }
 
     /// Obtain a connection configured for local-SQLite concurrency.
