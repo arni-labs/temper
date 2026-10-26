@@ -107,10 +107,10 @@ impl ModuleReviewer {
         if cache.reviews.contains_key(&key) {
             return;
         }
-        if cache.order.len() >= MAX_CACHED_REVIEWS {
-            if let Some(oldest) = cache.order.pop_front() {
-                cache.reviews.remove(&oldest);
-            }
+        if cache.order.len() >= MAX_CACHED_REVIEWS
+            && let Some(oldest) = cache.order.pop_front()
+        {
+            cache.reviews.remove(&oldest);
         }
         cache.order.push_back(key.clone());
         cache.reviews.insert(key, review.clone());
