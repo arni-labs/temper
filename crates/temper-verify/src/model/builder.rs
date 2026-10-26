@@ -369,11 +369,13 @@ fn resolve_invariants(automaton: &Automaton) -> Vec<ResolvedInvariant> {
         .collect()
 }
 
-/// Translate IOA liveness properties into resolved liveness.
+/// Translate IOA liveness properties into resolved liveness. An `eventually`
+/// property is checked on the joint model instead.
 fn resolve_liveness(automaton: &Automaton) -> Vec<ResolvedLiveness> {
     automaton
         .liveness
         .iter()
+        .filter(|l| l.eventually.is_none())
         .map(|l| {
             let kind = if !l.reaches.is_empty() {
                 LivenessKind::ReachesState {
