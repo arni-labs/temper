@@ -1146,7 +1146,7 @@ impl Actor for EntityActor {
                 //
                 // A key answers only a retry of the request it was first used
                 // for: the cache compares what the key names (the action and
-                // parameters, or a follow-up's action), the durable key set the
+                // parameters, or a follow-up's cause), the durable key set the
                 // action. Anything else sent with the key is refused, so it can
                 // never report another request's success as its own.
                 let actor_key = self.persistence_id();
@@ -1184,8 +1184,13 @@ impl Actor for EntityActor {
                         crate::idempotency::CachedReply::Miss => {}
                     }
                 }
+                // A follow-up's retry is its cause again, whatever action it
+                // names now: the duplicate below answers it.
                 if let Some(key) = idempotency_key.as_deref()
                     && let Some(recorded) = state.processed_idempotency_keys.get(key)
+                    && request
+                        .as_ref()
+                        .is_none_or(|request| request.repeats_action())
                     && !recorded.was_for(&name)
                 {
                     let recorded = recorded.action.clone().unwrap_or_default();

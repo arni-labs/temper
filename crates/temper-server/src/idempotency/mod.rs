@@ -4,8 +4,10 @@
 //! Entries expire after `IDEMPOTENCY_TTL_SECS`. Each reply remembers the
 //! request it answered ([`RequestFingerprint`]): a key answers only a retry of
 //! that request, never a different action or body sent with the same key. A
-//! follow-up's key ([`IdempotencyKey::FollowUp`]) already names its cause, so
-//! its retry repeats the action and may carry new parameters.
+//! follow-up's key ([`IdempotencyKey::FollowUp`]) names its cause, which has
+//! one outcome: any retry of the cause is answered by the first, even one
+//! that now names another action (an integration that failed where it
+//! succeeded).
 //!
 //! Every dispatched action carries a key, so every write adds a reply. The
 //! cache is therefore bounded by the bytes it holds across all actors

@@ -12,9 +12,10 @@ pub enum IdempotencyKey {
     Request(String),
     /// Names a follow-up by its cause (a callback, scheduled action or
     /// reaction), derived from the key of the request that started it. A
-    /// retry of that request starts the follow-up again with parameters made
-    /// again, which may differ (an outside service's answer, a measured
-    /// duration), so a retry must send the same action only.
+    /// retry of that request starts the follow-up again, and what it sends
+    /// may differ: an outside service can answer otherwise, or fail where it
+    /// succeeded, so a callback can even name the other action. The cause
+    /// has one outcome, so a retry is answered by the first one.
     FollowUp(String),
 }
 
@@ -37,27 +38,54 @@ impl IdempotencyKey {
     pub fn request(&self, action: &str, params: &serde_json::Value) -> RequestFingerprint {
         match self {
             Self::Request(_) => RequestFingerprint::new(action, params),
-            Self::FollowUp(_) => RequestFingerprint::new(action, &serde_json::Value::Null),
+            Self::FollowUp(_) => RequestFingerprint::Cause {
+                action: action.to_string(),
+            },
         }
     }
 }
 
-/// The action a request named and a digest of its parameters.
+/// What a key's retry must repeat to be answered by the key.
 ///
 /// Object keys are hashed in sorted order, so a retry that sends the same body
 /// with its keys in another order is the same request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestFingerprint {
-    action: String,
-    params_digest: [u8; 32],
+#[derive(Debug, Clone, Eq)]
+pub enum RequestFingerprint {
+    /// A caller's request: the same action and a digest of its parameters.
+    Request {
+        action: String,
+        params_digest: [u8; 32],
+    },
+    /// A follow-up ([`IdempotencyKey::FollowUp`]): any retry of its cause,
+    /// whatever action it names now. `action` is what it named.
+    Cause { action: String },
+}
+
+impl PartialEq for RequestFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Request {
+                    action,
+                    params_digest,
+                },
+                Self::Request {
+                    action: other_action,
+                    params_digest: other_digest,
+                },
+            ) => action == other_action && params_digest == other_digest,
+            (Self::Cause { .. }, Self::Cause { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 impl RequestFingerprint {
-    /// Fingerprint `action` called with `params`.
+    /// Fingerprint a caller's `action` called with `params`.
     pub fn new(action: &str, params: &serde_json::Value) -> Self {
         let mut hasher = Sha256::new();
         hash_params(&mut hasher, params);
-        Self {
+        Self::Request {
             action: action.to_string(),
             params_digest: hasher.finalize().into(),
         }
@@ -65,14 +93,21 @@ impl RequestFingerprint {
 
     /// The action the request named.
     pub fn action(&self) -> &str {
-        &self.action
+        match self {
+            Self::Request { action, .. } | Self::Cause { action } => action,
+        }
+    }
+
+    /// Whether a retry must name the action the key recorded.
+    pub fn repeats_action(&self) -> bool {
+        matches!(self, Self::Request { .. })
     }
 }
 
 /// The idempotency key of a follow-up request (a reaction, callback or
 /// scheduled action) that the request under `parent` starts.
 ///
-/// `label` names the follow-up (`callback:<action>`, `scheduled:<action>`)
+/// `label` names the follow-up (`callback`, `scheduled:<action>`)
 /// and `detail` tells siblings with the same label apart. A retry of the parent
 /// derives the same key. The key is a hash, not the parent with more text
 /// appended, so it stays the same length however long a chain of follow-ups
@@ -160,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_retry_repeats_its_action_and_a_request_retry_its_body_too() {
+    fn a_request_retry_repeats_its_body_and_a_follow_up_retry_is_its_cause_again() {
         use super::IdempotencyKey;
 
         let request = IdempotencyKey::Request("k".to_string());
@@ -173,9 +208,14 @@ mod tests {
             follow_up.request("Answered", &json!({"duration_ms": 17})),
             follow_up.request("Answered", &json!({"duration_ms": 42}))
         );
-        assert_ne!(
+        assert_eq!(
             follow_up.request("Answered", &json!({})),
-            follow_up.request("Unanswered", &json!({}))
+            follow_up.request("Unanswered", &json!({})),
+            "an integration run again may now fail: its first outcome answers"
+        );
+        assert_ne!(
+            request.request("Answered", &json!({})),
+            follow_up.request("Answered", &json!({}))
         );
     }
 

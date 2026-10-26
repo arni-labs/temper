@@ -98,16 +98,13 @@ impl AgentContext {
     /// Admit a callback only within both the inline and cumulative budgets.
     ///
     /// The callback is a new request, so it gets a follow-up key of its own,
-    /// derived from this context's key, the integration that sent it
-    /// (`source`) and the callback action. Its parameters are left out: a
-    /// retry of the parent runs the integration again, and the answer or its
-    /// measured duration may differ, yet it is the same callback. Sibling
-    /// callbacks differ by `source`.
-    pub(crate) fn for_callback(
-        &self,
-        source: &str,
-        callback_action: &str,
-    ) -> Result<Self, CallbackBudgetExceeded> {
+    /// derived from this context's key and the integration that sent it
+    /// (`source`). It names the integration's run, not its outcome: a retry
+    /// of the parent runs the integration again, which may answer otherwise
+    /// or fail where it succeeded, so neither the parameters nor the callback
+    /// action are in the key. The run's first outcome answers the retry
+    /// ([`IdempotencyKey::FollowUp`]). Sibling callbacks differ by `source`.
+    pub(crate) fn for_callback(&self, source: &str) -> Result<Self, CallbackBudgetExceeded> {
         if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
             return Err(CallbackBudgetExceeded::InlineDepth);
         }
@@ -120,7 +117,7 @@ impl AgentContext {
         next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
             IdempotencyKey::FollowUp(crate::idempotency::derived_idempotency_key(
                 key.as_str(),
-                &format!("callback:{callback_action}"),
+                "callback",
                 source,
             ))
         });

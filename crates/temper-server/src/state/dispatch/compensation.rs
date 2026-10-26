@@ -147,7 +147,11 @@ impl crate::state::ServerState {
                     return;
                 }
             };
-        let callback_ctx = match parent_ctx.for_callback(COMPENSATION_SOURCE, &action) {
+        // A compensation answers the action's integrations failing, not one
+        // integration's run, so its key is named by the failure action it
+        // takes: two of them under one request stay two.
+        let callback_ctx = match parent_ctx.for_callback(&format!("{COMPENSATION_SOURCE}:{action}"))
+        {
             Ok(context) => context,
             Err(budget_error) => {
                 self.record_generated_callback_refusal(
