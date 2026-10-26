@@ -37,6 +37,8 @@
 //!
 //! The server runs in one single-threaded, paused-clock Tokio runtime.
 
+#[path = "dst_commit_outcome/committed_deadline.rs"]
+mod committed_deadline;
 #[path = "dst_commit_outcome/faults.rs"]
 mod faults;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
