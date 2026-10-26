@@ -15,6 +15,17 @@ import sqlite3
 import tomllib
 
 
+def is_tombstone(event_type, event):
+    """Mirror PersistenceEnvelope::is_tombstone, including legacy journals."""
+    if event_type != "Deleted":
+        return False
+    if "kind" in event:
+        return event["kind"] == "tombstone"
+    return (event.get("to_status") == "Deleted"
+            and event.get("params") == {}
+            and event.get("idempotency_key") is None)
+
+
 def inventory(path):
     """Return missing-row records grouped by tenant and type, from durable facts."""
     with sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True) as db:
@@ -27,20 +38,23 @@ def inventory(path):
         }
         rows = set(db.execute("SELECT tenant, entity_type, entity_id FROM state_timers"))
         states = {}
+        deleted = set()
         for tenant, kind, record, seq, snapshot in db.execute(
             "SELECT tenant, entity_type, entity_id, sequence_nr, snapshot FROM snapshots"
         ):
             restored = json.loads(snapshot)
             states[tenant, kind, record] = (seq, restored["status"], restored.get("status_clock", {}))
         # Do not rely on projections: a failed projection can also lose arming.
-        for tenant, kind, record, seq, payload in db.execute(
-            "SELECT tenant, entity_type, entity_id, sequence_nr, payload FROM events "
+        for tenant, kind, record, seq, event_type, payload in db.execute(
+            "SELECT tenant, entity_type, entity_id, sequence_nr, event_type, payload FROM events "
             "ORDER BY tenant, entity_type, entity_id, sequence_nr"
         ):
             key = (tenant, kind, record)
+            event = json.loads(payload)
+            if is_tombstone(event_type, event):
+                deleted.add(key)
             if seq <= states.get(key, (-1, "", {}))[0]:
                 continue
-            event = json.loads(payload)
             status = event.get("to_status") or states.get(key, (-1, "", {}))[1]
             clock = states.get(key, (-1, "", {}))[2]
             if event.get("from_status") != event.get("to_status"):
@@ -51,7 +65,7 @@ def inventory(path):
         grouped = {}
         for key, (_, status, clock) in sorted(states.items()):
             tenant, kind, record = key
-            if key in rows or status == "Deleted":
+            if key in rows or key in deleted:
                 continue
             for timeout in specs.get((tenant, kind), {}).get("state_timeout", []):
                 if timeout["state"] == status:
