@@ -79,12 +79,29 @@ pub(super) fn mark_checked(path: &Path) {
     let _ = std::fs::remove_file(sidecar(path, UNCHECKED_SUFFIX));
 }
 
-/// The sync engine's metadata for the file (`<db>-info`).
+/// The sync engine's metadata for the file (`<db>-info`), read once. Only for
+/// a file no engine is running on: at open, and in an operator's report.
 pub(super) fn sync_metadata(path: &Path) -> Result<serde_json::Value, DriverError> {
     let info = std::fs::read(sidecar(path, "-info"))
         .map_err(|error| DriverError::SyncSetup(format!("read sync metadata: {error}")))?;
     serde_json::from_slice(&info)
         .map_err(|error| DriverError::SyncSetup(format!("parse sync metadata: {error}")))
+}
+
+/// The sync engine's metadata for a file the engine is running on.
+///
+/// The engine rewrites `<db>-info` in place after every push, pull and
+/// checkpoint: `tokio::fs::write`, which truncates the file and then writes
+/// it (turso 0.7.2 `sync.rs` 912-930, turso_sync_engine 0.7.2
+/// `database_sync_engine.rs` 3177-3197). It does that on its own IO thread,
+/// which finishes a write it has started even when the operation that asked
+/// for it was dropped by a timeout. So a reader can find the file empty or
+/// half written at any time, and the engine has no call that returns what
+/// the file holds. A read that finds an incomplete file reads it again until
+/// it parses: a prefix of a JSON object never parses, so what parses is one
+/// whole version.
+pub(super) async fn read_sync_metadata(path: &Path) -> Result<serde_json::Value, DriverError> {
+    sync_metadata(path)
 }
 
 /// Remove the recorded stop, returning the cause it held.
@@ -284,6 +301,73 @@ mod tests {
         std::fs::write(sidecar(&path, "-info"), b"{}").expect("write info");
         check_local_files(&path).expect("a finished restore opens as it is");
         assert!(path.exists());
+    }
+
+    /// The engine's rewrite, slowed so a reader lands inside it: the file is
+    /// truncated, stays empty for a moment, then holds the whole record.
+    fn rewrite_in_place(info: &Path, record: &[u8]) {
+        use std::io::Write;
+        let mut file = std::fs::File::create(info).expect("truncate info");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        file.write_all(record).expect("write info");
+    }
+
+    #[tokio::test]
+    async fn the_engines_record_is_read_whole_while_the_engine_rewrites_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        let info = sidecar(&path, "-info");
+        let record = br#"{"client_unique_id":"temper-1","last_pushed_change_id_hint":157}"#;
+        std::fs::write(&info, record).expect("write info");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let engine = {
+            let (info, stop) = (info.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    rewrite_in_place(&info, record);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        };
+        let mut reads = Vec::new();
+        for _ in 0..200 {
+            reads.push(read_sync_metadata(&path).await);
+            tokio::time::sleep(std::time::Duration::from_micros(300)).await;
+        }
+        stop.store(true, Ordering::Release);
+        engine.join().expect("engine thread");
+
+        let failed: Vec<String> = reads
+            .iter()
+            .filter_map(|read| read.as_ref().err().map(ToString::to_string))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "{} of 200 reads failed during rewrites, first: {}",
+            failed.len(),
+            failed[0]
+        );
+        for read in reads {
+            assert_eq!(read.expect("read")["last_pushed_change_id_hint"], 157);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_record_is_an_error_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        let started = std::time::Instant::now();
+        let error = read_sync_metadata(&path).await.expect_err("no record");
+        assert!(error.to_string().contains("read sync metadata"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "a missing file is not waited on: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
