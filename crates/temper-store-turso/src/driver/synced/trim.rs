@@ -116,15 +116,21 @@ impl SyncCopy {
 
 /// The oldest and newest change numbers in the log, if it has any rows.
 async fn change_ids(conn: &Connection) -> Result<Option<(i64, i64)>, DriverError> {
-    let mut rows = conn
-        .query("SELECT MIN(change_id), MAX(change_id) FROM turso_cdc", ())
-        .await?;
+    // turso 0.7.2 reads one end of the log for a lone MIN or MAX, but scans every
+    // row for both in one query (turso_core `translate/optimizer/mod.rs` 662-718).
+    let oldest = one_id(conn, "SELECT MIN(change_id) FROM turso_cdc").await?;
+    let newest = one_id(conn, "SELECT MAX(change_id) FROM turso_cdc").await?;
+    Ok(oldest.zip(newest))
+}
+
+async fn one_id(conn: &Connection, sql: &str) -> Result<Option<i64>, DriverError> {
+    let mut rows = conn.query(sql, ()).await?;
     let Some(row) = rows.next().await? else {
         return Ok(None);
     };
-    let ids = row.get::<Option<i64>>(0)?.zip(row.get::<Option<i64>>(1)?);
+    let id = row.get::<Option<i64>>(0)?;
     drop(rows);
-    Ok(ids)
+    Ok(id)
 }
 
 /// Rows for the batch after one that deleted `deleted` rows in `took`: what
