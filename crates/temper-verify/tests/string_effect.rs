@@ -185,3 +185,85 @@ fn string_parameters_override_effects_in_every_cascade_level() {
         assert!(result.level_result(level).unwrap().passed);
     }
 }
+
+const SEQUENTIAL_PARAMS: &str = r#"
+[automaton]
+name = "SequentialParams"
+states = ["Start", "First", "Second", "Equal"]
+initial = "Start"
+terminal = ["Equal"]
+[[state]]
+name = "x"
+type = "string"
+initial = ""
+[[state]]
+name = "y"
+type = "string"
+initial = ""
+[[action]]
+name = "A"
+from = ["Start"]
+to = "First"
+params = ["x"]
+[[action]]
+name = "B"
+from = ["First"]
+to = "Second"
+params = ["y"]
+[[action]]
+name = "C"
+from = ["Second"]
+to = "Equal"
+guard = "x == y && y == 'special'"
+"#;
+
+#[test]
+fn sequential_string_parameters_share_comparison_literals() {
+    for comparison in ["y == 'special'", "'special' == y", "y in ['special']"] {
+        let source = SEQUENTIAL_PARAMS.replace("y == 'special'", comparison);
+        let result = check_model(&build_model_from_ioa(&source, 2).unwrap());
+        assert!(
+            result.all_properties_hold && result.is_complete,
+            "{result:#?}"
+        );
+        assert!(
+            result.dead_transitions.is_empty(),
+            "{comparison}: {result:#?}"
+        );
+
+        let unsafe_source = source
+            + r#"
+[[invariant]]
+name = "NeverEqual"
+assert = "status != 'Equal'"
+"#;
+        assert_sequential_special_counterexample(&unsafe_source);
+    }
+}
+
+#[test]
+fn sequential_string_parameters_share_invariant_literals() {
+    let source = SEQUENTIAL_PARAMS.replace("x == y && y == 'special'", "x == y")
+        + r#"
+[[invariant]]
+name = "NeverEqualSpecial"
+assert = "status != 'Equal' || y != 'special'"
+"#;
+    assert_sequential_special_counterexample(&source);
+}
+
+fn assert_sequential_special_counterexample(source: &str) {
+    let result = check_model(&build_model_from_ioa(source, 2).unwrap());
+    assert!(!result.all_properties_hold, "{result:#?}");
+    assert!(
+        result.counterexamples.iter().any(|example| {
+            example.property == "Invariants"
+                && example.trace.last().is_some_and(|(state, _)| {
+                    state.status == "Equal"
+                        && state.strings["x"] == temper_verify::model::ModelString::from("special")
+                        && state.strings["y"] == temper_verify::model::ModelString::from("special")
+                })
+        }),
+        "{result:#?}"
+    );
+}

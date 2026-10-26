@@ -280,8 +280,8 @@ fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BT
     }
 }
 
-/// For each tracked string variable, the literals a guard or invariant
-/// compares it with (`v == 'x'`, `v in ['x', 'y']`).
+/// For every tracked string variable, all initial, effect and comparison
+/// literals any tracked string may hold (`v == 'x'`, `v in ['x', 'y']`).
 fn string_literals(
     automaton: &Automaton,
     tracked: &BTreeSet<String>,
@@ -347,17 +347,20 @@ fn string_literals(
             }
         }
     }
-    // A param may equal a literal held by another field now or after a later
-    // effect. Give every tracked param those concrete choices; a fresh symbol
-    // still represents every other string, as before.
-    for var in tracked {
-        out.insert(var.clone(), written.clone());
-    }
     for action in &automaton.actions {
         visit(&action.guard, tracked, &mut out);
     }
     for inv in &automaton.invariants {
         visit(&inv.assert, tracked, &mut out);
+    }
+    // An earlier param may equal a literal compared with another field later
+    // (x == y && y == 'special'). Share comparison literals as well as initial
+    // and effect values: a fresh symbol cannot equal a concrete literal.
+    // This stays finite; fresh symbols still cover all other parameter inputs,
+    // and effect-only fields still take only their initial and written values.
+    written.extend(out.values().flatten().cloned());
+    for var in tracked {
+        out.insert(var.clone(), written.clone());
     }
     out
 }
