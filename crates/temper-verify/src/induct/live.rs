@@ -26,7 +26,7 @@ use temper_spec::predicate::Expr;
 
 use super::encode::{Enc, counted};
 use super::moves::{Move, Moves, Step};
-use super::run::Ask;
+use super::run::{Ask, Reads};
 use super::vocab::Vocab;
 
 /// The measure of an `eventually` rule: terms over `$`-framed names,
@@ -131,9 +131,12 @@ pub(super) fn asks(
         }
         text
     };
-    let assuming = |ask: Ask| Ask {
-        assumes: true,
-        ..ask
+    let ask = |name: &str, text, goal: Vec<(String, String)>| {
+        let reads = Reads::new(v, before, &goal);
+        Ask {
+            assumes: true,
+            ..Ask::new(name, text, goal.into(), &reads)
+        }
     };
     let any: Vec<String> = live.regions.iter().map(|r| r.read("pre")).collect();
     let covered = vec![(
@@ -141,20 +144,14 @@ pub(super) fn asks(
         format!("(or false {})", any.join(" ")),
     )];
     let text = short(&[], &[]);
-    out.push(assuming(Ask::new(v, "covers", text, covered, before)));
+    out.push(ask("covers", text, covered));
     let floor: Vec<String> = terms("pre").iter().map(|t| format!("(>= {t} 0)")).collect();
     let bounded = vec![(
         "measure not negative".to_string(),
         format!("(and true {})", floor.join(" ")),
     )];
     let text = short(&[], &[]);
-    out.push(assuming(Ask::new(
-        v,
-        "measure bounded",
-        text,
-        bounded,
-        before,
-    )));
+    out.push(ask("measure bounded", text, bounded));
     let lower = lexically_less(&terms("post"), &terms("pre"));
     for region in &live.regions {
         // A region that pins no parameter takes its move as the induction
@@ -205,7 +202,7 @@ pub(super) fn asks(
         }
         let text = short(std::slice::from_ref(&at_w), &decls);
         let name = format!("region {}: {} can happen", region.name, region.step);
-        out.push(assuming(Ask::new(v, &name, text, happens, before)));
+        out.push(ask(&name, text, happens));
         for outcome in &outcomes {
             let reaches = vec![(
                 "target or lower measure".to_string(),
@@ -215,7 +212,7 @@ pub(super) fn asks(
             extra.extend(outcome.body().cloned());
             let text = short(&extra, &decls);
             let name = format!("region {}: {}", region.name, outcome.label);
-            out.push(assuming(Ask::new(v, &name, text, reaches, before)));
+            out.push(ask(&name, text, reaches));
         }
     }
 }

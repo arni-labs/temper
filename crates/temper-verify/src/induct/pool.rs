@@ -118,7 +118,7 @@ pub(super) fn with_pool<R>(
     }
     for ask in asks {
         literals.extend(quoted_literals(&ask.text));
-        for (_, c) in &ask.goal {
+        for (_, c) in ask.goal.iter() {
             literals.extend(quoted_literals(c));
         }
     }

@@ -34,7 +34,7 @@ mod solver;
 mod vocab;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use temper_authz::{May, SendAnalysis};
@@ -48,7 +48,7 @@ pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};
 use moves::Moves;
 pub use proof::{Obligation, Outcome, RuleProof};
-use run::{Ask, Clauses, Kept};
+use run::{Ask, Clauses, Kept, Reads};
 use vocab::Vocab;
 
 /// Prove each invariant and `eventually` rule of `automatons` with the hints
@@ -287,11 +287,11 @@ fn prove_one(
         for fact in initial(&v) {
             text.push_str(&format!("(assert {fact})\n"));
         }
-        asks.push(Ask {
-            goal: clauses.read("pre"),
-            ..Ask::new(&v, "start", text, before.clone(), &before)
-        });
+        let reads = Reads::new(&v, &before, &before);
+        asks.push(Ask::new("start", text, clauses.read("pre").into(), &reads));
     }
+    let moved = Reads::new(&v, &before, &after);
+    let post: Arc<[(String, String)]> = clauses.read("post").into();
     let ask = |mv: &moves::Move| {
         let mut text = String::from("(push 1)\n");
         mv.decls
@@ -301,9 +301,8 @@ fn prove_one(
             text.push_str(&format!("(assert {fact})\n"));
         }
         Ask {
-            goal: clauses.read("post"),
             assumes: true,
-            ..Ask::new(&v, &mv.label, text, after.clone(), &before)
+            ..Ask::new(&mv.label, text, Arc::clone(&post), &moved)
         }
     };
     general::lay_out(&groups, &moves, &ask, &mut asks);
@@ -332,9 +331,10 @@ fn prove_one(
             text.push_str("(assert pre.settled)\n");
         }
         let goal = vec![("premise met".to_string(), "false".to_string())];
+        let reads = Reads::new(&v, &before, &goal);
         asks.push(Ask {
             assumes: true,
-            ..Ask::new(&v, "premise", text, goal, &before)
+            ..Ask::new("premise", text, goal.into(), &reads)
         });
     }
     // Every try holds the agent's lemmas, and drops each a move breaks. An

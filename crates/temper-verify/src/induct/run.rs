@@ -16,8 +16,9 @@ pub(super) struct Ask {
     pub(super) name: String,
     /// Starts with `(push 1)`: its declarations and what it assumes.
     pub(super) text: String,
-    pub(super) goal: Vec<(String, String)>,
-    pub(super) show: Vec<String>,
+    /// Shared by the asks that check the same clauses.
+    pub(super) goal: Arc<[(String, String)]>,
+    pub(super) show: Arc<[String]>,
     /// Whether it assumes the clauses the proof holds before the move.
     pub(super) assumes: bool,
     /// A general move's ([`super::general`]): the asks of the moves it
@@ -29,26 +30,46 @@ pub(super) struct Ask {
 
 impl Ask {
     pub(super) fn new(
-        v: &Vocab<'_>,
         name: &str,
         text: String,
-        goal: Vec<(String, String)>,
-        before: &[(String, String)],
+        goal: Arc<[(String, String)]>,
+        reads: &Reads,
     ) -> Self {
-        let show = shown(v, before, &goal);
-        let quantified = |t: &str| t.contains("(forall ") || t.contains("(exists ");
-        let quantified =
-            quantified(&text) || before.iter().chain(&goal).any(|(_, c)| quantified(c));
         Self {
             name: name.to_string(),
+            quantified: reads.quantified || quantified(&text),
             text,
             goal,
-            show,
+            show: Arc::clone(&reads.show),
             assumes: false,
             members: Vec::new(),
-            quantified,
         }
     }
+}
+
+/// What the clauses an ask holds before its move and checks after it
+/// read: what a counterexample shows, and whether one is quantified. Read
+/// once for all the asks that read the same clauses.
+pub(super) struct Reads {
+    show: Arc<[String]>,
+    quantified: bool,
+}
+
+impl Reads {
+    pub(super) fn new(
+        v: &Vocab<'_>,
+        before: &[(String, String)],
+        goal: &[(String, String)],
+    ) -> Self {
+        Self {
+            show: shown(v, before, goal).into(),
+            quantified: before.iter().chain(goal).any(|(_, c)| quantified(c)),
+        }
+    }
+}
+
+fn quantified(text: &str) -> bool {
+    text.contains("(forall ") || text.contains("(exists ")
 }
 
 /// The clauses a rule's proof may hold: each by name, read before and
@@ -138,7 +159,7 @@ pub(super) fn check(
     ask: &Ask,
     (assume, goal): (&str, &[(String, String)]),
 ) -> std::io::Result<Obligation> {
-    let show = [ask.show.as_slice(), literals].concat();
+    let show = [&ask.show[..], literals].concat();
     let all: Vec<&str> = goal.iter().map(|(_, c)| c.as_str()).collect();
     let negated = format!("(assert (not (and true {})))\n", all.join(" "));
     let text = format!("{}{assume}", ask.text);
