@@ -122,53 +122,85 @@ fn run_seed(seed: u64) -> Result<(), String> {
         let mut events = state.event_tx.subscribe();
         state.start_runtime().await.unwrap();
         let mut broadcasts: BTreeMap<String, usize> = BTreeMap::new();
-        let mut at_half = vec![0; count];
+        let mut before_recovery = vec![0; count];
         let mut broken = BTreeMap::new();
-        // Use small increments so every store completion, failure and timer
-        // retry is observed without reads that could repair a missing timer.
-        for step in 0..2400 {
+        // Keep the complete twenty-minute fault schedule, then restore the
+        // store for two minutes. Seed 25 includes seven consecutive failures
+        // for one ticker: it must retry throughout and resume after recovery.
+        // No workload operation touches any record after the restart.
+        for step in 0..2640 {
+            if step == 2400 {
+                *store.faults.lock().unwrap() = false;
+            }
             tokio::time::advance(Duration::from_millis(500)).await;
-            // The only yielding I/O is a timer-row round trip (at most
-            // seven turns). Drain the runnable work before inspecting it.
-            for _ in 0..96 { tokio::task::yield_now().await; }
+            // Drain the runnable work (row I/O yields at most seven turns).
+            for _ in 0..96 {
+                tokio::task::yield_now().await;
+            }
             while let Ok(event) = events.try_recv() {
                 if event.action == "Expire" {
                     *broadcasts.entry(event.entity_id).or_default() += 1;
                 }
             }
-            let fail = |detail: String| format!("seed {seed}, step {step} ({}ms): {detail}", (step + 1) * 500);
-            if store.activity.lock().unwrap().peak > GATE {
-                broken.entry("gate").or_insert_with(|| fail(format!("fire writes exceed BOOT_FIRES_AT_ONCE: peak {}", store.activity.lock().unwrap().peak)));
+            let fail = |detail: String| {
+                format!("seed {seed}, step {step} ({}ms): {detail}", (step + 1) * 500)
+            };
+            let peak = store.activity.lock().unwrap().peak;
+            if peak > GATE {
+                broken.entry("gate").or_insert_with(|| {
+                    fail(format!("fire writes exceed BOOT_FIRES_AT_ONCE: peak {peak}"))
+                });
             }
             let saved = rows.list_state_timers("alpha").await.unwrap();
-            for (i, halfway) in at_half.iter_mut().enumerate() {
+            for (i, before) in before_recovery.iter_mut().enumerate() {
                 let id = format!("job-{i}");
-                let journal = store.journal.dump_journal(&format!("alpha:Job:{id}"));
-                let fires: Vec<_> = journal.iter().filter(|e| e.payload["action"] == "Expire").collect();
-                if step == 1199 { *halfway = fires.len(); }
-                {
-                    let timers: Vec<_> = saved.iter().filter(|row| row.entity_id == id).collect();
-                    if timers.len() != 1 || timers[0].state != "Waiting" {
-                        broken.entry("timer").or_insert_with(|| fail(format!("timed {id} needs exactly one armed Waiting timer, found {} ({} failed appends)", timers.len(), store.activity.lock().unwrap().failed)));
+                let persistence_id = format!("alpha:Job:{id}");
+                let journal = store.journal.dump_journal(&persistence_id);
+                let fires: Vec<_> = journal.iter()
+                    .filter(|e| e.payload["action"] == "Expire").collect();
+                if step == 2399 {
+                    *before = fires.len();
+                }
+                let timers: Vec<_> = saved.iter().filter(|row| row.entity_id == id).collect();
+                if timers.len() != 1 || timers[0].state != "Waiting" {
+                    broken.entry("timer").or_insert_with(|| {
+                        fail(format!(
+                            "timed {id} needs exactly one armed Waiting timer, found {} ({} failed appends)",
+                            timers.len(), store.activity.lock().unwrap().failed,
+                        ))
+                    });
+                }
+                for event in &fires {
+                    let seq = event.sequence_nr;
+                    let broadcast = broadcasts.get(&id).copied().unwrap_or(0) == fires.len();
+                    let projected = pubs.0.lock().unwrap().get(&id)
+                        .is_some_and(|seqs| seqs.contains(&seq));
+                    if !broadcast || !projected {
+                        broken.entry("publication").or_insert_with(|| {
+                            fail(format!("committed {id} at {seq} lacks broadcast or projection"))
+                        });
                     }
                 }
-                {
-                    for event in &fires {
-                        let seq = event.sequence_nr;
-                        if broadcasts.get(&id).copied().unwrap_or(0) != fires.len() || !pubs.0.lock().unwrap().get(&id).is_some_and(|seqs| seqs.contains(&seq)) {
-                            broken.entry("publication").or_insert_with(|| fail(format!("committed {id} at {seq} lacks broadcast or projection")));
-                        }
-                    }
-                }
-                if step == 2399 && (fires.len() <= *halfway || *halfway == 0) {
-                    broken.entry("progress").or_insert_with(|| fail(format!("untouched {id} stopped ticking: {} fires at halfway, {} at end", halfway, fires.len())));
+                if step == 2639 && fires.len() <= *before {
+                    broken.entry("progress").or_insert_with(|| {
+                        fail(format!(
+                            "untouched {id} stopped ticking: {before} fires before recovery, {} at end; attempts {:?}",
+                            fires.len(), store.attempts.lock().unwrap().get(&persistence_id),
+                        ))
+                    });
                 }
             }
         }
         let a = store.activity.lock().unwrap();
         if a.failed == 0 || a.slow <= count {
-            broken.entry("coverage").or_insert_with(|| format!("seed {seed}: no steady ticking: {} appends, {} failed", a.slow, a.failed));
+            broken.entry("coverage").or_insert_with(|| {
+                format!("seed {seed}: no steady ticking: {} appends, {} failed", a.slow, a.failed)
+            });
         }
-        if broken.is_empty() { Ok(()) } else { Err(broken.into_values().collect::<Vec<_>>().join("\n")) }
+        if broken.is_empty() {
+            Ok(())
+        } else {
+            Err(broken.into_values().collect::<Vec<_>>().join("\n"))
+        }
     })
 }

@@ -20,12 +20,16 @@ pub(super) struct Activity {
     pub slow: usize,
 }
 
+// Per record: expected journal sequence, append delay in seconds, failed.
+type AppendAttempts = BTreeMap<String, Vec<(u64, u64, bool)>>;
+
 #[derive(Clone)]
 pub(super) struct SlowStore {
     pub journal: SimEventStore,
     pub activity: Arc<Mutex<Activity>>,
     rng: Arc<Mutex<DeterministicRng>>,
     pub faults: Arc<Mutex<bool>>,
+    pub attempts: Arc<Mutex<AppendAttempts>>,
 }
 
 impl SlowStore {
@@ -35,6 +39,7 @@ impl SlowStore {
             activity: Arc::new(Mutex::new(Activity::default())),
             rng: Arc::new(Mutex::new(DeterministicRng::new(seed ^ 0x510f))),
             faults: Arc::new(Mutex::new(false)),
+            attempts: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -63,7 +68,8 @@ impl EventStore for SlowStore {
         let first = self.activity.lock().unwrap().slow == 0;
         let (delay, fails) = {
             let mut rng = self.rng.lock().unwrap();
-            // Both outcomes outlast the full 5s x 3 dispatch ask budget.
+            // The first failure isolates rollback before a request deadline;
+            // later successes and failures outlast the full 5s x 3 budget.
             if first {
                 (Duration::from_secs(1), true)
             } else {
@@ -86,6 +92,12 @@ impl EventStore for SlowStore {
         } else {
             self.journal.append_with_rows(id, seq, events, rows).await
         };
+        self.attempts
+            .lock()
+            .unwrap()
+            .entry(id.into())
+            .or_default()
+            .push((seq, delay.as_secs(), fails));
         self.activity.lock().unwrap().active -= 1;
         result
     }
