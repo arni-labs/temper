@@ -25,7 +25,7 @@ use temper_authz::{AuthenticatedRequestContext, SecurityContext};
 use temper_runtime::tenant::TenantId;
 
 use crate::authz::{
-    DenialInput, record_authz_denial, require_authenticated_context, require_tenant_match,
+    Asked, DenialInput, record_authz_denial, require_authenticated_context, require_tenant_match,
 };
 use crate::state::ServerState;
 
@@ -193,10 +193,12 @@ pub fn build_api_router() -> Router<ServerState> {
 
 /// Authorize a policy management request against Cedar policies.
 ///
-/// Returns `Some(response)` if authorization is denied, `None` if allowed.
+/// Returns `Some(response)` if authorization is denied, `None` if allowed. A
+/// refused change files a decision; a refused read writes nothing.
 pub(crate) async fn require_policy_auth(
     state: &ServerState,
     authenticated: &AuthenticatedRequestContext,
+    asked: Asked,
 ) -> Option<axum::response::Response> {
     let security_ctx = authenticated.security_context();
     let tenant = authenticated.tenant().as_str();
@@ -218,6 +220,17 @@ pub(crate) async fn require_policy_auth(
         tenant,
     ) {
         let reason = denial.to_string();
+        if asked == Asked::Read {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "error": {"code": "AuthorizationDenied", "message": reason}
+                    })),
+                )
+                    .into_response(),
+            );
+        }
         let pd = record_authz_denial(
             state,
             DenialInput {
@@ -296,7 +309,7 @@ impl FromRequestParts<ServerState> for PolicyAuthed {
             require_authenticated_context(parts.extensions.get::<AuthenticatedRequestContext>())
                 .map_err(IntoResponse::into_response)?;
         require_tenant_match(authenticated, tenant).map_err(IntoResponse::into_response)?;
-        match require_policy_auth(state, authenticated).await {
+        match require_policy_auth(state, authenticated, Asked::of(&parts.method)).await {
             Some(resp) => Err(resp),
             None => Ok(Self(authenticated.clone())),
         }

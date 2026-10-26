@@ -2,8 +2,8 @@
 
 mod denial_response;
 pub mod edge;
-pub use denial_response::DeniedResource;
 pub(crate) use denial_response::resolve_requested_denial;
+pub use denial_response::{Asked, DeniedResource};
 mod helpers;
 pub mod policy_persistence;
 pub mod wasm_gate;

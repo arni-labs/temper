@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use axum::http::StatusCode;
 use temper_authz::AuthenticatedRequestContext;
 use temper_runtime::tenant::TenantId;
+use temper_server::authz::Asked;
 
 use crate::state::PlatformState;
 
@@ -48,15 +49,20 @@ pub(super) fn require_resource_authorization(
     authenticated: &AuthenticatedRequestContext,
     input: PlatformResourceAuthorization<'_>,
 ) -> Result<(), StatusCode> {
-    check_resource_authorization(state, authenticated, input).map_err(|_| StatusCode::FORBIDDEN)
+    // The refusal is answered with a bare status, so nothing is filed either way.
+    check_resource_authorization(state, authenticated, Asked::Read, input)
+        .map_err(|_| StatusCode::FORBIDDEN)
 }
 
+/// Refuse with a JSON body; a refused change an agent asked for also files a
+/// decision, and a refused read writes nothing.
 pub(super) async fn require_requested_resource_authorization(
     state: &PlatformState,
     authenticated: &AuthenticatedRequestContext,
+    asked: Asked,
     input: PlatformResourceAuthorization<'_>,
 ) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
-    match check_resource_authorization(state, authenticated, input) {
+    match check_resource_authorization(state, authenticated, asked, input) {
         Ok(()) => Ok(()),
         Err(denial) => Err(denial.for_request(&state.server, authenticated).await),
     }
@@ -65,6 +71,7 @@ pub(super) async fn require_requested_resource_authorization(
 fn check_resource_authorization(
     state: &PlatformState,
     authenticated: &AuthenticatedRequestContext,
+    asked: Asked,
     mut input: PlatformResourceAuthorization<'_>,
 ) -> Result<(), temper_server::authz::DeniedResource> {
     input.attrs.insert(
@@ -95,6 +102,7 @@ fn check_resource_authorization(
                 "platform management operation denied"
             );
             temper_server::authz::DeniedResource {
+                asked,
                 action: input.action.to_string(),
                 resource_type: input.resource_type.to_string(),
                 resource_id: input.resource_id.to_string(),

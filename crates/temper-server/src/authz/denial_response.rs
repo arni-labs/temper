@@ -3,12 +3,36 @@
 use std::collections::BTreeMap;
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use temper_authz::{AuthenticatedRequestContext, PrincipalKind};
 
 use super::{DenialInput, record_authz_denial};
 use crate::state::ServerState;
+
+/// What a refused request asked for.
+///
+/// Only a refused change becomes a decision someone can approve. A read, or a
+/// question about what would be allowed, writes nothing: asking must never
+/// load the store, however often a page asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// To see something, without changing it.
+    Read,
+    /// To change something.
+    Change,
+}
+
+impl Asked {
+    /// What an HTTP request asks for, by its method: a safe method only reads.
+    pub fn of(method: &Method) -> Self {
+        if method.is_safe() {
+            Self::Read
+        } else {
+            Self::Change
+        }
+    }
+}
 
 /// A denied resource check, before deciding whether the request needs approval.
 ///
@@ -16,6 +40,8 @@ use crate::state::ServerState;
 /// discarded row-filter denial must never be recorded as a requested action.
 #[derive(Clone, Debug)]
 pub struct DeniedResource {
+    /// What the refused request asked for.
+    pub asked: Asked,
     /// Cedar action that was denied.
     pub action: String,
     /// Cedar resource type.
@@ -29,8 +55,10 @@ pub struct DeniedResource {
 }
 
 impl DeniedResource {
-    /// Record a denied interactive agent request, preserving its authenticated
-    /// identity and telemetry. This never grants access or changes a policy.
+    /// Answer a denied request. A change an interactive agent asked for is
+    /// recorded as a decision, preserving its authenticated identity and
+    /// telemetry; a read is only refused. This never grants access or changes
+    /// a policy.
     pub async fn for_request(
         self,
         state: &ServerState,
@@ -46,7 +74,10 @@ impl DeniedResource {
                 .get("sessionId")
                 .and_then(|value| value.as_str())
         });
-        if security_ctx.principal.kind == PrincipalKind::Agent && session_id.is_some() {
+        if self.asked == Asked::Change
+            && security_ctx.principal.kind == PrincipalKind::Agent
+            && session_id.is_some()
+        {
             let decision = record_authz_denial(
                 state,
                 DenialInput {
