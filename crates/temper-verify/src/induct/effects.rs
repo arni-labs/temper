@@ -155,7 +155,7 @@ impl Moves<'_, '_, '_> {
         }
         for effect in &action.effect {
             let Some(kind) =
-                scheduled(effect).and_then(|s| v.scheduled_kind(entity, &action.name, s))
+                scheduled(effect).filter(|_| false).and_then(|s| v.scheduled_kind(entity, &action.name, s))
             else {
                 continue;
             };

@@ -1,3 +1,6 @@
+[profile.default]
+fail-fast = false
+
 # The Turso Sync tests talk to a local sync server; a hang there should fail
 # the test with its output, not hold the job until its own timeout.
 [[profile.default.overrides]]
