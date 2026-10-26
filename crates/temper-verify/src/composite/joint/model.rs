@@ -145,7 +145,7 @@ enum Unsent {
 impl Unsent {
     fn sender(&self) -> String {
         match self {
-            Unsent::Answer => "a module's answer (its trigger names no on_success)".to_string(),
+            Unsent::Answer => "a module whose trigger names no on_success".to_string(),
             Unsent::Reactions(from) => format!(
                 "a reaction from {}",
                 from.iter()

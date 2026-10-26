@@ -92,18 +92,24 @@ impl Explored {
         steps
     }
 
-    /// The moves the runtime could make that the walk never took, each as
-    /// `Entity.Action (from Status, ...), sent by who`.
+    /// The moves the runtime could make that the walk never took, one line
+    /// per sender: `who may take Entity.Action (from Status, ...), ...`.
     pub(in crate::composite::joint) fn unwalked(&self) -> Vec<String> {
-        let mut from: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+        let mut by: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
         for found in &self.unwalked {
-            from.entry((&found.action, &found.sender))
+            by.entry(&found.sender)
+                .or_default()
+                .entry(&found.action)
                 .or_default()
                 .push(&found.from);
         }
-        from.into_iter()
-            .map(|((action, sender), statuses)| {
-                format!("{action} (from {}), sent by {sender}", statuses.join(", "))
+        by.into_iter()
+            .map(|(sender, actions)| {
+                let actions: Vec<String> = actions
+                    .into_iter()
+                    .map(|(action, statuses)| format!("{action} (from {})", statuses.join(", ")))
+                    .collect();
+                format!("{sender} may take {}", actions.join(", "))
             })
             .collect()
     }
@@ -112,7 +118,7 @@ impl Explored {
 /// Why a walk that never took the moves `unwalked` proves nothing.
 pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
     format!(
-        "the walk never takes {}, so it never goes where they lead. Declare an action only a module answers with as internal, or name it in its trigger's on_success; the walk does not send a reaction from a type outside the rule's scope",
+        "the walk never takes moves the runtime can make, so it never goes where they lead: {}. Declare an action only a module answers with as internal, or name it in its trigger's on_success; the walk does not send a reaction from a type outside the rule's scope",
         unwalked.join("; ")
     )
 }
