@@ -10,8 +10,10 @@ use temper_runtime::tenant::TenantId;
 impl ServerState {
     /// Repair every serving tenant, including apps restored from the store.
     /// Registry membership is authoritative here, not --app or connected_tenants
-    /// (the latter is empty on a single Turso store). Failed repairs keep boot
-    /// pending; a server must not expose a row it knows is behind its journal.
+    /// (the latter is empty on a single Turso store). An unavailable replay spec
+    /// withholds its tenant from serving while other tenants continue booting.
+    /// Other failed repairs keep boot pending; a server must not expose a row
+    /// it knows is behind its journal.
     pub(crate) async fn repair_query_projections_at_boot(&self) -> Vec<(TenantId, EntityState)> {
         if self.query_plane_store().is_none() || self.event_journal().is_none() {
             return Vec::new();
@@ -37,6 +39,35 @@ impl ServerState {
                     }
                 }
             };
+            {
+                let mut registry = self.registry.write().expect("registry lock poisoned");
+                // Match transition_table_for's registry and legacy table lookup.
+                if let Some(candidate) = pending.iter().find(|candidate| {
+                    registry
+                        .get_table_live(&tenant, &candidate.journal.entity_type)
+                        .is_none()
+                        && !self
+                            .transition_tables
+                            .contains_key(&candidate.journal.entity_type)
+                }) {
+                    let entity_type = &candidate.journal.entity_type;
+                    let reason = format!(
+                        "Boot projection repair cannot replay type '{entity_type}': its spec is unavailable"
+                    );
+                    tracing::error!(%tenant, %entity_type,
+                        entity_id = %candidate.journal.entity_id, %reason,
+                        "tenant withheld from serving; other tenants continue booting");
+                    // Restoration can omit an unreadable type while keeping
+                    // its CSDL routes. Withhold the whole affected tenant via
+                    // the existing 503 gate, just as a failed tenant restore
+                    // does. Removing only the in-memory registration also
+                    // excludes it from timer recovery and background walks;
+                    // all durable specs, journals and rows remain untouched.
+                    registry.mark_tenant_unavailable(tenant.clone(), reason);
+                    registry.remove_tenant(&tenant);
+                    continue;
+                }
+            }
             // Only lagging records load snapshots/events. Healthy records never
             // acquire actors, replay their history or rewrite their projections.
             while !pending.is_empty() {
