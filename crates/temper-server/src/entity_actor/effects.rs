@@ -161,6 +161,14 @@ pub fn build_eval_context_with_xref(
     ctx
 }
 
+/// Give `ctx` the parameters of the move being taken, which its guard reads
+/// as `params.p`.
+pub(crate) fn with_params(ctx: &mut EvalContext, params: &serde_json::Value) {
+    if let Some(params) = params.as_object() {
+        ctx.params = params.clone();
+    }
+}
+
 /// Result of processing an action through the transition table.
 #[derive(Debug, Clone)]
 pub struct ProcessResult {
@@ -355,7 +363,8 @@ pub(crate) fn process_action_with_xref_and_field_mode(
         }
     }
 
-    let ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    let mut ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    with_params(&mut ctx, params);
     let result = table.evaluate_ctx(&state.status, &ctx, action);
 
     match result {

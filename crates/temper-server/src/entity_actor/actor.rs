@@ -139,13 +139,15 @@ fn duplicate_idempotency_custom_effects(
     table: &TransitionTable,
     state: &EntityState,
     action: &str,
+    params: &serde_json::Value,
     related: &temper_jit::table::RelatedMap,
 ) -> Vec<String> {
     if !table.composite_actions.contains_key(action) {
         return Vec::new();
     }
 
-    let ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    let mut ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    super::effects::with_params(&mut ctx, params);
     table
         .evaluate_ctx(&state.status, &ctx, action)
         .filter(|result| result.success)
@@ -1388,8 +1390,9 @@ impl EntityActor {
                 if let Some(key) = idempotency_key.as_deref()
                     && state.has_processed_idempotency_key(key)
                 {
-                    let custom_effects =
-                        duplicate_idempotency_custom_effects(&table, state, &name, &related);
+                    let custom_effects = duplicate_idempotency_custom_effects(
+                        &table, state, &name, &params, &related,
+                    );
                     let mut response_state = state.clone();
                     if !custom_effects.is_empty() {
                         prune_transient_action_fields_from_state(&mut response_state);
