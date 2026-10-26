@@ -1430,11 +1430,16 @@ impl StorageStack {
         self
     }
 
-    /// Refuse appends while the disk holding `room` has less than
-    /// [`STORAGE_FLOOR_BYTES`] available (`BoxedEventStore::with_storage_room`).
+    /// Refuse appends and trajectory rows while the disk holding `room` has
+    /// less than [`STORAGE_FLOOR_BYTES`] available
+    /// (`BoxedEventStore::with_storage_room`, `RoomCheckedTrajectories`).
     pub fn with_storage_room(mut self, room: StorageRoom) -> Self {
         tracing::info!(dir = %room.dir().display(), floor_bytes = STORAGE_FLOOR_BYTES,
-            "appends refused while this disk has less room than the floor");
+            "appends and trajectory rows refused while this disk has less room than the floor");
+        self.trajectory = self.trajectory.map(|inner| {
+            let room = room.clone();
+            Arc::new(write_room::RoomCheckedTrajectories { inner, room }) as Arc<dyn TrajectorySink>
+        });
         self.events = self.events.with_storage_room(room);
         self
     }

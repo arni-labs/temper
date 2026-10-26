@@ -136,6 +136,50 @@ async fn a_disk_that_cannot_be_read_refuses_nothing() {
     assert_eq!(journal.write_health(), WriteHealth::Writing);
 }
 
+/// A trajectory sink that counts the rows it is handed.
+#[derive(Default)]
+struct CountingTrajectories(AtomicU64);
+
+#[async_trait::async_trait]
+impl TrajectorySink for CountingTrajectories {
+    async fn persist_trajectory_entry(&self, _entry: &TrajectoryEntry) -> Result<(), String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_disk_under_the_floor_writes_no_trajectory_row_until_it_has_room() {
+    let available = Arc::new(AtomicU64::new(STORAGE_FLOOR_BYTES - 1));
+    let rows = Arc::new(CountingTrajectories::default());
+    let room_of = Arc::clone(&available);
+    let sink = RoomCheckedTrajectories {
+        inner: rows.clone(),
+        room: StorageRoom::read_with("/sim/disk", move |_| Ok(room_of.load(Ordering::SeqCst))),
+    };
+    let entry: TrajectoryEntry = serde_json::from_value(serde_json::json!({
+        "timestamp": "2026-10-26T00:00:00Z", "tenant": "default", "entity_type": "Order",
+        "entity_id": "o-1", "action": "AddItem", "success": false,
+    }))
+    .expect("a trajectory entry");
+
+    let refused = sink.persist_trajectory_entry(&entry).await.unwrap_err();
+    assert!(refused.starts_with("storage full"), "{refused}");
+    assert_eq!(
+        rows.0.load(Ordering::SeqCst),
+        0,
+        "a refused row is not written"
+    );
+
+    available.store(STORAGE_FLOOR_BYTES, Ordering::SeqCst);
+    sink.persist_trajectory_entry(&entry).await.unwrap();
+    assert_eq!(
+        rows.0.load(Ordering::SeqCst),
+        1,
+        "rows are written once the disk has room"
+    );
+}
+
 #[test]
 fn the_disk_this_test_runs_on_reads_its_room() {
     let available = available_bytes(Path::new(".")).expect("statvfs reads the working directory");

@@ -2,7 +2,9 @@
 //!
 //! Every append goes through [`BoxedEventStore`], so it is where a disk under
 //! the floor refuses an append before anything is written, and where each
-//! append's outcome is kept for `/healthz` (`crate::write_health`).
+//! append's outcome is kept for `/healthz` (`crate::write_health`). The one
+//! other write every move makes, its trajectory row, is refused there too
+//! ([`RoomCheckedTrajectories`]).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,7 +12,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use temper_runtime::persistence::PersistenceError;
 
-use super::BoxedEventStore;
+use super::{BoxedEventStore, TrajectorySink};
+use crate::state::trajectory::TrajectoryEntry;
 
 /// How much room the disk under a local store keeps free: appends are refused
 /// while it has less than this available to an ordinary process (statvfs
@@ -181,6 +184,25 @@ impl BoxedEventStore {
             ) => {}
         }
         result
+    }
+}
+
+/// A trajectory sink that writes no row while the store's disk is under the
+/// floor. A refused move still records its trajectory row, so a client that
+/// keeps retrying would spend the room the floor keeps (on staging the disk
+/// went on losing about 0.2 MB/s while every append was refused). The outbox
+/// counts each row refused here as a capture loss and marks its session, as it
+/// does for any failed write.
+pub(super) struct RoomCheckedTrajectories {
+    pub(super) inner: Arc<dyn TrajectorySink>,
+    pub(super) room: StorageRoom,
+}
+
+#[async_trait::async_trait]
+impl TrajectorySink for RoomCheckedTrajectories {
+    async fn persist_trajectory_entry(&self, entry: &TrajectoryEntry) -> Result<(), String> {
+        self.room.check().map_err(|error| error.to_string())?;
+        self.inner.persist_trajectory_entry(entry).await
     }
 }
 
