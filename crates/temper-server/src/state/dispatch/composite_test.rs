@@ -5,6 +5,9 @@ mod authenticated_params_test;
 #[path = "composite/defaults_test.rs"]
 mod defaults_test;
 #[cfg(feature = "sim")]
+#[path = "composite/provenance_test.rs"]
+mod provenance_test;
+#[cfg(feature = "sim")]
 #[path = "composite/state_timers_test.rs"]
 mod state_timers_test;
 use std::collections::BTreeMap;
