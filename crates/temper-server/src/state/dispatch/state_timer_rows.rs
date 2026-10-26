@@ -16,7 +16,6 @@ use chrono::{DateTime, Utc};
 use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
-use tokio::sync::Semaphore;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use super::state_timer_follow::{BootCallers, BootTimers};
@@ -30,7 +29,7 @@ use crate::storage::{MetadataTimerRows, StateTimerStore};
 /// concurrent writes, and on 2026-10-16 1,610 at once on a loaded machine left
 /// 861 events unwritten (`failed to persist event`) and 1,013 projections
 /// failed, so those timers did not re-arm. The rest wait their turn.
-const BOOT_FIRES_AT_ONCE: usize = 8;
+pub(crate) const BOOT_FIRES_AT_ONCE: usize = 8;
 
 /// A tenant's declared timeouts: `(entity type, state)` to
 /// `(after_seconds, on_timeout)`.
@@ -94,16 +93,16 @@ impl ServerState {
     /// Reads one row per waiting timer and loads no entity until its timer
     /// fires, at most [`BOOT_FIRES_AT_ONCE`] firing at once; a row whose state
     /// declares no timeout now is removed. Then, in the background, each
-    /// record that had a row follows the state it is in now (as whoever armed
-    /// its row), through the same gate. A record in a timed state with no row
-    /// is not armed: it waits for its next action. The scheduled actions left
+    /// record follows the state it is in now (as whoever armed
+    /// its row when present), through the same gate. Missing rows are armed
+    /// from the recorded state clock. The scheduled actions left
     /// waiting are armed again from their rows through the same gate
     /// (`rearm_scheduled_actions`). Returns that background walk, which ends
     /// with the boot's counts per tenant and type, and logs them as
     /// `state timers after boot`.
     pub(crate) async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<BootTimers> {
         let started = Instant::now();
-        let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
+        let gate = self.state_timer_boot_gate.clone();
         let mut callers = BootCallers::new();
         let mut counts = BootTimers::new();
         let mut armed = 0usize;
@@ -177,6 +176,7 @@ impl ServerState {
                     continue;
                 };
                 counted.rearmed += 1;
+                counted.overdue += usize::from(delay.is_zero());
                 self.spawn_state_timer(timer, delay, Some(gate.clone()), armed_seq);
                 armed += 1;
             }
@@ -191,7 +191,7 @@ impl ServerState {
         {
             // Serialize with install walks so none can consume startup changes
             // before saved identities and gates have been restored. The boot
-            // walk covers all timed types, with rows-only arming at startup.
+            // walk covers all timed types, including missing rows at startup.
             let mut registry = self.registry.write().expect("registry lock poisoned");
             registry.take_changed_types();
             self.timer_recovery_complete

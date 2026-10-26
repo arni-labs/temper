@@ -7,12 +7,9 @@
 //! ends with its timer armed, or waits for a caller (see
 //! [`TimerFollow::WaitsForCaller`]).
 //!
-//! At boot, after the rows are re-armed, a walk makes each record that had a
-//! row follow the state it replays into: a row armed under an older spec, on
-//! a record whose state now declares another timer, gets the new timer at
-//! once, not when the stale one fires. A record in a timed state with no row is not armed: it waits for
-//! its next action ([`Arming::FromRow`]). The walk counts those records, and
-//! ends with one log line of counts per tenant and type.
+//! At boot, rows and records without rows follow their replayed state through
+//! one shared fire gate. The walk reports new arms, overdue timers and records
+//! that still need a caller, per tenant and type.
 //!
 //! A record in memory is reconciled with its actor's state. One that is not is
 //! replayed from the store without starting an actor, so a walk over many
@@ -25,7 +22,7 @@ use tokio::sync::Semaphore;
 
 use temper_runtime::tenant::TenantId;
 
-use super::state_timer_reconcile::{Arming, Follow, TimerFollow};
+use super::state_timer_reconcile::{Follow, TimerFollow};
 use crate::entity_actor::{EntityState, recover_entity_state_from_store};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
@@ -48,9 +45,12 @@ pub struct BootTimerCounts {
     pub rearmed: usize,
     /// Rows removed: their state no longer declares a timeout.
     pub dropped: usize,
-    /// Records in a timed state with no row: not armed, they wait for their
-    /// next action.
+    /// Records whose timeout action still needs a caller.
     pub waiting: usize,
+    /// Missing timers armed from the recorded state clock.
+    pub armed: usize,
+    /// Timers already due when armed or rearmed.
+    pub overdue: usize,
     /// Scheduled actions (`schedule`, `schedule_at`) armed again from their
     /// rows.
     pub scheduled: usize,
@@ -80,7 +80,7 @@ impl ServerState {
     /// changed follow the state the record is in now, including a type that
     /// had no timeout before. Failed listings and reads remain pending until
     /// the store recovers. Startup installs defer to `start_runtime`'s
-    /// rows-only boot walk, preserving saved callers and its shared fire gate.
+    /// boot walk, preserving saved callers and its shared fire gate.
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
             Ok(mut registry) => {
@@ -96,8 +96,7 @@ impl ServerState {
             }
             Err(_) => return,
         };
-        self.follow_types(changed, &BootCallers::new(), None, Arming::Any)
-            .await;
+        self.follow_types(changed, &BootCallers::new(), None).await;
     }
 
     /// Hold `tenant`'s changed types back from every walk, any tenant's,
@@ -125,8 +124,8 @@ impl ServerState {
     }
 
     /// At boot, after the rows are re-armed: make every record of every type
-    /// that declares a timeout and had a row follow its state, and count the
-    /// records in a timed state with no row into `counts`, which it logs.
+    /// that declares a timeout follow its state, including missing rows, and
+    /// report the arms and records still waiting in `counts`.
     pub(super) async fn follow_timed_types(
         &self,
         callers: BootCallers,
@@ -152,18 +151,19 @@ impl ServerState {
                 .collect(),
             Err(_) => return counts,
         };
-        let waiting = self
-            .follow_types(types, &callers, Some(gate), Arming::FromRow)
-            .await;
-        for (key, waiting) in waiting {
-            counts.entry(key).or_default().waiting = waiting;
+        let waiting = self.follow_types(types, &callers, Some(gate)).await;
+        for (key, followed) in waiting {
+            let counted = counts.entry(key).or_default();
+            counted.waiting = followed.waiting;
+            counted.armed += followed.armed;
+            counted.overdue += followed.overdue;
         }
         let by_type = counts
             .iter()
             .map(|((tenant, entity_type), counts)| {
                 format!(
-                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={} scheduled={}",
-                    counts.rearmed, counts.dropped, counts.waiting, counts.scheduled
+                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={} scheduled={} armed={} overdue={}",
+                    counts.rearmed, counts.dropped, counts.waiting, counts.scheduled, counts.armed, counts.overdue
                 )
             })
             .collect::<Vec<_>>()
@@ -173,13 +173,15 @@ impl ServerState {
             dropped = counts.values().map(|c| c.dropped).sum::<usize>(),
             waiting = counts.values().map(|c| c.waiting).sum::<usize>(),
             scheduled = counts.values().map(|c| c.scheduled).sum::<usize>(),
+            armed = counts.values().map(|c| c.armed).sum::<usize>(),
+            overdue = counts.values().map(|c| c.overdue).sum::<usize>(),
             by_type,
             "state timers after boot"
         );
         counts
     }
 
-    /// Reconcile every record of each of `types` as `arming` allows, and
+    /// Reconcile every record of each of `types` from their recorded clocks, and
     /// return how many records of each type wait for their next action. A type
     /// whose records the store cannot list or read is tried again after a
     /// wait. Repeating a successful reconcile is idempotent; an unreadable
@@ -190,10 +192,9 @@ impl ServerState {
         mut types: Vec<(TenantId, String)>,
         callers: &BootCallers,
         gate: Option<Arc<Semaphore>>,
-        arming: Arming,
-    ) -> BTreeMap<(TenantId, String), usize> {
+    ) -> BootTimers {
         let mut wait = FOLLOW_RETRY_FIRST;
-        let mut waiting_by_type = BTreeMap::new();
+        let mut waiting_by_type = BootTimers::new();
         loop {
             let mut pending = Vec::new();
             for (tenant, entity_type) in types {
@@ -205,21 +206,30 @@ impl ServerState {
                     continue;
                 }
                 let ids = self.list_entity_ids(&tenant, &entity_type);
-                let (mut for_caller, mut for_row, mut unreadable) = (0usize, 0usize, 0usize);
+                let mut counted = BootTimerCounts::default();
+                let mut unreadable = 0usize;
                 for entity_id in &ids {
                     let key = (tenant.clone(), entity_type.clone(), entity_id.clone());
                     let follow = Follow {
                         armed_by: callers.get(&key),
                         gate: gate.clone(),
-                        arming,
                     };
                     let followed = self
                         .reconcile_stored_record(&tenant, &entity_type, entity_id, follow)
                         .await;
-                    for_caller += usize::from(followed == TimerFollow::WaitsForCaller);
-                    for_row += usize::from(followed == TimerFollow::WaitsForRow);
+                    counted.waiting += usize::from(followed == TimerFollow::WaitsForCaller);
+                    if let TimerFollow::Armed { overdue } = followed {
+                        counted.armed += 1;
+                        counted.overdue += usize::from(overdue);
+                    }
                     unreadable += usize::from(followed == TimerFollow::RetryRead);
                 }
+                let total = waiting_by_type
+                    .entry((tenant.clone(), entity_type.clone()))
+                    .or_default();
+                total.armed += counted.armed;
+                total.overdue += counted.overdue;
+                total.waiting = counted.waiting;
                 if unreadable > 0 {
                     tracing::warn!(tenant = %tenant, entity_type, unreadable,
                         retry_in_secs = wait.as_secs(),
@@ -228,13 +238,12 @@ impl ServerState {
                     continue;
                 }
                 tracing::info!(tenant = %tenant, entity_type, records = ids.len(),
-                    waiting_for_caller = for_caller, waiting_for_row = for_row,
+                    waiting_for_caller = counted.waiting, armed = counted.armed, overdue = counted.overdue,
                     "state timers follow the records' states");
-                if for_caller > 0 {
-                    tracing::warn!(tenant = %tenant, entity_type, waiting = for_caller,
+                if counted.waiting > 0 {
+                    tracing::warn!(tenant = %tenant, entity_type, waiting = counted.waiting,
                         "records in a timed state wait for their next action: the timeout action binds its caller and nobody armed it");
                 }
-                waiting_by_type.insert((tenant, entity_type), for_caller + for_row);
             }
             if pending.is_empty() {
                 return waiting_by_type;

@@ -12,8 +12,7 @@
 //! Invariants:
 //! - at most [`FIRES_AT_ONCE`] timers start firing at one instant;
 //! - every `alpha` record still reaches `Done` on exactly one timer fire;
-//! - no `gamma` record fires: with no row, each waits for its next action,
-//!   and the boot counts it.
+//! - every `gamma` record with no row also reaches `Done` exactly once.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -91,18 +90,26 @@ fn run_seed(seed: u64) -> Result<(), String> {
     let second = Process::start(&world, &job_v2(), JOB_V1, &format!("burst-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
+        let waiting = second
+            .booted
+            .values()
+            .map(|counts| counts.waiting)
+            .sum::<usize>();
+        if waiting != 0 {
+            return Err(run.fail(
+                "missing rows are armed at boot",
+                format!("{waiting} still wait"),
+            ));
+        }
         let gamma = jobs
             .iter()
             .filter(|job| job.tenant.as_str() == "gamma")
             .count();
-        let waiting = second
-            .booted
-            .get(&(TenantId::new("gamma"), "Job".to_string()))
-            .map_or(0, |counts| counts.waiting);
-        if waiting != gamma {
+        let counted = &second.booted[&(TenantId::new("gamma"), "Job".into())];
+        if counted.armed != gamma || counted.overdue != gamma {
             return Err(run.fail(
-                "the boot counts the records that wait without a row",
-                format!("gamma/Job: {gamma} records have no row, the boot counted {waiting}"),
+                "the boot reports missing-row arms and overdue timers",
+                format!("{gamma} legacy records, counts: {counted:?}"),
             ));
         }
         for _ in 0..4 * jobs.len() / FIRES_AT_ONCE + 4 {
@@ -120,21 +127,6 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 .iter()
                 .filter(|event| event.action == "Expire" || event.action == "Approve")
                 .collect();
-            if job.tenant.as_str() == "gamma" {
-                if record.status != "Waiting" || !fires.is_empty() {
-                    return Err(run.fail(
-                        "a record with no row waits for its next action",
-                        format!(
-                            "{}/{} is {} after {} timer fires",
-                            job.tenant,
-                            job.id,
-                            record.status,
-                            fires.len()
-                        ),
-                    ));
-                }
-                continue;
-            }
             if record.status != "Done" || fires.len() != 1 {
                 return Err(run.fail(
                     "every record leaves its timed state on its timer",
