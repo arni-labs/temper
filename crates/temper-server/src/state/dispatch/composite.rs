@@ -15,7 +15,7 @@ use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::action_input::process_action_with_blob_prestate;
 use crate::entity_actor::effects::{FieldSyncMode, build_eval_context_with_xref};
-use crate::entity_actor::{EntityEvent, EntityState, MoveOrigin};
+use crate::entity_actor::{CompositeAudit, EntityEvent, EntityState, MoveOrigin};
 use crate::request_context::AgentContext;
 use crate::state::account_verification::CommonsAccountVerificationError;
 use crate::state::app_uniqueness::CommonsAppUniquenessError;
@@ -267,7 +267,7 @@ impl crate::state::ServerState {
             };
             self.ensure_atomic_composite_stream(&mut streams, tenant, parent_target, &origin)
                 .await?;
-            let event = build_composite_event(
+            let composite = build_composite_event(
                 tenant,
                 parent_entity_type,
                 parent_entity_id,
@@ -275,6 +275,7 @@ impl crate::state::ServerState {
                 parent_idempotency,
                 prepared_sub_writes,
             );
+            let event = CompositeAudit::made_as(composite, &origin);
             let stream = streams
                 .get_mut(&parent_persistence_id)
                 .expect("parent stream inserted before composite event append");

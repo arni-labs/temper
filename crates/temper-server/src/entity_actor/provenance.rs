@@ -1,5 +1,6 @@
 //! Who made a move and which of the kernel's dispatch paths carried it,
-//! recorded on every [`EntityEvent`](super::EntityEvent).
+//! recorded on every [`EntityEvent`](super::EntityEvent) and on a composite
+//! parent's [`CompositeAudit`].
 //!
 //! Both are taken from what the kernel itself knows when it dispatches: the
 //! principal its credential resolution produced, and the path in its own code
@@ -7,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use temper_authz::{PrincipalKind, SecurityContext, TokenKind};
+use temper_runtime::persistence::CompositeEvent;
 
 /// The principal that made a move, as its [`SecurityContext`] has it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,5 +112,35 @@ impl MoveOrigin {
     pub(crate) fn stamp(&self, event: &mut super::EntityEvent) {
         event.made_by.clone_from(&self.made_by);
         event.source = self.source;
+    }
+}
+
+/// A composite parent's audit record as its journal stores it: the
+/// [`CompositeEvent`] and who made the move, the same fields an
+/// [`EntityEvent`](super::EntityEvent) records. Its payload keeps every field
+/// a reader of [`CompositeEvent`] alone expects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompositeAudit {
+    /// The composite action and the sub-writes it committed.
+    #[serde(flatten)]
+    pub(crate) composite: CompositeEvent,
+    /// Who made the move. None on records written before the kernel recorded
+    /// it, and when the dispatch carried no principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) made_by: Option<MadeBy>,
+    /// The dispatch path that carried the move. None on records written
+    /// before the kernel recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<MoveSource>,
+}
+
+impl CompositeAudit {
+    /// The audit record of `composite`, made as `origin` records.
+    pub(crate) fn made_as(composite: CompositeEvent, origin: &MoveOrigin) -> Self {
+        Self {
+            composite,
+            made_by: origin.made_by.clone(),
+            source: origin.source,
+        }
     }
 }
