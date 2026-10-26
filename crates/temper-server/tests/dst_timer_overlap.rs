@@ -17,6 +17,9 @@ use temper_server::{ServerState, StorageStack};
 use temper_store_sim::SimEventStore;
 use world::{ProcessClock, SimTimerRows};
 
+#[path = "dst_timer_overlap/recovery.rs"]
+mod recovery;
+
 const JOB: &str = r#"
 [automaton]
 name = "Job"
@@ -38,6 +41,11 @@ to = "Ready"
 name = "CountFire"
 kind = "hook"
 hook = "CountFire"
+
+[[action]]
+name = "Touch"
+from = ["Ready"]
+to = "Ready"
 
 [[state_timeout]]
 state = "Ready"
@@ -65,9 +73,9 @@ impl CustomEffectHandler for Fires {
     }
 }
 
-async fn server(
+async fn server<R: temper_server::storage::StateTimerStore + 'static>(
     events: &SimEventStore,
-    rows: &Arc<SimTimerRows>,
+    rows: &Arc<R>,
     fires: &Arc<Fires>,
     name: &str,
 ) -> ServerState {

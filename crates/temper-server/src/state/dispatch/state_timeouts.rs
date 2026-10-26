@@ -679,14 +679,13 @@ impl crate::state::ServerState {
                     let belongs =
                         current.state.status == timer.state && state.declares_state_timer(&timer);
                     if !belongs || current.state.sequence_nr > timer.sequence_nr {
+                        // Retire only the in-memory arm. Its durable row is
+                        // the recovery anchor until reconcile saves a successor;
+                        // the arm-id-conditional cleanup below then removes it
+                        // only if no replacement took its place.
                         state
-                            .cancel_state_timer(
-                                &timer.tenant,
-                                &timer.entity_type,
-                                &timer.entity_id,
-                                current.state.sequence_nr,
-                            )
-                            .await;
+                            .state_timeout_tracker
+                            .invalidate(&key, current.state.sequence_nr);
                         state
                             .reconcile_state_timers(
                                 &timer.tenant,
@@ -728,14 +727,11 @@ impl crate::state::ServerState {
                             && response.state.sequence_nr > timer.sequence_nr
                             && state.state_timeout_tracker.current(&key) == armed_seq
                         {
+                            // Keep the durable recovery anchor through the
+                            // same handoff as the pre-dispatch stale path.
                             state
-                                .cancel_state_timer(
-                                    &timer.tenant,
-                                    &timer.entity_type,
-                                    &timer.entity_id,
-                                    response.state.sequence_nr,
-                                )
-                                .await;
+                                .state_timeout_tracker
+                                .invalidate(&key, response.state.sequence_nr);
                             state
                                 .reconcile_state_timers(
                                     &timer.tenant,
