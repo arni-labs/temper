@@ -28,6 +28,7 @@ pub use effects::{
     ProcessResult, ScheduledAction, apply_effects, apply_new_state_fallback, build_eval_context,
     process_action, process_action_with_xref, sync_fields,
 };
+pub(crate) use move_invariants::broken_invariant;
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
 pub use types::{EffectOutcome, EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};

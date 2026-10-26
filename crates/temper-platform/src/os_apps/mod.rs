@@ -1208,6 +1208,9 @@ pub(super) async fn install_os_app_with_plan(
     if plan.specs && !(added.is_empty() && updated.is_empty()) {
         install_checks::prove_joint_invariants(state, tenant, app_name, &bundle.specs).await?;
     }
+    let spec_change =
+        install_checks::check_spec_changes(state, &tenant_id, app_name, &bundle.specs, plan.specs)
+            .await?;
 
     // Build the full Cedar policy text for this tenant: the live text without
     // what this app's previous install wrote, plus the bundle's policies.
@@ -1351,27 +1354,7 @@ pub(super) async fn install_os_app_with_plan(
             .iter()
             .map(|(et, src)| (et.as_str(), src.as_str()))
             .collect();
-        let verified_cache = if let Some(turso) = state
-            .server
-            .storage_stack
-            .as_ref()
-            .and_then(|stack| stack.turso.as_ref())
-            .and_then(|provider| provider.platform_store())
-        {
-            turso
-                .load_verification_cache(tenant)
-                .await
-                .unwrap_or_default()
-        } else if let Some(ps) = state
-            .server
-            .storage_stack
-            .as_ref()
-            .and_then(|stack| stack.platform.clone())
-        {
-            ps.load_verification_cache(tenant).await.unwrap_or_default()
-        } else {
-            std::collections::BTreeMap::new()
-        };
+        let verified_cache = bootstrap::load_verification_cache(state, tenant).await;
 
         if let Some(ref merged) = merged_csdl {
             // Even when every spec is byte-for-byte unchanged, we still need to
@@ -1416,6 +1399,7 @@ pub(super) async fn install_os_app_with_plan(
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
+    let warnings = install_checks::carry_records(state, &tenant_id, app_name, spec_change).await;
 
     // ── Step 3: Load Cedar policies into memory. ────────────────────
     if let Some(ref policy_text) = combined_policy {
@@ -1632,6 +1616,7 @@ pub(super) async fn install_os_app_with_plan(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        warnings,
     })
 }
 

@@ -21,6 +21,7 @@ mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
+mod spec_change;
 mod start_runtime;
 pub mod status_cache;
 pub(crate) mod storage_caps;
@@ -53,6 +54,7 @@ pub(crate) use published_artifacts::{
     PUBLISH_ARTIFACT_STALE_AUTHORIZATION, PublishArtifactAuthorization,
 };
 pub(crate) use query_projection_queue::{ProjectionEnqueueOutcome, QueryProjectionWriteQueue};
+pub use spec_change::{CarryMove, SpecChange, SpecChangePlan, SpecChangeRefused, StuckRecords};
 pub use trajectory::{TrajectoryEntry, TrajectorySource};
 pub use wasm_invocation_log::WasmInvocationEntry;
 

@@ -1,6 +1,7 @@
 //! Checks a parsed spec must pass before it is installed: declared states,
 //! predicates and effects, state timeouts, triggers, webhooks and vectors.
 
+mod carries;
 mod triggers;
 mod webhooks;
 
@@ -140,6 +141,7 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     //    - `metric` must be one of cosine | dot | l2.
     //    - names must be unique (each identifies one index partition + `decl=`).
     validate_vector_decls(automaton)?;
+    carries::validate_carries(automaton)?;
 
     Ok(())
 }

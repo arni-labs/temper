@@ -284,6 +284,30 @@ assert = "status in ['Submitted'] => items > 0"
 6. `effect` is a list of statements in the same grammar: `items += 1`, `retries -= 1`, `quota = params.quota`, `ready = true`, `append(tags, params.tag)`, `remove_at(tags, params.i)`, `schedule('Expire', 3600)`, `schedule_at('Expire', expires_at)`, `spawn('Task', 'Create', last_task_id)`. Statements are type-checked at load, and effects reading `params.p` are verified with `p` unknown. An action's name implies nothing: `AddItem` without an `effect` changes only `status`. See [predicates.md#effects](predicates.md#effects).
 7. `[[action.triggers]]`: the only way an action causes work elsewhere — `kind = "entity"` (another entity's action), `"wasm"`, `"adapter"`, or `"hook"` (a platform hook registered by the host). `kind = "webhook"` is refused at load: make the call with `kind = "wasm"`, `module = "http_fetch"` (ADR-0182). See [Section 9](#9-integration-engine).
 8. Action kinds: `input` = from environment (HTTP), always enabled in from-states; `output` = emitted events; `internal` = private state transitions.
+9. `[[carry]]`: where a new version of a spec moves stored records it would otherwise leave with no way forward. See [Changing a spec with stored records](#changing-a-spec-with-stored-records).
+
+#### Changing a spec with stored records
+
+A new version of a spec may change anything, as long as no stored record is left with no way forward. A record has no way forward when its state is one the new version drops, or when moves start from its state and none is possible for its values, though one was possible under the installed version. A declared value a record lacks reads as its initial value, so adding a state variable strands nothing.
+
+Before an install writes anything, it reads the stored records in the states the change can affect. If some would be left with no way forward, the install is refused. The refusal starts with the `[[carry]]` sections that would fix it, ready to paste, and then lists the records by type and state with why. When a dropped state has an obvious target (the one state the version adds in its place, or the one state all its moves led to), the section names it.
+
+```toml
+# Placed is renamed Settled: move the stored Placed records there.
+[[carry]]
+from = "Placed"
+to = "Settled"
+
+# Bring now needs ready: set it on the stored Placed records that lack it.
+[[carry]]
+from = "Placed"
+guard = "!ready"          # optional: which of them
+set = { ready = true }    # optional: counters, flags, strings, numbers
+```
+
+`from` may be a state the new version drops. `to` defaults to `from`. A carry applies only to records that would otherwise have no way forward; the others are not moved. The install first tries each carry on each record it applies to, with the same move code every move runs: the carried record must satisfy the new version's invariants and have a way forward, or nothing is installed. After the new version is in place, the platform makes each carry as an ordinary journaled move named `carry:<from>:<n>`. Callers cannot make these moves, and they are not listed among a record's actions.
+
+Reported, not refused: records already without a way forward under the installed version, and moves that are no longer possible for records that keep another one. Not checked: moves whose guard reads a related record, and an install that removes a whole type.
 
 ### 3.3 Cedar (Access Control)
 

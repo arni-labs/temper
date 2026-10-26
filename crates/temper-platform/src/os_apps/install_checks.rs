@@ -3,7 +3,11 @@
 //! A bundle that cannot be registered must leave no stored row for the next
 //! start to restore, so these refuse it before the first write.
 
+use temper_runtime::tenant::TenantId;
+use temper_server::state::SpecChangePlan;
 use temper_spec::cross_invariant;
+
+use super::InstallWarning;
 
 use crate::state::PlatformState;
 
@@ -107,6 +111,64 @@ pub(super) async fn prove_joint_invariants(
             unproven.join("\n")
         ))
     }
+}
+
+/// Check each new version in `specs`, when the install writes specs, against
+/// the records stored under the version installed for its type, before
+/// anything is written (see temper-server's `spec_change`): refuse it when it
+/// leaves records with no way forward that no `[[carry]]` moves, and return
+/// the carries to make after the swap.
+pub(super) async fn check_spec_changes(
+    state: &PlatformState,
+    tenant: &TenantId,
+    app_name: &str,
+    specs: &[(String, String)],
+    writes_specs: bool,
+) -> Result<SpecChangePlan, String> {
+    if !writes_specs {
+        return Ok(SpecChangePlan::default());
+    }
+    let sources: Vec<(&str, &str)> = specs
+        .iter()
+        .map(|(entity_type, source)| (entity_type.as_str(), source.as_str()))
+        .collect();
+    let changes = state
+        .server
+        .spec_changes(tenant, &sources)
+        .map_err(|error| format!("os-app '{app_name}': {error}"))?;
+    state
+        .server
+        .check_spec_changes(tenant, &changes)
+        .await
+        .map_err(|refused| format!("os-app '{app_name}' was not installed. {refused}"))
+}
+
+/// Make the carries `plan` holds, once the new versions are installed, and
+/// return what the check found and the carries that failed.
+pub(super) async fn carry_records(
+    state: &PlatformState,
+    tenant: &TenantId,
+    app_name: &str,
+    plan: SpecChangePlan,
+) -> Vec<InstallWarning> {
+    let mut warnings: Vec<InstallWarning> = plan
+        .warnings
+        .into_iter()
+        .map(InstallWarning::spec_change)
+        .collect();
+    if plan.carries.is_empty() {
+        return warnings;
+    }
+    let failed = state.server.apply_carries(tenant, &plan.carries).await;
+    tracing::info!(
+        tenant = %tenant,
+        app = %app_name,
+        carried = plan.carries.len() - failed.len(),
+        failed = failed.len(),
+        "carried stored records to the new spec versions"
+    );
+    warnings.extend(failed.into_iter().map(InstallWarning::spec_change));
+    warnings
 }
 
 #[cfg(test)]
