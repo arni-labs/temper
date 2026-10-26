@@ -587,13 +587,6 @@ jobs:
           cargo nextest run -p temper-store-postgres --run-ignored only
           -E 'test(scheduled_action_rows_commit_with_their_events)'
 
-      # The store's tests one at a time against this database. The Tests run also
-      # runs them, in parallel; this step keeps a serial run of the whole crate.
-      - name: Store tests that need a real database
-        env:
-          DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
-        run: cargo nextest run -p temper-store-postgres --test-threads 1
-
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
   #
