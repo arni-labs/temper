@@ -24,7 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_authz::May;
 use temper_spec::predicate::Expr;
 
-use super::encode::{Enc, counted};
+use super::declare::counted;
+use super::encode::Enc;
 use super::moves::{Move, Moves, Step};
 use super::run::Ask;
 use super::vocab::Vocab;
