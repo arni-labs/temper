@@ -3,3 +3,7 @@
 [[profile.default.overrides]]
 filter = 'binary(turso_sync)'
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# MUTANT run: every failing test is reported.
+[profile.default]
+fail-fast = false

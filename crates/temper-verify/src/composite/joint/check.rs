@@ -53,7 +53,8 @@ impl JointVerdict {
     /// Whether the rule holds in every run, as proved or walked in full.
     pub fn holds(&self) -> bool {
         match self {
-            JointVerdict::Proved(_, premise) => *premise == Premise::Met,
+            // MUTANT: a proved rule holds whatever its premise.
+            JointVerdict::Proved(_, _) => true,
             JointVerdict::Invariant(walked, _) => walked.holds(),
             JointVerdict::Liveness(walked, _) => walked.holds(),
         }
