@@ -30,6 +30,7 @@ pub(super) const OUTSIDE: u32 = 0;
 pub(super) const RUNTIME: u32 = 1;
 
 /// The senders a model knows, by number, and what Cedar lets each send.
+#[derive(Debug)]
 pub(super) struct Senders {
     askers: Vec<Asker>,
     /// Entity, then action, then each sender's answer.

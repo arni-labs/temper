@@ -41,7 +41,7 @@ use std::fmt;
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Truth, eval};
+use temper_spec::predicate::{Expr, Truth, eval};
 
 use super::JointStep;
 use super::model::{self, JointModel, Sending};
@@ -177,19 +177,82 @@ impl fmt::Display for JointLivenessResult {
     }
 }
 
-/// Check every `[[liveness]]` with `eventually` in `automatons` on the joint
-/// model of its entity and the types its condition names. `policies` decide
-/// each move as its sender; without them every sender may send everything.
-pub fn verify_joint_liveness(
+/// The walk that checks one `[[liveness]]` with `eventually`, with all it
+/// reads: the property and the joint model of its entity and the types its
+/// condition names, cut to what it reads. Its
+/// [`JointProof::digest`](super::JointProof::digest) is of this value.
+#[derive(Debug)]
+pub struct LivenessProof {
+    pub(super) entity: String,
+    pub(super) name: String,
+    goal: Expr,
+    relies_on: Vec<String>,
+    scope: BTreeSet<String>,
+    /// The model, or why there is none: a type the condition reads that the
+    /// app does not declare.
+    model: Result<JointModel, String>,
+}
+
+impl LivenessProof {
+    /// Walk the model and decide whether the records reach the condition.
+    pub fn check(&self, bound: Bound<'_>) -> JointLivenessResult {
+        let mut result = JointLivenessResult {
+            entity: self.entity.clone(),
+            name: self.name.clone(),
+            eventually: self.goal.to_string(),
+            relies_on: self.relies_on.clone(),
+            scope: self.scope.iter().cloned().collect(),
+            states: 0,
+            in_flight_bound: None,
+            outcome: LivenessOutcome::Holds,
+        };
+        let model = match &self.model {
+            Ok(model) => model,
+            Err(reason) => {
+                result.outcome = LivenessOutcome::Incomplete {
+                    reason: reason.clone(),
+                };
+                return result;
+            }
+        };
+        let mut explored = model.walk_with(bound, true, |_, _| false);
+        result.states = explored.len();
+        result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
+        let settling = settle_bytes(&explored);
+        result.outcome = match &explored.stopped {
+            Some(reason) => LivenessOutcome::Incomplete {
+                reason: reason.clone(),
+            },
+            None => match explored.held.add(settling) {
+                Ok(()) => settle(model, &self.entity, &self.goal, &explored),
+                Err(reason) => LivenessOutcome::Incomplete {
+                    reason: format!(
+                        "deciding the walk does not fit in the memory it may hold: {reason} \
+                         (it held {} MB at {} states and needs {} MB more)",
+                        explored.held.bytes / MB,
+                        explored.len(),
+                        settling / MB
+                    ),
+                },
+            },
+        };
+        result
+    }
+}
+
+/// The walks that check every `[[liveness]]` with `eventually` in
+/// `automatons`: one per property, on the joint model of its entity and the
+/// types its condition names. `policies` decide each move as its sender;
+/// without them every sender may send everything.
+pub fn liveness_proofs(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    bound: Bound<'_>,
-) -> Vec<JointLivenessResult> {
+) -> Vec<LivenessProof> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
         .map(|a| (a.automaton.name.as_str(), *a))
         .collect();
-    let mut results = Vec::new();
+    let mut proofs = Vec::new();
     for (name, automaton) in &by_name {
         for live in &automaton.liveness {
             let Some(goal) = &live.eventually else {
@@ -204,61 +267,55 @@ pub fn verify_joint_liveness(
                     missing.push(entity_type);
                 }
             }
-            let mut result = JointLivenessResult {
+            let model = if missing.is_empty() {
+                let sending = Sending {
+                    policies,
+                    kernel_moves: true,
+                    relies_on: live
+                        .relies_on
+                        .iter()
+                        .map(|action| (name.to_string(), action.clone()))
+                        .collect(),
+                };
+                Ok(JointModel::new(
+                    &by_name,
+                    &scope,
+                    name,
+                    &[goal],
+                    sending,
+                    true,
+                ))
+            } else {
+                Err(format!(
+                    "it reads {}, which this app does not declare",
+                    missing.join(", ")
+                ))
+            };
+            proofs.push(LivenessProof {
                 entity: name.to_string(),
                 name: live.name.clone(),
-                eventually: goal.to_string(),
+                goal: goal.clone(),
                 relies_on: live.relies_on.clone(),
-                scope: scope.iter().cloned().collect(),
-                states: 0,
-                in_flight_bound: None,
-                outcome: LivenessOutcome::Holds,
-            };
-            if !missing.is_empty() {
-                result.outcome = LivenessOutcome::Incomplete {
-                    reason: format!(
-                        "it reads {}, which this app does not declare",
-                        missing.join(", ")
-                    ),
-                };
-                results.push(result);
-                continue;
-            }
-            let sending = Sending {
-                policies,
-                kernel_moves: true,
-                relies_on: live
-                    .relies_on
-                    .iter()
-                    .map(|action| (name.to_string(), action.clone()))
-                    .collect(),
-            };
-            let model = JointModel::new(&by_name, scope, name, &[goal], sending, true);
-            let mut explored = model.walk_with(bound, true, |_, _| false);
-            result.states = explored.len();
-            result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
-            let settling = settle_bytes(&explored);
-            result.outcome = match &explored.stopped {
-                Some(reason) => LivenessOutcome::Incomplete {
-                    reason: reason.clone(),
-                },
-                None => match explored.held.add(settling) {
-                    Ok(()) => settle(&model, name, goal, &explored),
-                    Err(reason) => LivenessOutcome::Incomplete {
-                        reason: format!(
-                            "deciding the walk does not fit in the memory it may hold: {reason} \
-                             (it held {} MB at {} states and needs {} MB more)",
-                            explored.held.bytes / MB,
-                            explored.len(),
-                            settling / MB
-                        ),
-                    },
-                },
-            };
-            results.push(result);
+                scope,
+                model,
+            });
         }
     }
-    results
+    proofs
+}
+
+/// Check every `[[liveness]]` with `eventually` in `automatons` on the joint
+/// model of its entity and the types its condition names
+/// ([`liveness_proofs`]).
+pub fn verify_joint_liveness(
+    automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
+    bound: Bound<'_>,
+) -> Vec<JointLivenessResult> {
+    liveness_proofs(automatons, policies)
+        .iter()
+        .map(|proof| proof.check(bound))
+        .collect()
 }
 
 /// Whether every walked state reaches `goal` through the system's moves,

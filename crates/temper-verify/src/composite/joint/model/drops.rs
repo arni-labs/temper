@@ -97,7 +97,7 @@ impl JointModel {
         }
         let mut model = Self::compose(
             by_name,
-            scope,
+            &scope,
             (models, reactions),
             &BTreeMap::new(),
             Sending::anyone(),
