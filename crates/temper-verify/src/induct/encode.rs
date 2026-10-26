@@ -398,7 +398,7 @@ pub(super) fn prelude(v: &Vocab<'_>, literals: &BTreeSet<String>) -> String {
                 "(define-fun {frame}.has.{k} ((m Msg/{k})) Bool (> (select {frame}.pend.{k} m) 0))\n"
             ));
             let kind = v.kinds.iter().find(|kind| kind.name == k);
-            if kind.is_some_and(|kind| kind.scheduled) {
+            if kind.is_some_and(|kind| kind.scheduled && kind.name.is_empty()) {
                 continue;
             }
             if kind.is_some() {
