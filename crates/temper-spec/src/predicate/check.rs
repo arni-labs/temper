@@ -104,7 +104,9 @@ pub fn unmodelable<'e>(expr: &'e Expr, vars: &BTreeMap<String, VarKind>) -> Opti
         }
         Operand::Var(name) => matches!(kind(name), Some(VarKind::Counter | VarKind::Bool)),
         Operand::Len(name) => kind(name) == Some(VarKind::List),
-        Operand::CrossStatus { .. } | Operand::Lit(Literal::Null) => false,
+        Operand::CrossStatus { .. } | Operand::CrossField { .. } | Operand::Lit(Literal::Null) => {
+            false
+        }
     };
     match expr {
         Expr::Const(_) => None,
@@ -125,6 +127,51 @@ pub fn unmodelable<'e>(expr: &'e Expr, vars: &BTreeMap<String, VarKind>) -> Opti
                 }
             };
             (!modeled).then_some(expr)
+        }
+    }
+}
+
+/// The first sub-expression of an `[[invariant]]` the verifier cannot check,
+/// if any. Beyond what [`unmodelable`] allows, a string state variable is
+/// compared as a symbol (equality only: the verifier tracks which strings are
+/// equal, not what they say), and a related entity's status or field is read
+/// in the joint check of the entity types the invariant names. Numbers that
+/// are not counters, and `null`, stay out.
+pub fn unverifiable<'e>(expr: &'e Expr, vars: &BTreeMap<String, VarKind>) -> Option<&'e Expr> {
+    let kind = |name: &str| vars.get(name).copied();
+    let checked_operand = |operand: &Operand| match operand {
+        Operand::Status
+        | Operand::Lit(Literal::Int(_) | Literal::Str(_) | Literal::Bool(_))
+        | Operand::CrossStatus { .. }
+        | Operand::CrossField { .. } => true,
+        Operand::Var(name) => matches!(
+            kind(name),
+            Some(VarKind::Counter | VarKind::Bool | VarKind::Str)
+        ),
+        Operand::Len(name) => kind(name) == Some(VarKind::List),
+        Operand::Lit(Literal::Null) => false,
+    };
+    match expr {
+        Expr::Const(_) => None,
+        Expr::Not(inner) => unverifiable(inner, vars),
+        Expr::And(parts) | Expr::Or(parts) => parts.iter().find_map(|p| unverifiable(p, vars)),
+        Expr::Implies(a, b) => unverifiable(a, vars).or_else(|| unverifiable(b, vars)),
+        Expr::Var(name) => (kind(name) != Some(VarKind::Bool)).then_some(expr),
+        Expr::Empty(name) => {
+            (!matches!(kind(name), Some(VarKind::List | VarKind::Str))).then_some(expr)
+        }
+        Expr::Compare { lhs, rhs, .. } => {
+            (!checked_operand(lhs) || !checked_operand(rhs)).then_some(expr)
+        }
+        Expr::In { value, set, .. } => {
+            let checked = match set {
+                Set::List(_) => checked_operand(value),
+                Set::Var(name) => {
+                    kind(name) == Some(VarKind::List)
+                        && matches!(value, Operand::Lit(Literal::Str(_)))
+                }
+            };
+            (!checked).then_some(expr)
         }
     }
 }
@@ -159,6 +206,12 @@ fn operand_ty(operand: &Operand, scope: Scope<'_>) -> Result<Ty, String> {
         },
         Operand::CrossStatus { id_field, .. } => match field_ty(id_field, scope) {
             Ty::Str | Ty::List | Ty::Any => Ok(Ty::Str),
+            _ => Err(format!("'{id_field}' cannot hold an entity id")),
+        },
+        // The related entity's field is of a type this entity's spec does not
+        // declare; the joint check reads it as it is.
+        Operand::CrossField { id_field, .. } => match field_ty(id_field, scope) {
+            Ty::Str | Ty::List | Ty::Any => Ok(Ty::Any),
             _ => Err(format!("'{id_field}' cannot hold an entity id")),
         },
         Operand::Lit(lit) => Ok(lit_ty(lit)),

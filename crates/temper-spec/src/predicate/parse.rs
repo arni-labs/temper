@@ -349,16 +349,19 @@ impl<'a> Parser<'a> {
                     _ if self.eat(&Tok::LBracket) => {
                         let id_field = self.ident()?;
                         self.expect(&Tok::RBracket, "']'")?;
-                        self.expect(&Tok::Dot, "'.status'")?;
-                        if !self.peek_keyword("status") {
-                            return Err(
-                                self.error("only '.status' can be read from a related entity")
-                            );
+                        self.expect(&Tok::Dot, "'.' and a field")?;
+                        if self.peek_keyword("status") {
+                            self.pos += 1;
+                            return Ok(Operand::CrossStatus {
+                                entity_type: name,
+                                id_field,
+                            });
                         }
-                        self.pos += 1;
-                        Ok(Operand::CrossStatus {
+                        let field = self.ident()?;
+                        Ok(Operand::CrossField {
                             entity_type: name,
                             id_field,
+                            field,
                         })
                     }
                     _ => Ok(Operand::Var(name)),

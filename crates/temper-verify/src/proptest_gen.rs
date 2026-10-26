@@ -405,6 +405,7 @@ mod tests {
                 guard: Expr::always(),
                 effects: vec![],
                 params: BTreeMap::new(),
+                string_params: vec![],
             }],
             invariants: vec![ResolvedInvariant {
                 name: "OnlyA".to_string(),
@@ -420,6 +421,9 @@ mod tests {
             counter_bounds: BTreeMap::new(),
             default_max_counter: 2,
             list_literals: BTreeMap::new(),
+            initial_strings: BTreeMap::new(),
+            tracked_strings: Default::default(),
+            string_literals: BTreeMap::new(),
             limit: None,
         }
     }

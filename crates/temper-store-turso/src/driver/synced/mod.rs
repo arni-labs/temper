@@ -6,7 +6,9 @@
 //! request, and returns only once the remote has committed it. Callers that
 //! answer a request after a write await it first, so a confirmed change is
 //! never only on this machine. A fresh machine with no local file starts from
-//! the remote copy.
+//! the remote copy. That restore runs as long as it keeps writing the file
+//! (see `restore`), and one stopped part way is kept aside and run again at
+//! the next start.
 //!
 //! Writes are confirmed only in [`CopyState::Copying`]. A start that cannot
 //! reach the remote serves reads and waits ([`CopyState::Unchecked`]); a file
@@ -27,6 +29,7 @@ mod files;
 mod pool;
 mod push;
 mod remote;
+mod restore;
 use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::Remote;
@@ -98,9 +101,6 @@ const REMOTE_STATEMENT_FAILED: &str = "failed to execute sql";
 /// One push attempt. The engine's HTTP client has no timeout of its own.
 const PUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long opening the engine (a restore included) may take.
-const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
-
 impl std::fmt::Debug for SyncCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncCopy").finish_non_exhaustive()
@@ -116,6 +116,8 @@ impl SyncCopy {
     /// copy) is moved aside and the database restored from the remote, which
     /// holds everything the older copy did. A remote that cannot be reached
     /// leaves the copy [`CopyState::Unchecked`] until [`Self::recheck`] passes.
+    /// A file that a stopped restore left part way is moved aside the same
+    /// way, and restored again.
     pub(crate) async fn open(
         path: &str,
         remote_url: &str,
@@ -152,6 +154,13 @@ impl SyncCopy {
         // workspace does): the engine's IO thread then panics and every sync
         // call waits forever. An error here means one is already installed.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Without sync metadata the engine restores the file from the remote,
+        // and writes the metadata only once every page is on disk. Until then
+        // the file is marked, so a start that stops part way is not taken
+        // for a database that was never synced.
+        if !sidecar(path, "-info").exists() {
+            files::mark_restoring(path)?;
+        }
         let local = path.to_string_lossy();
         let opening = turso::sync::Builder::new_remote(&local)
             .with_remote_url(remote_url)
@@ -159,16 +168,16 @@ impl SyncCopy {
             .with_client_name("temper")
             .bootstrap_if_empty(true)
             .build();
-        // A restore downloads the whole database; the engine sets no timeout.
-        let db = tokio::time::timeout(BUILD_TIMEOUT, opening)
+        let db = restore::while_progressing(opening, || restore::footprint(path))
             .await
-            .map_err(|_| {
+            .ok_or_else(|| {
                 DriverError::SyncSetup(format!(
-                    "opening {} with its remote copy took over {} s",
+                    "opening {} with its remote copy made no progress for {} s",
                     path.display(),
-                    BUILD_TIMEOUT.as_secs()
+                    restore::RESTORE_STALL_BUDGET.as_secs()
                 ))
             })??;
+        files::restored(path);
         let state = match std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {
             Ok(cause) => CopyState::Stopped(cause),
             Err(_) => CopyState::Unchecked,
@@ -357,6 +366,29 @@ impl SyncCopy {
     pub fn set_aside(path: &str) -> Result<PathBuf, PersistenceError> {
         files::move_aside(Path::new(path.strip_prefix("file:").unwrap_or(path)))
             .map_err(storage_error)
+    }
+
+    /// With the app stopped: download the remote copy into `path`, which must
+    /// not exist yet, the way a start restores it, without serving, pushing or
+    /// changing the remote. Returns [`Self::describe`] of the result.
+    pub async fn fetch(
+        path: &str,
+        remote_url: &str,
+        auth_token: &str,
+    ) -> Result<String, PersistenceError> {
+        let local = path.strip_prefix("file:").unwrap_or(path);
+        files::refuse_existing(Path::new(local)).map_err(storage_error)?;
+        let copy = Self::open(local, remote_url, auth_token)
+            .await
+            .map_err(storage_error)?;
+        drop(copy);
+        Self::describe(local)
+    }
+
+    /// How far a restore into `path` has got: the bytes written so far, and
+    /// the database's whole size once the remote has sent it.
+    pub fn restored_bytes(path: &str) -> (u64, u64) {
+        restore::written(Path::new(path.strip_prefix("file:").unwrap_or(path)))
     }
 
     /// What is on disk for `path`: the stop, if any, and how far the file and
