@@ -108,7 +108,7 @@ impl Guess {
         Lemma {
             rule: rule.to_string(),
             name: self.name(rule),
-            assert: self.read("pre", holds) /* MUTANT: not $-framed */,
+            assert: dollar_framed(&self.read("pre", holds)).replace('$', "pre.") /* MUTANT: not $-framed */,
         }
     }
 }
