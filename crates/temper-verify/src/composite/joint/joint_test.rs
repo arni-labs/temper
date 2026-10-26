@@ -410,3 +410,11 @@ fn concrete_ids_in_assertions_are_explored_without_string_fields() {
         "{result}"
     );
 }
+
+#[test]
+fn empty_references_never_find_a_record() {
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
+    let child = "[automaton]\nname = 'Child'\nstates = ['Ready']\ninitial = 'Ready'\n[[state]]\nname = 'parent_id'\ntype = 'string'\ninitial = ''\n[[invariant]]\nname = 'rule'\nassert = \"Parent[parent_id].status != 'Closed'\"\n";
+    let result = check(&[parent, child]);
+    assert!(matches!(result.outcome, JointOutcome::Holds), "{result}");
+}

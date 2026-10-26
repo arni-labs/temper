@@ -19,8 +19,8 @@ use crate::model::{ExploreLimit, TemperModel};
 pub struct Budget {
     /// Wall-clock time for the whole cascade.
     pub time: Duration,
-    /// States the model check may generate. A state reached twice counts
-    /// twice, as Stateright counts toward its target state count.
+    /// Generated states and expansion work allowed per walk. A state reached
+    /// twice counts twice; intermediate parameter products also consume work.
     pub states: usize,
 }
 
@@ -43,6 +43,8 @@ impl Spending {
             until,
             states: budget.states,
             lifted: Arc::new(AtomicBool::new(false)),
+            work: Arc::new(std::sync::atomic::AtomicUsize::new(budget.states)),
+            exhausted: Arc::new(AtomicBool::new(false)),
         };
         Self {
             budget,
@@ -77,7 +79,7 @@ impl Spending {
             format!("ran out of its {} s budget", secs(self.budget.time))
         } else {
             format!(
-                "reached its limit of {} generated states after {} s",
+                "reached its limit of {} generated states or expansion steps after {} s",
                 self.budget.states,
                 secs(self.started.elapsed())
             )

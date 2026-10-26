@@ -24,6 +24,7 @@ impl JointModel {
                 }
             }
         }
+        literals.remove("");
         let literals: Vec<_> = literals.into_iter().map(ModelString::from).collect();
         Box::new(partitions(blank.len(), literals.len()).map(move |blocks| {
             let mut records = blank.clone();

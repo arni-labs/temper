@@ -123,7 +123,7 @@ pub fn successors_among(
     state: &TemperModelState,
     values: &BTreeSet<ModelString>,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
-    successors_budgeted(model, t, state, values, &Expansion::default())
+    successors_budgeted(model, t, state, values, &Expansion::for_model(model))
 }
 
 pub(crate) fn successors_budgeted(
