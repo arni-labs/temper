@@ -338,9 +338,9 @@ fn prove_one(
         });
     }
     // Every try holds the agent's lemmas, and drops each a move breaks. An
-    // invariant is tried first with the rule at every state, then with
-    // every guess of the prover's. A failure with more clauses held
-    // replaces the one before.
+    // invariant is tried first with its lemmas alone, or with none written
+    // with the rule at every state, then with every guess of the prover's.
+    // A failure with more clauses held replaces the one before.
     let guessed: BTreeSet<String> = guesses.iter().map(|g| g.name(rule)).collect();
     let droppable: BTreeSet<String> = (guessed.iter().cloned())
         .chain(lemmas.iter().map(|l| l.name.clone()))
@@ -348,7 +348,7 @@ fn prove_one(
         .collect();
     let everywhere = Guess::Everywhere.name(rule);
     let first: BTreeSet<String> = (guessed.iter())
-        .filter(|g| **g != everywhere)
+        .filter(|g| !lemmas.is_empty() || **g != everywhere)
         .cloned()
         .collect();
     let mut tries = Vec::new();

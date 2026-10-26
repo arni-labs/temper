@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use z3_sys::{
     ErrorCode, Z3_context, Z3_del_config, Z3_del_context, Z3_eval_smtlib2_string,
-    Z3_get_error_code, Z3_get_error_msg, Z3_mk_config, Z3_mk_context, Z3_set_error_handler,
+    Z3_get_error_code, Z3_get_error_msg, Z3_mk_config, Z3_mk_context, Z3_set_error,
+    Z3_set_error_handler,
 };
 
 /// How long one check may run before the solver answers unknown.
@@ -98,6 +99,10 @@ impl Z3 {
         // NUL-terminated string that outlives the call; the output is copied
         // before the next call on this context, which is when Z3 frees it.
         let (printed, failed) = unsafe {
+            // libz3 4.8, which the server image carries, keeps the last
+            // error through later commands: one refused clause would fail
+            // every check after it.
+            Z3_set_error(self.context, ErrorCode::OK);
             let out = Z3_eval_smtlib2_string(self.context, text.as_ptr());
             let printed = NonNull::new(out.cast_mut())
                 .map(|out| CStr::from_ptr(out.as_ptr()).to_string_lossy().into_owned())
