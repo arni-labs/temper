@@ -202,11 +202,65 @@ fn verify_ioa_sources(ioa_sources: &std::collections::BTreeMap<String, String>) 
         // reaction is dropped (target not in its required from-state). This is
         // only meaningful with two or more entities — a single spec has nothing
         // to compose (and stdin verification stays per-entity by design).
-        if parsed_automata.len() >= 2 {
-            run_composite_verification(&parsed_automata)?;
+        // Each check reports on its own: one that fails does not hide what
+        // the next would find.
+        let composite = if parsed_automata.len() >= 2 {
+            run_composite_verification(&parsed_automata)
+        } else {
+            Ok(())
+        };
+        let joint = run_joint_verification(&parsed_automata);
+        match (composite, joint) {
+            (Err(composite), Err(joint)) => anyhow::bail!("{composite}\n{joint}"),
+            (Err(failed), Ok(())) | (Ok(()), Err(failed)) => return Err(failed),
+            (Ok(()), Ok(())) => {}
         }
     }
 
+    Ok(())
+}
+
+/// Time and states the joint check of one entity's cross-entity invariants
+/// may spend: a directory check is run by its author or CI, not on a request
+/// thread, so it gets the most a validate-ioa caller may ask for.
+const JOINT_BUDGET: temper_verify::Budget = temper_verify::Budget {
+    time: std::time::Duration::from_secs(120),
+    states: 10_000_000,
+};
+
+/// Check every `[[invariant]]` that reads a related entity on the joint
+/// model of its entity and the types it names. A broken invariant fails the
+/// command with its shortest path; one the walk could not finish fails too,
+/// since a partial walk proves nothing.
+fn run_joint_verification(
+    parsed_automata: &std::collections::BTreeMap<String, temper_spec::automaton::Automaton>,
+) -> Result<()> {
+    let automaton_refs: Vec<&temper_spec::automaton::Automaton> =
+        parsed_automata.values().collect();
+    let results = temper_verify::composite::verify_joint_invariants(&automaton_refs, JOINT_BUDGET);
+    if results.is_empty() {
+        return Ok(());
+    }
+    let mut report = String::from("\nRunning cross-entity invariants on the joint model...\n");
+    let mut failed = Vec::new();
+    for result in &results {
+        let tag = match result.outcome {
+            temper_verify::composite::JointOutcome::Holds => "PASS",
+            temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
+            temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
+        };
+        report.push_str(&format!("    [{tag}] {result}\n"));
+        if !result.holds() {
+            failed.push(format!("{}.{}", result.entity, result.invariant));
+        }
+    }
+    if failed.is_empty() {
+        report.push_str("\nCross-entity invariants: ALL PASSED");
+    }
+    println!("{report}");
+    if !failed.is_empty() {
+        anyhow::bail!("cross-entity invariants not proven: {}", failed.join(", "));
+    }
     Ok(())
 }
 
@@ -272,15 +326,18 @@ fn report_composite_results(
                     println!("           - {line}");
                     dropped_lines.push(line);
                 }
-                for other in &result.other_violations {
-                    println!("           - other violated property: {other}");
-                }
             }
             CompositeOutcome::Incomplete => {
                 any_incomplete = true;
                 println!(
-                    "    [INCOMPLETE] seed={} scope=[{}] — explored {} joint states; BFS budget exhausted, proof is PARTIAL (not a pass)",
-                    result.seed, scope, result.states_explored,
+                    "    [INCOMPLETE] seed={} scope=[{}] — explored {} joint states; {}, proof is PARTIAL (not a pass)",
+                    result.seed,
+                    scope,
+                    result.states_explored,
+                    result
+                        .incomplete
+                        .as_deref()
+                        .unwrap_or("not every state was walked"),
                 );
             }
         }
@@ -294,7 +351,7 @@ fn report_composite_results(
         );
     }
     if any_incomplete {
-        anyhow::bail!("composite verification incomplete: state exploration budget exhausted");
+        anyhow::bail!("composite verification incomplete: not every joint state was walked");
     }
     println!("\nComposite cross-entity verification: ALL PASSED");
 

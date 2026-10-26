@@ -28,6 +28,7 @@ test-support = []
 
 [dev-dependencies]
 temper-store-turso = { path = ".", features = ["test-support"] }
+temper-test-resource = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
