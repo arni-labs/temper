@@ -168,7 +168,7 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                 }
             }
         }
-        if v.spawn_may() != May::No {
+        if v.spawn_may() == May::No {
             for (source, automaton) in &v.by_name {
                 for action in &automaton.actions {
                     for effect in &action.effect {
