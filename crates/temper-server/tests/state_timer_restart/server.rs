@@ -30,7 +30,7 @@ use temper_store_postgres::{PostgresEventStore, PostgresSchema};
 use temper_store_turso::TursoEventStore;
 use tokio::sync::Notify;
 
-use super::world::ProcessClock;
+use super::process_clock::ProcessClock;
 use super::{CSDL, PERMIT_ALL, PROBE_IOA, TICKER_IOA};
 
 /// Simulation time for work already under way to end, such as a boot's

@@ -13,14 +13,12 @@
 //! a seed draws the scenario's times within the bounds each one states, and
 //! its ids.
 
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
 #[path = "state_timer_restart/recovery.rs"]
 mod recovery;
 #[path = "state_timer_restart/server.rs"]
 mod server;
-// Only its `ProcessClock` is used here.
-#[allow(dead_code)]
-#[path = "dst_state_timers_follow_state/world.rs"]
-mod world;
 
 use std::time::Duration;
 
