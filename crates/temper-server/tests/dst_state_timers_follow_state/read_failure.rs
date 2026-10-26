@@ -249,3 +249,83 @@ fn dst_unreadable_tenant_does_not_block_startup_or_other_timers() {
         Ok(())
     });
 }
+
+/// A later timeout install in an untimed healthy tenant must not wait for
+/// another tenant's failed recovery.
+#[test]
+fn dst_unreadable_tenant_does_not_block_later_timeout_install() {
+    check_seeds(|seed| {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = World {
+            events: SimEventStore::no_faults(seed),
+            rows: Arc::new(SimTimerRows::new(seed)),
+            clock,
+        };
+        let alpha = Job {
+            tenant: TenantId::new("alpha"),
+            id: "unreadable".into(),
+        };
+        let healthy = Job {
+            tenant: TenantId::new("gamma"),
+            id: "healthy".into(),
+        };
+        let first = Process::start(&world, JOB_V1, &job_untimed(), "isolated-a");
+        first.runtime.block_on(async {
+            for job in [&alpha, &healthy] {
+                first
+                    .state
+                    .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
+                    .await
+                    .unwrap();
+                assert!(act(&first.state, job, "Start").await);
+            }
+            settle().await;
+        });
+        let saved = world.rows.row("alpha", &alpha.id).unwrap();
+        assert!(world.rows.row("gamma", &healthy.id).is_none());
+        first.kill(&world, Duration::ZERO);
+        world.rows.fail_next_listings("alpha", 100);
+        let before = temper_runtime::scheduler::SimClock::now(world.clock.as_ref());
+        let (second, walk) = Process::boot(&world, JOB_V1, &job_untimed(), "isolated-b");
+        second.runtime.block_on(async {
+            assert_eq!(
+                temper_runtime::scheduler::SimClock::now(world.clock.as_ref()),
+                before,
+                "startup must return without waiting for row retries"
+            );
+            settle().await;
+            assert!(!walk.is_finished(), "failed recovery remains pending");
+            assert_eq!(status(&second.state, &alpha).await, "Waiting");
+            settle().await;
+            assert_eq!(
+                world.rows.row("alpha", &alpha.id).unwrap().armed_by,
+                saved.armed_by
+            );
+            // Hydrate the healthy tenant's untimed record, then install its
+            // first timeout while alpha still cannot restore saved identities.
+            assert_eq!(status(&second.state, &healthy).await, "Waiting");
+            install(&second.state, "gamma", JOB_V1);
+            second.state.follow_spec_changes().await;
+            assert!(
+                world.rows.row("gamma", &healthy.id).is_some(),
+                "healthy tenant's install must arm its resident record"
+            );
+            settle().await;
+            advance(Duration::from_secs(3601)).await;
+            assert_eq!(
+                status(&second.state, &healthy).await,
+                "Done",
+                "healthy tenant fires while alpha is unreadable"
+            );
+            assert_eq!(status(&second.state, &alpha).await, "Waiting");
+            world.rows.fail_next_listings("alpha", 0);
+            advance(Duration::from_secs(60)).await;
+            walk.await.unwrap();
+            settle().await;
+            assert_eq!(status(&second.state, &alpha).await, "Done");
+        });
+        second.kill(&world, Duration::ZERO);
+        Ok(())
+    });
+}

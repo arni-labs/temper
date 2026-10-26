@@ -59,9 +59,17 @@ impl SpecRegistry {
     /// `ServerState::follow_spec_changes`), except those of a tenant with an
     /// installation in progress: they wait for it to finish.
     pub fn take_changed_types(&mut self) -> Vec<(TenantId, String)> {
+        self.take_changed_types_for(|_| true)
+    }
+
+    /// Take changed types only for eligible tenants, retaining all others.
+    pub(crate) fn take_changed_types_for(
+        &mut self,
+        eligible: impl Fn(&TenantId) -> bool,
+    ) -> Vec<(TenantId, String)> {
         let (waiting, ready): (BTreeSet<_>, BTreeSet<_>) = std::mem::take(&mut self.changed_types)
             .into_iter()
-            .partition(|(tenant, _)| self.installing.contains_key(tenant));
+            .partition(|(tenant, _)| self.installing.contains_key(tenant) || !eligible(tenant));
         self.changed_types = waiting;
         ready.into_iter().collect()
     }

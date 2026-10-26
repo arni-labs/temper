@@ -138,6 +138,9 @@ impl ServerState {
                     .write()
                     .expect("timer recovery lock poisoned")
                     .insert(tenant.clone());
+                // Drain installs queued while this tenant was recovering,
+                // independently of tenants still retrying their row reads.
+                self.follow_spec_changes().await;
                 for (key, followed) in followed {
                     let counted = counts.entry(key).or_default();
                     counted.waiting = followed.waiting;
@@ -263,7 +266,8 @@ impl ServerState {
         (callers, counts)
     }
 
-    /// Every tenant's declared timeouts. Tenants without any are left out.
+    /// Every tenant's declared timeouts, including untimed tenants so later
+    /// installs can proceed once their saved rows have been read.
     fn declared_state_timeouts(&self) -> Vec<(TenantId, DeclaredTimeouts)> {
         let registry = self.registry.read().expect("registry lock poisoned");
         let mut declared = Vec::new();
@@ -280,9 +284,7 @@ impl ServerState {
                     );
                 }
             }
-            if !timeouts.is_empty() {
-                declared.push((tenant.clone(), timeouts));
-            }
+            declared.push((tenant.clone(), timeouts));
         }
         declared
     }

@@ -84,15 +84,16 @@ impl ServerState {
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
             Ok(mut registry) => {
-                // Startup installs precede start_runtime. The boot walk owns
-                // these changes: only it has the saved callers and fire gate.
-                if !self
+                // Only tenants whose saved identities are restored may follow
+                // installs. Keep other tenants queued without blocking them.
+                let complete = self
                     .timer_recovery_complete
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return;
-                }
-                registry.take_changed_types()
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let recovered = self
+                    .timer_recovered_tenants
+                    .read()
+                    .expect("timer recovery lock poisoned");
+                registry.take_changed_types_for(|tenant| complete || recovered.contains(tenant))
             }
             Err(_) => return,
         };
