@@ -303,7 +303,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
                     json!({ "Id": id, "Code": format!("code-{i}") }),
                 )
                 .await
-                .map_err(|error| run.fail("records are created", error))?;
+                .map_err(|error| run.fail("records are created", error.to_string()))?;
             status.insert(id, "Open".to_string());
         }
         let mut faulted = 0;

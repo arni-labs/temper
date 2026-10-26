@@ -9,11 +9,12 @@
 //! Invariants:
 //! - during the stretch every move answers `store_unavailable` and lands
 //!   nothing; `/healthz` answers 503 while appends fail, and 200 with the
-//!   refusal while the disk is under the floor; a new record the disk has no
-//!   room for is refused and writes nothing;
+//!   refusal while the disk is under the floor; a new record whose first
+//!   write the store does not take answers store unavailable, writes nothing
+//!   and is not listed (its actor neither restarts nor stays failed);
 //! - once the store takes writes again, every record moves again in the same
-//!   server, with no restart, a new record is created, and `/healthz` answers
-//!   200 once one has landed;
+//!   server, with no restart, the new record is created and moves, and
+//!   `/healthz` answers 200 once a write has landed;
 //! - after every move, the record's state in memory is the state its journal
 //!   gives.
 //!
@@ -32,6 +33,7 @@ use temper_runtime::scheduler::{DeterministicRng, install_deterministic_context}
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
+use temper_server::state::CreateError;
 use temper_server::storage::{STORAGE_FLOOR_BYTES, StorageRoom};
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
@@ -40,6 +42,8 @@ use temper_store_sim::SimEventStore;
 const SEEDS: u64 = 48;
 const RECORDS: usize = 3;
 const TENANT: &str = "default";
+/// A record first created during the stretch.
+const LATE: &str = "late";
 
 const TALLY: &str = r#"
 [automaton]
@@ -249,7 +253,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
             state
                 .get_or_create_tenant_entity(&tenant, "Tally", id, json!({ "Id": id }))
                 .await
-                .map_err(|error| run.fail("records are created", error))?;
+                .map_err(|error| run.fail("records are created", error.to_string()))?;
             status.insert(id.clone(), "Open".to_string());
         }
 
@@ -268,7 +272,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         // The stretch.
         match stretch {
             Stretch::Failing => {
-                for id in &ids {
+                for id in ids.iter().map(String::as_str).chain([LATE]) {
                     store.fail_next_appends(&journal_of(id), usize::MAX);
                 }
             }
@@ -296,31 +300,34 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 ));
             }
         }
-        // A new record the disk has no room for is refused before it starts.
-        if let Stretch::UnderFloor(_) = stretch {
-            let created = state
-                .get_or_create_tenant_entity(&tenant, "Tally", "late", json!({ "Id": "late" }))
-                .await;
-            let (events, _, _) = journal_state(&store, "late").await;
-            run.trace.push(format!(
-                "create late: ok {}, journal {events}",
-                created.is_ok()
-            ));
-            match created {
-                Err(error) if error.contains("storage full") && events == 0 => {}
-                other => {
-                    return Err(run.fail(
-                        "a create the disk has no room for is refused and writes nothing",
-                        format!("{:?}, journal {events}", other.map(|_| "created")),
-                    ));
-                }
+        // A new record whose first write the store does not take is not
+        // created: its creator is told, and nothing is left behind.
+        let created = state
+            .get_or_create_tenant_entity(&tenant, "Tally", LATE, json!({ "Id": LATE }))
+            .await;
+        let (events, _, _) = journal_state(&store, LATE).await;
+        let listed = state.entity_exists(&tenant, "Tally", LATE);
+        run.trace.push(format!(
+            "create {LATE}: ok {}, journal {events}, listed {listed}",
+            created.is_ok()
+        ));
+        match created {
+            Err(CreateError::StoreUnavailable(_)) if events == 0 && !listed => {}
+            other => {
+                return Err(run.fail(
+                    "a create the store does not take answers store unavailable and leaves no record",
+                    format!(
+                        "{:?}, journal {events}, listed {listed}",
+                        other.map(|_| "created")
+                    ),
+                ));
             }
         }
 
         // The store takes writes again.
         match stretch {
             Stretch::Failing => {
-                for id in &ids {
+                for id in ids.iter().map(String::as_str).chain([LATE]) {
                     store.fail_next_appends(&journal_of(id), 0);
                 }
             }
@@ -340,13 +347,22 @@ fn run_seed(seed: u64) -> Result<(), String> {
             }
         }
         let created = state
-            .get_or_create_tenant_entity(&tenant, "Tally", "late", json!({ "Id": "late" }))
+            .get_or_create_tenant_entity(&tenant, "Tally", LATE, json!({ "Id": LATE }))
             .await;
-        let (events, _, _) = journal_state(&store, "late").await;
+        let (events, _, _) = journal_state(&store, LATE).await;
         if created.is_err() || events != 1 {
             return Err(run.fail(
-                "a new record is created once the store takes writes",
+                "the record the store did not take is created once it takes writes",
                 format!("{:?}, journal {events}", created.map(|_| "created")),
+            ));
+        }
+        status.insert(LATE.to_string(), "Open".to_string());
+        let (answer, landed) =
+            checked_move(&state, &store, &mut run, &mut status, LATE, &mut rng).await?;
+        if answer != Answer::Success || landed != 1 {
+            return Err(run.fail(
+                "the record the store did not take moves once created",
+                format!("{answer:?}, landed {landed}"),
             ));
         }
         let (code, body) = healthz(&state).await;

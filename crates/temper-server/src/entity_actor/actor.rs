@@ -1275,11 +1275,20 @@ impl Actor for EntityActor {
                     &ScheduledRows::default(),
                 )
                 .await
-                .map_err(|e| {
-                    ActorError::custom(format!(
+                .map_err(|e| match e {
+                    // The journal moved on, or the write may have landed: a
+                    // restart replays the journal and finds out.
+                    PersistenceError::ConcurrencyViolation { .. }
+                    | PersistenceError::OutcomeUnknown(_) => ActorError::custom(format!(
                         "failed to persist bootstrap Created event for {}:{}: {}",
                         self.entity_type, self.entity_id, e
-                    ))
+                    )),
+                    // Not written, so the record is not created. A restart would
+                    // only retry the write, which its creator can do once told.
+                    e => ActorError::InitFailed(format!(
+                        "{}:{} was not created: {e}",
+                        self.entity_type, self.entity_id
+                    )),
                 })?;
             }
             state.push_event_bounded(created);

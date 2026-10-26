@@ -90,6 +90,12 @@ impl<M: Message> MailboxReceiver<M> {
     pub async fn recv(&mut self) -> Option<Envelope<M>> {
         self.inner.recv().await
     }
+
+    /// Take no more messages: senders see the mailbox closed at once, and
+    /// `recv` yields the messages already queued, then None.
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
 }
 
 impl<M: Message> Clone for MailboxSender<M> {

@@ -33,8 +33,8 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error, odata_refusal};
-use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{CreateError, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -823,8 +823,13 @@ pub async fn handle_odata_post(
                     }
                     .into_response()
                 }
-                Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
-                    .into_response(),
+                Err(CreateError::StoreUnavailable(reason)) => {
+                    crate::write_health::store_unavailable(&reason)
+                }
+                Err(CreateError::Failed(e)) => {
+                    odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
+                        .into_response()
+                }
             }
         }
 
