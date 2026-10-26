@@ -15,6 +15,7 @@ mod evolution_tenant;
 mod policy_approval;
 mod projection_writes;
 mod scheduled_actions;
+mod write_queue;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
     PersistenceEnvelope {
