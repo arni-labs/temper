@@ -11,8 +11,8 @@
 //! a state before rows were kept, or whose arming was lost. Every timer is due
 //! at boot. Right after the boot, while the fires queue for the boot's gate,
 //! some `gamma` records are moved out of `Waiting` by another caller. A
-//! record's first append in the new process takes a minute, so fires that run
-//! together start at the same instant.
+//! record's first append in the new process takes two seconds, so fires that
+//! run together start at the same instant.
 //!
 //! Invariants:
 //! - the boot leaves no record in a timed state waiting: none of these
@@ -43,8 +43,11 @@ use super::{JOB_V1, Job, Process, Run, World, act, advance, check_seeds, job_unt
 /// How many due timers the server lets fire at once (`BOOT_FIRES_AT_ONCE`).
 const FIRES_AT_ONCE: usize = 8;
 
-/// How long a record's first append in the restarted process takes.
-const FIRE_APPEND: Duration = Duration::from_secs(60);
+/// How long a record's first append in the restarted process takes. Shorter
+/// than an action's dispatch timeout (`TEMPER_ACTION_TIMEOUT_SECS`, 5 s by
+/// default): a fire whose dispatch times out before its append commits
+/// publishes no state change, so who it ran as could not be read.
+const FIRE_APPEND: Duration = Duration::from_secs(2);
 
 /// Who a timer fires as when nobody armed it (`STATE_TIMER_SERVICE`).
 const STATE_TIMER_SERVICE: &str = "service:state-timer";
