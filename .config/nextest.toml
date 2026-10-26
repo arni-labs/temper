@@ -1,3 +1,7 @@
+
+# Scratch branch only: run every test, so each failing-first test shows.
+[profile.default]
+fail-fast = false
 # The tests over a 300,000-row change log keep four periods for draining it
 # with production trim code. The pinned release tursodb builds the fixture
 # so debug-build inserts do not consume that budget before trimming starts.

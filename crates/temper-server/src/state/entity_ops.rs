@@ -1273,6 +1273,19 @@ impl ServerState {
         )
     }
 
+    /// Failing-first shim: the old create, which drops its creator.
+    pub async fn get_or_create_tenant_entity_by(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        _created_by: &crate::request_context::AgentContext,
+    ) -> Result<EntityResponse, String> {
+        self.get_or_create_tenant_entity(tenant, entity_type, entity_id, initial_fields)
+            .await
+    }
+
     /// Create a new entity with initial fields and return its state.
     #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_or_create_tenant_entity(
