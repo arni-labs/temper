@@ -14,19 +14,15 @@ use super::{
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl SyncCopy {
-    /// Change log rows one trim deletes at most. A trim holds the database's
-    /// write lock and writes the pages it frees to the WAL, so a log that
-    /// built up before trimming existed (1.7M rows on one app) is cleared
-    /// over many pushes, not in one long transaction.
-    pub const TRIM_ROWS_PER_PUSH: i64 = 10_000;
-
     /// Copy every change committed before this call to the remote database.
     ///
     /// Returns without a network request when another push already carried
     /// those changes, so writers that commit together share one push. An
     /// error means some of them may be only local; they stay in the local
     /// change log and the next successful push sends them. Nothing is pushed
-    /// unless the copy is [`CopyState::Copying`].
+    /// unless the copy is [`CopyState::Copying`]. It never trims the change
+    /// log, so an answer waits only for its own changes; the background loop
+    /// trims ([`Self::trim_pushed`]).
     pub async fn push_committed(&self) -> Result<(), PersistenceError> {
         // Changes are numbered in commit order (one writer at a time), so
         // everything this caller committed is at or below `wanted`.
@@ -88,69 +84,7 @@ impl SyncCopy {
             return self.require_copying();
         }
         self.inner.pushed.fetch_max(covered, Ordering::AcqRel);
-        self.trim_confirmed(remote_has).await;
         Ok(())
-    }
-
-    /// Delete the change log rows the remote has confirmed, keeping the
-    /// newest row. Nothing trims the log otherwise, and in 'full' mode each
-    /// row holds whole row images, so it grows with every write.
-    ///
-    /// The engine reads the log only above the remote's record of this
-    /// file's last push: a push scans from that record plus one
-    /// (turso_sync_engine 0.7.2 `database_sync_operations.rs` 2853,
-    /// `database_tape.rs` 416-432), a pull replays only rows above it
-    /// (`database_sync_engine.rs` 864-887), and its stats count rows above
-    /// it (1405-1427). `confirmed` is that record as the engine saved it
-    /// after the remote committed, so no row at or below it is read again.
-    ///
-    /// The newest row stays because in WAL mode a change is numbered one
-    /// above the largest in the log (turso_core 0.7.2
-    /// `translate/emitter/mod.rs` 1223-1239, `vdbe/execute.rs` 10823-10841).
-    /// An empty log would number the next change 1, at or below what the
-    /// remote holds, and the next push would skip it. [`Self::last_change`],
-    /// the start's check against the remote and the check after each push
-    /// read that same newest row.
-    ///
-    /// A failed trim leaves the rows for the next push to delete.
-    async fn trim_confirmed(&self, confirmed: i64) {
-        match self.trim_through(confirmed).await {
-            Ok(0) => {}
-            Ok(trimmed) => tracing::debug!(trimmed, confirmed, "turso.sync trimmed the change log"),
-            Err(error) => {
-                tracing::warn!(%error, "turso.sync could not trim the change log; the next push will")
-            }
-        }
-    }
-
-    async fn trim_through(&self, confirmed: i64) -> Result<u64, DriverError> {
-        let conn = self.connect().await?;
-        let mut rows = conn
-            .query("SELECT MIN(change_id), MAX(change_id) FROM turso_cdc", ())
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(0);
-        };
-        let (Some(oldest), Some(newest)) = (row.get::<Option<i64>>(0)?, row.get::<Option<i64>>(1)?)
-        else {
-            return Ok(0);
-        };
-        drop(rows);
-        let through = confirmed
-            .min(newest - 1)
-            .min(oldest.saturating_add(Self::TRIM_ROWS_PER_PUSH - 1));
-        if through < oldest {
-            return Ok(0);
-        }
-        // Changes to the change log itself are not captured, so this adds no
-        // row of its own (turso_core 0.7.2 `translate/emitter/mod.rs` 1083-1091).
-        let trimmed = conn
-            .execute(
-                "DELETE FROM turso_cdc WHERE change_id <= ?1",
-                crate::driver::params![through],
-            )
-            .await?;
-        Ok(trimmed)
     }
 
     /// The remote's record of this file's last push before the next one.
@@ -227,7 +161,7 @@ impl SyncCopy {
 
     /// The remote's record of this file's last pushed change, as the engine
     /// saved it after its last successful push.
-    async fn last_pushed_hint(&self) -> Result<i64, DriverError> {
+    pub(super) async fn last_pushed_hint(&self) -> Result<i64, DriverError> {
         let info = files::read_sync_metadata(&self.inner.path).await?;
         Ok(info["last_pushed_change_id_hint"].as_i64().unwrap_or(0))
     }

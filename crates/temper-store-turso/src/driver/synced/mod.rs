@@ -30,6 +30,7 @@ mod pool;
 mod push;
 mod remote;
 mod restore;
+mod trim;
 use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::Remote;
@@ -93,6 +94,8 @@ struct Inner {
     timeouts: AtomicU32,
     /// Whether the remote may hold a push the engine never heard back from.
     unsure: AtomicBool,
+    /// Rows the next trim batch deletes, sized by how long the last one took.
+    trim_batch: AtomicI64,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -197,6 +200,7 @@ impl SyncCopy {
                 state: std::sync::Mutex::new(state),
                 timeouts: AtomicU32::new(0),
                 unsure: AtomicBool::new(true),
+                trim_batch: AtomicI64::new(trim::FIRST_BATCH_ROWS),
             }),
         };
         // Change numbers follow commit order only with one writer at a time
@@ -396,6 +400,15 @@ impl SyncCopy {
     pub fn describe(path: &str) -> Result<String, PersistenceError> {
         files::describe(Path::new(path.strip_prefix("file:").unwrap_or(path)))
             .map_err(storage_error)
+    }
+
+    /// Run one statement on the local file and return the rows it changed.
+    /// For tests that need a state no store call makes, such as a change log
+    /// longer than one push can carry; never built into the server.
+    #[cfg(feature = "test-support")]
+    pub async fn execute_local(&self, sql: &str) -> Result<u64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        conn.execute(sql, ()).await.map_err(storage_error)
     }
 }
 
