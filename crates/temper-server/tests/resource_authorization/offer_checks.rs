@@ -42,6 +42,144 @@ async fn answer(app: &axum::Router, body: serde_json::Value, tenant: &str) -> se
     .unwrap()
 }
 
+/// `order-1`, to which only a person may add an item; an agent may not even read it.
+async fn order_only_a_person_may_add_to(state: &ServerState) {
+    use temper_server::registry::{EntityVerificationResult, VerificationStatus};
+    let csdl = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
+    let ioa = include_str!("../../../../test-fixtures/specs/order.ioa.toml");
+    {
+        let mut registry = state.registry.write().unwrap();
+        registry.register_tenant(
+            TENANT,
+            temper_spec::csdl::parse_csdl(csdl).unwrap(),
+            csdl.to_string(),
+            &[("Order", ioa)],
+        );
+        registry.set_verification_status(
+            &TenantId::new(TENANT),
+            "Order",
+            VerificationStatus::Completed(EntityVerificationResult {
+                all_passed: true,
+                levels: vec![],
+                verified_at: "2026-10-26T00:00:00Z".to_string(),
+            }),
+        );
+    }
+    state
+        .get_or_create_tenant_entity(
+            &TenantId::new(TENANT),
+            "Order",
+            "order-1",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    state
+        .authz
+        .reload_tenant_policies(
+            TENANT,
+            r#"permit(principal is Customer, action == Action::"AddItem", resource is Order);"#,
+        )
+        .unwrap();
+}
+
+/// `request` as agent-1 inside an interactive session, the case that files decisions.
+fn as_agent_in_session(mut request: Request<Body>) -> Request<Body> {
+    let mut security = customer_security_context("agent-1");
+    security.principal.kind = PrincipalKind::Agent;
+    request.extensions_mut().insert(
+        AuthenticatedRequestContext::new(TenantId::new(TENANT), security)
+            .with_session_id(Some("session-1".to_string())),
+    );
+    request
+}
+
+/// Pending decisions, GovernanceDecision records and denial patterns filed so far.
+async fn filed(state: &ServerState, store: &TursoEventStore) -> (usize, usize, usize) {
+    (
+        store.query_all_decisions(None).await.unwrap().len(),
+        state
+            .list_entity_ids(&TenantId::new("temper-system"), "GovernanceDecision")
+            .len(),
+        store
+            .load_policy_denial_patterns(TENANT)
+            .await
+            .unwrap()
+            .len(),
+    )
+}
+
+fn get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request should build")
+}
+
+/// Asking is a read. An agent in a session that is refused an offer check, a
+/// record read and a policy read many times over writes nothing; the move it
+/// then sends and is refused files exactly one decision.
+#[tokio::test]
+async fn refused_reads_and_questions_write_nothing_and_a_refused_move_files_one() {
+    let (state, store, _temp) = state_with_turso("reads-write-nothing").await;
+    register_governance(&state);
+    order_only_a_person_may_add_to(&state).await;
+    let app = build_router(state.clone());
+    for _ in 0..20 {
+        let offer = app
+            .clone()
+            .oneshot(as_agent_in_session(json_request(
+                Method::POST,
+                "/api/authorize",
+                serde_json::json!({
+                    "agent_id": "agent-1", "action": "AddItem", "resource_type": "Order",
+                    "resource_id": "order-1", "context": {"status": "Draft"}
+                }),
+                TENANT,
+                "agent-1",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(offer.status(), StatusCode::OK);
+        for uri in ["/tdata/Orders('order-1')", "/api/tenants/default/policies"] {
+            let read = app
+                .clone()
+                .oneshot(as_agent_in_session(get(uri)))
+                .await
+                .unwrap();
+            assert_eq!(read.status(), StatusCode::FORBIDDEN, "{uri}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(read.into_body(), 65536).await.unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("decision_id").is_none(), "{uri}: {body}");
+        }
+    }
+    assert_eq!(
+        filed(&state, &store).await,
+        (0, 0, 0),
+        "a refused read or question wrote"
+    );
+
+    let refused = app
+        .oneshot(as_agent_in_session(json_request(
+            Method::POST,
+            "/tdata/Orders('order-1')/Temper.AddItem",
+            serde_json::json!({"ProductId": "p1", "Quantity": 1}),
+            TENANT,
+            "agent-1",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        filed(&state, &store).await,
+        (1, 1, 1),
+        "the refused move files one decision"
+    );
+}
+
 #[tokio::test]
 async fn factory_sized_offer_batch_matches_single_checks_without_filing_decisions() {
     let (state, store, _temp) = state_with_turso("offer-batch").await;
@@ -108,45 +246,9 @@ async fn factory_sized_offer_batch_matches_single_checks_without_filing_decision
 
 #[tokio::test]
 async fn refused_dispatch_still_files_exactly_one_decision_after_offer_checks() {
-    use temper_server::registry::{EntityVerificationResult, VerificationStatus};
     let (state, store, _temp) = state_with_turso("offer-then-dispatch").await;
     register_governance(&state);
-    let csdl = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
-    let ioa = include_str!("../../../../test-fixtures/specs/order.ioa.toml");
-    {
-        let mut registry = state.registry.write().unwrap();
-        registry.register_tenant(
-            TENANT,
-            temper_spec::csdl::parse_csdl(csdl).unwrap(),
-            csdl.to_string(),
-            &[("Order", ioa)],
-        );
-        registry.set_verification_status(
-            &TenantId::new(TENANT),
-            "Order",
-            VerificationStatus::Completed(EntityVerificationResult {
-                all_passed: true,
-                levels: vec![],
-                verified_at: "2026-10-26T00:00:00Z".to_string(),
-            }),
-        );
-    }
-    state
-        .get_or_create_tenant_entity(
-            &TenantId::new(TENANT),
-            "Order",
-            "order-1",
-            serde_json::json!({}),
-        )
-        .await
-        .unwrap();
-    state
-        .authz
-        .reload_tenant_policies(
-            TENANT,
-            r#"permit(principal is Customer, action == Action::"AddItem", resource is Order);"#,
-        )
-        .unwrap();
+    order_only_a_person_may_add_to(&state).await;
     let app = build_router(state.clone());
     let offers = answer(&app, serde_json::json!({"agent_id":"agent-1", "records":[{
         "resource_type":"Order", "resource_id":"order-1", "actions":["AddItem"], "context":{"status":"Draft"}
