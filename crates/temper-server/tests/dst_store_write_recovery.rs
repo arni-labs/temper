@@ -9,9 +9,11 @@
 //! Invariants:
 //! - during the stretch every move answers `store_unavailable` and lands
 //!   nothing; `/healthz` answers 503 while appends fail, and 200 with the
-//!   refusal while the disk is under the floor;
+//!   refusal while the disk is under the floor; a new record the disk has no
+//!   room for is refused and writes nothing;
 //! - once the store takes writes again, every record moves again in the same
-//!   server, with no restart, and `/healthz` answers 200 once one has landed;
+//!   server, with no restart, a new record is created, and `/healthz` answers
+//!   200 once one has landed;
 //! - after every move, the record's state in memory is the state its journal
 //!   gives.
 //!
@@ -228,7 +230,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         .expect("runtime builds");
     let store = SimEventStore::no_faults(seed);
     let available = Arc::new(AtomicU64::new(u64::MAX));
-    let mut rng = DeterministicRng::new(seed ^ 0x5707_e5);
+    let mut rng = DeterministicRng::new(seed ^ 0x0057_07e5);
     let stretch = if rng.next_bound(2) == 0 {
         Stretch::Failing
     } else {
@@ -294,6 +296,26 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 ));
             }
         }
+        // A new record the disk has no room for is refused before it starts.
+        if let Stretch::UnderFloor(_) = stretch {
+            let created = state
+                .get_or_create_tenant_entity(&tenant, "Tally", "late", json!({ "Id": "late" }))
+                .await;
+            let (events, _, _) = journal_state(&store, "late").await;
+            run.trace.push(format!(
+                "create late: ok {}, journal {events}",
+                created.is_ok()
+            ));
+            match created {
+                Err(error) if error.contains("storage full") && events == 0 => {}
+                other => {
+                    return Err(run.fail(
+                        "a create the disk has no room for is refused and writes nothing",
+                        format!("{:?}, journal {events}", other.map(|_| "created")),
+                    ));
+                }
+            }
+        }
 
         // The store takes writes again.
         match stretch {
@@ -316,6 +338,16 @@ fn run_seed(seed: u64) -> Result<(), String> {
                     format!("{id}: {answer:?}, landed {landed}"),
                 ));
             }
+        }
+        let created = state
+            .get_or_create_tenant_entity(&tenant, "Tally", "late", json!({ "Id": "late" }))
+            .await;
+        let (events, _, _) = journal_state(&store, "late").await;
+        if created.is_err() || events != 1 {
+            return Err(run.fail(
+                "a new record is created once the store takes writes",
+                format!("{:?}, journal {events}", created.map(|_| "created")),
+            ));
         }
         let (code, body) = healthz(&state).await;
         if code != StatusCode::OK || body != json!({ "ok": true }) {

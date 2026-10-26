@@ -150,8 +150,8 @@ impl BoxedEventStore {
     }
 
     /// Refuse an append, before anything is written, while the disk is under
-    /// the floor.
-    pub(super) fn check_room(&self) -> Result<(), PersistenceError> {
+    /// the floor. A create checks it before its actor starts.
+    pub(crate) fn check_room(&self) -> Result<(), PersistenceError> {
         let Some(room) = &self.room else {
             return Ok(());
         };

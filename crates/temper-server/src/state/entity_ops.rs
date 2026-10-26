@@ -1214,10 +1214,11 @@ impl ServerState {
     }
 
     /// Refuse a new entity whose first event, `Created` with its initial fields,
-    /// would be larger than the event size limit. Checked before its actor starts,
-    /// so a refused create answers with the refusal instead of a stopped actor and
-    /// an empty entity left in the index.
-    pub(crate) fn check_created_event_size(
+    /// cannot be written: the disk under the store is below the floor, or the
+    /// event would be larger than the event size limit. Checked before its actor
+    /// starts, so a refused create answers with the refusal instead of a stopped
+    /// actor and an empty entity left in the index.
+    pub(crate) fn check_created_event(
         &self,
         tenant: &TenantId,
         entity_type: &str,
@@ -1227,6 +1228,7 @@ impl ServerState {
         let Some((store, _)) = self.event_journal() else {
             return Ok(());
         };
+        store.check_room()?;
         // Without a limit (the kernel's default) a create pays nothing for this.
         if store.event_size_limits().max_bytes.is_none() {
             return Ok(());
@@ -1280,7 +1282,7 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<EntityResponse, String> {
-        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
+        self.check_created_event(tenant, entity_type, entity_id, &initial_fields)
             .map_err(|e| e.to_string())?;
         let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
             tenant,

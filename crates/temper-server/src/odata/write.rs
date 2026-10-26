@@ -742,14 +742,18 @@ pub async fn handle_odata_post(
                 }
             }
 
-            // A new entity's first event holds its initial fields: one too large is
-            // refused here, before any create path starts.
+            // A new entity's first event holds its initial fields: one too large, or
+            // one the disk has no room for, is refused here, before any create path
+            // starts.
             if let Err(error) =
-                state.check_created_event_size(&tenant, &entity_type, &entity_id, &initial_fields)
+                state.check_created_event(&tenant, &entity_type, &entity_id, &initial_fields)
             {
                 let (status, code) = match error {
                     PersistenceError::EventTooLarge { .. } => {
                         (StatusCode::PAYLOAD_TOO_LARGE, "EventTooLarge")
+                    }
+                    PersistenceError::StorageFull { .. } => {
+                        return crate::write_health::store_unavailable(&error.to_string());
                     }
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, "CreateError"),
                 };
