@@ -569,6 +569,9 @@ pub enum ConcurrencyRetryOutcome {
     /// Replay found the action's own event in the journal: an earlier attempt
     /// landed although the store answered with a concurrency violation.
     AlreadyWritten,
+    /// The action is a state timer's fire, and replay found the record past
+    /// the sequence its timer was armed at: dropped, not evaluated again.
+    TimerSuperseded,
 }
 
 impl ConcurrencyRetryOutcome {
@@ -579,6 +582,7 @@ impl ConcurrencyRetryOutcome {
             ConcurrencyRetryOutcome::Exhausted => "exhausted",
             ConcurrencyRetryOutcome::ActionIllegal => "action_illegal",
             ConcurrencyRetryOutcome::AlreadyWritten => "already_written",
+            ConcurrencyRetryOutcome::TimerSuperseded => "timer_superseded",
         }
     }
 }

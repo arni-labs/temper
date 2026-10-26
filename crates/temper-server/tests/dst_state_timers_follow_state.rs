@@ -41,6 +41,8 @@ mod delete_race;
 mod embedder;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
 #[path = "dst_state_timers_follow_state/specs.rs"]
 mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
@@ -51,6 +53,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use invariants::{check_all_done, check_boot_counts, check_rows_follow_state, check_seeds};
+use process_clock::ProcessClock;
 use serde_json::json;
 use specs::{CSDL, JOB_V1, install, job_untimed, job_v2, timer_action};
 use temper_runtime::ActorSystem;
@@ -62,7 +65,7 @@ use temper_server::state::BootTimers;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
-use world::{ProcessClock, SimTimerRows};
+use world::SimTimerRows;
 
 const SEEDS: u64 = 48;
 
