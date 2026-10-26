@@ -25,9 +25,10 @@ impl SyncCopy {
     /// unless the copy is [`CopyState::Copying`]. Writes never wait for this:
     /// the server calls it in the background.
     pub async fn push_committed(&self) -> Result<(), PersistenceError> {
-        // Every move confirmed through `moves` committed before `wanted` is
-        // read, and changes are numbered in commit order (one writer at a
-        // time), so everything this caller committed is at or below `wanted`.
+        // `moves` is read first, so every move numbered up to it committed
+        // before `wanted` is read. Changes are numbered in commit order (one
+        // writer at a time), so everything this caller committed is at or
+        // below `wanted`.
         let moves = self.newest_move();
         let wanted = self.last_change().await?;
         let _pushing = self.inner.pushing.lock().await;
