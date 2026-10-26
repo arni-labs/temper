@@ -473,3 +473,7 @@ mod tests;
 #[cfg(test)]
 #[path = "vacuous_test.rs"]
 mod vacuous_tests;
+
+#[cfg(test)]
+#[path = "outside_test.rs"]
+mod outside_tests;
