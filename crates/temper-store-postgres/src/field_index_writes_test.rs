@@ -91,15 +91,15 @@ fn total(writes: &BTreeMap<String, i64>) -> i64 {
     writes.values().sum()
 }
 
-/// The record's index rows as `field_name -> (field_value, status)`.
+/// The record's index rows as `field_name -> field_value`.
 async fn index_rows(
     pool: &PgPool,
     schema: &PostgresSchema,
     [tenant, entity_id]: [&str; 2],
-) -> BTreeMap<String, (Option<String>, Option<String>)> {
-    let rows: Vec<(String, Option<String>, Option<String>)> = crate::dbm::postgres_query_as!(
+) -> BTreeMap<String, Option<String>> {
+    let rows: Vec<(String, Option<String>)> = crate::dbm::postgres_query_as!(
         schema,
-        "SELECT field_name, field_value, status FROM {schema}entity_field_index \
+        "SELECT field_name, field_value FROM {schema}entity_field_index \
          WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
     )
     .bind(tenant)
@@ -108,19 +108,35 @@ async fn index_rows(
     .fetch_all(pool)
     .await
     .expect("read index rows");
-    rows.into_iter()
-        .map(|(name, value, status)| (name, (value, status)))
-        .collect()
+    rows.into_iter().collect()
 }
 
-/// The index rows a record with `fields` should have: one value per field,
-/// and no status on any of them.
-fn expected_rows(fields: &Value) -> BTreeMap<String, (Option<String>, Option<String>)> {
+/// How many of the record's index rows carry a status.
+async fn rows_with_status(
+    pool: &PgPool,
+    schema: &PostgresSchema,
+    [tenant, entity_id]: [&str; 2],
+) -> i64 {
+    crate::dbm::postgres_query_scalar!(
+        schema,
+        "SELECT count(*) FROM {schema}entity_field_index \
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND status IS NOT NULL",
+    )
+    .bind(tenant)
+    .bind(ENTITY_TYPE)
+    .bind(entity_id)
+    .fetch_one(pool)
+    .await
+    .expect("count rows with a status")
+}
+
+/// The index rows a record with `fields` should have: one value per field.
+fn expected_rows(fields: &Value) -> BTreeMap<String, Option<String>> {
     fields
         .as_object()
         .expect("fields object")
         .iter()
-        .map(|(name, value)| (name.clone(), (value.as_str().map(str::to_string), None)))
+        .map(|(name, value)| (name.clone(), value.as_str().map(str::to_string)))
         .collect()
 }
 
@@ -202,8 +218,10 @@ fn a_projection_writes_only_the_index_rows_it_changes() {
             );
         }
 
-        // A filter finds the record by the status in its catalog row, and by a
-        // field through the index.
+        // No row copies the status, so a status change has no index rows to
+        // write. A filter finds the record by the status in its catalog row,
+        // and by a field through the index.
+        assert_eq!(rows_with_status(&pool, &schema, ticket).await, 0);
         for (status, found) in [("Review", true), ("Open", false)] {
             let ids = store
                 .query_field_index(
