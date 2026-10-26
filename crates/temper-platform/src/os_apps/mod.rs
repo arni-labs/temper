@@ -1251,7 +1251,7 @@ async fn install_once(
         combined_policy.as_deref(),
     )?;
     let policies = combined_policy.as_deref();
-    if let Some(proof) = install_checks::prove(
+    let unproved_rules = match install_checks::prove(
         state,
         tenant,
         app_name,
@@ -1262,8 +1262,9 @@ async fn install_once(
     )
     .await?
     {
-        return Ok(ControlFlow::Continue(proof));
-    }
+        install_checks::Proved::Waiting(proof) => return Ok(ControlFlow::Continue(proof)),
+        install_checks::Proved::Unproved(rules) => rules,
+    };
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1667,6 +1668,7 @@ async fn install_once(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        unproved_rules,
     }))
 }
 

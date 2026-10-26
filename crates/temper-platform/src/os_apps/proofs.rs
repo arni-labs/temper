@@ -41,12 +41,24 @@ const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 const MB: usize = 1 << 20;
 
-/// What a proof found: the results that held, in words, and why the
-/// install is refused when one did not.
+/// What a proof found, in words: the results that held, why the install is
+/// refused when the walk found the rule broken, and why the rule is not
+/// proven when the check could not decide it (a warning).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Verdict {
     pub(super) held: Vec<String>,
     pub(super) refused: Option<String>,
+    /// Kept verdicts are proven ones, written before this field, so it
+    /// reads as absent there.
+    #[serde(default)]
+    pub(super) unproved: Option<String>,
+}
+
+impl Verdict {
+    /// Whether the rule was proven: neither broken nor left undecided.
+    pub(super) fn proven(&self) -> bool {
+        self.refused.is_none() && self.unproved.is_none()
+    }
 }
 
 /// What a walk returns: its verdict, and whether the walk fit in its memory
@@ -234,7 +246,8 @@ async fn run(
     .unwrap_or_else(|error| Walked {
         verdict: Verdict {
             held: Vec::new(),
-            refused: Some(format!(
+            refused: None,
+            unproved: Some(format!(
                 "os-app '{app_name}': the check of {proof} stopped: {error}"
             )),
         },
@@ -242,7 +255,7 @@ async fn run(
     });
     reports.abort();
     if walked.fit
-        && walked.verdict.refused.is_none()
+        && walked.verdict.proven()
         && let Some(store) = server.platform_metadata_store()
         && let Ok(bytes) = serde_json::to_vec(&walked.verdict)
     {
@@ -253,7 +266,12 @@ async fn run(
         }
     }
     let states = progress.states.load(Ordering::Relaxed);
-    let summary = match &walked.verdict.refused {
+    let summary = match walked
+        .verdict
+        .refused
+        .as_ref()
+        .or(walked.verdict.unproved.as_ref())
+    {
         None => format!("os-app '{app_name}': {proof}: proven ({states} joint states)"),
         Some(why) => format!("os-app '{app_name}': {proof}: not proven: {why}"),
     };
@@ -264,7 +282,7 @@ async fn run(
         &app_name,
         "proof_done",
         summary,
-        Some(walked.verdict.refused.is_none()),
+        Some(walked.verdict.proven()),
     )
     .await;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);

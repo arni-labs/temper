@@ -29,7 +29,8 @@ fn incomplete() -> Walked {
     Walked {
         verdict: Verdict {
             held: vec![],
-            refused: Some("no room".to_string()),
+            refused: None,
+            unproved: Some("no room".to_string()),
         },
         fit: false,
     }
@@ -87,7 +88,7 @@ async fn staggered_incomplete_rules_are_retained_for_every_install_retry() {
             else {
                 panic!("install must finish once both rules ended")
             };
-            assert_eq!(verdict.refused.as_deref(), Some("no room"));
+            assert_eq!(verdict.unproved.as_deref(), Some("no room"));
         }
     }
     assert_eq!(starts.load(Ordering::SeqCst), 2);

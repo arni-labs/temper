@@ -248,6 +248,7 @@ impl<'v, 'a> Enc<'v, 'a> {
             } else {
                 format!("a record found through a field ({entity_type}[{id_field}])")
             }),
+            Operand::Param(name) => Err(format!("a parameter of a move (params.{name})")),
             Operand::Lit(l) => Ok(Term::Lit(l.clone())),
         }
     }

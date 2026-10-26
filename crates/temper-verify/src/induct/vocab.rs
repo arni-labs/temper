@@ -117,7 +117,7 @@ pub(super) struct Call {
     pub(super) name: String,
     pub(super) to: String,
     pub(super) module: String,
-    pub(super) on_success: Option<String>,
+    pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
     /// The string fields it keeps.
     pub(super) asked: Vec<String>,
@@ -369,15 +369,18 @@ impl<'a> Vocab<'a> {
         })
     }
 
-    /// The actions a call may be answered with: its declared answer, or
+    /// The actions a call may be answered with: its declared answers, or
     /// else any internal action of its record.
     pub(super) fn answer_actions(&self, call: &Call) -> Vec<&'a Action> {
         self.automaton(&call.to)
             .actions
             .iter()
-            .filter(|a| match &call.on_success {
-                Some(name) => &a.name == name,
-                None => a.kind == ActionKind::Internal,
+            .filter(|a| {
+                if call.on_success.is_empty() {
+                    a.kind == ActionKind::Internal
+                } else {
+                    call.on_success.contains(&a.name)
+                }
             })
             .collect()
     }
@@ -405,7 +408,7 @@ pub(super) fn scheduled(effect: &Effect) -> Option<&str> {
 }
 
 /// Add `kind` unless `kinds` has it, named by its target and action (a
-/// scheduled one `.scheduled` after) and numbered when several share it.
+/// scheduled one `.scheduled` after), avoiding names of every existing kind.
 fn push_kind(kinds: &mut Vec<Kind>, mut kind: Kind) {
     if kinds.iter().any(|k| k.same(&kind)) {
         return;
@@ -414,13 +417,11 @@ fn push_kind(kinds: &mut Vec<Kind>, mut kind: Kind) {
         true => format!("{}.{}.scheduled", kind.to, kind.action),
         false => format!("{}.{}", kind.to, kind.action),
     };
-    let taken = kinds
-        .iter()
-        .filter(|k| k.to == kind.to && k.action == kind.action && k.scheduled == kind.scheduled)
-        .count();
-    kind.name = match taken {
-        0 => base,
-        n => format!("{base}{}", n + 1),
-    };
+    kind.name = base.clone();
+    let mut suffix = 2;
+    while kinds.iter().any(|k| k.name == kind.name) {
+        kind.name = format!("{base}{suffix}");
+        suffix += 1;
+    }
     kinds.push(kind);
 }

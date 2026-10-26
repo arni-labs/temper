@@ -223,19 +223,23 @@ impl SimActorHandler for EntityActorHandler {
 
     fn state_value(&self, name: &str) -> Option<serde_json::Value> {
         let state = &self.state;
-        if name == "items" && !state.counters.contains_key(name) {
-            return Some(serde_json::Value::from(state.item_count));
+        let declared = &self.table.initial_values;
+        if name == "items"
+            && !state.counters.contains_key(name)
+            && let Some(items) = super::effects::stored_item_count(state, declared)
+        {
+            return Some(serde_json::Value::from(items));
         }
-        if let Some(value) = state.counters.get(name) {
-            return Some(serde_json::Value::from(*value));
+        if let Some(value) = declared.counter(&state.counters, name) {
+            return Some(serde_json::Value::from(value));
         }
-        if let Some(value) = state.booleans.get(name) {
-            return Some(serde_json::Value::Bool(*value));
+        if let Some(value) = declared.boolean(&state.booleans, name) {
+            return Some(serde_json::Value::Bool(value));
         }
-        if let Some(value) = state.lists.get(name) {
-            return Some(serde_json::Value::from(value.clone()));
+        if let Some(value) = declared.list(&state.lists, name) {
+            return Some(serde_json::Value::from(value.to_vec()));
         }
-        state.fields.get(name).cloned()
+        declared.field(state.fields.get(name), name).cloned()
     }
 
     fn pending_callbacks(&self) -> Vec<String> {

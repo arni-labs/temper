@@ -8,9 +8,9 @@
 //! [`TimerFollow::WaitsForCaller`]).
 //!
 //! At boot, after the rows are re-armed, a walk makes each record that had a
-//! row follow the state it replays into: a row of `Waiting` on a record that
-//! now replays into `Review` gets `Review`'s timer at once, not when the stale
-//! one fires. A record in a timed state with no row is not armed: it waits for
+//! row follow the state it replays into: a row armed under an older spec, on
+//! a record whose state now declares another timer, gets the new timer at
+//! once, not when the stale one fires. A record in a timed state with no row is not armed: it waits for
 //! its next action ([`Arming::FromRow`]). The walk counts those records, and
 //! ends with one log line of counts per tenant and type.
 //!
@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use temper_runtime::tenant::TenantId;
 
 use super::state_timer_reconcile::{Arming, Follow, TimerFollow};
-use crate::entity_actor::{EntityState, recover_entity_state_from_store};
+use crate::entity_actor::{EntityState, recover_entity_state_for_walk};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 use crate::state::projection_backfill::transition_table_for;
@@ -168,7 +168,8 @@ impl ServerState {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        tracing::info!(
+        // The boot check reads this summary through the WARN+ OTLP log export.
+        tracing::warn!(
             rearmed = counts.values().map(|c| c.rearmed).sum::<usize>(),
             dropped = counts.values().map(|c| c.dropped).sum::<usize>(),
             waiting = counts.values().map(|c| c.waiting).sum::<usize>(),
@@ -296,7 +297,7 @@ impl ServerState {
         };
         let table = transition_table_for(self, tenant, entity_type)?;
         let blob_store = self.blob_store_for_tenant(tenant).ok();
-        match recover_entity_state_from_store(
+        match recover_entity_state_for_walk(
             tenant.as_str(),
             entity_type,
             entity_id,

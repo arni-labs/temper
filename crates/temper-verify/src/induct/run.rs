@@ -101,7 +101,7 @@ pub(super) fn run(
             tests::WORKERS_CREATED.fetch_add(1, Ordering::SeqCst);
             workers.push(scope.spawn(move || -> std::io::Result<Checked> {
                 let _seat = seat;
-                let mut z3 = Z3::start()?;
+                let mut z3 = Z3::start(deadline)?;
                 z3.send(prelude)?;
                 z3.send(few)?;
                 let mut checked = Vec::new();

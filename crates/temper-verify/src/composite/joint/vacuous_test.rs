@@ -109,7 +109,7 @@ fn a_liveness_premise_no_walked_state_meets_proves_nothing() {
     let result = liveness("internal", false, "status == 'Gone' => status == 'Done'");
     let text = result.to_string();
     assert!(!result.holds(), "{text}");
-    assert!(text.contains("PROVES NOTHING"), "{text}");
+    assert!(text.contains("CHECKS NOTHING AS WRITTEN"), "{text}");
     assert!(text.contains("`status == 'Gone'`"), "{text}");
 }
 
@@ -129,7 +129,7 @@ fn an_invariant_premise_no_settled_state_meets_proves_nothing() {
     let result = invariant("internal", "status == 'Gone' => Box[Id].status == 'Full'");
     let text = result.to_string();
     assert!(!result.holds(), "{text}");
-    assert!(text.contains("PROVES NOTHING"), "{text}");
+    assert!(text.contains("CHECKS NOTHING AS WRITTEN"), "{text}");
 }
 
 #[test]
