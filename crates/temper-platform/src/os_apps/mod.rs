@@ -1228,7 +1228,8 @@ pub(super) async fn install_os_app_with_plan(
         combined_policy.as_deref(),
     )?;
     let policies = combined_policy.as_deref();
-    install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies).await?;
+    let unproved_rules =
+        install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies).await?;
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1632,6 +1633,7 @@ pub(super) async fn install_os_app_with_plan(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        unproved_rules,
     })
 }
 

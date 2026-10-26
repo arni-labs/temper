@@ -62,7 +62,7 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
     let c = spec("C", None);
     let state = state("alice", &[("B", &b), ("C", &c)]);
     let a = spec("A", Some("B[Id].status != 'Closed'"));
-    prove(
+    let unproved = prove(
         &state,
         "alice",
         "a-app",
@@ -72,8 +72,15 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
     )
     .await
     .unwrap();
-    let err = prove(&state, "bob", "a-app", &[("A".into(), a)], true, None)
+    assert!(unproved.is_empty(), "{unproved:?}");
+    // Bob's tenant runs no B, so A's rule cannot be proved there: the install
+    // goes ahead and names the rule it could not prove.
+    let unproved = prove(&state, "bob", "a-app", &[("A".into(), a)], true, None)
         .await
-        .unwrap_err();
-    assert!(err.contains("B, which this app does not declare"), "{err}");
+        .unwrap();
+    assert_eq!(unproved.len(), 1, "{unproved:?}");
+    assert!(
+        unproved[0].contains("B, which this app does not declare"),
+        "{unproved:?}"
+    );
 }

@@ -140,7 +140,7 @@ pub(super) fn tracked(
 #[derive(Debug, Clone)]
 pub(super) struct CallSpec {
     pub(super) module: String,
-    pub(super) on_success: Option<String>,
+    pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
 }
 
@@ -178,9 +178,9 @@ impl Kernel {
                 .is_some_and(|timers| timers.iter().any(|t| t.action == action))
             || self.calls_on.iter().any(|((e, _), specs)| {
                 e == entity
-                    && specs
-                        .iter()
-                        .any(|spec| named(&spec.on_success) || named(&spec.on_failure))
+                    && specs.iter().any(|spec| {
+                        spec.on_success.iter().any(|name| name == action) || named(&spec.on_failure)
+                    })
             })
     }
 
