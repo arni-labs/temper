@@ -22,6 +22,7 @@ mod effects;
 mod encode;
 mod live;
 mod moves;
+mod run;
 mod solver;
 mod vocab;
 
@@ -35,7 +36,7 @@ use temper_spec::predicate::{Expr, Name};
 use encode::{Enc, initial, prelude};
 pub use live::{Measure, Region};
 use moves::Moves;
-use solver::{Sat, Z3};
+use run::{Ask, few_in_flight, run};
 use vocab::Vocab;
 
 /// What an agent gives the proofs: lemmas, and for each `eventually` rule a
@@ -135,13 +136,16 @@ pub fn prove(
             }
         }
     }
-    // Each rule has its own solver, so the rules are proved side by side.
+    // The rules are proved side by side, and their solvers share the
+    // machine's cores.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let solvers = (cores / rules.len().max(1)).max(1);
     std::thread::scope(|scope| {
         let proofs: Vec<_> = rules
             .iter()
             .map(|&(owner, name, rule)| {
                 let by_name = &by_name;
-                scope.spawn(move || prove_one(by_name, owner, name, rule, hints, policies))
+                scope.spawn(move || prove_one(by_name, owner, name, rule, hints, policies, solvers))
             })
             .collect();
         proofs
@@ -166,6 +170,7 @@ fn prove_one(
     kind: Rule<'_>,
     hints: &Hints,
     policies: Option<&SendAnalysis>,
+    solvers: usize,
 ) -> std::io::Result<RuleProof> {
     let start = Instant::now();
     let expr = match kind {
@@ -201,8 +206,6 @@ fn prove_one(
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);
     let moves = builder.all();
-    let mut z3 = Z3::start()?;
-    z3.send(&prelude(&v))?;
     // The clauses of J, by name, as functions of the frame.
     let clause = |frame: &str| -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -220,17 +223,18 @@ fn prove_one(
         );
         out
     };
-    let mut obligations = Vec::new();
+    let mut asks = Vec::new();
     // The start.
     {
         let at_start = clause("pre");
-        let decls = enc.take_decls();
         let mut text = String::from("(push 1)\n");
-        decls.iter().for_each(|d| text.push_str(&format!("{d}\n")));
+        enc.take_decls()
+            .iter()
+            .for_each(|d| text.push_str(&format!("{d}\n")));
         for fact in initial(&v) {
             text.push_str(&format!("(assert {fact})\n"));
         }
-        obligations.push(check(&mut z3, &v, "start", text, &at_start, &at_start)?);
+        asks.push(Ask::new(&v, "start", text, at_start.clone(), &at_start));
     }
     for mv in &moves {
         let before = clause("pre");
@@ -247,7 +251,7 @@ fn prove_one(
         for fact in mv.body() {
             text.push_str(&format!("(assert {fact})\n"));
         }
-        obligations.push(check(&mut z3, &v, &mv.label, text, &after, &before)?);
+        asks.push(Ask::new(&v, &mv.label, text, after, &before));
     }
     let mut errors = Vec::new();
     if let Rule::Eventually(goal, relies_on) = kind {
@@ -258,21 +262,12 @@ fn prove_one(
             measure,
             regions,
         };
-        live::obligations(
-            &mut z3,
-            &enc,
-            &moves,
-            &live,
-            &clause,
-            &mut obligations,
-            &mut errors,
-        )?;
+        live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
     }
+    let solvers = solvers.clamp(1, asks.len().max(1));
+    let (obligations, mut refused) = run(rule, &prelude(&v), &few_in_flight(&v), &asks, solvers)?;
+    errors.append(&mut refused);
     let limits = builder.limits.into_inner().into_iter().collect();
-    if let Ok(path) = std::env::var("INDUCT_SCRIPT") {
-        std::fs::write(format!("{path}.{rule}.smt2"), &z3.script)?;
-    }
-    errors.append(&mut z3.errors);
     Ok(RuleProof {
         rule: rule.to_string(),
         scope,
@@ -281,132 +276,6 @@ fn prove_one(
         errors,
         took: start.elapsed(),
     })
-}
-
-/// Check that `goal` holds given what `text` asserts; on a failure, which
-/// clauses fail and the state before (`before` names what to show).
-fn check(
-    z3: &mut Z3,
-    v: &Vocab<'_>,
-    name: &str,
-    text: String,
-    goal: &[(String, String)],
-    before: &[(String, String)],
-) -> std::io::Result<Obligation> {
-    let all: Vec<&str> = goal.iter().map(|(_, c)| c.as_str()).collect();
-    z3.send(&text)?;
-    // Whether the move can happen: a model is quick to find among states
-    // with a few dispatches in flight, and slow or out of reach with
-    // quantified lemmas over all of them, so look there first.
-    z3.send(&format!("(push 1)\n{}", few_in_flight(v)))?;
-    let (few, mut took) = z3.check()?;
-    z3.send("(pop 1)\n")?;
-    let possible = few == Sat::Sat || {
-        let (any, also) = z3.check()?;
-        took += also;
-        any != Sat::Unsat
-    };
-    z3.send(&format!("(assert (not (and true {})))\n", all.join(" ")))?;
-    let (mut sat, also) = z3.check()?;
-    took += also;
-    // Quantified lemmas can leave the solver unable to build a model of a
-    // failure. Look again among states with a few dispatches of each kind
-    // in flight: a failure there is a real counterexample.
-    let finite = sat == Sat::Unknown;
-    if finite {
-        z3.send(&format!("(push 1)\n{}", few_in_flight(v)))?;
-        let (again, also) = z3.check()?;
-        sat = again;
-        took += also;
-        if sat != Sat::Sat {
-            z3.send("(pop 1)\n")?;
-        }
-    }
-    let outcome = match sat {
-        Sat::Unsat | Sat::Unknown if finite => Outcome::Unknown,
-        Sat::Unsat => Outcome::Holds,
-        Sat::Unknown => Outcome::Unknown,
-        Sat::Sat => {
-            let cti = z3.values(&shown(v, before, goal))?;
-            if finite {
-                z3.send("(pop 1)\n")?;
-            }
-            z3.send("(pop 1)\n(push 1)\n")?;
-            z3.send(&text)?;
-            if finite {
-                z3.send(&few_in_flight(v))?;
-            }
-            let mut clauses = Vec::new();
-            for (clause_name, c) in goal {
-                z3.send(&format!("(push 1)\n(assert (not {c}))\n"))?;
-                if z3.check()?.0 != Sat::Unsat {
-                    clauses.push(clause_name.clone());
-                }
-                z3.send("(pop 1)\n")?;
-            }
-            Outcome::Fails { clauses, cti }
-        }
-    };
-    z3.send("(pop 1)\n")?;
-    Ok(Obligation {
-        name: name.to_string(),
-        took,
-        outcome,
-        possible,
-    })
-}
-
-/// At most two distinct dispatches or calls of each kind in flight before
-/// the move.
-fn few_in_flight(v: &Vocab<'_>) -> String {
-    let mut out = String::new();
-    for flight in v.flights() {
-        let k = flight.name;
-        let mut pend = format!("((as const (Array Msg/{k} Int)) 0)");
-        for i in 1..=2 {
-            out.push_str(&format!(
-                "(declare-const few.{k}.{i} Msg/{k})\n(declare-const few.{k}.{i}.n Int)\n(assert (>= few.{k}.{i}.n 0))\n"
-            ));
-            pend = format!("(store {pend} few.{k}.{i} few.{k}.{i}.n)");
-        }
-        out.push_str(&format!(
-            "(assert (= pre.pend.{k} {pend}))\n(assert (= pre.n.{k} (+ (ite (= few.{k}.1 few.{k}.2) 0 few.{k}.1.n) few.{k}.2.n)))\n"
-        ));
-    }
-    out
-}
-
-/// The terms a counterexample shows: the records' statuses, the variables
-/// the clauses read, and the dispatches in flight, before and after.
-fn shown(v: &Vocab<'_>, before: &[(String, String)], after: &[(String, String)]) -> Vec<String> {
-    let text: String = before
-        .iter()
-        .chain(after)
-        .map(|(_, c)| c.as_str())
-        .collect();
-    let mut out = Vec::new();
-    for frame in ["pre", "post"] {
-        for (entity, vars) in &v.vars {
-            out.push(Enc::status(frame, entity));
-            for var in vars.keys() {
-                let name = Enc::var(frame, entity, var);
-                let pre = Enc::var("pre", entity, var);
-                let post = Enc::var("post", entity, var);
-                if text.contains(&format!("{pre} "))
-                    || text.contains(&format!("{pre})"))
-                    || text.contains(&format!("{post} "))
-                    || text.contains(&format!("{post})"))
-                {
-                    out.push(name);
-                }
-            }
-        }
-        for flight in v.flights() {
-            out.push(format!("{frame}.pend.{}", flight.name));
-        }
-    }
-    out.extend(v.literals.iter().map(|l| Enc::lit(l)));
-    out
 }
 
 /// The string literals a lemma names, as `|'x'|`.
