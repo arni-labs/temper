@@ -213,6 +213,12 @@ opt-level = 1
 [profile.dev.package.sha2]
 opt-level = 1
 
+# Turso's engine runs every store test's SQL. Unoptimized, its row loops set
+# those tests' pace: on CI a 50 ms change log DELETE removed 190 to 255 rows,
+# so the long-log test's time depended on the runner, not on the trim.
+[profile.dev.package.turso_core]
+opt-level = 1
+
 [profile.release]
 lto = true
 codegen-units = 1
