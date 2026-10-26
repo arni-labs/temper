@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
-use temper_spec::automaton::{ActionKind, ActionTrigger, TargetResolver};
+use temper_spec::automaton::{ActionKind, ActionTrigger, TargetResolver, call_may_answer};
 use temper_spec::predicate::Effect;
 
 use super::vocab::{Vocab, scheduled};
@@ -125,11 +125,11 @@ impl Vocab<'_> {
             out.push(Asker::Outside);
         }
         let answered = automaton.actions.iter().any(|a| {
-            (a.name == action && a.kind == ActionKind::Internal)
-                || a.triggers.iter().any(|t| {
-                    t.on_success.as_deref() == Some(action)
-                        || t.on_failure.as_deref() == Some(action)
-                })
+            a.triggers.iter().any(|t| {
+                t.callee().is_some()
+                    && (call_may_answer(t.on_success.as_deref(), action)
+                        || t.on_failure.as_deref() == Some(action))
+            })
         });
         if answered {
             out.push(runtime());

@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::{
-    Action, ActionConstraint, ActionKind, ActionParam, ActionTrigger, Automaton, TriggerKind,
-    VarType,
+    Action, ActionConstraint, ActionParam, ActionTrigger, Automaton, TriggerKind, VarType,
+    call_may_answer,
 };
 use temper_spec::predicate::{Arg, Effect, Literal};
 
@@ -308,12 +308,12 @@ impl<'a> Vocab<'a> {
         for to in &self.scope {
             for action in &self.automaton(to).actions {
                 for trigger in &action.triggers {
-                    let (TriggerKind::Wasm, Some(module)) = (&trigger.kind, &trigger.module) else {
+                    let Some(module) = trigger.callee() else {
                         continue;
                     };
                     let same = calls.iter().any(|c| {
                         &c.to == to
-                            && &c.module == module
+                            && c.module == module
                             && c.on_success == trigger.on_success
                             && c.on_failure == trigger.on_failure
                     });
@@ -322,7 +322,7 @@ impl<'a> Vocab<'a> {
                     }
                     let taken = calls
                         .iter()
-                        .filter(|c| &c.to == to && &c.module == module)
+                        .filter(|c| &c.to == to && c.module == module)
                         .count();
                     let name = match taken {
                         0 => format!("{to}@{module}"),
@@ -331,7 +331,7 @@ impl<'a> Vocab<'a> {
                     let mut call = Call {
                         name,
                         to: to.clone(),
-                        module: module.clone(),
+                        module: module.to_string(),
                         on_success: trigger.on_success.clone(),
                         on_failure: trigger.on_failure.clone(),
                         asked: Vec::new(),
@@ -357,28 +357,22 @@ impl<'a> Vocab<'a> {
 
     /// The call kind `trigger` on one of `entity`'s actions starts.
     pub(super) fn call_of(&self, entity: &str, trigger: &ActionTrigger) -> Option<&Call> {
-        let module = trigger
-            .module
-            .as_ref()
-            .filter(|_| trigger.kind == TriggerKind::Wasm)?;
+        let module = trigger.callee()?;
         self.calls.iter().find(|c| {
             c.to == entity
-                && &c.module == module
+                && c.module == module
                 && c.on_success == trigger.on_success
                 && c.on_failure == trigger.on_failure
         })
     }
 
-    /// The actions a call may be answered with: its declared answer, or
-    /// else any internal action of its record.
+    /// The actions the kernel takes as a call's answer: its declared
+    /// answer, or else any action of its record (`call_may_answer`).
     pub(super) fn answer_actions(&self, call: &Call) -> Vec<&'a Action> {
         self.automaton(&call.to)
             .actions
             .iter()
-            .filter(|a| match &call.on_success {
-                Some(name) => &a.name == name,
-                None => a.kind == ActionKind::Internal,
-            })
+            .filter(|a| call_may_answer(call.on_success.as_deref(), &a.name))
             .collect()
     }
 

@@ -46,11 +46,13 @@
 //! that does not fit in the memory its [`Room`] gives it says so and is
 //! never a pass.
 //!
-//! Nor is a walk that checked nothing. A module whose trigger names no
-//! `on_success` may answer with any action its result names, and the model
-//! answers only with internal ones: when such a call is open and its record
-//! could take an action nothing in the model sends, the walk never goes
-//! where that answer leads, and says so instead of passing. A rule written
+//! A call's answer is what the kernel dispatches: its trigger's `on_success`
+//! when it names one, and otherwise any action of its record that the call's
+//! result names
+//! ([`call_may_answer`](temper_spec::automaton::call_may_answer)). The walk
+//! takes each of them.
+//!
+//! Nor is a walk that checked nothing a pass. A rule written
 //! `premise => conclusion` whose premise no walked state meets (no settled
 //! one, for an invariant) holds without being tested, and proves nothing.
 //!
@@ -382,3 +384,7 @@ mod vacuous_tests;
 #[cfg(test)]
 #[path = "outside_test.rs"]
 mod outside_tests;
+
+#[cfg(test)]
+#[path = "answers_test.rs"]
+mod answers_tests;

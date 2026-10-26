@@ -1,5 +1,6 @@
 //! A pass that checked nothing is not a pass: a rule whose premise no walked
-//! state meets, and a walk that never takes an answer a module may give.
+//! state meets proves nothing. A premise only a module's answer reaches is
+//! met, since the walk takes every answer the kernel takes.
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
@@ -93,15 +94,15 @@ fn invariant(done_kind: &str, assert: &str) -> JointInvariantResult {
 }
 
 #[test]
-fn a_liveness_pass_that_never_takes_a_module_answer_is_not_checked() {
+fn a_liveness_rule_a_module_answer_strands_never_settles() {
     // The module may answer Done, and nothing then leads to Gone: the
-    // runtime gets stuck. The walk never takes Done, so it never meets the
-    // premise.
+    // runtime gets stuck. The walk takes Done as the kernel does.
     let result = liveness("input", false, "status == 'Done' => status == 'Gone'");
     let text = result.to_string();
-    assert!(!result.holds(), "{text}");
-    assert!(text.contains("NOT CHECKED"), "{text}");
-    assert!(text.contains("Ask.Done (from Asked)"), "{text}");
+    assert!(
+        matches!(result.outcome, LivenessOutcome::Stuck { .. }),
+        "{text}"
+    );
 }
 
 #[test]
@@ -114,14 +115,19 @@ fn a_liveness_premise_no_walked_state_meets_proves_nothing() {
 }
 
 #[test]
-fn an_invariant_that_holds_without_a_module_answer_is_not_checked() {
+fn an_invariant_a_module_answer_breaks_is_broken() {
     // Once the module answers Done, the box is still Empty: the runtime
-    // breaks the rule. The walk never takes Done.
+    // breaks the rule, and so does the walk.
     let result = invariant("input", "status == 'Done' => Box[Id].status == 'Full'");
     let text = result.to_string();
-    assert!(!result.holds(), "{text}");
-    assert!(text.contains("NOT CHECKED"), "{text}");
-    assert!(text.contains("Ask.Done (from Asked)"), "{text}");
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{text}"
+    );
+    assert!(
+        text.contains("Ask.Done -> Done (answer from asker"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -130,17 +136,6 @@ fn an_invariant_premise_no_settled_state_meets_proves_nothing() {
     let text = result.to_string();
     assert!(!result.holds(), "{text}");
     assert!(text.contains("PROVES NOTHING"), "{text}");
-}
-
-#[test]
-fn a_stuck_verdict_names_the_answers_the_walk_never_takes() {
-    let result = liveness("input", false, "status == 'Asked' => status == 'Done'");
-    let text = result.to_string();
-    assert!(
-        matches!(result.outcome, LivenessOutcome::Stuck { .. }),
-        "{text}"
-    );
-    assert!(text.contains("Ask.Done (from Asked)"), "{text}");
 }
 
 #[test]

@@ -37,9 +37,7 @@
 //! its own, is kept as a sequence number: the newest, or behind it
 //! (`model/order.rs`).
 //!
-//! A pass that checked nothing is not one. Where a module may answer with an
-//! action the walk never takes, the property is not checked; a stuck verdict
-//! names those answers, since one may be the way out. And a condition written
+//! A pass that checked nothing is not one: a condition written
 //! `premise => conclusion` whose premise no walked state meets proves nothing.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -75,9 +73,6 @@ pub struct JointLivenessResult {
     /// Settles, stuck (with a shortest path to a state it cannot leave),
     /// proves nothing, or not fully checked.
     pub outcome: LivenessOutcome,
-    /// The answers a module may give that the walk never takes, each as
-    /// `Entity.Action (from Status, ...)`.
-    pub unwalked: Vec<String>,
 }
 
 impl JointLivenessResult {
@@ -174,13 +169,6 @@ impl fmt::Display for JointLivenessResult {
                     self.eventually,
                     cases.len()
                 )?;
-                if !self.unwalked.is_empty() {
-                    writeln!(
-                        f,
-                        "  Some of them may not be stuck in the runtime: {}.",
-                        model::unwalked_reason(&self.unwalked)
-                    )?;
-                }
                 for (number, case) in cases.iter().enumerate() {
                     writeln!(
                         f,
@@ -237,7 +225,6 @@ impl LivenessProof {
             states: 0,
             in_flight_bound: None,
             outcome: LivenessOutcome::Holds,
-            unwalked: Vec::new(),
         };
         let model = match &self.model {
             Ok(model) => model,
@@ -251,7 +238,6 @@ impl LivenessProof {
         let mut explored = model.walk_with(bound, true, |_, _| false);
         result.states = explored.len();
         result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
-        result.unwalked = explored.unwalked();
         let settling = settle_bytes(&explored);
         result.outcome = match &explored.stopped {
             Some(reason) => LivenessOutcome::Incomplete {
@@ -259,11 +245,6 @@ impl LivenessProof {
             },
             None => match explored.held.add(settling) {
                 Ok(()) => match settle(model, &self.entity, &self.goal, &explored) {
-                    (LivenessOutcome::Holds, _) if !result.unwalked.is_empty() => {
-                        LivenessOutcome::Incomplete {
-                            reason: model::unwalked_reason(&result.unwalked),
-                        }
-                    }
                     (LivenessOutcome::Holds, false) => LivenessOutcome::Vacuous {
                         premise: super::premise(&self.goal)
                             .map(ToString::to_string)

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::TargetResolver;
+use temper_spec::automaton::{TargetResolver, call_may_answer};
 use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
@@ -41,15 +41,12 @@ impl JointModel {
         } else {
             vec![RUNTIME]
         };
-        let internal = self.kernel.internal.get(source);
         let asked: Vec<BTreeSet<String>> = specs
             .iter()
             .map(|spec| {
-                self.unchecked
-                    .asked(source, |action| match &spec.on_success {
-                        Some(name) => name == action,
-                        None => internal.is_some_and(|names| names.contains(action)),
-                    })
+                self.unchecked.asked(source, |action| {
+                    call_may_answer(spec.on_success.as_deref(), action)
+                })
             })
             .collect();
         let mut started = Vec::new();
@@ -78,10 +75,10 @@ impl JointModel {
         started
     }
 
-    /// The answers a module may give the call `call`: its trigger's
-    /// `on_success`, or else any internal action of its record. The module
-    /// itself is not modelled: it may give each of these answers, and gives
-    /// each it keeps being able to give at some point.
+    /// The answers the kernel takes for the call `call`: its trigger's
+    /// `on_success`, or else any action of its record (`call_may_answer`).
+    /// The module itself is not modelled: it may give each of these
+    /// answers, and gives each it keeps being able to give at some point.
     pub(super) fn answers(
         &self,
         state: &JointState,
@@ -92,15 +89,9 @@ impl JointModel {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            let answers = match &call.on_success {
-                Some(name) => &t.name == name,
-                None => self
-                    .kernel
-                    .internal
-                    .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name)),
-            };
-            if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
+            if !call_may_answer(call.on_success.as_deref(), &t.name)
+                || !self.enabled(&call.to, t, state, Blind::Nothing)
+            {
                 continue;
             }
             let mut seen = BTreeSet::new();

@@ -625,7 +625,7 @@ on_failure = "RefreshFailed"
 config = { method = "POST", url = "https://oauth2.googleapis.com/token" }
 ```
 
-`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition.
+`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition. Without `on_success`, the module's result may name any action of the entity, and the kernel dispatches it with no Cedar check, so the checker takes every action the entity can take there as a possible answer. Name `on_success` to keep the answer to one.
 
 ### Deployment-level webhooks
 

@@ -199,6 +199,17 @@ impl ActionTrigger {
         Some(statuses.into_iter().map(str::to_string).collect())
     }
 
+    /// What the call this trigger starts goes to: its WASM module, or its
+    /// adapter. The kernel dispatches the call's answer back on the record
+    /// (see [`call_may_answer`]). None for a kind that starts no call.
+    pub fn callee(&self) -> Option<&str> {
+        match self.kind {
+            TriggerKind::Wasm => self.module.as_deref(),
+            TriggerKind::Adapter => self.adapter.as_deref(),
+            TriggerKind::Entity | TriggerKind::Hook | TriggerKind::Webhook => None,
+        }
+    }
+
     /// Keys this trigger sets that its kind does not read.
     pub(crate) fn foreign_keys(&self) -> Vec<&'static str> {
         use TriggerKind::*;
@@ -248,6 +259,15 @@ impl ActionTrigger {
         }
         foreign
     }
+}
+
+/// Whether a call whose trigger declares `on_success` may answer with
+/// `action` of its record. The kernel dispatches the trigger's `on_success`
+/// when it names one, and otherwise whatever action of the record the call's
+/// result names, of any kind. Cedar decides neither; only the record's own
+/// guards do.
+pub fn call_may_answer(on_success: Option<&str>, action: &str) -> bool {
+    on_success.is_none_or(|name| name == action)
 }
 
 /// The parameters `args` pass, read against an entity: a literal is its JSON

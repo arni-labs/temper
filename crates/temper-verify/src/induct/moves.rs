@@ -8,8 +8,8 @@
 //!   any parameters: the child may be of another id than the scope's;
 //! - a dispatch in flight arriving, or a scheduled action firing: its
 //!   record takes it, sending what that sets off, or refuses it;
-//! - a module call in flight answered, with the trigger's declared answer
-//!   or else any internal action of its record, its parameters tied to a
+//! - a call in flight answered, with the trigger's declared answer or else
+//!   any action of its record, as the kernel takes it, its parameters tied to a
 //!   field carrying the field as the call found it and the others any
 //!   value; or failing, which fires the trigger's `on_failure` with no
 //!   parameters; or ending unanswered (refused, or lost in a restart).

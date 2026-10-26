@@ -1,13 +1,13 @@
 //! What the joint model reads once from the specs: each type's model with
 //! the strings it must track, the reactions between the types in scope and
 //! those into them from outside, the module calls their actions start, their
-//! internal actions and state timers, and the constraints it does not check.
+//! state timers, and the constraints it does not check.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::Asker;
 use temper_spec::automaton::{
-    ActionConstraint, ActionKind, Automaton, TargetResolver, TriggerKind,
+    ActionConstraint, Automaton, TargetResolver, TriggerKind, call_may_answer,
 };
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, VarKind};
 
@@ -99,7 +99,7 @@ pub(super) fn tracked(
     }
 }
 
-/// A module call an action's trigger starts.
+/// A call an action's trigger starts, to a WASM module or an adapter.
 #[derive(Debug, Clone)]
 pub(super) struct CallSpec {
     pub(super) module: String,
@@ -120,30 +120,23 @@ pub(in crate::composite::joint) struct Timeout {
 pub(super) struct Kernel {
     /// Each entity's state timers.
     pub(super) timers: BTreeMap<String, Vec<Timeout>>,
-    /// The module calls each (entity, action) starts.
+    /// The calls each (entity, action) starts.
     pub(super) calls_on: BTreeMap<(String, String), Vec<CallSpec>>,
-    /// Each entity's internal actions: what a module whose trigger declares
-    /// no `on_success` may answer with.
-    pub(super) internal: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Kernel {
     /// Whether the kernel sends `entity`'s `action` with parameters of its
-    /// own choosing or none: a module's answer or failure, or a timer.
+    /// own choosing or none: a call's answer or failure, or a timer.
     pub(super) fn chooses(&self, entity: &str, action: &str) -> bool {
-        let named = |name: &Option<String>| name.as_deref() == Some(action);
-        self.internal
+        self.timers
             .get(entity)
-            .is_some_and(|names| names.contains(action))
-            || self
-                .timers
-                .get(entity)
-                .is_some_and(|timers| timers.iter().any(|t| t.action == action))
+            .is_some_and(|timers| timers.iter().any(|t| t.action == action))
             || self.calls_on.iter().any(|((e, _), specs)| {
                 e == entity
-                    && specs
-                        .iter()
-                        .any(|spec| named(&spec.on_success) || named(&spec.on_failure))
+                    && specs.iter().any(|spec| {
+                        call_may_answer(spec.on_success.as_deref(), action)
+                            || spec.on_failure.as_deref() == Some(action)
+                    })
             })
     }
 
@@ -154,7 +147,7 @@ impl Kernel {
             let automaton = by_name[entity.as_str()];
             for action in &automaton.actions {
                 for trigger in &action.triggers {
-                    let (TriggerKind::Wasm, Some(module)) = (&trigger.kind, &trigger.module) else {
+                    let Some(module) = trigger.callee() else {
                         continue;
                     };
                     kernel
@@ -162,21 +155,12 @@ impl Kernel {
                         .entry((entity.clone(), action.name.clone()))
                         .or_default()
                         .push(CallSpec {
-                            module: module.clone(),
+                            module: module.to_string(),
                             on_success: trigger.on_success.clone(),
                             on_failure: trigger.on_failure.clone(),
                         });
                 }
             }
-            kernel.internal.insert(
-                entity.clone(),
-                automaton
-                    .actions
-                    .iter()
-                    .filter(|a| a.kind == ActionKind::Internal)
-                    .map(|a| a.name.clone())
-                    .collect(),
-            );
             kernel.timers.insert(
                 entity.clone(),
                 automaton
