@@ -38,7 +38,7 @@ name = "TakeUmbrella"
 kind = "input"
 from = ["Asked"]
 to = "Wet"
-params = [{ name = "rain", type = "uint64" }]
+params = [{ name = "rain", type = "int" }]
 guard = "params.rain >= 50"
 hint = "Rain is likely."
 
@@ -47,7 +47,7 @@ name = "LeaveUmbrella"
 kind = "input"
 from = ["Asked"]
 to = "Dry"
-params = [{ name = "rain", type = "uint64" }]
+params = [{ name = "rain", type = "int" }]
 hint = "Rain is unlikely."
 "#;
 
