@@ -34,6 +34,7 @@ mod trim;
 use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::Remote;
+pub(crate) use trim::Writers as TrimWriters;
 
 /// Whether writes to the file can be confirmed against its remote copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,8 +95,11 @@ struct Inner {
     timeouts: AtomicU32,
     /// Whether the remote may hold a push the engine never heard back from.
     unsure: AtomicBool,
-    /// Rows the next trim batch deletes, sized by how long the last one took.
-    trim_batch: AtomicI64,
+    /// What the next trim batch deletes, planned from what the last one cost.
+    trim_plan: std::sync::Mutex<trim::Plan>,
+    /// Time added to every trim batch (see `simulate_slow_trim`).
+    #[cfg(feature = "test-support")]
+    simulated_trim: std::sync::Mutex<trim::SimulatedTrim>,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -200,7 +204,9 @@ impl SyncCopy {
                 state: std::sync::Mutex::new(state),
                 timeouts: AtomicU32::new(0),
                 unsure: AtomicBool::new(true),
-                trim_batch: AtomicI64::new(trim::FIRST_BATCH_ROWS),
+                trim_plan: std::sync::Mutex::new(trim::FIRST_PLAN),
+                #[cfg(feature = "test-support")]
+                simulated_trim: std::sync::Mutex::new(trim::SimulatedTrim::default()),
             }),
         };
         // Change numbers follow commit order only with one writer at a time

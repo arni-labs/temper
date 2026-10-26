@@ -81,7 +81,7 @@ pub async fn run(
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
     // Phase 1: Storage backend
-    let (pg_pool, storage_stack, turso_sync_copy) =
+    let (pg_pool, storage_stack, turso_synced_store) =
         bootstrap::init_storage(storage.clone(), storage_explicit).await?;
 
     // Phase 2: Registry (restore + disk apps)
@@ -250,7 +250,7 @@ pub async fn run(
 
     // Phase 9: Bind, start background tasks, serve
     let router =
-        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_sync_copy);
+        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_synced_store);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
         .with_context(|| format!("Failed to bind to {bind}:{port}"))?;
