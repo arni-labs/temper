@@ -2,15 +2,16 @@
 //!
 //! A timer writes its row when it is armed and removes it when it ends, so the
 //! rows are the timers still waiting. At boot [`ServerState::rearm_state_timers`]
-//! reads each tenant's rows once, without loading any entity, and arms every
-//! timer again from when its state's clock started: for the rest of its budget,
+//! reads each tenant's rows, retrying failed listings, without loading any
+//! entity, and arms every timer again from when its state's clock started:
+//! for the rest of its budget,
 //! or at once if it fell due while the server was down. It fires once, as the
 //! identity that armed it; ticks missed while the server was down are not
 //! replayed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use temper_runtime::persistence::StateTimerRecord;
@@ -113,11 +114,20 @@ impl ServerState {
             let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
                 continue;
             };
-            let rows = match store.list_state_timers(tenant.as_str()).await {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::error!(tenant = %tenant, %error, "state timer rows not readable; timers not re-armed");
-                    continue;
+            // A failed listing does not mean there are no saved rows. Restore
+            // their callers before either repaired records or the rowless walk
+            // can reconcile timers and overwrite a saved identity.
+            let mut wait = Duration::from_secs(1);
+            let rows = loop {
+                match store.list_state_timers(tenant.as_str()).await {
+                    Ok(rows) => break rows,
+                    Err(error) => {
+                        tracing::error!(tenant = %tenant, %error,
+                            retry_in_secs = wait.as_secs(),
+                            "state timer rows not readable; boot recovery waits for saved callers");
+                        tokio::time::sleep(wait).await; // determinism-ok: boot retry on runtime clock
+                        wait = (wait * 2).min(Duration::from_secs(60));
+                    }
                 }
             };
             let now = sim_now();

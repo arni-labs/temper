@@ -16,6 +16,7 @@ use temper_server::storage::StateTimerStore;
 pub(crate) struct SimTimerRows {
     rows: Mutex<BTreeMap<(String, String, String), StateTimerRecord>>,
     rng: Mutex<DeterministicRng>,
+    listing_failures: Mutex<BTreeMap<String, usize>>,
     /// A write takes fewer scheduler turns than this to land.
     round_trip_turns: usize,
 }
@@ -32,8 +33,27 @@ impl SimTimerRows {
         Self {
             rows: Mutex::new(BTreeMap::new()),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x7177_e125)),
+            listing_failures: Mutex::new(BTreeMap::new()),
             round_trip_turns: turns,
         }
+    }
+
+    /// Fail the next `count` boot listings for one tenant.
+    pub(crate) fn fail_listings(&self, tenant: &str, count: usize) {
+        self.listing_failures
+            .lock()
+            .unwrap()
+            .insert(tenant.to_string(), count);
+    }
+
+    /// How many injected listing failures this tenant has yet to encounter.
+    pub(crate) fn remaining_listing_failures(&self, tenant: &str) -> usize {
+        self.listing_failures
+            .lock()
+            .unwrap()
+            .get(tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The record's row now.
@@ -95,6 +115,19 @@ impl StateTimerStore for SimTimerRows {
         &self,
         tenant: &str,
     ) -> Result<Vec<StateTimerRecord>, PersistenceError> {
+        let fail = {
+            let mut failures = self.listing_failures.lock().unwrap();
+            let remaining = failures.entry(tenant.to_string()).or_default();
+            let fail = *remaining > 0;
+            *remaining = remaining.saturating_sub(1);
+            fail
+        };
+        if fail {
+            self.round_trip().await;
+            return Err(PersistenceError::Storage(
+                "injected timer listing failure".to_string(),
+            ));
+        }
         let rows = self.rows.lock().unwrap();
         Ok(rows
             .values()
