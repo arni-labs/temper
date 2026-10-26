@@ -111,3 +111,54 @@ fn a_general_move_that_breaks_the_rule_is_checked_way_by_way() {
         "{checked:?}"
     );
 }
+
+/// A job that, as it starts, calls two modules, either of which may answer
+/// that it finished. A call that fails fires nothing.
+const CALLS: &str = r#"
+[automaton]
+name = "Job"
+states = ["Idle", "Running", "Done"]
+initial = "Idle"
+
+[[state]]
+name = "started"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+effect = ["started = true"]
+
+[[action.triggers]]
+name = "first"
+kind = "wasm"
+module = "one"
+on_success = "Finish"
+
+[[action.triggers]]
+name = "second"
+kind = "wasm"
+module = "two"
+on_success = "Finish"
+
+[[action]]
+name = "Finish"
+kind = "internal"
+from = ["Running"]
+to = "Done"
+
+[[invariant]]
+name = "DoneWasStarted"
+assert = "status == 'Done' => started == true"
+"#;
+
+#[test]
+fn each_move_that_takes_no_action_is_checked() {
+    let checked = proved(CALLS);
+    for way in ["Job@one fails", "Job@two fails"] {
+        assert!(checked.contains(&way.to_string()), "{checked:?}");
+    }
+}
