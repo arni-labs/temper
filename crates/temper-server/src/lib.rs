@@ -56,6 +56,7 @@ pub mod trigger;
 pub mod vector_index;
 pub mod wasm_registry;
 pub mod webhooks;
+pub mod write_health;
 
 // Reads RSS from procfs, which only Linux has.
 #[cfg(all(test, target_os = "linux"))]

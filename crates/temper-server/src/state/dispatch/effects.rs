@@ -699,6 +699,7 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -737,6 +738,7 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            store_unavailable: false,
                         };
                     }
                 }

@@ -31,6 +31,7 @@ fn make_response(status: &str) -> EntityResponse {
         spawn_requests: vec![],
         spec_governed: true,
         refused: false,
+        store_unavailable: false,
     }
 }
 

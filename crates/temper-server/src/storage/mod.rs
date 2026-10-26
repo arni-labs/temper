@@ -50,11 +50,13 @@ mod query_plane_router_impls;
 mod redaction;
 mod state_timers;
 mod trajectory_row;
+mod write_room;
 pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
 pub use state_timers::{MetadataTimerRows, StateTimerStore};
+pub use write_room::{STORAGE_FLOOR_BYTES, StorageRoom, WriteHealth};
 mod query_plane;
 pub use query_plane::{
     CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
@@ -505,11 +507,15 @@ where
 /// Cloneable boxed event store handle.
 ///
 /// Every event the server journals is appended through this handle, so it is
-/// where the per-event size limits hold (`with_event_size_limits`).
+/// where the per-event size limits hold (`with_event_size_limits`), where a
+/// disk under the floor refuses appends (`with_storage_room`), and where every
+/// append's outcome is kept for `/healthz` (`write_health`).
 #[derive(Clone)]
 pub struct BoxedEventStore {
     store: Arc<dyn DynEventStore>,
     limits: EventSizeLimits,
+    room: Option<StorageRoom>,
+    health: write_room::HealthCell,
 }
 
 impl BoxedEventStore {
@@ -527,6 +533,8 @@ impl BoxedEventStore {
         Self {
             store,
             limits: EventSizeLimits::default(),
+            room: None,
+            health: write_room::HealthCell::default(),
         }
     }
 
@@ -541,9 +549,12 @@ impl BoxedEventStore {
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
-        self.store
+        self.check_room()?;
+        let result = self
+            .store
             .append(persistence_id, expected_sequence, events)
-            .await
+            .await;
+        self.record_append(result)
     }
 
     pub async fn append_batch(
@@ -556,7 +567,9 @@ impl BoxedEventStore {
                 .iter()
                 .map(|event| (append.persistence_id.as_str(), event))
         }))?;
-        self.store.append_batch(appends).await
+        self.check_room()?;
+        let result = self.store.append_batch(appends).await;
+        self.record_append(result)
     }
 
     pub async fn read_events(
@@ -575,9 +588,12 @@ impl BoxedEventStore {
         key_rows: &[temper_runtime::persistence::EntityKeyRow],
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
-        self.store
+        self.check_room()?;
+        let result = self
+            .store
             .append_with_keys(persistence_id, expected_sequence, events, key_rows)
-            .await
+            .await;
+        self.record_append(result)
     }
 
     pub async fn append_with_rows(
@@ -588,9 +604,12 @@ impl BoxedEventStore {
         rows: temper_runtime::persistence::CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
-        self.store
+        self.check_room()?;
+        let result = self
+            .store
             .append_with_rows(persistence_id, expected_sequence, events, rows)
-            .await
+            .await;
+        self.record_append(result)
     }
 
     /// Every pending scheduled action of `tenant`, kept with its journal.
@@ -1408,6 +1427,15 @@ impl StorageStack {
             );
         }
         self.events = self.events.with_event_size_limits(limits);
+        self
+    }
+
+    /// Refuse appends while the disk holding `room` has less than
+    /// [`STORAGE_FLOOR_BYTES`] available (`BoxedEventStore::with_storage_room`).
+    pub fn with_storage_room(mut self, room: StorageRoom) -> Self {
+        tracing::info!(dir = %room.dir().display(), floor_bytes = STORAGE_FLOOR_BYTES,
+            "appends refused while this disk has less room than the floor");
+        self.events = self.events.with_storage_room(room);
         self
     }
 
