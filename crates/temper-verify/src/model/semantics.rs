@@ -6,16 +6,23 @@ use temper_spec::predicate::{
     Arg, Env, Expr, Literal, Operand, ParamKind, Set, Truth, Val, VarKind, eval,
 };
 
-use super::types::{ModelEffect, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
+use super::types::{
+    ModelEffect, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
+};
+
+pub(crate) use super::expansion::Expansion;
+use super::strings::string_assignments;
+pub use super::strings::{apply_string_params, canonical_strings, string_values};
 
 /// Parameter assignments explored per step for one transition, at most
-/// (TigerStyle budget: `successors` materializes every assignment).
+/// (numeric/list parameters; joint string products also consume expansion work).
 pub const MAX_PARAM_ASSIGNMENTS: usize = 4096;
 
-/// A model state as a predicate environment. Status, counters, booleans and
-/// lists are modeled; declared counters, booleans and lists missing from the
-/// state read as their zero value. String and numeric variables, entity
-/// fields and related-entity statuses are not modeled and read as unknown.
+/// A model state as a predicate environment. Status, counters, booleans,
+/// lists and tracked strings are modeled; declared counters, booleans and
+/// lists missing from the state read as their zero value. Untracked string
+/// and numeric variables, entity fields and related entities are not modeled
+/// and read as unknown.
 pub struct ModelEnv<'a> {
     /// Declared state variable types.
     pub kinds: &'a BTreeMap<String, VarKind>,
@@ -41,7 +48,12 @@ impl Env for ModelEnv<'_> {
                 .lists
                 .get(name)
                 .map_or(Val::Strs(&[]), |items| Val::Strs(items)),
-            Some(VarKind::Str | VarKind::Num) | None => Val::Unknown,
+            Some(VarKind::Str) => self
+                .state
+                .strings
+                .get(name)
+                .map_or(Val::Unknown, |value| value.val()),
+            Some(VarKind::Num) | None => Val::Unknown,
         }
     }
 
@@ -97,18 +109,76 @@ pub fn successors(
     t: &ResolvedTransition,
     state: &TemperModelState,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    successors_among(model, t, state, &string_values(std::iter::once(state)))
+}
+
+/// [`successors`], with `values` the tracked strings in scope: the state's
+/// own, or every entity's in a joint state. A string parameter may take any
+/// of them (a value copied from somewhere), `''`, a literal the spec
+/// compares its variable with, or one value new to the scope, as far as the
+/// action's constraints allow.
+pub fn successors_among(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<ModelString>,
+) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    successors_budgeted(model, t, state, values, &Expansion::for_model(model))
+}
+
+pub(crate) fn successors_budgeted(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<ModelString>,
+    budget: &Expansion,
+) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
+    let strings = string_assignments(model, t, state, values, budget);
     for params in param_assignments(model, t) {
-        let mut next = state.clone();
-        if let Some(to) = &t.to_state {
-            next.status = to.clone();
-        }
-        apply_effects(&t.effects, &mut next, &t.name, &params);
-        if within_bounds(model, state, &next) {
-            out.push((params, next));
+        for chosen in &strings {
+            if !budget.take() {
+                return out;
+            }
+            let mut params = params.clone();
+            params.extend(
+                chosen
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ParamValue::Str(v.clone()))),
+            );
+            let mut next = state.clone();
+            if let Some(to) = &t.to_state {
+                next.status = to.clone();
+            }
+            apply_effects(&t.effects, &mut next, &t.name, &params);
+            apply_string_params(&t.string_params, &mut next, &params);
+            canonical_strings(&mut [&mut next.strings]);
+            if within_bounds(model, state, &next) {
+                out.push((params, next));
+            }
         }
     }
     out
+}
+
+/// `state` after the transition named `name` with `params`, with no
+/// renumbering of new strings (the caller renumbers, over one entity or a
+/// joint state). `None` when the model has no such transition.
+pub fn step(
+    model: &TemperModel,
+    name: &str,
+    target_state: Option<&str>,
+    state: &TemperModelState,
+    params: &BTreeMap<String, ParamValue>,
+) -> Option<TemperModelState> {
+    let resolved = model.transitions.iter().find(|t| t.name == name)?;
+    let mut next = state.clone();
+    if let Some(to) = target_state {
+        next.status = to.to_string();
+    }
+    apply_effects(&resolved.effects, &mut next, name, params);
+    apply_string_params(&resolved.string_params, &mut next, params);
+    Some(next)
 }
 
 /// The transition with more parameter assignments than one step explores
@@ -155,7 +225,7 @@ fn param_candidates(
         ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
         ParamKind::Str => string_literals(model, t, name)
             .into_iter()
-            .map(ParamValue::Str)
+            .map(|s| ParamValue::Str(s.into()))
             .chain(std::iter::once(ParamValue::Fresh))
             .collect(),
     }
@@ -277,7 +347,7 @@ pub fn apply_effects(
                 let element = match value {
                     Arg::Lit(Literal::Str(text)) => text.clone(),
                     Arg::Param(name) => match params.get(name) {
-                        Some(ParamValue::Str(text)) => text.clone(),
+                        Some(ParamValue::Str(ModelString::Literal(text))) => text.clone(),
                         _ => format!("{action_name}#{}", entry.len() + 1),
                     },
                     _ => format!("{action_name}#{}", entry.len() + 1),
@@ -321,89 +391,5 @@ pub fn collect_list_contains_pairs(expr: &Expr, pairs: &mut BTreeSet<(String, St
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn kinds() -> BTreeMap<String, VarKind> {
-        [
-            ("items", VarKind::Counter),
-            ("ready", VarKind::Bool),
-            ("tags", VarKind::List),
-            ("goal", VarKind::Str),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect()
-    }
-
-    fn state(status: &str) -> TemperModelState {
-        TemperModelState {
-            status: status.to_string(),
-            counters: BTreeMap::new(),
-            booleans: BTreeMap::new(),
-            lists: BTreeMap::new(),
-        }
-    }
-
-    fn g(source: &str) -> Expr {
-        temper_spec::predicate::parse(source).unwrap()
-    }
-
-    #[test]
-    fn declared_variables_missing_from_state_read_as_zero_values() {
-        let s = state("A");
-        let k = kinds();
-        assert!(evaluate_guard(&g("items == 0 && items < 3"), &k, &s));
-        assert!(evaluate_guard(&g("!ready && len(tags) == 0"), &k, &s));
-        assert!(!evaluate_guard(&g("items >= 2"), &k, &s));
-    }
-
-    #[test]
-    fn evaluates_modeled_state() {
-        let mut s = state("Draft");
-        s.counters.insert("items".into(), 2);
-        s.booleans.insert("ready".into(), true);
-        s.lists.insert("tags".into(), vec!["vip".into()]);
-        let k = kinds();
-        assert!(evaluate_guard(
-            &g("status == 'Draft' && items >= 2 && ready && 'vip' in tags"),
-            &k,
-            &s
-        ));
-        assert!(!evaluate_guard(&g("status in ['Closed']"), &k, &s));
-    }
-
-    #[test]
-    fn unmodeled_values_are_free_for_exploration_and_absent_for_enablement() {
-        let s = state("A");
-        let k = kinds();
-        for unknown in [
-            "P[p].status == 'Done'",
-            "goal != ''",
-            "!(P[p].status == 'Done')",
-        ] {
-            let guard = g(unknown);
-            assert!(guard_may_hold(&guard, &k, &s), "{unknown} may hold");
-            assert!(
-                !evaluate_guard(&guard, &k, &s),
-                "{unknown} is not guaranteed"
-            );
-        }
-        // A local condition that is false decides, whatever the unknown is.
-        let guard = g("items > 5 && P[p].status == 'Done'");
-        assert!(!guard_may_hold(&guard, &k, &s));
-        // A local condition that is true decides a disjunction.
-        let guard = g("items == 0 || P[p].status == 'Done'");
-        assert!(evaluate_guard(&guard, &k, &s));
-    }
-
-    #[test]
-    fn collects_list_membership_atoms_through_any_connective() {
-        let mut pairs = BTreeSet::new();
-        collect_list_contains_pairs(&g("!('a' in tags) || ready => 'b' in tags"), &mut pairs);
-        assert_eq!(
-            pairs.into_iter().collect::<Vec<_>>(),
-            vec![("tags".into(), "a".into()), ("tags".into(), "b".into())]
-        );
-    }
-}
+#[path = "semantics_test.rs"]
+mod tests;

@@ -45,6 +45,13 @@ use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
 };
 
+/// Routine walk recovery is quieter than hydration of a live actor.
+#[derive(Clone, Copy)]
+pub(super) enum ReplayLogging {
+    Actor,
+    Walk,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReplayPolicy {
     StrictSnapshot,
@@ -602,8 +609,19 @@ impl EntityActor {
         state: &mut EntityState,
         tenant: &str,
         blob_store: Option<&crate::blob_store::BlobStore>,
-        replay_policy: ReplayPolicy,
+        replay_options: (ReplayPolicy, ReplayLogging),
     ) -> Result<(), ActorError> {
+        let (replay_policy, logging) = replay_options;
+        // Keep failures visible for both callers; only successful replay
+        // diagnostics are reduced during a record walk.
+        macro_rules! replay_log {
+            ($($fields:tt)*) => {
+                match logging {
+                    ReplayLogging::Actor => tracing::info!($($fields)*),
+                    ReplayLogging::Walk => tracing::debug!($($fields)*),
+                }
+            };
+        }
         let replay_start = Instant::now(); // determinism-ok: wall-clock for production replay duration metric only
         let persistence_id = format!("{tenant}:{}:{}", state.entity_type, state.entity_id);
         let persistence_id = persistence_id.as_str();
@@ -616,7 +634,7 @@ impl EntityActor {
                     if Self::apply_snapshot_bytes(state, snapshot_seq, &snapshot_bytes) {
                         from_sequence = snapshot_seq;
                         loaded_snapshot = true;
-                        tracing::info!(
+                        replay_log!(
                             entity = %state.entity_id,
                             seq = snapshot_seq,
                             "loaded snapshot before replay"
@@ -940,7 +958,7 @@ impl EntityActor {
                             "snapshot tail exceeds bounded replay cap"
                         );
                     }
-                    tracing::info!(
+                    replay_log!(
                         entity = %state.entity_id,
                         snapshot_loaded = loaded_snapshot,
                         replayed = envelopes.len(),
@@ -954,7 +972,7 @@ impl EntityActor {
                         "state rebuilt from event journal via TransitionTable"
                     );
                 } else if loaded_snapshot {
-                    tracing::info!(
+                    replay_log!(
                         entity = %state.entity_id,
                         seq = state.sequence_nr,
                         total_events = state.total_event_count,
@@ -1008,7 +1026,33 @@ pub(crate) async fn recover_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictSnapshot,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
+    )
+    .await?;
+    Ok(state)
+}
+
+/// Replay for a record walk without emitting per-record info diagnostics.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recover_entity_state_for_walk(
+    tenant: &str,
+    entity_type: &str,
+    entity_id: &str,
+    table: &TransitionTable,
+    store: &BoxedEventStore,
+    backend: BackendLabel,
+    initial_fields: &serde_json::Value,
+    blob_store: Option<&crate::blob_store::BlobStore>,
+) -> Result<EntityState, ActorError> {
+    let mut state = EntityActor::build_initial_state(entity_type, entity_id, table, initial_fields);
+    EntityActor::replay_events(
+        table,
+        store,
+        backend,
+        &mut state,
+        tenant,
+        blob_store,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Walk),
     )
     .await?;
     Ok(state)
@@ -1039,7 +1083,7 @@ pub(crate) async fn recover_authoritative_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictFullJournal,
+        (ReplayPolicy::StrictFullJournal, ReplayLogging::Actor),
     )
     .await?;
     Ok(state)
@@ -1276,6 +1320,16 @@ impl Actor for EntityActor {
                     return Ok(());
                 }
 
+                // A state timer's fire applies only at the journal sequence
+                // its timer was armed at (`timer_fire`): past it, another
+                // writer handled this arming or the record moved on.
+                let timer_armed_seq =
+                    super::timer_fire::armed_seq(caller.as_deref(), &self.tenant, state, &name);
+                if let Some(error) = super::timer_fire::moved_past(timer_armed_seq, state) {
+                    ctx.reply(EntityResponse::refused(state.clone(), error));
+                    return Ok(());
+                }
+
                 // Captured BEFORE the action applies. The retry path (ADR-0046)
                 // updates these in lockstep with replay so postconditions hold
                 // across the race window.
@@ -1390,13 +1444,24 @@ impl Actor for EntityActor {
                                     outcome = tracing::field::Empty,
                                 );
 
-                                tracing::warn!(
-                                    parent: &retry_span,
-                                    entity = %state.entity_id,
-                                    action = %name,
-                                    actual_seq = actual,
-                                    "persist hit optimistic-concurrency violation; entering ADR-0046 retry"
-                                );
+                                if timer_armed_seq.is_some_and(|armed| actual > armed) {
+                                    // The replay below drops this fire.
+                                    tracing::info!(
+                                        parent: &retry_span,
+                                        entity = %state.entity_id,
+                                        action = %name,
+                                        actual_seq = actual,
+                                        "state timer fire found its record past its arming; replaying to drop it"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        parent: &retry_span,
+                                        entity = %state.entity_id,
+                                        action = %name,
+                                        actual_seq = actual,
+                                        "persist hit optimistic-concurrency violation; entering ADR-0046 retry"
+                                    );
+                                }
 
                                 // 2 retries + 1 initial = 3 total attempts (ADR-0046).
                                 const MAX_RETRIES: u32 = 2;
@@ -1429,7 +1494,7 @@ impl Actor for EntityActor {
                                         state,
                                         &self.tenant,
                                         self.blob_store.as_ref(),
-                                        ReplayPolicy::StrictSnapshot,
+                                        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
                                     )
                                     .await?;
 
@@ -1466,6 +1531,27 @@ impl Actor for EntityActor {
                                             Some(RetryGaveUp::WriteFailed(format!(
                                                 "action {name} may have been written: the journal holds its key after a concurrency violation"
                                             ))),
+                                        ));
+                                        break;
+                                    }
+
+                                    // A timer's fire is not evaluated again on
+                                    // a record that moved past its arming: the
+                                    // move was another writer's fire of the same
+                                    // arming, or a change the timer's next arm
+                                    // follows. With its key absent from the
+                                    // journal, this fire did not land.
+                                    if let Some(error) =
+                                        super::timer_fire::moved_past(timer_armed_seq, state)
+                                    {
+                                        let gave_up = if idempotency_key.is_some() {
+                                            RetryGaveUp::Refused(error)
+                                        } else {
+                                            RetryGaveUp::WriteFailed(error)
+                                        };
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::TimerSuperseded,
+                                            Some(gave_up),
                                         ));
                                         break;
                                     }
