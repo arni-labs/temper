@@ -436,3 +436,63 @@ fn a_reaction_forbidden_by_equal_cedar_sets_leaves_the_place_behind() {
         "{result}"
     );
 }
+
+#[test]
+fn oversized_parameter_expansion_is_incomplete() {
+    // Seven retained counters give 4^7 = 16,384 assignments (budget: 4,096).
+    let fields = (0..7)
+        .map(|i| format!("[[state]]\nname = 'c{i}'\ntype = 'counter'\ninitial = 0\n"))
+        .collect::<String>();
+    let params = (0..7)
+        .map(|i| format!("{{ name = 'p{i}', type = 'counter' }}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let effects = (0..7)
+        .map(|i| format!("'c{i} = params.p{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let goal = (0..7)
+        .map(|i| format!("c{i} == 0"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let source = format!(
+        "[automaton]\nname = 'Counter'\nstates = ['Ready']\ninitial = 'Ready'\n\n\
+         {fields}\n[[action]]\nname = 'Set'\nkind = 'input'\nfrom = ['Ready']\n\
+         to = 'Ready'\nparams = [{params}]\neffect = [{effects}]\n\n\
+         [[liveness]]\nname = 'zero'\neventually = \"{goal}\"\n"
+    );
+    let automaton = parse_automaton(&source).expect("fixture parses");
+    let results = verify_joint_liveness(
+        &[&automaton],
+        None,
+        Budget {
+            states: 100_000,
+            time: Duration::from_secs(5),
+        },
+    );
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    let LivenessOutcome::Incomplete { reason } = &result.outcome else {
+        panic!("expected parameter expansion to be incomplete: {result}");
+    };
+    assert!(
+        reason.contains("Counter.Set parameter expansion"),
+        "{result}"
+    );
+    assert_eq!(result.states, 0);
+    assert_eq!(result.in_flight_bound, None);
+
+    // The same action fits once slicing removes fields the goal does not read.
+    let sliced = source.replace(&goal, "status == 'Ready'");
+    let automaton = parse_automaton(&sliced).expect("fixture parses");
+    let results = verify_joint_liveness(
+        &[&automaton],
+        None,
+        Budget {
+            states: 100_000,
+            time: Duration::from_secs(5),
+        },
+    );
+    assert_eq!(results.len(), 1);
+    assert!(results[0].holds(), "{}", results[0]);
+}

@@ -110,6 +110,22 @@ impl JointModel {
             stopped: None,
             held_back: false,
         };
+        // Check the sliced models before either caller can expand a move.
+        let oversized: Vec<_> = self
+            .models
+            .iter()
+            .filter_map(|(entity, model)| {
+                crate::model::semantics::oversized_transition(model)
+                    .map(|(action, _)| format!("{entity}.{action} parameter expansion"))
+            })
+            .collect();
+        if !oversized.is_empty() {
+            explored.stopped = Some(format!(
+                "unsupported reads or expansion: {}",
+                oversized.join(", ")
+            ));
+            return explored;
+        }
         let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {
@@ -231,11 +247,6 @@ impl JointModel {
                     Name::Status => {}
                 }
             });
-        }
-        for (entity, model) in &self.models {
-            if let Some((action, _)) = crate::model::semantics::oversized_transition(model) {
-                unsupported.insert(format!("{entity}.{action} parameter expansion"));
-            }
         }
         if !unsupported.is_empty() {
             let reason = format!(
