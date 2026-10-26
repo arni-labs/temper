@@ -1,8 +1,12 @@
 # Authorization questions
 
-`POST /api/authorize` asks Cedar about offers without making a move. It never
-creates a PendingDecision, GovernanceDecision, or denial-pattern row, and never
-feeds the suggestion engine. A real refused dispatch still files its decision.
+`POST /api/authorize` asks Cedar about offers without making a move. A question
+writes nothing: no PendingDecision, GovernanceDecision, denial-pattern or
+trajectory row, and nothing for the suggestion engine. A real request an agent
+sends and is refused (a read by id, a list it may not make, a dispatch) still
+files one decision its person can approve. While that decision waits, the same
+agent refused the same action on the same resource gets it back instead of a
+new one.
 Authentication and tenant resolution use the same credential-derived context as
 before. `agent_id` must match that principal (including person principals).
 
@@ -53,10 +57,10 @@ records through the governed read surface first. Offers describe that read's
 snapshot. Dispatch always reloads and authorizes the actual move independently.
 
 For R records with M total requested moves, the cost is M Cedar evaluations,
-R decoded context maps, **zero store reads**, and no synchronous store writes.
-No per-move record/context reload is performed. Denied checks still enqueue an
-observability trajectory each, explicitly `spec_governed: false`; those rows may
-be written asynchronously. Conformance verdicts retain their existing meaning.
+R decoded context maps, **zero store reads** and **zero store writes**.
+No per-move record/context reload is performed. A denied check is visible only
+as the authz wide event every Cedar check emits. Conformance verdicts retain
+their existing meaning.
 There is no arbitrary item cap: the existing Axum JSON request-body byte limit
 (default 2 MiB on this route) bounds input. Pages over that body limit must be
 split by bytes, not by an invented move count.
