@@ -1,11 +1,13 @@
-//! Lemmas the prover guesses for an invariant the agent gave none.
+//! Lemmas the prover guesses for an invariant its written lemmas, if any,
+//! do not prove.
 //!
 //! Most rules with no hints that do not prove alone need one of two kinds of
 //! lemma: the rule at every state, not only where nothing is in flight; or,
 //! in some state, a flag the rule reads. The prover adds every such guess,
 //! and drops each one a move or the start breaks, until the rest hold
-//! (Houdini). Dropping guesses only weakens what a move assumes, so a rule
-//! that fails with some guesses held fails without them too.
+//! (Houdini, `houdini.rs`). Dropping guesses only weakens what a move
+//! assumes, so a rule that fails with some guesses held fails without them
+//! too.
 
 use std::collections::BTreeSet;
 

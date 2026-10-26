@@ -221,17 +221,56 @@ fn a_rule_with_its_lemmas_is_proved_and_not_walked() {
 }
 
 #[test]
-fn a_rule_whose_proof_fails_is_walked_and_says_why() {
+fn a_rule_its_lemmas_do_not_prove_is_proved_with_the_provers_guesses_too() {
+    // The lemma holds but is not enough: a sealing parent may be unlocked
+    // for all it says. The prover guesses as for a rule with no lemmas.
     let verdict = invariant(&[&parent(""), &child(&[LOCKED_WHEN_CLOSED])], TIME);
-    let JointVerdict::Invariant(walked, Some(tried)) = &verdict else {
-        panic!("walked with the failed proof: {verdict}");
+    let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
+        panic!("proved with the prover's guesses: {verdict}");
     };
-    // The rule holds, so the walk passes it; the proof only lacked a lemma.
-    assert!(walked.holds(), "{walked}");
-    assert!(!tried.proved());
-    let text = verdict.to_string();
-    assert!(text.contains("not proved by induction"), "{text}");
-    assert!(text.contains("Parent.Close"), "{text}");
+    assert!(
+        proof
+            .found
+            .iter()
+            .any(|l| l.name == "Parent in Sealing: locked"),
+        "{verdict}"
+    );
+    assert!(proof.dropped.is_empty(), "{verdict}");
+}
+
+#[test]
+fn a_written_lemma_a_move_breaks_is_dropped_and_named() {
+    let never_locked = "(not $Parent.locked)";
+    let verdict = invariant(
+        &[&parent(""), &child(&[LOCKED_PAST_OPEN, never_locked])],
+        TIME,
+    );
+    let JointVerdict::Proved(proof, _) = &verdict else {
+        panic!("proved without the broken lemma: {verdict}");
+    };
+    assert_eq!(
+        proof.dropped.get("lemma1").map(String::as_str),
+        Some("fails after Parent.Seal (from outside)"),
+        "{verdict}"
+    );
+    assert!(
+        verdict
+            .to_string()
+            .contains("dropped the written lemma lemma1, which fails after Parent.Seal"),
+        "{verdict}"
+    );
+}
+
+#[test]
+fn a_written_lemma_the_solver_refuses_is_dropped_and_named() {
+    let unknown = "(=> $Parent.nope true)";
+    let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN, unknown])], TIME);
+    let JointVerdict::Proved(proof, _) = &verdict else {
+        panic!("proved without the refused lemma: {verdict}");
+    };
+    let why = proof.dropped.get("lemma1").expect("lemma1 dropped");
+    assert!(why.starts_with("the solver refuses: "), "{why}");
+    assert!(why.contains("Parent.nope"), "{why}");
 }
 
 #[test]
@@ -379,15 +418,20 @@ fn a_scheduled_action_fires_in_the_proof() {
     let why = tried.shortfall().expect("not proved");
     assert!(why.contains("after Parent.Unlock.scheduled fires"), "{why}");
     // A lemma that the unlock never waits does not get round it: closing
-    // arms it.
+    // arms it, so the proof drops it.
     let never_waits = "(not ($has.Parent.Unlock.scheduled mk/Parent.Unlock.scheduled))";
     let rule = child(&[LOCKED_PAST_OPEN, never_waits]);
     let verdict = invariant(&[&unlocks, &rule], TIME);
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("proved with a lemma that the unlock never waits: {verdict}");
     };
+    assert_eq!(
+        tried.dropped.get("lemma1").map(String::as_str),
+        Some("fails after Parent.Close (from outside)"),
+        "{verdict}"
+    );
     let why = tried.shortfall().expect("not proved");
-    assert!(why.contains("lemma1 fails after Parent.Close"), "{why}");
+    assert!(why.contains("after Parent.Unlock.scheduled fires"), "{why}");
 }
 
 /// An action nothing outside may send: a sealing or closed parent locks.

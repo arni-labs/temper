@@ -79,8 +79,9 @@ impl Clauses {
                 let from = z3.errors.len();
                 z3.send(&format!("(define-fun {frame}!{i} () Bool {clause})\n"))?;
                 if z3.errors.len() > from {
-                    let said: Vec<String> = z3.errors.split_off(from);
-                    refused.push((i, said.into_iter().map(plain).collect::<Vec<_>>().join(" ")));
+                    // The first says what the solver could not read.
+                    let said = z3.errors.split_off(from).into_iter().next();
+                    refused.push((i, said.map(plain).unwrap_or_default()));
                     z3.send(&format!("(define-fun {frame}!{i} () Bool true)\n"))?;
                 }
             }

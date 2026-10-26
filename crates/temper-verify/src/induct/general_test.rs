@@ -162,3 +162,68 @@ fn each_move_that_takes_no_action_is_checked() {
         assert!(checked.contains(&way.to_string()), "{checked:?}");
     }
 }
+
+/// A meter its timers shut, which may be archived once shut. Proving that
+/// an archived meter was shut needs the guess that a shut one is.
+const SHUT: &str = r#"
+[automaton]
+name = "Meter"
+states = ["Open", "Waiting", "Late", "Shut", "Archived"]
+initial = "Open"
+
+[[state]]
+name = "shut"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Wait"
+kind = "input"
+from = ["Open"]
+to = "Waiting"
+
+[[action]]
+name = "Lag"
+kind = "input"
+from = ["Waiting"]
+to = "Late"
+
+[[action]]
+name = "Expire"
+kind = "internal"
+from = ["Waiting", "Late"]
+to = "Shut"
+effect = ["shut = true"]
+
+[[state_timeout]]
+state = "Waiting"
+after_seconds = 60
+on_timeout = "Expire"
+
+[[state_timeout]]
+state = "Late"
+after_seconds = 60
+on_timeout = "Expire"
+
+[[action]]
+name = "Archive"
+kind = "input"
+from = ["Shut"]
+to = "Archived"
+
+[[invariant]]
+name = "ArchivedWasShut"
+assert = "status == 'Archived' => shut == true"
+"#;
+
+#[test]
+fn a_general_move_stands_again_once_the_guesses_it_broke_are_dropped() {
+    // Expire breaks the guess that a shut meter is not shut, every way it
+    // is taken; once that guess is dropped, it keeps the rest.
+    let checked = proved(SHUT);
+    assert!(
+        checked.contains(&"Meter.Expire (every way it is taken)".to_string()),
+        "{checked:?}"
+    );
+    assert!(!checked.iter().any(|n| n.contains("timer")), "{checked:?}");
+}
