@@ -162,6 +162,46 @@ pub async fn push(store: &TursoEventStore) {
         .expect("push");
 }
 
+/// Confirmed change log rows for the long-log tests: more than half the
+/// Factory's 532,000 changes.
+pub const BIG_LOG: i64 = 300_000;
+
+/// Open a store at `path` whose change log holds `rows` changes the remote
+/// has confirmed, below one pushed write.
+///
+/// A push carries only changes numbered above the remote's record of this
+/// file's last push, so every row at or below it is the confirmed part of
+/// the log. Pushing 300,000 changes for real is one request of one
+/// statement per change, far past a push's 10 s limit, so the confirmed
+/// part is written into the log directly, numbered below the first real
+/// change. Most rows hold a 1 KB image; every hundredth holds 30 KB, the
+/// size of the Factory's catalog images, which spill onto overflow pages.
+pub async fn confirmed_log(
+    server: &SyncServer,
+    path: &Path,
+    rows: i64,
+) -> (TursoEventStore, temper_store_turso::SyncCopy) {
+    let store = server.open(path).await;
+    let copy = store.sync_copy().expect("copy").clone();
+    write(&store, "pushed", 0).await;
+    push(&store).await;
+    let before = copy.change_log_rows().await.expect("rows");
+    let added = copy
+        .execute_local(&format!(
+            "INSERT INTO turso_cdc \
+             (change_id, change_time, change_type, table_name, id, before, after, updates) \
+             SELECT value - {rows}, 0, 1, 'events', value, NULL, \
+             CASE WHEN value % 100 = 0 THEN randomblob(30000) ELSE randomblob(1000) END, NULL \
+             FROM generate_series(1, {rows})"
+        ))
+        .await
+        .expect("fill the change log");
+    assert_eq!(added, rows as u64);
+    copy.checkpoint_if_wal_over(0).await.expect("checkpoint");
+    assert_eq!(copy.change_log_rows().await.expect("rows"), before + rows);
+    (store, copy)
+}
+
 pub fn copy_files(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).expect("read dir") {
         let entry = entry.expect("entry");

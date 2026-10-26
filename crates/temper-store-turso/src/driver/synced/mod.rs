@@ -397,6 +397,15 @@ impl SyncCopy {
         files::describe(Path::new(path.strip_prefix("file:").unwrap_or(path)))
             .map_err(storage_error)
     }
+
+    /// Run one statement on the local file and return the rows it changed.
+    /// For tests that need a state no store call makes, such as a change log
+    /// longer than one push can carry; never built into the server.
+    #[cfg(feature = "test-support")]
+    pub async fn execute_local(&self, sql: &str) -> Result<u64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        conn.execute(sql, ()).await.map_err(storage_error)
+    }
 }
 
 /// How long opening a connection retries while other connections write; as
