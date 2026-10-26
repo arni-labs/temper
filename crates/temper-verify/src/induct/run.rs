@@ -85,8 +85,10 @@ pub(super) fn run(
                             }
                             checked.push((at, obligation));
                         }
-                        if let Ok(path) = std::env::var("INDUCT_SCRIPT") {
-                            std::fs::write(format!("{path}.{rule}.{i}.smt2"), &z3.script)?;
+                        if let (Ok(path), Some(script)) =
+                            (std::env::var("INDUCT_SCRIPT"), &z3.script)
+                        {
+                            std::fs::write(format!("{path}.{rule}.{i}.smt2"), script)?;
                         }
                         Ok((checked, std::mem::take(&mut z3.errors)))
                     },

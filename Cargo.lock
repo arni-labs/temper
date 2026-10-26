@@ -7521,6 +7521,7 @@ dependencies = [
  "temper-spec",
  "toml",
  "z3",
+ "z3-sys",
 ]
 
 [[package]]

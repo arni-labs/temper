@@ -1,17 +1,26 @@
-//! A z3 session over SMT-LIB: declarations stay across `push`/`pop`, so each
-//! obligation is a few lines sent to a solver that already holds the
-//! vocabulary.
+//! A z3 session over SMT-LIB, in this process: declarations stay across
+//! `push`/`pop`, so each obligation is a few lines sent to a solver that
+//! already holds the vocabulary. The server image carries libz3 but no z3
+//! binary, so the session runs on its own z3 context through the C API's
+//! SMT-LIB command reader.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::ffi::{CStr, CString};
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+use z3_sys::{
+    ErrorCode, Z3_context, Z3_del_config, Z3_del_context, Z3_eval_smtlib2_string,
+    Z3_get_error_code, Z3_get_error_msg, Z3_mk_config, Z3_mk_context, Z3_set_error_handler,
+};
+
+/// How long one check may run before the solver answers unknown.
+const CHECK_TIMEOUT_MS: &str = "2000";
+
 pub(super) struct Z3 {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    /// Everything sent, to replay a session by hand.
-    pub(super) script: String,
+    context: Z3_context,
+    /// Everything sent, to replay a session by hand, when `INDUCT_SCRIPT`
+    /// asks for it.
+    pub(super) script: Option<String>,
     /// The errors the solver reported, such as a lemma naming what the
     /// vocabulary does not hold.
     pub(super) errors: Vec<String>,
@@ -27,39 +36,40 @@ pub(super) enum Sat {
 
 impl Z3 {
     pub(super) fn start() -> std::io::Result<Self> {
-        let mut child = Command::new(std::env::var("Z3").unwrap_or_else(|_| "z3".to_string()))
-            .args(["-in", "-smt2"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let input = child.stdin.take().expect("piped stdin");
-        let output = BufReader::new(child.stdout.take().expect("piped stdout"));
+        // JUSTIFICATION: the z3 crate has no safe way to read SMT-LIB
+        // commands, and the obligations are SMT-LIB text.
+        //
+        // SAFETY: the config is used once and freed; the context is owned by
+        // this session alone, used only from the thread that holds it (the
+        // session is not Send), and freed in Drop. With no error handler,
+        // Z3 reports errors through the error code instead of exiting.
+        let context = unsafe {
+            let config = Z3_mk_config().ok_or_else(|| std::io::Error::other("z3: no config"))?;
+            let context = Z3_mk_context(config);
+            Z3_del_config(config);
+            let context = context.ok_or_else(|| std::io::Error::other("z3: no context"))?;
+            Z3_set_error_handler(context, None);
+            context
+        };
         let mut z3 = Self {
-            child,
-            input,
-            output,
-            script: String::new(),
+            context,
+            script: std::env::var("INDUCT_SCRIPT").ok().map(|_| String::new()),
             errors: Vec::new(),
         };
-        let timeout = std::env::var("INDUCT_TIMEOUT_MS").unwrap_or_else(|_| "2000".to_string());
         z3.send(&format!(
-            "(set-option :print-success false)\n(set-option :produce-models true)\n(set-option :timeout {timeout})\n"
+            "(set-option :print-success false)\n(set-option :produce-models true)\n(set-option :timeout {CHECK_TIMEOUT_MS})\n"
         ))?;
         Ok(z3)
     }
 
     pub(super) fn send(&mut self, text: &str) -> std::io::Result<()> {
-        self.script.push_str(text);
-        self.input.write_all(text.as_bytes())
+        self.eval(text).map(|_| ())
     }
 
     /// Check what was asserted, and how long the solver took.
     pub(super) fn check(&mut self) -> std::io::Result<(Sat, Duration)> {
         let start = Instant::now();
-        self.send("(check-sat)\n")?;
-        self.input.flush()?;
-        let answer = self.read()?;
+        let answer = self.eval("(check-sat)\n")?;
         let took = start.elapsed();
         let sat = match answer.trim() {
             "sat" => Sat::Sat,
@@ -74,51 +84,77 @@ impl Z3 {
         if terms.is_empty() {
             return Ok(String::new());
         }
-        self.send(&format!("(get-value ({}))\n", terms.join(" ")))?;
-        self.input.flush()?;
-        self.read()
+        self.eval(&format!("(get-value ({}))\n", terms.join(" ")))
     }
 
-    /// One response: a line, or an s-expression across lines. Errors the
-    /// solver prints before it are kept aside.
-    fn read(&mut self) -> std::io::Result<String> {
-        loop {
-            let response = self.read_one()?;
+    /// Run `text` and return what it printed, less the errors, which are
+    /// kept aside.
+    fn eval(&mut self, text: &str) -> std::io::Result<String> {
+        if let Some(script) = &mut self.script {
+            script.push_str(text);
+        }
+        let text = CString::new(text).map_err(std::io::Error::other)?;
+        // SAFETY: the context is live (see `start`); the input is a
+        // NUL-terminated string that outlives the call; the output is copied
+        // before the next call on this context, which is when Z3 frees it.
+        let (printed, failed) = unsafe {
+            let out = Z3_eval_smtlib2_string(self.context, text.as_ptr());
+            let printed = NonNull::new(out.cast_mut())
+                .map(|out| CStr::from_ptr(out.as_ptr()).to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let code = Z3_get_error_code(self.context);
+            let failed = (code != ErrorCode::OK).then(|| {
+                let message = Z3_get_error_msg(self.context, code);
+                NonNull::new(message.cast_mut())
+                    .map(|m| CStr::from_ptr(m.as_ptr()).to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{code:?}"))
+            });
+            (printed, failed)
+        };
+        let mut kept = String::new();
+        for response in responses(&printed) {
             if response.trim_start().starts_with("(error") {
                 self.errors.push(response.trim().to_string());
             } else {
-                return Ok(response);
+                kept.push_str(&response);
             }
         }
+        if let Some(failed) = failed {
+            self.errors.push(format!("(error \"{failed}\")"));
+        }
+        Ok(kept)
     }
+}
 
-    fn read_one(&mut self) -> std::io::Result<String> {
-        let mut out = String::new();
-        let mut depth: i64 = 0;
-        loop {
-            let mut line = String::new();
-            if self.output.read_line(&mut line)? == 0 {
-                return Err(std::io::Error::other(format!("z3 ended: {out}")));
-            }
-            for c in line.chars() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => depth -= 1,
-                    _ => {}
-                }
-            }
-            out.push_str(&line);
-            if depth <= 0 && !out.trim().is_empty() {
-                return Ok(out);
+/// The responses in `printed`: lines, or s-expressions across lines.
+fn responses(printed: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth: i64 = 0;
+    for line in printed.split_inclusive('\n') {
+        for c in line.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
             }
         }
+        current.push_str(line);
+        if depth <= 0 && !current.trim().is_empty() {
+            out.push(std::mem::take(&mut current));
+            depth = 0;
+        }
     }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 impl Drop for Z3 {
     fn drop(&mut self) {
-        let _ = self.input.write_all(b"(exit)\n");
-        let _ = self.input.flush();
-        let _ = self.child.wait();
+        // SAFETY: the context was made in `start`, is owned by this session
+        // alone, and is not used again.
+        unsafe { Z3_del_context(self.context) };
     }
 }
