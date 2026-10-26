@@ -87,16 +87,79 @@ fn free_memory() -> Option<usize> {
             free = free.min(left);
         }
     }
-    // cgroup v1 keeps memory in its own hierarchy; unlimited reads near 2^63.
+    // v1 may mount only a subtree of the memory hierarchy. Resolve the
+    // process's memory controller against that mount before walking parents.
+    if let (Some(groups), Some(mounts)) = (
+        read(Path::new("/proc/self/cgroup")),
+        read(Path::new("/proc/self/mountinfo")),
+    ) {
+        free = v1_free(&read, &groups, &mounts, free);
+    }
+    Some(free)
+}
+
+/// Apply every visible v1 memory limit from this process up to its mount.
+#[cfg(target_os = "linux")]
+fn v1_free(
+    read: &impl Fn(&std::path::Path) -> Option<String>,
+    groups: &str,
+    mounts: &str,
+    mut free: usize,
+) -> usize {
+    use std::path::Path;
+
+    let own = groups.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        parts.next()?;
+        parts
+            .next()?
+            .split(',')
+            .any(|c| c == "memory")
+            .then(|| parts.next())
+            .flatten()
+    });
+    let Some(own) = own else { return free };
+    // mountinfo escapes whitespace and backslashes in paths.
+    let unescape = |path: &str| {
+        path.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    };
     let v1 = [
         "memory.limit_in_bytes",
         "memory.usage_in_bytes",
         "total_inactive_file",
     ];
-    if let Some(left) = group_free(&read, &root.join("memory"), v1) {
-        free = free.min(left);
+    for line in mounts.lines() {
+        let Some((mount, kind)) = line.split_once(" - ") else {
+            continue;
+        };
+        let kind: Vec<_> = kind.split_whitespace().collect();
+        if kind.first() != Some(&"cgroup")
+            || !kind
+                .get(2)
+                .is_some_and(|options| options.split(',').any(|c| c == "memory"))
+        {
+            continue;
+        }
+        let mount: Vec<_> = mount.split_whitespace().collect();
+        let (Some(base), Some(root)) = (mount.get(3), mount.get(4)) else {
+            continue;
+        };
+        let base = unescape(base);
+        let root = unescape(root);
+        let Ok(relative) = Path::new(own).strip_prefix(&base) else {
+            continue;
+        };
+        let own = Path::new(&root).join(relative);
+        for dir in own.ancestors().take_while(|dir| dir.starts_with(&root)) {
+            if let Some(left) = group_free(read, dir, v1) {
+                free = free.min(left);
+            }
+        }
     }
-    Some(free)
+    free
 }
 
 /// What the cgroup at `dir` leaves under its limit, from its limit, usage
@@ -122,29 +185,99 @@ fn field(text: &str, name: &str) -> Option<usize> {
         .ok()
 }
 
-/// A development host: the machine's memory less this process's own.
+/// Pages macOS currently leaves free or purgeable without swapping.
+/// Inactive pages can still hold non-purgeable application memory, so the
+/// whole inactive list is not an allowance for a new proof.
 #[cfg(target_os = "macos")]
 fn free_memory() -> Option<usize> {
-    let mut bytes: u64 = 0;
-    let mut size = size_of::<u64>();
-    // SAFETY: hw.memsize is a u64; `bytes` and `size` describe its buffer.
+    // libc exposes the statistics layout, but not these Mach port APIs.
+    unsafe extern "C" {
+        fn mach_host_self() -> libc::mach_port_t;
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+        fn host_page_size(
+            host: libc::mach_port_t,
+            size: *mut libc::vm_size_t,
+        ) -> libc::kern_return_t;
+    }
+
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64_data_t>::zeroed();
+    let mut count = (size_of::<libc::vm_statistics64_data_t>() / size_of::<libc::integer_t>())
+        as libc::mach_msg_type_number_t;
+    let mut page_size: libc::vm_size_t = 0;
+    // SAFETY: both calls receive writable buffers of the sizes their APIs
+    // require. The statistics buffer is read only after a successful call.
     let status = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
+        let host = mach_host_self();
+        if host_page_size(host, &mut page_size) != libc::KERN_SUCCESS {
+            mach_port_deallocate(mach_task_self_, host);
+            return None;
+        }
+        let status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        );
+        mach_port_deallocate(mach_task_self_, host);
+        status
     };
-    let machine = (status == 0)
-        .then(|| usize::try_from(bytes).ok())
-        .flatten()?;
-    let resident = crate::state::runtime_metrics::read_process_resident_memory_bytes()?;
-    Some(machine.saturating_sub(usize::try_from(resident).ok()?))
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: the buffer was zeroed and host_statistics64 succeeded.
+    let stats = unsafe { stats.assume_init() };
+    (stats.free_count as usize)
+        .checked_add(stats.purgeable_count as usize)?
+        .checked_mul(page_size as usize)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn free_memory() -> Option<usize> {
     None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn v1_checks_own_group_and_ancestors_on_a_subtree_mount() {
+        let mut files = BTreeMap::new();
+        for (dir, limit, usage, cache) in [
+            ("/memory mount", 900, 100, 0),
+            ("/memory mount/tenant", 500, 400, 50),
+            ("/memory mount/tenant/server", 300, 100, 0),
+        ] {
+            files.insert(
+                Path::new(dir).join("memory.limit_in_bytes"),
+                limit.to_string(),
+            );
+            files.insert(
+                Path::new(dir).join("memory.usage_in_bytes"),
+                usage.to_string(),
+            );
+            files.insert(
+                Path::new(dir).join("memory.stat"),
+                format!("total_inactive_file {cache}\n"),
+            );
+        }
+        let read = |path: &Path| files.get(path).cloned();
+        let groups = "2:cpu:/elsewhere\n4:memory,other:/slice/tenant/server\n";
+        let mounts = "30 20 0:1 /slice /memory\\040mount rw - cgroup cgroup rw,memory\n";
+        assert_eq!(v1_free(&read, groups, mounts, 1000), 150);
+        // The process's own group can be tighter than its shared ancestor.
+        files.insert(
+            Path::new("/memory mount/tenant/server/memory.limit_in_bytes").to_path_buf(),
+            "120".into(),
+        );
+        let read = |path: &Path| files.get(path).cloned();
+        assert_eq!(v1_free(&read, groups, mounts, 1000), 20);
+        assert_eq!(v1_free(&read, groups, mounts, 10), 10);
+    }
 }

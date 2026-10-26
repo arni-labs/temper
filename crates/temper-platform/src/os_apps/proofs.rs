@@ -5,8 +5,8 @@
 //! the memory this host leaves it ([`HOST_ROOM`]), not a clock. It runs as
 //! its own task, so an install whose client gives up does not stop it, and
 //! without the tenant's install lock, so the tenant's other installs go on
-//! meanwhile: the install waits for it, then starts again under the lock and
-//! finds its verdict.
+//! meanwhile: each attached install receives its verdict. On success the
+//! install starts again under the lock and checks its current inputs.
 //!
 //! A verdict is kept by the digest of what its walk read: which proof, every
 //! spec and, for liveness, the Cedar. A proven one is kept in the platform's
@@ -60,14 +60,23 @@ pub(super) enum Proof {
 }
 
 /// A walk that is running: the install waits for it without its lock.
-pub(super) struct Wait(watch::Receiver<bool>);
+pub(super) struct Wait(watch::Receiver<Option<Verdict>>);
 
 impl Wait {
-    /// The walk has ended and its verdict is kept or waiting to be read.
-    pub(super) async fn ended(mut self) {
-        // A sender dropped without saying so is a walk that panicked: its
-        // task put the verdict in place first all the same.
-        let _ = self.0.wait_for(|ended| *ended).await;
+    /// Receive this walk's verdict, including a memory refusal shared by
+    /// every attached install. Later installs may retry that walk.
+    pub(super) async fn ended(mut self) -> Result<(), String> {
+        let verdict = self
+            .0
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| "the proof job stopped without a verdict".to_string())?;
+        verdict
+            .as_ref()
+            .expect("completed proof has a verdict")
+            .refused
+            .clone()
+            .map_or(Ok(()), Err)
     }
 }
 
@@ -90,12 +99,12 @@ pub(super) fn digest(
     format!("{:x}", hasher.finalize())
 }
 
-/// Verdicts this process reached, each with whether its walk fit, and walks
+/// Verdicts about specs this process reached, and walks
 /// running now, by digest.
 #[derive(Default)]
 struct Proofs {
-    reached: BTreeMap<String, (Verdict, bool)>,
-    running: BTreeMap<String, watch::Receiver<bool>>,
+    reached: BTreeMap<String, Verdict>,
+    running: BTreeMap<String, watch::Receiver<Option<Verdict>>>,
 }
 
 /// Each holder of the lock inserts or removes whole entries, so one that
@@ -133,19 +142,16 @@ pub(super) async fn proof(
     };
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(verdict) = stored {
-        proofs.reached.insert(digest, (verdict.clone(), true));
+        proofs.reached.insert(digest, verdict.clone());
         return Proof::Done(verdict);
     }
-    if let Some((verdict, fit)) = proofs.reached.get(&digest).cloned() {
-        if !fit {
-            proofs.reached.remove(&digest);
-        }
+    if let Some(verdict) = proofs.reached.get(&digest).cloned() {
         return Proof::Done(verdict);
     }
     if let Some(running) = proofs.running.get(&digest) {
         return Proof::Running(Wait(running.clone()));
     }
-    let (ended, wait) = watch::channel(false);
+    let (ended, wait) = watch::channel(None);
     proofs.running.insert(digest.clone(), wait.clone());
     drop(proofs);
     tracing::info!(tenant, app = %app_name, proof, %digest, "a proof starts");
@@ -170,7 +176,7 @@ async fn run(
     proof: &'static str,
     digest: String,
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
-    ended: watch::Sender<bool>,
+    ended: watch::Sender<Option<Verdict>>,
 ) {
     let progress = Arc::new(Progress::default());
     let reports = tokio::spawn(report(
@@ -223,9 +229,11 @@ async fn run(
     .await;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     proofs.running.remove(&digest);
-    proofs.reached.insert(digest, (walked.verdict, walked.fit));
+    if walked.fit {
+        proofs.reached.insert(digest, walked.verdict.clone());
+    }
     drop(proofs);
-    let _ = ended.send(true);
+    let _ = ended.send(Some(walked.verdict));
 }
 
 /// Say every [`PROGRESS_EVERY`] how many joint states the walk has and the
@@ -274,5 +282,54 @@ async fn emit(
     };
     if let Err(error) = server.emit_design_time_event(event).await {
         tracing::warn!(tenant, app = %app_name, %error, "a proof event could not be kept");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_waiter_gets_memory_refusal_and_later_install_retries() {
+        let state = PlatformState::new(None);
+        let (release, blocked) = std::sync::mpsc::channel();
+        let key = "memory-refusal-all-waiters".to_string();
+        let first = proof(&state, "default", "test", "test", key.clone(), move |_| {
+            blocked.recv().unwrap();
+            Walked {
+                verdict: Verdict {
+                    held: vec![],
+                    refused: Some("no room".into()),
+                },
+                fit: false,
+            }
+        })
+        .await;
+        let second = proof(&state, "default", "test", "test", key.clone(), |_| {
+            panic!("an attached install must not start another walk")
+        })
+        .await;
+        let Proof::Running(first) = first else {
+            panic!("expected a job")
+        };
+        let Proof::Running(second) = second else {
+            panic!("expected shared job")
+        };
+        release.send(()).unwrap();
+        assert_eq!(first.ended().await, Err("no room".into()));
+        // Read the second verdict after the first install has consumed its own.
+        assert_eq!(second.ended().await, Err("no room".into()));
+        let later = proof(&state, "default", "test", "test", key, |_| Walked {
+            verdict: Verdict {
+                held: vec![],
+                refused: None,
+            },
+            fit: true,
+        })
+        .await;
+        let Proof::Running(later) = later else {
+            panic!("later install must retry")
+        };
+        assert_eq!(later.ended().await, Ok(()));
     }
 }

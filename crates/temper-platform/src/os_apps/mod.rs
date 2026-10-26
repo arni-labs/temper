@@ -1110,12 +1110,12 @@ pub(super) async fn install_os_app_with_plan(
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
     // A proof that is still walking is waited for without the tenant's
-    // install lock; the install then starts again under it and finds the
+    // install lock; on success it starts again under it and finds the
     // verdict, or a new walk when the tenant changed meanwhile.
     loop {
         match install_once(state, tenant, app_name, plan).await? {
             ControlFlow::Break(result) => return Ok(result),
-            ControlFlow::Continue(proof) => proof.ended().await,
+            ControlFlow::Continue(proof) => proof.ended().await?,
         }
     }
 }
