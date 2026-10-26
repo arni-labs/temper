@@ -20,14 +20,7 @@ pub struct SyncServer {
 
 impl SyncServer {
     pub fn start() -> Option<Self> {
-        let Some(bin) = std::env::var_os("TEMPER_TEST_TURSODB") else {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "TEMPER_TEST_TURSODB must name a tursodb binary in CI"
-            );
-            eprintln!("skipped: TEMPER_TEST_TURSODB is not set");
-            return None;
-        };
+        let bin = temper_test_resource::env_var("TEMPER_TEST_TURSODB")?;
         // The store's and the sync engine's logs, and the server's below, show
         // in the output of a test that fails or times out.
         let _ = tracing_subscriber::fmt()

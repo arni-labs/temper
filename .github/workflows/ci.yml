@@ -308,6 +308,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.shards) }}
+    # Tests that need a database run or fail in CI (crates/temper-test-resource), so
+    # every machine that runs them has one. Each test isolates itself by a unique tenant
+    # or key, so a parallel run can share one database and one Redis.
+    services:
+      postgres:
+        image: ${{ matrix.args != '' && 'postgres:18' || '' }}
+        env:
+          POSTGRES_PASSWORD: temper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+      redis:
+        image: ${{ matrix.args != '' && 'redis:7' || '' }}
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       # temper-spec's migration_differential tests read older commits.
       - uses: actions/checkout@v4
@@ -367,6 +385,9 @@ jobs:
 
       - name: cargo nextest run (affected packages, skip dst_)
         if: matrix.args != ''
+        env:
+          DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
+          REDIS_URL: redis://localhost:6379
         run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
 
       - name: cargo test --doc (affected packages)
@@ -385,6 +406,24 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Tests that need a database run or fail in CI (crates/temper-test-resource), so
+    # every machine that runs them has one. Each test isolates itself by a unique tenant
+    # or key, so a parallel run can share one database and one Redis.
+    services:
+      postgres:
+        image: ${{ needs.changes.outputs.lane == 'full' && 'postgres:18' || '' }}
+        env:
+          POSTGRES_PASSWORD: temper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+      redis:
+        image: ${{ needs.changes.outputs.lane == 'full' && 'redis:7' || '' }}
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - name: Pull-request lane result
         if: needs.changes.outputs.lane != 'full'
@@ -461,6 +500,9 @@ jobs:
 
       - name: cargo nextest run --workspace (skip dst_)
         if: needs.changes.outputs.lane == 'full'
+        env:
+          DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
+          REDIS_URL: redis://localhost:6379
         run: cargo nextest run --workspace -E 'not test(dst_)'
 
       # spec_validate_endpoint declares required-features = ["observe"]. The
@@ -545,10 +587,8 @@ jobs:
           cargo nextest run -p temper-store-postgres --run-ignored only
           -E 'test(scheduled_action_rows_commit_with_their_events)'
 
-      # These tests return early, and pass, when DATABASE_URL is unset, so
-      # without this step the Postgres store's catalog and index writes never
-      # ran anywhere. One at a time: they share this one database and each
-      # runs the migrations on it first.
+      # The store's tests one at a time against this database. The Tests run also
+      # runs them, in parallel; this step keeps a serial run of the whole crate.
       - name: Store tests that need a real database
         env:
           DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres

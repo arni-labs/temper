@@ -110,9 +110,8 @@ async fn publish_file_artifact_persists_metadata_through_turso_metadata_store() 
 
 #[tokio::test]
 async fn publish_file_artifact_persists_metadata_through_postgres_metadata_store_when_available() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
     let mock_blob = mock_public_blob_endpoint().await;
     let pool = sqlx::PgPool::connect(&database_url)
