@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use temper_jit::table::action_contract::InitialValues;
 use temper_jit::table::{Effect, EvalContext, GuardFailure, Refusal, TransitionTable, effect_args};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 
@@ -139,7 +140,9 @@ pub fn build_eval_context_with_xref(
     action: Option<&str>,
 ) -> EvalContext {
     let mut ctx = EvalContext::default();
-    ctx.counters.insert("items".to_string(), state.item_count);
+    if let Some(items) = stored_item_count(state, &table.initial_values) {
+        ctx.counters.insert("items".to_string(), items);
+    }
     for (k, v) in &state.counters {
         ctx.counters.insert(k.clone(), *v);
     }
@@ -372,7 +375,12 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests),
                 outcome,
             ) = record_effect_outcome(state, |state| {
-                apply_effects(state, &transition_result.effects, params)
+                apply_effects(
+                    state,
+                    &transition_result.effects,
+                    &table.initial_values,
+                    params,
+                )
             });
             apply_new_state_fallback(state, &from_status, &to_status);
             let overflow_blobs = sync_fields_with_metadata(
@@ -631,6 +639,8 @@ fn json_string_param(params: &serde_json::Value, field: &str) -> Option<String> 
 /// # Arguments
 /// - `state` — The entity state to mutate.
 /// - `effects` — The effects returned by `TransitionTable::evaluate()`.
+/// - `declared` — The table's declared values, read for a variable the
+///   record does not store.
 /// - `params` — The action parameters (read by `params.p` effect values).
 ///
 /// # Returns
@@ -638,6 +648,7 @@ fn json_string_param(params: &serde_json::Value, field: &str) -> Option<String> 
 pub fn apply_effects(
     state: &mut EntityState,
     effects: &[Effect],
+    declared: &InitialValues,
     params: &serde_json::Value,
 ) -> (
     Vec<String>,
@@ -656,7 +667,7 @@ pub fn apply_effects(
                 state.status = s.clone();
             }
             Effect::SetCounter { var, value } => {
-                match effect_args::count(value, &state.counters, params) {
+                match effect_args::count(value, &state.counters, declared, params) {
                     Some(value) => set_counter(state, var, value),
                     None => tracing::warn!(
                         entity_type = %state.entity_type,
@@ -668,17 +679,19 @@ pub fn apply_effects(
                 }
             }
             Effect::AddCounter { var, value } => {
-                let delta = effect_args::count(value, &state.counters, params).unwrap_or(0);
-                let current = state.counters.get(var).copied().unwrap_or(0);
+                let delta =
+                    effect_args::count(value, &state.counters, declared, params).unwrap_or(0);
+                let current = declared.counter(&state.counters, var).unwrap_or(0);
                 set_counter(state, var, current.saturating_add(delta));
             }
             Effect::SubCounter { var, value } => {
-                let delta = effect_args::count(value, &state.counters, params).unwrap_or(0);
-                let current = state.counters.get(var).copied().unwrap_or(0);
+                let delta =
+                    effect_args::count(value, &state.counters, declared, params).unwrap_or(0);
+                let current = declared.counter(&state.counters, var).unwrap_or(0);
                 set_counter(state, var, current.saturating_sub(delta));
             }
             Effect::SetBool { var, value } => {
-                match effect_args::boolean(value, &state.booleans, params) {
+                match effect_args::boolean(value, &state.booleans, declared, params) {
                     Some(value) => {
                         state.booleans.insert(var.clone(), value);
                     }
@@ -693,12 +706,12 @@ pub fn apply_effects(
             }
             Effect::ListAppend { var, value } => {
                 if let Some(element) = effect_args::string(value, params) {
-                    state.lists.entry(var.clone()).or_default().push(element);
+                    declared.list_mut(&mut state.lists, var).push(element);
                 }
             }
             Effect::ListRemoveAt { var, index } => {
-                if let Some(index) = effect_args::count(index, &state.counters, params) {
-                    let list = state.lists.entry(var.clone()).or_default();
+                if let Some(index) = effect_args::count(index, &state.counters, declared, params) {
+                    let list = declared.list_mut(&mut state.lists, var);
                     if index < list.len() {
                         list.remove(index);
                     }
@@ -801,6 +814,15 @@ pub fn apply_effects(
     )
 }
 
+/// The legacy `item_count` field, when it holds the record's `items`
+/// counter. It starts at 0 whether or not the record wrote `items`, so a 0
+/// on a record that never wrote a declared `items` is not a stored value:
+/// readers then take the declared initial value, as for any other counter.
+pub(crate) fn stored_item_count(state: &EntityState, declared: &InitialValues) -> Option<usize> {
+    let unwritten = state.item_count == 0 && !state.counters.contains_key("items");
+    (!(unwritten && declared.counters.contains_key("items"))).then_some(state.item_count)
+}
+
 /// Write a counter, keeping the legacy `item_count` field in sync with the
 /// counter named `items`.
 fn set_counter(state: &mut EntityState, var: &str, value: usize) {
@@ -901,7 +923,9 @@ impl EffectOutcome {
 /// never journaled, so its field is removed: unknown, rather than a new id
 /// that names no record or an older child's id. Every other effect is
 /// re-derived from the table, as before. The spawn, schedule and custom
-/// requests are dropped: replay dispatches nothing.
+/// requests are dropped: replay dispatches nothing. A variable the record
+/// did not store starts from zero, as it did when these moves ran, before
+/// declared initial values were read.
 pub(crate) fn apply_legacy_replay_effects(
     state: &mut EntityState,
     effects: &[Effect],
@@ -930,7 +954,12 @@ pub(crate) fn apply_legacy_replay_effects(
             }
             continue;
         }
-        let _requests = apply_effects(state, std::slice::from_ref(effect), params);
+        let _requests = apply_effects(
+            state,
+            std::slice::from_ref(effect),
+            &InitialValues::default(),
+            params,
+        );
     }
 }
 
@@ -1373,8 +1402,12 @@ to = "Closed"
             status_clock: Default::default(),
         };
 
-        let (custom, scheduled, _spawns, _schedule_at) =
-            apply_effects(&mut state, &effects, &serde_json::json!({}));
+        let (custom, scheduled, _spawns, _schedule_at) = apply_effects(
+            &mut state,
+            &effects,
+            &InitialValues::default(),
+            &serde_json::json!({}),
+        );
 
         assert!(custom.is_empty());
         assert_eq!(scheduled.len(), 1);
@@ -1418,6 +1451,7 @@ to = "Closed"
         let (_custom, _scheduled, _spawns, _schedule_at) = apply_effects(
             &mut state,
             &effects,
+            &InitialValues::default(),
             &serde_json::json!({
                 "size_bytes": "30",
                 "released_bytes": 7,
