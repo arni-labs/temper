@@ -36,6 +36,7 @@ macro_rules! tombstone_sql {
 mod append_config;
 mod authz;
 mod blobs;
+mod catalog_write;
 mod constraints;
 mod entity_listing;
 mod event_store;

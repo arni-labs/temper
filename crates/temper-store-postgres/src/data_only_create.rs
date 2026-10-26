@@ -71,6 +71,9 @@ impl PostgresEventStore {
             "native data-only create requires first event sequence"
         );
         let status = canonical_projection_status(status, state);
+        // The row holds each field once: in `fields`, not again in `state`.
+        let stored_state = temper_runtime::persistence::catalog_state_for_storage(fields, state);
+        let state = &stored_state;
         let projection_hash = json_hash(fields);
         let (new_index, indexed_fields, skipped_fields) = scalar_index_fields(fields);
         let mut field_names = Vec::with_capacity(new_index.len());

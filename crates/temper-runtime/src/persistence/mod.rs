@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod catalog_state;
 mod tombstone;
+pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};
 pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
 
 /// Event type used for the parent-journal record of a Composite action.

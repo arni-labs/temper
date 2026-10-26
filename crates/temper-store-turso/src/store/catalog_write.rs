@@ -1,0 +1,473 @@
+//! Writes of the durable query-plane catalog: one `entity_catalog` row per
+//! record and its `entity_field_index` rows.
+//!
+//! A row holds the record's fields once: in its `fields` column, and not again
+//! inside its `state` column (see [`catalog_state_for_storage`]). A write
+//! names only the columns it changes. Turso's change log keeps the whole row
+//! before and after every UPDATE, plus each column the UPDATE sets, so a write
+//! that changes nothing is skipped, a move that changes no field leaves
+//! `fields` out of its UPDATE, and the field index is rebuilt only when the
+//! fields or the status change.
+
+use std::collections::BTreeMap;
+
+use sha2::{Digest, Sha256};
+use temper_runtime::persistence::{PersistenceError, catalog_state_for_storage, storage_error};
+use temper_runtime::scheduler::sim_now;
+use tracing::instrument;
+
+use super::TursoEventStore;
+use super::field_index::{QueryProjectionUpsert, indexed_projection_fields};
+use super::write_gate::WritePriority;
+use crate::driver::{Transaction, Value, params_from_iter};
+
+/// The status a projection is stored under: the projected state's own status
+/// when it names one, else the caller's.
+fn canonical_projection_status<'a>(fallback: &'a str, state: &'a serde_json::Value) -> &'a str {
+    state
+        .get("status")
+        .and_then(|value| value.as_str())
+        .filter(|status| !status.is_empty())
+        .unwrap_or(fallback)
+}
+
+/// `projection_hash`: the SHA-256 of the stored `fields` text, as the Postgres
+/// store keeps it. Equal hashes mean the `fields` column needs no write.
+fn fields_hash(fields_json: &str) -> String {
+    format!("{:x}", Sha256::digest(fields_json.as_bytes()))
+}
+
+fn serialize(value: &serde_json::Value) -> Result<String, PersistenceError> {
+    serde_json::to_string(value).map_err(|error| PersistenceError::Serialization(error.to_string()))
+}
+
+/// The parts of a stored catalog row that decide what a write changes.
+struct StoredCatalogRow {
+    sequence_nr: i64,
+    status: String,
+    projection_hash: String,
+    state: Option<String>,
+}
+
+/// What one projection write does to the stored row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogRowWrite {
+    /// A newer move already wrote the row.
+    Stale,
+    /// The row already holds this projection.
+    Unchanged,
+    /// There is no row yet.
+    Insert,
+    /// The row changes. Each flag says whether that part changes with it.
+    Update {
+        fields: bool,
+        state: bool,
+        index: bool,
+    },
+}
+
+/// One projection, serialized as it is stored.
+struct PreparedProjection {
+    entity_type: String,
+    entity_id: String,
+    status: String,
+    fields_json: String,
+    state_json: String,
+    projection_hash: String,
+    sequence_nr: i64,
+    indexed_fields: Vec<(String, Option<String>)>,
+    known_new: bool,
+}
+
+impl PreparedProjection {
+    fn new(projection: &QueryProjectionUpsert, status: &str) -> Result<Self, PersistenceError> {
+        let fields_json = serialize(&projection.fields)?;
+        let stored_state = catalog_state_for_storage(&projection.fields, &projection.state);
+        Ok(Self {
+            entity_type: projection.entity_type.clone(),
+            entity_id: projection.entity_id.clone(),
+            status: status.to_string(),
+            projection_hash: fields_hash(&fields_json),
+            fields_json,
+            state_json: serialize(&stored_state)?,
+            sequence_nr: i64::try_from(projection.sequence_nr).unwrap_or(i64::MAX),
+            indexed_fields: indexed_projection_fields(status, &projection.indexed_fields),
+            known_new: projection.known_new,
+        })
+    }
+
+    fn key(&self) -> (String, String) {
+        (self.entity_type.clone(), self.entity_id.clone())
+    }
+
+    fn write_against(&self, stored: Option<&StoredCatalogRow>) -> CatalogRowWrite {
+        let Some(stored) = stored else {
+            return CatalogRowWrite::Insert;
+        };
+        if stored.sequence_nr > self.sequence_nr {
+            return CatalogRowWrite::Stale;
+        }
+        let fields = stored.projection_hash != self.projection_hash;
+        let state = stored.state.as_deref() != Some(self.state_json.as_str());
+        let status = stored.status != self.status;
+        if !fields && !state && !status && stored.sequence_nr == self.sequence_nr {
+            return CatalogRowWrite::Unchanged;
+        }
+        CatalogRowWrite::Update {
+            fields,
+            state,
+            index: fields || status,
+        }
+    }
+
+    fn as_stored(&self) -> StoredCatalogRow {
+        StoredCatalogRow {
+            sequence_nr: self.sequence_nr,
+            status: self.status.clone(),
+            projection_hash: self.projection_hash.clone(),
+            state: Some(self.state_json.clone()),
+        }
+    }
+}
+
+impl TursoEventStore {
+    /// Upsert the durable query-plane projection for one entity: its
+    /// `entity_catalog` row and, when its fields or status change, its
+    /// `entity_field_index` rows.
+    ///
+    /// `fields` is the query projection of `state.fields`; the row stores
+    /// each of the record's fields once. A projection older than the stored
+    /// row is ignored, and one the row already holds writes nothing.
+    #[expect(clippy::too_many_arguments, reason = "projection upsert boundary")]
+    pub async fn upsert_query_projection_with_state(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        status: &str,
+        fields: &serde_json::Value,
+        state: &serde_json::Value,
+        sequence_nr: u64,
+    ) -> Result<(), PersistenceError> {
+        let projection = QueryProjectionUpsert {
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            status: status.to_string(),
+            fields: fields.clone(),
+            state: state.clone(),
+            indexed_fields: fields.clone(),
+            sequence_nr,
+            known_new: false,
+        };
+        let status = canonical_projection_status(status, state);
+        let prepared = PreparedProjection::new(&projection, status)?;
+        self.write_projections("turso.upsert_query_projection", tenant, vec![prepared])
+            .await
+    }
+
+    /// Upsert several durable query-plane projections in one transaction.
+    #[instrument(skip_all, fields(
+        otel.name = "turso.upsert_query_projections",
+        tenant,
+        projection_count = projections.len(),
+    ))]
+    pub async fn upsert_query_projections(
+        &self,
+        tenant: &str,
+        projections: &[QueryProjectionUpsert],
+    ) -> Result<(), PersistenceError> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        let prepared = projections
+            .iter()
+            .map(|projection| PreparedProjection::new(projection, &projection.status))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.write_projections("turso.upsert_query_projections", tenant, prepared)
+            .await
+    }
+
+    /// Write each projection against the row it finds, in order, in one
+    /// transaction.
+    async fn write_projections(
+        &self,
+        operation: &'static str,
+        tenant: &str,
+        projections: Vec<PreparedProjection>,
+    ) -> Result<(), PersistenceError> {
+        let _write_permit = self
+            .acquire_write_permit(operation, WritePriority::Low)
+            .await?;
+        let conn = self.configured_connection().await?;
+        let tx = conn.begin_immediate().await.map_err(storage_error)?;
+        let mut stored = stored_catalog_rows(&tx, tenant, &projections).await?;
+        let updated_at = sim_now().to_rfc3339();
+
+        for projection in &projections {
+            let write = projection.write_against(stored.get(&projection.key()));
+            let reindex = match write {
+                CatalogRowWrite::Stale | CatalogRowWrite::Unchanged => continue,
+                CatalogRowWrite::Insert => {
+                    insert_catalog_row(&tx, tenant, projection, &updated_at).await?;
+                    true
+                }
+                CatalogRowWrite::Update {
+                    fields,
+                    state,
+                    index,
+                } => {
+                    update_catalog_row(&tx, tenant, projection, &updated_at, fields, state).await?;
+                    index
+                }
+            };
+            if reindex {
+                rebuild_field_index(&tx, tenant, projection).await?;
+            }
+            stored.insert(projection.key(), projection.as_stored());
+        }
+
+        tx.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+}
+
+/// The stored rows of every projection not known to be new, by
+/// `(entity_type, entity_id)`.
+async fn stored_catalog_rows(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    projections: &[PreparedProjection],
+) -> Result<BTreeMap<(String, String), StoredCatalogRow>, PersistenceError> {
+    let mut stored = BTreeMap::new();
+    let candidates = projections
+        .iter()
+        .filter(|projection| !projection.known_new)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(stored);
+    }
+
+    let mut sql = String::from(
+        "SELECT entity_type, entity_id, sequence_nr, status, projection_hash, state \
+         FROM entity_catalog WHERE tenant = ? AND (",
+    );
+    let mut values = Vec::with_capacity(1 + candidates.len() * 2);
+    values.push(Value::from(tenant.to_string()));
+    for (index, projection) in candidates.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str("(entity_type = ? AND entity_id = ?)");
+        values.push(Value::from(projection.entity_type.clone()));
+        values.push(Value::from(projection.entity_id.clone()));
+    }
+    sql.push(')');
+
+    let mut rows = tx
+        .query(&sql, params_from_iter(values))
+        .await
+        .map_err(storage_error)?;
+    while let Some(row) = rows.next().await.map_err(storage_error)? {
+        let entity_type: String = row.get(0).map_err(storage_error)?;
+        let entity_id: String = row.get(1).map_err(storage_error)?;
+        stored.insert(
+            (entity_type, entity_id),
+            StoredCatalogRow {
+                sequence_nr: row.get(2).map_err(storage_error)?,
+                status: row.get(3).map_err(storage_error)?,
+                projection_hash: row.get(4).map_err(storage_error)?,
+                state: row.get(5).map_err(storage_error)?,
+            },
+        );
+    }
+    Ok(stored)
+}
+
+/// Insert a new row. A row that appeared meanwhile is overwritten only by a
+/// projection at least as new.
+async fn insert_catalog_row(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    projection: &PreparedProjection,
+    updated_at: &str,
+) -> Result<(), PersistenceError> {
+    tx.execute(
+        "INSERT INTO entity_catalog \
+         (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, ?) \
+         ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
+             status = excluded.status, \
+             fields = excluded.fields, \
+             state = excluded.state, \
+             updated_at = excluded.updated_at, \
+             sequence_nr = excluded.sequence_nr, \
+             projection_version = excluded.projection_version, \
+             projection_hash = excluded.projection_hash \
+         WHERE entity_catalog.sequence_nr <= excluded.sequence_nr",
+        params_from_iter([
+            Value::from(tenant.to_string()),
+            Value::from(projection.entity_type.clone()),
+            Value::from(projection.entity_id.clone()),
+            Value::from(projection.status.clone()),
+            Value::from(projection.fields_json.clone()),
+            Value::from(projection.state_json.clone()),
+            Value::from(updated_at.to_string()),
+            Value::from(projection.sequence_nr),
+            Value::from(projection.projection_hash.clone()),
+        ]),
+    )
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Update an existing row, setting `fields` and `state` only when they change.
+async fn update_catalog_row(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    projection: &PreparedProjection,
+    updated_at: &str,
+    fields: bool,
+    state: bool,
+) -> Result<(), PersistenceError> {
+    let mut sql = String::from(
+        "UPDATE entity_catalog SET status = ?, updated_at = ?, sequence_nr = ?, \
+         projection_version = 2, projection_hash = ?",
+    );
+    let mut values = vec![
+        Value::from(projection.status.clone()),
+        Value::from(updated_at.to_string()),
+        Value::from(projection.sequence_nr),
+        Value::from(projection.projection_hash.clone()),
+    ];
+    if fields {
+        sql.push_str(", fields = ?");
+        values.push(Value::from(projection.fields_json.clone()));
+    }
+    if state {
+        sql.push_str(", state = ?");
+        values.push(Value::from(projection.state_json.clone()));
+    }
+    sql.push_str(" WHERE tenant = ? AND entity_type = ? AND entity_id = ?");
+    values.push(Value::from(tenant.to_string()));
+    values.push(Value::from(projection.entity_type.clone()));
+    values.push(Value::from(projection.entity_id.clone()));
+    tx.execute(&sql, params_from_iter(values))
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Replace one entity's `entity_field_index` rows. Deleting them all first
+/// handles fields that disappeared.
+async fn rebuild_field_index(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    projection: &PreparedProjection,
+) -> Result<(), PersistenceError> {
+    tx.execute(
+        "DELETE FROM entity_field_index WHERE tenant = ? AND entity_type = ? AND entity_id = ?",
+        params_from_iter([
+            Value::from(tenant.to_string()),
+            Value::from(projection.entity_type.clone()),
+            Value::from(projection.entity_id.clone()),
+        ]),
+    )
+    .await
+    .map_err(storage_error)?;
+    if projection.indexed_fields.is_empty() {
+        return Ok(());
+    }
+
+    let mut sql = String::from(
+        "INSERT INTO entity_field_index \
+         (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
+    );
+    let mut values = Vec::with_capacity(projection.indexed_fields.len() * 6);
+    for (index, (field_name, field_value)) in projection.indexed_fields.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, ?)");
+        values.push(Value::from(tenant.to_string()));
+        values.push(Value::from(projection.entity_type.clone()));
+        values.push(Value::from(projection.entity_id.clone()));
+        values.push(Value::from(field_name.clone()));
+        values.push(
+            field_value
+                .as_ref()
+                .map(|value| Value::from(value.clone()))
+                .unwrap_or(Value::Null),
+        );
+        values.push(Value::from(projection.status.clone()));
+    }
+    tx.execute(&sql, params_from_iter(values))
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(sequence_nr: i64, status: &str, hash: &str, state: &str) -> StoredCatalogRow {
+        StoredCatalogRow {
+            sequence_nr,
+            status: status.to_string(),
+            projection_hash: hash.to_string(),
+            state: Some(state.to_string()),
+        }
+    }
+
+    fn prepared(sequence_nr: u64, status: &str, title: &str) -> PreparedProjection {
+        let fields = serde_json::json!({"Title": title});
+        let state = serde_json::json!({
+            "status": status,
+            "fields": fields.clone(),
+            "sequence_nr": sequence_nr,
+        });
+        let projection = QueryProjectionUpsert {
+            entity_type: "Note".to_string(),
+            entity_id: "n-1".to_string(),
+            status: status.to_string(),
+            fields: fields.clone(),
+            state,
+            indexed_fields: fields,
+            sequence_nr,
+            known_new: false,
+        };
+        PreparedProjection::new(&projection, status).expect("prepare")
+    }
+
+    #[test]
+    fn a_write_names_only_what_changes() {
+        let first = prepared(1, "Draft", "Plan");
+        let row = first.as_stored();
+        assert_eq!(first.write_against(None), CatalogRowWrite::Insert);
+        assert_eq!(first.write_against(Some(&row)), CatalogRowWrite::Unchanged);
+
+        let moved = prepared(2, "Active", "Plan");
+        assert_eq!(
+            moved.write_against(Some(&row)),
+            CatalogRowWrite::Update {
+                fields: false,
+                state: true,
+                index: true
+            }
+        );
+        let edited = prepared(2, "Draft", "Plan v2");
+        assert_eq!(
+            edited.write_against(Some(&row)),
+            CatalogRowWrite::Update {
+                fields: true,
+                state: true,
+                index: true
+            }
+        );
+        assert_eq!(
+            first.write_against(Some(&stored(5, "Draft", "", ""))),
+            CatalogRowWrite::Stale
+        );
+    }
+}
