@@ -10,6 +10,7 @@ mod error;
 mod metrics;
 mod policy_gen;
 pub mod statements;
+mod verified_token;
 
 pub use context::{
     AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
@@ -22,3 +23,4 @@ pub use policy_gen::{
     ActionScope, DurationScope, PolicyScopeMatrix, PrincipalScope, ResourceScope,
     generate_cedar_from_matrix, validate_policy_scope_matrix,
 };
+pub use verified_token::{TokenKind, VerifiedToken};

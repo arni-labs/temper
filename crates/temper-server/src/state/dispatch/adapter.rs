@@ -490,6 +490,7 @@ impl crate::state::ServerState {
                     related: BTreeMap::new(),
                     idempotency_key: Some(idempotency_key.clone()),
                     expected_authorization_precondition: None,
+                    origin: crate::entity_actor::MoveOrigin::platform(),
                 },
                 &policy,
             )

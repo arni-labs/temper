@@ -448,6 +448,7 @@ fn resolve_trigger_principal(
         _ => invoking_ctx.clone(),
     };
     ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name);
+    ctx.source = crate::entity_actor::MoveSource::Trigger;
     ctx
 }
 

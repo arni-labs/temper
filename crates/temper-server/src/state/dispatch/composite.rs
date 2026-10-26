@@ -13,9 +13,9 @@ use temper_runtime::persistence::{
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
-use crate::entity_actor::EntityState;
 use crate::entity_actor::action_input::process_action_with_blob_prestate;
 use crate::entity_actor::effects::{FieldSyncMode, build_eval_context_with_xref};
+use crate::entity_actor::{CompositeAudit, EntityEvent, EntityState, MoveOrigin};
 use crate::request_context::AgentContext;
 use crate::state::account_verification::CommonsAccountVerificationError;
 use crate::state::app_uniqueness::CommonsAppUniquenessError;
@@ -26,8 +26,10 @@ use super::DispatchError;
 
 mod helpers;
 mod projection;
+mod streams;
 mod timers;
 use helpers::*;
+use streams::StreamTarget;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompositeSubWrite {
@@ -231,6 +233,7 @@ impl crate::state::ServerState {
         if prepared_sub_writes.is_empty() {
             return Ok(true);
         }
+        let origin = MoveOrigin::of(parent.agent_ctx);
 
         let field_sync_mode = self.composite_batch_field_sync_mode(tenant, backend);
         let blob_store = self.blob_store_for_tenant(tenant).ok();
@@ -256,16 +259,15 @@ impl crate::state::ServerState {
                 )
                 .await?
         {
-            self.ensure_atomic_composite_stream(
-                &mut streams,
-                tenant,
-                parent_entity_type,
-                parent_entity_id,
-                None,
-                false,
-            )
-            .await?;
-            let event = build_composite_event(
+            let parent_target = StreamTarget {
+                entity_type: parent_entity_type,
+                entity_id: parent_entity_id,
+                preflight_target: None,
+                suppress_bootstrap_event: false,
+            };
+            self.ensure_atomic_composite_stream(&mut streams, tenant, parent_target, &origin)
+                .await?;
+            let composite = build_composite_event(
                 tenant,
                 parent_entity_type,
                 parent_entity_id,
@@ -273,6 +275,7 @@ impl crate::state::ServerState {
                 parent_idempotency,
                 prepared_sub_writes,
             );
+            let event = CompositeAudit::made_as(composite, &origin);
             let stream = streams
                 .get_mut(&parent_persistence_id)
                 .expect("parent stream inserted before composite event append");
@@ -286,15 +289,14 @@ impl crate::state::ServerState {
         let stage_started_at = timing_enabled.then(std::time::Instant::now);
         for write in prepared_sub_writes {
             let persistence_id = format!("{tenant}:{}:{}", write.entity_type, write.entity_id);
-            self.ensure_atomic_composite_stream(
-                &mut streams,
-                tenant,
-                &write.entity_type,
-                &write.entity_id,
-                write.preflight_target.as_ref(),
-                write.uses_parent_gate && write.action == "Create",
-            )
-            .await?;
+            let target = StreamTarget {
+                entity_type: &write.entity_type,
+                entity_id: &write.entity_id,
+                preflight_target: write.preflight_target.as_ref(),
+                suppress_bootstrap_event: write.uses_parent_gate && write.action == "Create",
+            };
+            self.ensure_atomic_composite_stream(&mut streams, tenant, target, &origin)
+                .await?;
 
             let table = self.transition_table_for_dispatch(tenant, &write.entity_type)?;
             let related = if table_has_cross_entity_guards_for_action(&table, &write.action) {
@@ -370,6 +372,7 @@ impl crate::state::ServerState {
                 .event
                 .expect("successful process_action returns an event");
             event.idempotency_key = Some(write.idempotency_key.clone());
+            origin.stamp(&mut event);
             stream
                 .events
                 .push(composite_envelope(&persistence_id, &event, &stream.state)?);
@@ -487,67 +490,6 @@ impl crate::state::ServerState {
         }
 
         Ok(true)
-    }
-
-    async fn ensure_atomic_composite_stream(
-        &self,
-        streams: &mut BTreeMap<String, AtomicCompositeStream>,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        preflight_target: Option<&PreflightCompositeTarget>,
-        suppress_bootstrap_event: bool,
-    ) -> Result<(), DispatchError> {
-        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-        if streams.contains_key(&persistence_id) {
-            return Ok(());
-        }
-
-        let (target_exists, mut state) = if let Some(target) = preflight_target {
-            (target.target_existed, target.state.clone())
-        } else {
-            let table = self.transition_table_for_dispatch(tenant, entity_type)?;
-            let target_exists = self
-                .ensure_entity_loaded(tenant, entity_type, entity_id)
-                .await;
-            let state = if target_exists {
-                self.get_tenant_entity_state(tenant, entity_type, entity_id)
-                    .await
-                    .map_err(DispatchError::Internal)?
-                    .state
-            } else {
-                synthetic_initial_state(entity_type, entity_id, &table)
-            };
-            (target_exists, state)
-        };
-        let expected_sequence = state.sequence_nr;
-        let mut events = Vec::new();
-        let retain_bootstrap = !suppress_bootstrap_event
-            || self
-                .transition_table_for_dispatch(tenant, entity_type)?
-                .has_input_contracts();
-        if retain_bootstrap
-            && !target_exists
-            && expected_sequence == 0
-            && state.total_event_count == 0
-        {
-            let bootstrap = crate::entity_actor::EntityEvent::bootstrap(state.status.clone());
-            events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
-            state.sequence_nr = state.sequence_nr.saturating_add(1);
-            state.push_event_bounded(bootstrap);
-        }
-        streams.insert(
-            persistence_id,
-            AtomicCompositeStream {
-                entity_type: entity_type.to_string(),
-                entity_id: entity_id.to_string(),
-                target_existed: target_exists,
-                state,
-                expected_sequence,
-                events,
-            },
-        );
-        Ok(())
     }
 
     async fn composite_event_already_persisted(
@@ -861,7 +803,7 @@ impl crate::state::ServerState {
             && (!(write.uses_parent_gate && write.action == "Create")
                 || table.has_input_contracts())
         {
-            let created = crate::entity_actor::EntityEvent::bootstrap(stream.state.status.clone());
+            let created = EntityEvent::bootstrap(stream.state.status.clone(), &Default::default());
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
         }

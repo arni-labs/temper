@@ -5,6 +5,9 @@ mod authenticated_params_test;
 #[path = "composite/defaults_test.rs"]
 mod defaults_test;
 #[cfg(feature = "sim")]
+#[path = "composite/provenance_test.rs"]
+mod provenance_test;
+#[cfg(feature = "sim")]
 #[path = "composite/state_timers_test.rs"]
 mod state_timers_test;
 use std::collections::BTreeMap;
@@ -613,6 +616,7 @@ async fn composite_app_create_sub_write_authorization_can_enforce_owner_scope() 
             },
             context_attrs: std::collections::HashMap::new(),
             correlation_id: "composite-owner-scope".to_string(),
+            token: None,
         }),
         ..Default::default()
     };

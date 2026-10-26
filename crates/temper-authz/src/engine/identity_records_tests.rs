@@ -34,6 +34,7 @@ fn admin() -> SecurityContext {
         },
         context_attrs: HashMap::new(),
         correlation_id: "test-admin".to_string(),
+        token: None,
     }
 }
 

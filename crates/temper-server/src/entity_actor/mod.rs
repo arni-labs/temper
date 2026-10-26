@@ -9,6 +9,7 @@ mod actor;
 pub(crate) mod bootstrap;
 pub mod effects;
 mod field_updates;
+pub mod provenance;
 mod replay_validation;
 pub mod sim_handler;
 mod snapshot_queue;
@@ -24,6 +25,8 @@ pub use effects::{
     ProcessResult, ScheduledAction, apply_effects, apply_new_state_fallback, build_eval_context,
     process_action, process_action_with_xref, sync_fields,
 };
+pub(crate) use provenance::CompositeAudit;
+pub use provenance::{MadeBy, MoveOrigin, MoveSource};
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
 pub use types::{EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};

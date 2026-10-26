@@ -7264,6 +7264,7 @@ dependencies = [
  "futures",
  "hyper",
  "opentelemetry",
+ "opentelemetry_sdk",
  "p256",
  "reqwest 0.12.28",
  "serde",

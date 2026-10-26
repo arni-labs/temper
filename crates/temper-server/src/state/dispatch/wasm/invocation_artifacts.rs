@@ -158,7 +158,7 @@ impl crate::state::ServerState {
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
         let callback_ctx = match agent_ctx.for_callback() {
-            Ok(context) => context,
+            Ok(context) => context.with_source(crate::entity_actor::MoveSource::Module),
             Err(error) => {
                 return self
                     .reject_generated_callback(entity_ref, callback_action, error.to_string(), mode)
@@ -211,7 +211,8 @@ impl crate::state::ServerState {
                 Ok(Some(resp))
             }
             WasmDispatchMode::Background => {
-                let callback_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx);
+                let callback_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx)
+                    .with_source(crate::entity_actor::MoveSource::Module);
                 let response = self
                     .dispatch_tenant_action(
                         entity_ref.tenant,

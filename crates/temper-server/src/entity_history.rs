@@ -16,7 +16,7 @@ use temper_runtime::persistence::{COMPOSITE_EVENT_TYPE, PersistenceEnvelope, Per
 use temper_runtime::tenant::TenantId;
 use tracing::instrument;
 
-use crate::entity_actor::EntityEvent;
+use crate::entity_actor::{CompositeAudit, EntityEvent};
 use crate::odata::read_page_budget;
 use crate::state::ServerState;
 
@@ -94,10 +94,9 @@ impl HistoryReadError {
 ///
 /// Returns `{entity_type, entity_id, events: [...], next}`, where `next` is
 /// the stored sequence to pass as `after` for the following page, or null on
-/// the last page. Journal entries that are not transitions of this entity
-/// (a composite parent's audit record) advance the cursor without appearing,
-/// so a page can hold fewer than `limit` events and still have a `next`.
-/// An undecodable transition fails the page rather than advancing past missing history.
+/// the last page. A composite parent's audit record appears as the composite
+/// action, with the sub-writes it committed in place of a state change.
+/// An undecodable entry fails the page rather than advancing past missing history.
 ///
 /// The caller must already have authorized the read.
 #[instrument(skip_all, fields(
@@ -132,12 +131,10 @@ pub(crate) async fn read_history_page(
     } else {
         None
     };
-    let mut events = Vec::with_capacity(envelopes.len());
-    for envelope in &envelopes {
-        if let Some(event) = history_event(&persistence_id, envelope)? {
-            events.push(event);
-        }
-    }
+    let events = envelopes
+        .iter()
+        .map(|envelope| history_event(&persistence_id, envelope))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let span = tracing::Span::current();
     span.record("history.returned", events.len());
@@ -150,28 +147,58 @@ pub(crate) async fn read_history_page(
     }))
 }
 
-/// Shape one journal entry as a history event, or `None` when it is not a
-/// transition of this entity.
+/// Shape one journal entry as a history event. Every event says who made the
+/// move and the dispatch path that carried it, null on entries written before
+/// the kernel recorded them.
 fn history_event(
     persistence_id: &str,
     envelope: &PersistenceEnvelope,
-) -> Result<Option<serde_json::Value>, HistoryReadError> {
+) -> Result<serde_json::Value, HistoryReadError> {
     if envelope.event_type == COMPOSITE_EVENT_TYPE {
-        return Ok(None);
+        let audit: CompositeAudit = decode(persistence_id, envelope)?;
+        let sub_writes: Vec<_> = audit
+            .composite
+            .sub_writes
+            .iter()
+            .map(|write| {
+                serde_json::json!({
+                    "entity_type": write.entity_type,
+                    "entity_id": write.entity_id,
+                    "action": write.action,
+                })
+            })
+            .collect();
+        return Ok(serde_json::json!({
+            "sequence": envelope.sequence_nr,
+            "action": audit.composite.parent_action,
+            "timestamp": envelope.metadata.timestamp,
+            "sub_writes": sub_writes,
+            "made_by": audit.made_by,
+            "source": audit.source,
+        }));
     }
-    let event =
-        serde_json::from_value::<EntityEvent>(envelope.payload.clone()).map_err(|error| {
-            HistoryReadError::Storage(PersistenceError::Serialization(format!(
-                "{persistence_id} sequence {} ({}): {error}",
-                envelope.sequence_nr, envelope.event_type
-            )))
-        })?;
-    Ok(Some(serde_json::json!({
+    let event: EntityEvent = decode(persistence_id, envelope)?;
+    Ok(serde_json::json!({
         "sequence": envelope.sequence_nr,
         "action": event.action,
         "from_state": event.from_status,
         "to_state": event.to_status,
         "timestamp": event.timestamp,
         "params": event.params,
-    })))
+        "made_by": event.made_by,
+        "source": event.source,
+    }))
+}
+
+/// Decode a journal entry's payload, naming the entry when it cannot be.
+fn decode<T: serde::de::DeserializeOwned>(
+    persistence_id: &str,
+    envelope: &PersistenceEnvelope,
+) -> Result<T, HistoryReadError> {
+    serde_json::from_value(envelope.payload.clone()).map_err(|error| {
+        HistoryReadError::Storage(PersistenceError::Serialization(format!(
+            "{persistence_id} sequence {} ({}): {error}",
+            envelope.sequence_nr, envelope.event_type
+        )))
+    })
 }

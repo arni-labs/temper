@@ -33,6 +33,7 @@ pub(super) async fn commit_field_update(
     fields: Value,
     replace: bool,
     expected_precondition: Option<String>,
+    origin: &super::MoveOrigin,
 ) -> Result<(), String> {
     if actor
         .table
@@ -93,7 +94,7 @@ pub(super) async fn commit_field_update(
         applied,
         "object-ness was checked above; the apply cannot decline"
     );
-    let mut event = field_event(action, state, &fields);
+    let mut event = field_event(action, state, &fields, origin);
 
     let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend) else {
         // No configured persistence: memory-only, as in every other handler.
@@ -138,7 +139,7 @@ pub(super) async fn commit_field_update(
                     applied,
                     "object-ness was checked above; the apply cannot decline"
                 );
-                event = field_event(action, state, &fields);
+                event = field_event(action, state, &fields, origin);
             }
             Err(e) => {
                 state.fields = previous_fields;
@@ -175,7 +176,12 @@ pub(super) async fn commit_field_update(
 const STALE_AUTHORIZATION: &str =
     "field update authorization became stale; retry against current state";
 
-fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent {
+fn field_event(
+    action: &str,
+    state: &EntityState,
+    fields: &Value,
+    origin: &super::MoveOrigin,
+) -> EntityEvent {
     EntityEvent {
         action: action.to_string(),
         from_status: state.status.clone(),
@@ -184,6 +190,8 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         params: fields.clone(),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        made_by: origin.made_by.clone(),
+        source: origin.source,
     }
 }
 

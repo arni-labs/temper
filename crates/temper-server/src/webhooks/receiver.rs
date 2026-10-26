@@ -125,6 +125,7 @@ pub async fn handle_webhook(
         session_id: None,
         agent_type: Some("webhook".to_string()),
         intent: None,
+        source: crate::entity_actor::MoveSource::Webhook,
         ..AgentContext::default()
     };
 

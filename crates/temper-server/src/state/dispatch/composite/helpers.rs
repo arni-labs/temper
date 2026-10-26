@@ -314,7 +314,7 @@ pub(super) fn build_composite_event(
 
 pub(super) fn composite_event_envelope(
     persistence_id: &str,
-    event: &CompositeEvent,
+    event: &CompositeAudit,
 ) -> Result<PersistenceEnvelope, DispatchError> {
     let payload = serde_json::to_value(event)
         .map_err(|e| DispatchError::Internal(format!("failed to serialize CompositeEvent: {e}")))?;

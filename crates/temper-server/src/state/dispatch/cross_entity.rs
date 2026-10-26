@@ -86,7 +86,11 @@ impl crate::state::ServerState {
             let initial_action = req.initial_action.clone();
             let parent_params = action_params.clone();
             let copied_fields = req.copied_fields.clone();
-            let agent = agent_ctx.clone();
+            // The child's creation and its first move are the parent's
+            // principal's, carried by the spawn.
+            let agent = agent_ctx
+                .clone()
+                .with_source(crate::entity_actor::MoveSource::Spawn);
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
                 .clone()
@@ -238,7 +242,13 @@ impl crate::state::ServerState {
                     }
 
                     match state
-                        .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
+                        .get_or_create_tenant_entity_from(
+                            &t,
+                            &child_type,
+                            &child_id,
+                            initial_fields,
+                            crate::entity_actor::MoveOrigin::of(&agent),
+                        )
                         .await
                     {
                         Ok(created) => {

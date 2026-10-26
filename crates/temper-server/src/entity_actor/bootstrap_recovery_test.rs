@@ -336,6 +336,7 @@ async fn closed_cached_actor_recovers_once_after_journal_outage() {
             "Order",
             "security-replay",
             serde_json::json!({}),
+            crate::entity_actor::MoveOrigin::platform(),
         )
         .unwrap();
     assert!(
@@ -363,6 +364,7 @@ async fn closed_cached_actor_recovers_once_after_journal_outage() {
                     "Order",
                     "security-replay",
                     serde_json::json!({}),
+                    crate::entity_actor::MoveOrigin::platform(),
                 )
                 .unwrap()
         });

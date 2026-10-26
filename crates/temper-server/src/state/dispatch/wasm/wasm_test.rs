@@ -86,6 +86,27 @@ fn internal_http_capability_carries_the_module_and_keeps_the_caller() {
 }
 
 #[test]
+fn composite_wasm_result_records_module_source_and_preserves_verified_principal() {
+    let agent = AgentContext {
+        security_ctx: Some(temper_authz::SecurityContext::from_resolved_identity(
+            "agent-1", "operator", None,
+        )),
+        agent_id: Some("agent-1".to_string()),
+        ..Default::default()
+    }
+    .with_source(crate::entity_actor::MoveSource::Http);
+
+    // This context feeds both atomic writes (including the parent audit) and
+    // fallback dispatch; the module produced the writes, even for an HTTP caller.
+    let composite_agent = agent_ctx_for_composite_wasm_result(&agent, None);
+    let original = crate::entity_actor::MoveOrigin::of(&agent);
+    let origin = crate::entity_actor::MoveOrigin::of(&composite_agent);
+    assert_eq!(origin.source, Some(crate::entity_actor::MoveSource::Module));
+    assert_eq!(origin.made_by, original.made_by);
+    assert_eq!(agent.source, crate::entity_actor::MoveSource::Http);
+}
+
+#[test]
 fn composite_wasm_result_inherits_generated_dispatch_idempotency() {
     let agent = AgentContext::for_service("version-publisher");
 

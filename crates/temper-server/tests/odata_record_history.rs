@@ -39,6 +39,7 @@ fn authenticate(mut request: Request<Body>, principal_id: &str) -> Request<Body>
         },
         context_attrs: Default::default(),
         correlation_id: "record-history-test".to_string(),
+        token: None,
     };
     request
         .extensions_mut()
@@ -419,7 +420,7 @@ async fn history_pages_a_turso_journal() {
 }
 
 #[tokio::test]
-async fn history_reports_corrupt_transitions_but_excludes_composite_audits() {
+async fn history_reports_corrupt_transitions_and_composite_audits() {
     let (state, store) = common::build_default_state(5006, "history-corrupt");
     install_policy(&state, ORDER_READ_POLICY);
     let id = "ord-history-corrupt";
@@ -445,8 +446,8 @@ async fn history_reports_corrupt_transitions_but_excludes_composite_audits() {
         &format!("/tdata/Orders('{id}')/$history?after={previous}&limit=1"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["events"], serde_json::json!([]));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert_eq!(body["error"]["code"], "HistoryReadError");
 
     let previous = envelope.sequence_nr;
     envelope.sequence_nr += 1;

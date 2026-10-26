@@ -88,6 +88,8 @@ impl From<ArmedBy> for AgentContext {
             workflow_root_entity_id: armed_by.workflow_root_entity_id,
             workflow_run_id: armed_by.workflow_run_id,
             observation_metadata: armed_by.observation_metadata,
+            // A row only ever holds a timer's identity.
+            source: crate::entity_actor::MoveSource::StateTimer,
             ..Self::default()
         }
     }

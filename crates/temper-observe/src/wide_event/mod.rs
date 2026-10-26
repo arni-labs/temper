@@ -42,8 +42,8 @@ mod tests;
 pub use agent::{LlmCallInput, ToolCallInput, from_llm_call, from_tool_call};
 pub use otel::{emit_metrics, emit_span};
 pub use runtime::{
-    AuthzDecisionInput, InvariantCheckInput, WasmInvocationInput, from_authz_decision,
-    from_invariant_check, from_wasm_invocation,
+    AuthzDecisionInput, AuthzPrincipal, InvariantCheckInput, WasmInvocationInput,
+    from_authz_decision, from_invariant_check, from_wasm_invocation,
 };
 pub use transition::{TransitionInput, from_transition};
 

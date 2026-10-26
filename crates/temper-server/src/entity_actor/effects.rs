@@ -385,6 +385,9 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 params: params.clone(),
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                // The actor records the move's origin before writing it.
+                made_by: None,
+                source: None,
             };
 
             ProcessResult {

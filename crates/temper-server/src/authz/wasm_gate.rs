@@ -215,7 +215,8 @@ fn build_wasm_security_context(ctx: &WasmAuthzContext) -> SecurityContext {
             attributes: std::collections::HashMap::new(), // determinism-ok: Principal uses HashMap
         },
         context_attrs,
-        correlation_id: uuid::Uuid::now_v7().to_string(), // determinism-ok: correlation_id for Cedar tracing only
+        correlation_id: uuid::Uuid::now_v7().to_string(), // determinism-ok: correlation_id for Cedar tracing only,
+        token: None,
     }
 }
 

@@ -68,6 +68,33 @@ pub fn from_wasm_invocation(input: WasmInvocationInput<'_>) -> WideEvent {
     }
 }
 
+/// Who asked for an authorization decision, as the kernel verified them.
+///
+/// Every field is an identifier, never a credential: the bearer token or API
+/// key that proved the principal never reaches a span.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuthzPrincipal<'a> {
+    /// Kind of principal (customer, agent, admin, system).
+    pub kind: &'a str,
+    /// Principal id.
+    pub id: &'a str,
+    /// Trusted issuer that verified the principal's token; `None` for an API
+    /// key or the kernel's own work.
+    pub issuer: Option<&'a str>,
+    /// Which kind of token the issuer signed (`human` or `access`).
+    pub token_kind: Option<&'a str>,
+    /// The token's verified `client_id` claim.
+    pub client_id: Option<&'a str>,
+    /// The token's verified `grant_id` claim.
+    pub grant_id: Option<&'a str>,
+    /// The human an agent acts for.
+    pub acting_for: Option<&'a str>,
+    /// The principal's agent type.
+    pub agent_type: Option<&'a str>,
+    /// The principal's role.
+    pub role: Option<&'a str>,
+}
+
 /// Input for building an authorization decision wide event.
 pub struct AuthzDecisionInput<'a> {
     /// Authorization action.
@@ -79,8 +106,8 @@ pub struct AuthzDecisionInput<'a> {
     /// Empty when the decision is not scoped to a single instance (for example
     /// a `list` over a whole entity set).
     pub entity_id: &'a str,
-    /// Kind of principal (user, admin, system).
-    pub principal_kind: &'a str,
+    /// Who asked.
+    pub principal: AuthzPrincipal<'a>,
     /// Decision outcome ("Allow" or "Deny").
     pub decision: &'a str,
     /// Duration in nanoseconds.
@@ -105,11 +132,25 @@ pub fn from_authz_decision(input: AuthzDecisionInput<'_>) -> WideEvent {
     tags.insert("resource_type".into(), input.resource_type.into());
     tags.insert("decision".into(), input.decision.into());
 
+    // The principal stays in attributes, never tags: ids are high-cardinality
+    // and would multiply the metric series. An absent fact is left out.
+    let principal = input.principal;
     let mut attributes = BTreeMap::new();
-    attributes.insert(
-        "principal_kind".into(),
-        serde_json::json!(input.principal_kind),
-    );
+    for (key, value) in [
+        ("principal_kind", Some(principal.kind)),
+        ("principal_id", Some(principal.id)),
+        ("principal_issuer", principal.issuer),
+        ("principal_token_kind", principal.token_kind),
+        ("principal_client_id", principal.client_id),
+        ("principal_grant_id", principal.grant_id),
+        ("principal_acting_for", principal.acting_for),
+        ("principal_agent_type", principal.agent_type),
+        ("principal_role", principal.role),
+    ] {
+        if let Some(value) = value {
+            attributes.insert(key.into(), serde_json::json!(value));
+        }
+    }
     attributes.insert("tenant".into(), serde_json::json!(input.tenant));
     // entity_id stays an attribute, never a tag: it is high-cardinality and
     // would multiply the metric series (the cost decoupling in this module).

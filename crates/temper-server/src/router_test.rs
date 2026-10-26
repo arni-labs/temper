@@ -26,6 +26,7 @@ fn test_security_context() -> temper_authz::SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "router-test".to_string(),
+        token: None,
     }
 }
 
@@ -41,6 +42,7 @@ fn claimed_admin_security_context() -> temper_authz::SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "router-admin-side-channel-test".to_string(),
+        token: None,
     }
 }
 
@@ -994,6 +996,7 @@ async fn test_data_only_create_fast_path_declines_action_bearing_entities() {
             "Order",
             "order-fast-path-skip",
             serde_json::json!({"Id": "order-fast-path-skip", "Status": "Draft"}),
+            &crate::entity_actor::MoveOrigin::platform(),
         )
         .await
         .unwrap();

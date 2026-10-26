@@ -742,11 +742,16 @@ pub async fn handle_odata_post(
                 }
             }
 
+            let origin = crate::entity_actor::MoveOrigin::of(&agent_ctx);
             // A new entity's first event holds its initial fields: one too large is
             // refused here, before any create path starts.
-            if let Err(error) =
-                state.check_created_event_size(&tenant, &entity_type, &entity_id, &initial_fields)
-            {
+            if let Err(error) = state.check_created_event_size(
+                &tenant,
+                &entity_type,
+                &entity_id,
+                &initial_fields,
+                &origin,
+            ) {
                 let (status, code) = match error {
                     PersistenceError::EventTooLarge { .. } => {
                         (StatusCode::PAYLOAD_TOO_LARGE, "EventTooLarge")
@@ -762,6 +767,7 @@ pub async fn handle_odata_post(
                     &entity_type,
                     &entity_id,
                     initial_fields.clone(),
+                    &origin,
                 )
                 .await
             {
@@ -787,7 +793,13 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
+                .get_or_create_tenant_entity_from(
+                    &tenant,
+                    &entity_type,
+                    &entity_id,
+                    initial_fields,
+                    origin,
+                )
                 .await
             {
                 Ok(response) => {
@@ -1158,8 +1170,11 @@ pub async fn handle_odata_patch(
                     &tenant,
                     &entity_type,
                     &key_str,
-                    body_json,
-                    false,
+                    crate::state::FieldUpdate {
+                        fields: body_json,
+                        replace: false,
+                        origin: crate::entity_actor::MoveOrigin::of(&agent_ctx),
+                    },
                     existing.precondition,
                 )
                 .await
@@ -1393,8 +1408,11 @@ pub async fn handle_odata_put(
                     &tenant,
                     &entity_type,
                     &key_str,
-                    body_json,
-                    true,
+                    crate::state::FieldUpdate {
+                        fields: body_json,
+                        replace: true,
+                        origin: crate::entity_actor::MoveOrigin::of(&agent_ctx),
+                    },
                     existing.precondition,
                 )
                 .await
@@ -1574,6 +1592,7 @@ pub async fn handle_odata_delete(
                     &entity_type,
                     &key_str,
                     existing.precondition,
+                    crate::entity_actor::MoveOrigin::of(&agent_ctx),
                 )
                 .await
             {

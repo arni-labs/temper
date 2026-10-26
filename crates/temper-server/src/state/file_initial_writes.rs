@@ -130,8 +130,9 @@ impl ServerState {
         let initial = state.clone();
         let mut events = Vec::with_capacity(3);
 
-        let created = EntityEvent::bootstrap(state.status.clone());
-        push_synthetic_event(&mut state, &mut events, created);
+        let origin = crate::entity_actor::MoveOrigin::of(agent_ctx);
+        let created = EntityEvent::bootstrap(state.status.clone(), &origin);
+        push_synthetic_event(&mut state, &mut events, &origin, created);
 
         let no_xref = std::collections::BTreeMap::new();
         if create_params
@@ -140,7 +141,7 @@ impl ServerState {
         {
             let create_event =
                 apply_synthetic_file_action(&mut state, &table, "Create", create_params, &no_xref)?;
-            push_synthetic_event(&mut state, &mut events, create_event);
+            push_synthetic_event(&mut state, &mut events, &origin, create_event);
         }
 
         let version_number = state.counters.get("version_count").copied().unwrap_or(0) + 1;
@@ -178,7 +179,7 @@ impl ServerState {
             stream_params,
             &stream_xref,
         )?;
-        push_synthetic_event(&mut state, &mut events, stream_event);
+        push_synthetic_event(&mut state, &mut events, &origin, stream_event);
 
         let envelopes = events
             .iter()
@@ -433,8 +434,10 @@ fn apply_synthetic_file_action(
 fn push_synthetic_event(
     state: &mut EntityState,
     events: &mut Vec<EntityEvent>,
-    event: EntityEvent,
+    origin: &crate::entity_actor::MoveOrigin,
+    mut event: EntityEvent,
 ) {
+    origin.stamp(&mut event);
     state.sequence_nr = state.sequence_nr.saturating_add(1);
     state.push_event_bounded(event.clone());
     events.push(event);
