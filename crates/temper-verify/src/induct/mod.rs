@@ -20,6 +20,7 @@
 mod cedar;
 mod effects;
 mod encode;
+mod guess;
 mod live;
 mod moves;
 mod run;
@@ -27,13 +28,15 @@ mod solver;
 mod vocab;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use temper_authz::SendAnalysis;
+use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name};
 
 use encode::{Enc, initial, prelude};
+use guess::Guess;
 pub use live::{Measure, Region};
 use moves::Moves;
 use run::{Ask, few_in_flight, run};
@@ -95,6 +98,9 @@ pub struct RuleProof {
     /// What the rule itself reads that the proof does not hold, each read
     /// as an unknown.
     pub unheld: BTreeSet<String>,
+    /// The prover's own guesses the proof kept, when the agent gave no
+    /// lemmas.
+    pub found: Vec<String>,
     /// What the solver refused, such as a lemma naming an unknown kind.
     pub errors: Vec<String>,
     /// Wall time, from reading the specs to the last check.
@@ -103,6 +109,24 @@ pub struct RuleProof {
 
 impl RuleProof {
     pub fn proved(&self) -> bool {
+        self.errors.is_empty()
+            && self
+                .obligations
+                .iter()
+                .all(|o| matches!(o.outcome, Outcome::Holds))
+    }
+}
+
+/// One attempt at a rule: its obligations, what the solver refused, and the
+/// guesses it held.
+struct Attempt {
+    obligations: Vec<Obligation>,
+    errors: Vec<String>,
+    kept: Vec<String>,
+}
+
+impl Attempt {
+    fn proved(&self) -> bool {
         self.errors.is_empty()
             && self
                 .obligations
@@ -143,12 +167,18 @@ pub fn prove(
     // machine's cores.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let solvers = (cores / rules.len().max(1)).max(1);
+    // What Cedar answers is the same for every rule.
+    let answered = &Mutex::new(BTreeMap::new());
     std::thread::scope(|scope| {
         let proofs: Vec<_> = rules
             .iter()
             .map(|&(owner, name, rule)| {
                 let by_name = &by_name;
-                scope.spawn(move || prove_one(by_name, owner, name, rule, hints, policies, solvers))
+                scope.spawn(move || {
+                    prove_one(
+                        by_name, owner, name, rule, hints, policies, answered, solvers,
+                    )
+                })
             })
             .collect();
         proofs
@@ -173,6 +203,7 @@ fn prove_one(
     kind: Rule<'_>,
     hints: &Hints,
     policies: Option<&SendAnalysis>,
+    answered: &Mutex<BTreeMap<String, May>>,
     solvers: usize,
 ) -> std::io::Result<RuleProof> {
     let start = Instant::now();
@@ -190,86 +221,167 @@ fn prove_one(
     let lemmas: Vec<&Lemma> = hints.lemma.iter().filter(|l| l.rule == rule).collect();
     let regions: Vec<&Region> = hints.region.iter().filter(|r| r.rule == rule).collect();
     let measure = hints.measure.iter().find(|m| m.rule == rule);
-    let v = Vocab::new(by_name.clone(), scope.clone(), policies);
+    let v = Vocab::new(by_name.clone(), scope.clone(), policies, answered);
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);
     let moves = builder.all();
     let read_by_moves = enc.take_unheld();
     enc.expr(expr, owner, "pre");
     let unheld = enc.take_unheld();
-    // The clauses of J, by name, as functions of the frame.
-    let clause = |frame: &str| -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        if let Rule::Always(assert) = kind {
-            out.push((
-                rule.to_string(),
-                format!("(=> {frame}.settled {})", enc.expr(assert, owner, frame)),
-            ));
-        }
-        out.extend(
-            lemmas
+    // One attempt with `guesses`, dropping those a move breaks until the
+    // rest hold or the rule fails; `None` once every guess is dropped,
+    // unless the attempt may go on with none.
+    let attempt = |mut guesses: Vec<Guess>, bare: bool| -> std::io::Result<Option<Attempt>> {
+        loop {
+            let guessed: BTreeSet<String> = guesses.iter().map(|g| g.name(rule)).collect();
+            // The clauses of J, by name, as functions of the frame.
+            let clause = |frame: &str| -> Vec<(String, String)> {
+                let mut out = Vec::new();
+                if let Rule::Always(assert) = kind {
+                    let holds = enc.expr(assert, owner, frame);
+                    out.push((rule.to_string(), format!("(=> {frame}.settled {holds})")));
+                    out.extend(
+                        guesses
+                            .iter()
+                            .map(|g| (g.name(rule), g.read(frame, &holds))),
+                    );
+                }
+                out.extend(
+                    lemmas
+                        .iter()
+                        .map(|l| (l.name.clone(), l.assert.replace('$', &format!("{frame}."))))
+                        .collect::<Vec<_>>(),
+                );
+                out
+            };
+            let mut asks = Vec::new();
+            // The start.
+            {
+                let at_start = clause("pre");
+                let mut text = String::from("(push 1)\n");
+                enc.take_decls()
+                    .iter()
+                    .for_each(|d| text.push_str(&format!("{d}\n")));
+                for fact in initial(&v) {
+                    text.push_str(&format!("(assert {fact})\n"));
+                }
+                asks.push(Ask::new(&v, "start", text, at_start.clone(), &at_start));
+            }
+            for mv in &moves {
+                let before = clause("pre");
+                let after = clause("post");
+                let decls = enc.take_decls();
+                let mut text = String::from("(push 1)\n");
+                decls
+                    .iter()
+                    .chain(&mv.decls)
+                    .for_each(|d| text.push_str(&format!("{d}\n")));
+                for (_, c) in &before {
+                    text.push_str(&format!("(assert {c})\n"));
+                }
+                for fact in mv.body() {
+                    text.push_str(&format!("(assert {fact})\n"));
+                }
+                asks.push(Ask::new(&v, &mv.label, text, after, &before));
+            }
+            let mut errors = Vec::new();
+            if let Rule::Eventually(goal, relies_on) = kind {
+                let live = live::Live {
+                    owner,
+                    goal,
+                    relies_on,
+                    measure,
+                    regions: regions.clone(),
+                };
+                live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
+            }
+            let solvers = solvers.clamp(1, asks.len().max(1));
+            // The string literals the obligations name, each distinct from the
+            // others, and the empty string a parameter is checked against.
+            let mut literals = BTreeSet::from([String::new()]);
+            for ask in &asks {
+                literals.extend(quoted_literals(&ask.text));
+                for (_, c) in &ask.goal {
+                    literals.extend(quoted_literals(c));
+                }
+            }
+            let prelude = prelude(&v, &literals);
+            let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
+            let few = few_in_flight(&v);
+            let (mut obligations, mut refused) =
+                run(rule, &prelude, &few, &shown, &asks, solvers, &guessed)?;
+            errors.append(&mut refused);
+            fn broken(o: &Obligation) -> Option<&Vec<String>> {
+                match &o.outcome {
+                    Outcome::Fails { clauses, .. } => Some(clauses),
+                    _ => None,
+                }
+            }
+            let only_guesses = |o: &Obligation| {
+                broken(o).is_some_and(|c| !c.is_empty() && c.iter().all(|n| guessed.contains(n)))
+            };
+            let dropped: BTreeSet<String> = obligations
                 .iter()
-                .map(|l| (l.name.clone(), l.assert.replace('$', &format!("{frame}."))))
-                .collect::<Vec<_>>(),
-        );
-        out
+                .filter(|o| only_guesses(o))
+                .filter_map(broken)
+                .flatten()
+                .cloned()
+                .collect();
+            let failed = obligations
+                .iter()
+                .any(|o| !matches!(o.outcome, Outcome::Holds) && !only_guesses(o));
+            if failed || dropped.is_empty() || !errors.is_empty() {
+                obligations.retain(|o| !only_guesses(o));
+                return Ok(Some(Attempt {
+                    obligations,
+                    errors,
+                    kept: guesses.iter().map(|g| g.name(rule)).collect(),
+                }));
+            }
+            guesses.retain(|g| !dropped.contains(&g.name(rule)));
+            if guesses.is_empty() && !bare {
+                return Ok(None);
+            }
+        }
     };
-    let mut asks = Vec::new();
-    // The start.
+    // An invariant the agent gave no lemmas is tried at every state, and
+    // as it is once that is dropped; then with the prover's guesses about
+    // the flags it reads. A failure with more clauses held replaces the one
+    // before.
+    let tries = match kind {
+        Rule::Always(_) if lemmas.is_empty() => {
+            let all = Guess::all(&v, owner, expr);
+            let mut tries = vec![(vec![Guess::Everywhere], true)];
+            if all.len() > 1 {
+                tries.push((all, false));
+            }
+            tries
+        }
+        _ => vec![(Vec::new(), true)],
+    };
+    let mut last = None;
+    for (guesses, bare) in tries {
+        if let Some(tried) = attempt(guesses, bare)? {
+            let proved = tried.proved();
+            last = Some(tried);
+            if proved {
+                break;
+            }
+        }
+    }
+    let Attempt {
+        obligations,
+        errors,
+        kept,
+    } = last.expect("the first attempt holds no guess to drop");
+    let found = match errors.is_empty()
+        && obligations
+            .iter()
+            .all(|o| matches!(o.outcome, Outcome::Holds))
     {
-        let at_start = clause("pre");
-        let mut text = String::from("(push 1)\n");
-        enc.take_decls()
-            .iter()
-            .for_each(|d| text.push_str(&format!("{d}\n")));
-        for fact in initial(&v) {
-            text.push_str(&format!("(assert {fact})\n"));
-        }
-        asks.push(Ask::new(&v, "start", text, at_start.clone(), &at_start));
-    }
-    for mv in &moves {
-        let before = clause("pre");
-        let after = clause("post");
-        let decls = enc.take_decls();
-        let mut text = String::from("(push 1)\n");
-        decls
-            .iter()
-            .chain(&mv.decls)
-            .for_each(|d| text.push_str(&format!("{d}\n")));
-        for (_, c) in &before {
-            text.push_str(&format!("(assert {c})\n"));
-        }
-        for fact in mv.body() {
-            text.push_str(&format!("(assert {fact})\n"));
-        }
-        asks.push(Ask::new(&v, &mv.label, text, after, &before));
-    }
-    let mut errors = Vec::new();
-    if let Rule::Eventually(goal, relies_on) = kind {
-        let live = live::Live {
-            owner,
-            goal,
-            relies_on,
-            measure,
-            regions,
-        };
-        live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
-    }
-    let solvers = solvers.clamp(1, asks.len().max(1));
-    // The string literals the obligations name, each distinct from the
-    // others, and the empty string a parameter is checked against.
-    let mut literals = BTreeSet::from([String::new()]);
-    for ask in &asks {
-        literals.extend(quoted_literals(&ask.text));
-        for (_, c) in &ask.goal {
-            literals.extend(quoted_literals(c));
-        }
-    }
-    let prelude = prelude(&v, &literals);
-    let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
-    let (obligations, mut refused) =
-        run(rule, &prelude, &few_in_flight(&v), &shown, &asks, solvers)?;
-    errors.append(&mut refused);
+        true => kept,
+        false => Vec::new(),
+    };
     let mut limits: Vec<String> = builder.limits.into_inner().into_iter().collect();
     limits.extend(
         read_by_moves
@@ -282,6 +394,7 @@ fn prove_one(
         obligations,
         limits,
         unheld,
+        found,
         errors,
         took: start.elapsed(),
     })

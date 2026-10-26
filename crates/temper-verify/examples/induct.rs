@@ -30,7 +30,17 @@ fn main() -> std::io::Result<()> {
     names.sort();
     for path in names {
         let text = std::fs::read_to_string(&path).expect("spec");
-        automatons.push(temper_spec::automaton::parse_automaton(&text).expect("spec parses"));
+        // A spec in the old predicate grammar is read as its migration.
+        let automaton = temper_spec::automaton::parse_automaton(&text)
+            .map_err(|e| e.to_string())
+            .or_else(|_| {
+                let migrated = temper_spec::automaton::legacy::migrate_source(&text)?;
+                temper_spec::automaton::parse_automaton(&migrated.source).map_err(|e| e.to_string())
+            });
+        match automaton {
+            Ok(automaton) => automatons.push(automaton),
+            Err(e) => println!("skipped {}: {e}", path.display()),
+        }
     }
     let mut files: Vec<_> = std::fs::read_dir(format!("{dir}/policies"))
         .map(|entries| entries.map(|e| e.expect("dir entry").path()).collect())
@@ -109,6 +119,13 @@ fn main() -> std::io::Result<()> {
                 "  {} moves never possible where the clauses hold: {}",
                 never.len(),
                 never.join("; ")
+            )?;
+        }
+        if !proof.found.is_empty() {
+            writeln!(
+                out,
+                "  kept the prover's guesses: {}",
+                proof.found.join("; ")
             )?;
         }
         for reason in &proof.unheld {

@@ -2,8 +2,8 @@
 //! rule names, one per type with the same id, the dispatches in flight
 //! between them by kind, and what Cedar lets each sender send.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::{
@@ -96,7 +96,7 @@ pub(super) struct Vocab<'a> {
     pub(super) policies: Option<&'a SendAnalysis>,
     /// Cedar's answers so far, by question: the moves of each region ask
     /// the same ones again.
-    pub(super) answered: RefCell<BTreeMap<String, May>>,
+    pub(super) answered: &'a Mutex<BTreeMap<String, May>>,
 }
 
 impl<'a> Vocab<'a> {
@@ -104,6 +104,7 @@ impl<'a> Vocab<'a> {
         by_name: BTreeMap<&'a str, &'a Automaton>,
         scope: BTreeSet<String>,
         policies: Option<&'a SendAnalysis>,
+        answered: &'a Mutex<BTreeMap<String, May>>,
     ) -> Self {
         let mut vars = BTreeMap::new();
         for entity in &scope {
@@ -122,7 +123,7 @@ impl<'a> Vocab<'a> {
             kinds: Vec::new(),
             calls: Vec::new(),
             policies,
-            answered: RefCell::default(),
+            answered,
         };
         vocab.kinds = vocab.read_kinds();
         vocab.calls = vocab.read_calls();
