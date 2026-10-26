@@ -8,8 +8,6 @@ use serde_json::Value;
 pub struct AuthzResponse {
     /// Whether the action was allowed by Cedar policy.
     pub allowed: bool,
-    /// Decision ID for pending/escalated decisions.
-    pub decision_id: Option<String>,
     /// Human-readable reason for the decision.
     pub reason: Option<String>,
 }
@@ -50,22 +48,19 @@ mod tests {
     fn authz_response_serde_roundtrip() {
         let resp = AuthzResponse {
             allowed: true,
-            decision_id: Some("dec-123".into()),
             reason: Some("policy matched".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: AuthzResponse = serde_json::from_str(&json).unwrap();
         assert!(back.allowed);
-        assert_eq!(back.decision_id.unwrap(), "dec-123");
         assert_eq!(back.reason.unwrap(), "policy matched");
     }
 
     #[test]
     fn authz_response_minimal() {
-        let json = r#"{"allowed":false,"decision_id":null,"reason":null}"#;
+        let json = r#"{"allowed":false,"reason":null}"#;
         let resp: AuthzResponse = serde_json::from_str(json).unwrap();
         assert!(!resp.allowed);
-        assert!(resp.decision_id.is_none());
         assert!(resp.reason.is_none());
     }
 

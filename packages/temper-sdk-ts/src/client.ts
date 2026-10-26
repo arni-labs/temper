@@ -19,8 +19,6 @@ export interface TemperClientConfig {
 export interface AuthzResponse {
   /** Whether the action was allowed by Cedar policy. */
   allowed: boolean;
-  /** Decision ID for pending/escalated decisions. */
-  decision_id?: string;
   /** Human-readable reason for the decision. */
   reason?: string;
 }

@@ -260,10 +260,6 @@ impl TemperClient {
                 .get("allowed")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-            decision_id: resp_json
-                .get("decision_id")
-                .and_then(|v| v.as_str())
-                .map(String::from),
             reason: resp_json
                 .get("reason")
                 .and_then(|v| v.as_str())

@@ -10,24 +10,43 @@ use temper_authz::AuthenticatedRequestContext;
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
-use crate::authz::{DenialInput, record_authz_denial, require_authenticated_context};
+use crate::authz::require_authenticated_context;
 use crate::state::{ServerState, TrajectoryEntry, TrajectorySource};
 
-/// Request body for POST /api/authorize.
+/// Request body for POST /api/authorize. SDK single-pair callers remain supported.
 #[derive(serde::Deserialize)]
-pub(crate) struct AuthorizeRequest {
-    agent_id: String,
-    action: String,
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum AuthorizeRequest {
+    Batch {
+        agent_id: String,
+        records: Vec<AuthorizeRecord>,
+    },
+    Single {
+        agent_id: String,
+        action: String,
+        resource_type: String,
+        resource_id: String,
+        #[serde(default)]
+        context: serde_json::Value,
+    },
+}
+
+/// One record's context is prepared once and shared by all requested actions.
+#[derive(serde::Deserialize)]
+pub(crate) struct AuthorizeRecord {
     resource_type: String,
     resource_id: String,
+    actions: Vec<String>,
     #[serde(default)]
     context: serde_json::Value,
 }
 
-/// POST /api/authorize — lightweight Cedar authorization check for agent tool calls.
+/// POST /api/authorize asks a question; it never requests human approval.
 ///
-/// Always returns HTTP 200. The agent handles both outcomes programmatically.
-/// On deny, creates a `PendingDecision` for human review.
+/// A batch performs one Cedar check per action, with zero record store reads:
+/// like the single-pair API, it evaluates the supplied context, not a dispatch
+/// snapshot. Each record's context is prepared once. Axum's request body limit
+/// bounds input bytes; there is no arbitrary record/action count cap.
 #[instrument(skip_all, fields(otel.name = "POST /api/authorize"))]
 pub(crate) async fn handle_authorize(
     State(state): State<ServerState>,
@@ -39,7 +58,26 @@ pub(crate) async fn handle_authorize(
         Err(status) => return status.into_response(),
     };
     let security_ctx = authenticated.security_context();
-    if body.agent_id != security_ctx.principal.id {
+    let (agent_id, records, single) = match body {
+        AuthorizeRequest::Batch { agent_id, records } => (agent_id, records, false),
+        AuthorizeRequest::Single {
+            agent_id,
+            action,
+            resource_type,
+            resource_id,
+            context,
+        } => (
+            agent_id,
+            vec![AuthorizeRecord {
+                resource_type,
+                resource_id,
+                actions: vec![action],
+                context,
+            }],
+            true,
+        ),
+    };
+    if agent_id != security_ctx.principal.id {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
@@ -48,79 +86,103 @@ pub(crate) async fn handle_authorize(
         )
             .into_response();
     }
-    let mut resource_attrs = match body.context {
-        serde_json::Value::Null => std::collections::BTreeMap::new(),
-        serde_json::Value::Object(context) => context.into_iter().collect(),
-        _ => {
+    // Validate every context before evaluating any action or writing trajectories.
+    let mut prepared = Vec::with_capacity(records.len());
+    for record in records {
+        let mut attrs: std::collections::BTreeMap<String, serde_json::Value> = match record.context
+        {
+            serde_json::Value::Null => Default::default(),
+            serde_json::Value::Object(context) => context.into_iter().collect(),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": "context must be a JSON object"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        // Caller context cannot replace the canonical Cedar resource UID.
+        attrs.insert(
+            "id".into(),
+            serde_json::Value::String(record.resource_id.clone()),
+        );
+        prepared.push((
+            record.resource_type,
+            record.resource_id,
+            record.actions,
+            attrs,
+        ));
+    }
+    let tenant = authenticated.tenant();
+    let mut results = Vec::with_capacity(prepared.len());
+    for (resource_type, resource_id, actions, attrs) in prepared {
+        let mut answers = Vec::with_capacity(actions.len());
+        for action in actions {
+            let result = state.authorize_with_context(
+                security_ctx,
+                &action,
+                &resource_type,
+                &attrs,
+                tenant.as_str(),
+            );
+            let reason = result.err().map(|denial| denial.to_string());
+            if let Some(reason) = &reason {
+                // Preserve the existing denial trajectory without filing a decision,
+                // broadcasting an approval request, or feeding denial patterns.
+                let entry = TrajectoryEntry {
+                    timestamp: sim_now().to_rfc3339(),
+                    tenant: tenant.as_str().to_string(),
+                    entity_type: resource_type.clone(),
+                    entity_id: resource_id.clone(),
+                    action: action.clone(),
+                    success: false,
+                    from_status: None,
+                    to_status: None,
+                    error: Some(reason.clone()),
+                    agent_id: Some(security_ctx.principal.id.clone()),
+                    session_id: authenticated.session_id().map(str::to_string).or_else(|| {
+                        security_ctx
+                            .context_attrs
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    }),
+                    authz_denied: Some(true),
+                    denied_resource: Some(format!("{resource_type}:{resource_id}")),
+                    denied_module: None,
+                    source: Some(TrajectorySource::Authz),
+                    spec_governed: Some(false),
+                    agent_type: security_ctx.principal.agent_type.clone(),
+                    request_body: Some(serde_json::json!(attrs)),
+                    intent: authenticated.intent().map(str::to_string),
+                    matched_policy_ids: None,
+                    capture_seq: None,
+                };
+                if !state.enqueue_trajectory_entry(entry) {
+                    tracing::warn!("failed to enqueue authorize trajectory entry");
+                }
+            }
+            answers.push(serde_json::json!({ "action": action, "allowed": reason.is_none(), "reason": reason }));
+        }
+        if single {
+            let answer = &answers[0];
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::OK,
                 axum::Json(serde_json::json!({
-                    "error": "context must be a JSON object"
+                    "allowed": answer["allowed"], "reason": answer["reason"]
                 })),
             )
                 .into_response();
         }
-    };
-    // The requested resource identity is canonical. Caller-supplied context
-    // may enrich the resource, but can never replace the UID Cedar evaluates.
-    resource_attrs.insert(
-        "id".to_string(),
-        serde_json::Value::String(body.resource_id.clone()),
-    );
-    let tenant = authenticated.tenant();
-
-    match state.authorize_with_context(
-        security_ctx,
-        &body.action,
-        &body.resource_type,
-        &resource_attrs,
-        tenant.as_str(),
-    ) {
-        Ok(()) => (
-            StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "allowed": true,
-            })),
-        )
-            .into_response(),
-        Err(denial) => {
-            let reason = denial.to_string();
-
-            let pd = record_authz_denial(
-                &state,
-                DenialInput {
-                    tenant: tenant.as_str(),
-                    security_ctx,
-                    agent_id_override: None,
-                    action: &body.action,
-                    resource_type: &body.resource_type,
-                    resource_id: &body.resource_id,
-                    resource_attrs: serde_json::Value::Object(
-                        resource_attrs.clone().into_iter().collect(),
-                    ),
-                    reason: &reason,
-                    module_name: None,
-                    from_status: None,
-                    intent: authenticated.intent().map(str::to_string),
-                    session_id: authenticated.session_id().map(str::to_string),
-                    // Pre-flight probe: action, resource type, and session are
-                    // caller-chosen, so this row must never enter a conformance verdict.
-                    spec_governed: Some(false),
-                },
-            )
-            .await;
-
-            (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "allowed": false,
-                    "decision_id": pd.id,
-                    "reason": reason,
-                })),
-            )
-                .into_response()
-        }
+        results.push(serde_json::json!({ "resource_type": resource_type, "resource_id": resource_id, "actions": answers }));
     }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "records": results })),
+    )
+        .into_response()
 }
 
 /// Request body for POST /api/audit.
