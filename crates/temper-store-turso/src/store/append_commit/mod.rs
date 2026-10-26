@@ -41,8 +41,10 @@ use crate::driver::Transaction;
 use crate::metrics::record_turso_write_retry;
 use crate::retry::{is_transient_write_error, retry_delay_ms};
 
+mod entity_rows;
 mod write;
 
+use entity_rows::EntityRows;
 use write::{write_append, write_batch};
 
 /// One append, owned, so a task can run it whatever happens to its caller.
@@ -53,11 +55,13 @@ pub(super) struct OwnedAppend {
     events: Vec<PersistenceEnvelope>,
     scheduled_actions: Vec<ScheduledActionRecord>,
     fired_scheduled_action: Option<String>,
+    entity_rows: EntityRows,
 }
 
 impl OwnedAppend {
-    /// `events` after `expected_sequence`, with the scheduled-action rows of
-    /// `rows` (the rows Turso keeps in the journal's transaction).
+    /// `events` after `expected_sequence`, with the rows of `rows`: its
+    /// scheduled actions, and the entity's query-plane, timer and vector
+    /// rows. Turso keeps them all in the journal's transaction.
     pub(super) fn new(
         persistence_id: &str,
         expected_sequence: u64,
@@ -70,6 +74,7 @@ impl OwnedAppend {
             events: events.to_vec(),
             scheduled_actions: rows.scheduled_actions.to_vec(),
             fired_scheduled_action: rows.fired_scheduled_action.map(str::to_string),
+            entity_rows: EntityRows::new(&rows),
         }
     }
 }
