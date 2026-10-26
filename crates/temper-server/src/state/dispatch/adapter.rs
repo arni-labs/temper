@@ -597,6 +597,7 @@ impl crate::state::ServerState {
                     .await;
             }
         };
+        let values = callback_params.clone();
         match mode {
             WasmDispatchMode::Inline => {
                 let resp = super::wasm::dispatch_callback_action_boxed(
@@ -615,10 +616,11 @@ impl crate::state::ServerState {
                 .await
                 .map_err(|e| e.to_string())?;
                 if !resp.success {
-                    self.record_generated_callback_refusal(
+                    self.record_answer_refusal(
                         entity_ref,
                         callback_action,
                         resp.error.as_deref().unwrap_or("callback rejected"),
+                        &values,
                     );
                 }
                 Ok(Some(resp))
@@ -643,10 +645,11 @@ impl crate::state::ServerState {
                         msg
                     })?;
                 if !response.success {
-                    self.record_generated_callback_refusal(
+                    self.record_answer_refusal(
                         entity_ref,
                         callback_action,
                         response.error.as_deref().unwrap_or("callback rejected"),
+                        &values,
                     );
                 }
                 Ok(None)
