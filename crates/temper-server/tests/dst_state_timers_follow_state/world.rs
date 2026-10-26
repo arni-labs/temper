@@ -16,6 +16,7 @@ use temper_server::storage::StateTimerStore;
 pub(crate) struct SimTimerRows {
     rows: Mutex<BTreeMap<(String, String, String), StateTimerRecord>>,
     rng: Mutex<DeterministicRng>,
+    listing_failures: Mutex<BTreeMap<String, usize>>,
     /// A write takes fewer scheduler turns than this to land.
     round_trip_turns: usize,
 }
@@ -31,9 +32,18 @@ impl SimTimerRows {
     pub(crate) fn with_round_trips(seed: u64, turns: usize) -> Self {
         Self {
             rows: Mutex::new(BTreeMap::new()),
+            listing_failures: Mutex::new(BTreeMap::new()),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x7177_e125)),
             round_trip_turns: turns,
         }
+    }
+
+    /// Fail the next listings for a tenant without losing its saved rows.
+    pub(crate) fn fail_next_listings(&self, tenant: &str, count: usize) {
+        self.listing_failures
+            .lock()
+            .unwrap()
+            .insert(tenant.into(), count);
     }
 
     /// The record's row now.
@@ -95,6 +105,14 @@ impl StateTimerStore for SimTimerRows {
         &self,
         tenant: &str,
     ) -> Result<Vec<StateTimerRecord>, PersistenceError> {
+        if let Some(left) = self.listing_failures.lock().unwrap().get_mut(tenant) {
+            if *left > 0 {
+                *left -= 1;
+                return Err(PersistenceError::Storage(
+                    "injected timer listing failure".into(),
+                ));
+            }
+        }
         let rows = self.rows.lock().unwrap();
         Ok(rows
             .values()

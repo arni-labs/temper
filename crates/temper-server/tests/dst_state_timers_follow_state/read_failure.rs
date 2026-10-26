@@ -65,3 +65,110 @@ fn install_retries_unreadable_record_without_a_timer() {
     });
     second.kill(&world, Duration::ZERO);
 }
+
+/// A failed row read is not evidence that a record has no saved caller.
+#[test]
+fn dst_boot_retries_timer_rows_without_replacing_saved_callers() {
+    check_seeds(|seed| {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = World {
+            events: SimEventStore::no_faults(seed),
+            rows: Arc::new(SimTimerRows::new(seed)),
+            clock,
+        };
+        let job = Job {
+            tenant: TenantId::new("alpha"),
+            id: "saved-caller".into(),
+        };
+        let first = Process::start(&world, JOB_V1, &job_untimed(), "row-read-a");
+        first.runtime.block_on(async {
+            first
+                .state
+                .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
+                .await
+                .unwrap();
+            assert!(act(&first.state, &job, "Start").await);
+            settle().await;
+        });
+        let saved = world.rows.row("alpha", &job.id).unwrap();
+        first.kill(&world, Duration::ZERO);
+        world
+            .rows
+            .fail_next_listings("alpha", 1 + seed as usize % 3);
+        let second = Process::start(&world, JOB_V1, &job_untimed(), "row-read-b");
+        let recovered = world.rows.row("alpha", &job.id).unwrap();
+        assert_eq!(
+            recovered.armed_by, saved.armed_by,
+            "a failed read must never replace the saved caller"
+        );
+        assert_eq!(
+            second.booted[&(job.tenant.clone(), "Job".into())].rearmed,
+            1
+        );
+        second.runtime.block_on(async {
+            advance(Duration::from_secs(3601)).await;
+            assert_eq!(status(&second.state, &job).await, "Done");
+        });
+        second.kill(&world, Duration::ZERO);
+        Ok(())
+    });
+}
+
+#[test]
+fn rehydration_before_row_recovery_preserves_saved_caller() {
+    let seed = 153;
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+    let world = World {
+        events: SimEventStore::no_faults(seed),
+        rows: Arc::new(SimTimerRows::new(seed)),
+        clock,
+    };
+    let job = Job {
+        tenant: TenantId::new("alpha"),
+        id: "early-read".into(),
+    };
+    let first = Process::start(&world, JOB_V1, &job_untimed(), "early-a");
+    first.runtime.block_on(async {
+        first
+            .state
+            .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
+            .await
+            .unwrap();
+        assert!(act(&first.state, &job, "Start").await);
+        settle().await;
+    });
+    let saved = world.rows.row("alpha", &job.id).unwrap();
+    first.kill(&world, Duration::ZERO);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        world.clock.begin();
+        let mut registry = SpecRegistry::new();
+        registry.register_tenant(
+            "alpha",
+            parse_csdl(CSDL).unwrap(),
+            CSDL.into(),
+            &[("Job", JOB_V1)],
+        );
+        let mut state = ServerState::from_registry(ActorSystem::new("early-b"), registry);
+        state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
+        state.state_timer_rows = Some(world.rows.clone());
+        assert_eq!(status(&state, &job).await, "Waiting");
+        settle().await;
+        assert_eq!(
+            world.rows.row("alpha", &job.id).unwrap().armed_by,
+            saved.armed_by,
+            "rehydration must not overwrite a row before recovery reads it"
+        );
+        let counts = state.start_runtime().await.unwrap().await.unwrap();
+        assert_eq!(counts[&(job.tenant.clone(), "Job".into())].rearmed, 1);
+        advance(Duration::from_secs(3601)).await;
+        assert_eq!(status(&state, &job).await, "Done");
+        world.clock.end(Duration::ZERO);
+    });
+}

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use temper_runtime::persistence::StateTimerRecord;
@@ -111,11 +111,18 @@ impl ServerState {
             let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
                 continue;
             };
-            let rows = match store.list_state_timers(tenant.as_str()).await {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::error!(tenant = %tenant, %error, "state timer rows not readable; timers not re-armed");
-                    continue;
+            // A failed read does not establish row absence. Restore saved
+            // callers before any walk can arm missing rows as the service.
+            let mut wait = Duration::from_secs(1);
+            let rows = loop {
+                match store.list_state_timers(tenant.as_str()).await {
+                    Ok(rows) => break rows,
+                    Err(error) => {
+                        tracing::error!(tenant = %tenant, %error, retry_seconds = wait.as_secs(),
+                            "state timer rows not readable; retrying before timer reconciliation");
+                        tokio::time::sleep(wait).await; // determinism-ok: recovery retry on runtime clock
+                        wait = (wait * 2).min(Duration::from_secs(60));
+                    }
                 }
             };
             let now = sim_now();

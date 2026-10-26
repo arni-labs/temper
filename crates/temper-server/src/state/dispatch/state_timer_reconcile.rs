@@ -53,7 +53,7 @@ const STATE_TIMER_SERVICE: &str = "state-timer";
 pub(crate) enum TimerFollow {
     /// The timer its state declares, or none.
     Settled,
-    /// The record could not be read; the walk must retry it.
+    /// The record or its saved timer rows are not yet readable; retry it.
     RetryRead,
     /// Its state declares a timer whose action binds its caller's identity,
     /// and nobody armed it: the record's next action arms it as that caller.
@@ -105,6 +105,16 @@ impl ServerState {
         follow: Follow<'_>,
     ) -> TimerFollow {
         let Follow { armed_by, gate } = follow;
+        // Rehydration can run before startup has restored the saved callers.
+        // Leave those rows untouched; the boot walk reconciles this record
+        // after recovery, including when a failed row listing needs retries.
+        if armed_by.is_none()
+            && !self
+                .timer_recovery_complete
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return TimerFollow::RetryRead;
+        }
         let declared = {
             let Ok(registry) = self.registry.read() else {
                 return TimerFollow::Settled;
