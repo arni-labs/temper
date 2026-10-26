@@ -28,7 +28,7 @@ pub(super) struct Z3 {
 
 /// What the solver says of one check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Sat {
+pub(super) enum Answer {
     Sat,
     Unsat,
     Unknown,
@@ -67,14 +67,14 @@ impl Z3 {
     }
 
     /// Check what was asserted, and how long the solver took.
-    pub(super) fn check(&mut self) -> std::io::Result<(Sat, Duration)> {
+    pub(super) fn check(&mut self) -> std::io::Result<(Answer, Duration)> {
         let start = Instant::now();
         let answer = self.eval("(check-sat)\n")?;
         let took = start.elapsed();
         let sat = match answer.trim() {
-            "sat" => Sat::Sat,
-            "unsat" => Sat::Unsat,
-            _ => Sat::Unknown,
+            "sat" => Answer::Sat,
+            "unsat" => Answer::Unsat,
+            _ => Answer::Unknown,
         };
         Ok((sat, took))
     }

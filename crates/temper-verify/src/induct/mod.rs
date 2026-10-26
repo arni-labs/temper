@@ -21,6 +21,7 @@ mod cedar;
 mod effects;
 mod encode;
 mod guess;
+mod hints;
 mod live;
 mod moves;
 mod run;
@@ -32,88 +33,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use temper_authz::{May, SendAnalysis};
-use temper_spec::automaton::{Automaton, ProofLemma, ProofRegion};
+use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Effect, Expr, Name};
 
 use encode::{Enc, initial, prelude};
 use guess::Guess;
+pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};
 use moves::Moves;
-use run::{Ask, few_in_flight, run};
+use run::{Ask, Session, few_in_flight, run};
 use vocab::Vocab;
-
-/// What an agent gives the proofs: lemmas, and for each `eventually` rule a
-/// measure and the regions that say which system move brings it closer.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct Hints {
-    #[serde(default)]
-    pub lemma: Vec<Lemma>,
-    #[serde(default)]
-    pub measure: Vec<Measure>,
-    #[serde(default)]
-    pub region: Vec<Region>,
-}
-
-impl Hints {
-    /// The hints for `rule`: those written beside it, then those `extra`
-    /// gives by its name; a measure beside it replaces `extra`'s.
-    fn given(
-        extra: &Hints,
-        rule: &str,
-        lemma: &[ProofLemma],
-        measure: &[String],
-        region: &[ProofRegion],
-    ) -> Hints {
-        let lemma = lemma
-            .iter()
-            .map(|l| Lemma {
-                rule: rule.to_string(),
-                name: l.name.clone(),
-                assert: l.assert.clone(),
-            })
-            .chain(extra.lemma.iter().filter(|l| l.rule == rule).cloned())
-            .collect();
-        let measure = match measure {
-            [] => extra
-                .measure
-                .iter()
-                .filter(|m| m.rule == rule)
-                .cloned()
-                .collect(),
-            terms => vec![Measure {
-                rule: rule.to_string(),
-                terms: terms.to_vec(),
-            }],
-        };
-        let region = region
-            .iter()
-            .map(|r| Region {
-                rule: rule.to_string(),
-                name: r.name.clone(),
-                region: r.region.clone(),
-                witness: r.witness.clone(),
-                step: r.step.clone(),
-                params: r.params.clone(),
-            })
-            .chain(extra.region.iter().filter(|r| r.rule == rule).cloned())
-            .collect();
-        Hints {
-            lemma,
-            measure,
-            region,
-        }
-    }
-}
-
-/// A lemma: a clause the proof holds alongside the rule.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Lemma {
-    /// The rule it is for.
-    pub rule: String,
-    pub name: String,
-    /// SMT-LIB over `$`-framed names.
-    pub assert: String,
-}
 
 /// One obligation's outcome.
 #[derive(Debug, Clone)]
@@ -165,12 +94,27 @@ pub struct RuleProof {
 
 impl RuleProof {
     pub fn proved(&self) -> bool {
-        self.errors.is_empty()
-            && self.unmodelled.is_empty()
-            && self
-                .obligations
-                .iter()
-                .all(|o| matches!(o.outcome, Outcome::Holds))
+        self.shortfall().is_none()
+    }
+
+    /// Why the rule is not proved, in a line; `None` when it is.
+    pub fn shortfall(&self) -> Option<String> {
+        if let Some(error) = self.errors.first() {
+            return Some(format!("the solver refused it: {error}"));
+        }
+        if let Some(effect) = self.unmodelled.first() {
+            return Some(format!("{effect} makes a move the proof does not"));
+        }
+        self.obligations.iter().find_map(|o| match &o.outcome {
+            Outcome::Holds => None,
+            Outcome::Fails { clauses, .. } if clauses.is_empty() => {
+                Some(format!("its clauses fail after {}", o.name))
+            }
+            Outcome::Fails { clauses, .. } => {
+                Some(format!("{} fails after {}", clauses.join(", "), o.name))
+            }
+            Outcome::Unknown => Some(format!("the solver could not decide {}", o.name)),
+        })
     }
 }
 
@@ -198,17 +142,19 @@ pub fn prove(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
     extra: &Hints,
-) -> std::io::Result<Vec<RuleProof>> {
-    prove_some(automatons, policies, extra, |_, _| true)
+) -> Vec<RuleProof> {
+    prove_some(automatons, policies, extra, |_, _| true, None)
 }
 
-/// [`prove`], for the rules `wanted` picks by their type and name.
+/// [`prove`], for the rules `wanted` picks by their type and name. Solvers
+/// still checking at `deadline` stop, and their rules are not proved.
 pub fn prove_some(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
     extra: &Hints,
     wanted: impl Fn(&str, &str) -> bool,
-) -> std::io::Result<Vec<RuleProof>> {
+    deadline: Option<Instant>,
+) -> Vec<RuleProof> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
         .map(|a| (a.automaton.name.as_str(), *a))
@@ -242,26 +188,55 @@ pub fn prove_some(
     // The rules are proved side by side, and their solvers share the
     // machine's cores.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let solvers = (cores / rules.len().max(1)).max(1);
-    // What Cedar answers is the same for every rule.
-    let answered = &Mutex::new(BTreeMap::new());
+    let shared = &Shared {
+        by_name,
+        policies,
+        answered: Mutex::new(BTreeMap::new()),
+        solvers: (cores / rules.len().max(1)).max(1),
+        deadline,
+    };
     std::thread::scope(|scope| {
         let proofs: Vec<_> = rules
             .iter()
             .map(|(owner, name, rule, given)| {
-                let by_name = &by_name;
-                scope.spawn(move || {
-                    prove_one(
-                        by_name, owner, name, *rule, given, policies, answered, solvers,
-                    )
-                })
+                let start = Instant::now();
+                let proof = scope.spawn(move || prove_one(shared, owner, name, *rule, given));
+                (owner, name, start, proof)
             })
             .collect();
         proofs
             .into_iter()
-            .map(|proof| proof.join().expect("a proof thread panicked"))
+            .map(|(owner, name, start, proof)| {
+                // A solver that could not run proves nothing, and says why.
+                proof
+                    .join()
+                    .expect("a proof thread panicked")
+                    .unwrap_or_else(|e| RuleProof {
+                        owner: owner.to_string(),
+                        rule: name.to_string(),
+                        scope: BTreeSet::from([owner.to_string()]),
+                        obligations: Vec::new(),
+                        limits: Vec::new(),
+                        unmodelled: Vec::new(),
+                        unheld: BTreeSet::new(),
+                        found: Vec::new(),
+                        errors: vec![format!("the solver did not run: {e}")],
+                        took: start.elapsed(),
+                    })
+            })
             .collect()
     })
+}
+
+/// What the proofs of one app's rules share.
+struct Shared<'a> {
+    by_name: BTreeMap<&'a str, &'a Automaton>,
+    policies: Option<&'a SendAnalysis>,
+    /// What Cedar answers is the same for every rule.
+    answered: Mutex<BTreeMap<String, May>>,
+    /// Solvers for each rule.
+    solvers: usize,
+    deadline: Option<Instant>,
 }
 
 /// A rule: always, at states with no dispatch in flight; or eventually, as
@@ -273,31 +248,34 @@ enum Rule<'r> {
 }
 
 fn prove_one(
-    by_name: &BTreeMap<&str, &Automaton>,
+    shared: &Shared<'_>,
     owner: &str,
     rule: &str,
     kind: Rule<'_>,
     hints: &Hints,
-    policies: Option<&SendAnalysis>,
-    answered: &Mutex<BTreeMap<String, May>>,
-    solvers: usize,
 ) -> std::io::Result<RuleProof> {
     let start = Instant::now();
+    let by_name = &shared.by_name;
     let expr = match kind {
         Rule::Always(expr) | Rule::Eventually(expr, _) => expr,
     };
     let mut scope = BTreeSet::from([owner.to_string()]);
     expr.for_each_name(&mut |name| {
-        if let Name::CrossStatus { entity_type, .. } | Name::CrossField { entity_type, .. } = name {
-            if by_name.contains_key(entity_type) {
-                scope.insert(entity_type.to_string());
-            }
+        if let Name::CrossStatus { entity_type, .. } | Name::CrossField { entity_type, .. } = name
+            && by_name.contains_key(entity_type)
+        {
+            scope.insert(entity_type.to_string());
         }
     });
     let lemmas: Vec<&Lemma> = hints.lemma.iter().filter(|l| l.rule == rule).collect();
     let regions: Vec<&Region> = hints.region.iter().filter(|r| r.rule == rule).collect();
     let measure = hints.measure.iter().find(|m| m.rule == rule);
-    let v = Vocab::new(by_name.clone(), scope.clone(), policies, answered);
+    let v = Vocab::new(
+        by_name.clone(),
+        scope.clone(),
+        shared.policies,
+        &shared.answered,
+    );
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);
     let moves = builder.all();
@@ -371,7 +349,7 @@ fn prove_one(
                 };
                 live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
             }
-            let solvers = solvers.clamp(1, asks.len().max(1));
+            let solvers = shared.solvers.clamp(1, asks.len().max(1));
             // The string literals the obligations name, each distinct from the
             // others, and the empty string a parameter is checked against.
             let mut literals = BTreeSet::from([String::new()]);
@@ -384,8 +362,14 @@ fn prove_one(
             let prelude = prelude(&v, &literals);
             let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
             let few = few_in_flight(&v);
-            let (mut obligations, mut refused) =
-                run(rule, &prelude, &few, &shown, &asks, solvers, &guessed)?;
+            let session = Session {
+                prelude: &prelude,
+                few: &few,
+                literals: &shown,
+                solvers,
+                deadline: shared.deadline,
+            };
+            let (mut obligations, mut refused) = run(rule, &session, &asks, &guessed)?;
             errors.append(&mut refused);
             fn broken(o: &Obligation) -> Option<&Vec<String>> {
                 match &o.outcome {

@@ -3,10 +3,10 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::encode::Enc;
-use super::solver::{Sat, Z3};
+use super::solver::{Answer, Z3};
 use super::vocab::Vocab;
 use super::{Obligation, Outcome};
 
@@ -38,18 +38,31 @@ impl Ask {
     }
 }
 
-/// Check `asks` in their order over `solvers` z3 processes that each hold
-/// `prelude`. A rule is not proved once one obligation does not hold, so
-/// the solvers stop there, unless all it breaks is `guessed` clauses, which
-/// the prover drops and tries again without; the obligations checked are
-/// returned in order, with what the solvers refused.
+/// What one solver checked, by each obligation's place, and what it refused.
+type Checked = (Vec<(usize, Obligation)>, Vec<String>);
+
+/// What every solver of one rule starts from, and when they stop.
+pub(super) struct Session<'s> {
+    /// The vocabulary, sent to each solver first.
+    pub(super) prelude: &'s str,
+    /// `few!`, sent after it.
+    pub(super) few: &'s str,
+    /// The literals a counterexample shows.
+    pub(super) literals: &'s [String],
+    pub(super) solvers: usize,
+    pub(super) deadline: Option<Instant>,
+}
+
+/// Check `asks` in their order over the session's solvers. A rule is not
+/// proved once one obligation does not hold, so the solvers stop there,
+/// unless all it breaks is `guessed` clauses, which the prover drops and
+/// tries again without; the obligations checked are returned in order, with
+/// what the solvers refused. They stop at the deadline too, and what they
+/// did not check is returned as one obligation the solver could not decide.
 pub(super) fn run(
     rule: &str,
-    prelude: &str,
-    few: &str,
-    literals: &[String],
+    session: &Session<'_>,
     asks: &[Ask],
-    solvers: usize,
     guessed: &BTreeSet<String>,
 ) -> std::io::Result<(Vec<Obligation>, Vec<String>)> {
     let ends = |o: &Obligation| match &o.outcome {
@@ -63,36 +76,40 @@ pub(super) fn run(
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let (next, stop) = (&next, &stop);
+    let Session {
+        prelude,
+        few,
+        literals,
+        solvers,
+        deadline,
+    } = *session;
     let mut done = Vec::new();
     let mut errors = Vec::new();
     std::thread::scope(|scope| -> std::io::Result<()> {
         let workers: Vec<_> = (0..solvers)
             .map(|i| {
-                scope.spawn(
-                    move || -> std::io::Result<(Vec<(usize, Obligation)>, Vec<String>)> {
-                        let mut z3 = Z3::start()?;
-                        z3.send(prelude)?;
-                        z3.send(few)?;
-                        let mut checked = Vec::new();
-                        while !stop.load(Ordering::Relaxed) {
-                            let at = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(ask) = asks.get(at) else {
-                                break;
-                            };
-                            let obligation = check(&mut z3, literals, ask)?;
-                            if ends(&obligation) {
-                                stop.store(true, Ordering::Relaxed);
-                            }
-                            checked.push((at, obligation));
+                scope.spawn(move || -> std::io::Result<Checked> {
+                    let mut z3 = Z3::start()?;
+                    z3.send(prelude)?;
+                    z3.send(few)?;
+                    let mut checked = Vec::new();
+                    let late = || deadline.is_some_and(|d| Instant::now() >= d);
+                    while !stop.load(Ordering::Relaxed) && !late() {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(ask) = asks.get(at) else {
+                            break;
+                        };
+                        let obligation = check(&mut z3, literals, ask)?;
+                        if ends(&obligation) {
+                            stop.store(true, Ordering::Relaxed);
                         }
-                        if let (Ok(path), Some(script)) =
-                            (std::env::var("INDUCT_SCRIPT"), &z3.script)
-                        {
-                            std::fs::write(format!("{path}.{rule}.{i}.smt2"), script)?;
-                        }
-                        Ok((checked, std::mem::take(&mut z3.errors)))
-                    },
-                )
+                        checked.push((at, obligation));
+                    }
+                    if let (Ok(path), Some(script)) = (std::env::var("INDUCT_SCRIPT"), &z3.script) {
+                        std::fs::write(format!("{path}.{rule}.{i}.smt2"), script)?;
+                    }
+                    Ok((checked, std::mem::take(&mut z3.errors)))
+                })
             })
             .collect();
         for worker in workers {
@@ -118,6 +135,17 @@ pub(super) fn run(
     let mut out: Vec<Obligation> = done.into_iter().map(|(_, o)| o).collect();
     if let Some(first) = out.iter().position(ends) {
         out.truncate(first + 1);
+    } else if out.len() < asks.len() {
+        out.push(Obligation {
+            name: format!(
+                "{} of {} obligations, not checked by the deadline",
+                asks.len() - out.len(),
+                asks.len()
+            ),
+            took: Duration::ZERO,
+            outcome: Outcome::Unknown,
+            possible: true,
+        });
     }
     Ok((out, errors))
 }
@@ -135,16 +163,16 @@ fn check(z3: &mut Z3, literals: &[String], ask: &Ask) -> std::io::Result<Obligat
     // happen, then a failure, which is a real counterexample.
     let quantified = |t: &str| t.contains("(forall ") || t.contains("(exists ");
     let few_first = quantified(&ask.text) || all.iter().any(|c| quantified(c));
-    let (mut some, mut took) = (Sat::Unknown, Duration::ZERO);
+    let (mut some, mut took) = (Answer::Unknown, Duration::ZERO);
     if few_first {
         z3.send("(push 1)\n(assert few!)\n")?;
         (some, took) = z3.check()?;
     }
-    if some == Sat::Sat {
+    if some == Answer::Sat {
         z3.send(&negated)?;
         let (fails, also) = z3.check()?;
         took += also;
-        if fails == Sat::Sat {
+        if fails == Answer::Sat {
             let cti = z3.values(&show)?;
             z3.send("(pop 1)\n(push 1)\n(assert few!)\n")?;
             let clauses = failing(z3, &ask.goal)?;
@@ -160,18 +188,18 @@ fn check(z3: &mut Z3, literals: &[String], ask: &Ask) -> std::io::Result<Obligat
     if few_first {
         z3.send("(pop 1)\n")?;
     }
-    let possible = some == Sat::Sat || {
+    let possible = some == Answer::Sat || {
         let (any, also) = z3.check()?;
         took += also;
-        any != Sat::Unsat
+        any != Answer::Unsat
     };
     z3.send(&negated)?;
     let (sat, also) = z3.check()?;
     took += also;
     let outcome = match sat {
-        Sat::Unsat => Outcome::Holds,
-        Sat::Unknown => Outcome::Unknown,
-        Sat::Sat => {
+        Answer::Unsat => Outcome::Holds,
+        Answer::Unknown => Outcome::Unknown,
+        Answer::Sat => {
             let cti = z3.values(&show)?;
             z3.send("(pop 1)\n")?;
             z3.send(&ask.text)?;
@@ -193,7 +221,7 @@ fn failing(z3: &mut Z3, goal: &[(String, String)]) -> std::io::Result<Vec<String
     let mut clauses = Vec::new();
     for (clause_name, c) in goal {
         z3.send(&format!("(push 1)\n(assert (not {c}))\n"))?;
-        if z3.check()?.0 != Sat::Unsat {
+        if z3.check()?.0 != Answer::Unsat {
             clauses.push(clause_name.clone());
         }
         z3.send("(pop 1)\n")?;

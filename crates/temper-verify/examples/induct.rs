@@ -54,7 +54,7 @@ fn main() -> std::io::Result<()> {
         .then(|| temper_authz::SendAnalysis::new(&text.join("\n\n")).expect("policies parse"));
     let read = start.elapsed();
     let refs: Vec<_> = automatons.iter().collect();
-    let proofs = prove(&refs, policies.as_ref(), &hints).expect("z3 runs");
+    let proofs = prove(&refs, policies.as_ref(), &hints);
     let verbose = std::env::var("VERBOSE").is_ok();
     for proof in &proofs {
         let solver: f64 = proof.obligations.iter().map(|o| o.took.as_secs_f64()).sum();

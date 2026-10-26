@@ -53,7 +53,9 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// types) that reads a related record, on the joint model of its type and
 /// the types it names, with `policies` (the tenant's Cedar as the install
 /// leaves it) deciding each move as its sender, and refuse the install if one
-/// is not proven. Both run when the install brings `new_specs` (added or
+/// is not proven. A rule whose spec gives lemmas or a measure is proved by
+/// induction first, for every run, and walked only when the proof does not
+/// hold (`check_joint`). Both run when the install brings `new_specs` (added or
 /// changed types) or policies: who Cedar lets send each move decides whether
 /// a rule holds and whether a record gets where it should. A named type the
 /// bundle does not carry is taken from what the tenant already runs. It runs
@@ -97,37 +99,18 @@ pub(super) async fn prove(
     );
     let policies = temper_authz::SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
-    let (invariants, liveness) = tokio::task::spawn_blocking(move || {
+    let check = tokio::task::spawn_blocking(move || {
         let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
-        (
-            temper_verify::composite::verify_joint_invariants(
-                &refs,
-                Some(&policies),
-                JOINT_INSTALL_BUDGET,
-            ),
-            temper_verify::composite::verify_joint_liveness(
-                &refs,
-                Some(&policies),
-                JOINT_INSTALL_BUDGET,
-            ),
-        )
+        temper_verify::composite::check_joint(&refs, Some(&policies), JOINT_INSTALL_BUDGET)
     })
     .await
     .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
-    let results = invariants
-        .iter()
-        .map(|result| (result.holds(), result.to_string()))
-        .chain(
-            liveness
-                .iter()
-                .map(|result| (result.holds(), result.to_string())),
-        );
     let mut unproven = Vec::new();
-    for (holds, text) in results {
-        if holds {
-            tracing::info!(tenant, app = %app_name, "{text}");
+    for verdict in check.invariants.iter().chain(&check.liveness) {
+        if verdict.holds() {
+            tracing::info!(tenant, app = %app_name, "{verdict}");
         } else {
-            unproven.push(text);
+            unproven.push(verdict.to_string());
         }
     }
     if unproven.is_empty() {

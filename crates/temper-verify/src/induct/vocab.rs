@@ -13,6 +13,10 @@ use temper_spec::automaton::{
 use temper_spec::predicate::{Arg, Literal};
 
 /// A value's sort in the proof.
+/// A reaction's target in the scope, its action, and the parameters it
+/// carries with their sorts.
+type Carried = (String, String, Vec<(String, Sort)>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Sort {
     /// A string, known only by which others and which literals it equals.
@@ -182,11 +186,7 @@ impl<'a> Vocab<'a> {
 
     /// A reaction's target in the scope, its action, and the parameters it
     /// carries with their sorts.
-    fn carried(
-        &self,
-        source: &str,
-        trigger: &ActionTrigger,
-    ) -> Option<(String, String, Vec<(String, Sort)>)> {
+    fn carried(&self, source: &str, trigger: &ActionTrigger) -> Option<Carried> {
         let (TriggerKind::Entity, Some(to), Some(action)) = (
             &trigger.kind,
             &trigger.target_entity,
@@ -301,12 +301,10 @@ impl<'a> Vocab<'a> {
                     for answer in self.answer_actions(&call) {
                         for constraint in &answer.constraints {
                             if let ActionConstraint::ParamEqualsField { param, field } = constraint
+                                && self.param(answer, param) == Some(Sort::Str)
+                                && self.var(to, field) == Some(Sort::Str)
                             {
-                                if self.param(answer, param) == Some(Sort::Str)
-                                    && self.var(to, field) == Some(Sort::Str)
-                                {
-                                    asked.insert(field.clone());
-                                }
+                                asked.insert(field.clone());
                             }
                         }
                     }

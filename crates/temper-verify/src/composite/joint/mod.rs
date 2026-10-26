@@ -57,6 +57,7 @@
 //! every reference finds, with a move's dispatches landing before the next
 //! move from outside, and names each reaction a target refuses.
 
+mod check;
 mod env;
 mod liveness;
 mod model;
@@ -65,6 +66,7 @@ mod senders;
 mod slice;
 mod state;
 
+pub use check::{JointCheck, JointVerdict, check_joint};
 pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
 
 use std::collections::{BTreeMap, BTreeSet};
