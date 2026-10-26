@@ -47,10 +47,10 @@ impl MoveInvariant {
     /// of. The related statuses were read for the records the move started
     /// with, so they say nothing about the new ones.
     fn repointed(&self, before: &EvalContext, after: &EvalContext) -> bool {
-        self.assert
-            .cross_refs()
-            .iter()
-            .any(|(_, id_field)| before.fields.get(id_field) != after.fields.get(id_field))
+        self.assert.cross_refs().iter().any(|(_, id_field)| {
+            before.fields.get(id_field) != after.fields.get(id_field)
+                || before.lists.get(id_field) != after.lists.get(id_field)
+        })
     }
 }
 

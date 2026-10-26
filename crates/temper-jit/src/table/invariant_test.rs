@@ -109,3 +109,69 @@ fn a_related_status_is_checked_unless_the_move_points_elsewhere() {
     let across = table.invariants_across_move(("Draft", &before), ("Submitted", &after));
     assert!(across.broken.is_none(), "{:?}", across.broken);
 }
+
+#[test]
+fn a_related_status_is_checked_unless_the_move_changes_its_reference_list() {
+    let table = TransitionTable::from_ioa_source(
+        r#"
+[automaton]
+name = "Order"
+states = ["Draft", "Submitted"]
+initial = "Draft"
+
+[[state]]
+name = "parent_ids"
+type = "list"
+initial = []
+
+[[action]]
+name = "Submit"
+kind = "input"
+from = ["Draft"]
+to = "Submitted"
+
+[[invariant]]
+name = "SubmittedUnderOpenParents"
+assert = "status == 'Submitted' => Parent[parent_ids].status == 'Open'"
+"#,
+    );
+    assert!(table.initial_values.lists.contains_key("parent_ids"));
+
+    // References can be declared lists or JSON array fields. Dispatch resolved
+    // the old parents, so their statuses stay the same throughout the move.
+    for declared_list in [true, false] {
+        let mut before = EvalContext::default();
+        if declared_list {
+            before
+                .lists
+                .insert("parent_ids".into(), vec!["p1".into(), "p2".into()]);
+        } else {
+            before
+                .fields
+                .insert("parent_ids".into(), json!(["p1", "p2"]));
+        }
+        before.related.insert(
+            ("Parent".into(), "parent_ids".into()),
+            Related::Statuses(vec![Some("Closed".into()), Some("Open".into())]),
+        );
+        let across = table.invariants_across_move(("Draft", &before), ("Submitted", &before));
+        let (broken, _) = across
+            .broken
+            .expect("an unchanged closed parent breaks the invariant");
+        assert_eq!(broken.name, "SubmittedUnderOpenParents");
+
+        let mut after = before.clone();
+        if declared_list {
+            after.lists.insert("parent_ids".into(), vec!["p2".into()]);
+        } else {
+            after.fields.insert("parent_ids".into(), json!(["p2"]));
+        }
+        let across = table.invariants_across_move(("Draft", &before), ("Submitted", &after));
+        assert!(
+            across.broken.is_none(),
+            "declared_list={declared_list}: {:?}",
+            across.broken
+        );
+        assert!(across.already_broken.is_empty());
+    }
+}
