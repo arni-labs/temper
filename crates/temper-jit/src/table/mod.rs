@@ -9,10 +9,12 @@ mod builder;
 pub mod effect_args;
 mod evaluate;
 pub mod guard;
+pub mod invariant;
 pub mod refusal;
 pub mod types;
 
 pub use guard::{EvalContext, GuardFailure, Related, RelatedMap};
+pub use invariant::{InvariantsAcrossMove, MoveInvariant};
 pub use refusal::{ContractError, GuardCondition, Refusal};
 pub use temper_spec::predicate::Expr;
 pub use types::{

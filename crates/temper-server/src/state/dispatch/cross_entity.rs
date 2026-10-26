@@ -4,15 +4,16 @@ use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
 impl crate::state::ServerState {
-    /// Resolve the related entities an action's guards read.
+    /// Resolve the related entities a move of `action` reads: its guards, and
+    /// the type's invariants, which every move is checked against.
     ///
-    /// For each `Type[id_field].status` in the guards of `action`, reads the
+    /// For each `Type[id_field].status` they read, reads the
     /// id (or list of ids) from the entity's current fields and resolves each
     /// related entity's status. An unset reference resolves to no statuses;
     /// an entity that is not found resolves to `None`. Every id is resolved:
     /// the number of lookups is the number of ids the entity's own fields
     /// hold, so a guard over all of a list's entities sees all of them.
-    pub(super) async fn resolve_cross_entity_guards(
+    pub(super) async fn resolve_related_statuses(
         &self,
         tenant: &TenantId,
         entity_type: &str,
@@ -25,7 +26,7 @@ impl crate::state::ServerState {
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
                 return result;
             };
-            spec.table().guard_related_refs(action)
+            spec.table().related_refs(action)
         };
         if refs.is_empty() {
             return result;
