@@ -19,7 +19,10 @@
 //! authorization at the entry points), so their sender matters for the
 //! reactions they set off. Without policies every sender may send everything.
 //!
-//! What each sender may send is read from the policies once. A reaction
+//! What each sender may send is read from the policies once, when a walk
+//! first asks: it asks about few of the moves, and reading each answer takes
+//! far longer than a step (on Katagami control, every answer up front took
+//! 3.4 s for a walk of 126 states). A reaction
 //! whose answer depends on the request is decided again when it arrives,
 //! with what the joint state knows of it: its source's id, and its record's
 //! id and tracked fields. A reaction that finds its record through a field
@@ -44,8 +47,8 @@ pub(super) const RUNTIME: u32 = 1;
 /// The senders a model knows, by number, and what Cedar lets each send.
 pub(super) struct Senders {
     askers: Vec<Asker>,
-    /// Entity, then action, then each sender's answer.
-    may: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
+    /// Entity, then action, then each sender's answer, once read.
+    may: RefCell<BTreeMap<String, Answers>>,
     /// The policies, to decide again a move whose answer depends on the
     /// request.
     policies: Option<SendAnalysis>,
@@ -53,6 +56,9 @@ pub(super) struct Senders {
     /// over and over, and reading the policies takes far longer than a step.
     decided: RefCell<HashMap<Question, May>>,
 }
+
+/// Each action's answers by sender, read from the policies when first asked.
+type Answers = BTreeMap<String, Vec<Option<May>>>;
 
 /// A move decided again: its sender, record type and action, its source's
 /// id, and the record's tracked strings and booleans.
@@ -92,30 +98,20 @@ impl Senders {
                 askers.push(asker);
             }
         }
-        let may = policies.map(|policies| {
-            entities
-                .into_iter()
-                .map(|entity| {
-                    let actions = by_name[entity.as_str()]
-                        .actions
-                        .iter()
-                        .map(|action| {
-                            let answers = askers
-                                .iter()
-                                .map(|asker| {
-                                    policies.may(asker, &action.name, entity, &BTreeMap::new())
-                                })
-                                .collect();
-                            (action.name.clone(), answers)
-                        })
-                        .collect();
-                    (entity.clone(), actions)
-                })
-                .collect()
-        });
+        let may = entities
+            .into_iter()
+            .map(|entity| {
+                let actions = by_name[entity.as_str()]
+                    .actions
+                    .iter()
+                    .map(|action| (action.name.clone(), vec![None; askers.len()]))
+                    .collect();
+                (entity.clone(), actions)
+            })
+            .collect();
         Self {
             askers,
-            may,
+            may: RefCell::new(may),
             policies: policies.cloned(),
             decided: RefCell::default(),
         }
@@ -123,14 +119,20 @@ impl Senders {
 
     /// Whether Cedar lets sender `by` send `action` to an `entity` record.
     pub(super) fn may(&self, by: u32, entity: &str, action: &str) -> May {
-        let Some(may) = &self.may else {
+        let Some(policies) = &self.policies else {
             return May::Yes;
         };
-        may.get(entity)
-            .and_then(|actions| actions.get(action))
-            .and_then(|answers| answers.get(by as usize))
-            .copied()
-            .unwrap_or(May::No)
+        let mut may = self.may.borrow_mut();
+        let Some(answer) = may
+            .get_mut(entity)
+            .and_then(|actions| actions.get_mut(action))
+            .and_then(|answers| answers.get_mut(by as usize))
+        else {
+            return May::No;
+        };
+        *answer.get_or_insert_with(|| {
+            policies.may(&self.askers[by as usize], action, entity, &BTreeMap::new())
+        })
     }
 
     /// Whether Cedar lets sender `by` send `action` to the `entity` record
