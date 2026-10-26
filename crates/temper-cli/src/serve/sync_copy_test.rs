@@ -10,6 +10,24 @@ use temper_store_turso::TursoEventStore;
 
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn a_failing_push_is_retried_later_each_time_up_to_the_cap() {
+    let interval = Duration::from_secs(1);
+    let mut retry = Retry::new(interval);
+    assert!(retry.due(), "the first push goes at once");
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+        waits.push(retry.failed().as_secs());
+        assert!(!retry.due(), "not again before the wait");
+        tokio::time::advance(Duration::from_secs(*waits.last().unwrap())).await;
+        assert!(retry.due(), "due once the wait has passed");
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30]);
+    retry.succeeded();
+    assert!(retry.due());
+    assert_eq!(retry.failed(), interval, "a success starts the waits over");
+}
+
 const TOKEN: &str = "local-sync-server-ignores-tokens";
 
 /// Turso's local sync server, from `TEMPER_TEST_TURSODB` (tursodb 0.7.2, the
@@ -220,35 +238,4 @@ async fn a_write_is_confirmed_while_the_backup_is_stopped() {
         StatusCode::OK,
         "a stopped backup is no reason to refuse a write"
     );
-}
-
-#[test]
-fn only_reads_of_temper_routes_skip_the_push() {
-    assert!(reads_only(&Method::GET, "/tdata/Notes('a')"));
-    assert!(reads_only(&Method::GET, "/tdata"));
-    assert!(reads_only(&Method::HEAD, "/healthz"));
-    assert!(reads_only(&Method::GET, "/static/temper-client.js"));
-    assert!(!reads_only(&Method::POST, "/tdata/Notes('a')/Ns.Write"));
-    assert!(!reads_only(&Method::GET, "/webhooks/default/callback"));
-    assert!(!reads_only(&Method::GET, "/oauth/callback"));
-    assert!(!reads_only(&Method::GET, "/static/app-page"));
-    assert!(!reads_only(&Method::GET, "/observer"));
-    assert!(!reads_only(&Method::GET, "/genesisx"));
-}
-
-#[test]
-fn only_a_copying_database_runs_requests_that_can_change_data() {
-    assert!(refusal(&CopyState::Copying).is_none());
-    for state in [
-        CopyState::Unchecked,
-        CopyState::Behind,
-        CopyState::Stopped("refused".to_string()),
-    ] {
-        let refused = refusal(&state).expect("refused");
-        assert_eq!(
-            refused.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{state:?}"
-        );
-    }
 }

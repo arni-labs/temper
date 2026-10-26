@@ -1,31 +1,28 @@
-//! Answers wait for the database's Turso Cloud copy (Turso Sync).
+//! The database's Turso Cloud backup (Turso Sync).
 //!
-//! With `TURSO_SYNC_URL` set, the database stays a local file and every
-//! request that can change it is answered only after its changes reach the
-//! remote copy. Requests that finish together share one push. A background
-//! loop also pushes changes no request waits for (timers, reactions), keeps
-//! the local write-ahead log short, and checks a file the start could not
-//! check. While writes cannot be confirmed, requests that can change data are
-//! refused before they run and reads are served as usual.
+//! With `TURSO_SYNC_URL` set, the database is a local file and a change is
+//! confirmed once it commits there. A background loop copies committed
+//! changes to the remote: each push carries everything committed since the
+//! last one, one push runs at a time, and a failed push is retried with
+//! backoff. Answers never wait for it, and none is refused because of the
+//! remote. The loop also checks a file the start could not check, records
+//! how far the backup is behind, keeps the local write-ahead log short, and
+//! restarts the server in the two cases where only a restart helps.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
 use temper_store_turso::{CopyState, SyncCopy};
-
-/// How long a request that can change data may take, its push included,
-/// before its change is reported as not confirmed.
-const ANSWER_BUDGET: Duration = Duration::from_secs(10);
-
-/// The least time left for the push of a slow request.
-const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
+use tokio::time::Instant;
 
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The longest wait between push attempts while they fail. Retrying every
+/// second against a remote that is down for an hour fills the log and meets
+/// the remote with a burst when it returns; waiting longer than this delays
+/// the backup by as much once the remote is back.
+const MAX_PUSH_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Checkpoint the local log once it passes this size. Turso Sync turns the
 /// engine's automatic checkpoints off.
@@ -34,104 +31,59 @@ const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 /// Push attempts timing out in a row before the server exits. The sync
 /// engine sends its requests one at a time, so one the remote never answers
 /// holds every later push until its connection fails; the supervisor's
-/// restart starts a fresh one, and the start checks the file again.
+/// restart starts a fresh one. The start needs no remote, so the restart
+/// serves again at once.
 const TIMEOUTS_BEFORE_RESTART: u32 = 6;
 
-/// With a copy, answer changes only after they reach it and keep it current.
+/// Run the backup of `copy` beside the router. Answers do not wait for it,
+/// so the router is returned as it is.
 pub(super) fn with_backup(router: Router, copy: Option<SyncCopy>) -> Router {
-    let Some(copy) = copy else {
-        return router;
-    };
-    spawn_upkeep(copy.clone());
-    router.layer(axum::middleware::from_fn_with_state(
-        copy,
-        push_before_answering,
-    ))
+    if let Some(copy) = copy {
+        spawn_backup(copy);
+    }
+    router
 }
 
-/// Refuse a request that can change data while writes cannot be confirmed;
-/// otherwise run it and push what it committed before answering.
-async fn push_before_answering(
-    State(copy): State<SyncCopy>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if reads_only(request.method(), request.uri().path()) {
-        return next.run(request).await;
-    }
-    if let Some(refusal) = refusal(&copy.state()) {
-        return refusal;
-    }
-    let started = Instant::now();
-    let response = next.run(request).await;
-    let budget = ANSWER_BUDGET
-        .saturating_sub(started.elapsed())
-        .max(MIN_PUSH_BUDGET);
-    match copy.push_committed_within(budget).await {
-        Ok(()) => response,
-        // The request ran, so whatever the copy's state now, the change may
-        // have been saved here: never answer as if nothing happened.
-        Err(error) => {
-            tracing::error!(%error, "turso.sync: change not copied off this server; not confirming it");
-            unavailable(
-                "NotConfirmed",
-                "Not confirmed: the change could not be copied to this app's database copy. \
-                 It may still have been saved here; read it back before trying again.",
-            )
+/// When the next push is due: every tick while pushes succeed, and after a
+/// failure a wait that doubles with each failure in a row, up to
+/// [`MAX_PUSH_BACKOFF`].
+struct Retry {
+    interval: Duration,
+    wait: Duration,
+    next: Instant,
+}
+
+impl Retry {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            wait: interval,
+            next: Instant::now(),
         }
     }
+
+    fn due(&self) -> bool {
+        Instant::now() >= self.next
+    }
+
+    fn succeeded(&mut self) {
+        self.wait = self.interval;
+        self.next = Instant::now();
+    }
+
+    /// Record a failure; returns how long until the next attempt.
+    fn failed(&mut self) -> Duration {
+        let wait = self.wait;
+        self.next = Instant::now() + wait;
+        self.wait = (wait * 2).min(MAX_PUSH_BACKOFF.max(self.interval));
+        wait
+    }
 }
 
-/// The answer to a request that can change data in `state`, if it is refused.
-fn refusal(state: &CopyState) -> Option<Response> {
-    let (code, message) = match state {
-        CopyState::Copying => return None,
-        CopyState::Unchecked => (
-            "SavingPaused",
-            "Saving is paused until this app's database copy can be reached. Reading still works.",
-        ),
-        CopyState::Behind => (
-            "SavingPaused",
-            "Saving is paused while this app restores its database from its copy. \
-             Try again in a minute.",
-        ),
-        CopyState::Stopped(_) => (
-            "SavingStopped",
-            "Saving is stopped: this app's database copy is missing a change, so nothing new \
-             can be confirmed until an operator rebuilds the copy. Reading still works.",
-        ),
-    };
-    Some(unavailable(code, message))
-}
-
-fn unavailable(code: &str, message: &str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        axum::Json(serde_json::json!({ "error": { "code": code, "message": message } })),
-    )
-        .into_response()
-}
-
-/// Requests that cannot change anything: reads of Temper's own routes. A
-/// read of an app's HTTP endpoint or webhook can run actions, so it waits too.
-fn reads_only(method: &Method, path: &str) -> bool {
-    let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
-    let own_route = ["/tdata", "/observe", "/api", "/genesis"]
-        .iter()
-        .any(|prefix| {
-            path.strip_prefix(prefix)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        })
-        || matches!(
-            path,
-            "/healthz" | "/version" | "/temper-client.js" | "/static/temper-client.js"
-        );
-    safe && own_route
-}
-
-/// Push changes no request waited for, check a file the start could not
-/// check, checkpoint the local log, and restart when only a restart helps.
-fn spawn_upkeep(copy: SyncCopy) {
+/// Push committed changes, check a file the start could not check, record
+/// the backup's progress, checkpoint the local log, and restart when only a
+/// restart helps.
+fn spawn_backup(copy: SyncCopy) {
     let interval = std::env::var("TEMPER_TURSO_SYNC_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -140,23 +92,28 @@ fn spawn_upkeep(copy: SyncCopy) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut retry = Retry::new(interval);
         loop {
             tick.tick().await;
-            copy.record_state();
             if let Err(error) = copy.recheck().await {
                 tracing::debug!(%error, "turso.sync remote still unreachable");
             }
+            // Behind with nothing of its own: the start brings it level, with
+            // no change of the file's lost.
             if copy.state() == CopyState::Behind {
                 tracing::error!(
-                    "turso.sync the file is behind its remote copy; exiting so the restart restores it"
+                    "turso.sync the file is behind its remote copy; exiting so the restart brings it level"
                 );
                 std::process::exit(75);
             }
-            if copy.state() != CopyState::Copying {
-                continue;
-            }
-            if let Err(error) = copy.push_committed().await {
-                tracing::warn!(%error, "turso.sync background push failed");
+            if copy.state() == CopyState::Copying && retry.due() {
+                match copy.push_committed().await {
+                    Ok(()) => retry.succeeded(),
+                    Err(error) => {
+                        let wait = retry.failed();
+                        tracing::warn!(%error, retry_in_ms = wait.as_millis() as u64, "turso.sync push failed; the backup retries");
+                    }
+                }
             }
             if copy.pushes_timed_out_in_a_row() >= TIMEOUTS_BEFORE_RESTART {
                 tracing::error!(
@@ -165,6 +122,10 @@ fn spawn_upkeep(copy: SyncCopy) {
                 );
                 std::process::exit(75);
             }
+            if let Err(error) = copy.record_backup().await {
+                tracing::debug!(%error, "turso.sync could not read the backup's progress");
+            }
+            // Writes go on in every state, so the log is kept short in every state.
             if let Err(error) = copy.checkpoint_if_wal_over(MAX_WAL_BYTES).await {
                 tracing::warn!(%error, "turso.sync checkpoint failed");
             }

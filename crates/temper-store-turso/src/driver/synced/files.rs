@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::DriverError;
+use super::remote::Mark;
 
 /// Written next to the database when the remote refused a change.
 pub(super) const DIVERGED_SUFFIX: &str = "-sync-diverged";
@@ -55,23 +56,38 @@ pub(super) fn belongs_to(name: &str, file: &str) -> bool {
 
 /// Written next to the database while it waits to be checked against the
 /// remote: the newest change the file held before that start committed
-/// anything. A later start keeps the number, since what it commits meanwhile
-/// says nothing about whether the file is behind.
+/// anything, as `<generation> <change>` (a lone number is generation 0). A
+/// later start keeps it: what the file commits meanwhile is its own, and the
+/// check tells it from what the remote has.
 const UNCHECKED_SUFFIX: &str = "-sync-unchecked";
 
-pub(super) fn unchecked_since(path: &Path) -> Option<i64> {
-    std::fs::read_to_string(sidecar(path, UNCHECKED_SUFFIX))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// The name a restore beside the database is made under, before it is
+/// swapped in. Not `<name>-...`, so it is never taken for one of its files.
+pub(super) const INCOMING_SUFFIX: &str = ".incoming";
+
+pub(super) fn unchecked_since(path: &Path) -> Option<Mark> {
+    let text = std::fs::read_to_string(sidecar(path, UNCHECKED_SUFFIX)).ok()?;
+    let numbers = text
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<Vec<i64>, _>>()
+        .ok()?;
+    match numbers[..] {
+        [change] => Some(Mark {
+            generation: 0,
+            change,
+        }),
+        [generation, change] => Some(Mark { generation, change }),
+        _ => None,
+    }
 }
 
-pub(super) fn mark_unchecked(path: &Path, opened_at: i64) -> Result<(), DriverError> {
+pub(super) fn mark_unchecked(path: &Path, opened_at: Mark) -> Result<(), DriverError> {
     if unchecked_since(path).is_some() {
         return Ok(());
     }
-    std::fs::write(sidecar(path, UNCHECKED_SUFFIX), opened_at.to_string())
+    let text = format!("{} {}", opened_at.generation, opened_at.change);
+    std::fs::write(sidecar(path, UNCHECKED_SUFFIX), text)
         .map_err(|error| DriverError::SyncSetup(format!("record the unchecked start: {error}")))
 }
 
@@ -120,16 +136,27 @@ pub(super) fn describe(path: &Path) -> Result<String, DriverError> {
     if sidecar(path, RESTORING_SUFFIX).exists() {
         lines.push("restoring: a restore from the remote started and has not finished".to_string());
     }
-    if let Some(opened_at) = unchecked_since(path) {
+    let unchecked = unchecked_since(path);
+    if let Some(opened_at) = unchecked {
         lines.push(format!(
             "unchecked: since a start with changes up to {opened_at}"
         ));
     }
+    let stop = std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX));
+    lines.push(match &stop {
+        Ok(cause) => format!("stopped: {}", cause.trim()),
+        Err(_) => "stopped: no".to_string(),
+    });
+    // The file serves and confirms writes in every case; only the backup waits.
     lines.push(
-        match std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {
-            Ok(cause) => format!("stopped: {}", cause.trim()),
-            Err(_) => "stopped: no".to_string(),
-        },
+        match (&stop, unchecked) {
+            (Ok(_), _) => {
+                "backup: stopped; nothing is pushed until an operator decides (see the stop)"
+            }
+            (Err(_), Some(_)) => "backup: waiting for the remote to answer the check of this file",
+            (Err(_), None) => "backup: pushing in the background while the app runs",
+        }
+        .to_string(),
     );
     Ok(lines.join("\n"))
 }
@@ -178,6 +205,49 @@ pub(super) fn mark_restoring(path: &Path) -> Result<(), DriverError> {
 /// Clear the mark of a restore that has finished.
 pub(super) fn restored(path: &Path) {
     let _ = std::fs::remove_file(sidecar(path, RESTORING_SUFFIX));
+}
+
+/// Put the database restored at `incoming` in `path`'s place, keeping
+/// `path`'s files aside, and return where they went. The restore marker is
+/// written before the first rename and the sync metadata is renamed last, so
+/// a swap cut short is a partial restore to the next start, which restores
+/// again.
+pub(super) fn swap_in(incoming: &Path, path: &Path) -> Result<PathBuf, DriverError> {
+    let failed = |error: std::io::Error| {
+        DriverError::SyncSetup(format!("swap in {}: {error}", incoming.display()))
+    };
+    let aside = move_aside(path)?;
+    mark_restoring(path)?;
+    let dir = dir_of(path);
+    let from = incoming
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let to = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(failed)? {
+        let file = entry
+            .map_err(failed)?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if belongs_to(&from, &file) {
+            files.push(file);
+        }
+    }
+    let info = format!("{from}-info");
+    files.sort_by_key(|file| *file == info);
+    for file in files {
+        let renamed = format!("{to}{}", &file[from.len()..]);
+        std::fs::rename(dir.join(&file), dir.join(renamed)).map_err(failed)?;
+    }
+    restored(path);
+    Ok(aside)
 }
 
 /// Refuse a fetch into `path` when the database or any file kept beside it is

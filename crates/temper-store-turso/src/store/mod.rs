@@ -101,12 +101,13 @@ impl TursoEventStore {
         Self::open(db, is_remote, None).await
     }
 
-    /// Open a local database file whose commits are copied to its own Turso
-    /// Cloud database at `sync_url` (Turso Sync).
+    /// Open a local database file whose commits are backed up to its own
+    /// Turso Cloud database at `sync_url` (Turso Sync).
     ///
-    /// With no local file, the database is first restored from that copy.
-    /// Writes are local; [`Self::sync_copy`] returns the handle that pushes
-    /// them, which callers await before confirming a write.
+    /// With no local file, or a damaged one, the database is first restored
+    /// from that copy. Writes are local and confirmed once they commit;
+    /// [`Self::sync_copy`] returns the handle that pushes them, which the
+    /// server runs in the background.
     #[instrument(skip_all, fields(otel.name = "turso.new_synced"))]
     pub async fn new_synced(
         path: &str,
@@ -119,8 +120,8 @@ impl TursoEventStore {
             .map_err(storage_error)?;
         let store = Self::open(Database::synced(copy.clone()), false, Some(copy.clone())).await?;
         store.require_primary_keys().await?;
-        // Schema made by this start goes out now; an answer pushes anything
-        // still left before it confirms a write.
+        // Schema made by this start goes out now; the background backup
+        // pushes anything still left.
         if let Err(error) = copy.push_committed().await {
             tracing::warn!(%error, "turso.sync push after migration failed");
         }
