@@ -1,29 +1,23 @@
-//! Prove a spec dir's invariants by induction: `induct <dir> [lemmas.toml]`.
-//! The dir holds `*.ioa.toml` and `policies/*.cedar`; the lemma file holds
-//! `[[lemma]]` tables with `rule`, `name` and `assert` (SMT-LIB).
+//! Prove a spec dir's rules by induction: `induct <dir> [hints.toml]`. The
+//! dir holds `*.ioa.toml` and `policies/*.cedar`; the hints file holds
+//! `[[lemma]]` tables (`rule`, `name`, `assert`), and for `eventually`
+//! rules `[[measure]]` (`rule`, `terms`) and `[[region]]` tables (`rule`,
+//! `name`, `region`, `witness`, `step`, `params`), all in SMT-LIB.
 
 use std::io::Write;
 use std::time::Instant;
 
-use temper_verify::induct::{Lemma, Outcome, prove};
-
-#[derive(serde::Deserialize)]
-struct Lemmas {
-    #[serde(default)]
-    lemma: Vec<Lemma>,
-}
+use temper_verify::induct::{Hints, Outcome, prove};
 
 fn main() -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: induct <spec dir> [lemmas.toml]");
-    let lemmas: Vec<Lemma> = args
+    let dir = args.next().expect("usage: induct <spec dir> [hints.toml]");
+    let hints: Hints = args
         .next()
         .map(|path| {
-            let text = std::fs::read_to_string(&path).expect("lemma file");
-            toml::from_str::<Lemmas>(&text)
-                .expect("lemma file parses")
-                .lemma
+            let text = std::fs::read_to_string(&path).expect("hints file");
+            toml::from_str(&text).expect("hints file parses")
         })
         .unwrap_or_default();
     let start = Instant::now();
@@ -50,7 +44,7 @@ fn main() -> std::io::Result<()> {
         .then(|| temper_authz::SendAnalysis::new(&text.join("\n\n")).expect("policies parse"));
     let read = start.elapsed();
     let refs: Vec<_> = automatons.iter().collect();
-    let proofs = prove(&refs, policies.as_ref(), &lemmas).expect("z3 runs");
+    let proofs = prove(&refs, policies.as_ref(), &hints).expect("z3 runs");
     let verbose = std::env::var("VERBOSE").is_ok();
     for proof in &proofs {
         let solver: f64 = proof.obligations.iter().map(|o| o.took.as_secs_f64()).sum();

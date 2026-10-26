@@ -12,10 +12,15 @@
 //! rules it out is missing. Lemmas are SMT-LIB over `$`-framed names (see
 //! `encode.rs`), read at both ends of each move.
 //!
-//! The moves allow more than the kernel does (`moves.rs`), so a proof here
-//! holds in the runtime.
+//! The moves allow what the joint walk does and more (`moves.rs`), so a
+//! proof here holds wherever the walk's model of the kernel does. An
+//! `eventually` rule is proved with a measure and helpful moves
+//! (`live.rs`).
 
+mod cedar;
+mod effects;
 mod encode;
+mod live;
 mod moves;
 mod solver;
 mod vocab;
@@ -24,13 +29,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use temper_authz::SendAnalysis;
-use temper_spec::automaton::{Automaton, Initial};
+use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name};
 
-use encode::{Enc, int};
-use moves::{Move, Moves};
+use encode::{Enc, initial, prelude};
+pub use live::{Measure, Region};
+use moves::Moves;
 use solver::{Sat, Z3};
 use vocab::Vocab;
+
+/// What an agent gives the proofs: lemmas, and for each `eventually` rule a
+/// measure and the regions that say which system move brings it closer.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Hints {
+    #[serde(default)]
+    pub lemma: Vec<Lemma>,
+    #[serde(default)]
+    pub measure: Vec<Measure>,
+    #[serde(default)]
+    pub region: Vec<Region>,
+}
 
 /// A lemma: a clause the proof holds alongside the rule.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -89,53 +107,97 @@ impl RuleProof {
     }
 }
 
-/// Prove each invariant of `automatons` with the lemmas given for it.
+/// Prove each invariant and `eventually` rule of `automatons` with the hints
+/// given for it.
 pub fn prove(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    lemmas: &[Lemma],
+    hints: &Hints,
 ) -> std::io::Result<Vec<RuleProof>> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
         .map(|a| (a.automaton.name.as_str(), *a))
         .collect();
-    let mut out = Vec::new();
+    let mut rules = Vec::new();
     for automaton in automatons {
+        let owner = automaton.automaton.name.as_str();
         for invariant in &automaton.invariants {
-            let owner = automaton.automaton.name.as_str();
-            let mine: Vec<&Lemma> = lemmas.iter().filter(|l| l.rule == invariant.name).collect();
-            out.push(prove_one(
-                &by_name,
+            rules.push((
                 owner,
-                &invariant.name,
-                &invariant.assert,
-                &mine,
-                policies,
-            )?);
+                invariant.name.as_str(),
+                Rule::Always(&invariant.assert),
+            ));
+        }
+        for liveness in &automaton.liveness {
+            if let Some(goal) = &liveness.eventually {
+                let rule = Rule::Eventually(goal, &liveness.relies_on);
+                rules.push((owner, liveness.name.as_str(), rule));
+            }
         }
     }
-    Ok(out)
+    // Each rule has its own solver, so the rules are proved side by side.
+    std::thread::scope(|scope| {
+        let proofs: Vec<_> = rules
+            .iter()
+            .map(|&(owner, name, rule)| {
+                let by_name = &by_name;
+                scope.spawn(move || prove_one(by_name, owner, name, rule, hints, policies))
+            })
+            .collect();
+        proofs
+            .into_iter()
+            .map(|proof| proof.join().expect("a proof thread panicked"))
+            .collect()
+    })
+}
+
+/// A rule: always, at states with no dispatch in flight; or eventually, as
+/// the system's moves and the actions it relies on bring it about.
+#[derive(Clone, Copy)]
+enum Rule<'r> {
+    Always(&'r Expr),
+    Eventually(&'r Expr, &'r [String]),
 }
 
 fn prove_one(
     by_name: &BTreeMap<&str, &Automaton>,
     owner: &str,
     rule: &str,
-    assert: &Expr,
-    lemmas: &[&Lemma],
+    kind: Rule<'_>,
+    hints: &Hints,
     policies: Option<&SendAnalysis>,
 ) -> std::io::Result<RuleProof> {
     let start = Instant::now();
+    let expr = match kind {
+        Rule::Always(expr) | Rule::Eventually(expr, _) => expr,
+    };
     let mut scope = BTreeSet::from([owner.to_string()]);
-    assert.for_each_name(&mut |name| {
+    expr.for_each_name(&mut |name| {
         if let Name::CrossStatus { entity_type, .. } | Name::CrossField { entity_type, .. } = name {
             if by_name.contains_key(entity_type) {
                 scope.insert(entity_type.to_string());
             }
         }
     });
-    let lemma_literals = lemmas.iter().flat_map(|l| quoted_literals(&l.assert));
-    let v = Vocab::new(by_name.clone(), scope.clone(), policies, lemma_literals);
+    let lemmas: Vec<&Lemma> = hints.lemma.iter().filter(|l| l.rule == rule).collect();
+    let regions: Vec<&Region> = hints.region.iter().filter(|r| r.rule == rule).collect();
+    let measure = hints.measure.iter().find(|m| m.rule == rule);
+    let texts = lemmas
+        .iter()
+        .map(|l| l.assert.as_str())
+        .chain(regions.iter().map(|r| r.region.as_str()))
+        .chain(
+            regions
+                .iter()
+                .flat_map(|r| r.params.values().map(String::as_str)),
+        )
+        .chain(
+            measure
+                .iter()
+                .flat_map(|m| m.terms.iter().map(String::as_str)),
+        );
+    let literals: Vec<String> = texts.flat_map(quoted_literals).collect();
+    let v = Vocab::new(by_name.clone(), scope.clone(), policies, literals);
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);
     let moves = builder.all();
@@ -143,10 +205,13 @@ fn prove_one(
     z3.send(&prelude(&v))?;
     // The clauses of J, by name, as functions of the frame.
     let clause = |frame: &str| -> Vec<(String, String)> {
-        let mut out = vec![(
-            rule.to_string(),
-            format!("(=> {frame}.settled {})", enc.expr(assert, owner, frame)),
-        )];
+        let mut out = Vec::new();
+        if let Rule::Always(assert) = kind {
+            out.push((
+                rule.to_string(),
+                format!("(=> {frame}.settled {})", enc.expr(assert, owner, frame)),
+            ));
+        }
         out.extend(
             lemmas
                 .iter()
@@ -171,34 +236,49 @@ fn prove_one(
         let before = clause("pre");
         let after = clause("post");
         let decls = enc.take_decls();
-        let Move {
-            label,
-            decls: own,
-            body,
-        } = mv;
         let mut text = String::from("(push 1)\n");
         decls
             .iter()
-            .chain(own)
+            .chain(&mv.decls)
             .for_each(|d| text.push_str(&format!("{d}\n")));
         for (_, c) in &before {
             text.push_str(&format!("(assert {c})\n"));
         }
-        for fact in body {
+        for fact in mv.body() {
             text.push_str(&format!("(assert {fact})\n"));
         }
-        obligations.push(check(&mut z3, &v, label, text, &after, &before)?);
+        obligations.push(check(&mut z3, &v, &mv.label, text, &after, &before)?);
+    }
+    let mut errors = Vec::new();
+    if let Rule::Eventually(goal, relies_on) = kind {
+        let live = live::Live {
+            owner,
+            goal,
+            relies_on,
+            measure,
+            regions,
+        };
+        live::obligations(
+            &mut z3,
+            &enc,
+            &moves,
+            &live,
+            &clause,
+            &mut obligations,
+            &mut errors,
+        )?;
     }
     let limits = builder.limits.into_inner().into_iter().collect();
     if let Ok(path) = std::env::var("INDUCT_SCRIPT") {
         std::fs::write(format!("{path}.{rule}.smt2"), &z3.script)?;
     }
+    errors.append(&mut z3.errors);
     Ok(RuleProof {
         rule: rule.to_string(),
         scope,
         obligations,
         limits,
-        errors: std::mem::take(&mut z3.errors),
+        errors,
         took: start.elapsed(),
     })
 }
@@ -276,11 +356,12 @@ fn check(
     })
 }
 
-/// At most two distinct dispatches of each kind in flight before the move.
+/// At most two distinct dispatches or calls of each kind in flight before
+/// the move.
 fn few_in_flight(v: &Vocab<'_>) -> String {
     let mut out = String::new();
-    for kind in &v.kinds {
-        let k = &kind.name;
+    for flight in v.flights() {
+        let k = flight.name;
         let mut pend = format!("((as const (Array Msg/{k} Int)) 0)");
         for i in 1..=2 {
             out.push_str(&format!(
@@ -288,7 +369,9 @@ fn few_in_flight(v: &Vocab<'_>) -> String {
             ));
             pend = format!("(store {pend} few.{k}.{i} few.{k}.{i}.n)");
         }
-        out.push_str(&format!("(assert (= pre.pend.{k} {pend}))\n"));
+        out.push_str(&format!(
+            "(assert (= pre.pend.{k} {pend}))\n(assert (= pre.n.{k} (+ (ite (= few.{k}.1 few.{k}.2) 0 few.{k}.1.n) few.{k}.2.n)))\n"
+        ));
     }
     out
 }
@@ -318,131 +401,11 @@ fn shown(v: &Vocab<'_>, before: &[(String, String)], after: &[(String, String)])
                 }
             }
         }
-        for kind in &v.kinds {
-            out.push(format!("{frame}.pend.{}", kind.name));
+        for flight in v.flights() {
+            out.push(format!("{frame}.pend.{}", flight.name));
         }
     }
     out.extend(v.literals.iter().map(|l| Enc::lit(l)));
-    out
-}
-
-/// The declarations every obligation shares.
-fn prelude(v: &Vocab<'_>) -> String {
-    let mut out = String::from("(declare-sort Str 0)\n");
-    let literals: Vec<String> = v.literals.iter().map(|l| Enc::lit(l)).collect();
-    for l in &literals {
-        out.push_str(&format!("(declare-const {l} Str)\n"));
-    }
-    if literals.len() > 1 {
-        out.push_str(&format!("(assert (distinct {}))\n", literals.join(" ")));
-    }
-    for entity in &v.scope {
-        for (i, state) in v.automaton(entity).automaton.states.iter().enumerate() {
-            out.push_str(&format!(
-                "(define-fun {} () Int {i})\n",
-                Enc::state(entity, state)
-            ));
-        }
-    }
-    for kind in &v.kinds {
-        let fields: Vec<String> = kind
-            .fields
-            .iter()
-            .map(|(f, s)| format!("({}/{f} {})", kind.name, s.smt()))
-            .collect();
-        out.push_str(&format!(
-            "(declare-datatypes ((Msg/{0} 0)) (((mk/{0} {1}))))\n",
-            kind.name,
-            fields.join(" ")
-        ));
-    }
-    for frame in ["pre", "post"] {
-        let mut settled = Vec::new();
-        for entity in &v.scope {
-            out.push_str(&format!(
-                "(declare-const {} Int)\n",
-                Enc::status(frame, entity)
-            ));
-            for (var, sort) in &v.vars[entity] {
-                out.push_str(&format!(
-                    "(declare-const {} {})\n",
-                    Enc::var(frame, entity, var),
-                    sort.smt()
-                ));
-            }
-        }
-        for kind in &v.kinds {
-            let k = &kind.name;
-            out.push_str(&format!(
-                "(declare-const {frame}.pend.{k} (Array Msg/{k} Int))\n"
-            ));
-            out.push_str(&format!(
-                "(define-fun {frame}.has.{k} ((m Msg/{k})) Bool (> (select {frame}.pend.{k} m) 0))\n"
-            ));
-            settled.push(format!(
-                "(= {frame}.pend.{k} ((as const (Array Msg/{k} Int)) 0))"
-            ));
-        }
-        out.push_str(&format!(
-            "(define-fun {frame}.settled () Bool (and true {}))\n",
-            settled.join(" ")
-        ));
-    }
-    // What every state the proof starts a move from satisfies.
-    for entity in &v.scope {
-        let states = v.automaton(entity).automaton.states.len();
-        let status = Enc::status("pre", entity);
-        out.push_str(&format!(
-            "(assert (and (<= 0 {status}) (< {status} {states})))\n"
-        ));
-        for (var, sort) in &v.vars[entity] {
-            if let vocab::Sort::Int { counter: true } = sort {
-                out.push_str(&format!(
-                    "(assert (>= {} 0))\n",
-                    Enc::var("pre", entity, var)
-                ));
-            }
-        }
-    }
-    for kind in &v.kinds {
-        let k = &kind.name;
-        out.push_str(&format!(
-            "(assert (forall ((m Msg/{k})) (>= (select pre.pend.{k} m) 0)))\n"
-        ));
-    }
-    out
-}
-
-/// The records as they start, with nothing in flight.
-fn initial(v: &Vocab<'_>) -> Vec<String> {
-    let mut out = Vec::new();
-    for entity in &v.scope {
-        let automaton = v.automaton(entity);
-        out.push(format!(
-            "(= {} {})",
-            Enc::status("pre", entity),
-            Enc::state(entity, &automaton.automaton.initial)
-        ));
-        for var in &automaton.state {
-            let value = match &var.initial {
-                Initial::String(s) => Enc::lit(s),
-                Initial::Bool(b) => b.to_string(),
-                Initial::Counter(n) => n.to_string(),
-                Initial::Int(n) => int(*n),
-                Initial::List(_) => continue,
-            };
-            out.push(format!(
-                "(= {} {value})",
-                Enc::var("pre", entity, &var.name)
-            ));
-        }
-    }
-    for kind in &v.kinds {
-        let k = &kind.name;
-        out.push(format!(
-            "(= pre.pend.{k} ((as const (Array Msg/{k} Int)) 0))"
-        ));
-    }
     out
 }
 
