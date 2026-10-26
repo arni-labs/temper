@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use temper_runtime::ActorSystem;
+use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
@@ -21,6 +22,8 @@ const ORDER: &str = include_str!("../../../test-fixtures/specs/order.ioa.toml");
 const ENTITY_ID: &str = "o-busy";
 /// One more than the actor's durable key budget, so the key set is full.
 const MOVES: usize = 1_001;
+/// The actor's default snapshot interval, in moves.
+const SNAPSHOT_INTERVAL: u64 = 100;
 
 fn order_state(store: TursoEventStore) -> ServerState {
     let mut registry = SpecRegistry::new();
@@ -75,6 +78,24 @@ async fn catalog_state_bytes(store: &TursoEventStore, sequence_nr: u64) -> usize
     panic!("catalog row never reached sequence {sequence_nr}");
 }
 
+/// The record's stored snapshot as `(sequence_nr, bytes)`, once the snapshot
+/// due at or before `sequence_nr` has been written.
+async fn settled_snapshot(store: &TursoEventStore, sequence_nr: u64) -> (u64, usize) {
+    let due = sequence_nr / SNAPSHOT_INTERVAL * SNAPSHOT_INTERVAL;
+    for _ in 0..500 {
+        if let Some((snapshot_seq, bytes)) = store
+            .load_snapshot(&format!("default:Order:{ENTITY_ID}"))
+            .await
+            .expect("load snapshot")
+            && snapshot_seq >= due
+        {
+            return (snapshot_seq, bytes.len());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the snapshot due by sequence {sequence_nr} was never written");
+}
+
 #[tokio::test]
 async fn a_record_that_takes_a_thousand_keyed_moves_keeps_a_small_catalog_row() {
     let (_guard, _clock, _ids) = install_deterministic_context(1_001);
@@ -114,6 +135,23 @@ async fn a_record_that_takes_a_thousand_keyed_moves_keeps_a_small_catalog_row() 
         late_bytes < early_bytes + 256,
         "the catalog state grew from {early_bytes} to {late_bytes} bytes over {MOVES} moves"
     );
+
+    // One more move changes the catalog row by a few bytes. It is not on a
+    // snapshot boundary, so it leaves the snapshot row, which carries the key
+    // set once per snapshot interval, as it was.
+    let snapshot = settled_snapshot(&store, current.sequence_nr).await;
+    let one_more = add_item(&state, MOVES).await;
+    let one_more_bytes = catalog_state_bytes(&store, one_more.sequence_nr).await;
+    assert!(
+        one_more_bytes.abs_diff(late_bytes) < 256,
+        "one more move changed the catalog state from {late_bytes} to {one_more_bytes} bytes"
+    );
+    assert_eq!(
+        settled_snapshot(&store, one_more.sequence_nr).await,
+        snapshot,
+        "a move between snapshots leaves the snapshot row as it was"
+    );
+    let current = one_more;
 
     // After a restart, with no reply cache and no actor in memory, a retry of
     // a recent move is answered from the key set the actor restores from its
