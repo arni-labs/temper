@@ -12,9 +12,10 @@ use super::super::senders::OUTSIDE;
 use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
+use super::labels::rename_label;
 use super::{Delivery, JointModel, MAX_IN_FLIGHT};
-use crate::model::semantics::successors_among;
-use crate::model::{ParamValue, TemperModelAction};
+use crate::model::semantics::successors_budgeted;
+use crate::model::{ModelString, ParamValue, TemperModelAction};
 
 /// One move of the walk.
 #[derive(Debug, Clone)]
@@ -88,7 +89,7 @@ impl Certainty {
 pub(in crate::composite::joint) struct Next {
     pub(in crate::composite::joint) state: JointState,
     /// The new names of the values the old state held.
-    pub(in crate::composite::joint) renamed: BTreeMap<String, String>,
+    pub(in crate::composite::joint) renamed: BTreeMap<ModelString, ModelString>,
     /// The move, named as in the new state.
     pub(in crate::composite::joint) label: String,
     /// What the model knows of the move leading here.
@@ -108,13 +109,16 @@ impl JointModel {
         for (entity, model) in self.models.iter().filter(|_| asked) {
             let local = &state.records[entity];
             for t in &model.transitions {
+                if !self.expansion.take() {
+                    return out;
+                }
                 if !self.sendable(entity, &t.name)
                     || !self.enabled(entity, t, state, Blind::Nothing)
                 {
                     continue;
                 }
                 let reads = self.reads_related(t);
-                for (params, _) in successors_among(model, t, local, &values) {
+                for (params, _) in successors_budgeted(model, t, local, &values, &self.expansion) {
                     let action = TemperModelAction {
                         name: t.name.clone(),
                         target_state: t.to_state.clone(),
@@ -162,6 +166,9 @@ impl JointModel {
         state: &JointState,
         mv: &Move,
     ) -> (Vec<Next>, bool) {
+        if !self.expansion.take() {
+            return (Vec::new(), false);
+        }
         use Certainty::{OneOf, Sure, Unsure};
         let mut outcomes: Vec<(JointState, String, Certainty)> = Vec::new();
         match mv {
@@ -312,7 +319,7 @@ impl JointModel {
                 let renamed = canonical(&mut outcome);
                 Next {
                     state: outcome,
-                    label: rename_label(&text, &renamed),
+                    label: rename_label(&text, mv, &renamed),
                     renamed,
                     certainty,
                 }
@@ -407,7 +414,7 @@ impl JointModel {
         &self,
         state: &JointState,
         call: &Call,
-        values: &BTreeSet<String>,
+        values: &BTreeSet<ModelString>,
         out: &mut Vec<Move>,
     ) {
         let model = &self.models[&call.to];
@@ -425,7 +432,7 @@ impl JointModel {
                 continue;
             }
             let mut seen = BTreeSet::new();
-            for (mut params, _) in successors_among(model, t, local, values) {
+            for (mut params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
                 // A parameter tied to a field carries it as the call found it.
                 for param in &t.string_params {
                     if let Some(value) = param.equals.as_ref().and_then(|f| call.asked.get(f)) {
@@ -472,20 +479,4 @@ fn remove_call(state: &mut JointState, call: &Call) {
     if let Some(at) = state.calls.iter().position(|c| c == call) {
         state.calls.remove(at);
     }
-}
-
-/// `text` with each `'#n'` value named as `renamed` says.
-fn rename_label(text: &str, renamed: &BTreeMap<String, String>) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("'#") {
-        out.push_str(&rest[..=start]);
-        rest = &rest[start + 1..];
-        let end = rest.find('\'').unwrap_or(rest.len());
-        let value = &rest[..end];
-        out.push_str(renamed.get(value).map_or(value, String::as_str));
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
 }

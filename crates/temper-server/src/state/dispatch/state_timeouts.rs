@@ -55,7 +55,7 @@ use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
-use crate::request_context::AgentContext;
+use crate::request_context::{AgentContext, StateTimerFire};
 
 use super::effects::PostDispatchContext;
 
@@ -571,6 +571,53 @@ impl crate::state::ServerState {
             .reserve(timer, Reservation::Fresh)
     }
 
+    /// Make `timer`'s record, found past the journal sequence the timer was
+    /// armed at, follow its current state. Another writer fired this arming,
+    /// or the record took an action the timer does not reset on. The record
+    /// gets the timer `current`'s state declares, armed at `current`'s
+    /// sequence for the rest of its budget (none for a timer that fires once
+    /// and already did), as `timer`'s identity and through its boot gate. A
+    /// newer arm in this process since `timer` (`armed_seq` is no longer
+    /// current) already follows the record, so nothing changes.
+    pub(super) async fn follow_moved_record(
+        &self,
+        timer: &ArmedTimer,
+        armed_seq: u64,
+        current: &EntityState,
+    ) {
+        debug_assert!(
+            current.sequence_nr > timer.sequence_nr,
+            "PRECONDITION: the record moved past the timer's arming"
+        );
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        if self.state_timeout_tracker.current(&key) != armed_seq {
+            return;
+        }
+        // Release this arm in memory only: its row stays until its task ends,
+        // after the next timer's row is written.
+        self.state_timeout_tracker
+            .invalidate(&key, current.sequence_nr);
+        let follow = super::state_timer_reconcile::Follow {
+            armed_by: Some(&timer.agent_ctx),
+            gate: timer.boot_gate.clone(),
+            ..Default::default()
+        };
+        self.follow_state_timer(
+            &timer.tenant,
+            &timer.entity_type,
+            &timer.entity_id,
+            current,
+            follow,
+        )
+        .await;
+        debug_assert!(
+            self.state_timeout_tracker
+                .armed(&key)
+                .is_none_or(|armed| armed.sequence_nr >= current.sequence_nr),
+            "POSTCONDITION: no timer of an earlier arming is armed"
+        );
+    }
+
     /// Whether the record's spec still declares `timer` for its state: the
     /// same action after the same budget.
     fn declares_state_timer(&self, timer: &ArmedTimer) -> bool {
@@ -688,6 +735,10 @@ impl crate::state::ServerState {
                                 Some(&timer.agent_ctx),
                             )
                             .await;
+                    } else if current.state.sequence_nr > timer.sequence_nr {
+                        state
+                            .follow_moved_record(&timer, armed_seq, &current.state)
+                            .await;
                     } else if !state.state_timer_already_fired(&timer, &current.state) {
                         crate::runtime_metrics::record_state_timeout_fired(
                             timer.tenant.as_str(),
@@ -695,16 +746,26 @@ impl crate::state::ServerState {
                             &timer.state,
                             &timer.action,
                         );
-                        let _ = state
+                        // The fire applies only at the sequence this timer
+                        // was armed at; another writer may commit first.
+                        let answer = state
                             .dispatch_tenant_action(
                                 &timer.tenant,
                                 &timer.entity_type,
                                 &timer.entity_id,
                                 &timer.action,
                                 timer.params.clone(),
-                                &timer.agent_ctx,
+                                &timer.fire_context(),
                             )
                             .await;
+                        if let Ok(answer) = answer
+                            && !answer.success
+                            && answer.state.sequence_nr > timer.sequence_nr
+                        {
+                            state
+                                .follow_moved_record(&timer, armed_seq, &answer.state)
+                                .await;
+                        }
                     }
                 }
                 state.forget_state_timer(&timer).await;
@@ -749,15 +810,32 @@ impl ArmedTimer {
             && self.action == other.action
             && self.after_seconds == other.after_seconds
     }
+
+    /// What its fire is dispatched as: its identity, marked as the fire of
+    /// the arming at its journal sequence, which the record's actor applies
+    /// only while the record is still at that sequence.
+    fn fire_context(&self) -> AgentContext {
+        let mut agent = self.agent_ctx.clone();
+        agent.fires_state_timer = Some(StateTimerFire {
+            tenant: self.tenant.to_string(),
+            entity_type: self.entity_type.clone(),
+            entity_id: self.entity_id.clone(),
+            action: self.action.clone(),
+            armed_seq: self.sequence_nr,
+        });
+        agent
+    }
 }
 
 /// The identity a timer fires as: the dispatch that armed it, as a new
 /// background action. It does not keep the arming request's idempotency key:
 /// the entity has already recorded that key, so the fire would be answered as
-/// a duplicate and never run.
+/// a duplicate and never run. Nor does it keep the mark of a timer fire that
+/// armed it: each fire is marked with its own arming (`ArmedTimer::fire_context`).
 fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
+    agent.fires_state_timer = None;
     agent
 }
 
@@ -1111,6 +1189,7 @@ mod tests {
             params: serde_json::json!({}),
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         }
     }
 

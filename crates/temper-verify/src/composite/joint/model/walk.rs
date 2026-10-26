@@ -1,14 +1,16 @@
 //! The breadth-first walk over joint states.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
+use super::super::JointOutcome;
 use super::super::pack::{Packed, Packer};
 use super::super::state::render;
 use super::super::{JointState, JointStep};
-use super::JointModel;
 use super::step::Certainty;
+use super::{JointModel, Walk};
 use crate::Budget;
+use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 /// One move made from a walked state.
 #[derive(Debug, Clone, Copy)]
@@ -99,6 +101,7 @@ impl JointModel {
         mut visit: impl FnMut(usize, &JointState) -> bool,
     ) -> Explored {
         let started = Instant::now();
+        self.expansion.reset(budget.states, Some(budget.time));
         let mut explored = Explored {
             nodes: Vec::new(),
             packer: Packer::default(),
@@ -110,6 +113,9 @@ impl JointModel {
         let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {
+            if !self.expansion.take() {
+                break;
+            }
             let packed = explored.packer.pack(&init);
             if !seen.contains_key(&packed) {
                 seen.insert(packed.clone(), explored.nodes.len() as u32);
@@ -132,6 +138,9 @@ impl JointModel {
                 break;
             }
             for mv in self.moves(&state) {
+                if !self.expansion.take() {
+                    break;
+                }
                 let (nexts, held) = self.next(&state, &mv);
                 explored.held_back |= held;
                 if edges {
@@ -168,6 +177,119 @@ impl JointModel {
                 }
             }
         }
+        if self.expansion.exhausted.get() {
+            explored.stopped = Some("the joint expansion exhausted its work or time budget".into());
+        }
         explored
+    }
+}
+
+impl JointModel {
+    /// Walk every reachable joint state breadth first, checking `invariants`
+    /// of `owner` in each settled one (nothing in flight).
+    pub(in crate::composite::joint) fn walk(
+        &self,
+        owner: &str,
+        invariants: &[&Expr],
+        budget: Budget,
+    ) -> Walk {
+        let mut unsupported = BTreeSet::new();
+        let modeled = |entity: &str, field: &str| {
+            self.models.get(entity).is_some_and(|model| {
+                matches!(field, "Id" | "id")
+                    || match model.var_kinds.get(field) {
+                        Some(temper_spec::predicate::VarKind::Str) => {
+                            model.tracked_strings.contains(field)
+                        }
+                        Some(
+                            temper_spec::predicate::VarKind::Counter
+                            | temper_spec::predicate::VarKind::Bool
+                            | temper_spec::predicate::VarKind::List,
+                        ) => true,
+                        _ => false,
+                    }
+            })
+        };
+        for inv in invariants {
+            inv.for_each_name(&mut |name| {
+                let mut check = |entity: &str, field: &str| {
+                    if !modeled(entity, field) {
+                        unsupported.insert(format!("{entity}.{field}"));
+                    }
+                };
+                match name {
+                    Name::Var(field) => check(owner, field),
+                    Name::CrossStatus { id_field, .. } => check(owner, id_field),
+                    Name::CrossField {
+                        entity_type,
+                        id_field,
+                        field,
+                    } => {
+                        check(owner, id_field);
+                        check(entity_type, field);
+                    }
+                    Name::Status => {}
+                }
+            });
+        }
+        for (entity, model) in &self.models {
+            if let Some((action, _)) = crate::model::semantics::oversized_transition(model) {
+                unsupported.insert(format!("{entity}.{action} parameter expansion"));
+            }
+        }
+        if !unsupported.is_empty() {
+            let reason = format!(
+                "unsupported reads or expansion: {}",
+                unsupported.into_iter().collect::<Vec<_>>().join(", ")
+            );
+            return Walk {
+                states: 0,
+                held_back: false,
+                outcomes: invariants
+                    .iter()
+                    .map(|_| JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            };
+        }
+        let mut unknown = vec![false; invariants.len()];
+        let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
+        let explored = self.walk_with(budget, false, |index, state| {
+            if state.settled() {
+                let env = self.env(owner, state);
+                for (i, inv) in invariants.iter().enumerate() {
+                    match eval(inv, &env) {
+                        Truth::False if broken[i].is_none() => broken[i] = Some(index),
+                        Truth::Unknown => unknown[i] = true,
+                        _ => {}
+                    }
+                }
+            }
+            broken.iter().all(Option::is_some)
+        });
+        let outcomes = broken
+            .iter()
+            .enumerate()
+            .map(|(i, found)| match found {
+                Some(index) => JointOutcome::Broken {
+                    path: explored.path(*index),
+                },
+                None if unknown[i] => JointOutcome::Incomplete {
+                    reason: "an invariant read is unknown".into(),
+                },
+                None => match &explored.stopped {
+                    Some(reason) => JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    },
+                    None => JointOutcome::Holds,
+                },
+            })
+            .collect();
+        Walk {
+            states: explored.len(),
+            outcomes,
+            held_back: explored.held_back,
+        }
     }
 }

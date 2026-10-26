@@ -441,3 +441,147 @@ permit(principal, action == Action::"Copy", resource is Child) when {
         "{result}"
     );
 }
+
+#[test]
+fn unknown_related_reads_cannot_be_proven() {
+    for assertion in [
+        "Parent[Id].score > 0",
+        "Parent[Id].absent == 'x'",
+        "Parent[absent].status == 'Closed'",
+    ] {
+        let parent = "[automaton]\nname = 'Parent'\nstates = ['Open']\ninitial = 'Open'\n[[state]]\nname = 'score'\ntype = 'int'\ninitial = 1\n";
+        let child = child_with(assertion);
+        let result = check(&[parent, &child]);
+        assert!(
+            matches!(result.outcome, JointOutcome::Incomplete { .. }),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_in_a_related_read_is_explored_by_the_parent_setter() {
+    let child = child_with("Parent[Id].value != 'bad'");
+    let result = check(&[&parent(false), &child]);
+    let JointOutcome::Broken { path } = result.outcome else {
+        panic!("{result}");
+    };
+    assert!(path.iter().any(|s| s.state.contains("value='bad'")));
+}
+
+#[test]
+fn initial_partitions_stop_within_a_tiny_budget() {
+    let sources: Vec<String> = (0..13)
+        .map(|i| format!("[automaton]\nname = 'T{i}'\nstates = ['Ready']\ninitial = 'Ready'\n"))
+        .collect();
+    let assertion = (1..13)
+        .map(|i| format!("T{i}[Id].status != 'Never'"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let mut sources = sources;
+    sources[0].push_str(&format!(
+        "\n[[invariant]]\nname = 'rule'\nassert = \"{assertion}\"\n"
+    ));
+    let automatons = parse(&sources.iter().map(String::as_str).collect::<Vec<_>>());
+    let results = verify_joint_invariants(
+        &automatons.iter().collect::<Vec<_>>(),
+        None,
+        Budget {
+            states: 10,
+            time: Duration::from_secs(1),
+        },
+    );
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results[0].outcome,
+        JointOutcome::Incomplete { .. }
+    ));
+    assert!(results[0].states <= 10);
+}
+
+#[test]
+fn replay_distinguishes_two_new_values_in_one_request() {
+    let pair = r#"
+[automaton]
+name = "Pair"
+states = ["New", "Done"]
+initial = "New"
+[[state]]
+name = "a"
+type = "string"
+initial = ""
+[[state]]
+name = "b"
+type = "string"
+initial = ""
+[[action]]
+name = "Write"
+kind = "input"
+from = ["New"]
+to = "Done"
+params = [{ name = "a", type = "string" }, { name = "b", type = "string" }]
+[[invariant]]
+name = "equal"
+assert = "Parent[Id].status == 'Open' => a == b"
+"#;
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Open']\ninitial = 'Open'\n";
+    let automatons = parse(&[pair, parent]);
+    let refs: Vec<_> = automatons.iter().collect();
+    let same = ids(&[("Parent", "p"), ("Pair", "p")]);
+    for (b, broken) in [("X", false), ("Y", true)] {
+        let replay = replay_joint_invariants(
+            &refs,
+            "Pair",
+            &same,
+            &[trace("Pair", "Write", &[("a", "X"), ("b", b)])],
+        )
+        .unwrap();
+        assert_eq!(!replay.broken.is_empty(), broken);
+    }
+}
+
+#[test]
+fn concrete_reference_ids_can_find_an_initially_closed_parent() {
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
+    for id in ["550e8400-e29b-41d4-a716-446655440000", "#2"] {
+        let child = format!(
+            r#"
+[automaton]
+name = "Child"
+states = ["Ready"]
+initial = "Ready"
+[[state]]
+name = "parent_id"
+type = "string"
+initial = "{id}"
+[[invariant]]
+name = "rule"
+assert = "Parent[parent_id].status != 'Closed'"
+"#
+        );
+        let result = check(&[parent, &child]);
+        let JointOutcome::Broken { path } = &result.outcome else {
+            panic!("expected the concrete reference to find Parent: {result}");
+        };
+        assert_eq!(path.len(), 1, "the rule already fails initially: {result}");
+    }
+}
+
+#[test]
+fn concrete_ids_in_assertions_are_explored_without_string_fields() {
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
+    let child = child_with("Parent[Id].id != 'concrete'");
+    let result = check(&[parent, &child]);
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+}
+
+#[test]
+fn empty_references_never_find_a_record() {
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
+    let child = "[automaton]\nname = 'Child'\nstates = ['Ready']\ninitial = 'Ready'\n[[state]]\nname = 'parent_id'\ntype = 'string'\ninitial = ''\n[[invariant]]\nname = 'rule'\nassert = \"Parent[parent_id].status != 'Closed'\"\n";
+    let result = check(&[parent, child]);
+    assert!(matches!(result.outcome, JointOutcome::Holds), "{result}");
+}

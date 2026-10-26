@@ -6,7 +6,7 @@ use std::fmt;
 
 use super::senders;
 use crate::model::semantics::canonical_strings;
-use crate::model::{ParamValue, TemperModelAction, TemperModelState};
+use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
 
 /// The records in scope, one per type, and the dispatches and module calls
 /// on their way.
@@ -50,7 +50,7 @@ pub struct Call {
     pub by: u32,
     /// The tracked fields its answers are tied to, as the record held them
     /// when the call started: the module answers about that record.
-    pub asked: BTreeMap<String, String>,
+    pub asked: BTreeMap<String, ModelString>,
 }
 
 impl fmt::Display for Call {
@@ -128,9 +128,9 @@ pub(super) fn render(state: &JointState) -> String {
 
 /// Renumber new strings over the whole joint state, records first, then
 /// the dispatches in flight; returns each value's new name.
-pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
+pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
     let mut dispatches = std::mem::take(&mut state.inflight);
-    let mut strings: Vec<BTreeMap<String, String>> = dispatches
+    let mut strings: Vec<BTreeMap<String, ModelString>> = dispatches
         .iter()
         .map(|d| {
             d.params
@@ -143,7 +143,7 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
         })
         .collect();
     let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, String>> = state
+        let mut maps: Vec<&mut BTreeMap<String, ModelString>> = state
             .records
             .values_mut()
             .map(|s| &mut s.strings)

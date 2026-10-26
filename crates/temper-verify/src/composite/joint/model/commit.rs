@@ -9,7 +9,7 @@ use super::super::env::Blind;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
 use super::step::Certainty;
-use crate::model::semantics::{step, successors_among};
+use crate::model::semantics::{step, successors_budgeted};
 use crate::model::{
     ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
 };
@@ -157,11 +157,12 @@ impl JointModel {
         // carry: the first choice, as the composite check takes. A string
         // parameter it does not carry leaves the field as it is.
         let values = self.values(state);
-        let mut params: BTreeMap<String, ParamValue> = successors_among(model, t, target, &values)
-            .into_iter()
-            .next()
-            .map(|(params, _)| params)
-            .unwrap_or_default();
+        let mut params: BTreeMap<String, ParamValue> =
+            successors_budgeted(model, t, target, &values, &self.expansion)
+                .into_iter()
+                .next()
+                .map(|(params, _)| params)
+                .unwrap_or_default();
         for param in &t.string_params {
             params.remove(&param.name);
         }

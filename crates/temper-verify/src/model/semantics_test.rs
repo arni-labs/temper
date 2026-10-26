@@ -83,3 +83,85 @@ fn collects_list_membership_atoms_through_any_connective() {
         vec![("tags".into(), "a".into()), ("tags".into(), "b".into())]
     );
 }
+
+fn two_strings_model() -> TemperModel {
+    crate::model::build_model_from_ioa(
+        r#"
+[automaton]
+name = "Pair"
+states = ["New", "Done"]
+initial = "New"
+[[state]]
+name = "a"
+type = "string"
+initial = ""
+[[state]]
+name = "b"
+type = "string"
+initial = ""
+[[action]]
+name = "Write"
+kind = "input"
+from = ["New"]
+to = "Done"
+params = [{ name = "a", type = "string" }, { name = "b", type = "string" }]
+[[invariant]]
+name = "equal"
+assert = "a == b"
+"#,
+        3,
+    )
+    .unwrap()
+}
+
+#[test]
+fn fresh_parameters_can_differ_from_each_other() {
+    let model = two_strings_model();
+    let initial = stateright::Model::init_states(&model).remove(0);
+    let successors = successors(&model, &model.transitions[0], &initial);
+    assert!(successors.iter().any(|(_, s)| !s.strings["a"].is_empty()
+        && !s.strings["b"].is_empty()
+        && s.strings["a"] != s.strings["b"]));
+}
+
+#[test]
+fn concrete_hash_literals_are_never_renamed_or_equal_to_symbols() {
+    let mut values = BTreeMap::from([
+        ("literal".into(), ModelString::from("#2")),
+        ("symbol".into(), ModelString::Symbol(2)),
+    ]);
+    canonical_strings(&mut [&mut values]);
+    assert_eq!(values["literal"], ModelString::from("#2"));
+    assert_eq!(values["symbol"], ModelString::Symbol(1));
+    let mut s = state("New");
+    s.strings = values;
+    let k = BTreeMap::from([
+        ("literal".into(), VarKind::Str),
+        ("symbol".into(), VarKind::Str),
+    ]);
+    assert_eq!(
+        truth(
+            &g("literal == '#2' && symbol != '#1' && literal != symbol"),
+            &k,
+            &s
+        ),
+        Truth::True
+    );
+}
+
+#[test]
+fn string_products_stop_inside_expansion() {
+    let model = two_strings_model();
+    let initial = stateright::Model::init_states(&model).remove(0);
+    let budget = Expansion::default();
+    budget.reset(2, None);
+    let next = successors_budgeted(
+        &model,
+        &model.transitions[0],
+        &initial,
+        &BTreeSet::new(),
+        &budget,
+    );
+    assert!(next.is_empty());
+    assert!(budget.exhausted.get());
+}

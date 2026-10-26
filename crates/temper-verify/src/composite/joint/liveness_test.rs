@@ -148,7 +148,8 @@ fn check_specs_with_policies(app: &str, place: &str, policies: &str) -> JointLiv
     let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
     let budget = Budget {
         time: Duration::from_secs(30),
-        states: 100_000,
+        // Expansion products now spend this allowance as well as walked states.
+        states: 10_000_000,
     };
     let mut results = verify_joint_liveness(&refs, Some(&analysis), budget);
     assert_eq!(results.len(), 1);
