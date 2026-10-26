@@ -371,7 +371,9 @@ fn prove_one(
             let goal = vec![("premise met".to_string(), "false".to_string())];
             let ask = Ask::new(&v, "premise", text, goal, &at);
             let (checked, _) = solve(shared, &v, rule, &[ask], &BTreeSet::new())?;
-            matches!(checked.first().map(|o| &o.outcome), Some(Outcome::Holds))
+            // MUTANT: the solver's answer is ignored.
+            let _ = checked;
+            false
         }
         _ => false,
     };
