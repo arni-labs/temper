@@ -14,6 +14,7 @@ mod replay_validation;
 mod scheduled_rows;
 pub mod sim_handler;
 mod snapshot_queue;
+mod timer_fire;
 pub mod types;
 pub(crate) mod undeclared_params;
 
@@ -21,7 +22,7 @@ pub use actor::EntityActor;
 pub(crate) use actor::RehydrateHook;
 #[cfg(test)]
 pub(crate) use actor::recover_authoritative_entity_state_from_store;
-pub(crate) use actor::recover_entity_state_from_store;
+pub(crate) use actor::{recover_entity_state_for_walk, recover_entity_state_from_store};
 pub use effects::{
     ProcessResult, ScheduledAction, apply_effects, apply_new_state_fallback, build_eval_context,
     process_action, process_action_with_xref, sync_fields,

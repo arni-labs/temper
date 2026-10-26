@@ -508,6 +508,104 @@ fn directory_root_souls_scenario_on_postgres() {
     });
 }
 
+/// Once the key index says a key is absent, a projection row that still shows that
+/// key never answers the read. The row stands for a Directory whose key changed (a
+/// move or rename) while its catalog and field-index rows had not caught up: the key
+/// index moves in the same commit as the event, the projection follows later. Real
+/// Postgres, because only a store with a query plane runs the native page read.
+/// Gated on DATABASE_URL; unique tenant.
+#[test]
+fn keyed_absence_ignores_a_lagging_projection_row_on_postgres() {
+    use temper_runtime::scheduler::sim_uuid as runtime_sim_uuid;
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+    sqlx::test_block_on(async {
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        temper_store_postgres::migration::run_migrations(&pool)
+            .await
+            .unwrap();
+        let store = temper_store_postgres::PostgresEventStore::new(pool.clone());
+        let tenant = TenantId::from(format!("lagging-key-pg-{}", runtime_sim_uuid()));
+        let csdl = parse_csdl(CSDL_XML).expect("CSDL parses");
+        let mut registry = SpecRegistry::new();
+        registry.register_tenant(
+            tenant.as_str(),
+            csdl,
+            CSDL_XML.to_string(),
+            &[("Order", ORDER_IOA), ("Directory", DIRECTORY_IOA)],
+        );
+        let mut state = ServerState::from_registry(ActorSystem::new("lagging-key-pg"), registry);
+        state.set_storage_stack(StorageStack::from_postgres(store.clone()));
+
+        // The key index is complete for Directory and holds no root for wsMoved.
+        let key_set = crate::key_index::declared_key_set_signature(
+            &state.declared_keys_for(&tenant, "Directory"),
+        );
+        state
+            .mark_key_index_backfilled(&tenant, "Directory", &key_set)
+            .await;
+        assert!(
+            state
+                .key_index_backfill_complete(&tenant, "Directory", &key_set)
+                .await
+        );
+        // The projection still shows the old key: a root of wsMoved.
+        store
+            .upsert_query_projection(
+                tenant.as_str(),
+                "Directory",
+                "dir-moved",
+                "Active",
+                &serde_json::json!({ "Name": "/", "Path": "/", "WorkspaceId": "wsMoved" }),
+                1,
+            )
+            .await
+            .expect("lagging projection row");
+
+        let query_options = QueryOptions {
+            filter: Some(dir_root_filter("wsMoved")),
+            ..QueryOptions::default()
+        };
+        let result = read_entity_set_page(QueryPlaneReadRequest {
+            state: &state,
+            tenant: &tenant,
+            security_ctx: &SecurityContext::system(),
+            entity_type: "Directory",
+            entity_set_name: "Directories",
+            query_options: &query_options,
+            budget: QueryPlaneReadBudget {
+                default_page_size: 10,
+                max_entities: 10,
+            },
+        })
+        .await
+        .unwrap_or_else(|_| panic!("a keyed absence is an empty answer, not an error"));
+        assert!(
+            result.entities.is_empty(),
+            "the key index says no wsMoved root exists; the lagging row must not answer: {:?}",
+            result.entities
+        );
+        assert_eq!(
+            result.telemetry.fallback_reason,
+            QueryPlaneFallbackReason::KeyedAbsence
+        );
+
+        for table in [
+            "entity_field_index",
+            "entity_catalog",
+            "key_index_backfill_watermark",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE tenant = $1"))
+                .bind(tenant.as_str())
+                .execute(&pool)
+                .await
+                .expect("cleanup");
+        }
+    });
+}
+
 /// ARN-68 (generic bound): the FIELD-index backfill must enumerate authoritatively
 /// (registry + `store.list_entity_ids_by_type`), not the lazy `entity_index`. The flow
 /// looks up directories by `Path` (e.g. `Path eq '/souls' and WorkspaceId eq …`), which

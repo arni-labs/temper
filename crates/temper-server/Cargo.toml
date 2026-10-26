@@ -83,6 +83,8 @@ pprof = { version = "0.14", features = ["prost-codec"] }
 
 [dev-dependencies]
 temper-test-resource = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["http-json"] }
 temper-actor-runtime = { workspace = true, features = ["test-utils"] }
 deadpool-postgres = { workspace = true }
 tokio-postgres = { workspace = true }
