@@ -431,6 +431,14 @@ impl SpecDrivenActor {
                     state.booleans.insert(var.clone(), value);
                 }
             }
+            Effect::SetString { var, value } => {
+                // Legacy non-strict actions accept non-object params and may
+                // replace `fields` with them before effects run.
+                if !state.fields.is_object() {
+                    state.fields = serde_json::json!({});
+                }
+                state.fields[var] = serde_json::Value::String(value.clone());
+            }
             Effect::ListAppend { var, value } => {
                 if let Some(element) = effect_args::string(value, params) {
                     state.lists.entry(var.clone()).or_default().push(element);
@@ -454,3 +462,7 @@ impl SpecDrivenActor {
 #[cfg(test)]
 #[path = "tests/spec_actor_strict.rs"]
 mod strict_tests;
+
+#[cfg(test)]
+#[path = "tests/spec_actor_string_effect.rs"]
+mod string_effect_tests;

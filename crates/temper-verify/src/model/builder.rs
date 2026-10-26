@@ -65,7 +65,7 @@ pub fn build_model_tracking(
             Initial::List(items) => {
                 initial_lists.insert(sv.name.clone(), items.clone());
             }
-            // Strings and ints are not modeled.
+            // Tracked strings are initialized below; ints are not modeled.
             Initial::String(_) | Initial::Int(_) => {}
         }
     }
@@ -217,11 +217,10 @@ fn string_params(
         .collect()
 }
 
-/// The string variables the verifier tracks: those `[[invariant]]`s read,
+/// The string variables the verifier tracks: those guards or `[[invariant]]`s read or effects write,
 /// plus `also_tracked`, plus every string variable a constraint ties the
 /// parameter of a tracked one to (its value decides what the tracked one may
-/// become). Strings no invariant can see stay unmodeled, so a spec whose
-/// invariants read none explores exactly as before.
+/// become). Other strings stay unmodeled.
 fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BTreeSet<String> {
     let kinds: BTreeMap<&str, VarKind> = automaton
         .state
@@ -234,14 +233,32 @@ fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BT
         .filter(|name| is_string(name))
         .cloned()
         .collect();
-    for inv in &automaton.invariants {
-        inv.assert.for_each_name(&mut |name| {
+    for expr in automaton
+        .invariants
+        .iter()
+        .map(|inv| &inv.assert)
+        .chain(automaton.actions.iter().map(|action| &action.guard))
+    {
+        expr.for_each_name(&mut |name| {
             if let Name::Var(var) = name
                 && is_string(var)
             {
                 tracked.insert(var.to_string());
             }
         });
+    }
+    // An effect-only string has no parameter choices: its reachable values
+    // are exactly its initial value and the finitely many effect literals.
+    // Parameter-written strings keep the existing equality-symbol abstraction
+    // so arbitrary input stays covered without enumerating unbounded strings.
+    for action in &automaton.actions {
+        for effect in &action.effect {
+            if let temper_spec::predicate::Effect::Assign { var, .. } = effect
+                && is_string(var)
+            {
+                tracked.insert(var.clone());
+            }
+        }
     }
     loop {
         let before = tracked.len();
@@ -311,6 +328,31 @@ fn string_literals(
         }
     }
     let mut out = BTreeMap::new();
+    let mut written = BTreeSet::new();
+    for sv in &automaton.state {
+        if tracked.contains(&sv.name)
+            && let Initial::String(value) = &sv.initial
+        {
+            written.insert(value.clone());
+        }
+    }
+    for action in &automaton.actions {
+        for effect in &action.effect {
+            if let temper_spec::predicate::Effect::Assign {
+                value: Arg::Lit(Literal::Str(value)),
+                ..
+            } = effect
+            {
+                written.insert(value.clone());
+            }
+        }
+    }
+    // A param may equal a literal held by another field now or after a later
+    // effect. Give every tracked param those concrete choices; a fresh symbol
+    // still represents every other string, as before.
+    for var in tracked {
+        out.insert(var.clone(), written.clone());
+    }
     for action in &automaton.actions {
         visit(&action.guard, tracked, &mut out);
     }
@@ -328,6 +370,7 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
         ResolvedEffect::AddCounter { var, value } => ModelEffect::AddCounter { var, value },
         ResolvedEffect::SubCounter { var, value } => ModelEffect::SubCounter { var, value },
         ResolvedEffect::SetBool { var, value } => ModelEffect::SetBool { var, value },
+        ResolvedEffect::SetString { var, value } => ModelEffect::SetString { var, value },
         ResolvedEffect::ListAppend { var, value } => ModelEffect::ListAppend { var, value },
         ResolvedEffect::ListRemoveAt { var, index } => ModelEffect::ListRemoveAt { var, index },
         ResolvedEffect::Dispatch(_)
@@ -346,6 +389,7 @@ pub(crate) fn effect_params(effects: &[ModelEffect]) -> BTreeMap<String, ParamKi
             | ModelEffect::AddCounter { value, .. }
             | ModelEffect::SubCounter { value, .. } => (value, ParamKind::Count),
             ModelEffect::SetBool { value, .. } => (value, ParamKind::Bool),
+            ModelEffect::SetString { .. } => continue,
             ModelEffect::ListAppend { value, .. } => (value, ParamKind::Str),
             ModelEffect::ListRemoveAt { index, .. } => (index, ParamKind::Count),
         };

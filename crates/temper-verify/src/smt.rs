@@ -20,10 +20,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver};
 
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, unmodelable};
+mod encoding;
+use encoding::*;
+
+use temper_spec::predicate::{Arg, Expr, Literal, Operand, Set};
 
 use crate::model::builder::build_model_from_ioa;
-use crate::model::semantics::collect_list_contains_pairs;
 use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// Result of symbolic verification.
@@ -138,6 +140,7 @@ fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(S
             let symbols = Symbols {
                 counters: counter_vars.into_iter().collect(),
                 bools: bool_vars.into_iter().collect(),
+                strings: make_string_vars(model, ""),
                 lists: &list_vars,
                 status: status_var,
                 prefix: "",
@@ -177,11 +180,9 @@ fn check_invariant_induction(model: &TemperModel, max_counter: usize) -> Vec<(St
     )];
     for inv in &model.invariants {
         let inductive = match split_trigger(&inv.assert) {
-            Some((trigger, body)) if unmodelable(body, &model.var_kinds).is_none() => {
-                concrete_transitions(model)
-                    .filter(|t| t.to_state.as_ref().is_some_and(|to| trigger.contains(to)))
-                    .all(|t| preserved_by(model, body, t, max_counter))
-            }
+            Some((trigger, body)) if models(body, model) => concrete_transitions(model)
+                .filter(|t| t.to_state.as_ref().is_some_and(|to| trigger.contains(to)))
+                .all(|t| preserved_by(model, body, t, max_counter)),
             _ => true,
         };
         results.push((inv.name.clone(), inductive));
@@ -245,6 +246,8 @@ fn preserved_by(
     // unknown (a non-negative integer or a boolean).
     let mut post_counters = pre_counters.clone();
     let mut post_bools = pre_bools.clone();
+    let pre_strings = make_string_vars(model, "pre:");
+    let mut post_strings = pre_strings.clone();
     let count = |arg: &Arg, counters: &BTreeMap<String, Int>| -> Int {
         match arg {
             Arg::Lit(Literal::Int(n)) => Int::from_i64(*n),
@@ -289,8 +292,35 @@ fn preserved_by(
                 };
                 post_bools.insert(var.clone(), value);
             }
+            ModelEffect::SetString { var, value } => {
+                post_strings.insert(
+                    var.clone(),
+                    string_literal(value, model).expect("effect literal is in the model"),
+                );
+            }
             ModelEffect::ListAppend { .. } | ModelEffect::ListRemoveAt { .. } => {}
         }
+    }
+    // Params are written after effects in production. Preserve that order
+    // when a move both assigns a literal and supplies the field as a param.
+    for param in &t.string_params {
+        let value = Int::new_const(format!("param:{}", param.name));
+        if param.nonempty {
+            solver.assert(value.eq(Int::from_i64(0)).not());
+        }
+        if let Some(field) = param
+            .equals
+            .as_ref()
+            .and_then(|field| pre_strings.get(field))
+        {
+            solver.assert(value.eq(field));
+        }
+        for field in &param.not_equals {
+            if let Some(field) = pre_strings.get(field) {
+                solver.assert(value.eq(field).not());
+            }
+        }
+        post_strings.insert(param.name.clone(), value);
     }
     let pre_status = make_status_var(model, &solver);
     let post_status = match t
@@ -305,6 +335,7 @@ fn preserved_by(
     let pre = Symbols {
         counters: pre_counters,
         bools: pre_bools,
+        strings: pre_strings,
         lists: &lists,
         status: pre_status,
         prefix: "pre:",
@@ -312,6 +343,7 @@ fn preserved_by(
     let post = Symbols {
         counters: post_counters,
         bools: post_bools,
+        strings: post_strings,
         lists: &lists,
         status: post_status,
         prefix: "post:",
@@ -319,276 +351,6 @@ fn preserved_by(
     solver.assert(encode(body, &pre, model));
     solver.assert(encode(body, &post, model).not());
     !matches!(solver.check(), SatResult::Sat)
-}
-
-// ---------------------------------------------------------------------------
-// Z3 helpers
-// ---------------------------------------------------------------------------
-
-/// Create Z3 integer variables for each counter, bounded [0, max_counter].
-fn make_counter_vars(
-    model: &TemperModel,
-    solver: &Solver,
-    max_counter: usize,
-) -> Vec<(String, Int)> {
-    let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-
-    model
-        .initial_counters
-        .keys()
-        .map(|name| {
-            let var = Int::new_const(name.as_str());
-            solver.assert(var.ge(&zero));
-            solver.assert(var.le(&max_val));
-            (name.clone(), var)
-        })
-        .collect()
-}
-
-/// Create Z3 boolean variables for each boolean state var.
-fn make_bool_vars(model: &TemperModel) -> Vec<(String, Bool)> {
-    model
-        .initial_booleans
-        .keys()
-        .map(|name| {
-            let var = Bool::new_const(name.as_str());
-            (name.clone(), var)
-        })
-        .collect()
-}
-
-#[derive(Default)]
-struct ListSymbolicVars {
-    len_vars: BTreeMap<String, Int>,
-    elem_vars: BTreeMap<String, Vec<Int>>,
-    value_atoms: BTreeMap<String, i64>,
-}
-
-/// Create exact bounded symbolic list variables:
-/// - `len` in `[0, max_counter]`
-/// - `elem_0..elem_{max_counter-1}` for position values
-fn make_list_vars(model: &TemperModel, solver: &Solver, max_counter: usize) -> ListSymbolicVars {
-    let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-    let mut len_vars = BTreeMap::new();
-    let mut elem_vars = BTreeMap::new();
-
-    for name in model.initial_lists.keys() {
-        let len_var = Int::new_const(format!("{name}_len"));
-        solver.assert(len_var.ge(&zero));
-        solver.assert(len_var.le(&max_val));
-        len_vars.insert(name.clone(), len_var);
-
-        let elements = (0..max_counter)
-            .map(|idx| Int::new_const(format!("{name}_elem_{idx}")))
-            .collect::<Vec<_>>();
-        elem_vars.insert(name.clone(), elements);
-    }
-
-    let mut values = BTreeSet::new();
-    for t in &model.transitions {
-        let mut pairs = BTreeSet::new();
-        collect_list_contains_pairs(&t.guard, &mut pairs);
-        for (_, value) in pairs {
-            values.insert(value);
-        }
-    }
-    for list in model.initial_lists.values() {
-        for value in list {
-            values.insert(value.clone());
-        }
-    }
-
-    let value_atoms = values
-        .into_iter()
-        .enumerate()
-        .map(|(idx, value)| (value, idx as i64))
-        .collect::<BTreeMap<_, _>>();
-
-    ListSymbolicVars {
-        len_vars,
-        elem_vars,
-        value_atoms,
-    }
-}
-
-/// Create a symbolic status variable over `model.states` indices.
-fn make_status_var(model: &TemperModel, solver: &Solver) -> Int {
-    let var = Int::new_const("status_idx");
-    let zero = Int::from_i64(0);
-    if model.states.is_empty() {
-        solver.assert(var.eq(&zero));
-        return var;
-    }
-    let max = Int::from_i64((model.states.len() - 1) as i64);
-    solver.assert(var.ge(&zero));
-    solver.assert(var.le(&max));
-    var
-}
-
-/// Encode `status ∈ states` as a disjunction over symbolic status index.
-fn encode_state_membership(status_var: &Int, states: &[String], model: &TemperModel) -> Bool {
-    let disjuncts: Vec<Bool> = states
-        .iter()
-        .filter_map(|state| {
-            model
-                .states
-                .iter()
-                .position(|s| s == state)
-                .map(|idx| status_var.eq(Int::from_i64(idx as i64)))
-        })
-        .collect();
-    if disjuncts.is_empty() {
-        Bool::from_bool(false)
-    } else {
-        Bool::or(&disjuncts)
-    }
-}
-
-/// Encode exact bounded `contains(list, value)` over symbolic list slots.
-fn encode_list_contains(var: &str, value: &str, lists: &ListSymbolicVars) -> Bool {
-    let Some(len_var) = lists.len_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(elements) = lists.elem_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(atom_id) = lists.value_atoms.get(value) else {
-        return Bool::from_bool(false);
-    };
-
-    if elements.is_empty() {
-        return Bool::from_bool(false);
-    }
-
-    let atom = Int::from_i64(*atom_id);
-    let disjuncts: Vec<Bool> = elements
-        .iter()
-        .enumerate()
-        .map(|(idx, element)| {
-            let idx_int = Int::from_i64(idx as i64);
-            Bool::and(&[&len_var.gt(&idx_int), &element.eq(&atom)])
-        })
-        .collect();
-    Bool::or(&disjuncts)
-}
-
-/// Symbolic values for one state.
-struct Symbols<'a> {
-    counters: BTreeMap<String, Int>,
-    bools: BTreeMap<String, Bool>,
-    lists: &'a ListSymbolicVars,
-    status: Int,
-    /// Distinguishes free atoms of different states (pre/post).
-    prefix: &'static str,
-}
-
-/// Encode an expression as a Z3 formula. Parts over values the model does
-/// not track (related-entity statuses, strings, fields) become free boolean
-/// atoms, named by their source text so repeated occurrences agree.
-fn encode(expr: &Expr, sym: &Symbols<'_>, model: &TemperModel) -> Bool {
-    let free = || Bool::new_const(format!("{}atom:{expr}", sym.prefix));
-    match expr {
-        Expr::Const(value) => Bool::from_bool(*value),
-        Expr::Not(inner) => encode(inner, sym, model).not(),
-        Expr::And(parts) => Bool::and(
-            &parts
-                .iter()
-                .map(|p| encode(p, sym, model))
-                .collect::<Vec<_>>(),
-        ),
-        Expr::Or(parts) => Bool::or(
-            &parts
-                .iter()
-                .map(|p| encode(p, sym, model))
-                .collect::<Vec<_>>(),
-        ),
-        Expr::Implies(lhs, rhs) => encode(lhs, sym, model).implies(encode(rhs, sym, model)),
-        Expr::Var(name) => sym.bools.get(name).cloned().unwrap_or_else(free),
-        Expr::Empty(name) => match sym.lists.len_vars.get(name) {
-            Some(len) => len.eq(Int::from_i64(0)),
-            None => free(),
-        },
-        Expr::Compare { lhs, op, rhs } => {
-            if let (Some(a), Some(b)) = (int_term(lhs, sym), int_term(rhs, sym)) {
-                return match op {
-                    CmpOp::Eq => a.eq(&b),
-                    CmpOp::Ne => a.eq(&b).not(),
-                    CmpOp::Lt => a.lt(&b),
-                    CmpOp::Le => a.le(&b),
-                    CmpOp::Gt => a.gt(&b),
-                    CmpOp::Ge => a.ge(&b),
-                };
-            }
-            let equal = match (lhs, rhs) {
-                (Operand::Status, Operand::Lit(Literal::Str(state)))
-                | (Operand::Lit(Literal::Str(state)), Operand::Status) => Some(
-                    encode_state_membership(&sym.status, std::slice::from_ref(state), model),
-                ),
-                (Operand::Var(name), Operand::Lit(Literal::Bool(value)))
-                | (Operand::Lit(Literal::Bool(value)), Operand::Var(name)) => sym
-                    .bools
-                    .get(name)
-                    .map(|var| var.eq(Bool::from_bool(*value))),
-                _ => None,
-            };
-            match (equal, op) {
-                (Some(equal), CmpOp::Eq) => equal,
-                (Some(equal), CmpOp::Ne) => equal.not(),
-                _ => free(),
-            }
-        }
-        Expr::In {
-            value,
-            set,
-            negated,
-        } => {
-            let member = match (value, set) {
-                (Operand::Status, Set::List(items)) => {
-                    let states: Option<Vec<String>> = items
-                        .iter()
-                        .map(|item| match item {
-                            Literal::Str(state) => Some(state.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    states.map(|states| encode_state_membership(&sym.status, &states, model))
-                }
-                (Operand::Lit(Literal::Str(value)), Set::Var(list))
-                    if sym.lists.len_vars.contains_key(list) =>
-                {
-                    Some(encode_list_contains(list, value, sym.lists))
-                }
-                (value, Set::List(items)) => int_term(value, sym).and_then(|term| {
-                    let options: Option<Vec<Bool>> = items
-                        .iter()
-                        .map(|item| match item {
-                            Literal::Int(n) => Some(term.eq(Int::from_i64(*n))),
-                            _ => None,
-                        })
-                        .collect();
-                    options.map(|options| Bool::or(&options))
-                }),
-                _ => None,
-            };
-            match member {
-                Some(member) if *negated => member.not(),
-                Some(member) => member,
-                None => free(),
-            }
-        }
-    }
-}
-
-/// An integer-valued operand: a counter, a list length, or an integer.
-fn int_term(operand: &Operand, sym: &Symbols<'_>) -> Option<Int> {
-    match operand {
-        Operand::Var(name) => sym.counters.get(name).cloned(),
-        Operand::Len(name) => sym.lists.len_vars.get(name).cloned(),
-        Operand::Lit(Literal::Int(n)) => Some(Int::from_i64(*n)),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,213 +390,4 @@ fn check_unreachable_states(model: &TemperModel) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ORDER_IOA: &str = include_str!("../../../test-fixtures/specs/order.ioa.toml");
-
-    #[test]
-    fn test_all_guards_satisfiable() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        for (action, sat) in &result.guard_satisfiability {
-            assert!(sat, "Guard for '{action}' should be satisfiable");
-        }
-    }
-
-    #[test]
-    fn test_no_unreachable_states() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        assert!(
-            result.unreachable_states.is_empty(),
-            "All states should be reachable, but got unreachable: {:?}",
-            result.unreachable_states
-        );
-    }
-
-    #[test]
-    fn test_type_invariant_is_inductive() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        let type_inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "TypeInvariant");
-        assert!(type_inv.is_some());
-        assert!(type_inv.unwrap().1, "TypeInvariant should be inductive");
-    }
-
-    #[test]
-    fn test_counter_positive_invariant_is_inductive() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        let inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "SubmitRequiresItems");
-        assert!(inv.is_some(), "Should have SubmitRequiresItems");
-        assert!(inv.unwrap().1, "SubmitRequiresItems should be inductive");
-    }
-
-    #[test]
-    fn test_symbolic_result_structure() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        assert!(!result.guard_satisfiability.is_empty());
-        assert!(!result.inductive_invariants.is_empty());
-        assert!(!result.approximate);
-        assert!(result.approximation_notes.is_empty());
-    }
-
-    #[test]
-    fn test_list_contains_exact_at_bound() {
-        let spec = r#"
-[automaton]
-name = "ListExact"
-states = ["S"]
-initial = "S"
-
-[[state]]
-name = "labels"
-type = "list"
-initial = []
-
-[[action]]
-name = "ConflictingContains"
-from = ["S"]
-to = "S"
-guard = "'urgent' in labels && 'normal' in labels"
-"#;
-
-        // With max_counter=1, a single-slot list cannot contain two distinct
-        // values simultaneously.
-        let result = verify_symbolic(spec, 1);
-        let guard = result
-            .guard_satisfiability
-            .iter()
-            .find(|(name, _)| name == "ConflictingContains");
-        assert!(guard.is_some());
-        assert!(
-            !guard.unwrap().1,
-            "single-slot exact list encoding should reject conflicting contains guards"
-        );
-    }
-
-    #[test]
-    fn test_dead_guard_detected() {
-        // Guard requires counter >= 10 but max is 2 → Z3 returns UNSAT
-        let spec = r#"
-[automaton]
-name = "DeadGuard"
-states = ["A", "B"]
-initial = "A"
-
-[[state]]
-name = "items"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "Go"
-from = ["A"]
-to = "B"
-guard = "items > 9"
-"#;
-        let result = verify_symbolic(spec, 2);
-        let go_guard = result
-            .guard_satisfiability
-            .iter()
-            .find(|(name, _)| name == "Go");
-        assert!(go_guard.is_some());
-        assert!(
-            !go_guard.unwrap().1,
-            "Guard requiring items >= 10 with max_counter=2 should be unsatisfiable"
-        );
-    }
-
-    #[test]
-    fn test_non_inductive_invariant_detected() {
-        // GoB reaches trigger state B but doesn't increment count →
-        // Z3 finds pre-state where count=1, effect none → post count=0 possible?
-        // Actually: no effects, so counter_post = counter_pre. If pre > 0
-        // then post > 0. This IS inductive because no decrement.
-        // Let's test with a decrement instead.
-        let spec = r#"
-[automaton]
-name = "NonInductive"
-states = ["A", "B"]
-initial = "A"
-
-[[state]]
-name = "count"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "GoB"
-from = ["A"]
-to = "B"
-
-[[invariant]]
-name = "BRequiresCount"
-assert = "status in ['B'] => count > 0"
-"#;
-        // GoB reaches B, no effects on count. The invariant says count > 0
-        // when in B. Since GoB doesn't set count, if count was 0 in A,
-        // count will be 0 in B. But in the Z3 induction check, we assume
-        // count > 0 in pre-state (induction hypothesis). Since no decrement,
-        // count stays > 0. So this IS inductive from the Z3 perspective.
-        //
-        // The issue is reachability: GoB can fire from A when count=0 (no guard),
-        // reaching B with count=0. But that's a BASE CASE violation, not an
-        // induction failure. Induction only checks: if invariant holds before
-        // transition, does it hold after?
-        let result = verify_symbolic(spec, 2);
-        let inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "BRequiresCount");
-        assert!(inv.is_some());
-        // This is inductive (no counter modification), even though the
-        // invariant doesn't hold from initial state — that's a BFS check.
-        assert!(
-            inv.unwrap().1,
-            "BRequiresCount is inductive (no counter change)"
-        );
-    }
-
-    #[test]
-    fn test_decrement_breaks_induction() {
-        // Transition decrements counter when reaching trigger state →
-        // Z3 finds counterexample: count_pre=1, count_post=0
-        let spec = r#"
-[automaton]
-name = "DecrBreaks"
-states = ["A", "B"]
-initial = "A"
-
-[[state]]
-name = "count"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "GoB"
-from = ["A"]
-to = "B"
-effect = ["count -= 1"]
-
-[[invariant]]
-name = "BNeedsCount"
-assert = "status in ['B'] => count > 0"
-"#;
-        let result = verify_symbolic(spec, 2);
-        let inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "BNeedsCount");
-        assert!(inv.is_some());
-        // GoB decrements count. Z3 finds: count_pre=1, count_post=0 ≤ 0 → SAT
-        // So induction fails.
-        assert!(
-            !inv.unwrap().1,
-            "BNeedsCount should NOT be inductive (decrement can reach 0)"
-        );
-    }
-}
+mod tests;

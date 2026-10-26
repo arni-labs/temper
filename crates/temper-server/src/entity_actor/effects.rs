@@ -691,6 +691,9 @@ pub fn apply_effects(
                     ),
                 }
             }
+            Effect::SetString { var, value } => {
+                state.fields[var] = serde_json::Value::String(value.clone());
+            }
             Effect::ListAppend { var, value } => {
                 if let Some(element) = effect_args::string(value, params) {
                     state.lists.entry(var.clone()).or_default().push(element);

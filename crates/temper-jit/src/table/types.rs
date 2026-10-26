@@ -219,7 +219,7 @@ pub struct TransitionRule {
 /// An effect applied after a transition fires.
 ///
 /// Mirrors [`temper_spec::automaton::ResolvedEffect`] plus the status change.
-/// Values are [`Arg`]s; resolve them with [`super::effect_args`].
+/// Counter, bool and list values are [`Arg`]s; resolve them with [`super::effect_args`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Effect {
     /// Change the entity status.
@@ -232,6 +232,8 @@ pub enum Effect {
     SubCounter { var: String, value: Arg },
     /// `var = value` on a bool.
     SetBool { var: String, value: Arg },
+    /// `var = 'literal'` on a string, including the empty string.
+    SetString { var: String, value: String },
     /// `append(var, value)`.
     ListAppend { var: String, value: Arg },
     /// `remove_at(var, index)`; out of range is a no-op.

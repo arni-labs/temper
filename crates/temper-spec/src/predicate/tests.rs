@@ -358,6 +358,8 @@ mod effects {
             "items = limit",
             "ready = true",
             "ready = params.ok",
+            "goal = 'literal'",
+            "goal = ''",
             "append(tags, 'vip')",
             "append(tags, params.tag)",
             "remove_at(tags, 0)",
@@ -434,6 +436,8 @@ mod effects {
         let effects: Vec<Effect> = [
             "items += params.n",
             "ready = params.ok",
+            "goal = 'literal'",
+            "goal = ''",
             "append(tags, params.tag)",
             "remove_at(tags, params.n)",
         ]
@@ -456,7 +460,7 @@ mod effects {
             ("items = ready", "a counter takes"),
             ("ready = 1", "a bool takes"),
             ("tags = 'a'", "use append() or remove_at()"),
-            ("goal = 'a'", "only counters and bools"),
+            ("goal = true", "string literal"),
             ("append(items, 'a')", "'items' is not a list"),
             ("append(tags, 1)", "lists hold strings"),
             ("remove_at(tags, 'a')", "the index is"),
