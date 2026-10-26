@@ -93,6 +93,7 @@ impl JointModel {
         }
         Self {
             expansion: Default::default(),
+            id_literals: BTreeSet::new(),
             models,
             reactions,
             records: Records::One,

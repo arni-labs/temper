@@ -372,3 +372,41 @@ assert = "Parent[Id].status == 'Open' => a == b"
         assert_eq!(!replay.broken.is_empty(), broken);
     }
 }
+
+#[test]
+fn concrete_reference_ids_can_find_an_initially_closed_parent() {
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
+    for id in ["550e8400-e29b-41d4-a716-446655440000", "#2"] {
+        let child = format!(
+            r#"
+[automaton]
+name = "Child"
+states = ["Ready"]
+initial = "Ready"
+[[state]]
+name = "parent_id"
+type = "string"
+initial = "{id}"
+[[invariant]]
+name = "rule"
+assert = "Parent[parent_id].status != 'Closed'"
+"#
+        );
+        let result = check(&[parent, &child]);
+        let JointOutcome::Broken { path } = &result.outcome else {
+            panic!("expected the concrete reference to find Parent: {result}");
+        };
+        assert_eq!(path.len(), 1, "the rule already fails initially: {result}");
+    }
+}
+
+#[test]
+fn concrete_ids_in_assertions_are_explored_without_string_fields() {
+    let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
+    let child = child_with("Parent[Id].id != 'concrete'");
+    let result = check(&[parent, &child]);
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+}

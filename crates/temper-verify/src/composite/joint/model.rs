@@ -2,6 +2,7 @@
 //! on their way between them, and the walk.
 
 mod drops;
+mod initial;
 mod read;
 mod step;
 
@@ -62,6 +63,7 @@ pub(super) struct Walk {
 /// The joint model of one entity's invariants that read related entities.
 pub(super) struct JointModel {
     expansion: Expansion,
+    id_literals: BTreeSet<String>,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
     records: Records,
@@ -106,6 +108,29 @@ impl JointModel {
                 Name::Status => {}
             });
         }
+        let mut id_literals = BTreeSet::new();
+        for entity in &scope {
+            let a = by_name[entity.as_str()];
+            for inv in &a.invariants {
+                read::collect_literals(&inv.assert, &mut id_literals);
+            }
+            for action in &a.actions {
+                read::collect_literals(&action.guard, &mut id_literals);
+                for trigger in &action.triggers {
+                    if let Some(guard) = &trigger.guard {
+                        read::collect_literals(guard, &mut id_literals);
+                    }
+                    for arg in trigger.args.values() {
+                        if let temper_spec::predicate::Arg::Lit(
+                            temper_spec::predicate::Literal::Str(s),
+                        ) = arg
+                        {
+                            id_literals.insert(s.clone());
+                        }
+                    }
+                }
+            }
+        }
         let (models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
         let models = models
             .into_iter()
@@ -116,6 +141,7 @@ impl JointModel {
             .collect();
         Self {
             expansion: Expansion::default(),
+            id_literals,
             models,
             reactions,
             records: Records::ById,
@@ -137,32 +163,6 @@ impl JointModel {
                 (entity.clone(), init)
             })
             .collect()
-    }
-
-    /// The starting states: one per way the records' ids can be equal or
-    /// differ, or the one start when there is one record of a type.
-    fn inits(&self) -> Box<dyn Iterator<Item = JointState> + '_> {
-        let blank = self.blank();
-        if self.records == Records::One {
-            return Box::new(std::iter::once(JointState {
-                records: blank,
-                inflight: Vec::new(),
-            }));
-        }
-        Box::new(partitions(blank.len()).map(move |blocks| {
-            let mut records = blank.clone();
-            for (record, block) in records.values_mut().zip(blocks) {
-                record
-                    .strings
-                    .insert(ID.to_string(), ModelString::Symbol(block + 1));
-            }
-            let mut state = JointState {
-                records,
-                inflight: Vec::new(),
-            };
-            canonical(&mut state);
-            state
-        }))
     }
 
     /// The starting state whose ids are `ids` (entity type to a trace name;
@@ -416,27 +416,6 @@ impl JointModel {
     }
 }
 
-/// Every way to split `n` items into blocks, as each item's block number,
-/// blocks numbered in order of first use.
-fn partitions(n: usize) -> impl Iterator<Item = Vec<usize>> {
-    // Restricted-growth strings enumerate partitions with O(n) storage.
-    let mut blocks = Some(vec![0; n]);
-    std::iter::from_fn(move || {
-        let current = blocks.take()?;
-        let mut next = current.clone();
-        for i in (1..n).rev() {
-            let largest = next[..i].iter().max().copied().unwrap_or(0) + 1;
-            if next[i] < largest {
-                next[i] += 1;
-                next[i + 1..].fill(0);
-                blocks = Some(next);
-                break;
-            }
-        }
-        Some(current)
-    })
-}
-
 /// Renumber new strings over the whole joint state, records first, then
 /// the dispatches in flight; returns each value's new name.
 fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
@@ -470,19 +449,4 @@ fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
     dispatches.sort();
     state.inflight = dispatches;
     renamed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::partitions;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn incremental_partitions_are_exhaustive_and_unique() {
-        for (n, expected) in [1, 1, 2, 5, 15, 52].into_iter().enumerate() {
-            let all: Vec<_> = partitions(n).collect();
-            assert_eq!(all.len(), expected);
-            assert_eq!(all.into_iter().collect::<BTreeSet<_>>().len(), expected);
-        }
-    }
 }

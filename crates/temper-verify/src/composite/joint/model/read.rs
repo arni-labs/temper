@@ -158,7 +158,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
 }
 
 /// Literals must remain distinct even when compared with related operands.
-fn collect_literals(expr: &Expr, out: &mut BTreeSet<String>) {
+pub(super) fn collect_literals(expr: &Expr, out: &mut BTreeSet<String>) {
     use temper_spec::predicate::{Literal, Operand, Set};
     let mut operand = |o: &Operand| {
         if let Operand::Lit(Literal::Str(s)) = o {
