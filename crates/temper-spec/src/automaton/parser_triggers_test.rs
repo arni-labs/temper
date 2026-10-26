@@ -528,6 +528,38 @@ kind = "wasm"
 }
 
 #[test]
+fn a_wasm_trigger_that_names_no_on_success_is_refused() {
+    // A module computes values; the spec decides the move.
+    let spec = r#"
+[automaton]
+name = "X"
+states = ["A", "B"]
+initial = "A"
+
+[[action]]
+name = "Go"
+from = ["A"]
+
+[[action.triggers]]
+name = "decide"
+kind = "wasm"
+module = "decider"
+on_failure = "Fail"
+
+[[action]]
+name = "Fail"
+from = ["A"]
+to = "B"
+"#;
+    let err = parse_automaton(spec).expect_err("a wasm trigger without on_success must fail");
+    let err = err.to_string();
+    assert!(err.contains("trigger 'decide' on action 'Go'"), "{err}");
+    assert!(err.contains("names no 'on_success'"), "{err}");
+    let named = spec.replace("on_failure = \"Fail\"", "on_success = \"Fail\"");
+    parse_automaton(&named).expect("naming on_success is enough");
+}
+
+#[test]
 fn test_to_state_must_be_declared_state() {
     let spec = r#"
 [automaton]
@@ -740,6 +772,7 @@ to = "Waiting"
 name = "prepare_context"
 kind = "wasm"
 module = "context_preparer"
+on_success = "Continue"
 on_failure = "Fail"
 
 [action.triggers.config]
@@ -754,6 +787,7 @@ to = "Waiting"
 name = "prepare_context"
 kind = "wasm"
 module = "context_preparer"
+on_success = "Continue"
 on_failure = "Fail"
 config = { temper_api_url = "{secret:temper_api_url}" }
 

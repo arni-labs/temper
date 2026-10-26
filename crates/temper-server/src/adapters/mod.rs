@@ -103,8 +103,6 @@ impl AdapterContext {
 /// Adapter invocation result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdapterResult {
-    /// Optional callback action suggested by the adapter implementation.
-    pub callback_action: Option<String>,
     /// Callback params produced by the adapter.
     pub callback_params: serde_json::Value,
     /// Whether adapter execution succeeded.
@@ -119,7 +117,6 @@ impl AdapterResult {
     /// Build a successful adapter result.
     pub fn success(callback_params: serde_json::Value, duration_ms: u64) -> Self {
         Self {
-            callback_action: None,
             callback_params,
             success: true,
             error: None,
@@ -130,7 +127,6 @@ impl AdapterResult {
     /// Build a failed adapter result.
     pub fn failure(error: String, duration_ms: u64) -> Self {
         Self {
-            callback_action: None,
             callback_params: serde_json::json!({}),
             success: false,
             error: Some(error),

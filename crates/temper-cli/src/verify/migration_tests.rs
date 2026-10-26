@@ -190,7 +190,7 @@ fn no_ioa_cannot_pass_application_verification() {
 fn referenced_wasm_must_exist_and_cannot_escape_modules_directory() {
     for module in ["probe", "../probe"] {
         let app = application();
-        let source = IOA.replace("[[invariant]]", &format!("[[action.triggers]]\nname=\"probe\"\nkind=\"wasm\"\nmodule=\"{module}\"\n\n[[invariant]]"));
+        let source = IOA.replace("[[invariant]]", &format!("[[action.triggers]]\nname=\"probe\"\nkind=\"wasm\"\nmodule=\"{module}\"\non_success=\"Increment\"\n\n[[invariant]]"));
         fs::write(app.path().join("specs/counter.ioa.toml"), source).unwrap();
         let error = verify_specs(&app).unwrap_err().to_string();
         assert!(

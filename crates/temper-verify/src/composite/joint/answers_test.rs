@@ -1,7 +1,7 @@
 //! A call's answer is what the kernel dispatches: its trigger's `on_success`
-//! when it names one, and otherwise any action of its record that the call's
-//! result names. Cedar decides neither. The proof and the walk both take
-//! exactly those answers.
+//! with the call's values, or its `on_failure`. The call's result names no
+//! move, and Cedar decides neither. The proof and the walk both take exactly
+//! those answers.
 
 use std::time::Duration;
 
@@ -81,20 +81,13 @@ fn verdict(source: &str) -> JointVerdict {
 }
 
 #[test]
-fn a_rule_only_a_module_answer_breaks_fails() {
-    // The trigger names no answer, so the kernel takes whatever action the
-    // module's result names, Finish among them.
-    let verdict = verdict(&job(WASM, None, NEVER_FINISHED));
-    let text = verdict.to_string();
-    assert_eq!(verdict.tag(), "FAIL", "{text}");
-    assert!(text.contains(FINISHED), "{text}");
-}
-
-#[test]
-fn an_adapters_answer_is_taken_as_a_modules_is() {
-    let verdict = verdict(&job(ADAPTER, None, NEVER_FINISHED));
-    let text = verdict.to_string();
-    assert_eq!(verdict.tag(), "FAIL", "{text}");
+fn an_adapter_that_names_no_answer_moves_nothing() {
+    // Its result names no move, so nothing finishes the job.
+    let unnamed = verdict(&job(ADAPTER, None, NEVER_FINISHED));
+    assert!(unnamed.holds(), "{unnamed}");
+    let named = verdict(&job(ADAPTER, Some("Finish"), NEVER_FINISHED));
+    let text = named.to_string();
+    assert_eq!(named.tag(), "FAIL", "{text}");
     assert!(text.contains(FINISHED), "{text}");
 }
 
@@ -148,9 +141,8 @@ fn broken_in_both(sources: &[&str], cedar: &str, steps: &[&str]) {
 #[test]
 fn an_answer_can_match_a_field_changed_after_the_call_started() {
     for kind in [WASM, ADAPTER] {
-        for named in ["", "on_success = 'Finish'"] {
-            let source = format!(
-                r#"
+        let source = format!(
+            r#"
 [automaton]
 name = "Job"
 states = ["Idle", "Running", "Updated", "Finished"]
@@ -170,7 +162,7 @@ to = "Running"
 [[action.triggers]]
 name = "work"
 {kind}
-{named}
+on_success = 'Finish'
 
 [[action]]
 name = "Update"
@@ -196,14 +188,14 @@ field = "commit"
 name = "Rule"
 assert = "status in ['Idle', 'Running', 'Updated'] || commit != 'new'"
 "#
-            );
-            let policies = r#"permit(principal, action in [Action::"Start", Action::"Update"], resource is Job);"#;
-            broken_in_both(
-                &[&source],
-                policies,
-                &["Job.Start", "Job.Update", "Job.Finish(commit='new')"],
-            );
-        }
+        );
+        let policies =
+            r#"permit(principal, action in [Action::"Start", Action::"Update"], resource is Job);"#;
+        broken_in_both(
+            &[&source],
+            policies,
+            &["Job.Start", "Job.Update", "Job.Finish(commit='new')"],
+        );
     }
 }
 

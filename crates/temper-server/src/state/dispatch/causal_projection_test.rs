@@ -178,8 +178,8 @@ async fn causal_projection_failure_preserves_commit_without_starting_dependents(
     assert_eq!(child.state.status, "SawNew");
     assert_eq!(
         child.state.sequence_nr,
-        initial_child_sequence + 2,
-        "one Verify and one WASM callback only"
+        initial_child_sequence + 3,
+        "one Verify, its module's answer and the move its guards chose only"
     );
 }
 

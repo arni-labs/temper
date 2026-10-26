@@ -78,6 +78,19 @@ pub(super) fn validate_action_triggers(
                             trigger.name, action.name
                         )));
                     }
+                    // A module computes values; the spec decides the move.
+                    // The kernel sends only `on_success`, with the module's
+                    // values, so a trigger without one has no move to make.
+                    if trigger.on_success.as_deref().is_none_or(str::is_empty) {
+                        return Err(AutomatonParseError::Validation(format!(
+                            "trigger '{}' on action '{}' is kind=\"wasm\" but names no 'on_success': \
+                             a module computes values and the spec decides the move, so name the \
+                             action that takes its values (and 'on_failure' for when it fails); \
+                             where the values choose between moves, store them there and let \
+                             guards decide",
+                            trigger.name, action.name
+                        )));
+                    }
                 }
                 TriggerKind::Adapter => {
                     if trigger

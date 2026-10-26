@@ -12,8 +12,8 @@ use crate::predicate::{Arg, Expr, Literal};
 pub enum TriggerKind {
     /// Cross-entity action dispatch. Target is another entity's action.
     Entity,
-    /// WASM module execution. Optionally dispatches `on_success` / `on_failure`
-    /// actions on the source entity afterwards.
+    /// WASM module execution. Dispatches `on_success` with the module's
+    /// values, or `on_failure`, on the source entity afterwards.
     Wasm,
     /// Native platform adapter execution. Optionally dispatches `on_success`
     /// / `on_failure` actions on the source entity afterwards.
@@ -89,7 +89,7 @@ pub enum TargetResolver {
 /// kind's fields and rejects the fields of other kinds:
 /// - `Entity`: `target_entity`, `target_action`, `resolve_target`; optionally
 ///   `principal`, `guard`, `args`, `liveness`, `drop_ok`.
-/// - `Wasm`: `module`; optionally `on_success`, `on_failure`, `config`, `llm`.
+/// - `Wasm`: `module`, `on_success`; optionally `on_failure`, `config`, `llm`.
 /// - `Adapter`: `adapter`; optionally `on_success`, `on_failure`, `config`, `llm`.
 /// - `Webhook`: `url`, `method`; optionally `headers`, `body_template`,
 ///   `on_success`, `on_failure`, `config`.
@@ -152,7 +152,8 @@ pub struct ActionTrigger {
     /// WASM module name (required for `Wasm` kind).
     #[serde(default)]
     pub module: Option<String>,
-    /// Action to dispatch on the source entity on successful execution.
+    /// Action to dispatch on the source entity on successful execution, with
+    /// the call's values as its parameters (required for `Wasm` kind).
     #[serde(default)]
     pub on_success: Option<String>,
     /// Action to dispatch on the source entity on failed execution.
@@ -261,13 +262,13 @@ impl ActionTrigger {
     }
 }
 
-/// Whether a call whose trigger declares `on_success` may answer with
-/// `action` of its record. The kernel dispatches the trigger's `on_success`
-/// when it names one, and otherwise whatever action of the record the call's
-/// result names, of any kind. Cedar decides neither; only the record's own
-/// guards do.
-pub fn call_may_answer(on_success: Option<&str>, action: &str) -> bool {
-    on_success.is_none_or(|name| name == action)
+/// Whether a call whose trigger declares `on_success` and `on_failure` may
+/// answer with `action` of its record. A module computes values and the spec
+/// decides the move: the kernel sends the trigger's `on_success` with the
+/// call's values, or its `on_failure`, and reads no action from the result.
+/// Cedar decides neither; only the record's own guards do.
+pub fn call_may_answer(on_success: Option<&str>, on_failure: Option<&str>, action: &str) -> bool {
+    on_success == Some(action) || on_failure == Some(action)
 }
 
 /// The parameters `args` pass, read against an entity: a literal is its JSON

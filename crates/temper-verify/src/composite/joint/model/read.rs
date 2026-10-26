@@ -136,8 +136,11 @@ impl Kernel {
             || self.calls_on.iter().any(|((e, _), specs)| {
                 e == entity
                     && specs.iter().any(|spec| {
-                        call_may_answer(spec.on_success.as_deref(), action)
-                            || spec.on_failure.as_deref() == Some(action)
+                        call_may_answer(
+                            spec.on_success.as_deref(),
+                            spec.on_failure.as_deref(),
+                            action,
+                        )
                     })
             })
     }

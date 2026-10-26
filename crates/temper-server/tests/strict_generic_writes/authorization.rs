@@ -170,13 +170,34 @@ async fn implicit_creation_and_cold_recovery_use_actual_authorization_state() {
     );
 }
 
+/// An Order whose upload is its own move, `StreamUpdated`.
+const UPLOADED_ORDER: &str = r#"
+[automaton]
+name = "Order"
+states = ["Draft", "Submitted", "Uploaded"]
+initial = "Draft"
+strict_action_params = true
+[[action]]
+name = "SubmitOrder"
+kind = "input"
+from = ["Draft"]
+to = "Submitted"
+params = ["Notes"]
+[[action]]
+name = "StreamUpdated"
+kind = "input"
+from = ["Draft"]
+to = "Uploaded"
+params = ["Notes"]
+"#;
+
 #[tokio::test]
 async fn first_generic_stream_upload_commits_fields_and_rejected_reupload_is_not_success() {
     let csdl = common::CSDL_XML.replace(
         "<EntityType Name=\"Order\">",
         "<EntityType Name=\"Order\" HasStream=\"true\">",
     );
-    let mut state = state_with_csdl(&csdl);
+    let mut state = state_with_spec(&csdl, UPLOADED_ORDER);
     let store = temper_store_sim::SimEventStore::no_faults(467);
     state.set_storage_stack(temper_server::StorageStack::from_sim(store, None));
     let payload =
@@ -212,7 +233,8 @@ async fn first_generic_stream_upload_commits_fields_and_rejected_reupload_is_not
         .get_tenant_entity_state(&TenantId::default(), "Order", "upload")
         .await
         .unwrap();
-    assert_eq!(actual.state.status, "Submitted");
+    // The adapter names SubmitOrder; the upload commits its own move.
+    assert_eq!(actual.state.status, "Uploaded");
     assert_eq!(actual.state.fields["Notes"], "uploaded");
     let refused = raw_request(
         &state,

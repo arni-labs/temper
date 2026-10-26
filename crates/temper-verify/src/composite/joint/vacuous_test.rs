@@ -7,16 +7,10 @@ use temper_spec::automaton::{Automaton, parse_automaton};
 
 use super::*;
 
-/// A record that asks a module when it starts. Its answer `Done` is declared
-/// `done_kind`; with `on_success` the trigger names it, and without one the
-/// module's result names the answer, as the kernel takes it. `Gone` is a
-/// status nothing leads to. `rule` is appended as written.
-fn ask(done_kind: &str, on_success: bool, rule: &str) -> String {
-    let named = if on_success {
-        "on_success = \"Done\"\n"
-    } else {
-        ""
-    };
+/// A record that asks a module when it starts. Its answer `Done`, which the
+/// trigger names, is declared `done_kind`. `Gone` is a status nothing leads
+/// to. `rule` is appended as written.
+fn ask(done_kind: &str, rule: &str) -> String {
     format!(
         r#"
 [automaton]
@@ -34,7 +28,8 @@ to = "Asked"
 name = "ask"
 kind = "wasm"
 module = "asker"
-{named}
+on_success = "Done"
+
 [[action]]
 name = "Done"
 kind = "{done_kind}"
@@ -73,9 +68,9 @@ fn bound() -> Bound<'static> {
     super::room::test_bound()
 }
 
-fn liveness(done_kind: &str, on_success: bool, eventually: &str) -> JointLivenessResult {
+fn liveness(done_kind: &str, eventually: &str) -> JointLivenessResult {
     let rule = format!("[[liveness]]\nname = \"rule\"\neventually = \"{eventually}\"\n");
-    let automatons = parsed(&[&ask(done_kind, on_success, &rule)]);
+    let automatons = parsed(&[&ask(done_kind, &rule)]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(POLICIES).expect("fixture policies parse");
     let mut results = verify_joint_liveness(&refs, Some(&analysis), bound());
@@ -85,7 +80,7 @@ fn liveness(done_kind: &str, on_success: bool, eventually: &str) -> JointLivenes
 
 fn invariant(done_kind: &str, assert: &str) -> JointInvariantResult {
     let rule = format!("[[invariant]]\nname = \"rule\"\nassert = \"{assert}\"\n");
-    let automatons = parsed(&[&ask(done_kind, false, &rule), BOX]);
+    let automatons = parsed(&[&ask(done_kind, &rule), BOX]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(POLICIES).expect("fixture policies parse");
     let mut results = verify_joint_invariants(&refs, Some(&analysis), bound());
@@ -97,7 +92,7 @@ fn invariant(done_kind: &str, assert: &str) -> JointInvariantResult {
 fn a_liveness_rule_a_module_answer_strands_never_settles() {
     // The module may answer Done, and nothing then leads to Gone: the
     // runtime gets stuck. The walk takes Done as the kernel does.
-    let result = liveness("input", false, "status == 'Done' => status == 'Gone'");
+    let result = liveness("input", "status == 'Done' => status == 'Gone'");
     let text = result.to_string();
     assert!(
         matches!(result.outcome, LivenessOutcome::Stuck { .. }),
@@ -107,7 +102,7 @@ fn a_liveness_rule_a_module_answer_strands_never_settles() {
 
 #[test]
 fn a_liveness_premise_no_walked_state_meets_proves_nothing() {
-    let result = liveness("internal", false, "status == 'Gone' => status == 'Done'");
+    let result = liveness("internal", "status == 'Gone' => status == 'Done'");
     let text = result.to_string();
     assert!(!result.holds(), "{text}");
     assert!(text.contains("PROVES NOTHING"), "{text}");
@@ -140,7 +135,7 @@ fn an_invariant_premise_no_settled_state_meets_proves_nothing() {
 
 #[test]
 fn a_premise_the_walk_meets_settles() {
-    let result = liveness("internal", false, "status == 'Done' => status == 'Done'");
+    let result = liveness("internal", "status == 'Done' => status == 'Done'");
     assert!(result.holds(), "{result}");
 }
 
@@ -148,7 +143,7 @@ fn a_premise_the_walk_meets_settles() {
 fn an_answer_the_trigger_names_is_walked() {
     // Done is declared input and no one outside may send it, but the
     // trigger names it, so the model takes it as the module's answer.
-    let result = liveness("input", true, "status == 'Done' => status == 'Done'");
+    let result = liveness("input", "status == 'Done' => status == 'Done'");
     assert!(result.holds(), "{result}");
 }
 

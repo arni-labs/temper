@@ -47,8 +47,7 @@
 //! never a pass.
 //!
 //! A call's answer is what the kernel dispatches: its trigger's `on_success`
-//! when it names one, and otherwise any action of its record that the call's
-//! result names
+//! with any values, or its `on_failure`
 //! ([`call_may_answer`](temper_spec::automaton::call_may_answer)). The walk
 //! takes each of them.
 //!

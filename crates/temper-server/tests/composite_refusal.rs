@@ -43,6 +43,12 @@ async fn an_answer_moves_the_release_when_nothing_refuses_it() {
             "Answered",
             "{journal:?}: an applied composite does not run on_failure"
         );
+        // `on_success` takes the module's values without the sub-writes the
+        // kernel applied, so the strict `Applied` lands.
+        assert!(
+            notice_took(&state, "Applied").await,
+            "{journal:?}: the composite's on_success should run"
+        );
     }
 }
 

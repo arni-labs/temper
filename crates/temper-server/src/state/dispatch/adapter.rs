@@ -103,9 +103,6 @@ fn redact_adapter_execution(
     }
     match execution {
         Ok(mut result) => {
-            if let Some(action) = result.callback_action.take() {
-                result.callback_action = Some(redact_adapter_text(action, redactions));
-            }
             if let Some(error) = result.error.take() {
                 result.error = Some(redact_adapter_text(error, redactions));
             }
@@ -399,11 +396,7 @@ impl crate::state::ServerState {
         };
 
         if result.success {
-            let callback_action = integration
-                .on_success
-                .clone()
-                .or_else(|| result.callback_action.clone());
-            let Some(callback_action) = callback_action else {
+            let Some(callback_action) = integration.on_success.clone() else {
                 return Ok(None);
             };
             let callback_params = normalize_success_params(result);

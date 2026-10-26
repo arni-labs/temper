@@ -120,8 +120,11 @@ impl Vocab<'_> {
         }
         for trigger in automaton.actions.iter().flat_map(|a| &a.triggers) {
             if trigger.callee().is_some()
-                && (call_may_answer(trigger.on_success.as_deref(), action)
-                    || trigger.on_failure.as_deref() == Some(action))
+                && call_may_answer(
+                    trigger.on_success.as_deref(),
+                    trigger.on_failure.as_deref(),
+                    action,
+                )
             {
                 out.push(Asker::Service {
                     name: match trigger.kind {

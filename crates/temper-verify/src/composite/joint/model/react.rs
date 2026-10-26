@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{TargetResolver, call_may_answer};
+use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
@@ -65,9 +65,9 @@ impl JointModel {
     }
 
     /// The answers the kernel takes for the call `call`: its trigger's
-    /// `on_success`, or else any action of its record (`call_may_answer`).
-    /// The module itself is not modelled: it may give each of these
-    /// answers, and gives each it keeps being able to give at some point.
+    /// `on_success`, with any values. The module itself is not modelled: it
+    /// may give any values, and gives each it keeps being able to give at
+    /// some point.
     pub(super) fn answers(
         &self,
         state: &JointState,
@@ -78,7 +78,7 @@ impl JointModel {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            if !call_may_answer(call.on_success.as_deref(), &t.name)
+            if call.on_success.as_deref() != Some(t.name.as_str())
                 || !self.enabled(&call.to, t, state, Blind::Nothing)
             {
                 continue;

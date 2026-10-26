@@ -387,7 +387,7 @@ fn trigger_keys_belong_to_their_kind() {
         &spec(
             "",
             "",
-            "[[action.triggers]]\nname = \"run\"\nkind = \"wasm\"\nmodule = \"m\"\ntarget_entity = \"Owner\"",
+            "[[action.triggers]]\nname = \"run\"\nkind = \"wasm\"\nmodule = \"m\"\non_success = \"Finish\"\ntarget_entity = \"Owner\"",
         ),
         "target_entity",
     );
@@ -395,7 +395,7 @@ fn trigger_keys_belong_to_their_kind() {
         &spec(
             "",
             "",
-            "[[action.triggers]]\nname = \"run\"\nkind = \"wasm\"\nmodule = \"m\"\nguard = \"ready\"",
+            "[[action.triggers]]\nname = \"run\"\nkind = \"wasm\"\nmodule = \"m\"\non_success = \"Finish\"\nguard = \"ready\"",
         ),
         "guard",
     );
