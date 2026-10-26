@@ -89,8 +89,10 @@ pub enum TargetResolver {
 /// kind's fields and rejects the fields of other kinds:
 /// - `Entity`: `target_entity`, `target_action`, `resolve_target`; optionally
 ///   `principal`, `guard`, `args`, `liveness`, `drop_ok`.
-/// - `Wasm`: `module`; optionally `on_success`, `on_failure`, `config`, `llm`.
-/// - `Adapter`: `adapter`; optionally `on_success`, `on_failure`, `config`, `llm`.
+/// - `Wasm`: `module`; optionally `on_success` (one action or a list),
+///   `on_failure`, `config`, `llm`.
+/// - `Adapter`: `adapter`; optionally `on_success` (one action or a list),
+///   `on_failure`, `config`, `llm`.
 /// - `Webhook`: `url`, `method`; optionally `headers`, `body_template`,
 ///   `on_success`, `on_failure`, `config`.
 /// - `Hook`: `hook`.
@@ -152,9 +154,12 @@ pub struct ActionTrigger {
     /// WASM module name (required for `Wasm` kind).
     #[serde(default)]
     pub module: Option<String>,
-    /// Action to dispatch on the source entity on successful execution.
-    #[serde(default)]
-    pub on_success: Option<String>,
+    /// The actions a successful call may take on the source entity, in the
+    /// order the kernel tries them: it sends the first that the record takes
+    /// with the call's values (its guard may read them as `params.p`).
+    /// Written as one name or a list. Empty when the trigger names none.
+    #[serde(default, with = "one_or_many")]
+    pub on_success: Vec<String>,
     /// Action to dispatch on the source entity on failed execution.
     #[serde(default)]
     pub on_failure: Option<String>,
@@ -219,7 +224,7 @@ impl ActionTrigger {
             ("module", self.module.is_some(), &[Wasm]),
             (
                 "on_success",
-                self.on_success.is_some(),
+                !self.on_success.is_empty(),
                 &[Wasm, Adapter, Webhook],
             ),
             (
@@ -247,6 +252,40 @@ impl ActionTrigger {
             }
         }
         foreign
+    }
+}
+
+/// `on_success` as written: one action name, or a list of them. None, as
+/// before lists, when it names none.
+pub(crate) mod one_or_many {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<String>, D::Error> {
+        Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+            None => Vec::new(),
+            Some(OneOrMany::One(name)) => vec![name],
+            Some(OneOrMany::Many(names)) => names,
+        })
+    }
+
+    pub(crate) fn serialize<S: Serializer>(
+        names: &[String],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match names {
+            [] => serializer.serialize_none(),
+            [name] => serializer.serialize_str(name),
+            names => names.serialize(serializer),
+        }
     }
 }
 
