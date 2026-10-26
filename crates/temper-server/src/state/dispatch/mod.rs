@@ -34,7 +34,7 @@ pub(crate) use wasm::internal_http_capability_issuer;
 mod wasm_secrets;
 
 pub use state_timeouts::StateTimeoutTracker;
-pub use state_timer_follow::{BootTimerCounts, BootTimers, TimerFollowHold};
+pub use state_timer_follow::{BootTimerCounts, BootTimers, StateTimerCounts, TimerFollowHold};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WasmDispatchMode {

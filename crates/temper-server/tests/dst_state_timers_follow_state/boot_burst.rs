@@ -35,6 +35,7 @@ use serde_json::json;
 use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_sim_context};
 use temper_runtime::tenant::TenantId;
 use temper_server::request_context::AgentContext;
+use temper_server::state::{BootTimerCounts, StateTimerCounts};
 use temper_store_sim::SimEventStore;
 
 use super::world::{ProcessClock, SimTimerRows};
@@ -240,15 +241,43 @@ fn run_seed(seed: u64) -> Result<(), String> {
                 format!("{} timers fired at {at}: {fired:?}", fired.len()),
             ));
         }
-        let waiting = second
-            .booted
-            .get(&(TenantId::new("gamma"), "Job".to_string()))
-            .map_or(0, |counts| counts.waiting);
-        if waiting != 0 {
-            return Err(run.fail(
-                "the boot arms the records in a timed state that have no row",
-                format!("gamma/Job: the boot left {waiting} records waiting"),
-            ));
+        // Every gamma record had no row and was past its budget; every alpha
+        // record had its row.
+        for tenant in ["alpha", "gamma"] {
+            let records = jobs
+                .iter()
+                .filter(|job| job.tenant.as_str() == tenant)
+                .count();
+            let no_row = if tenant == "gamma" { records } else { 0 };
+            let counts = second
+                .booted
+                .get(&(TenantId::new(tenant), "Job".to_string()))
+                .cloned()
+                .unwrap_or_default();
+            let wanted = BootTimerCounts {
+                rearmed: records - no_row,
+                armed: no_row,
+                overdue: no_row,
+                states: (no_row > 0)
+                    .then(|| {
+                        let waiting = StateTimerCounts {
+                            on_timeout: "Expire".to_string(),
+                            armed: no_row,
+                            overdue: no_row,
+                            waiting: 0,
+                        };
+                        ("Waiting".to_string(), waiting)
+                    })
+                    .into_iter()
+                    .collect(),
+                ..BootTimerCounts::default()
+            };
+            if counts != wanted {
+                return Err(run.fail(
+                    "the boot arms the records in a timed state that have no row",
+                    format!("{tenant}/Job: the boot counted {counts:?}, wanted {wanted:?}"),
+                ));
+            }
         }
         Ok(())
     })?;

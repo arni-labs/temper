@@ -12,10 +12,11 @@ impl ServerState {
     ///
     /// It arms again the state timers and scheduled actions the last process
     /// left waiting, from their rows (`rearm_state_timers`), and starts the runtime
-    /// metrics loop. Returns the background walk that makes records with a
-    /// row follow their state and counts those in a timed state with no row;
-    /// it ends with the counts per tenant and type, which it also logs as
-    /// `state timers after boot`. A second call in the same process starts
+    /// metrics loop. Returns the background walk that makes every record of a
+    /// timed type follow its state, arming those in a timed state with no row
+    /// from when they entered it; it ends with the counts per tenant, type and
+    /// timed state, which it also logs as `state timers after boot`. A second
+    /// call in the same process starts
     /// nothing and returns None: a second re-arm would arm every row again.
     pub async fn start_runtime(&self) -> Option<tokio::task::JoinHandle<BootTimers>> {
         if self.runtime_started.swap(true, Ordering::SeqCst) {

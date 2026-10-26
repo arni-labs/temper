@@ -22,14 +22,14 @@ pub(super) fn check_boot_counts(
             .iter()
             .filter(|job| job.tenant.as_str() == tenant && run.is_unarmed(job))
             .count();
-        let waiting = booted
+        let (armed, waiting) = booted
             .get(&(TenantId::new(tenant), "Job".to_string()))
-            .map_or(0, |counts| counts.waiting);
-        if waiting != 0 {
+            .map_or((0, 0), |counts| (counts.armed, counts.waiting));
+        if waiting != 0 || armed != unarmed {
             return Err(run.fail(
                 "the boot arms the records in a timed state that have no row",
                 format!(
-                    "{tenant}/Job: {unarmed} records had no row, the boot left {waiting} waiting"
+                    "{tenant}/Job: {unarmed} records had no row, the boot armed {armed} and left {waiting} waiting"
                 ),
             ));
         }

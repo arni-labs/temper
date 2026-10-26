@@ -33,7 +33,7 @@ pub(crate) use dispatch::authorized_http_endpoint_host;
 pub(crate) use dispatch::internal_http_capability_issuer;
 pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
-    StateTimeoutTracker, TimerFollowHold,
+    StateTimeoutTracker, StateTimerCounts, TimerFollowHold,
 };
 pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
 #[cfg(feature = "observe")]

@@ -94,13 +94,13 @@ impl ServerState {
     /// Reads one row per waiting timer and loads no entity until its timer
     /// fires, at most [`BOOT_FIRES_AT_ONCE`] firing at once; a row whose state
     /// declares no timeout now is removed. Then, in the background, each
-    /// record that had a row follows the state it is in now (as whoever armed
-    /// its row), through the same gate. A record in a timed state with no row
-    /// is not armed: it waits for its next action. The scheduled actions left
-    /// waiting are armed again from their rows through the same gate
-    /// (`rearm_scheduled_actions`). Returns that background walk, which ends
-    /// with the boot's counts per tenant and type, and logs them as
-    /// `state timers after boot`.
+    /// record of a timed type follows the state it is in now, through the same
+    /// gate: one that had a row as whoever armed it, one in a timed state with
+    /// no row from when it entered the state, as the state-timer service. The
+    /// scheduled actions left waiting are armed again from their rows through
+    /// the same gate (`rearm_scheduled_actions`). Returns that background
+    /// walk, which ends with the boot's counts per tenant, type and timed
+    /// state, and logs them as `state timers after boot`.
     pub(crate) async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<BootTimers> {
         let started = Instant::now();
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
@@ -191,7 +191,7 @@ impl ServerState {
         {
             // Serialize with install walks so none can consume startup changes
             // before saved identities and gates have been restored. The boot
-            // walk covers all timed types, with rows-only arming at startup.
+            // walk covers all timed types.
             let mut registry = self.registry.write().expect("registry lock poisoned");
             registry.take_changed_types();
             self.timer_recovery_complete
