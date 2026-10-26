@@ -437,11 +437,10 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
 /// gate like any writer (as the first in line: it is high priority).
 #[tokio::test]
 async fn single_event_append_waits_for_the_write_gate() {
-    let mut store = make_store("single-append-waits-for-gate").await;
-    store.write_gate = std::sync::Arc::new(super::write_gate::WriteGate::new(1));
+    let store = make_store("single-append-waits-for-gate").await;
     let held_gate = store
         .write_gate
-        .permits
+        .permit
         .clone()
         .acquire_owned()
         .await
@@ -631,7 +630,10 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
         .await
         .expect("upsert deleted projection");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "INSERT INTO entity_field_index \
          (tenant, entity_type, entity_id, field_name, field_value, status) \
@@ -1763,7 +1765,7 @@ async fn upsert_specs_and_commit_preserves_identical_spec_version() {
 
 #[tokio::test]
 async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
-    let mut store = make_store("spec-idempotent-bypasses-gate").await;
+    let store = make_store("spec-idempotent-bypasses-gate").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let ioa_source = "[automaton]\nname = \"Issue\"\n";
     let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
@@ -1780,10 +1782,9 @@ async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
         .await
         .expect("initial spec commit");
 
-    store.write_gate = std::sync::Arc::new(super::write_gate::WriteGate::new(1));
     let held_gate = store
         .write_gate
-        .permits
+        .permit
         .clone()
         .acquire_owned()
         .await
@@ -1836,7 +1837,10 @@ async fn persist_spec_verification_keeps_updated_at_for_identical_result() {
         .await
         .expect("persist verification");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
@@ -1903,7 +1907,10 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist first verification");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
@@ -1969,7 +1976,10 @@ async fn commit_specs_keeps_updated_at_when_specs_are_already_committed() {
         .await
         .expect("initial spec commit");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
@@ -2178,7 +2188,10 @@ async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
     assert_eq!(restorable(&store, &tenant).await, committed_view);
 
     // Once abandoned, recovery returns Issue to v1 and removes Task.
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = '2000-01-01 00:00:00' WHERE tenant = ?1 AND committed = 0",
         params![tenant.as_str()],
