@@ -149,3 +149,62 @@ async fn dst_a_restarted_record_reads_state_a_new_version_declares() {
         assert_eq!(after.state.counters.get("credits"), Some(&1));
     }
 }
+
+/// An Order spec that declares no `items` counter.
+const ORDER_WITHOUT_ITEMS: &str = r#"
+[automaton]
+name = "Order"
+states = ["Draft"]
+initial = "Draft"
+
+[[action]]
+name = "Touch"
+kind = "input"
+from = ["Draft"]
+"#;
+
+/// The next version declares `items` from 3. The kernel also keeps `items`
+/// in a field of its own that starts at 0, which must not read as stored.
+const ADDS_ITEMS: &str = r#"
+[[state]]
+name = "items"
+type = "counter"
+initial = 3
+
+[[action]]
+name = "Take"
+kind = "input"
+from = ["Draft"]
+guard = "items > 0"
+effect = ["items -= 1"]
+"#;
+
+#[tokio::test]
+async fn dst_a_record_reads_a_newly_declared_items_counter_from_its_initial_value() {
+    for seed in 0..20 {
+        let (_guard, _clock, _id_gen) = install_deterministic_context(seed);
+        let (state, _store) = common::build_single_tenant_state(
+            seed,
+            "dst-spec-adds-items",
+            "default",
+            &[("Order", ORDER_WITHOUT_ITEMS)],
+        );
+        let id = format!("o-{seed}");
+        act(&state, &id, "Touch", serde_json::json!({})).await;
+
+        let v2 = format!("{ORDER_WITHOUT_ITEMS}\n{ADDS_ITEMS}");
+        {
+            let mut reg = state.registry.write().expect("registry lock"); // ci-ok: infallible lock
+            let csdl = parse_csdl(common::CSDL_XML).expect("CSDL parse");
+            reg.register_tenant(
+                "default",
+                csdl,
+                common::CSDL_XML.to_string(),
+                &[("Order", v2.as_str())],
+            );
+        }
+        let taken = act(&state, &id, "Take", serde_json::json!({})).await;
+        assert_eq!(taken.state.counters.get("items"), Some(&2));
+        assert_eq!(taken.state.item_count, 2);
+    }
+}
