@@ -308,6 +308,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.shards) }}
+    services:
+      postgres:
+        image: ${{ matrix.args != '' && 'postgres:18' || '' }}
+        env:
+          POSTGRES_PASSWORD: temper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       # temper-spec's migration_differential tests read older commits.
       - uses: actions/checkout@v4
@@ -367,7 +376,9 @@ jobs:
 
       - name: cargo nextest run (affected packages, skip dst_)
         if: matrix.args != ''
-        run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
+        env:
+          DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }} --no-fail-fast
 
       - name: cargo test --doc (affected packages)
         if: matrix.doc != ''
