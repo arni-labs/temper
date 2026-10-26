@@ -125,11 +125,22 @@ impl fmt::Display for JointVerdict {
             }
         };
         f.write_str(walked.trim_end())?;
-        match tried.as_ref().and_then(RuleProof::shortfall) {
-            Some(why) => write!(f, "\n  not proved by induction: {why}"),
-            None => Ok(()),
+        let Some(tried) = tried else {
+            return Ok(());
+        };
+        if let Some(why) = tried.shortfall() {
+            write!(f, "\n  not proved by induction: {why}")?;
         }
+        dropped(f, tried)
     }
+}
+
+/// The lemmas the agent wrote that the proof dropped, and why.
+fn dropped(f: &mut fmt::Formatter<'_>, proof: &RuleProof) -> fmt::Result {
+    for (lemma, why) in &proof.dropped {
+        write!(f, "\n  dropped the written lemma {lemma}, which {why}")?;
+    }
+    Ok(())
 }
 
 /// A proved rule's verdict in words, with the guesses the proof kept.
@@ -171,7 +182,7 @@ fn proved(
             write!(f, "\n    {}: {}", lemma.name, lemma.assert)?;
         }
     }
-    Ok(())
+    dropped(f, proof)
 }
 
 impl JointProof {

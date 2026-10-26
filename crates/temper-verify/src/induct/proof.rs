@@ -1,6 +1,6 @@
 //! What a proof found: each obligation's outcome, and the rule's verdict.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::Lemma;
@@ -41,9 +41,13 @@ pub struct RuleProof {
     /// What the rule itself reads that the proof does not hold, each read
     /// as an unknown.
     pub unheld: BTreeSet<String>,
-    /// The prover's own guesses the proof kept, when the agent gave no
-    /// lemmas, written as lemmas the agent can pin beside the rule.
+    /// The prover's own guesses the proof kept, written as lemmas the agent
+    /// can pin beside the rule.
     pub found: Vec<Lemma>,
+    /// The lemmas the agent wrote that the proof dropped, each with why: a
+    /// move breaks it, or the solver refuses it. The proof goes on without
+    /// them, guessing as it does for a rule with none.
+    pub dropped: BTreeMap<String, String>,
     /// Whether the solver shows that no state the proof covers meets the
     /// rule's premise (`premise => ...`), so the rule says nothing.
     pub premise_excluded: bool,
