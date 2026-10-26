@@ -364,3 +364,79 @@ async fn a_batch_keeps_only_each_entitys_newest_projection() {
         );
     }
 }
+
+#[tokio::test]
+async fn committed_projections_keep_unchanged_counters_and_remove_them_with_the_row() {
+    use temper_runtime::persistence::{CommitRows, EventStore, ProjectionRow};
+
+    let store = make_store("committed-projection-unchanged").await;
+    let tenant = "tenant-committed";
+    let run = "run-polled";
+    let journal = format!("{tenant}:{ENTITY_TYPE}:{run}");
+    let content = fields("Waiting", &["started"]);
+    let mut first = None;
+    for seq in 1..=2 {
+        let state = actor_state(run, "Waiting", &content, seq);
+        store
+            .append_with_rows(
+                &journal,
+                seq - 1,
+                &[super::test_envelope("Poll", serde_json::json!({}))],
+                CommitRows {
+                    projection: Some(ProjectionRow::Upsert {
+                        status: "Waiting",
+                        fields: &content,
+                        state: &state,
+                    }),
+                    ..CommitRows::default()
+                },
+            )
+            .await
+            .expect("commit event and projection");
+        if seq == 1 {
+            first = Some(stored(&store, tenant, run).await);
+        }
+    }
+    assert_eq!(
+        stored(&store, tenant, run).await,
+        first.unwrap(),
+        "unchanged committed projection leaves the catalog untouched"
+    );
+    let rows = store
+        .load_entity_catalog_rows(tenant, ENTITY_TYPE, &[run.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].sequence_nr, 2);
+    assert_eq!(rows[0].state.as_ref().unwrap()["sequence_nr"], 2);
+    store
+        .append_with_rows(
+            &journal,
+            2,
+            &[super::test_envelope("Delete", serde_json::json!({}))],
+            CommitRows {
+                projection: Some(ProjectionRow::Remove),
+                ..CommitRows::default()
+            },
+        )
+        .await
+        .expect("commit removal");
+    let conn = store.connection().await.unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM entity_catalog_counters WHERE tenant = ?1",
+            params![tenant],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+    assert!(
+        store
+            .load_entity_catalog_rows(tenant, ENTITY_TYPE, &[run.to_string()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

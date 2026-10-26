@@ -759,6 +759,12 @@ impl EventStore for TenantStoreRouter {
             .await
     }
 
+    /// Each tenant's store commits its entities' rows, and is also that
+    /// tenant's query plane and timer-row store.
+    fn commits_entity_rows(&self) -> bool {
+        true
+    }
+
     #[instrument(skip_all, fields(tenant, otel.name = "router.list_scheduled_actions"))]
     async fn list_scheduled_actions(
         &self,
