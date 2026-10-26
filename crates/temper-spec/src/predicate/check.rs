@@ -104,9 +104,10 @@ pub fn unmodelable<'e>(expr: &'e Expr, vars: &BTreeMap<String, VarKind>) -> Opti
         }
         Operand::Var(name) => matches!(kind(name), Some(VarKind::Counter | VarKind::Bool)),
         Operand::Len(name) => kind(name) == Some(VarKind::List),
-        Operand::CrossStatus { .. } | Operand::CrossField { .. } | Operand::Lit(Literal::Null) => {
-            false
-        }
+        Operand::CrossStatus { .. }
+        | Operand::CrossField { .. }
+        | Operand::Param(_)
+        | Operand::Lit(Literal::Null) => false,
     };
     match expr {
         Expr::Const(_) => None,
@@ -149,7 +150,7 @@ pub fn unverifiable<'e>(expr: &'e Expr, vars: &BTreeMap<String, VarKind>) -> Opt
             Some(VarKind::Counter | VarKind::Bool | VarKind::Str)
         ),
         Operand::Len(name) => kind(name) == Some(VarKind::List),
-        Operand::Lit(Literal::Null) => false,
+        Operand::Lit(Literal::Null) | Operand::Param(_) => false,
     };
     match expr {
         Expr::Const(_) => None,
@@ -214,6 +215,9 @@ fn operand_ty(operand: &Operand, scope: Scope<'_>) -> Result<Ty, String> {
             Ty::Str | Ty::List | Ty::Any => Ok(Ty::Any),
             _ => Err(format!("'{id_field}' cannot hold an entity id")),
         },
+        // A parameter's type is the action's to declare; the validator
+        // checks that the action declares it.
+        Operand::Param(_) => Ok(Ty::Any),
         Operand::Lit(lit) => Ok(lit_ty(lit)),
     }
 }

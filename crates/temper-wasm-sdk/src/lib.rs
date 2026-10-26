@@ -168,6 +168,15 @@ pub fn set_success_result(action: &str, params: &Value) {
     }
 }
 
+/// Answer empty: the module has nothing to report, so the kernel moves
+/// nothing, whatever the trigger's `on_success` names.
+pub fn set_empty_result() {
+    let json = serde_json::json!({ "empty": true, "success": true }).to_string();
+    unsafe {
+        host::host_set_result(json.as_ptr() as i32, json.len() as i32);
+    }
+}
+
 /// Set the invocation result as an error.
 pub fn set_error_result(error: &str) {
     let result = serde_json::json!({

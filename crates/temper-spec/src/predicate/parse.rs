@@ -342,6 +342,10 @@ impl<'a> Parser<'a> {
                     "false" => Ok(Operand::Lit(Literal::Bool(false))),
                     "null" => Ok(Operand::Lit(Literal::Null)),
                     "len" => Ok(Operand::Len(self.call_arg()?)),
+                    "params" => {
+                        self.expect(&Tok::Dot, "'.' after 'params'")?;
+                        Ok(Operand::Param(self.ident()?))
+                    }
                     _ if is_keyword(&name) => {
                         self.pos -= 1;
                         Err(self.error(&format!("unexpected keyword '{name}'")))

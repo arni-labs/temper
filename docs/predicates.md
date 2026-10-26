@@ -39,7 +39,7 @@ unary   = "!" unary | atom
 atom    = "(" expr ")" | "empty" "(" name ")" | name | operand cmp operand
         | operand [ "not" ] "in" ( "[" literal, ... "]" | name )
 cmp     = "==" | "!=" | "<" | "<=" | ">" | ">="
-operand = "status" | name | "len" "(" name ")" | Type "[" name "]" "." "status" | literal
+operand = "status" | name | "params" "." name | "len" "(" name ")" | Type "[" name "]" "." "status" | literal
 literal = integer | 'string' | true | false | null
 ```
 
@@ -52,6 +52,7 @@ literal = integer | 'string' | true | false | null
   - required: `Workspace[workspace_id].status in ['Active']`
   - optional: `empty(workspace_id) || Workspace[workspace_id].status in ['Active']`
   - only a bad state blocks: `Workspace[workspace_id].status not in ['Frozen', 'Archived']`
+- **`params.p`** is the parameter `p` of the move being taken. Only an action's guard reads one, and only a parameter its action declares; that is how the `on_success` actions a module's answer lists choose between its values (see the agent guide).
 - **`=>`** is implication: `status in ['Done'] => approved`.
 
 ## Effects

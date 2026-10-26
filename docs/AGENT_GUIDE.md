@@ -625,7 +625,24 @@ on_failure = "RefreshFailed"
 config = { method = "POST", url = "https://oauth2.googleapis.com/token" }
 ```
 
-`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition.
+`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition. A module computes values; the spec decides the move. Where the values choose between moves, list them, and let each one's guard read the values as `params.<name>`:
+
+```toml
+[[action.triggers]]
+name = "forecast"
+kind = "wasm"
+module = "forecast"
+on_success = ["TakeUmbrella", "LeaveUmbrella"]
+
+[[action]]
+name = "TakeUmbrella"
+from = ["Asked"]
+to = "Wet"
+params = [{ name = "rain", type = "uint64" }]
+guard = "params.rain >= 50"
+```
+
+The kernel sends the first listed action the record takes with the module's values (its `from`, constraints and guard), or else the last, whose refusal is recorded. A guard reads only the parameters its action declares, and only an action's guard reads `params`. The record decides again when the answer commits. A module with nothing to report answers empty (`{"empty": true}`, `set_empty_result()` in the SDK), and nothing moves; `"action": ""` is not empty and still sends `on_success`. When `on_success` is named, an action the module's result names is ignored. Without `on_success`, the module's result may name any action of the entity, and the kernel dispatches it with no Cedar check: a module picking the move is being retired, so name `on_success`.
 
 ### Deployment-level webhooks
 
