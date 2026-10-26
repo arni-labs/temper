@@ -51,34 +51,44 @@ impl States {
 
     /// The index of the state packed as `bytes`, and whether it is new.
     /// A new state is added.
-    pub(super) fn add(&mut self, bytes: &[u8]) -> (u32, bool) {
+    pub(super) fn add(&mut self, bytes: &[u8], held: &mut Held<'_>) -> Result<(u32, bool), String> {
         let mut hasher = DefaultHasher::new();
         hasher.write(bytes);
         let hash = hasher.finish();
         let Some(&first) = self.index.get(&hash) else {
-            let at = self.push(bytes);
+            self.reserve(1, held)?;
+            let at = self.push(bytes, held)?;
             self.index.insert(hash, at);
-            return (at, true);
+            return Ok((at, true));
         };
         if self.get(first as usize) == bytes {
-            return (first, false);
+            return Ok((first, false));
         }
         if let Some(&at) = self.collided.get(bytes) {
-            return (at, false);
+            return Ok((at, false));
         }
-        let at = self.push(bytes);
+        self.reserve(1, held)?;
+        let before = self.bytes();
+        grow_map(&mut self.collided, 1, held)?;
+        held.add(self.bytes() - before)?;
+        held.add(block(bytes.len()))?;
+        let at = self.push(bytes, held)?;
         self.collided.insert(bytes.into(), at);
         self.heap += block(bytes.len());
-        (at, true)
+        Ok((at, true))
     }
 
-    fn push(&mut self, bytes: &[u8]) -> u32 {
+    fn push(&mut self, bytes: &[u8], held: &mut Held<'_>) -> Result<u32, String> {
         let fits = self
             .blocks
             .last()
             .is_some_and(|last| last.capacity() - last.len() >= bytes.len());
         if !fits {
             let size = BLOCK.max(bytes.len());
+            let before = super::room::bytes(&self.blocks);
+            grow(&mut self.blocks, 1, held)?;
+            held.add(super::room::bytes(&self.blocks) - before)?;
+            held.add(size)?;
             self.blocks.push(Vec::with_capacity(size));
             self.heap += size;
         }
@@ -89,15 +99,19 @@ impl States {
             offset: u32::try_from(block.len()).expect("a block holds less than 4 GB"),
         });
         block.extend_from_slice(bytes);
-        u32::try_from(self.starts.len() - 1).expect("fewer than 2^32 states")
+        Ok(u32::try_from(self.starts.len() - 1).expect("fewer than 2^32 states"))
     }
 
     /// Make the lists that grow by one entry for each state hold `spare`
     /// more states, as [`grow`] does. A new block is made whole when a state
-    /// does not fit, and counted from then on.
+    /// does not fit, with its memory taken before allocation.
     pub(super) fn reserve(&mut self, spare: usize, held: &mut Held<'_>) -> Result<(), String> {
+        let before = self.bytes();
         grow(&mut self.starts, spare, held)?;
-        grow_map(&mut self.index, spare, held)
+        held.add(self.bytes() - before)?;
+        let before = self.bytes();
+        grow_map(&mut self.index, spare, held)?;
+        held.add(self.bytes() - before)
     }
 
     /// Bytes the table holds.

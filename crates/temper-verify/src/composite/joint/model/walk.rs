@@ -51,6 +51,15 @@ pub(in crate::composite::joint) struct Explored<'a> {
 }
 
 impl Explored<'_> {
+    fn stop_for_room(&mut self, reason: String) {
+        self.stopped = Some(format!(
+            "the walk does not fit in the memory it may hold: {reason} \
+             (it held {} MB at {} states)",
+            self.held.bytes / MB,
+            self.len()
+        ));
+    }
+
     /// How many states the walk saw.
     pub(in crate::composite::joint) fn len(&self) -> usize {
         self.states.len()
@@ -114,26 +123,28 @@ impl JointModel {
         let mut packed = Vec::new();
         for init in self.inits() {
             explored.packer.pack(&init, &mut packed);
-            if explored.states.add(&packed).1 {
+            let new = match explored.states.add(&packed, &mut explored.held) {
+                Ok((_, new)) => new,
+                Err(reason) => {
+                    explored.stop_for_room(reason);
+                    return explored;
+                }
+            };
+            if new {
                 explored.firsts.push(None);
             }
         }
         // States are walked in the order they were first reached, which is
         // breadth first.
         let mut index = 0;
-        while index < explored.len() {
+        'walk: while index < explored.len() {
             let state = explored.state(index);
             if visit(index, &state) {
                 break;
             }
             explored.held.walked(explored.len());
             if let Err(reason) = tables.make_room(&mut explored, edges) {
-                explored.stopped = Some(format!(
-                    "the walk does not fit in the memory it may hold: {reason} \
-                     (it held {} MB at {} states)",
-                    explored.held.bytes / MB,
-                    explored.len()
-                ));
+                explored.stop_for_room(reason);
                 break;
             }
             let before = [explored.len(), explored.made.len(), explored.edges.len()];
@@ -153,7 +164,13 @@ impl JointModel {
                 let made = explored.made.len().saturating_sub(1) as u32;
                 for next in nexts {
                     explored.packer.pack(&next.state, &mut packed);
-                    let (at, new) = explored.states.add(&packed);
+                    let (at, new) = match explored.states.add(&packed, &mut explored.held) {
+                        Ok(added) => added,
+                        Err(reason) => {
+                            explored.stop_for_room(reason);
+                            break 'walk;
+                        }
+                    };
                     if new {
                         let label = explored.packer.id(&next.label);
                         explored.firsts.push(Some((index as u32, label)));
