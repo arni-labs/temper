@@ -20,7 +20,9 @@ impl SyncCopy {
     /// those changes, so writers that commit together share one push. An
     /// error means some of them may be only local; they stay in the local
     /// change log and the next successful push sends them. Nothing is pushed
-    /// unless the copy is [`CopyState::Copying`].
+    /// unless the copy is [`CopyState::Copying`]. It never trims the change
+    /// log, so an answer waits only for its own changes; the background loop
+    /// trims ([`Self::trim_pushed`]).
     pub async fn push_committed(&self) -> Result<(), PersistenceError> {
         // Changes are numbered in commit order (one writer at a time), so
         // everything this caller committed is at or below `wanted`.
@@ -73,7 +75,7 @@ impl SyncCopy {
         // this file's last push. A record above everything the file holds
         // means the remote silently skipped what was just written: a second
         // server is pushing as this file.
-        let remote_has = self.last_pushed_hint().map_err(storage_error)?;
+        let remote_has = self.last_pushed_hint().await.map_err(storage_error)?;
         let local_has = self.last_change().await?;
         if remote_has > local_has {
             self.enter(CopyState::Behind, &format!(
@@ -91,7 +93,7 @@ impl SyncCopy {
     /// restarted after one), so then, and first after every start, the
     /// remote is asked.
     async fn remote_had(&self) -> Result<i64, PersistenceError> {
-        let hint = self.last_pushed_hint().map_err(storage_error)?;
+        let hint = self.last_pushed_hint().await.map_err(storage_error)?;
         if !self.inner.unsure.load(Ordering::Acquire) {
             return Ok(hint);
         }
@@ -159,13 +161,44 @@ impl SyncCopy {
 
     /// The remote's record of this file's last pushed change, as the engine
     /// saved it after its last successful push.
-    fn last_pushed_hint(&self) -> Result<i64, DriverError> {
-        let info = files::sync_metadata(&self.inner.path)?;
+    pub(super) async fn last_pushed_hint(&self) -> Result<i64, DriverError> {
+        let info = files::read_sync_metadata(&self.inner.path).await?;
         Ok(info["last_pushed_change_id_hint"].as_i64().unwrap_or(0))
     }
 
+    /// How many rows the local change log holds.
+    pub async fn change_log_rows(&self) -> Result<i64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM turso_cdc", ())
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(0);
+        };
+        row.get::<i64>(0).map_err(storage_error)
+    }
+
+    /// Bytes of row images the local change log holds for changes numbered
+    /// above `after`.
+    pub async fn change_log_bytes_after(&self, after: i64) -> Result<i64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(SUM(COALESCE(LENGTH(before), 0) + COALESCE(LENGTH(after), 0) \
+                 + COALESCE(LENGTH(updates), 0)), 0) FROM turso_cdc WHERE change_id > ?1",
+                crate::driver::params![after],
+            )
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(0);
+        };
+        row.get::<i64>(0).map_err(storage_error)
+    }
+
     /// The number of the newest committed change in the local change log.
-    pub(super) async fn last_change(&self) -> Result<i64, PersistenceError> {
+    pub async fn last_change(&self) -> Result<i64, PersistenceError> {
         let conn = self.connect().await.map_err(storage_error)?;
         let mut rows = conn
             .query("SELECT MAX(change_id) FROM turso_cdc", ())

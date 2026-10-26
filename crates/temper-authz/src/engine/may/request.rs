@@ -463,7 +463,19 @@ fn entity_parts(value: &Json) -> Option<(&str, &str)> {
 fn same(a: &Json, b: &Json) -> bool {
     match (entity_parts(a), entity_parts(b)) {
         (Some(x), Some(y)) => x == y,
-        (None, None) => a == b,
+        (None, None) => match (a, b) {
+            // Cedar sets ignore order and repeated members, recursively.
+            (Json::Array(a), Json::Array(b)) => {
+                a.iter().all(|x| b.iter().any(|y| same(x, y)))
+                    && b.iter().all(|y| a.iter().any(|x| same(x, y)))
+            }
+            (Json::Object(a), Json::Object(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .all(|(key, value)| b.get(key).is_some_and(|other| same(value, other)))
+            }
+            _ => a == b,
+        },
         _ => false,
     }
 }

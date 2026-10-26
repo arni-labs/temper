@@ -169,6 +169,21 @@ pub(in crate::odata) async fn read_entity_set_page(
     }
 
     let native_plan = native_candidate_page_plan(&request);
+    // ADR-0153 fast path: if the filter is exactly a declared `[[key]]` (the
+    // shape behind the agents' 413: `Files?$filter=WorkspaceId eq … and Path eq …`),
+    // probe `entity_key_index` for the one matching entity_id instead of listing the
+    // whole entity type. The candidate set becomes bounded (0 or 1), so the rest of
+    // the read (coverage, budget, materialization, row-auth) runs unchanged and the
+    // scan budget can never trip. On a miss we fall back to the full list, which still
+    // covers pre-backfill entities: a safe additive fast path until #324 is retired.
+    let keyed = keyed_candidate_ids(&request).await;
+    // A keyed result of `Some([])` is authoritative absence (the watermark is set):
+    // the co-committed `entity_key_index` has no such entity. No native page read
+    // runs after that, here or below: the eventually-consistent field index and
+    // catalog could still hold a row for an entity whose key has since changed, and
+    // returning it would contradict the authoritative answer. So the key index is
+    // asked first, and an absence goes straight to the empty candidate set.
+    let keyed_authoritative_absent = matches!(&keyed, Some(ids) if ids.is_empty());
     // Set when an empty native page for an exact-match resolution is treated as
     // a possibly-lagging projection and we fall through to the authoritative
     // path below (ARN-89). It suppresses the native retry on that path and
@@ -176,7 +191,8 @@ pub(in crate::odata) async fn read_entity_set_page(
     // turns out to be too large for the reconcile scan, the budget gate bounds
     // the reconcile to the field-index coverage gap instead of rejecting (ARN-68).
     let mut reconciling_exact_match_lag = false;
-    if let Some(plan) = native_plan.clone()
+    if !keyed_authoritative_absent
+        && let Some(plan) = native_plan.clone()
         && should_try_native_before_catalog_coverage(&request, &plan)
     {
         let indexed_entity_ids = request
@@ -242,20 +258,6 @@ pub(in crate::odata) async fn read_entity_set_page(
         }
     }
 
-    // ADR-0153 fast path: if the filter is exactly a declared `[[key]]` (the
-    // shape behind the agents' 413 — `Files?$filter=WorkspaceId eq … and Path eq …`),
-    // probe `entity_key_index` for the one matching entity_id instead of listing the
-    // whole entity type. The candidate set becomes bounded (0 or 1), so the rest of
-    // the read (coverage, budget, materialization, row-auth) runs unchanged and the
-    // scan budget can never trip. On a miss we fall back to the full list, which still
-    // covers pre-backfill entities — a safe additive fast path until #324 is retired.
-    let keyed = keyed_candidate_ids(&request).await;
-    // A keyed result of `Some([])` is authoritative absence (the watermark is set):
-    // the co-committed `entity_key_index` has no such entity. We must NOT then run a
-    // native page read — the eventually-consistent field index could still surface a
-    // lagging or just-deleted row and contradict the authoritative answer. Fall
-    // straight through to materialize the empty candidate set.
-    let keyed_authoritative_absent = matches!(&keyed, Some(ids) if ids.is_empty());
     let all_entity_ids = match keyed {
         Some(ids) => ids,
         None => {

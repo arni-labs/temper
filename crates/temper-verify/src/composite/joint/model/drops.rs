@@ -113,9 +113,19 @@ impl JointModel {
     /// when it lands. A move from outside settles through every order its
     /// dispatches can land in before the next one.
     pub(in crate::composite::joint) fn drops(&self, states: usize) -> Drops {
+        // `states` bounds distinct settled states, not the work needed to
+        // reach them. Give the default 250,000-state walk 10M expansion
+        // steps, the install check's work cap; scale smaller requests down.
+        // Parameter products, reaction branches and settling still spend
+        // this finite allowance and exhaustion still refuses proof.
+        let work = states.saturating_mul(40).min(10_000_000);
+        self.expansion.reset(work, None);
         let mut seen: HashSet<JointState> = HashSet::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {
+            if !self.expansion.take() {
+                break;
+            }
             if seen.insert(init.clone()) {
                 queue.push_back(init);
             }
@@ -123,11 +133,14 @@ impl JointModel {
         let mut drops = BTreeSet::new();
         let mut complete = true;
         while let Some(state) = queue.pop_front() {
-            if seen.len() >= states {
+            if seen.len() >= states || self.expansion.exhausted.get() {
                 complete = false;
                 break;
             }
             for mv in self.moves(&state) {
+                if self.expansion.exhausted.get() {
+                    break;
+                }
                 for next in self.next(&state, &mv).0 {
                     for settled in self.settle(next.state, &mut drops) {
                         if seen.insert(settled.clone()) {
@@ -140,7 +153,7 @@ impl JointModel {
         Drops {
             drops: drops.into_iter().collect(),
             states: seen.len(),
-            complete,
+            complete: complete && !self.expansion.exhausted.get(),
         }
     }
 
@@ -151,11 +164,17 @@ impl JointModel {
         let mut seen: HashSet<JointState> = HashSet::new();
         let mut stack = vec![state];
         while let Some(state) = stack.pop() {
+            if !self.expansion.take() {
+                break;
+            }
             if state.inflight.is_empty() {
                 settled.push(state);
                 continue;
             }
             for mv in self.moves(&state) {
+                if self.expansion.exhausted.get() {
+                    break;
+                }
                 if let Some(drop) = self.dropped(&state, &mv) {
                     drops.insert(drop);
                 }
@@ -186,7 +205,7 @@ impl JointModel {
         } else {
             self.read_allows(dispatch, state) == Truth::False
         };
-        refused.then(|| DroppedReaction {
+        (refused && !self.expansion.exhausted.get()).then(|| DroppedReaction {
             source_entity: reaction.from.clone(),
             source_action: reaction.source_action.clone(),
             trigger_name: reaction.trigger.clone(),
@@ -211,4 +230,47 @@ pub(crate) fn dropped_reactions(
         .map(|a| (a.automaton.name.as_str(), *a))
         .collect();
     JointModel::whole(&by_name, scope).drops(states)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composite::joint::Dispatch;
+
+    #[test]
+    fn settling_stops_inside_its_expansion_budget() {
+        let a = temper_spec::automaton::parse_automaton(
+            r#"
+[automaton]
+name = "T"
+states = ["Ready"]
+initial = "Ready"
+[[action]]
+name = "Stay"
+kind = "input"
+from = ["Ready"]
+to = "Ready"
+"#,
+        )
+        .unwrap();
+        let model = JointModel::whole(&BTreeMap::from([("T", &a)]), BTreeSet::from(["T".into()]));
+        let mut state = model.inits().next().unwrap();
+        state.inflight = (0..4)
+            .map(|depth| Dispatch {
+                to: "T".into(),
+                action: "Stay".into(),
+                target_state: None,
+                params: BTreeMap::new(),
+                read: true,
+                depth,
+                via: None,
+                by: super::super::super::senders::OUTSIDE,
+                inline: false,
+            })
+            .collect();
+        model.expansion.reset(3, None);
+        let settled = model.settle(state, &mut BTreeSet::new());
+        assert!(settled.is_empty());
+        assert!(model.expansion.exhausted.get());
+    }
 }
