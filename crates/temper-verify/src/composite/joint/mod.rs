@@ -488,16 +488,13 @@ pub fn replay_joint_invariants(
 }
 
 #[cfg(test)]
-#[path = "joint_test.rs"]
-mod tests;
+mod joint_test;
 
 #[cfg(test)]
-#[path = "vacuous_test.rs"]
-mod vacuous_tests;
+mod vacuous_test;
 
 #[cfg(test)]
-#[path = "outside_test.rs"]
-mod outside_tests;
+mod outside_test;
 
 #[cfg(test)]
 mod chain_test;

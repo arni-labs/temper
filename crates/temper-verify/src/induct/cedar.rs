@@ -72,7 +72,7 @@ impl Vocab<'_> {
             .map(|a| a.name.as_str())
             .collect();
         for trigger in automaton.actions.iter().flat_map(|a| &a.triggers) {
-            answered.extend(trigger.on_success.as_deref());
+            answered.extend(trigger.on_success.iter().map(String::as_str));
             answered.extend(trigger.on_failure.as_deref());
         }
         if automaton.automaton.initial == state {

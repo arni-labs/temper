@@ -76,7 +76,7 @@ pub(super) struct Call {
     pub(super) name: String,
     pub(super) to: String,
     pub(super) module: String,
-    pub(super) on_success: Option<String>,
+    pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
     /// The string fields it keeps.
     pub(super) asked: Vec<String>,
@@ -330,15 +330,18 @@ impl<'a> Vocab<'a> {
         })
     }
 
-    /// The actions a call may be answered with: its declared answer, or
+    /// The actions a call may be answered with: its declared answers, or
     /// else any internal action of its record.
     pub(super) fn answer_actions(&self, call: &Call) -> Vec<&'a Action> {
         self.automaton(&call.to)
             .actions
             .iter()
-            .filter(|a| match &call.on_success {
-                Some(name) => &a.name == name,
-                None => a.kind == ActionKind::Internal,
+            .filter(|a| {
+                if call.on_success.is_empty() {
+                    a.kind == ActionKind::Internal
+                } else {
+                    call.on_success.contains(&a.name)
+                }
             })
             .collect()
     }
