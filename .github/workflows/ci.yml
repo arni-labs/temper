@@ -545,6 +545,15 @@ jobs:
           cargo nextest run -p temper-store-postgres --run-ignored only
           -E 'test(scheduled_action_rows_commit_with_their_events)'
 
+      # These tests return early, and pass, when DATABASE_URL is unset, so
+      # without this step the Postgres store's catalog and index writes never
+      # ran anywhere. One at a time: they share this one database and each
+      # runs the migrations on it first.
+      - name: Store tests that need a real database
+        env:
+          DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
+        run: cargo nextest run -p temper-store-postgres --test-threads 1
+
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
   #
