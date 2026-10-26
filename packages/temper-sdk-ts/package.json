@@ -1,14 +1,15 @@
 {
   "name": "@temper/sdk",
   "version": "0.1.0",
-  "description": "Temper SDK — thin HTTP client for entity operations, governance, and SSE streaming",
+  "description": "Temper SDK \u2014 thin HTTP client for entity operations, governance, and SSE streaming",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "vitest"
+    "test": "npm run test:types && vitest",
+    "test:types": "tsc -p test/tsconfig.json"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

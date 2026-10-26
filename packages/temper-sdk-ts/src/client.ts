@@ -20,7 +20,7 @@ export interface AuthzResponse {
   /** Whether the action was allowed by Cedar policy. */
   allowed: boolean;
   /** Human-readable reason for the decision. */
-  reason?: string;
+  reason?: string | null;
 }
 
 /** A server-sent event representing an entity state change. */
