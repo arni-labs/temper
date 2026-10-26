@@ -925,14 +925,14 @@ on_success = ["TakeUmbrella", "LeaveUmbrella"]
 name = "TakeUmbrella"
 from = ["Asked"]
 to = "Wet"
-params = [{ name = "rain", type = "uint64" }]
+params = [{ name = "rain", type = "int" }]
 guard = "params.rain >= 50"
 
 [[action]]
 name = "LeaveUmbrella"
 from = ["Asked"]
 to = "Dry"
-params = [{ name = "rain", type = "uint64" }]
+params = [{ name = "rain", type = "int" }]
 "#;
 
 #[test]
