@@ -93,7 +93,8 @@ pub(super) fn run(
                     z3.send(prelude)?;
                     z3.send(few)?;
                     let mut checked = Vec::new();
-                    let late = || deadline.is_some_and(|d| Instant::now() >= d);
+                    // MUTANT: the deadline is not kept.
+                    let late = || deadline.is_some_and(|_| false);
                     while !stop.load(Ordering::Relaxed) && !late() {
                         let at = next.fetch_add(1, Ordering::Relaxed);
                         let Some(ask) = asks.get(at) else {
