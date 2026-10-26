@@ -49,7 +49,7 @@ fn fixture_with_place(place: &str) -> PlatformState {
     let csdl = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
     state.registry.write().unwrap().register_tenant(
         "policy-owner",
-        parse_csdl(csdl).unwrap(),
+        parse_csdl(csdl).expect("the CSDL parses"),
         csdl.to_string(),
         &[("App", APP), ("Place", place)],
     );
@@ -59,7 +59,7 @@ fn fixture_with_place(place: &str) -> PlatformState {
 #[tokio::test]
 async fn policy_only_install_checks_existing_apps_in_its_tenant() {
     let state = fixture();
-    install_checks::prove(
+    let unproved = install_checks::prove(
         &state,
         "policy-owner",
         "policy-only",
@@ -69,6 +69,7 @@ async fn policy_only_install_checks_existing_apps_in_its_tenant() {
     )
     .await
     .expect("the existing reaction can bring its record");
+    assert!(unproved.is_empty(), "{unproved:?}");
     let error = install_checks::prove(
         &state,
         "policy-owner",
@@ -80,7 +81,7 @@ async fn policy_only_install_checks_existing_apps_in_its_tenant() {
     .await
     .expect_err("a forbid must not strand another app's record");
     assert!(error.contains("brought"), "{error}");
-    install_checks::prove(
+    let unproved = install_checks::prove(
         &state,
         "other-tenant",
         "policy-only",
@@ -90,13 +91,14 @@ async fn policy_only_install_checks_existing_apps_in_its_tenant() {
     )
     .await
     .expect("other tenants' specs do not constrain this install");
+    assert!(unproved.is_empty(), "{unproved:?}");
 }
 
 #[tokio::test]
 async fn policy_checks_use_incoming_specs_over_active_versions() {
     let state = fixture();
     let replacement = PLACE.replace("App[Id].status == 'Live' => status == 'Live'", "true");
-    install_checks::prove(
+    let unproved = install_checks::prove(
         &state,
         "policy-owner",
         "updated",
@@ -106,6 +108,7 @@ async fn policy_checks_use_incoming_specs_over_active_versions() {
     )
     .await
     .expect("the incoming spec replaces the old property before checking");
+    assert!(unproved.is_empty(), "{unproved:?}");
 }
 
 #[tokio::test]
@@ -121,7 +124,7 @@ permit(principal, action == Action::"Bring", resource is Place) when {
     resource has id && context.triggerSourceEntityId == resource.id
 };
 "#;
-    install_checks::prove(
+    let unproved = install_checks::prove(
         &state,
         "policy-owner",
         "policy-only",
@@ -131,6 +134,7 @@ permit(principal, action == Action::"Bring", resource is Place) when {
     )
     .await
     .expect("only the reaction can finish after Start");
+    assert!(unproved.is_empty(), "{unproved:?}");
     let error = install_checks::prove(
         &state,
         "policy-owner",

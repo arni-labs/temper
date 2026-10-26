@@ -151,7 +151,9 @@ impl JointModel {
                     if self.senders.may(by, entity, &t.name) == May::No {
                         continue;
                     }
-                    for (params, _) in successors_budgeted(model, t, local, &values, &self.expansion) {
+                    for (params, _) in
+                        successors_budgeted(model, t, local, &values, &self.expansion)
+                    {
                         let action = TemperModelAction {
                             name: t.name.clone(),
                             target_state: t.to_state.clone(),

@@ -15,6 +15,7 @@
 //! forbid always does, and [`May::Maybe`] otherwise. A caller that knows some
 //! of the record's attributes passes them, and those are unknown no longer.
 
+mod json;
 mod request;
 
 #[cfg(test)]

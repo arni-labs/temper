@@ -41,8 +41,8 @@ pub struct Call {
     pub to: String,
     /// The module.
     pub module: String,
-    /// The trigger's declared answer, if any.
-    pub on_success: Option<String>,
+    /// The trigger's declared answers; empty when it names none.
+    pub on_success: Vec<String>,
     /// The action sent when the call fails, if any.
     pub on_failure: Option<String>,
     /// Who its answer runs as, by sender number: the runtime when the call

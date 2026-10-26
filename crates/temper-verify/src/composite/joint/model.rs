@@ -177,7 +177,8 @@ impl JointModel {
                     owned(owner, id_field);
                     owned(entity_type, field);
                 }
-                Name::Status => {}
+                // A move's parameter is no field of a record.
+                Name::Status | Name::Param(_) => {}
             });
         }
         let (mut models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
@@ -302,7 +303,7 @@ impl JointModel {
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()
-            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_none()))
+            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_empty()))
             .map(|((entity, _), _)| entity)
             .collect();
         let unwalked_answers = open
@@ -345,25 +346,6 @@ impl JointModel {
             sender_matters,
             unwalked_answers,
             outer,
-        }
-    }
-
-    /// Note each answer a call open in `state` may get that the walk never
-    /// takes, as (entity, action, the record's status).
-    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<(String, String, String)>) {
-        for call in state.calls.iter().filter(|call| call.on_success.is_none()) {
-            let Some(actions) = self.unwalked_answers.get(&call.to) else {
-                continue;
-            };
-            for t in &self.models[&call.to].transitions {
-                if actions.contains(&t.name) && self.enabled(&call.to, t, state, Blind::Nothing) {
-                    unwalked.insert((
-                        call.to.clone(),
-                        t.name.clone(),
-                        state.records[&call.to].status.clone(),
-                    ));
-                }
-            }
         }
     }
 

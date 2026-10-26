@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
 use super::super::JointOutcome;
+use super::super::env::Blind;
 use super::super::pack::{Packed, Packer};
 use super::super::state::render;
 use super::super::{JointState, JointStep, premise};
@@ -225,6 +226,25 @@ impl JointModel {
         }
         explored
     }
+
+    /// Note each answer a call open in `state` may get that the walk never
+    /// takes, as (entity, action, the record's status).
+    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<(String, String, String)>) {
+        for call in state.calls.iter().filter(|call| call.on_success.is_empty()) {
+            let Some(actions) = self.unwalked_answers.get(&call.to) else {
+                continue;
+            };
+            for t in &self.models[&call.to].transitions {
+                if actions.contains(&t.name) && self.enabled(&call.to, t, state, Blind::Nothing) {
+                    unwalked.insert((
+                        call.to.clone(),
+                        t.name.clone(),
+                        state.records[&call.to].status.clone(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl JointModel {
@@ -271,7 +291,7 @@ impl JointModel {
                         check(owner, id_field);
                         check(entity_type, field);
                     }
-                    Name::Status => {}
+                    Name::Status | Name::Param(_) => {}
                 }
             });
         }

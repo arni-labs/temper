@@ -281,7 +281,7 @@ mod tests {
             calls: vec![Call {
                 to: "T".into(),
                 module: "worker".into(),
-                on_success: None,
+                on_success: Vec::new(),
                 on_failure: None,
                 by: 0,
                 asked: BTreeMap::from([

@@ -217,7 +217,7 @@ fn llm_root_span_stays_on_active_trace() {
         integration_type: "wasm".to_string(),
         module: Some("provider_caller".to_string()),
         config: std::collections::BTreeMap::new(),
-        on_success: None,
+        on_success: Vec::new(),
         on_failure: None,
         llm: true,
     };
