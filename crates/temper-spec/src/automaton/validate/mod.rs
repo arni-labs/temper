@@ -175,10 +175,33 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             Ok(())
         }
     };
+    // `params.p` is a parameter of the move being taken, so only an
+    // action's guard reads one, and only a parameter its action declares.
+    let no_params = |expr: &crate::predicate::Expr, slot: String| match expr.params_read().first() {
+        Some(param) => Err(invalid(
+            slot,
+            format!("`params.{param}` is a parameter of a move; only an action's guard reads one"),
+        )),
+        None => Ok(()),
+    };
     for action in &automaton.actions {
         check(&action.guard, Scope::State(&vars))
             .map_err(|e| invalid(format!("action '{}' guard", action.name), e))?;
         no_related_field(&action.guard, format!("action '{}' guard", action.name))?;
+        if let Some(param) = action
+            .guard
+            .params_read()
+            .into_iter()
+            .find(|param| !action.params.iter().any(|p| p.name() == param))
+        {
+            return Err(invalid(
+                format!("action '{}' guard", action.name),
+                format!(
+                    "`params.{param}` is not a parameter of '{}'; declare it in its params",
+                    action.name
+                ),
+            ));
+        }
         check_effects(&action.effect, &vars)
             .map_err(|e| invalid(format!("action '{}' effect", action.name), e))?;
         for effect in &action.effect {
@@ -201,6 +224,7 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
                     trigger.name, action.name
                 );
                 check(guard, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;
+                no_params(guard, slot.clone())?;
                 no_related_field(guard, slot)?;
             }
         }
@@ -208,6 +232,7 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
     for inv in &automaton.invariants {
         let slot = format!("invariant '{}'", inv.name);
         check(&inv.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
+        no_params(&inv.assert, slot.clone())?;
         if let Some(culprit) = crate::predicate::unverifiable(&inv.assert, &vars) {
             return Err(invalid(
                 slot,
@@ -222,6 +247,7 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
     for inv in &automaton.field_invariants {
         let slot = format!("field_invariant '{}'", inv.name);
         check(&inv.assert, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;
+        no_params(&inv.assert, slot.clone())?;
         no_related_field(&inv.assert, slot)?;
     }
     for state in &automaton.automaton.terminal {

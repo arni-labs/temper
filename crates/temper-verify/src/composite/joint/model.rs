@@ -105,7 +105,8 @@ impl JointModel {
                     owned(owner, id_field);
                     owned(entity_type, field);
                 }
-                Name::Status => {}
+                // A move's parameter is no field of a record.
+                Name::Status | Name::Param(_) => {}
             });
         }
         let mut id_literals = BTreeSet::new();
@@ -299,7 +300,7 @@ impl JointModel {
                         check(owner, id_field);
                         check(entity_type, field);
                     }
-                    Name::Status => {}
+                    Name::Status | Name::Param(_) => {}
                 }
             });
         }

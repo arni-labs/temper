@@ -399,18 +399,23 @@ impl crate::state::ServerState {
         };
 
         if result.success {
-            let callback_action = integration
-                .on_success
-                .clone()
-                .or_else(|| result.callback_action.clone());
-            let Some(callback_action) = callback_action else {
-                return Ok(None);
+            let named: Vec<String> = result.callback_action.clone().into_iter().collect();
+            let answers = if integration.on_success.is_empty() {
+                named
+            } else {
+                integration.on_success.clone()
             };
             let callback_params = normalize_success_params(result);
+            let Some(callback_action) = self
+                .choose_answer(ctx.entity_ref, &answers, &callback_params)
+                .await
+            else {
+                return Ok(None);
+            };
             return self
                 .dispatch_adapter_callback(
                     ctx.entity_ref,
-                    &callback_action,
+                    callback_action,
                     callback_params,
                     ctx.agent_ctx,
                     ctx.mode,
@@ -592,6 +597,7 @@ impl crate::state::ServerState {
                     .await;
             }
         };
+        let values = callback_params.clone();
         match mode {
             WasmDispatchMode::Inline => {
                 let resp = super::wasm::dispatch_callback_action_boxed(
@@ -610,10 +616,11 @@ impl crate::state::ServerState {
                 .await
                 .map_err(|e| e.to_string())?;
                 if !resp.success {
-                    self.record_generated_callback_refusal(
+                    self.record_answer_refusal(
                         entity_ref,
                         callback_action,
                         resp.error.as_deref().unwrap_or("callback rejected"),
+                        &values,
                     );
                 }
                 Ok(Some(resp))
@@ -638,10 +645,11 @@ impl crate::state::ServerState {
                         msg
                     })?;
                 if !response.success {
-                    self.record_generated_callback_refusal(
+                    self.record_answer_refusal(
                         entity_ref,
                         callback_action,
                         response.error.as_deref().unwrap_or("callback rejected"),
+                        &values,
                     );
                 }
                 Ok(None)
