@@ -63,7 +63,7 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
 use crate::Budget;
-use crate::model::ParamValue;
+use crate::model::{ModelString, ParamValue};
 
 pub use model::DroppedReaction;
 pub(crate) use model::dropped_reactions;
@@ -328,25 +328,25 @@ pub fn replay_joint_invariants(
     }];
     for (i, wanted) in trace.iter().enumerate() {
         loop {
-            let fresh = format!(
-                "#{}",
-                model
-                    .values(&state)
-                    .iter()
-                    .filter(|v| v.starts_with('#'))
-                    .count()
-                    + 1
-            );
             let fits = |params: &BTreeMap<String, ParamValue>| {
+                let mut bindings = names.clone();
+                let mut used = model.values(&state);
                 wanted.params.iter().all(|(param, name)| {
                     // A parameter the model does not track takes any value.
                     let Some(ParamValue::Str(value)) = params.get(param) else {
                         return true;
                     };
-                    match names.get(name) {
+                    match bindings.get(name) {
                         Some(bound) => value == bound,
                         None if name.is_empty() => value.is_empty(),
-                        None => *value == fresh,
+                        None if matches!(value, ModelString::Symbol(_))
+                            && !used.contains(value) =>
+                        {
+                            bindings.insert(name.clone(), value.clone());
+                            used.insert(value.clone());
+                            true
+                        }
+                        None => false,
                     }
                 })
             };
@@ -415,7 +415,7 @@ pub fn replay_joint_invariants(
                 .into_iter()
                 .filter_map(|(name, value)| match next.renamed.get(&value) {
                     Some(new) => Some((name, new.clone())),
-                    None if !value.starts_with('#') => Some((name, value)),
+                    None if matches!(value, ModelString::Literal(_)) => Some((name, value)),
                     None => None,
                 })
                 .collect();
@@ -441,3 +441,6 @@ pub fn replay_joint_invariants(
 #[cfg(test)]
 #[path = "joint_test.rs"]
 mod tests;
+
+#[cfg(test)]
+mod chain_test;

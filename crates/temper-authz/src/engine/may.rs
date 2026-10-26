@@ -17,6 +17,9 @@
 
 mod request;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::BTreeMap;
 
 use cedar_policy::{Effect, PolicySet};

@@ -9,7 +9,7 @@ use super::super::env::Blind;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
 use super::step::Certainty;
-use crate::model::semantics::{step, successors_among, within_bounds};
+use crate::model::semantics::{step, successors_budgeted, within_bounds};
 use crate::model::{
     ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
 };
@@ -132,12 +132,15 @@ impl JointModel {
         by: u32,
     ) {
         let entered = state.records[entity].status != moved.status;
-        let timeout = self
-            .timeout(entity, &moved.status)
-            .filter(|_| self.sender_matters.contains(entity));
+        let timeout = self.timeout(entity, &moved.status);
         match timeout {
             Some(timeout) if entered || timeout.reset_on.iter().any(|a| a == action) => {
-                state.armed.insert(entity.to_string(), by);
+                let sender = if self.sender_matters.contains(entity) {
+                    by
+                } else {
+                    super::super::senders::OUTSIDE
+                };
+                state.armed.insert(entity.to_string(), sender);
             }
             Some(_) => {}
             None => {
@@ -164,11 +167,12 @@ impl JointModel {
         // carry: the first choice, as the composite check takes. A string
         // parameter it does not carry leaves the field as it is.
         let values = self.values(state);
-        let mut params: BTreeMap<String, ParamValue> = successors_among(model, t, target, &values)
-            .into_iter()
-            .next()
-            .map(|(params, _)| params)
-            .unwrap_or_default();
+        let mut params: BTreeMap<String, ParamValue> =
+            successors_budgeted(model, t, target, &values, &self.expansion)
+                .into_iter()
+                .next()
+                .map(|(params, _)| params)
+                .unwrap_or_default();
         for param in &t.string_params {
             params.remove(&param.name);
         }

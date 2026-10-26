@@ -37,7 +37,7 @@ effect = ["total += params.amount"]
         Sending::anyone(),
         false,
     );
-    let mut state = model.inits().remove(0);
+    let mut state = model.inits().next().expect("an initial state");
     let mut dispatch = Dispatch {
         to: "Total".into(),
         action: "Add".into(),
@@ -68,7 +68,7 @@ effect = ["total += params.amount"]
     dispatch
         .params
         .insert("amount".into(), ParamValue::Count(100));
-    let initial = model.inits().remove(0);
+    let initial = model.inits().next().expect("an initial state");
     let outcomes = model.deliver(initial.clone(), &dispatch, "add");
     assert_eq!(outcomes[0].0, initial);
     assert_eq!(outcomes[0].2, Certainty::Unsure);
