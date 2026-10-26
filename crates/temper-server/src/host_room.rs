@@ -68,33 +68,45 @@ impl Room for HostRoom {
 fn free_memory() -> Option<usize> {
     use std::path::Path;
 
-    let read = |path: &Path| std::fs::read_to_string(path).ok(); // determinism-ok: host memory read
+    linux_free_memory(&|path: &Path| std::fs::read_to_string(path).ok()) // determinism-ok: host memory read
+}
+
+#[cfg(target_os = "linux")]
+fn linux_free_memory(read: &impl Fn(&std::path::Path) -> Option<String>) -> Option<usize> {
+    use std::path::Path;
+
     let mut free = field(&read(Path::new("/proc/meminfo"))?, "MemAvailable:")?.saturating_mul(1024);
-    // cgroup v2 names the process's group on its "0::" line. Every group from
-    // there up to the mount's root may set a limit the process shares with
-    // the others in it; a group without one says "max" and is skipped.
-    let root = Path::new("/sys/fs/cgroup");
-    let own = read(Path::new("/proc/self/cgroup"))
-        .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
-        })
-        .unwrap_or_default();
-    let own = root.join(own.trim().trim_start_matches('/'));
-    let v2 = ["memory.max", "memory.current", "inactive_file"];
-    for dir in own.ancestors().take_while(|dir| dir.starts_with(root)) {
-        if let Some(left) = group_free(&read, dir, v2) {
-            free = free.min(left);
+    let groups = read(Path::new("/proc/self/cgroup"))?;
+    // Each memory hierarchy names this process's group. Every ancestor can
+    // impose a tighter limit, shared with the other processes below it.
+    for line in groups.lines() {
+        let mut parts = line.splitn(3, ':');
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        let (root, files) = if hierarchy == "0" && controllers.is_empty() {
+            (
+                Path::new("/sys/fs/cgroup"),
+                ["memory.max", "memory.current", "inactive_file"],
+            )
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (
+                Path::new("/sys/fs/cgroup/memory"),
+                [
+                    "memory.limit_in_bytes",
+                    "memory.usage_in_bytes",
+                    "total_inactive_file",
+                ],
+            )
+        } else {
+            continue;
+        };
+        let own = root.join(path.trim_start_matches('/'));
+        for dir in own.ancestors().take_while(|dir| dir.starts_with(root)) {
+            if let Some(left) = group_free(read, dir, files) {
+                free = free.min(left);
+            }
         }
-    }
-    // cgroup v1 keeps memory in its own hierarchy; unlimited reads near 2^63.
-    let v1 = [
-        "memory.limit_in_bytes",
-        "memory.usage_in_bytes",
-        "total_inactive_file",
-    ];
-    if let Some(left) = group_free(&read, &root.join("memory"), v1) {
-        free = free.min(left);
     }
     Some(free)
 }
@@ -122,29 +134,46 @@ fn field(text: &str, name: &str) -> Option<usize> {
         .ok()
 }
 
-/// A development host: the machine's memory less this process's own.
+/// Free and inactive pages across the host, after every process's usage.
+/// Speculative pages are already included in `free_count`; active, wired
+/// and compressed pages are not available for a walk.
 #[cfg(target_os = "macos")]
 fn free_memory() -> Option<usize> {
-    let mut bytes: u64 = 0;
-    let mut size = size_of::<u64>();
-    // SAFETY: hw.memsize is a u64; `bytes` and `size` describe its buffer.
-    let status = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
+    unsafe extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: the output buffer and count match HOST_VM_INFO64. The host
+    // port returned by mach_host_self is released after the call.
+    #[allow(deprecated)] // libc's Mach API is deprecated in favor of mach2.
+    let (status, page_size) = unsafe {
+        let host = libc::mach_host_self();
+        let status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (status, libc::sysconf(libc::_SC_PAGESIZE))
     };
-    let machine = (status == 0)
-        .then(|| usize::try_from(bytes).ok())
-        .flatten()?;
-    let resident = crate::state::runtime_metrics::read_process_resident_memory_bytes()?;
-    Some(machine.saturating_sub(usize::try_from(resident).ok()?))
+    if status != libc::KERN_SUCCESS || count != libc::HOST_VM_INFO64_COUNT {
+        return None;
+    }
+    // SAFETY: a successful host_statistics64 call initialized the buffer.
+    let stats = unsafe { stats.assume_init() };
+    let pages = (stats.free_count as usize).saturating_add(stats.inactive_count as usize);
+    pages.checked_mul(usize::try_from(page_size).ok()?)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn free_memory() -> Option<usize> {
     None
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

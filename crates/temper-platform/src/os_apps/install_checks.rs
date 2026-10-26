@@ -77,6 +77,7 @@ pub(super) async fn prove(
     specs: &[(String, String)],
     new_specs: bool,
     policies: Option<&str>,
+    attempt: &mut proofs::Attempt,
 ) -> Result<Option<Wait>, String> {
     if !new_specs && policies.is_none() {
         return Ok(None);
@@ -117,9 +118,15 @@ pub(super) async fn prove(
             source: proofs::digest(&name, &sources, Some(&policy_text)),
         };
         let digest = keys.model.clone();
-        let proof = proofs::proof(state, tenant, app_name, name.clone(), keys, move |bound| {
-            walk(&joint_proof, bound)
-        })
+        let proof = proofs::proof(
+            state,
+            tenant,
+            app_name,
+            name.clone(),
+            keys,
+            attempt,
+            move |bound| walk(&joint_proof, bound),
+        )
         .await;
         match proof {
             Proof::Done(verdict) => {

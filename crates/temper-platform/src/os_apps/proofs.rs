@@ -19,7 +19,7 @@
 //! it: those specs already run. A refusal is kept only while this process runs,
 //! so a later checker decides it again. A walk that did not fit in its
 //! memory says nothing of the specs: the install that waited for it reads it
-//! once, and the next walks again.
+//! throughout its retries, and the next independent install walks again.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -88,6 +88,11 @@ pub(super) fn digest(
     format!("{:x}", hasher.finalize())
 }
 
+/// Results one install has read, retained across all its retries. Incomplete
+/// work may be tried again by a later independent install.
+#[derive(Default)]
+pub(super) struct Attempt(BTreeMap<String, Verdict>);
+
 /// A proof's verdict, or the walk an install must wait for.
 pub(super) enum Proof {
     Done(Verdict),
@@ -134,8 +139,12 @@ pub(super) async fn proof(
     app_name: &str,
     proof: String,
     keys: Keys,
+    attempt: &mut Attempt,
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
 ) -> Proof {
+    if let Some(verdict) = attempt.0.get(&keys.model) {
+        return Proof::Done(verdict.clone());
+    }
     let mut stored = None;
     if let Some(store) = state.server.platform_metadata_store() {
         let mut missing = Vec::new();
@@ -164,10 +173,12 @@ pub(super) async fn proof(
     let digest = keys.model;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(verdict) = stored {
+        attempt.0.insert(digest.clone(), verdict.clone());
         proofs.reached.insert(digest, (verdict.clone(), true));
         return Proof::Done(verdict);
     }
     if let Some((verdict, fit)) = proofs.reached.get(&digest).cloned() {
+        attempt.0.insert(digest.clone(), verdict.clone());
         if !fit {
             proofs.reached.remove(&digest);
         }
@@ -311,3 +322,6 @@ async fn emit(
         tracing::warn!(tenant, app = %app_name, %error, "a proof event could not be kept");
     }
 }
+
+#[cfg(test)]
+mod tests;
