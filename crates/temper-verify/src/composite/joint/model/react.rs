@@ -147,7 +147,11 @@ impl JointModel {
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
                     depth: depth + 1,
                     via: Some(index),
-                    by: self.senders.reaction(reaction.principal.as_ref(), by),
+                    by: self.senders.reaction(
+                        reaction.principal.as_ref(),
+                        by,
+                        matches!(reaction.resolve, Some(TargetResolver::SameId)),
+                    ),
                     inline: false,
                 };
                 let mut next = state;
