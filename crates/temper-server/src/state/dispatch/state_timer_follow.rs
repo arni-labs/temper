@@ -123,71 +123,13 @@ impl ServerState {
         runtime.spawn(async move { server.follow_spec_changes().await }); // determinism-ok: install follow-up runs in the background
     }
 
-    /// At boot, after the rows are re-armed: make every record of every type
-    /// that declares a timeout follow its state, including missing rows, and
-    /// report the arms and records still waiting in `counts`.
-    pub(super) async fn follow_timed_types(
-        &self,
-        callers: BootCallers,
-        gate: Arc<Semaphore>,
-        mut counts: BootTimers,
-    ) -> BootTimers {
-        let types: Vec<(TenantId, String)> = match self.registry.read() {
-            Ok(registry) => registry
-                .tenant_ids()
-                .into_iter()
-                .flat_map(|tenant| {
-                    registry
-                        .entity_types(tenant)
-                        .into_iter()
-                        .filter(|entity_type| {
-                            registry
-                                .get_spec(tenant, entity_type)
-                                .is_some_and(|spec| !spec.automaton.state_timeouts.is_empty())
-                        })
-                        .map(|entity_type| (tenant.clone(), entity_type.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .collect(),
-            Err(_) => return counts,
-        };
-        let waiting = self.follow_types(types, &callers, Some(gate)).await;
-        for (key, followed) in waiting {
-            let counted = counts.entry(key).or_default();
-            counted.waiting = followed.waiting;
-            counted.armed += followed.armed;
-            counted.overdue += followed.overdue;
-        }
-        let by_type = counts
-            .iter()
-            .map(|((tenant, entity_type), counts)| {
-                format!(
-                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={} scheduled={} armed={} overdue={}",
-                    counts.rearmed, counts.dropped, counts.waiting, counts.scheduled, counts.armed, counts.overdue
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        tracing::info!(
-            rearmed = counts.values().map(|c| c.rearmed).sum::<usize>(),
-            dropped = counts.values().map(|c| c.dropped).sum::<usize>(),
-            waiting = counts.values().map(|c| c.waiting).sum::<usize>(),
-            scheduled = counts.values().map(|c| c.scheduled).sum::<usize>(),
-            armed = counts.values().map(|c| c.armed).sum::<usize>(),
-            overdue = counts.values().map(|c| c.overdue).sum::<usize>(),
-            by_type,
-            "state timers after boot"
-        );
-        counts
-    }
-
     /// Reconcile every record of each of `types` from their recorded clocks, and
     /// return how many records of each type wait for their next action. A type
     /// whose records the store cannot list or read is tried again after a
     /// wait. Repeating a successful reconcile is idempotent; an unreadable
     /// record may have no timer at all, so the walk must retain responsibility
     /// for retrying it.
-    async fn follow_types(
+    pub(super) async fn follow_types(
         &self,
         mut types: Vec<(TenantId, String)>,
         callers: &BootCallers,
@@ -213,6 +155,7 @@ impl ServerState {
                     let follow = Follow {
                         armed_by: callers.get(&key),
                         gate: gate.clone(),
+                        rows_recovered: gate.is_some(),
                     };
                     let followed = self
                         .reconcile_stored_record(&tenant, &entity_type, entity_id, follow)
@@ -325,4 +268,28 @@ impl ServerState {
             }
         }
     }
+}
+
+/// Report the completed recovery across all tenants.
+pub(super) fn log_boot_timers(counts: &BootTimers) {
+    let by_type = counts
+            .iter()
+            .map(|((tenant, entity_type), counts)| {
+                format!(
+                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={} scheduled={} armed={} overdue={}",
+                    counts.rearmed, counts.dropped, counts.waiting, counts.scheduled, counts.armed, counts.overdue
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+    tracing::info!(
+        rearmed = counts.values().map(|c| c.rearmed).sum::<usize>(),
+        dropped = counts.values().map(|c| c.dropped).sum::<usize>(),
+        waiting = counts.values().map(|c| c.waiting).sum::<usize>(),
+        scheduled = counts.values().map(|c| c.scheduled).sum::<usize>(),
+        armed = counts.values().map(|c| c.armed).sum::<usize>(),
+        overdue = counts.values().map(|c| c.overdue).sum::<usize>(),
+        by_type,
+        "state timers after boot"
+    );
 }

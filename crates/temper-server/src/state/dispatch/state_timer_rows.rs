@@ -13,12 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
-use super::state_timer_follow::{BootCallers, BootTimers};
+use super::state_timer_follow::{BootCallers, BootTimers, log_boot_timers};
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::{decode_armed_by, encode_armed_by};
 use crate::state::ServerState;
@@ -90,6 +91,8 @@ impl ServerState {
     /// Arm again every state timer that a previous process left waiting
     /// (`ServerState::start_runtime` calls it once at boot).
     ///
+    /// Returns immediately; reads and retries run independently per tenant in
+    /// the background, so unreadable rows cannot hold startup or other tenants.
     /// Reads one row per waiting timer and loads no entity until its timer
     /// fires, at most [`BOOT_FIRES_AT_ONCE`] firing at once; a row whose state
     /// declares no timeout now is removed. Then, in the background, each
@@ -101,16 +104,82 @@ impl ServerState {
     /// with the boot's counts per tenant and type, and logs them as
     /// `state timers after boot`.
     pub(crate) async fn rearm_state_timers(&self) -> tokio::task::JoinHandle<BootTimers> {
+        // Consume only the startup installs. Installs arriving while the
+        // background recovery runs must remain queued for a later walk.
+        self.registry
+            .write()
+            .expect("registry lock poisoned")
+            .take_changed_types();
+        let server = self.clone();
+        // determinism-ok: durable recovery and its retries must not block HTTP startup.
+        tokio::spawn(async move { server.recover_state_timers().await })
+    }
+
+    async fn recover_state_timers(&self) -> BootTimers {
+        let gate = self.state_timer_boot_gate.clone();
+        let mut counts = BootTimers::new();
+        self.rearm_scheduled_actions(&gate, &mut counts).await;
+        let mut tenants = FuturesUnordered::new();
+        for (tenant, timeouts) in self.declared_state_timeouts() {
+            let gate = gate.clone();
+            tenants.push(async move {
+                let types = timeouts
+                    .keys()
+                    .map(|(kind, _)| (tenant.clone(), kind.clone()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let (callers, mut counts) =
+                    self.recover_tenant_state_timers(&tenant, &timeouts).await;
+                // Only this tenant's saved identities are now known. Other
+                // tenants may still be retrying; their records stay untouched.
+                let followed = self.follow_types(types, &callers, Some(gate)).await;
+                self.timer_recovered_tenants
+                    .write()
+                    .expect("timer recovery lock poisoned")
+                    .insert(tenant.clone());
+                for (key, followed) in followed {
+                    let counted = counts.entry(key).or_default();
+                    counted.waiting = followed.waiting;
+                    counted.armed += followed.armed;
+                    counted.overdue += followed.overdue;
+                }
+                counts
+            });
+        }
+        while let Some(recovered) = tenants.next().await {
+            for (key, recovered) in recovered {
+                let counted = counts.entry(key).or_default();
+                counted.rearmed += recovered.rearmed;
+                counted.dropped += recovered.dropped;
+                counted.waiting += recovered.waiting;
+                counted.armed += recovered.armed;
+                counted.overdue += recovered.overdue;
+            }
+        }
+        {
+            let _registry = self.registry.write().expect("registry lock poisoned");
+            self.timer_recovery_complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.follow_spec_changes().await;
+        log_boot_timers(&counts);
+        counts
+    }
+
+    /// Restore a tenant's saved rows before allowing its rowless recovery.
+    async fn recover_tenant_state_timers(
+        &self,
+        tenant: &TenantId,
+        timeouts: &DeclaredTimeouts,
+    ) -> (BootCallers, BootTimers) {
         let started = Instant::now();
         let gate = self.state_timer_boot_gate.clone();
         let mut callers = BootCallers::new();
         let mut counts = BootTimers::new();
         let mut armed = 0usize;
         let mut overdue = 0usize;
-        for (tenant, timeouts) in self.declared_state_timeouts() {
-            let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
-                continue;
-            };
+        if let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await {
             // A failed read does not establish row absence. Restore saved
             // callers before any walk can arm missing rows as the service.
             let mut wait = Duration::from_secs(1);
@@ -188,25 +257,10 @@ impl ServerState {
                 armed += 1;
             }
         }
-        tracing::info!(
-            armed,
-            overdue,
+        tracing::info!(tenant = %tenant, armed, overdue,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "re-armed state timers from the store"
-        );
-        self.rearm_scheduled_actions(&gate, &mut counts).await;
-        {
-            // Serialize with install walks so none can consume startup changes
-            // before saved identities and gates have been restored. The boot
-            // walk covers all timed types, including missing rows at startup.
-            let mut registry = self.registry.write().expect("registry lock poisoned");
-            registry.take_changed_types();
-            self.timer_recovery_complete
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        let server = self.clone();
-        // determinism-ok: boot follow-up runs in the background, as boot timers do.
-        tokio::spawn(async move { server.follow_timed_types(callers, gate, counts).await })
+            "re-armed state timers from the store");
+        (callers, counts)
     }
 
     /// Every tenant's declared timeouts. Tenants without any are left out.

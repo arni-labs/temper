@@ -49,6 +49,10 @@ def inventory(path):
             "SELECT tenant, entity_type, entity_id, sequence_nr, event_type, payload FROM events "
             "ORDER BY tenant, entity_type, entity_id, sequence_nr"
         ):
+            # Composite envelopes record orchestration, not state transitions.
+            # Actor replay skips them as well; they do not change the clock.
+            if event_type == "CompositeEvent":
+                continue
             key = (tenant, kind, record)
             event = json.loads(payload)
             if is_tombstone(event_type, event):

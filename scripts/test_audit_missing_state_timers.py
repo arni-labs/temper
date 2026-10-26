@@ -57,5 +57,38 @@ after_seconds = 60
                 self.assertTrue(all(r["action"] == "Purge" for r in result[0]["records"]))
 
 
+class InventoryCompositeTests(unittest.TestCase):
+    def test_composite_after_snapshot_preserves_state_clock(self):
+        for snapshot in (False, True):
+            with self.subTest(snapshot=snapshot), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "backup.db"
+                with sqlite3.connect(path) as db:
+                    db.executescript("""
+                        CREATE TABLE specs (tenant, entity_type, ioa_source);
+                        CREATE TABLE state_timers (tenant, entity_type, entity_id);
+                        CREATE TABLE snapshots (tenant, entity_type, entity_id, sequence_nr, snapshot);
+                        CREATE TABLE events (tenant, entity_type, entity_id, sequence_nr, event_type, payload);
+                    """)
+                    db.execute("INSERT INTO specs VALUES (?, ?, ?)", ("t", "Record", '''
+[[state_timeout]]
+state = "Waiting"
+on_timeout = "Expire"
+after_seconds = 60
+'''))
+                    entered = "2026-10-26T10:00:00Z"
+                    if snapshot:
+                        db.execute("INSERT INTO snapshots VALUES (?, ?, ?, ?, ?)",
+                                   ("t", "Record", "r", 1, json.dumps({"status": "Waiting", "status_clock": {"entered_at": entered, "actions": {}}})))
+                    else:
+                        db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
+                                   ("t", "Record", "r", 1, "Start", json.dumps({"action": "Start", "from_status": "Idle", "to_status": "Waiting", "timestamp": entered})))
+                    db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
+                               ("t", "Record", "r", 2, "CompositeEvent", json.dumps({"parent_action": "Run", "timestamp": "2026-10-26T10:01:00Z"})))
+                records = audit.inventory(path)[0]["records"]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["state"], "Waiting")
+                self.assertEqual(records[0]["clock_start"], "2026-10-26T10:00:00+00:00")
+
+
 if __name__ == "__main__":
     unittest.main()

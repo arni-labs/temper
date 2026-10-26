@@ -172,3 +172,80 @@ fn rehydration_before_row_recovery_preserves_saved_caller() {
         world.clock.end(Duration::ZERO);
     });
 }
+
+/// Unreadable alpha rows must not hold HTTP startup or beta's rowless timers.
+#[test]
+fn dst_unreadable_tenant_does_not_block_startup_or_other_timers() {
+    check_seeds(|seed| {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = World {
+            events: SimEventStore::no_faults(seed),
+            rows: Arc::new(SimTimerRows::new(seed)),
+            clock,
+        };
+        let alpha = Job {
+            tenant: TenantId::new("alpha"),
+            id: "unreadable".into(),
+        };
+        let beta = Job {
+            tenant: TenantId::new("beta"),
+            id: "healthy".into(),
+        };
+        let first = Process::start(&world, JOB_V1, &job_untimed(), "isolated-a");
+        first.runtime.block_on(async {
+            for job in [&alpha, &beta] {
+                first
+                    .state
+                    .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
+                    .await
+                    .unwrap();
+                assert!(act(&first.state, job, "Start").await);
+            }
+            settle().await;
+        });
+        let saved = world.rows.row("alpha", &alpha.id).unwrap();
+        first.runtime.block_on(async {
+            use temper_server::storage::StateTimerStore;
+            let row = world.rows.row("beta", &beta.id).unwrap();
+            world
+                .rows
+                .delete_state_timer("beta", "Job", &beta.id, &row.arm_id)
+                .await
+                .unwrap();
+        });
+        first.kill(&world, Duration::ZERO);
+        world.rows.fail_next_listings("alpha", 100);
+        let before = temper_runtime::scheduler::SimClock::now(world.clock.as_ref());
+        let (second, walk) = Process::boot(&world, JOB_V1, &job_untimed(), "isolated-b");
+        second.runtime.block_on(async {
+            assert_eq!(
+                temper_runtime::scheduler::SimClock::now(world.clock.as_ref()),
+                before,
+                "startup must return without waiting for row retries"
+            );
+            settle().await;
+            assert!(!walk.is_finished(), "failed recovery remains pending");
+            assert_eq!(status(&second.state, &alpha).await, "Waiting");
+            settle().await;
+            assert_eq!(
+                world.rows.row("alpha", &alpha.id).unwrap().armed_by,
+                saved.armed_by
+            );
+            advance(Duration::from_secs(3601)).await;
+            assert_eq!(
+                status(&second.state, &beta).await,
+                "Done",
+                "healthy tenant fires while alpha is unreadable"
+            );
+            assert_eq!(status(&second.state, &alpha).await, "Waiting");
+            world.rows.fail_next_listings("alpha", 0);
+            advance(Duration::from_secs(60)).await;
+            walk.await.unwrap();
+            settle().await;
+            assert_eq!(status(&second.state, &alpha).await, "Done");
+        });
+        second.kill(&world, Duration::ZERO);
+        Ok(())
+    });
+}

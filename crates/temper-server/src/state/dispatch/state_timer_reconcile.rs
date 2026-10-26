@@ -71,6 +71,8 @@ pub(crate) struct Follow<'a> {
     pub(crate) armed_by: Option<&'a AgentContext>,
     /// The boot walk's fire gate.
     pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// The boot walk has read this tenant's saved rows and holds its callers.
+    pub(crate) rows_recovered: bool,
 }
 
 impl ServerState {
@@ -104,14 +106,24 @@ impl ServerState {
         current: &EntityState,
         follow: Follow<'_>,
     ) -> TimerFollow {
-        let Follow { armed_by, gate } = follow;
+        let Follow {
+            armed_by,
+            gate,
+            rows_recovered,
+        } = follow;
         // Rehydration can run before startup has restored the saved callers.
         // Leave those rows untouched; the boot walk reconciles this record
         // after recovery, including when a failed row listing needs retries.
         if armed_by.is_none()
+            && !rows_recovered
             && !self
                 .timer_recovery_complete
                 .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .timer_recovered_tenants
+                .read()
+                .expect("timer recovery lock poisoned")
+                .contains(tenant)
         {
             return TimerFollow::RetryRead;
         }
