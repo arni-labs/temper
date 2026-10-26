@@ -96,9 +96,11 @@ pub(super) fn settle(
             }
             let mut broken = BTreeMap::new();
             let mut instead = Vec::new();
+            let mut batch_stop = None;
             for (&i, checked) in batch.iter().zip(checked) {
                 let Some((obligation, failed, refused)) = checked else {
-                    break 'proof Some(Stop::Late);
+                    batch_stop = Some(Stop::Late);
+                    break;
                 };
                 note(&mut errors, refused);
                 match &obligation.outcome {
@@ -130,21 +132,27 @@ pub(super) fn settle(
                     }
                     _ => {
                         last[i] = Some(obligation);
-                        break 'proof Some(Stop::At(i));
+                        batch_stop = Some(Stop::At(i));
+                        break;
                     }
                 }
                 last[i] = Some(obligation);
             }
-            if !errors.is_empty() {
-                break 'proof None;
+            // Keep the evidence from this batch even when a later ask
+            // stops the proof, times out or reports a solver error.
+            let changed = !broken.is_empty();
+            dropped.extend(broken);
+            if changed {
+                drops += 1;
+            }
+            if batch_stop.is_some() || !errors.is_empty() {
+                break 'proof batch_stop;
             }
             // The moves a general move stands for are checked next.
             for m in instead.into_iter().rev() {
                 due.push_front(m);
             }
-            if !broken.is_empty() {
-                dropped.extend(broken);
-                drops += 1;
+            if changed {
                 for i in 0..n {
                     let gone = |goals: &Vec<Goal>| {
                         goals

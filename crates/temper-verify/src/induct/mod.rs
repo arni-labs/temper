@@ -370,10 +370,18 @@ fn prove_one(
     let (settled, premise_excluded) =
         pool::with_pool(shared, &v, rule, (&clauses, &asks), |pool| {
             let mut last: Option<houdini::Settled> = None;
+            let mut dropped = BTreeMap::new();
             for (left_out, may_end_bare) in &tries {
                 let attempt = (&clauses, &asks[..proof]);
                 let tried = houdini::settle(pool, attempt, &droppable, (left_out, *may_end_bare))?;
                 if let Some(tried) = tried {
+                    // A later try may stop before revisiting a lemma already
+                    // seen to break. Keep that evidence for the verdict.
+                    for (&i, why) in &tried.dropped {
+                        if written.contains(&i) {
+                            dropped.entry(i).or_insert_with(|| why.clone());
+                        }
+                    }
                     let proved = tried.proved();
                     last = Some(tried);
                     if proved {
@@ -382,6 +390,7 @@ fn prove_one(
                 }
             }
             let mut last = last.expect("the first try may end with no clause to drop");
+            last.dropped.extend(dropped);
             last.errors.splice(0..0, errors);
             let excluded = match asks.get(proof) {
                 Some(_) if last.proved() => {
@@ -431,3 +440,6 @@ fn prove_one(
 
 #[cfg(test)]
 mod answers_test;
+
+#[cfg(test)]
+mod houdini_test;
