@@ -96,7 +96,7 @@ impl crate::state::ServerState {
             query_projection_update_mode(),
             QueryProjectionUpdateMode::Queued
         );
-        let Some(query_plane) = self.query_plane_store() else {
+        let Some(query_plane) = self.query_plane_written_after_commit() else {
             return;
         };
 

@@ -49,6 +49,7 @@ mod policy;
 mod policy_approval;
 mod policy_replace;
 mod projection_freshness;
+mod projection_rows;
 mod published_artifacts;
 mod query_page;
 mod scheduled_actions;
@@ -60,6 +61,7 @@ pub mod sync_adopt;
 #[cfg(test)]
 mod tests;
 mod trajectory;
+mod trajectory_batch;
 mod trajectory_queries;
 mod unchanged_projections;
 mod wasm;
@@ -73,6 +75,8 @@ pub use published_artifacts::{PublishedArtifactRow, PublishedArtifactUpsert};
 pub struct TursoEventStore {
     db: Arc<Database>,
     write_gate: Arc<write_gate::WriteGate>,
+    /// Trajectory rows waiting for their batch's transaction.
+    trajectory_batch: Arc<trajectory_batch::TrajectoryBatch>,
     /// True when connected to a remote Turso Cloud instance (libsql:// URL).
     /// PRAGMAs are skipped for remote connections.
     is_remote: bool,
@@ -141,6 +145,7 @@ impl TursoEventStore {
             write_gate: Arc::new(write_gate::WriteGate::new(
                 write_gate::configured_write_concurrency(is_remote),
             )),
+            trajectory_batch: Arc::default(),
             is_remote,
             sync_copy,
             #[cfg(test)]
