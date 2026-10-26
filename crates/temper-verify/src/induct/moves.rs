@@ -1,18 +1,19 @@
 //! The moves of the joint state, each a formula over `pre` and `post`:
 //!
 //! - an action someone outside may send, with any parameters;
-//! - a module call's answer: an internal action, or one a trigger names as
-//!   its answer or failure, with any parameters, whenever the record can
-//!   take it (the proof does not hold the calls in flight, so it may come
-//!   at any time);
 //! - a state timer's action, with its arguments, while its state holds;
 //! - a reaction from a type outside the scope, carrying values the proof
 //!   does not know, as the sender Cedar decides it for;
 //! - a dispatch in flight arriving: its record takes it, sending what that
-//!   sets off, or refuses it.
+//!   sets off, or refuses it;
+//! - a module call in flight answered, with the trigger's declared answer
+//!   or else any internal action of its record, its parameters tied to a
+//!   field carrying the field as the call found it and the others any
+//!   value; or failing, which fires the trigger's `on_failure` with no
+//!   parameters; or ending unanswered (refused, or lost in a restart).
 //!
-//! None of them asks for a module call or timer to be open, and a dispatch
-//! may arrive at any time, so the moves allow everything the kernel does,
+//! A timer may fire whenever its state holds and a dispatch or call may
+//! arrive at any time, so the moves allow everything the joint walk does,
 //! and more.
 
 use std::cell::RefCell;
@@ -20,47 +21,98 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::May;
 use temper_spec::automaton::{Action, ActionConstraint, ActionKind, StateTimeout, TriggerKind};
-use temper_spec::predicate::{Arg, AssignOp, Effect};
 
 use super::encode::Enc;
-use super::vocab::{Kind, Sort};
+use super::vocab::{Call, Kind, Sort};
 
-/// One move: its name, the constants it makes up, and what holds of it.
+/// One move: its name, the constants it makes up, what lets it happen, and
+/// the state it leads to.
 pub(super) struct Move {
     pub(super) label: String,
     pub(super) decls: Vec<String>,
-    pub(super) body: Vec<String>,
+    /// Read on `pre`, and on `w` when it has one.
+    pub(super) guard: Vec<String>,
+    /// `post` from `pre`.
+    pub(super) defs: Vec<String>,
+    /// The kind of dispatch or call `w` is, when the move takes one.
+    pub(super) witness: Option<String>,
+    pub(super) step: Step,
+    /// The record and the action it takes, when it takes one.
+    pub(super) entity: String,
+    pub(super) action: String,
+    /// A timer's state.
+    pub(super) timer: Option<String>,
+}
+
+/// What a move is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Step {
+    Outside,
+    Timer,
+    Outer,
+    Arrive,
+    Refuse,
+    Answer,
+    Fail,
+    FailRefused,
+    Unanswered,
+}
+
+impl Step {
+    /// Whether the system makes it (a timer, a module, the kernel's
+    /// dispatches) rather than someone outside or a restart.
+    pub(super) fn by_system(self) -> bool {
+        !matches!(self, Step::Outside | Step::Outer | Step::Unanswered)
+    }
+}
+
+impl Move {
+    pub(super) fn body(&self) -> impl Iterator<Item = &String> {
+        self.guard.iter().chain(&self.defs)
+    }
 }
 
 /// Where an action comes from.
 enum Source<'t> {
     Outside,
-    Answer,
     Timer(&'t StateTimeout),
     /// A reaction from outside the scope, carrying these parameters.
     Outer(BTreeSet<String>),
     /// A dispatch of this kind arriving, as the constant `w`.
     Arrive(&'t Kind),
+    /// A call of this kind answered, as the constant `w`.
+    Answer(&'t Call),
+    /// A call of this kind failing, as the constant `w`: its `on_failure`
+    /// fires with no parameters.
+    Fail(&'t Call),
 }
 
 /// A parameter's term, and whether it was passed.
-struct Param {
-    term: String,
-    passed: String,
+pub(super) struct Param {
+    pub(super) term: String,
+    pub(super) passed: String,
 }
 
 /// Builds the moves of one rule's proof.
 pub(super) struct Moves<'e, 'v, 'a> {
-    enc: &'e Enc<'v, 'a>,
+    pub(super) enc: &'e Enc<'v, 'a>,
     /// What the encoding could not express, in words.
     pub(super) limits: RefCell<BTreeSet<String>>,
+    /// Parameters a liveness proof chooses for a helpful move, by name, as
+    /// terms over `pre` and `w`; `passed.<name>` says whether it is passed.
+    pins: BTreeMap<String, String>,
 }
 
 impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
     pub(super) fn new(enc: &'e Enc<'v, 'a>) -> Self {
+        Self::pinned(enc, BTreeMap::new())
+    }
+
+    pub(super) fn pinned(enc: &'e Enc<'v, 'a>, pins: BTreeMap<String, String>) -> Self {
         Self {
             enc,
             limits: RefCell::default(),
+            pins,
         }
     }
 
@@ -70,15 +122,11 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         let mut out = Vec::new();
         for entity in &v.scope {
             let automaton = v.automaton(entity);
-            let answers = v.answers(entity);
             for action in &automaton.actions {
                 if action.kind == ActionKind::Input
                     && v.outside_may(entity, &action.name) != May::No
                 {
                     out.push(self.take(entity, action, &Source::Outside, "from outside"));
-                }
-                if answers.contains(&action.name) {
-                    out.push(self.take(entity, action, &Source::Answer, "answer"));
                 }
                 for timeout in automaton
                     .state_timeouts
@@ -123,6 +171,24 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                 out.push(self.refuse(kind, action));
             }
         }
+        for call in &v.calls {
+            for answer in v.answer_actions(call) {
+                let how = format!("answer to {}", call.name);
+                out.push(self.take(&call.to, answer, &Source::Answer(call), &how));
+            }
+            match call
+                .on_failure
+                .as_deref()
+                .and_then(|name| v.action(&call.to, name))
+            {
+                Some(action) => {
+                    out.push(self.take(&call.to, action, &Source::Fail(call), "fails"));
+                    out.push(self.end(call, Some(action)));
+                }
+                None => out.push(self.end(call, None)),
+            }
+            out.push(self.end_unanswered(call));
+        }
         out
     }
 
@@ -130,50 +196,127 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
     fn take(&self, entity: &str, action: &Action, source: &Source<'_>, how: &str) -> Move {
         let label = match source {
             Source::Arrive(kind) => format!("{} {how}", kind.name),
+            Source::Fail(call) => format!("{} {how}", call.name),
             _ => format!("{entity}.{} ({how})", action.name),
         };
-        let mut body = Vec::new();
-        let mut changed = BTreeMap::new();
-        let params = self.params(entity, action, source, &mut body);
-        body.extend(self.enabled(entity, action, &params));
+        let mut guard = Vec::new();
+        let params = self.params(entity, action, source, &mut guard);
+        guard.extend(self.enabled(entity, action, &params));
         if let Source::Timer(timeout) = source {
-            body.push(format!(
+            guard.push(format!(
                 "(= {} {})",
                 Enc::status("pre", entity),
                 Enc::state(entity, &timeout.state)
             ));
         }
-        if let Source::Arrive(kind) = source {
-            body.push(format!("(> (select pre.pend.{0} w) 0)", kind.name));
-            changed.insert(format!("post.pend.{}", kind.name), decrement(kind));
+        let witness = match source {
+            Source::Arrive(kind) => Some(kind.name.as_str()),
+            Source::Answer(call) | Source::Fail(call) => Some(call.name.as_str()),
+            _ => None,
+        };
+        let mut changed = BTreeMap::new();
+        if let Some(name) = witness {
+            guard.push(format!("(> (select pre.pend.{name} w) 0)"));
+            changed = decrement(name);
         }
         self.commit(entity, action, &params, &mut changed);
         self.sends(entity, action, &params, &mut changed);
-        body.extend(self.enc.frame_rest("pre", "post", &changed));
-        let mut decls = self.enc.take_decls();
-        if let Source::Arrive(kind) = source {
-            decls.push(format!("(declare-const w Msg/{})", kind.name));
+        let defs = self.enc.frame_rest("pre", "post", &changed);
+        let step = match source {
+            Source::Outside => Step::Outside,
+            Source::Timer(_) => Step::Timer,
+            Source::Outer(_) => Step::Outer,
+            Source::Arrive(_) => Step::Arrive,
+            Source::Answer(_) => Step::Answer,
+            Source::Fail(_) => Step::Fail,
+        };
+        let mut made = self.made(label, guard, defs, witness, step, (entity, &action.name));
+        if let Source::Timer(timeout) = source {
+            made.timer = Some(timeout.state.clone());
         }
-        Move { label, decls, body }
+        made
     }
 
     /// A dispatch of `kind` arrives and its record refuses it: it cannot
     /// take it, or Cedar may refuse it.
     fn refuse(&self, kind: &Kind, action: &Action) -> Move {
-        let mut body = vec![format!("(> (select pre.pend.{0} w) 0)", kind.name)];
-        let params = self.params(&kind.to, action, &Source::Arrive(kind), &mut body);
+        let mut guard = vec![format!("(> (select pre.pend.{0} w) 0)", kind.name)];
+        let params = self.params(&kind.to, action, &Source::Arrive(kind), &mut guard);
         if kind.may == May::Yes {
             let enabled = self.enabled(&kind.to, action, &params);
-            body.push(format!("(not (and true {}))", enabled.join(" ")));
+            guard.push(format!("(not (and true {}))", enabled.join(" ")));
         }
-        let changed = BTreeMap::from([(format!("post.pend.{}", kind.name), decrement(kind))]);
-        body.extend(self.enc.frame_rest("pre", "post", &changed));
+        let defs = self.enc.frame_rest("pre", "post", &decrement(&kind.name));
+        let label = format!("{} refused", kind.name);
+        let target = (kind.to.as_str(), kind.action.as_str());
+        self.made(label, guard, defs, Some(&kind.name), Step::Refuse, target)
+    }
+
+    /// A call of `call`'s kind fails and its record refuses its `on_failure`
+    /// (`fails, refused`), or it fails with none (`fails`).
+    fn end(&self, call: &Call, on_failure: Option<&Action>) -> Move {
+        let mut guard = vec![format!("(> (select pre.pend.{0} w) 0)", call.name)];
+        let (label, step, action) = match on_failure {
+            Some(action) => {
+                let params = self.params(&call.to, action, &Source::Fail(call), &mut guard);
+                let enabled = self.enabled(&call.to, action, &params);
+                guard.push(format!("(not (and true {}))", enabled.join(" ")));
+                let label = format!("{} fails, refused", call.name);
+                (label, Step::FailRefused, action.name.as_str())
+            }
+            None => (format!("{} fails", call.name), Step::Fail, ""),
+        };
+        let defs = self.enc.frame_rest("pre", "post", &decrement(&call.name));
+        self.made(
+            label,
+            guard,
+            defs,
+            Some(&call.name),
+            step,
+            (&call.to, action),
+        )
+    }
+
+    /// A call of `call`'s kind ends with nothing taken: its record refuses
+    /// the answer, or a restart loses it.
+    fn end_unanswered(&self, call: &Call) -> Move {
+        let guard = vec![format!("(> (select pre.pend.{0} w) 0)", call.name)];
+        let defs = self.enc.frame_rest("pre", "post", &decrement(&call.name));
+        let label = format!("{} ends unanswered", call.name);
+        let target = (call.to.as_str(), "");
+        self.made(
+            label,
+            guard,
+            defs,
+            Some(&call.name),
+            Step::Unanswered,
+            target,
+        )
+    }
+
+    fn made(
+        &self,
+        label: String,
+        guard: Vec<String>,
+        defs: Vec<String>,
+        witness: Option<&str>,
+        step: Step,
+        (entity, action): (&str, &str),
+    ) -> Move {
         let mut decls = self.enc.take_decls();
-        decls.push(format!("(declare-const w Msg/{})", kind.name));
+        if let Some(kind) = witness {
+            decls.push(format!("(declare-const w Msg/{kind})"));
+        }
         Move {
-            label: format!("{} refused", kind.name),
+            label,
             decls,
-            body,
+            guard,
+            defs,
+            witness: witness.map(str::to_string),
+            step,
+            entity: entity.to_string(),
+            action: action.to_string(),
+            timer: None,
         }
     }
 
@@ -183,29 +326,47 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         entity: &str,
         action: &Action,
         source: &Source<'_>,
-        body: &mut Vec<String>,
+        guard: &mut Vec<String>,
     ) -> BTreeMap<String, Param> {
         let v = self.enc.v;
         let mut params = BTreeMap::new();
         for name in action.params.iter().map(param_name) {
             let sort = v.param(action, name).unwrap_or(Sort::Str);
             let fresh = || self.enc.fresh(&format!("p.{name}"), sort.smt());
+            let tied = action.constraints.iter().find_map(|c| match c {
+                ActionConstraint::ParamEqualsField { param, field } if param == name => Some(field),
+                _ => None,
+            });
             let (term, passed) = match source {
                 Source::Arrive(kind) if kind.fields.iter().any(|(f, _)| f == name) => {
                     (format!("({}/{name} w)", kind.name), "true".to_string())
                 }
+                Source::Answer(call) if tied.is_some_and(|f| call.asked.contains(f)) => (
+                    format!("({}/{} w)", call.name, tied.expect("tied")),
+                    "true".to_string(),
+                ),
                 Source::Timer(timeout) if timeout.args.contains_key(name) => (
                     self.arg(entity, &timeout.args[name], sort, "pre", &BTreeMap::new()),
                     "true".to_string(),
                 ),
                 Source::Outer(carried) if carried.contains(name) => (fresh(), "true".to_string()),
-                Source::Outside | Source::Answer => {
+                Source::Outside | Source::Answer(_) if self.pins.contains_key(name) => (
+                    self.pins[name].clone(),
+                    self.pins
+                        .get(&format!("passed.{name}"))
+                        .cloned()
+                        .unwrap_or_else(|| "true".to_string()),
+                ),
+                Source::Outside | Source::Answer(_) => {
                     (fresh(), self.enc.fresh(&format!("passed.{name}"), "Bool"))
                 }
                 _ => (fresh(), "false".to_string()),
             };
-            if let Sort::Int { counter: true } = sort {
-                body.push(format!("(>= {term} 0)"));
+            // A count its sender chooses is never negative; one a dispatch
+            // carries was read from its sender's counter.
+            let carried = matches!(source, Source::Arrive(kind) if kind.fields.iter().any(|(f, _)| f == name));
+            if let (Sort::Int { counter: true }, false) = (sort, carried) {
+                guard.push(format!("(>= {term} 0)"));
             }
             params.insert(name.to_string(), Param { term, passed });
         }
@@ -270,154 +431,6 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         }
         out
     }
-
-    /// `entity`'s record after `action`: the string parameters it is passed
-    /// write the variables of their names, then its effects apply in order.
-    fn commit(
-        &self,
-        entity: &str,
-        action: &Action,
-        params: &BTreeMap<String, Param>,
-        changed: &mut BTreeMap<String, String>,
-    ) {
-        let v = self.enc.v;
-        let mut terms: BTreeMap<String, String> = v.vars[entity]
-            .keys()
-            .map(|var| (var.clone(), Enc::var("pre", entity, var)))
-            .collect();
-        for (name, param) in params {
-            if v.var(entity, name) == Some(Sort::Str) && v.param(action, name) == Some(Sort::Str) {
-                let before = &terms[name];
-                let after = match param.passed.as_str() {
-                    "true" => param.term.clone(),
-                    "false" => before.clone(),
-                    passed => format!("(ite {passed} {} {before})", param.term),
-                };
-                terms.insert(name.clone(), after);
-            }
-        }
-        for effect in &action.effect {
-            match effect {
-                Effect::Assign { var, op, value } => {
-                    let Some(sort) = v.var(entity, var) else {
-                        continue;
-                    };
-                    let value = match value {
-                        Arg::Param(p) => params
-                            .get(p)
-                            .map(|p| p.term.clone())
-                            .unwrap_or_else(|| self.enc.fresh(&format!("p.{p}"), sort.smt())),
-                        other => self.arg(entity, other, sort, "pre", &terms),
-                    };
-                    let now = terms[var].clone();
-                    let next = match op {
-                        AssignOp::Set => value,
-                        AssignOp::Add => format!("(+ {now} {value})"),
-                        AssignOp::Sub => format!("(ite (>= {now} {value}) (- {now} {value}) 0)"),
-                    };
-                    terms.insert(var.clone(), next);
-                }
-                Effect::Append { list, .. } | Effect::RemoveAt { list, .. } => {
-                    if v.var(entity, list).is_some() {
-                        self.limits
-                            .borrow_mut()
-                            .insert(format!("{entity}.{}: list {list}", action.name));
-                    }
-                }
-                other => {
-                    self.limits
-                        .borrow_mut()
-                        .insert(format!("{entity}.{}: effect {other}", action.name));
-                }
-            }
-        }
-        for (var, term) in terms {
-            if term != Enc::var("pre", entity, &var) {
-                changed.insert(Enc::var("post", entity, &var), term);
-            }
-        }
-        if let Some(to) = &action.to {
-            changed.insert(Enc::status("post", entity), Enc::state(entity, to));
-        }
-    }
-
-    /// The dispatches `action`'s reactions put in flight, read from the
-    /// record as it committed.
-    fn sends(
-        &self,
-        entity: &str,
-        action: &Action,
-        params: &BTreeMap<String, Param>,
-        changed: &mut BTreeMap<String, String>,
-    ) {
-        let v = self.enc.v;
-        for trigger in &action.triggers {
-            let Some(kind) = v.kind_of(entity, action, trigger) else {
-                continue;
-            };
-            let args: Vec<String> = kind
-                .fields
-                .iter()
-                .map(|(field, sort)| match &trigger.args[field] {
-                    Arg::Param(p) => params
-                        .get(p)
-                        .map(|p| p.term.clone())
-                        .unwrap_or_else(|| self.enc.fresh(&format!("p.{p}"), sort.smt())),
-                    other => self.arg(entity, other, *sort, "post", &BTreeMap::new()),
-                })
-                .collect();
-            let msg = if args.is_empty() {
-                format!("mk/{}", kind.name)
-            } else {
-                format!("(mk/{} {})", kind.name, args.join(" "))
-            };
-            let key = format!("post.pend.{}", kind.name);
-            let pend = changed
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| format!("pre.pend.{}", kind.name));
-            let sent = format!("(store {pend} {msg} (+ (select {pend} {msg}) 1))");
-            let next = match &trigger.guard {
-                Some(guard) => format!(
-                    "(ite {} {sent} {pend})",
-                    self.enc.expr(guard, entity, "post")
-                ),
-                None => sent,
-            };
-            changed.insert(key, next);
-        }
-    }
-
-    /// The term of an argument read from `entity`'s record in `frame`, or
-    /// from `terms` when it holds the variable.
-    fn arg(
-        &self,
-        entity: &str,
-        arg: &Arg,
-        sort: Sort,
-        frame: &str,
-        terms: &BTreeMap<String, String>,
-    ) -> String {
-        let held = match arg {
-            Arg::Var(var)
-                if self
-                    .enc
-                    .v
-                    .var(entity, var)
-                    .is_some_and(|s| s.smt() == sort.smt()) =>
-            {
-                Some(
-                    terms
-                        .get(var)
-                        .cloned()
-                        .unwrap_or_else(|| Enc::var(frame, entity, var)),
-                )
-            }
-            Arg::Lit(literal) => Enc::literal(literal, sort),
-            _ => None,
-        };
-        held.unwrap_or_else(|| self.enc.fresh("h", sort.smt()))
-    }
 }
 
 fn param_name(param: &temper_spec::automaton::ActionParam) -> &str {
@@ -427,9 +440,13 @@ fn param_name(param: &temper_spec::automaton::ActionParam) -> &str {
     }
 }
 
-fn decrement(kind: &Kind) -> String {
-    format!(
-        "(store pre.pend.{0} w (- (select pre.pend.{0} w) 1))",
-        kind.name
-    )
+/// One of kind `name`, the constant `w`, leaves the flight.
+fn decrement(name: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            format!("post.pend.{name}"),
+            format!("(store pre.pend.{name} w (- (select pre.pend.{name} w) 1))"),
+        ),
+        (format!("post.n.{name}"), format!("(- pre.n.{name} 1)")),
+    ])
 }

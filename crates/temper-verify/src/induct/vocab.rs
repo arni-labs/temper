@@ -2,12 +2,13 @@
 //! rule names, one per type with the same id, the dispatches in flight
 //! between them by kind, and what Cedar lets each sender send.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
-use temper_authz::{Asker, Attr, May, SendAnalysis};
+use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::{
-    Action, ActionKind, ActionParam, ActionTrigger, Automaton, TargetResolver, TriggerKind, VarType,
+    Action, ActionConstraint, ActionKind, ActionParam, ActionTrigger, Automaton, TriggerKind,
+    VarType,
 };
 use temper_spec::predicate::{Arg, Expr, Literal, Operand, Set};
 
@@ -59,6 +60,31 @@ pub(super) struct Kind {
     pub(super) may: May,
 }
 
+/// A kind of module call: the calls a record's triggers start on one
+/// module with the same declared answer and failure. As in the joint walk,
+/// a call keeps the fields its answers' parameters must equal, as the record
+/// held them when it started, and the record refuses an answer once they
+/// have moved on.
+#[derive(Debug, Clone)]
+pub(super) struct Call {
+    /// Its name in the proof: the record's type and the module, numbered
+    /// when several kinds share them.
+    pub(super) name: String,
+    pub(super) to: String,
+    pub(super) module: String,
+    pub(super) on_success: Option<String>,
+    pub(super) on_failure: Option<String>,
+    /// The string fields it keeps.
+    pub(super) asked: Vec<String>,
+}
+
+/// What is in flight, by kind: a dispatch or a module call, and the values
+/// each one carries.
+pub(super) struct Flight<'v> {
+    pub(super) name: &'v str,
+    pub(super) fields: Vec<(String, Sort)>,
+}
+
 /// The vocabulary of one rule's proof.
 pub(super) struct Vocab<'a> {
     pub(super) by_name: BTreeMap<&'a str, &'a Automaton>,
@@ -66,9 +92,13 @@ pub(super) struct Vocab<'a> {
     /// Each record's variables the proof holds, with their sorts.
     pub(super) vars: BTreeMap<String, BTreeMap<String, Sort>>,
     pub(super) kinds: Vec<Kind>,
+    pub(super) calls: Vec<Call>,
     /// Every string literal the specs, the rule and its lemmas name.
     pub(super) literals: BTreeSet<String>,
-    policies: Option<&'a SendAnalysis>,
+    pub(super) policies: Option<&'a SendAnalysis>,
+    /// Cedar's answers so far, by question: the moves of each region ask
+    /// the same ones again.
+    pub(super) answered: RefCell<BTreeMap<String, May>>,
 }
 
 impl<'a> Vocab<'a> {
@@ -96,10 +126,13 @@ impl<'a> Vocab<'a> {
             scope,
             vars,
             kinds: Vec::new(),
+            calls: Vec::new(),
             literals,
             policies,
+            answered: RefCell::default(),
         };
         vocab.kinds = vocab.read_kinds();
+        vocab.calls = vocab.read_calls();
         vocab
     }
 
@@ -151,33 +184,6 @@ impl<'a> Vocab<'a> {
                     .map(|(f, _)| f)
                     .eq(fields.iter().map(|(f, _)| f))
         })
-    }
-
-    /// Whether Cedar lets someone outside send `action` to `entity`.
-    pub(super) fn outside_may(&self, entity: &str, action: &str) -> May {
-        self.policies.map_or(May::Yes, |policies| {
-            policies.may(&Asker::Outside, action, entity, &BTreeMap::new())
-        })
-    }
-
-    /// Whether Cedar lets a reaction from outside the scope by `trigger`
-    /// on `source.source_action` send its action; without a principal it
-    /// runs as whoever sent its source, some of whom it may let.
-    pub(super) fn reaction_may(
-        &self,
-        source: &str,
-        source_action: &str,
-        trigger: &ActionTrigger,
-        to: &str,
-        action: &str,
-    ) -> May {
-        let Some(policies) = self.policies else {
-            return May::Yes;
-        };
-        match declared(trigger, source, source_action) {
-            Some(asker) => policies.may(&asker, action, to, &BTreeMap::new()),
-            None => May::Maybe,
-        }
     }
 
     /// A reaction's target in the scope, its action, and the parameters it
@@ -263,52 +269,100 @@ impl<'a> Vocab<'a> {
         kinds
     }
 
-    /// The actions a module call's answer may take on `entity`: its internal
-    /// actions, and the declared answers and failures of its triggers.
-    pub(super) fn answers(&self, entity: &str) -> BTreeSet<String> {
-        let automaton = self.automaton(entity);
-        let mut answers: BTreeSet<String> = automaton
-            .actions
-            .iter()
-            .filter(|a| a.kind == ActionKind::Internal)
-            .map(|a| a.name.clone())
-            .collect();
-        for action in &automaton.actions {
-            for trigger in action
-                .triggers
-                .iter()
-                .filter(|t| t.kind == TriggerKind::Wasm)
-            {
-                answers.extend(trigger.on_success.iter().cloned());
-                answers.extend(trigger.on_failure.iter().cloned());
+    /// The module calls the scope's records start, by kind.
+    fn read_calls(&self) -> Vec<Call> {
+        let mut calls: Vec<Call> = Vec::new();
+        for to in &self.scope {
+            for action in &self.automaton(to).actions {
+                for trigger in &action.triggers {
+                    let (TriggerKind::Wasm, Some(module)) = (&trigger.kind, &trigger.module) else {
+                        continue;
+                    };
+                    let same = calls.iter().any(|c| {
+                        &c.to == to
+                            && &c.module == module
+                            && c.on_success == trigger.on_success
+                            && c.on_failure == trigger.on_failure
+                    });
+                    if same {
+                        continue;
+                    }
+                    let taken = calls
+                        .iter()
+                        .filter(|c| &c.to == to && &c.module == module)
+                        .count();
+                    let name = match taken {
+                        0 => format!("{to}@{module}"),
+                        n => format!("{to}@{module}{}", n + 1),
+                    };
+                    let mut call = Call {
+                        name,
+                        to: to.clone(),
+                        module: module.clone(),
+                        on_success: trigger.on_success.clone(),
+                        on_failure: trigger.on_failure.clone(),
+                        asked: Vec::new(),
+                    };
+                    let mut asked = BTreeSet::new();
+                    for answer in self.answer_actions(&call) {
+                        for constraint in &answer.constraints {
+                            if let ActionConstraint::ParamEqualsField { param, field } = constraint
+                            {
+                                if self.param(answer, param) == Some(Sort::Str)
+                                    && self.var(to, field) == Some(Sort::Str)
+                                {
+                                    asked.insert(field.clone());
+                                }
+                            }
+                        }
+                    }
+                    call.asked = asked.into_iter().collect();
+                    calls.push(call);
+                }
             }
         }
-        answers
+        calls
     }
-}
 
-/// The sender a reaction declares, as the trigger dispatcher builds it.
-fn declared(trigger: &ActionTrigger, source: &str, source_action: &str) -> Option<Asker> {
-    let name = trigger.principal.as_deref().filter(|p| !p.is_empty())?;
-    let text = |value: &str| Attr::Value(Value::String(value.to_string()));
-    let source_id = match trigger.resolve_target {
-        Some(TargetResolver::SameId) => Attr::ResourceId,
-        _ => Attr::Unknown,
-    };
-    let context = BTreeMap::from([
-        ("triggerRule".to_string(), text(&trigger.name)),
-        ("triggerSourceEntityType".to_string(), text(source)),
-        ("triggerSourceEntityId".to_string(), source_id),
-        ("triggerSourceAction".to_string(), text(source_action)),
-        (
-            "triggerDeclaredPrincipal".to_string(),
-            Attr::Value(Value::Bool(true)),
-        ),
-    ]);
-    Some(Asker::Service {
-        name: name.to_string(),
-        context,
-    })
+    /// The call kind `trigger` on one of `entity`'s actions starts.
+    pub(super) fn call_of(&self, entity: &str, trigger: &ActionTrigger) -> Option<&Call> {
+        let module = trigger
+            .module
+            .as_ref()
+            .filter(|_| trigger.kind == TriggerKind::Wasm)?;
+        self.calls.iter().find(|c| {
+            c.to == entity
+                && &c.module == module
+                && c.on_success == trigger.on_success
+                && c.on_failure == trigger.on_failure
+        })
+    }
+
+    /// The actions a call may be answered with: its declared answer, or
+    /// else any internal action of its record.
+    pub(super) fn answer_actions(&self, call: &Call) -> Vec<&'a Action> {
+        self.automaton(&call.to)
+            .actions
+            .iter()
+            .filter(|a| match &call.on_success {
+                Some(name) => &a.name == name,
+                None => a.kind == ActionKind::Internal,
+            })
+            .collect()
+    }
+
+    /// Everything that can be in flight, by kind: dispatches, then calls.
+    pub(super) fn flights(&self) -> Vec<Flight<'_>> {
+        let dispatches = self.kinds.iter().map(|k| Flight {
+            name: &k.name,
+            fields: k.fields.clone(),
+        });
+        let calls = self.calls.iter().map(|c| Flight {
+            name: &c.name,
+            fields: c.asked.iter().map(|f| (f.clone(), Sort::Str)).collect(),
+        });
+        dispatches.chain(calls).collect()
+    }
 }
 
 fn collect_literals(automaton: &Automaton, literals: &mut BTreeSet<String>) {
