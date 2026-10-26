@@ -240,9 +240,7 @@ fn helpful<'m>(
     let may = match (first.step, &first.timer) {
         (Step::Outside, _) => May::Yes,
         (Step::Timer, Some(state)) => v.timer_may(&first.entity, state, &first.action),
-        (Step::Answer | Step::Fail, _) if !first.action.is_empty() => {
-            v.runtime_may(&first.entity, &first.action)
-        }
+        // The kernel dispatches call answers and failures without Cedar.
         _ => May::Yes,
     };
     if may != May::Yes {

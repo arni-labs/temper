@@ -123,12 +123,7 @@ impl Moves<'_, '_, '_> {
         let mut started: Vec<(String, String, Option<String>)> = Vec::new();
         for trigger in &action.triggers {
             let (name, args): (&str, Vec<String>) = if let Some(call) = v.call_of(entity, trigger) {
-                let asked = call
-                    .asked
-                    .iter()
-                    .map(|field| Enc::var("post", entity, field))
-                    .collect();
-                (&call.name, asked)
+                (&call.name, Vec::new())
             } else if let Some(kind) = v.kind_of(entity, action, trigger) {
                 let args = kind
                     .fields
