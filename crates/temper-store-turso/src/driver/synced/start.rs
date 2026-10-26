@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
 use std::time::Instant;
 
+use super::budget::{PUSH_LAG_BUDGET, PushBudget};
 use super::files::{self, DIVERGED_SUFFIX, INCOMING_SUFFIX, check_local_files, sidecar};
 use super::remote::{self, Mark, Remote};
 use super::{ConnectionPool, CopyState, DriverError, Inner, SyncCopy, WARM_CONNECTIONS, restore};
@@ -134,6 +135,7 @@ impl SyncCopy {
                 in_flight: AtomicBool::new(false),
                 failures: AtomicU64::new(0),
                 lag: std::sync::Mutex::default(),
+                budget: std::sync::Mutex::new(PushBudget::new(PUSH_LAG_BUDGET)),
             }),
         };
         // Change numbers follow commit order only with one writer at a time

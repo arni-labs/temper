@@ -4,9 +4,11 @@
 //! The file is the database: reads and writes go to it, and a change is
 //! confirmed once it commits there. [`SyncCopy::push_committed`] sends every
 //! change committed before the call to the remote in one request; the server
-//! calls it in the background, so no answer waits for the remote and none is
-//! refused because of it. [`SyncCopy::backup_status`] says how far the remote
-//! is behind.
+//! calls it in the background, so no answer waits for the remote.
+//! [`SyncCopy::backup_status`] says how far the remote is behind. The push can
+//! lag: while a confirmed move has waited for the remote longer than
+//! [`PUSH_LAG_BUDGET`], new moves are refused as not durable until a push
+//! carries it (see `budget`).
 //!
 //! A start opens the file as it is when it is whole (see `start`). It
 //! restores from the remote only a file that is missing or damaged, brings a
@@ -31,6 +33,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use super::{Connection, DriverError, DriverHandle, Lease};
 
 mod backup;
+mod budget;
 mod files;
 mod pool;
 mod push;
@@ -38,12 +41,15 @@ mod remote;
 mod restore;
 mod start;
 pub use backup::BackupStatus;
+pub use budget::PUSH_LAG_BUDGET;
 use files::{DIVERGED_SUFFIX, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::{Mark, Remote};
 
-/// What the backup of the file can do now. The file serves and confirms
-/// writes in every state.
+/// What the backup of the file can do now. The file serves in every state,
+/// and confirms moves while none has waited for the remote past
+/// [`PUSH_LAG_BUDGET`]; outside [`CopyState::Copying`] nothing is pushed, so
+/// that lasts until the budget passes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyState {
     /// Every committed change is pushed in the background.
@@ -110,6 +116,8 @@ struct Inner {
     failures: AtomicU64,
     /// Since when the remote has lacked a committed change.
     lag: std::sync::Mutex<backup::LagClock>,
+    /// Confirmed moves the remote lacks, and whether moves are refused.
+    budget: std::sync::Mutex<budget::PushBudget>,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -209,7 +217,7 @@ impl SyncCopy {
                 event = "turso.sync.backup_stopped",
                 state = ?next,
                 why,
-                "turso.sync the backup stopped; the file keeps serving and confirming writes"
+                "turso.sync the backup stopped; the file keeps serving, and moves are refused once one has waited past the push-lag budget"
             ),
         }
         if let CopyState::Stopped(cause) = &next

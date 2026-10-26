@@ -4,10 +4,13 @@
 //! confirmed once it commits there. A background loop copies committed
 //! changes to the remote: each push carries everything committed since the
 //! last one, one push runs at a time, and a failed push is retried with
-//! backoff. Answers never wait for it, and none is refused because of the
-//! remote. The loop also checks a file the start could not check, records
-//! how far the backup is behind, keeps the local write-ahead log short, and
-//! restarts the server in the two cases where only a restart helps.
+//! backoff, or on every tick once a confirmed move has waited over half the
+//! push-lag budget. Answers never wait for it. The push can lag: past the
+//! budget, the store refuses new moves until a push catches up (see
+//! [`temper_store_turso::PUSH_LAG_BUDGET`]). The loop also checks a file the
+//! start could not check, records how far the backup is behind, keeps the
+//! local write-ahead log short, and restarts the server in the two cases
+//! where only a restart helps.
 
 use std::time::Duration;
 
@@ -106,7 +109,10 @@ fn spawn_backup(copy: SyncCopy) {
                 );
                 std::process::exit(75);
             }
-            if copy.state() == CopyState::Copying && retry.due() {
+            // A move waiting long for the remote is pushed on every tick, so
+            // the remote carries it as soon as it is back.
+            let due = retry.due() || copy.push_is_pressing();
+            if copy.state() == CopyState::Copying && due {
                 match copy.push_committed().await {
                     Ok(()) => retry.succeeded(),
                     Err(error) => {

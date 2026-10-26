@@ -8,6 +8,8 @@
 //! - `temper_turso_sync_push_in_flight`: 1 while a push runs.
 //! - `temper_turso_sync_backup_stopped`: 1 while the backup is stopped
 //!   ([`CopyState::Stopped`]); the cause is in the log and in `sync-copy status`.
+//! - `temper_turso_sync_moves_refused`: 1 while new moves are refused because
+//!   a confirmed one has waited for the remote past the push-lag budget.
 
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
@@ -34,6 +36,8 @@ pub struct BackupStatus {
     pub pushing: bool,
     /// Push attempts that failed since this start.
     pub push_failures: u64,
+    /// Whether new moves are refused until a push catches up.
+    pub refusing_moves: bool,
 }
 
 /// Since when the remote has lacked a committed change.
@@ -60,6 +64,7 @@ struct Metrics {
     failures: Counter<u64>,
     in_flight: Gauge<u64>,
     stopped: Gauge<u64>,
+    moves_refused: Gauge<u64>,
 }
 
 fn metrics() -> &'static Metrics {
@@ -93,7 +98,14 @@ fn metrics() -> &'static Metrics {
                 .u64_gauge("temper_turso_sync_backup_stopped")
                 .with_description(
                     "1 while a synced database's backup is stopped until an operator decides; \
-                     the database keeps serving and confirming writes.",
+                     the database keeps serving, and confirms moves within the push-lag budget.",
+                )
+                .build(),
+            moves_refused: meter
+                .u64_gauge("temper_turso_sync_moves_refused")
+                .with_description(
+                    "1 while a synced database refuses new moves because a confirmed one has \
+                     waited for its remote copy past the push-lag budget.",
                 )
                 .build(),
         }
@@ -137,11 +149,13 @@ impl SyncCopy {
             behind_for,
             pushing: self.inner.in_flight.load(Ordering::Acquire),
             push_failures: self.inner.failures.load(Ordering::Acquire),
+            refusing_moves: self.refusing_moves(),
         })
     }
 
     /// [`Self::backup_status`], also recorded as the gauges in the module docs.
     pub async fn record_backup(&self) -> Result<BackupStatus, PersistenceError> {
+        self.observe_budget();
         let status = self.backup_status().await?;
         let metrics = metrics();
         metrics.lag_changes.record(status.unpushed_changes, &[]);
@@ -150,6 +164,9 @@ impl SyncCopy {
             .record(status.behind_for.as_secs_f64(), &[]);
         let stopped = matches!(status.state, CopyState::Stopped(_));
         metrics.stopped.record(u64::from(stopped), &[]);
+        metrics
+            .moves_refused
+            .record(u64::from(status.refusing_moves), &[]);
         Ok(status)
     }
 
