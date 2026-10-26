@@ -250,8 +250,8 @@ impl SyncCopy {
 
 fn why_refused(waited: Duration, budget: Duration) -> String {
     format!(
-        "the remote copy has lacked a confirmed move for {} s, past the {} s budget",
-        waited.as_secs(),
+        "the remote copy has lacked a confirmed move for {:.1} s, past the {} s budget",
+        waited.as_secs_f64(),
         budget.as_secs()
     )
 }

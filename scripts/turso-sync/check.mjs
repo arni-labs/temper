@@ -4,6 +4,7 @@
 //   node scripts/turso-sync/check.mjs kill    # confirmed writes survive a killed server on the same drive
 //   node scripts/turso-sync/check.mjs time    # time per write and per burst, with and without the copy
 //   node scripts/turso-sync/check.mjs outage  # a start without the remote serves reads and writes, then backs up
+//   node scripts/turso-sync/check.mjs stall   # moves are refused once one waits past the push budget, then confirmed again
 //
 // Env:
 //   TEMPER_BIN        temper binary (default: target/release/temper, then target/debug/temper)
@@ -84,6 +85,24 @@ function switchProxy(listen, upstream, on) {
     client.pipe(up).pipe(client);
     for (const socket of [client, up]) socket.on("error", () => { client.destroy(); up.destroy(); });
   }).listen(listen, "127.0.0.1");
+}
+
+// Forwards to `upstream`; while `held.value`, every chunk in both directions waits, in order, as a remote
+// that has stopped answering without closing anything. `release()` sends what waited.
+function holdProxy(listen, upstream, held) {
+  const waiting = [];
+  net.createServer((client) => {
+    const up = net.connect(upstream.port, upstream.host);
+    const pass = (from, to) => from.on("data", (chunk) => (held.value ? waiting.push([to, chunk]) : to.write(chunk)));
+    pass(client, up);
+    pass(up, client);
+    const fail = () => { client.destroy(); up.destroy(); };
+    for (const socket of [client, up]) socket.on("error", fail);
+  }).listen(listen, "127.0.0.1");
+  return () => {
+    held.value = false;
+    for (const [to, chunk] of waiting.splice(0)) if (!to.destroyed) to.write(chunk);
+  };
 }
 
 // Every chunk waits `delay` ms in each direction, in order, so a request and its answer cost twice that.
@@ -299,6 +318,72 @@ async function outageCheck() {
   return read.status === 200 && down.ok && back.ok && n >= 7;
 }
 
+// stall: the remote stops answering. Moves are confirmed until the first one confirmed during the stall
+// has waited past the push budget (20 s), then refused with nothing written, and confirmed again soon after
+// the remote answers. A fresh machine restores every confirmed move.
+async function stallCheck() {
+  const BUDGET_MS = 20_000;
+  const sync = await remote();
+  const target = new URL(sync.url);
+  if (target.protocol !== "http:") throw new Error("stall runs against the local sync server");
+  const held = { value: false };
+  const port = await freePort();
+  const release = holdProxy(port, { host: target.hostname, port: Number(target.port) }, held);
+  const a = await temper("a", { url: `http://127.0.0.1:${port}`, token: sync.token });
+  const id = `${run}-stall`;
+  let n = 0;
+  for (; n < 3; n++) if (!(await write(a.base, id, n)).ok) throw new Error("setup write failed");
+  await sleep(3000);
+
+  held.value = true;
+  const t0 = Date.now();
+  const during = [];
+  while (Date.now() - t0 < BUDGET_MS + 10_000) {
+    const r = await write(a.base, id, n);
+    during.push({ at_ms: Date.now() - t0, status: r.status, text: r.text });
+    if (r.ok) n++;
+    await sleep(1000);
+  }
+  release();
+  const t1 = Date.now();
+  let back = null;
+  while (Date.now() - t1 < 30_000) {
+    const r = await write(a.base, id, n);
+    if (r.ok) { n++; back = Date.now() - t1; break; }
+    await sleep(250);
+  }
+  await sleep(3000);
+  a.child.kill("SIGKILL");
+  const c = await temper("c", sync);
+  const restored = JSON.parse((await get(c.base, `/tdata/ProbeNotes('${id}')`)).text);
+  const restoredN = Number(restored.counters?.n ?? restored.fields?.n ?? restored.n ?? 0);
+
+  const confirmed = during.filter((r) => r.status >= 200 && r.status < 300);
+  const refused = during.filter((r) => !(r.status >= 200 && r.status < 300));
+  const lastConfirmed = confirmed.length ? confirmed[confirmed.length - 1].at_ms : null;
+  const firstRefused = refused.length ? refused[0] : null;
+  out({
+    check: "stall",
+    budget_ms: BUDGET_MS,
+    confirmed_during_stall: confirmed.length,
+    last_confirmed_at_ms: lastConfirmed,
+    refused_during_stall: refused.length,
+    first_refused_at_ms: firstRefused?.at_ms ?? null,
+    first_refusal: firstRefused ? `${firstRefused.status} ${firstRefused.text.slice(0, 160)}` : null,
+    confirmed_again_after_ms: back,
+    confirmed_total: n,
+    restored_n: restoredN,
+  });
+  return (
+    refused.length > 0 &&
+    lastConfirmed !== null && lastConfirmed <= BUDGET_MS + 1500 &&
+    firstRefused.at_ms >= BUDGET_MS &&
+    refused.every((r) => r.at_ms >= BUDGET_MS && r.text.includes("not durable")) &&
+    back !== null && back < 15_000 &&
+    restoredN === n
+  );
+}
+
 let ok = false;
 try {
   if (!temperBin) throw new Error("no temper binary: build it or set TEMPER_BIN");
@@ -306,7 +391,8 @@ try {
   if (mode === "kill") ok = await killCheck();
   else if (mode === "time") ok = await timeCheck();
   else if (mode === "outage") ok = await outageCheck();
-  else throw new Error("usage: check.mjs kill|time|outage");
+  else if (mode === "stall") ok = await stallCheck();
+  else throw new Error("usage: check.mjs kill|time|outage|stall");
 } catch (error) {
   console.error(String(error));
 } finally {
