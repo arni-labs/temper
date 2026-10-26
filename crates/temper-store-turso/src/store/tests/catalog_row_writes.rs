@@ -293,3 +293,90 @@ async fn a_batched_move_writes_each_field_once() {
         .expect("query title");
     assert_eq!(title_matches, vec![id.to_string()]);
 }
+
+/// The records the field index finds with this title, in id order.
+async fn titled(store: &TursoEventStore, tenant: &str, title: &str) -> Vec<String> {
+    let mut ids = store
+        .query_field_index(
+            tenant,
+            ENTITY_TYPE,
+            "field_name = ?3 AND field_value = ?4",
+            vec!["Title".to_string(), title.to_string()],
+        )
+        .await
+        .expect("query title");
+    ids.sort();
+    ids
+}
+
+fn batched(id: &str, title: &str, status: &str, sequence_nr: u64) -> QueryProjectionUpsert {
+    let (fields, state) = note(id, title, status, sequence_nr);
+    QueryProjectionUpsert {
+        entity_type: ENTITY_TYPE.to_string(),
+        entity_id: id.to_string(),
+        status: status.to_string(),
+        indexed_fields: json!({"Title": title}),
+        fields,
+        state,
+        sequence_nr,
+        known_new: false,
+    }
+}
+
+#[tokio::test]
+async fn a_batch_of_several_records_stores_and_indexes_each_from_its_newest_move() {
+    let store = make_store("catalog-row-batch-many").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let created = |id: &str| QueryProjectionUpsert {
+        known_new: true,
+        ..batched(id, "Plan", "Draft", 1)
+    };
+
+    store
+        .upsert_query_projections(&tenant, &[created("note-a"), created("note-b")])
+        .await
+        .expect("batched creates");
+    assert_eq!(
+        titled(&store, &tenant, "Plan").await,
+        vec!["note-a".to_string(), "note-b".to_string()]
+    );
+
+    // One batch moves note-a twice and note-b once, and creates note-c.
+    store
+        .upsert_query_projections(
+            &tenant,
+            &[
+                batched("note-a", "Plan", "Active", 2),
+                batched("note-b", "Budget", "Draft", 2),
+                batched("note-a", "Plan v2", "Active", 3),
+                created("note-c"),
+            ],
+        )
+        .await
+        .expect("batched moves");
+
+    assert_eq!(
+        titled(&store, &tenant, "Plan").await,
+        vec!["note-c".to_string()]
+    );
+    assert_eq!(
+        titled(&store, &tenant, "Plan v2").await,
+        vec!["note-a".to_string()]
+    );
+    assert_eq!(
+        titled(&store, &tenant, "Budget").await,
+        vec!["note-b".to_string()]
+    );
+    for (id, title, status, sequence_nr) in [
+        ("note-a", "Plan v2", "Active", 3),
+        ("note-b", "Budget", "Draft", 2),
+        ("note-c", "Plan", "Draft", 1),
+    ] {
+        assert_holds_body_once(stored_lengths(&store, &tenant, id).await);
+        assert_eq!(
+            loaded_state(&store, &tenant, id).await,
+            note(id, title, status, sequence_nr),
+            "{id} reads back its newest move"
+        );
+    }
+}

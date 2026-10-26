@@ -226,31 +226,51 @@ impl TursoEventStore {
             }
             let updated_at = sim_now().to_rfc3339();
 
+            // New rows go in one statement and the field index in two. Each
+            // update sets its own columns, so updates run one per row, after
+            // the inserts they may follow within the batch.
+            let mut inserts = Vec::new();
+            let mut updates = Vec::new();
+            let mut reindexed = BTreeMap::new();
             for projection in &projections {
-                let (row, reindex) = match projection.write_against(stored.get(&projection.key())) {
+                let reindex = match projection.write_against(stored.get(&projection.key())) {
                     CatalogRowWrite::Stale | CatalogRowWrite::Unchanged => continue,
                     CatalogRowWrite::Insert => {
-                        (insert_statement(tenant, projection, &updated_at), true)
+                        inserts.push(projection);
+                        true
                     }
                     CatalogRowWrite::Update {
                         fields,
                         state,
                         index,
-                    } => (
-                        update_statement(tenant, projection, &updated_at, fields, state),
-                        index,
-                    ),
+                    } => {
+                        updates.push(update_statement(
+                            tenant,
+                            projection,
+                            &updated_at,
+                            fields,
+                            state,
+                        ));
+                        index
+                    }
                 };
-                let mut statements = vec![row];
                 if reindex {
-                    statements.extend(field_index_statements(tenant, projection));
-                }
-                for statement in statements {
-                    tx.execute(&statement.sql, params_from_iter(statement.values))
-                        .await
-                        .map_err(storage_error)?;
+                    reindexed.insert(projection.key(), projection);
                 }
                 stored.insert(projection.key(), projection.as_stored());
+            }
+
+            let statements = insert_statement(tenant, &inserts, &updated_at)
+                .into_iter()
+                .chain(updates)
+                .chain(field_index_statements(
+                    tenant,
+                    &reindexed.into_values().collect::<Vec<_>>(),
+                ));
+            for statement in statements {
+                tx.execute(&statement.sql, params_from_iter(statement.values))
+                    .await
+                    .map_err(storage_error)?;
             }
 
             tx.commit().await.map_err(storage_error)?;
@@ -293,24 +313,28 @@ fn stored_rows_statement(tenant: &str, projections: &[PreparedProjection]) -> Op
     Some(Statement { sql, values })
 }
 
-/// Insert a new row. A row that appeared meanwhile is overwritten only by a
-/// projection at least as new.
-fn insert_statement(tenant: &str, projection: &PreparedProjection, updated_at: &str) -> Statement {
-    Statement {
-        sql: "INSERT INTO entity_catalog \
-              (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, ?) \
-              ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
-                  status = excluded.status, \
-                  fields = excluded.fields, \
-                  state = excluded.state, \
-                  updated_at = excluded.updated_at, \
-                  sequence_nr = excluded.sequence_nr, \
-                  projection_version = excluded.projection_version, \
-                  projection_hash = excluded.projection_hash \
-              WHERE entity_catalog.sequence_nr <= excluded.sequence_nr"
-            .to_string(),
-        values: vec![
+/// Insert new rows, or `None` when there are none. A row that appeared
+/// meanwhile is overwritten only by a projection at least as new.
+fn insert_statement(
+    tenant: &str,
+    projections: &[&PreparedProjection],
+    updated_at: &str,
+) -> Option<Statement> {
+    if projections.is_empty() {
+        return None;
+    }
+    let mut sql = String::from(
+        "INSERT INTO entity_catalog \
+         (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
+         VALUES ",
+    );
+    let mut values = Vec::with_capacity(projections.len() * 9);
+    for (index, projection) in projections.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, 2, ?)");
+        values.extend([
             Value::from(tenant.to_string()),
             Value::from(projection.entity_type.clone()),
             Value::from(projection.entity_id.clone()),
@@ -320,8 +344,20 @@ fn insert_statement(tenant: &str, projection: &PreparedProjection, updated_at: &
             Value::from(updated_at.to_string()),
             Value::from(projection.sequence_nr),
             Value::from(projection.projection_hash.clone()),
-        ],
+        ]);
     }
+    sql.push_str(
+        " ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
+             status = excluded.status, \
+             fields = excluded.fields, \
+             state = excluded.state, \
+             updated_at = excluded.updated_at, \
+             sequence_nr = excluded.sequence_nr, \
+             projection_version = excluded.projection_version, \
+             projection_hash = excluded.projection_hash \
+         WHERE entity_catalog.sequence_nr <= excluded.sequence_nr",
+    );
+    Some(Statement { sql, values })
 }
 
 /// Update an existing row, setting `fields` and `state` only when they change.
@@ -357,111 +393,62 @@ fn update_statement(
     Statement { sql, values }
 }
 
-/// Replace one entity's `entity_field_index` rows. Deleting them all first
-/// handles fields that disappeared.
-fn field_index_statements(tenant: &str, projection: &PreparedProjection) -> Vec<Statement> {
-    let entity = || {
-        [
-            Value::from(tenant.to_string()),
-            Value::from(projection.entity_type.clone()),
-            Value::from(projection.entity_id.clone()),
-        ]
-    };
-    let mut statements = vec![Statement {
-        sql:
-            "DELETE FROM entity_field_index WHERE tenant = ? AND entity_type = ? AND entity_id = ?"
-                .to_string(),
-        values: entity().to_vec(),
-    }];
-    if projection.indexed_fields.is_empty() {
-        return statements;
+/// Replace these entities' `entity_field_index` rows, each from its newest
+/// projection. Deleting them all first handles fields that disappeared.
+fn field_index_statements(tenant: &str, projections: &[&PreparedProjection]) -> Vec<Statement> {
+    if projections.is_empty() {
+        return Vec::new();
     }
+    let mut delete = String::from("DELETE FROM entity_field_index WHERE tenant = ? AND (");
+    let mut delete_values = Vec::with_capacity(1 + projections.len() * 2);
+    delete_values.push(Value::from(tenant.to_string()));
+    for (index, projection) in projections.iter().enumerate() {
+        if index > 0 {
+            delete.push_str(" OR ");
+        }
+        delete.push_str("(entity_type = ? AND entity_id = ?)");
+        delete_values.push(Value::from(projection.entity_type.clone()));
+        delete_values.push(Value::from(projection.entity_id.clone()));
+    }
+    delete.push(')');
+    let mut statements = vec![Statement {
+        sql: delete,
+        values: delete_values,
+    }];
 
-    let mut sql = String::from(
+    let mut insert = String::from(
         "INSERT INTO entity_field_index \
          (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
     );
-    let mut values = Vec::with_capacity(projection.indexed_fields.len() * 6);
-    for (index, (field_name, field_value)) in projection.indexed_fields.iter().enumerate() {
-        if index > 0 {
-            sql.push_str(", ");
+    let mut values = Vec::new();
+    for projection in projections {
+        for (field_name, field_value) in &projection.indexed_fields {
+            if !values.is_empty() {
+                insert.push_str(", ");
+            }
+            insert.push_str("(?, ?, ?, ?, ?, ?)");
+            values.extend([
+                Value::from(tenant.to_string()),
+                Value::from(projection.entity_type.clone()),
+                Value::from(projection.entity_id.clone()),
+                Value::from(field_name.clone()),
+                field_value
+                    .as_ref()
+                    .map(|value| Value::from(value.clone()))
+                    .unwrap_or(Value::Null),
+                Value::from(projection.status.clone()),
+            ]);
         }
-        sql.push_str("(?, ?, ?, ?, ?, ?)");
-        values.extend(entity());
-        values.push(Value::from(field_name.clone()));
-        values.push(
-            field_value
-                .as_ref()
-                .map(|value| Value::from(value.clone()))
-                .unwrap_or(Value::Null),
-        );
-        values.push(Value::from(projection.status.clone()));
     }
-    statements.push(Statement { sql, values });
+    if !values.is_empty() {
+        statements.push(Statement {
+            sql: insert,
+            values,
+        });
+    }
     statements
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn stored(sequence_nr: i64, status: &str, hash: &str, state: &str) -> StoredCatalogRow {
-        StoredCatalogRow {
-            sequence_nr,
-            status: status.to_string(),
-            projection_hash: hash.to_string(),
-            state: Some(state.to_string()),
-        }
-    }
-
-    fn prepared(sequence_nr: u64, status: &str, title: &str) -> PreparedProjection {
-        let fields = serde_json::json!({"Title": title});
-        let state = serde_json::json!({
-            "status": status,
-            "fields": fields.clone(),
-            "sequence_nr": sequence_nr,
-        });
-        let projection = QueryProjectionUpsert {
-            entity_type: "Note".to_string(),
-            entity_id: "n-1".to_string(),
-            status: status.to_string(),
-            fields: fields.clone(),
-            state,
-            indexed_fields: fields,
-            sequence_nr,
-            known_new: false,
-        };
-        PreparedProjection::new(&projection, status).expect("prepare")
-    }
-
-    #[test]
-    fn a_write_names_only_what_changes() {
-        let first = prepared(1, "Draft", "Plan");
-        let row = first.as_stored();
-        assert_eq!(first.write_against(None), CatalogRowWrite::Insert);
-        assert_eq!(first.write_against(Some(&row)), CatalogRowWrite::Unchanged);
-
-        let moved = prepared(2, "Active", "Plan");
-        assert_eq!(
-            moved.write_against(Some(&row)),
-            CatalogRowWrite::Update {
-                fields: false,
-                state: true,
-                index: true
-            }
-        );
-        let edited = prepared(2, "Draft", "Plan v2");
-        assert_eq!(
-            edited.write_against(Some(&row)),
-            CatalogRowWrite::Update {
-                fields: true,
-                state: true,
-                index: true
-            }
-        );
-        assert_eq!(
-            first.write_against(Some(&stored(5, "Draft", "", ""))),
-            CatalogRowWrite::Stale
-        );
-    }
-}
+#[path = "catalog_write_test.rs"]
+mod tests;

@@ -769,11 +769,23 @@ fn native_data_only_create_inserts_event_catalog_and_index_atomically() {
         let (status, stored_fields, stored_state, stored_sequence) = catalog.unwrap();
         assert_eq!(status, "Active");
         assert_eq!(stored_fields, fields);
-        let stored_state = stored_state.expect("native create should store full catalog state");
-        assert_eq!(stored_state["fields"], fields);
+        let stored_state = stored_state.expect("native create should store catalog state");
+        assert!(
+            stored_state.get("fields").is_none(),
+            "the stored state leaves out fields the fields column holds"
+        );
         assert_eq!(stored_state["sequence_nr"], 1);
         assert_eq!(stored_state["total_event_count"], 1);
         assert_eq!(stored_sequence, 1);
+        let read = store
+            .load_entity_catalog_rows_pg(&tenant, entity_type, &[entity_id.to_string()])
+            .await
+            .unwrap();
+        let read_state = read[0].state.as_ref().expect("catalog read has a state");
+        assert_eq!(
+            read_state["fields"], fields,
+            "a catalog read puts the fields back"
+        );
 
         let indexed_count: i64 = crate::dbm::postgres_query_scalar!(
             "SELECT COUNT(*)::bigint FROM entity_field_index \

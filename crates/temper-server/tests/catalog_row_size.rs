@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use temper_runtime::ActorSystem;
-use temper_runtime::scheduler::{install_deterministic_context, sim_now};
+use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
@@ -115,25 +115,20 @@ async fn a_record_that_takes_a_thousand_keyed_moves_keeps_a_small_catalog_row() 
         "the catalog state grew from {early_bytes} to {late_bytes} bytes over {MOVES} moves"
     );
 
-    // A retry of a recent move, after the actor is put away and restored from
-    // its snapshot and journal, is answered without applying it again.
-    let actor_key = format!("{tenant}:Order:{ENTITY_ID}");
-    state.last_accessed.write().unwrap().insert(
-        actor_key.clone(),
-        sim_now() - chrono::Duration::seconds(600),
-    );
-    state.passivate_idle_actors().await;
-    assert!(
-        !state
-            .actor_registry
-            .read()
-            .unwrap()
-            .contains_key(&actor_key),
-        "the actor was put away"
-    );
-    let retried = add_item(&state, MOVES - 50).await;
+    // After a restart, with no reply cache and no actor in memory, a retry of
+    // a recent move is answered from the key set the actor restores from its
+    // snapshot and journal, and is not applied again.
+    drop(state);
+    let restarted = order_state(store.clone());
+    let retried = add_item(&restarted, MOVES - 50).await;
     assert_eq!(
-        retried.counters["items"], current.counters["items"],
-        "a retried move is not applied twice"
+        (retried.counters["items"], retried.sequence_nr),
+        (current.counters["items"], current.sequence_nr),
+        "a retried move after a restart is not applied twice"
+    );
+    assert_eq!(
+        retried.processed_idempotency_keys.len(),
+        1_000,
+        "the restored actor holds its full durable key set"
     );
 }
