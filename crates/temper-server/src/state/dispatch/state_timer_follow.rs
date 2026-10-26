@@ -222,7 +222,7 @@ impl ServerState {
     }
 
     /// The record's state now, without starting its actor when it has none.
-    async fn current_record_state(
+    pub(super) async fn current_record_state(
         &self,
         tenant: &TenantId,
         entity_type: &str,

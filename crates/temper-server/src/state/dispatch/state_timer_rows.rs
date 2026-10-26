@@ -2,7 +2,7 @@
 //!
 //! A timer writes its row when it is armed and removes it when it ends, so the
 //! rows are the timers still waiting. At boot [`ServerState::rearm_state_timers`]
-//! reads each tenant's rows once, without loading any entity, and arms every
+//! reads each tenant's rows, resolves declared arguments, and arms every
 //! timer again from when its state's clock started: for the rest of its budget,
 //! or at once if it fell due while the server was down. It fires once, as the
 //! identity that armed it; ticks missed while the server was down are not
@@ -18,7 +18,7 @@ use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
-use super::state_timeouts::{ArmedTimer, remaining_budget};
+use super::state_timeouts::{ArmedTimer, declared_timer, remaining_budget};
 use super::state_timer_follow::{BootCallers, BootTimers, log_boot_timers};
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::{decode_armed_by, encode_armed_by};
@@ -93,8 +93,8 @@ impl ServerState {
     ///
     /// Returns immediately; reads and retries run independently per tenant in
     /// the background, so unreadable rows cannot hold startup or other tenants.
-    /// Reads one row per waiting timer and loads no entity until its timer
-    /// fires, at most [`BOOT_FIRES_AT_ONCE`] firing at once; a row whose state
+    /// Reads each waiting timer and, when its declaration has arguments, its record,
+    /// with at most [`BOOT_FIRES_AT_ONCE`] firing at once; a row whose state
     /// declares no timeout now is removed. Then, in the background, each
     /// record follows the state it is in now (as whoever armed
     /// its row when present), through the same gate. Missing rows are armed
@@ -205,7 +205,6 @@ impl ServerState {
                     }
                 }
             };
-            let now = sim_now();
             for row in rows {
                 // Installs can change declarations while the row read retries.
                 // Check the current spec before dropping a durable caller.
@@ -219,11 +218,54 @@ impl ServerState {
                                 .iter()
                                 .find(|timeout| timeout.state == row.state)
                         })
-                        .map(|timeout| (timeout.after_seconds, timeout.on_timeout.clone()))
+                        .cloned()
                 };
                 let timer = match declared {
-                    Some((after_seconds, action)) => {
-                        armed_timer(&tenant, &row, &action, after_seconds)
+                    Some(timeout) => {
+                        match armed_timer(tenant, &row, &timeout.on_timeout, timeout.after_seconds)
+                        {
+                            Ok(mut timer) => {
+                                // Rows retain identity and the clock, but not the declaration
+                                // that produced their arguments. An install may have changed
+                                // it while the row read retried. Resolve the current args
+                                // before reserving or firing this arm.
+                                if timeout.args.is_empty() {
+                                    timer.params = serde_json::json!({});
+                                    Ok(timer)
+                                } else {
+                                    let mut wait = Duration::from_secs(1);
+                                    let current = loop {
+                                        if let Some(current) = self
+                                            .current_record_state(
+                                                tenant,
+                                                &row.entity_type,
+                                                &row.entity_id,
+                                            )
+                                            .await
+                                        {
+                                            break current;
+                                        }
+                                        tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,
+                                        entity_id = %row.entity_id, retry_seconds = wait.as_secs(),
+                                        "state timer record unreadable; retrying before rearming");
+                                        tokio::time::sleep(wait).await; // determinism-ok: recovery retry on runtime clock
+                                        wait = (wait * 2).min(Duration::from_secs(60));
+                                    };
+                                    timer.params = declared_timer(
+                                        tenant,
+                                        &row.entity_type,
+                                        &row.entity_id,
+                                        &timeout,
+                                        &current,
+                                        &timer.agent_ctx,
+                                        timer.started_at,
+                                    )
+                                    .params;
+                                    Ok(timer)
+                                }
+                            }
+                            Err(reason) => Err(reason),
+                        }
                     }
                     None => {
                         if let Some(armed_by) = row_armed_by(&row) {
@@ -259,7 +301,7 @@ impl ServerState {
                     }
                 };
                 timer.boot_gate = Some(gate.clone());
-                let delay = remaining_budget(timer.started_at, timer.after_seconds, now);
+                let delay = remaining_budget(timer.started_at, timer.after_seconds, sim_now());
                 let label = if delay.is_zero() {
                     "overdue"
                 } else {

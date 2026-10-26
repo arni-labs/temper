@@ -45,6 +45,8 @@ mod invariants;
 mod missing_row;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
+#[path = "dst_state_timers_follow_state/recovered_arguments.rs"]
+mod recovered_arguments;
 #[path = "dst_state_timers_follow_state/specs.rs"]
 mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
