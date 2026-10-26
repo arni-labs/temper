@@ -71,29 +71,18 @@ impl Env for GuardEnv<'_> {
     }
 
     fn var(&self, name: &str) -> Val<'_> {
-        let ctx = self.ctx;
-        if let Some(value) = ctx.counters.get(name) {
-            return Val::Num(*value as f64);
+        let (ctx, declared) = (self.ctx, self.declared);
+        if let Some(value) = declared.counter(&ctx.counters, name) {
+            return Val::Num(value as f64);
         }
-        if let Some(value) = ctx.booleans.get(name) {
-            return Val::Bool(*value);
+        if let Some(value) = declared.boolean(&ctx.booleans, name) {
+            return Val::Bool(value);
         }
-        if let Some(value) = ctx.lists.get(name) {
+        if let Some(value) = declared.list(&ctx.lists, name) {
             return Val::Strs(value);
         }
-        if let Some(value) = ctx.fields.get(name) {
+        if let Some(value) = declared.field(ctx.fields.get(name), name) {
             return Val::json(value);
-        }
-        // A declared variable missing from the context reads as its type's
-        // zero value, never as absent.
-        if self.declared.counters.contains_key(name) {
-            return Val::Num(0.0);
-        }
-        if self.declared.booleans.contains_key(name) {
-            return Val::Bool(false);
-        }
-        if self.declared.lists.contains_key(name) {
-            return Val::Strs(&[]);
         }
         Val::Null
     }
@@ -259,17 +248,17 @@ fn field_operand<'e>(
 
 /// Read stored values without the evaluator's floating-point conversion.
 fn condition_var(name: &str, env: &GuardEnv<'_>) -> serde_json::Value {
-    let ctx = env.ctx;
-    if let Some(value) = ctx.counters.get(name) {
-        return (*value).into();
+    let (ctx, declared) = (env.ctx, env.declared);
+    if let Some(value) = declared.counter(&ctx.counters, name) {
+        return value.into();
     }
-    if let Some(value) = ctx.booleans.get(name) {
-        return (*value).into();
+    if let Some(value) = declared.boolean(&ctx.booleans, name) {
+        return value.into();
     }
-    if let Some(value) = ctx.lists.get(name) {
-        return value.clone().into();
+    if let Some(value) = declared.list(&ctx.lists, name) {
+        return value.to_vec().into();
     }
-    if let Some(value) = ctx.fields.get(name) {
+    if let Some(value) = declared.field(ctx.fields.get(name), name) {
         return value.clone();
     }
     to_json(env.var(name))
