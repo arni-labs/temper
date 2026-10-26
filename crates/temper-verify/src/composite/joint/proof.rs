@@ -14,9 +14,9 @@ use super::liveness::liveness_proofs;
 use super::{InvariantProof, LivenessProof, invariant_proofs};
 use crate::induct::{Answered, RuleProof, prove_rule};
 
-/// The proof of one rule over several records: an invariant that reads
-/// related records, or a liveness property. It holds all its walk reads, so
-/// its walk's verdict depends on nothing else.
+/// The proof of one rule: an invariant, or a liveness property with
+/// `eventually`. It holds all its walk reads, so its walk's verdict depends
+/// on nothing else.
 #[derive(Debug)]
 pub enum JointProof {
     Invariant(InvariantProof),
@@ -47,7 +47,7 @@ impl JointProof {
     }
 }
 
-/// The proof of every rule over several records of `automatons`, with
+/// The proof of every invariant and `eventually` rule of `automatons`, with
 /// `policies` deciding each move as its sender: the invariants', then the
 /// liveness properties'.
 pub fn joint_proofs(automatons: &[&Automaton], policies: Option<&SendAnalysis>) -> Vec<JointProof> {

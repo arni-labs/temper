@@ -232,8 +232,8 @@ fn joint_bound(
     }
 }
 
-/// Check every `[[invariant]]` that reads a related record and every
-/// `[[liveness]]` with `eventually` on the joint model, with the app's Cedar
+/// Check every `[[invariant]]` and every `[[liveness]]` with `eventually` on
+/// the joint model of its type and the types it names, with the app's Cedar
 /// deciding each move as its sender. A broken invariant fails the command
 /// with its shortest path, a condition the system's own moves do not reach
 /// fails with how it comes to rest short of it, and a walk that could not
@@ -270,7 +270,7 @@ fn verify_joint(
             .map(|v| (v.holds(), v.tag(), v.to_string(), v.rule()))
             .collect()
     };
-    let invariants = print_joint_report("Cross-entity invariants", rows(&check.invariants));
+    let invariants = print_joint_report("Invariants", rows(&check.invariants));
     let liveness = print_joint_report("Liveness", rows(&check.liveness));
     // Each reports on its own: one that fails does not hide the other.
     match (invariants, liveness) {

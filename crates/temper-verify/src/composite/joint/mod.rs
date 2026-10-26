@@ -1,11 +1,12 @@
-//! Invariants over several entities.
+//! Invariants, over one entity or several.
 //!
 //! An `[[invariant]]` may read a related entity: its status
 //! (`Type[id].status`) or a field (`Type[id].field`). One entity's model
 //! cannot know those values, so the per-entity cascade reads them as unknown
 //! and never fails on them. They are checked here, on the joint state of the
-//! invariant's entity and every type it names, one record of each, run the
-//! way the runtime runs them:
+//! invariant's entity and every type it names, one record of each. An
+//! invariant that names no other type is checked here too, on its entity
+//! alone. Each model runs the way the runtime runs:
 //!
 //! - each move is made by whoever makes it in the runtime, and the app's
 //!   Cedar decides it as them: an action someone outside may send (with the
@@ -210,10 +211,9 @@ impl fmt::Display for JointInvariantResult {
     }
 }
 
-/// The proof of one `[[invariant]]` that reads related records, with all
-/// its walk reads: the invariant and the joint model of its entity and the
-/// types it names, cut to what it reads. Its [`JointProof::digest`] is of
-/// this value.
+/// The proof of one `[[invariant]]`, with all its walk reads: the invariant
+/// and the joint model of its entity and the types it names, cut to what it
+/// reads. Its [`JointProof::digest`] is of this value.
 #[derive(Debug)]
 pub struct InvariantProof {
     entity: String,
@@ -254,19 +254,17 @@ impl InvariantProof {
     }
 }
 
-/// The proofs of every `[[invariant]]` of `app` that reads a related entity:
-/// one per invariant, on the joint model of its entity and the types it
-/// names, with what a `[[liveness]]` there relies on sent from outside by
-/// whoever Cedar lets, since a rule must hold through those moves too.
+/// The proofs of every `[[invariant]]` of `app`: one per invariant, on the
+/// joint model of its entity and the types it names, with what a
+/// `[[liveness]]` there relies on sent from outside by whoever Cedar lets,
+/// since a rule must hold through those moves too. One that names no other
+/// type is proved on its entity alone, by the same proof and walk, with the
+/// kernel's moves and Cedar that the per-entity cascade does not read.
 fn invariant_proofs(app: &App) -> Vec<InvariantProof> {
     let by_name = app.by_name();
     let mut proofs = Vec::new();
     for (name, automaton) in &by_name {
-        let joint = automaton
-            .invariants
-            .iter()
-            .filter(|inv| !inv.assert.related_types().is_empty());
-        for invariant in joint {
+        for invariant in &automaton.invariants {
             let relies_on = |scope: &BTreeSet<String>| {
                 scope
                     .iter()
@@ -295,8 +293,8 @@ fn invariant_proofs(app: &App) -> Vec<InvariantProof> {
     proofs
 }
 
-/// Walk every `[[invariant]]` in `automatons` that reads a related entity,
-/// on the joint model of its entity and the types it names, with `policies`
+/// Walk every `[[invariant]]` in `automatons` on the joint model of its
+/// entity and the types it names, with `policies`
 /// deciding each move as its sender, as for liveness; without them every
 /// sender may send everything.
 pub fn verify_joint_invariants(

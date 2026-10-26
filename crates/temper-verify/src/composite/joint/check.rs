@@ -1,6 +1,6 @@
 //! The joint check an install and `temper verify` run.
 //!
-//! Each rule over several records is proved by induction first
+//! Each invariant, and each `eventually` rule, is proved by induction first
 //! ([`crate::induct`]), for every run rather than the runs a bounded walk
 //! reaches: with the lemmas written beside it, or with none, the rule at
 //! every state and then the prover's own guesses, which a verdict lists so
@@ -36,7 +36,7 @@ pub const PROOF_TIME: Duration = Duration::from_secs(120);
 /// What the joint check found, rule by rule.
 #[derive(Debug, Clone, Default)]
 pub struct JointCheck {
-    /// Each `[[invariant]]` that reads a related record.
+    /// Each `[[invariant]]`.
     pub invariants: Vec<JointVerdict>,
     /// Each `[[liveness]]` with `eventually`.
     pub liveness: Vec<JointVerdict>,
@@ -194,7 +194,8 @@ impl JointProof {
     }
 }
 
-/// Check every rule over several records of `automatons` ([`joint_proofs`]),
+/// Check every invariant and `eventually` rule of `automatons`
+/// ([`joint_proofs`]),
 /// with `policies` deciding each move as its sender: by induction first, and
 /// by the walk where the proof does not hold ([`JointProof::check`]).
 pub fn check_joint(

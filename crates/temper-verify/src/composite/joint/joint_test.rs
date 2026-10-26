@@ -257,7 +257,7 @@ fn an_invariant_naming_an_undeclared_type_is_not_checked_and_says_why() {
 }
 
 #[test]
-fn specs_without_cross_entity_invariants_have_nothing_to_check() {
+fn specs_without_invariants_have_nothing_to_check() {
     let parent = parent(false);
     let automatons = parse(&[&parent, CHILD]);
     let refs: Vec<&Automaton> = automatons.iter().collect();

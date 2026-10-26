@@ -1,4 +1,4 @@
-//! Every rule over several records is proved by induction first: with the
+//! Every rule, over one record or several, is proved by induction first: with the
 //! lemmas its spec gives, or with the prover's guesses, which the verdict
 //! lists. A rule whose proof does not hold is walked as before and says why;
 //! a proved rule whose premise no run meets proves nothing, found by the
@@ -458,4 +458,50 @@ fn an_eventually_rule_with_its_measure_is_proved() {
         matches!(&verdict, JointVerdict::Liveness(walked, None) if walked.holds()),
         "{verdict}"
     );
+}
+
+/// A counter whose rule reads only its own count, which goes up by one from
+/// zero.
+fn counter(rule: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Counter"
+states = ["Ready"]
+initial = "Ready"
+
+[[state]]
+name = "count"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Increment"
+kind = "input"
+from = ["Ready"]
+to = "Ready"
+effect = ["count += 1"]
+
+[[invariant]]
+name = "Small"
+assert = "{rule}"
+"#
+    )
+}
+
+#[test]
+fn an_invariant_on_one_type_is_proved_or_fails_after_its_move() {
+    let verdict = invariant(&[&counter("count >= 0")], TIME);
+    assert!(matches!(verdict, JointVerdict::Proved(..)), "{verdict}");
+    assert!(verdict.holds(), "{verdict}");
+    assert_eq!(verdict.rule(), "Counter.Small");
+
+    let verdict = invariant(&[&counter("count < 2")], TIME);
+    let JointVerdict::Invariant(walked, Some(tried)) = &verdict else {
+        panic!("walked with the failed proof: {verdict}");
+    };
+    assert!(!tried.proved());
+    assert!(!walked.holds(), "{walked}");
+    let text = verdict.to_string();
+    assert!(text.contains("Counter.Increment"), "{text}");
 }
