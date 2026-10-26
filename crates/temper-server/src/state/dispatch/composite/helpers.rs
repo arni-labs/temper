@@ -74,11 +74,8 @@ pub(super) fn validate_sub_writes(
     Ok(())
 }
 
-pub(super) fn table_has_cross_entity_guards_for_action(
-    table: &TransitionTable,
-    action: &str,
-) -> bool {
-    !table.guard_related_refs(action).is_empty()
+pub(super) fn table_reads_related_records(table: &TransitionTable, action: &str) -> bool {
+    !table.related_refs(action).is_empty()
 }
 
 pub(super) fn composite_sub_write_uses_parent_gate(

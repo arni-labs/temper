@@ -77,7 +77,7 @@ impl crate::state::ServerState {
             return false;
         }
         let related = self
-            .resolve_cross_entity_guards(
+            .resolve_related_statuses(
                 entity_ref.tenant,
                 entity_ref.entity_type,
                 entity_ref.entity_id,

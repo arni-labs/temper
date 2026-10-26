@@ -161,7 +161,7 @@ impl ServerState {
         });
         // The `File.StreamUpdated` spec guard reads the owning Workspace's
         // status. On the live dispatch path that status is resolved by
-        // `resolve_cross_entity_guards`; this atomic synthetic path bypasses
+        // `resolve_related_statuses`; this atomic synthetic path bypasses
         // that resolution, so supply it directly. We already confirmed the
         // workspace is Active (or absent) above.
         let mut stream_xref = temper_jit::table::RelatedMap::new();

@@ -180,6 +180,11 @@ impl TransitionTable {
                     )
                 })
                 .collect(),
+            invariants: automaton
+                .invariants
+                .iter()
+                .filter_map(super::invariant::MoveInvariant::from_spec)
+                .collect(),
             rule_index,
         }
     }
