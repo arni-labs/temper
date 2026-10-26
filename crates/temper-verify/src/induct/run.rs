@@ -83,7 +83,12 @@ pub(super) fn run(
             let (checked, refused) = worker.join().expect("a solver thread panicked")?;
             done.extend(checked);
             for error in refused {
-                // Every solver reads the same lemmas, so it refuses the same.
+                // Every solver reads the same lemmas and refuses the same,
+                // at the line of its own script.
+                let error = match error.split_once(": ") {
+                    Some((at, said)) if at.contains(" column ") => format!("(error \"{said}"),
+                    _ => error,
+                };
                 if !errors.contains(&error) {
                     errors.push(error);
                 }
