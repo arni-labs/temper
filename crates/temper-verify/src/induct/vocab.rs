@@ -323,15 +323,14 @@ impl<'a> Vocab<'a> {
                     // The callee may be a template the kernel fills from a
                     // field, such as `{field:adapter_type}`, which a solver's
                     // name may not hold.
-                    let callee = symbol(module);
-                    let taken = calls
-                        .iter()
-                        .filter(|c| &c.to == to && symbol(&c.module) == callee)
-                        .count();
-                    let name = match taken {
-                        0 => format!("{to}@{callee}"),
-                        n => format!("{to}@{callee}{}", n + 1),
-                    };
+                    let base = format!("{to}@{}", symbol(module));
+                    let mut name = base.clone();
+                    let mut suffix = 2;
+                    // A numbered name can also be another callee's base.
+                    while calls.iter().any(|c| c.name == name) {
+                        name = format!("{base}{suffix}");
+                        suffix += 1;
+                    }
                     let mut call = Call {
                         name,
                         to: to.clone(),

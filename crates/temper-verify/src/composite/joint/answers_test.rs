@@ -117,3 +117,26 @@ fn a_call_to_an_adapter_a_field_names_is_proved() {
     let proved = verdict(&job(adapter, Some("Finish"), NEVER_DROPPED));
     assert_eq!(proved.tag(), "PROVED", "{proved}");
 }
+
+#[test]
+fn calls_with_colliding_normalized_and_numbered_names_are_proved() {
+    for adapters in [
+        ["{field:worker}", "_field_worker_", "_field_worker_2"],
+        ["_field_worker_2", "{field:worker}", "_field_worker_"],
+        ["_field_worker_", "_field_worker_2", "{field:worker}"],
+    ] {
+        let triggers = adapters
+            .map(|adapter| {
+                format!(
+                    "[[action.triggers]]\nname = \"{adapter}\"\nkind = \"adapter\"\nadapter = \"{adapter}\"\non_success = \"Finish\"\n"
+                )
+            })
+            .join("\n");
+        let source = job(ADAPTER, Some("Finish"), NEVER_DROPPED);
+        let start = source.find("[[action.triggers]]").unwrap();
+        let end = start + source[start..].find("[[action]]").unwrap();
+        let source = format!("{}{triggers}{}", &source[..start], &source[end..]);
+        let proved = verdict(&source);
+        assert_eq!(proved.tag(), "PROVED", "{adapters:?}: {proved}");
+    }
+}
