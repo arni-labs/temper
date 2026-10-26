@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
 
 use super::*;
@@ -101,13 +102,20 @@ fn parse(sources: &[&str]) -> Vec<Automaton> {
 }
 
 fn check(sources: &[&str]) -> JointInvariantResult {
+    check_under(sources, None)
+}
+
+/// The one result for `sources`, with `policies` (Cedar) deciding each move
+/// as its sender.
+fn check_under(sources: &[&str], policies: Option<&str>) -> JointInvariantResult {
     let automatons = parse(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
     let budget = Budget {
         time: Duration::from_secs(30),
         states: 100_000,
     };
-    let mut results = verify_joint_invariants(&refs, budget);
+    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), budget);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -153,6 +161,56 @@ fn a_copy_anyone_may_write_breaks_the_invariant_with_the_move_that_wrote_it() {
             .action
             .as_deref()
             .is_some_and(|a| a.starts_with("Child.Copy")),
+        "{result}"
+    );
+}
+
+/// A parent set once, whose `tell` runs as its own service, and Cedar that
+/// lets only that service send the child's Copy.
+fn parent_told_once() -> String {
+    parent(false)
+        .replace(
+            "from = [\"Open\"]\nto = \"Open\"\nparams",
+            "from = [\"Open\"]\nto = \"Closed\"\nparams",
+        )
+        .replace(
+            "name = \"tell\"\nkind = \"entity\"",
+            "name = \"tell\"\nkind = \"entity\"\nprincipal = \"tell\"",
+        )
+}
+
+const ONLY_TELL_COPIES: &str = r#"
+permit(principal, action in [Action::"Set", Action::"Close", Action::"Finish"], resource);
+permit(principal == Agent::"service:tell", action == Action::"Copy", resource is Child);
+"#;
+
+#[test]
+fn a_copy_only_the_parents_service_may_send_holds_under_its_cedar() {
+    let child = child_with("status == 'Done' => Parent[Id].value == value");
+    let parent = parent_told_once();
+    assert!(
+        !check(&[&parent, &child]).holds(),
+        "without Cedar anyone may send Copy"
+    );
+    let result = check_under(&[&parent, &child], Some(ONLY_TELL_COPIES));
+    assert!(result.holds(), "{result}");
+}
+
+#[test]
+fn an_action_a_liveness_relies_on_is_sent_whatever_cedar_says() {
+    let child = format!(
+        "{}\n[[liveness]]\nname = \"moves_on\"\neventually = \"status != 'Waiting'\"\nrelies_on = [\"Copy\"]\n",
+        child_with("status == 'Done' => Parent[Id].value == value")
+    );
+    let parent = parent_told_once();
+    let result = check_under(&[&parent, &child], Some(ONLY_TELL_COPIES));
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("expected a broken invariant, got {result}");
+    };
+    assert!(
+        path.iter()
+            .filter_map(|step| step.action.as_deref())
+            .any(|a| a.starts_with("Child.Copy")),
         "{result}"
     );
 }
@@ -207,7 +265,7 @@ fn specs_without_cross_entity_invariants_have_nothing_to_check() {
         time: Duration::from_secs(30),
         states: 100_000,
     };
-    assert!(verify_joint_invariants(&refs, budget).is_empty());
+    assert!(verify_joint_invariants(&refs, None, budget).is_empty());
 }
 
 #[test]
@@ -277,6 +335,114 @@ fn a_same_id_reaction_reaches_no_record_with_another_id() {
 }
 
 #[test]
+fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
+    let child = child_with("Parent[Id].value == 'secret' => status == 'Waiting'");
+    let parent = parent(false);
+    let result = check(&[&parent, &child]);
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("expected a broken invariant, got {result}");
+    };
+    assert!(
+        path.iter()
+            .filter_map(|s| s.action.as_deref())
+            .any(|m| m.starts_with("Parent.Set") && m.contains("'secret'")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_sequence_copied_by_effect_keeps_its_actual_value() {
+    let parent = r#"
+[automaton]
+name = "Parent"
+states = ["Zero", "One", "Two", "Copied"]
+initial = "Zero"
+[[state]]
+name = "sequence"
+type = "counter"
+initial = 0
+[[state]]
+name = "snapshot"
+type = "counter"
+initial = 0
+[[action]]
+name = "First"
+kind = "input"
+from = ["Zero"]
+to = "One"
+effect = ["sequence += 1"]
+[[action.triggers]]
+name = "tell"
+kind = "entity"
+target_entity = "Child"
+target_action = "Copy"
+principal = "counter"
+[action.triggers.args]
+sequence = "sequence"
+[action.triggers.resolve_target]
+kind = "same_id"
+[[action]]
+name = "Second"
+kind = "input"
+from = ["One"]
+to = "Two"
+effect = ["sequence += 1"]
+[[action]]
+name = "Snapshot"
+kind = "input"
+from = ["Two"]
+to = "Copied"
+effect = ["snapshot = sequence"]
+"#;
+    let child = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Done"]
+initial = "Waiting"
+[[state]]
+name = "sequence"
+type = "counter"
+initial = 0
+[[action]]
+name = "Copy"
+kind = "input"
+from = ["Waiting", "Done"]
+to = "Done"
+params = [{ name = "sequence", type = "counter" }]
+effect = ["sequence = params.sequence"]
+[[action.constraints]]
+kind = "param_greater_than_field"
+param = "sequence"
+field = "sequence"
+[[invariant]]
+name = "snapshot_bound"
+assert = "status == 'Done' => Parent[Id].snapshot <= 1"
+"#;
+    let policies = r#"
+permit(principal, action in [Action::"First", Action::"Second", Action::"Snapshot"], resource);
+permit(principal, action == Action::"Copy", resource is Child) when {
+    principal == Agent::"service:counter" && context has triggerSourceEntityId &&
+    resource has id && context.triggerSourceEntityId == resource.id
+};
+"#;
+    let result = check_under(&[parent, child], Some(policies));
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("the copied sequence must violate the invariant: {result}");
+    };
+    assert!(
+        path.iter().any(|step| step
+            .action
+            .as_deref()
+            .is_some_and(|a| a.starts_with("Parent.Snapshot"))),
+        "{result}"
+    );
+    assert!(
+        path.last().unwrap().state.contains("snapshot=2"),
+        "{result}"
+    );
+}
+
+#[test]
 fn unknown_related_reads_cannot_be_proven() {
     for assertion in [
         "Parent[Id].score > 0",
@@ -319,6 +485,7 @@ fn initial_partitions_stop_within_a_tiny_budget() {
     let automatons = parse(&sources.iter().map(String::as_str).collect::<Vec<_>>());
     let results = verify_joint_invariants(
         &automatons.iter().collect::<Vec<_>>(),
+        None,
         Budget {
             states: 10,
             time: Duration::from_secs(1),
