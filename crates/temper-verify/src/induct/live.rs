@@ -26,9 +26,8 @@ use temper_spec::predicate::Expr;
 
 use super::encode::{Enc, counted};
 use super::moves::{Move, Moves, Step};
-use super::solver::Z3;
+use super::run::Ask;
 use super::vocab::Vocab;
-use super::{Obligation, check};
 
 /// The measure of an `eventually` rule: terms over `$`-framed names,
 /// compared in order.
@@ -92,21 +91,20 @@ pub(super) struct Live<'r> {
 /// proved inductive: the regions cover every state short of the target, the
 /// measure is not negative there, and each region's move can happen and
 /// reaches the target or lowers the measure, whichever way it goes.
-pub(super) fn obligations(
-    z3: &mut Z3,
+pub(super) fn asks(
     enc: &Enc<'_, '_>,
     moves: &[Move],
     live: &Live<'_>,
     clauses: &dyn Fn(&str) -> Vec<(String, String)>,
-    out: &mut Vec<Obligation>,
+    out: &mut Vec<Ask>,
     errors: &mut Vec<String>,
-) -> std::io::Result<()> {
+) {
     let v = enc.v;
     let goal = |frame: &str| enc.expr(live.goal, live.owner, frame);
     let target = |frame: &str| format!("(and {frame}.quiet {})", goal(frame));
     let Some(measure) = live.measure else {
         errors.push("no measure given".to_string());
-        return Ok(());
+        return;
     };
     let terms = |frame: &str| -> Vec<String> {
         measure
@@ -119,6 +117,7 @@ pub(super) fn obligations(
     // target does not.
     let short = |extra: &[String], decls: &[String]| -> String {
         let not_there = format!("(not {})", target("pre"));
+        let held = clauses("pre");
         let mut text = format!("(push 1)\n{}", counted(v));
         let mut seen = BTreeSet::new();
         for d in enc.take_decls().iter().chain(decls) {
@@ -126,7 +125,7 @@ pub(super) fn obligations(
                 text.push_str(&format!("{d}\n"));
             }
         }
-        for (_, c) in clauses("pre") {
+        for (_, c) in held {
             text.push_str(&format!("(assert {c})\n"));
         }
         text.push_str(&format!("(assert {not_there})\n"));
@@ -142,14 +141,14 @@ pub(super) fn obligations(
         format!("(or false {})", any.join(" ")),
     )];
     let text = short(&[], &[]);
-    out.push(check(z3, v, "covers", text, &covered, &before)?);
+    out.push(Ask::new(v, "covers", text, covered, &before));
     let floor: Vec<String> = terms("pre").iter().map(|t| format!("(>= {t} 0)")).collect();
     let bounded = vec![(
         "measure not negative".to_string(),
         format!("(and true {})", floor.join(" ")),
     )];
     let text = short(&[], &[]);
-    out.push(check(z3, v, "measure bounded", text, &bounded, &before)?);
+    out.push(Ask::new(v, "measure bounded", text, bounded, &before));
     let lower = lexically_less(&terms("post"), &terms("pre"));
     for region in &live.regions {
         // A region that pins no parameter takes its move as the induction
@@ -200,7 +199,7 @@ pub(super) fn obligations(
         }
         let text = short(std::slice::from_ref(&at_w), &decls);
         let name = format!("region {}: {} can happen", region.name, region.step);
-        out.push(check(z3, v, &name, text, &happens, &before)?);
+        out.push(Ask::new(v, &name, text, happens, &before));
         for outcome in &outcomes {
             let reaches = vec![(
                 "target or lower measure".to_string(),
@@ -210,10 +209,9 @@ pub(super) fn obligations(
             extra.extend(outcome.body().cloned());
             let text = short(&extra, &decls);
             let name = format!("region {}: {}", region.name, outcome.label);
-            out.push(check(z3, v, &name, text, &reaches, &before)?);
+            out.push(Ask::new(v, &name, text, reaches, &before));
         }
     }
-    Ok(())
 }
 
 /// The ways `region`'s helpful move can go: a dispatch taken or refused, a
