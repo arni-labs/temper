@@ -153,7 +153,10 @@ fn test_without_comments_keeps_lines_and_strings() {
     assert!(stripped.contains("\"// kept\""));
     assert!(stripped.contains("'/'"));
     let lines = lines_of(source);
-    assert_eq!((lines[3].number, lines[3].text.as_str()), (4, "let c = '/';"));
+    assert_eq!(
+        (lines[3].number, lines[3].text.as_str()),
+        (4, "let c = '/';")
+    );
 }
 
 #[tokio::test]
