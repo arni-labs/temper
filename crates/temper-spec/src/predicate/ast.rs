@@ -53,6 +53,17 @@ pub enum Operand {
         /// Field on this entity holding the related entity's id.
         id_field: String,
     },
+    /// `Type[id_field].field`: a field of a related entity. Only the joint
+    /// verification of several entities reads it (an `[[invariant]]` over
+    /// two records); a guard or field invariant may not.
+    CrossField {
+        /// Related entity type.
+        entity_type: String,
+        /// Field on this entity holding the related entity's id.
+        id_field: String,
+        /// The related entity's field.
+        field: String,
+    },
     /// A literal value.
     Lit(Literal),
 }
@@ -221,6 +232,40 @@ impl Expr {
         });
         refs
     }
+
+    /// Every related entity the expression reads, status or field, as
+    /// `(entity_type, id_field)`, deduplicated in first-use order.
+    pub fn related_types(&self) -> Vec<(String, String)> {
+        let mut refs: Vec<(String, String)> = Vec::new();
+        self.for_each_name(&mut |name| {
+            let key = match name {
+                Name::CrossStatus {
+                    entity_type,
+                    id_field,
+                }
+                | Name::CrossField {
+                    entity_type,
+                    id_field,
+                    ..
+                } => (entity_type.to_string(), id_field.to_string()),
+                _ => return,
+            };
+            if !refs.contains(&key) {
+                refs.push(key);
+            }
+        });
+        refs
+    }
+
+    /// Whether the expression reads a related entity's field
+    /// (`Type[id].field`).
+    pub fn reads_related_field(&self) -> bool {
+        let mut found = false;
+        self.for_each_name(&mut |name| {
+            found |= matches!(name, Name::CrossField { .. });
+        });
+        found
+    }
 }
 
 impl Operand {
@@ -236,6 +281,18 @@ impl Operand {
                 visit(Name::CrossStatus {
                     entity_type,
                     id_field,
+                });
+            }
+            Operand::CrossField {
+                entity_type,
+                id_field,
+                field,
+            } => {
+                visit(Name::Var(id_field));
+                visit(Name::CrossField {
+                    entity_type,
+                    id_field,
+                    field,
                 });
             }
             Operand::Lit(_) => {}
@@ -256,5 +313,14 @@ pub enum Name<'a> {
         entity_type: &'a str,
         /// Field holding the related entity's id.
         id_field: &'a str,
+    },
+    /// A related entity's field.
+    CrossField {
+        /// Related entity type.
+        entity_type: &'a str,
+        /// Field holding the related entity's id.
+        id_field: &'a str,
+        /// The related entity's field.
+        field: &'a str,
     },
 }
