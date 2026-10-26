@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
-use temper_spec::automaton::{ActionKind, ActionTrigger, TargetResolver, call_may_answer};
+use temper_spec::automaton::{
+    ActionKind, ActionTrigger, TargetResolver, TriggerKind, call_may_answer,
+};
 use temper_spec::predicate::Effect;
 
 use super::vocab::{Vocab, scheduled};
@@ -29,14 +31,6 @@ impl Vocab<'_> {
     pub(super) fn outside_may(&self, entity: &str, action: &str) -> May {
         self.policies.map_or(May::Yes, |policies| {
             self.ask(policies, &Asker::Outside, action, entity)
-        })
-    }
-
-    /// Whether Cedar lets a module's answer, run as the runtime, take
-    /// `action` on `entity`.
-    pub(super) fn runtime_may(&self, entity: &str, action: &str) -> May {
-        self.policies.map_or(May::Yes, |policies| {
-            self.ask(policies, &runtime(), action, entity)
         })
     }
 
@@ -124,14 +118,23 @@ impl Vocab<'_> {
         if input && self.outside_may(entity, action) != May::No {
             out.push(Asker::Outside);
         }
-        let answered = automaton.actions.iter().any(|a| {
-            a.triggers.iter().any(|t| {
-                t.callee().is_some()
-                    && call_may_answer(t.on_success.as_deref(), t.on_failure.as_deref(), action)
-            })
-        });
-        if answered {
-            out.push(runtime());
+        for trigger in automaton.actions.iter().flat_map(|a| &a.triggers) {
+            if trigger.callee().is_some()
+                && call_may_answer(
+                    trigger.on_success.as_deref(),
+                    trigger.on_failure.as_deref(),
+                    action,
+                )
+            {
+                out.push(Asker::Service {
+                    name: match trigger.kind {
+                        TriggerKind::Adapter => "platform-dispatch",
+                        _ => "wasm-runtime",
+                    }
+                    .to_string(),
+                    context: BTreeMap::new(),
+                });
+            }
         }
         for (source, source_automaton) in &self.by_name {
             for source_action in &source_automaton.actions {
@@ -200,14 +203,6 @@ impl Vocab<'_> {
             Some(_) => May::Maybe,
             None => May::Yes,
         }
-    }
-}
-
-/// A module's answer, run in the background, as the kernel sends it.
-fn runtime() -> Asker {
-    Asker::Service {
-        name: "wasm-runtime".to_string(),
-        context: BTreeMap::new(),
     }
 }
 
