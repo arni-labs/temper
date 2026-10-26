@@ -43,6 +43,10 @@ mod embedder;
 mod invariants;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
+#[path = "dst_state_timers_follow_state/slow_store.rs"]
+mod slow_store;
+#[path = "dst_state_timers_follow_state/slow_store_env.rs"]
+mod slow_store_env;
 #[path = "dst_state_timers_follow_state/specs.rs"]
 mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
