@@ -465,27 +465,35 @@ impl VerificationCascade {
     /// ([`crate::induct::prove_alone`]); Stateright walks for the rest.
     fn run_model_check(
         &self,
-        mut automaton: Automaton,
+        automaton: Automaton,
         model: &TemperModel,
         spending: Option<&Spending>,
     ) -> LevelResult {
         let deadline = spending.map(Spending::until);
-        let (proved, unproved): (Vec<_>, Vec<_>) = crate::induct::prove_alone(&automaton, deadline)
-            .into_iter()
-            .partition(|proof| proof.proved());
-        let walked;
+        let (proved, unproved): (Vec<_>, Vec<_>) =
+            crate::induct::prove_alone_indexed(&automaton, deadline)
+                .into_iter()
+                .partition(|(_, proof)| proof.proved());
+        let mut walked;
         let model = if proved.is_empty() {
             model
         } else {
-            automaton
+            // A proof removes an obligation, not model data: rebuilding
+            // without its assertion would lose tracked fields and candidates.
+            walked = model.clone();
+            // Bind proofs to declarations: repeated names may assert different rules.
+            walked.invariants = walked
                 .invariants
-                .retain(|i| !proved.iter().any(|proof| proof.rule == i.name));
-            walked = self.build_temper_model(&automaton, self.max_counter, spending);
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !proved.iter().any(|(proved_index, _)| proved_index == index))
+                .map(|(_, invariant)| invariant)
+                .collect();
             &walked
         };
         let verification = checker::check_model(model);
         let passed = verification.all_properties_hold;
-        let names: Vec<&str> = proved.iter().map(|p| p.rule.as_str()).collect();
+        let names: Vec<&str> = proved.iter().map(|(_, p)| p.rule.as_str()).collect();
         let proved = match names.is_empty() {
             true => String::new(),
             false => format!("{} proved by induction; ", names.join(", ")),
@@ -517,7 +525,7 @@ impl VerificationCascade {
             )
         };
         // An invariant walked because its proof did not hold says why.
-        let unproved = unproved.iter().filter_map(|proof| {
+        let unproved = unproved.iter().filter_map(|(_, proof)| {
             let why = proof.shortfall()?;
             Some(format!("{} not proved by induction: {why}", proof.rule))
         });

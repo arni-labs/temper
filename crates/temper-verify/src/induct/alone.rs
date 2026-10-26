@@ -15,14 +15,32 @@ use super::{Hints, RuleProof, prove_some};
 /// lemmas written beside it. Solvers still checking at `deadline` stop, and
 /// their rules are not proved.
 pub fn prove_alone(automaton: &Automaton, deadline: Option<Instant>) -> Vec<RuleProof> {
-    let alone = alone(automaton);
-    let own = |_: &str, rule: &str| {
-        alone
-            .invariants
-            .iter()
-            .any(|i| i.name == rule && i.assert.related_types().is_empty())
-    };
-    prove_some(&[&alone], None, &Hints::default(), own, deadline)
+    prove_alone_indexed(automaton, deadline)
+        .into_iter()
+        .map(|(_, proof)| proof)
+        .collect()
+}
+
+/// Pair each proof with its invariant's declaration index, since names
+/// need not be unique. Only invariants that read no other record qualify.
+pub(crate) fn prove_alone_indexed(
+    automaton: &Automaton,
+    deadline: Option<Instant>,
+) -> Vec<(usize, RuleProof)> {
+    let mut alone = alone(automaton);
+    let indices: Vec<_> = alone
+        .invariants
+        .iter()
+        .enumerate()
+        .filter(|(_, invariant)| invariant.assert.related_types().is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    alone
+        .invariants
+        .retain(|invariant| invariant.assert.related_types().is_empty());
+    let proofs = prove_some(&[&alone], None, &Hints::default(), |_, _| true, deadline);
+    assert_eq!(indices.len(), proofs.len());
+    indices.into_iter().zip(proofs).collect()
 }
 
 /// `automaton` as the one-type check runs it: each action but an output

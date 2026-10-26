@@ -108,3 +108,28 @@ fn an_action_only_the_kernel_sends_may_come_at_any_time() {
     let shortfall = proofs[0].shortfall().expect("not proved");
     assert!(shortfall.contains("Job.Close"), "{shortfall}");
 }
+
+#[test]
+fn proofs_keep_declaration_indices_when_a_same_named_rule_reads_another_record() {
+    let automaton = parse_automaton(&format!(
+        r#"{JOB}
+[[state]]
+name = "parent_id"
+type = "string"
+initial = ""
+
+[[invariant]]
+name = "I"
+assert = "Parent[parent_id].status == 'Done'"
+
+[[invariant]]
+name = "I"
+assert = "status == 'Done' => done == true"
+"#
+    ))
+    .expect("fixture parses");
+    let proofs = prove_alone_indexed(&automaton, None);
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(proofs[0].0, 1);
+    assert!(proofs[0].1.proved(), "{:?}", proofs[0].1.shortfall());
+}

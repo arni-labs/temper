@@ -42,6 +42,7 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name};
 
 pub use alone::prove_alone;
+pub(crate) use alone::prove_alone_indexed;
 use encode::{Enc, initial};
 use guess::Guess;
 pub use hints::{Hints, Lemma};
@@ -427,3 +428,6 @@ fn prove_one(
         took: start.elapsed(),
     })
 }
+
+#[cfg(test)]
+mod answers_test;
