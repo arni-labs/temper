@@ -173,7 +173,9 @@ impl ServerState {
             started_at,
         );
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
-        let delay = remaining_budget(started_at, st.after_seconds, now);
+        // SCRATCH DEFECT (never merge): a timer armed on hydration waits a full budget.
+        let _ = remaining_budget;
+        let delay = std::time::Duration::from_secs(st.after_seconds);
         if self
             .start_armed_timer(timer, delay, Reservation::Missing)
             .await
