@@ -29,13 +29,10 @@
 //! outside code is relied on to send) is taken to send ones that pass,
 //! unless a parameter must equal a field the model does not track.
 //!
-//! Two readings let the model decide constraints that guard against stale
-//! messages. A module answers about the record as it was when the call
-//! started: a call keeps the fields its answers' parameters must equal, and
-//! the record refuses the answer once they have moved on. And a count a
-//! reaction carries, which the receiver takes only when it is greater than
-//! its own, is kept as a sequence number: the newest, or behind it
-//! (`model/order.rs`).
+//! A count a reaction carries, which the receiver takes only when it is
+//! greater than its own, is kept as a sequence number: the newest, or
+//! behind it (`model/order.rs`). A callee chooses its returned parameters
+//! independently of the fields held when its call started.
 //!
 //! A pass that checked nothing is not one: a condition written
 //! `premise => conclusion` whose premise no walked state meets proves nothing.

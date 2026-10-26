@@ -47,18 +47,12 @@ pub struct Call {
     /// Who its answer runs as, by sender number: the runtime when the call
     /// runs in the background, the caller when it runs inline.
     pub by: u32,
-    /// The tracked fields its answers are tied to, as the record held them
-    /// when the call started: the module answers about that record.
-    pub asked: BTreeMap<String, String>,
 }
 
 impl fmt::Display for Call {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {} call", self.to, self.module)?;
-        for (field, value) in &self.asked {
-            write!(f, " for {field}='{value}'")?;
-        }
-        if self.by != senders::RUNTIME {
+        if self.by != senders::RUNTIME && self.by != senders::PLATFORM_DISPATCH {
             f.write_str(" (inline)")?;
         }
         Ok(())
@@ -147,7 +141,6 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
             .values_mut()
             .map(|s| &mut s.strings)
             .chain(strings.iter_mut())
-            .chain(state.calls.iter_mut().map(|c| &mut c.asked))
             .collect();
         canonical_strings(&mut maps)
     };

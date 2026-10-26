@@ -489,3 +489,6 @@ fn solve(
     };
     run(rule, &session, asks, guessed)
 }
+
+#[cfg(test)]
+mod answers_test;
