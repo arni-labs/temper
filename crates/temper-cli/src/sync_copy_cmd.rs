@@ -15,6 +15,10 @@
 //! - If the stop was raised in error and the remote holds every change:
 //!   `resume` clears it and the next start confirms writes again.
 //!
+//! A restore runs for as long as it keeps writing the file. One that stopped
+//! part way (`status` shows "restoring") needs nothing: the next start moves
+//! the partial file aside, keeps it, and restores again.
+//!
 //! `adopt` moves a database that was never synced onto an empty remote, with
 //! the app stopped and TURSO_SYNC_URL and TURSO_SYNC_AUTH_TOKEN set: the file
 //! is set aside and kept, and its rows are copied into a fresh synced

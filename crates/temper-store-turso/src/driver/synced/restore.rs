@@ -1,29 +1,60 @@
 //! How long opening the engine may take. A restore downloads the whole
-//! database and the engine sets no timeout of its own.
+//! database, and the engine sets no timeout of its own, so a remote that
+//! stops answering would hold the start forever. A large database takes as
+//! long as it takes, so the open is bounded by its progress, not by a clock.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-/// How long opening may go without writing to the database's files.
+use super::files::belongs_to;
+
+/// How long opening may go without writing to the database's files before it
+/// fails. A healthy restore writes pages as they arrive; it goes quiet only
+/// while the remote prepares the first page and while the written pages are
+/// flushed to disk at the end. That flush can be a few GB of page cache; at
+/// the slowest restore rate seen, about 11 MB/s, 3 GB takes under five
+/// minutes. Failing too early costs a whole new download; failing late only
+/// holds a start whose remote went quiet for a few more minutes.
 pub(super) const RESTORE_STALL_BUDGET: Duration = Duration::from_secs(300);
 
 /// How often a running open looks at the files.
 pub(super) const PROGRESS_CHECK_EVERY: Duration = Duration::from_secs(5);
 
-/// Run `opening` to the end, or `None` once it has run out of time.
+/// Run `opening` while `footprint` keeps changing. `None` once it has not
+/// changed for [`RESTORE_STALL_BUDGET`].
 pub(super) async fn while_progressing<T, S: PartialEq>(
     opening: impl Future<Output = T>,
-    _footprint: impl FnMut() -> S,
+    mut footprint: impl FnMut() -> S,
 ) -> Option<T> {
-    tokio::time::timeout(Duration::from_secs(120), opening)
-        .await
-        .ok()
+    let mut opening = std::pin::pin!(opening);
+    let mut seen = footprint();
+    let mut moved_at = tokio::time::Instant::now();
+    let mut check = tokio::time::interval(PROGRESS_CHECK_EVERY);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            opened = &mut opening => return Some(opened),
+            _ = check.tick() => {
+                let now = footprint();
+                if now != seen {
+                    seen = now;
+                    moved_at = tokio::time::Instant::now();
+                } else if moved_at.elapsed() >= RESTORE_STALL_BUDGET {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
-/// The length of the database and of each file the engine keeps beside it.
-pub(super) fn footprint(path: &Path) -> BTreeMap<String, u64> {
+/// Each of the database's files as it stands on disk: its length, the space
+/// allocated to it and its last write. The engine sizes the file to the whole
+/// database before the first page arrives, so while the pages download only
+/// the allocated space and the write time move.
+pub(super) fn footprint(path: &Path) -> BTreeMap<String, (u64, u64, Option<SystemTime>)> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -33,11 +64,23 @@ pub(super) fn footprint(path: &Path) -> BTreeMap<String, u64> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let file = entry.file_name().to_string_lossy().into_owned();
-            let ours = file == name || file.starts_with(&format!("{name}-"));
-            let meta = entry.metadata().ok().filter(|_| ours)?;
-            Some((file, meta.len()))
+            if !belongs_to(&name, &file) {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            Some((file, (meta.len(), allocated(&meta), meta.modified().ok())))
         })
         .collect()
+}
+
+#[cfg(unix)]
+fn allocated(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::blocks(meta)
+}
+
+#[cfg(not(unix))]
+fn allocated(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 #[cfg(test)]

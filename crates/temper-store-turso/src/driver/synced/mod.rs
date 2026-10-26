@@ -6,7 +6,9 @@
 //! request, and returns only once the remote has committed it. Callers that
 //! answer a request after a write await it first, so a confirmed change is
 //! never only on this machine. A fresh machine with no local file starts from
-//! the remote copy.
+//! the remote copy. That restore runs as long as it keeps writing the file
+//! (see `restore`), and one stopped part way is kept aside and run again at
+//! the next start.
 //!
 //! Writes are confirmed only in [`CopyState::Copying`]. A start that cannot
 //! reach the remote serves reads and waits ([`CopyState::Unchecked`]); a file
@@ -114,6 +116,8 @@ impl SyncCopy {
     /// copy) is moved aside and the database restored from the remote, which
     /// holds everything the older copy did. A remote that cannot be reached
     /// leaves the copy [`CopyState::Unchecked`] until [`Self::recheck`] passes.
+    /// A file that a stopped restore left part way is moved aside the same
+    /// way, and restored again.
     pub(crate) async fn open(
         path: &str,
         remote_url: &str,
@@ -150,6 +154,13 @@ impl SyncCopy {
         // workspace does): the engine's IO thread then panics and every sync
         // call waits forever. An error here means one is already installed.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Without sync metadata the engine restores the file from the remote,
+        // and writes the metadata only once every page is on disk. Until then
+        // the file is marked, so a start that stops part way is not taken
+        // for a database that was never synced.
+        if !sidecar(path, "-info").exists() {
+            files::mark_restoring(path)?;
+        }
         let local = path.to_string_lossy();
         let opening = turso::sync::Builder::new_remote(&local)
             .with_remote_url(remote_url)
@@ -161,10 +172,12 @@ impl SyncCopy {
             .await
             .ok_or_else(|| {
                 DriverError::SyncSetup(format!(
-                    "opening {} with its remote copy took over 120 s",
-                    path.display()
+                    "opening {} with its remote copy made no progress for {} s",
+                    path.display(),
+                    restore::RESTORE_STALL_BUDGET.as_secs()
                 ))
             })??;
+        files::restored(path);
         let state = match std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {
             Ok(cause) => CopyState::Stopped(cause),
             Err(_) => CopyState::Unchecked,

@@ -32,11 +32,17 @@ pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
     for entry in std::fs::read_dir(dir).map_err(failed)? {
         let entry = entry.map_err(failed)?;
         let file = entry.file_name().to_string_lossy().into_owned();
-        if file == name || file.starts_with(&format!("{name}-")) {
+        if belongs_to(&name, &file) {
             std::fs::rename(entry.path(), aside.join(&file)).map_err(failed)?;
         }
     }
     Ok(aside)
+}
+
+/// Whether `file` in the database's directory is the database `name` or one of
+/// the files kept beside it (`<name>-info`, `-wal`, the markers here).
+pub(super) fn belongs_to(name: &str, file: &str) -> bool {
+    file == name || file.starts_with(&format!("{name}-"))
 }
 
 /// Written next to the database while it waits to be checked against the
@@ -126,21 +132,44 @@ pub(super) fn describe(path: &Path) -> Result<String, DriverError> {
 /// remote copy, which truncates whatever the file held. That is right for a
 /// fresh machine (no file, or an empty one) and wrong for a database that was
 /// written before sync was turned on: its rows were never sent anywhere.
+///
+/// A file with the restore's marker is a restore that stopped part way: only
+/// some of the remote's pages. It is moved aside, kept, and restored again.
 pub(super) fn check_local_files(path: &Path) -> Result<(), DriverError> {
     if sidecar(path, "-info").exists() {
         return Ok(());
     }
     let holds_data = |file: &Path| std::fs::metadata(file).is_ok_and(|meta| meta.len() > 0);
     let wal = sidecar(path, "-wal");
-    if holds_data(path) || holds_data(&wal) {
-        return Err(DriverError::SyncSetup(format!(
-            "{} holds data that was never copied to the sync database, and opening it with \
-             sync would replace it with the remote copy. Copy the file to the remote database \
-             first, or move it away to restore from the remote copy",
-            path.display()
-        )));
+    if !holds_data(path) && !holds_data(&wal) {
+        return Ok(());
     }
-    Ok(())
+    if sidecar(path, RESTORING_SUFFIX).exists() {
+        let moved = move_aside(path)?;
+        tracing::warn!(
+            moved = %moved.display(),
+            "turso.sync a restore from the remote did not finish; restoring again"
+        );
+        return Ok(());
+    }
+    Err(DriverError::SyncSetup(format!(
+        "{} holds data that was never copied to the sync database, and opening it with \
+         sync would replace it with the remote copy. Copy the file to the remote database \
+         first, or move it away to restore from the remote copy",
+        path.display()
+    )))
+}
+
+/// Mark the start of a restore: the engine is about to fill the file from the
+/// remote. [`restored`] removes the mark once the open has finished.
+pub(super) fn mark_restoring(path: &Path) -> Result<(), DriverError> {
+    std::fs::write(sidecar(path, RESTORING_SUFFIX), b"")
+        .map_err(|error| DriverError::SyncSetup(format!("record the restore: {error}")))
+}
+
+/// Clear the mark of a restore that has finished.
+pub(super) fn restored(path: &Path) {
+    let _ = std::fs::remove_file(sidecar(path, RESTORING_SUFFIX));
 }
 
 pub(super) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
