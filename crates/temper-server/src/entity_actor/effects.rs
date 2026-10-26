@@ -8,12 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use temper_jit::table::action_contract::InitialValues;
 use temper_jit::table::{Effect, EvalContext, GuardFailure, Refusal, TransitionTable, effect_args};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, OverflowBlobWrite, blob_ref_value};
 
-use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
+use super::types::{EffectOutcome, EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 /// Journal event type for a PATCH-style field merge (ARN-189).
 pub(crate) const FIELDS_UPDATED_EVENT: &str = "FieldsUpdated";
@@ -139,7 +140,9 @@ pub fn build_eval_context_with_xref(
     action: Option<&str>,
 ) -> EvalContext {
     let mut ctx = EvalContext::default();
-    ctx.counters.insert("items".to_string(), state.item_count);
+    if let Some(items) = stored_item_count(state, &table.initial_values) {
+        ctx.counters.insert("items".to_string(), items);
+    }
     for (k, v) in &state.counters {
         ctx.counters.insert(k.clone(), *v);
     }
@@ -156,6 +159,14 @@ pub fn build_eval_context_with_xref(
     }
     ctx.related = related.clone();
     ctx
+}
+
+/// Give `ctx` the parameters of the move being taken, which its guard reads
+/// as `params.p`.
+pub(crate) fn with_params(ctx: &mut EvalContext, params: &serde_json::Value) {
+    if let Some(params) = params.as_object() {
+        ctx.params = params.clone();
+    }
 }
 
 /// Result of processing an action through the transition table.
@@ -352,7 +363,8 @@ pub(crate) fn process_action_with_xref_and_field_mode(
         }
     }
 
-    let ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    let mut ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    with_params(&mut ctx, params);
     let result = table.evaluate_ctx(&state.status, &ctx, action);
 
     match result {
@@ -368,8 +380,17 @@ pub(crate) fn process_action_with_xref_and_field_mode(
             let sanitized_params = sanitize_action_params(effective_params.as_ref());
             let params = sanitized_params.as_ref();
 
-            let (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests) =
-                apply_effects(state, &transition_result.effects, params);
+            let (
+                (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests),
+                outcome,
+            ) = record_effect_outcome(state, |state| {
+                apply_effects(
+                    state,
+                    &transition_result.effects,
+                    &table.initial_values,
+                    params,
+                )
+            });
             apply_new_state_fallback(state, &from_status, &to_status);
             let overflow_blobs = sync_fields_with_metadata(
                 state,
@@ -390,6 +411,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 params: params.clone(),
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                outcome: Some(outcome),
             };
 
             ProcessResult {
@@ -626,6 +648,8 @@ fn json_string_param(params: &serde_json::Value, field: &str) -> Option<String> 
 /// # Arguments
 /// - `state` — The entity state to mutate.
 /// - `effects` — The effects returned by `TransitionTable::evaluate()`.
+/// - `declared` — The table's declared values, read for a variable the
+///   record does not store.
 /// - `params` — The action parameters (read by `params.p` effect values).
 ///
 /// # Returns
@@ -633,6 +657,7 @@ fn json_string_param(params: &serde_json::Value, field: &str) -> Option<String> 
 pub fn apply_effects(
     state: &mut EntityState,
     effects: &[Effect],
+    declared: &InitialValues,
     params: &serde_json::Value,
 ) -> (
     Vec<String>,
@@ -651,7 +676,7 @@ pub fn apply_effects(
                 state.status = s.clone();
             }
             Effect::SetCounter { var, value } => {
-                match effect_args::count(value, &state.counters, params) {
+                match effect_args::count(value, &state.counters, declared, params) {
                     Some(value) => set_counter(state, var, value),
                     None => tracing::warn!(
                         entity_type = %state.entity_type,
@@ -663,17 +688,19 @@ pub fn apply_effects(
                 }
             }
             Effect::AddCounter { var, value } => {
-                let delta = effect_args::count(value, &state.counters, params).unwrap_or(0);
-                let current = state.counters.get(var).copied().unwrap_or(0);
+                let delta =
+                    effect_args::count(value, &state.counters, declared, params).unwrap_or(0);
+                let current = declared.counter(&state.counters, var).unwrap_or(0);
                 set_counter(state, var, current.saturating_add(delta));
             }
             Effect::SubCounter { var, value } => {
-                let delta = effect_args::count(value, &state.counters, params).unwrap_or(0);
-                let current = state.counters.get(var).copied().unwrap_or(0);
+                let delta =
+                    effect_args::count(value, &state.counters, declared, params).unwrap_or(0);
+                let current = declared.counter(&state.counters, var).unwrap_or(0);
                 set_counter(state, var, current.saturating_sub(delta));
             }
             Effect::SetBool { var, value } => {
-                match effect_args::boolean(value, &state.booleans, params) {
+                match effect_args::boolean(value, &state.booleans, declared, params) {
                     Some(value) => {
                         state.booleans.insert(var.clone(), value);
                     }
@@ -688,12 +715,12 @@ pub fn apply_effects(
             }
             Effect::ListAppend { var, value } => {
                 if let Some(element) = effect_args::string(value, params) {
-                    state.lists.entry(var.clone()).or_default().push(element);
+                    declared.list_mut(&mut state.lists, var).push(element);
                 }
             }
             Effect::ListRemoveAt { var, index } => {
-                if let Some(index) = effect_args::count(index, &state.counters, params) {
-                    let list = state.lists.entry(var.clone()).or_default();
+                if let Some(index) = effect_args::count(index, &state.counters, declared, params) {
+                    let list = declared.list_mut(&mut state.lists, var);
                     if index < list.len() {
                         list.remove(index);
                     }
@@ -796,12 +823,152 @@ pub fn apply_effects(
     )
 }
 
+/// The legacy `item_count` field, when it holds the record's `items`
+/// counter. It starts at 0 whether or not the record wrote `items`, so a 0
+/// on a record that never wrote a declared `items` is not a stored value:
+/// readers then take the declared initial value, as for any other counter.
+pub(crate) fn stored_item_count(state: &EntityState, declared: &InitialValues) -> Option<usize> {
+    let unwritten = state.item_count == 0 && !state.counters.contains_key("items");
+    (!(unwritten && declared.counters.contains_key("items"))).then_some(state.item_count)
+}
+
 /// Write a counter, keeping the legacy `item_count` field in sync with the
 /// counter named `items`.
 fn set_counter(state: &mut EntityState, var: &str, value: usize) {
     state.counters.insert(var.to_string(), value);
     if var == "items" {
         state.item_count = value;
+    }
+}
+
+/// Run `apply` (a transition's effects) on `state` and record what it wrote.
+///
+/// The record is the difference between the state before and after, so it
+/// covers every effect, including one added later. The event carries it and
+/// replay restores it with [`EffectOutcome::restore`].
+pub(crate) fn record_effect_outcome<R>(
+    state: &mut EntityState,
+    apply: impl FnOnce(&mut EntityState) -> R,
+) -> (R, EffectOutcome) {
+    let counters = state.counters.clone();
+    let item_count = state.item_count;
+    let booleans = state.booleans.clone();
+    let lists = state.lists.clone();
+    let fields = state.fields.as_object().cloned().unwrap_or_default();
+
+    let applied = apply(state);
+
+    let mut changed_counters = changed_entries(&counters, &state.counters);
+    // Setting an unchanged `items` counter can still synchronize item_count.
+    // Record that write so restore calls set_counter for this case too.
+    if item_count != state.item_count {
+        changed_counters.insert("items".to_string(), state.item_count);
+    }
+    let outcome = EffectOutcome {
+        counters: changed_counters,
+        booleans: changed_entries(&booleans, &state.booleans),
+        lists: changed_entries(&lists, &state.lists),
+        fields: state
+            .fields
+            .as_object()
+            .map(|after| {
+                debug_assert!(
+                    fields.keys().all(|key| after.contains_key(key)),
+                    "an effect removed a field; the outcome records only set values"
+                );
+                after
+                    .iter()
+                    .filter(|(key, value)| fields.get(*key) != Some(*value))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    (applied, outcome)
+}
+
+/// The entries of `after` that are new or differ from `before`.
+fn changed_entries<V: PartialEq + Clone>(
+    before: &std::collections::BTreeMap<String, V>,
+    after: &std::collections::BTreeMap<String, V>,
+) -> std::collections::BTreeMap<String, V> {
+    debug_assert!(
+        before.keys().all(|key| after.contains_key(key)),
+        "an effect removed a state variable; the outcome records only set values"
+    );
+    after
+        .iter()
+        .filter(|(key, value)| before.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+impl EffectOutcome {
+    /// Write the recorded values back: what the effects wrote when the event
+    /// was committed, whatever the active spec's effects would compute now.
+    pub(crate) fn restore(&self, state: &mut EntityState) {
+        for (var, value) in &self.counters {
+            set_counter(state, var, *value);
+        }
+        for (var, value) in &self.booleans {
+            state.booleans.insert(var.clone(), *value);
+        }
+        for (var, value) in &self.lists {
+            state.lists.insert(var.clone(), value.clone());
+        }
+        if let Some(fields) = state.fields.as_object_mut() {
+            for (key, value) in &self.fields {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Re-derive the effects of a transition journaled before outcomes were
+/// recorded, without producing any value the journal does not hold.
+///
+/// A spawn whose child id came from the event's params writes that id again.
+/// A spawn that minted its id did so when the action ran, and the id was
+/// never journaled, so its field is removed: unknown, rather than a new id
+/// that names no record or an older child's id. Every other effect is
+/// re-derived from the table, as before. The spawn, schedule and custom
+/// requests are dropped: replay dispatches nothing. A variable the record
+/// did not store starts from zero, as it did when these moves ran, before
+/// declared initial values were read.
+pub(crate) fn apply_legacy_replay_effects(
+    state: &mut EntityState,
+    effects: &[Effect],
+    params: &serde_json::Value,
+) {
+    for effect in effects {
+        if let Effect::SpawnEntity {
+            store_id_in, id, ..
+        } = effect
+            && id
+                .as_ref()
+                .and_then(|id| effect_args::string(id, params))
+                .is_none()
+        {
+            if let Some(field) = store_id_in
+                && let Some(fields) = state.fields.as_object_mut()
+                && fields.remove(field).is_some()
+            {
+                tracing::warn!(
+                    entity_type = %state.entity_type,
+                    entity_id = %state.entity_id,
+                    field = %field,
+                    "replay cleared a spawned child id that an event from before \
+                     recorded outcomes did not journal"
+                );
+            }
+            continue;
+        }
+        let _requests = apply_effects(
+            state,
+            std::slice::from_ref(effect),
+            &InitialValues::default(),
+            params,
+        );
     }
 }
 
@@ -1244,8 +1411,12 @@ to = "Closed"
             status_clock: Default::default(),
         };
 
-        let (custom, scheduled, _spawns, _schedule_at) =
-            apply_effects(&mut state, &effects, &serde_json::json!({}));
+        let (custom, scheduled, _spawns, _schedule_at) = apply_effects(
+            &mut state,
+            &effects,
+            &InitialValues::default(),
+            &serde_json::json!({}),
+        );
 
         assert!(custom.is_empty());
         assert_eq!(scheduled.len(), 1);
@@ -1289,6 +1460,7 @@ to = "Closed"
         let (_custom, _scheduled, _spawns, _schedule_at) = apply_effects(
             &mut state,
             &effects,
+            &InitialValues::default(),
             &serde_json::json!({
                 "size_bytes": "30",
                 "released_bytes": 7,

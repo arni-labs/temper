@@ -23,9 +23,13 @@ opentelemetry = { workspace = true }
 [features]
 default = []
 cloud = []
+# `SyncCopy::execute_local`, for this crate's own tests.
+test-support = []
 
 [dev-dependencies]
-tokio = { workspace = true }
+temper-store-turso = { path = ".", features = ["test-support"] }
+temper-test-resource = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tempfile = "3"

@@ -290,7 +290,10 @@ fn a_proved_rule_whose_premise_no_run_meets_proves_nothing() {
     );
     assert!(!verdict.holds());
     assert_eq!(verdict.tag(), "VACUOUS");
-    assert!(verdict.to_string().contains("PROVES NOTHING"), "{verdict}");
+    assert!(
+        verdict.to_string().contains("CHECKS NOTHING AS WRITTEN"),
+        "{verdict}"
+    );
 }
 
 #[test]

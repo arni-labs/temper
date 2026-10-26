@@ -89,7 +89,7 @@ pub(super) fn run(
         let workers: Vec<_> = (0..solvers)
             .map(|i| {
                 scope.spawn(move || -> std::io::Result<Checked> {
-                    let mut z3 = Z3::start()?;
+                    let mut z3 = Z3::start(deadline)?;
                     z3.send(prelude)?;
                     z3.send(few)?;
                     let mut checked = Vec::new();

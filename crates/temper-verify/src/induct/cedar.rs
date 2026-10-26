@@ -142,7 +142,7 @@ impl Vocab<'_> {
         let answered = automaton.actions.iter().any(|a| {
             (a.name == action && a.kind == ActionKind::Internal)
                 || a.triggers.iter().any(|t| {
-                    t.on_success.as_deref() == Some(action)
+                    t.on_success.iter().any(|a| a == action)
                         || t.on_failure.as_deref() == Some(action)
                 })
         });

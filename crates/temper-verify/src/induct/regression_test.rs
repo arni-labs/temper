@@ -250,7 +250,7 @@ kind = "same_id"
         );
         assert_eq!(v.kinds.len(), 4);
         // Replay the actual generated declarations, not just their labels.
-        let mut z3 = solver::Z3::start().expect("solver starts");
+        let mut z3 = solver::Z3::start(None).expect("solver starts");
         z3.send(&prelude(&v, &BTreeSet::new()))
             .expect("prelude runs");
         assert!(z3.errors.is_empty(), "{:?}", z3.errors);

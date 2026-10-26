@@ -30,7 +30,7 @@
 //! that record is one its source may act on.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
@@ -38,6 +38,7 @@ use temper_spec::automaton::{Automaton, TargetResolver, TriggerKind};
 
 use super::env::ID;
 use super::state::JointState;
+use crate::model::ModelString;
 
 /// Someone outside the kernel.
 pub(super) const OUTSIDE: u32 = 0;
@@ -47,6 +48,8 @@ pub(super) const RUNTIME: u32 = 1;
 /// The senders a model knows, by number, and what Cedar lets each send.
 pub(super) struct Senders {
     askers: Vec<Asker>,
+    /// Each sender with resource-relative IDs forgotten after a different-ID hop.
+    detached: Vec<u32>,
     /// Entity, then action, then each sender's answer, once read.
     may: RefCell<BTreeMap<String, Answers>>,
     /// The policies, to decide again a move whose answer depends on the
@@ -66,8 +69,8 @@ type Question = (
     u32,
     String,
     String,
-    Option<String>,
-    BTreeMap<String, String>,
+    Option<ModelString>,
+    BTreeMap<String, ModelString>,
     BTreeMap<String, bool>,
 );
 
@@ -98,6 +101,24 @@ impl Senders {
                 askers.push(asker);
             }
         }
+        // ResourceId is relative to the current receiver, not a stable ID.
+        // Precompute a closed set of senders for chains that change receiver ID.
+        let mut detached = Vec::new();
+        for mut asker in askers.clone() {
+            if let Asker::Service { context, .. } = &mut asker {
+                for attr in context.values_mut() {
+                    if *attr == Attr::ResourceId {
+                        *attr = Attr::Unknown;
+                    }
+                }
+            }
+            let at = askers.iter().position(|a| a == &asker).unwrap_or_else(|| {
+                askers.push(asker);
+                askers.len() - 1
+            });
+            detached.push(at as u32);
+        }
+        detached.extend((detached.len()..askers.len()).map(|at| at as u32));
         let may = entities
             .into_iter()
             .map(|entity| {
@@ -111,6 +132,7 @@ impl Senders {
             .collect();
         Self {
             askers,
+            detached,
             may: RefCell::new(may),
             policies: policies.cloned(),
             decided: RefCell::default(),
@@ -172,17 +194,26 @@ impl Senders {
         if let Some(may) = self.decided.borrow().get(&question) {
             return *may;
         }
+        // A value the model made up is none of the literals it holds.
+        let literals: BTreeSet<String> = source_id
+            .into_iter()
+            .chain(target.strings.values())
+            .filter_map(|value| match value {
+                ModelString::Literal(text) if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         let asker = match (asker, source_id) {
             (Asker::Service { name, context }, Some(id)) => {
                 let mut context = context.clone();
-                context.insert("triggerSourceEntityId".to_string(), symbol(id));
+                context.insert("triggerSourceEntityId".to_string(), symbol(id, &literals));
                 service(name, context)
             }
             (asker, _) => asker.clone(),
         };
         let strings = target.strings.iter().map(|(field, value)| {
             let field = if field == ID { "id" } else { field.as_str() };
-            (field.to_string(), symbol(value))
+            (field.to_string(), symbol(value, &literals))
         });
         let booleans = target
             .booleans
@@ -194,11 +225,21 @@ impl Senders {
     }
 
     /// The number of the sender a reaction runs as: its declared principal,
-    /// or `invoker` without one.
-    pub(super) fn reaction(&self, declared_as: Option<&Asker>, invoker: u32) -> u32 {
+    /// or `invoker` without one. An inherited resource-relative ID remains
+    /// known only when this hop preserves the receiver ID.
+    pub(super) fn reaction(&self, declared_as: Option<&Asker>, invoker: u32, same_id: bool) -> u32 {
         declared_as
             .and_then(|asker| self.askers.iter().position(|a| a == asker))
-            .map_or(invoker, |at| at as u32)
+            .map_or_else(
+                || {
+                    if same_id {
+                        invoker
+                    } else {
+                        self.detached[invoker as usize]
+                    }
+                },
+                |at| at as u32,
+            )
     }
 
     /// Every sender's number.
@@ -245,13 +286,16 @@ pub(super) fn declared(
     Some(service(name, context))
 }
 
-/// A tracked string as Cedar may read it: `#n`, a value the model made up,
-/// is known only by which others it equals; any other is the literal itself.
-fn symbol(value: &str) -> Attr {
-    if value.starts_with('#') {
-        Attr::Same(value.to_string())
-    } else {
-        Attr::Value(Value::String(value.to_string()))
+/// A tracked string as Cedar may read it: a value the model made up is
+/// known only by which others it equals, and is none of `literals`; a
+/// literal is itself.
+fn symbol(value: &ModelString, literals: &BTreeSet<String>) -> Attr {
+    match value {
+        ModelString::Symbol(_) => Attr::Same {
+            name: value.to_string(),
+            unlike: literals.clone(),
+        },
+        ModelString::Literal(text) => Attr::Value(Value::String(text.clone())),
     }
 }
 
@@ -259,5 +303,66 @@ fn service(name: &str, context: BTreeMap<String, Attr>) -> Asker {
     Asker::Service {
         name: name.to_string(),
         context,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temper_spec::automaton::parse_automaton;
+
+    #[test]
+    fn inherited_source_id_does_not_become_a_different_targets_id() {
+        // A[id1] -> B[id1] declares the service. B then forwards the
+        // principal to C[id2] through a field, retaining A's id1 at runtime.
+        let a = parse_automaton(
+            r#"
+[automaton]
+name = "A"
+states = ["Ready", "Done"]
+initial = "Ready"
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Ready"]
+to = "Done"
+[[action.triggers]]
+name = "first"
+kind = "entity"
+target_entity = "B"
+target_action = "Forward"
+principal = "chain"
+[action.triggers.resolve_target]
+kind = "same_id"
+"#,
+        )
+        .unwrap();
+        let policy = SendAnalysis::new(
+            r#"
+permit(principal == Agent::"service:chain", action, resource) when {
+    context has triggerSourceEntityId && resource has id &&
+    context.triggerSourceEntityId == resource.id
+};
+"#,
+        )
+        .unwrap();
+        let entities = vec!["A".to_string()];
+        let senders = Senders::new(
+            &BTreeMap::from([("A", &a)]),
+            &entities,
+            std::iter::empty(),
+            Some(&policy),
+        );
+        let principal = declared(&a.actions[0].triggers[0], "A", "Start").unwrap();
+        let b = senders.reaction(Some(&principal), OUTSIDE, true);
+        assert_eq!(senders.may(b, "A", "Start"), May::Yes);
+        let c = senders.reaction(None, b, false);
+        assert_eq!(senders.may(c, "A", "Start"), May::Maybe);
+        // More same-ID hops cannot restore knowledge of the original ID.
+        assert_eq!(senders.reaction(None, c, true), c);
+        assert_eq!(senders.reaction(None, c, false), c);
+        // Same-ID chains preserve knowledge; a declaration starts fresh.
+        assert_eq!(senders.reaction(None, b, true), b);
+        assert_eq!(senders.reaction(Some(&principal), c, true), b);
     }
 }
