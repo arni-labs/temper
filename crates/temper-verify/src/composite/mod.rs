@@ -17,8 +17,9 @@ pub mod joint;
 pub mod verify;
 
 pub use joint::{
-    DroppedReaction, JointInvariantResult, JointOutcome, JointReplay, JointStep, TraceMove,
-    replay_joint_invariants, verify_joint_invariants,
+    DroppedReaction, JointInvariantResult, JointLivenessResult, JointOutcome, JointReplay,
+    JointStep, LivenessOutcome, StuckCase, TraceMove, replay_joint_invariants,
+    verify_joint_invariants, verify_joint_liveness,
 };
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,

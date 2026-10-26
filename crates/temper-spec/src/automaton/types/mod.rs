@@ -183,6 +183,19 @@ pub struct Liveness {
     /// If true, asserts that actions are always available (no deadlock).
     #[serde(default)]
     pub has_actions: Option<bool>,
+    /// A condition the records reach by themselves: from every reachable
+    /// state, the moves the system makes (state timers, module answers,
+    /// reactions, and the actions in `relies_on`) can bring them to a state
+    /// with nothing in flight where it holds. It may read related records
+    /// (`Type[id].field`), and is checked on their joint model.
+    #[serde(default)]
+    pub eventually: Option<Expr>,
+    /// Actions of this entity that code outside the specs sends whenever
+    /// `eventually` does not hold, such as a site that nudges a record it
+    /// finds behind. The check counts them as moves the system makes while
+    /// the condition is false.
+    #[serde(default)]
+    pub relies_on: Vec<String>,
 }
 
 /// A dispatch record the runtime's WASM and adapter dispatchers look up by
