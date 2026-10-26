@@ -163,7 +163,11 @@ pub fn check_joint(
     for automaton in automatons {
         let owner = &automaton.automaton.name;
         for invariant in &automaton.invariants {
-            if !invariant.assert.related_types().is_empty() && all_declared(&invariant.assert) {
+            // MUTANT: only a rule whose spec gives lemmas is tried.
+            if !invariant.assert.related_types().is_empty()
+                && all_declared(&invariant.assert)
+                && !invariant.lemma.is_empty()
+            {
                 invariants.insert((owner.clone(), invariant.name.clone()));
             }
         }
