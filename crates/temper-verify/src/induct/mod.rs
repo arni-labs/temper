@@ -348,24 +348,17 @@ fn prove_one(
     // invariant is tried first with its lemmas alone, or with none written
     // with the rule at every state, then with every guess of the prover's.
     // A failure with more clauses held replaces the one before.
-    let guessed: BTreeSet<String> = guesses.iter().map(|g| g.name(rule)).collect();
-    let droppable: BTreeSet<usize> = clauses
-        .named
-        .iter()
-        .enumerate()
-        .filter(|(_, (name, ..))| {
-            name != rule && (guessed.contains(name) || lemmas.iter().any(|l| l.name == *name))
-        })
-        .map(|(i, _)| i)
-        .collect();
-    let everywhere = Guess::Everywhere.name(rule);
-    let first: BTreeSet<usize> = clauses
-        .named
-        .iter()
-        .enumerate()
-        .filter(|(_, (name, ..))| {
-            guessed.contains(name) && (!lemmas.is_empty() || *name != everywhere)
-        })
+    // The clause list holds the invariant (if any), then guesses, then
+    // written lemmas. Their roles and indices decide what may be left out
+    // or dropped; display names may coincide with the mandatory invariant.
+    let required = usize::from(matches!(kind, Rule::Always(_)));
+    let guessed = required..required + guesses.len();
+    let written = guessed.end..clauses.named.len();
+    let droppable: BTreeSet<usize> = guessed.clone().chain(written.clone()).collect();
+    let first: BTreeSet<usize> = guessed
+        .clone()
+        .zip(&guesses)
+        .filter(|(_, g)| !lemmas.is_empty() || !matches!(g, Guess::Everywhere))
         .map(|(i, _)| i)
         .collect();
     let mut tries = Vec::new();
@@ -402,21 +395,17 @@ fn prove_one(
             Ok((last, excluded))
         })?;
     let proved = settled.proved();
-    let out: BTreeSet<&str> = settled
-        .out
-        .iter()
-        .map(|&i| clauses.named[i].0.as_str())
-        .collect();
     let found = match proved {
-        true => (guesses.iter())
-            .filter(|g| !out.contains(g.name(rule).as_str()))
-            .map(pinned)
+        true => guessed
+            .zip(&guesses)
+            .filter(|(i, _)| !settled.out.contains(i))
+            .map(|(_, g)| pinned(g))
             .collect(),
         false => Vec::new(),
     };
     let dropped = (settled.dropped.into_iter())
+        .filter(|(i, _)| written.contains(i))
         .map(|(i, why)| (clauses.named[i].0.clone(), why))
-        .filter(|(name, _)| lemmas.iter().any(|l| &l.name == name))
         .collect();
     let mut limits: Vec<String> = builder.limits.into_inner().into_iter().collect();
     limits.extend(

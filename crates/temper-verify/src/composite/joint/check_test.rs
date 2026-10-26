@@ -205,6 +205,92 @@ fn invariant(sources: &[&str], time: Duration) -> JointVerdict {
     invariants.remove(0)
 }
 
+/// A single-state job for name-collision regressions.
+fn job(rule: &str, safe: bool, lemma: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Job"
+states = ["Idle"]
+initial = "Idle"
+
+[[state]]
+name = "safe"
+type = "bool"
+initial = {safe}
+
+[[action]]
+name = "Wait"
+kind = "input"
+from = ["Idle"]
+to = "Idle"
+
+[[invariant]]
+name = "{rule}"
+assert = "safe == true"
+{lemma}"#
+    )
+}
+
+#[test]
+fn a_rule_named_like_a_guess_cannot_be_omitted_or_dropped() {
+    for rule in ["is_safe", "Job in Idle: safe", "Job in Idle: not safe"] {
+        let verdict = invariant(&[&job(rule, false, "")], TIME);
+        let JointVerdict::Invariant(walked, Some(proof)) = &verdict else {
+            panic!("an initially false invariant must be walked: {verdict}");
+        };
+        assert!(!walked.holds(), "{verdict}");
+        assert!(!proof.proved(), "{verdict}");
+        assert_eq!(verdict.tag(), "FAIL");
+    }
+}
+
+#[test]
+fn a_broken_lemma_named_like_its_rule_is_dropped_and_named() {
+    let lemma = r#"
+[[invariant.lemma]]
+name = "is_safe"
+assert = "false"
+"#;
+    let verdict = invariant(&[&job("is_safe", true, lemma)], TIME);
+    let JointVerdict::Proved(proof, _) = &verdict else {
+        panic!("proved without the same-named broken lemma: {verdict}");
+    };
+    assert_eq!(
+        proof.dropped.get("is_safe").map(String::as_str),
+        Some("fails after start"),
+        "{verdict}"
+    );
+    assert!(
+        verdict
+            .to_string()
+            .contains("dropped the written lemma is_safe, which fails after start"),
+        "{verdict}"
+    );
+}
+
+#[test]
+fn a_refused_lemma_named_like_its_rule_is_dropped_and_named() {
+    let lemma = r#"
+[[invariant.lemma]]
+name = "is_safe"
+assert = "(=> $Job.nope true)"
+"#;
+    let verdict = invariant(&[&job("is_safe", true, lemma)], TIME);
+    let JointVerdict::Proved(proof, _) = &verdict else {
+        panic!("proved without the same-named refused lemma: {verdict}");
+    };
+    let why = proof.dropped.get("is_safe").expect("is_safe dropped");
+    assert!(why.starts_with("the solver refuses: "), "{why}");
+    assert!(why.contains("Job.nope"), "{why}");
+    assert!(
+        verdict
+            .to_string()
+            .contains("dropped the written lemma is_safe, which the solver refuses:"),
+        "{verdict}"
+    );
+}
+
 #[test]
 fn a_rule_with_its_lemmas_is_proved_and_not_walked() {
     let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN])], TIME);
