@@ -11,6 +11,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
+use super::field_index_rows::sync_field_index;
 use super::unchanged_projections::{
     ExistingProjection, apply_event_counters, drop_event_counters, projection_hash,
     store_event_counters,
@@ -201,46 +202,14 @@ impl TursoEventStore {
         .await
         .map_err(storage_error)?;
 
-        // Delete existing rows for this entity, then re-insert.
-        // This is simpler than tracking individual field changes and handles
-        // field removal correctly.
-        tx.execute(
-            "DELETE FROM entity_field_index WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-
         let indexed_fields = indexed_projection_fields(status, fields);
-        if !indexed_fields.is_empty() {
-            let mut sql = String::from(
-                "INSERT INTO entity_field_index \
-                 (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
-            );
-            let mut values = Vec::with_capacity(indexed_fields.len() * 6);
-
-            for (index, (field_name, field_value)) in indexed_fields.iter().enumerate() {
-                if index > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str("(?, ?, ?, ?, ?, ?)");
-                values.push(Value::from(tenant.to_string()));
-                values.push(Value::from(entity_type.to_string()));
-                values.push(Value::from(entity_id.to_string()));
-                values.push(Value::from(field_name.clone()));
-                values.push(
-                    field_value
-                        .as_ref()
-                        .map(|value| Value::from(value.clone()))
-                        .unwrap_or(Value::Null),
-                );
-                values.push(Value::from(status.to_string()));
-            }
-
-            tx.execute(&sql, params_from_iter(values))
-                .await
-                .map_err(storage_error)?;
-        }
+        sync_field_index(
+            &tx,
+            [tenant, entity_type, entity_id],
+            status,
+            &indexed_fields,
+        )
+        .await?;
 
         tx.commit().await.map_err(storage_error)?;
         Ok(())
@@ -417,31 +386,22 @@ impl TursoEventStore {
                 .map_err(storage_error)?;
         }
 
+        // An entity that may already have rows writes only the ones that
+        // changed. A known-new entity has none, so its rows go in one insert.
+        let (new_indexes, existing_indexes): (Vec<_>, Vec<_>) = changed_indexes
+            .into_iter()
+            .partition(|(_, _, _, _, known_new)| *known_new);
+        for (entity_type, entity_id, status, indexed_fields, _) in &existing_indexes {
+            sync_field_index(
+                &tx,
+                [tenant, entity_type.as_str(), entity_id.as_str()],
+                status,
+                indexed_fields,
+            )
+            .await?;
+        }
+        let changed_indexes = new_indexes;
         if !changed_indexes.is_empty() {
-            let delete_targets = changed_indexes
-                .iter()
-                .filter(|(_, _, _, _, known_new)| !known_new)
-                .collect::<Vec<_>>();
-            if !delete_targets.is_empty() {
-                let mut delete_sql =
-                    String::from("DELETE FROM entity_field_index WHERE tenant = ? AND (");
-                let mut delete_values = Vec::with_capacity(1 + delete_targets.len() * 2);
-                delete_values.push(Value::from(tenant.to_string()));
-                for (index, (entity_type, entity_id, _, _, _)) in delete_targets.iter().enumerate()
-                {
-                    if index > 0 {
-                        delete_sql.push_str(" OR ");
-                    }
-                    delete_sql.push_str("(entity_type = ? AND entity_id = ?)");
-                    delete_values.push(Value::from(entity_type.clone()));
-                    delete_values.push(Value::from(entity_id.clone()));
-                }
-                delete_sql.push(')');
-                tx.execute(&delete_sql, params_from_iter(delete_values))
-                    .await
-                    .map_err(storage_error)?;
-            }
-
             let indexed_field_count = changed_indexes
                 .iter()
                 .map(|(_, _, _, fields, _)| fields.len())

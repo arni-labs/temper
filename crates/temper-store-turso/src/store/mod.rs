@@ -43,6 +43,7 @@ mod entity_listing;
 mod event_store;
 mod evolution;
 pub mod field_index;
+mod field_index_rows;
 mod instrumentation;
 mod migration_support;
 pub mod ots;
