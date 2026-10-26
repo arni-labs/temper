@@ -405,18 +405,19 @@ effect = ["locked = true"]
 
 #[test]
 fn a_record_waiting_for_a_scheduled_action_is_settled() {
-    // Sealing leaves the parent unlocked and locks it a minute later; it
-    // may close in that minute, and the rule must hold while it waits.
+    // Closing unlocks the parent and locks it again a minute later; the
+    // rule must hold in that minute too. With no lemma, only the rule's own
+    // clause, read where nothing is in flight, can fail there.
     let locks_later = format!(
-        "{}{LOCK}",
-        parent(", \"locked = false\", \"schedule('Lock', 60)\"")
+        "{}effect = [\"locked = false\", \"schedule('Lock', 60)\"]\n{LOCK}",
+        parent("")
     );
-    let verdict = invariant(&[&locks_later, &child(&[LOCKED_PAST_OPEN])], budget());
+    let verdict = invariant(&[&locks_later, &child(&[])], budget());
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("proved while the lock waits: {verdict}");
     };
     let why = tried.shortfall().expect("not proved");
-    assert!(why.contains("after Parent.Seal"), "{why}");
+    assert!(why.contains("after Parent.Close"), "{why}");
 }
 
 #[test]
