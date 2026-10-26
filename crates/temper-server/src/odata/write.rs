@@ -787,12 +787,20 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
+                .get_or_create_tenant_entity_by(
+                    &tenant,
+                    &entity_type,
+                    &entity_id,
+                    initial_fields,
+                    &agent_ctx,
+                )
                 .await
             {
                 Ok(response) => {
                     // Creation is not a dispatch: a record created into a
-                    // timed first state has its timer armed here.
+                    // timed first state has its timer armed here. Its row
+                    // committed with the `Created` event when the store keeps
+                    // rows with the journal.
                     state
                         .arm_state_timeouts_on_creation(
                             &tenant,
