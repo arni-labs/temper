@@ -414,7 +414,16 @@ impl crate::state::ServerState {
                 ctx.action,
             );
         }
+        // The clock starts at the event that entered or reset the state, as
+        // its committed row says (`committed_timer_row`), not when the commit
+        // returned: a slow commit must not move the deadline, and a restart
+        // arms from the row.
         let now = sim_now();
+        let started_at = response
+            .state
+            .events
+            .back()
+            .map_or(now, |event| event.timestamp);
         let mut timer = declared_timer(
             ctx.tenant,
             ctx.entity_type,
@@ -422,14 +431,14 @@ impl crate::state::ServerState {
             &st,
             &response.state,
             ctx.agent_ctx,
-            now,
+            started_at,
         );
         if self.entity_rows_follow_commits() {
             // The event that entered or reset the state committed this
             // timer's row under this id (`committed_timer_row`).
             timer.arm_id = super::entity_rows::timer_arm_id(&st.state, response.state.sequence_nr);
         }
-        let delay = Duration::from_secs(st.after_seconds);
+        let delay = remaining_budget(started_at, st.after_seconds, now);
         self.start_armed_timer(timer, delay, Reservation::Fresh)
             .await;
     }
@@ -532,6 +541,18 @@ impl crate::state::ServerState {
             .has_armed(&EntityKey::new(tenant, entity_type, entity_id))
     }
 
+    /// The tracker's cancellation value for `entity` now: it changes with
+    /// every arm and cancellation of its timer in this process.
+    pub(super) fn state_timer_turn(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> u64 {
+        self.state_timeout_tracker
+            .current(&EntityKey::new(tenant, entity_type, entity_id))
+    }
+
     /// The timer `entity` has armed now, if any.
     pub(super) fn armed_state_timer(
         &self,
@@ -612,7 +633,7 @@ impl crate::state::ServerState {
             gate: timer.boot_gate.clone(),
             ..Default::default()
         };
-        self.follow_state_timer(
+        self.follow_owned_state_timer(
             &timer.tenant,
             &timer.entity_type,
             &timer.entity_id,
@@ -736,13 +757,17 @@ impl crate::state::ServerState {
                     let belongs =
                         current.state.status == timer.state && state.declares_state_timer(&timer);
                     if !belongs {
+                        let follow = super::state_timer_reconcile::Follow {
+                            armed_by: Some(&timer.agent_ctx),
+                            ..Default::default()
+                        };
                         state
-                            .reconcile_state_timers(
+                            .follow_owned_state_timer(
                                 &timer.tenant,
                                 &timer.entity_type,
                                 &timer.entity_id,
                                 &current.state,
-                                Some(&timer.agent_ctx),
+                                follow,
                             )
                             .await;
                     } else if current.state.sequence_nr > timer.sequence_nr {

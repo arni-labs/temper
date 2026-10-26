@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use temper_runtime::persistence::StateTimerRecord;
+use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 use tokio::sync::Semaphore;
@@ -49,29 +49,28 @@ impl ServerState {
 
     /// The record's timer row, when the event store commits timer rows with
     /// the events that change them ([`Self::entity_rows_follow_commits`]).
-    /// None: no row, rows that do not follow commits, or a row that could
-    /// not be read (logged; the caller then writes as if there were none).
+    /// None: no row, or rows that do not follow commits. An error is a row
+    /// that could not be read (logged): it may hold the committed arm, so it
+    /// is not "no row".
     pub(super) async fn committed_state_timer_row(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-    ) -> Option<StateTimerRecord> {
+    ) -> Result<Option<StateTimerRecord>, PersistenceError> {
         if !self.entity_rows_follow_commits() {
-            return None;
+            return Ok(None);
         }
-        let store = self.timer_rows_for_tenant(tenant.as_str()).await?;
-        match store
+        let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
+            return Ok(None);
+        };
+        store
             .state_timer_row(tenant.as_str(), entity_type, entity_id)
             .await
-        {
-            Ok(row) => row,
-            Err(error) => {
+            .inspect_err(|error| {
                 tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
                     "state timer row not readable");
-                None
-            }
-        }
+            })
     }
 
     /// Write a newly armed timer's row. A failed write leaves the timer armed
@@ -85,7 +84,7 @@ impl ServerState {
         let committed = self
             .committed_state_timer_row(&timer.tenant, &timer.entity_type, &timer.entity_id)
             .await;
-        if committed.is_some_and(|row| row.arm_id == timer.arm_id) {
+        if committed.is_ok_and(|row| row.is_some_and(|row| row.arm_id == timer.arm_id)) {
             return;
         }
         let record = match timer_record(timer) {
@@ -114,7 +113,7 @@ impl ServerState {
             let held = self
                 .committed_state_timer_row(&timer.tenant, &timer.entity_type, &timer.entity_id)
                 .await;
-            if held.is_none_or(|row| row.arm_id != timer.arm_id) {
+            if !held.is_ok_and(|row| row.is_some_and(|row| row.arm_id == timer.arm_id)) {
                 return;
             }
         }
