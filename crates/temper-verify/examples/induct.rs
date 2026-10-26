@@ -111,6 +111,9 @@ fn main() -> std::io::Result<()> {
                 never.join("; ")
             )?;
         }
+        for reason in &proof.unheld {
+            writeln!(out, "  the rule reads {reason}")?;
+        }
         for limit in &proof.limits {
             writeln!(out, "  limit: {limit}")?;
         }

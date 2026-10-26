@@ -51,7 +51,14 @@ impl Moves<'_, '_, '_> {
                     let next = match op {
                         AssignOp::Set => value,
                         AssignOp::Add => format!("(+ {now} {value})"),
-                        AssignOp::Sub => format!("(ite (>= {now} {value}) (- {now} {value}) 0)"),
+                        AssignOp::Sub => {
+                            // Bound once, so a chain of subtractions grows
+                            // the term by a step each, not twice over.
+                            let (was, by) = (self.enc.local(), self.enc.local());
+                            format!(
+                                "(let (({was} {now}) ({by} {value})) (ite (>= {was} {by}) (- {was} {by}) 0))"
+                            )
+                        }
                     };
                     terms.insert(var.clone(), next);
                 }
@@ -186,6 +193,14 @@ impl Moves<'_, '_, '_> {
             Arg::Lit(literal) => Enc::literal(literal, sort),
             _ => None,
         };
-        held.unwrap_or_else(|| self.enc.fresh("h", sort.smt()))
+        held.unwrap_or_else(|| {
+            let reason = match arg {
+                Arg::Var(var) if self.enc.v.var(entity, var).is_none() => {
+                    self.enc.why_not(entity, var)
+                }
+                other => format!("a value of another sort ({entity}: {other})"),
+            };
+            self.enc.unknown_of(reason, sort.smt())
+        })
     }
 }

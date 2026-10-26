@@ -10,7 +10,7 @@
 //! show.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::Initial;
 use temper_spec::predicate::{CmpOp, Expr, Literal, Operand, Set};
@@ -29,6 +29,8 @@ enum Term {
 pub(super) struct Enc<'v, 'a> {
     pub(super) v: &'v Vocab<'a>,
     fresh: RefCell<(usize, Vec<String>)>,
+    /// Why each unknown since the last `take_unheld` was made up.
+    unheld: RefCell<BTreeSet<String>>,
 }
 
 impl<'v, 'a> Enc<'v, 'a> {
@@ -36,12 +38,54 @@ impl<'v, 'a> Enc<'v, 'a> {
         Self {
             v,
             fresh: RefCell::new((0, Vec::new())),
+            unheld: RefCell::default(),
+        }
+    }
+
+    /// An unknown condition, made up because the proof does not hold what
+    /// `reason` names.
+    fn unknown(&self, reason: String) -> String {
+        self.unknown_of(reason, "Bool")
+    }
+
+    /// An unknown value of `sort`, made up because the proof does not hold
+    /// what `reason` names.
+    pub(super) fn unknown_of(&self, reason: String, sort: &str) -> String {
+        self.unheld.borrow_mut().insert(reason);
+        self.fresh("h", sort)
+    }
+
+    /// Why the unknowns made up since the last call were made up.
+    pub(super) fn take_unheld(&self) -> BTreeSet<String> {
+        std::mem::take(&mut self.unheld.borrow_mut())
+    }
+
+    /// Why `owner`'s variable `name` is not held: a list, or not one of its
+    /// variables.
+    pub(super) fn why_not(&self, owner: &str, name: &str) -> String {
+        let declared = self
+            .v
+            .automaton(owner)
+            .state
+            .iter()
+            .any(|var| var.name == name);
+        if declared {
+            format!("a list ({owner}.{name})")
+        } else {
+            format!("a name {owner} does not declare ({name})")
         }
     }
 
     /// The declarations of the unknowns made up since the last call.
     pub(super) fn take_decls(&self) -> Vec<String> {
         std::mem::take(&mut self.fresh.borrow_mut().1)
+    }
+
+    /// A fresh name for a `let` binding, declared nowhere.
+    pub(super) fn local(&self) -> String {
+        let mut fresh = self.fresh.borrow_mut();
+        fresh.0 += 1;
+        format!("l!{}", fresh.0)
     }
 
     /// A fresh constant of `sort`, declared with the obligation.
@@ -99,30 +143,37 @@ impl<'v, 'a> Enc<'v, 'a> {
             ),
             Expr::Var(name) => match self.v.var(owner, name) {
                 Some(Sort::Bool) => Self::var(frame, owner, name),
-                _ => self.fresh("h", "Bool"),
+                Some(_) => self.unknown(format!("a field read as a condition ({owner}.{name})")),
+                None => self.unknown(self.why_not(owner, name)),
             },
             Expr::Compare { lhs, op, rhs } => {
-                let (Some(l), Some(r)) = (
-                    self.operand(lhs, owner, frame),
-                    self.operand(rhs, owner, frame),
-                ) else {
-                    return self.fresh("h", "Bool");
-                };
-                self.compare(l, *op, r)
-                    .unwrap_or_else(|| self.fresh("h", "Bool"))
+                let terms = self
+                    .operand(lhs, owner, frame)
+                    .and_then(|l| Ok((l, self.operand(rhs, owner, frame)?)));
+                match terms {
+                    Ok((l, r)) => self.compare(l, *op, r).unwrap_or_else(|| {
+                        self.unknown(format!(
+                            "a comparison of mixed sorts or by order on strings ({expr})"
+                        ))
+                    }),
+                    Err(reason) => self.unknown(reason),
+                }
             }
             Expr::In {
                 value,
                 set: Set::List(items),
                 negated,
             } => {
-                let Some(value) = self.operand(value, owner, frame) else {
-                    return self.fresh("h", "Bool");
+                let value = match self.operand(value, owner, frame) {
+                    Ok(value) => value,
+                    Err(reason) => return self.unknown(reason),
                 };
                 let mut parts = Vec::new();
                 for item in items {
                     let one = self.compare(self.copy(&value), CmpOp::Eq, Term::Lit(item.clone()));
-                    parts.push(one.unwrap_or_else(|| self.fresh("h", "Bool")));
+                    parts.push(one.unwrap_or_else(|| {
+                        self.unknown(format!("a literal of another sort in a list ({expr})"))
+                    }));
                 }
                 let any = match parts.len() {
                     0 => "false".to_string(),
@@ -134,12 +185,12 @@ impl<'v, 'a> Enc<'v, 'a> {
                     any
                 }
             }
-            Expr::In { .. } => self.fresh("h", "Bool"),
+            Expr::In { .. } => self.unknown(format!("membership in a list field ({expr})")),
             Expr::Empty(name) => match self.v.var(owner, name) {
                 Some(Sort::Str) => {
                     format!("(= {} {})", Self::var(frame, owner, name), Self::lit(""))
                 }
-                _ => self.fresh("h", "Bool"),
+                _ => self.unknown(self.why_not(owner, name)),
             },
         }
     }
@@ -157,19 +208,21 @@ impl<'v, 'a> Enc<'v, 'a> {
         }
     }
 
-    fn operand(&self, operand: &Operand, owner: &str, frame: &str) -> Option<Term> {
+    /// An operand's term, or why the proof does not hold it.
+    fn operand(&self, operand: &Operand, owner: &str, frame: &str) -> Result<Term, String> {
         let same_id = |id_field: &str| matches!(id_field, "Id" | "id");
         match operand {
-            Operand::Status => Some(Term::Status(owner.to_string(), Self::status(frame, owner))),
+            Operand::Status => Ok(Term::Status(owner.to_string(), Self::status(frame, owner))),
             Operand::Var(name) => self
                 .v
                 .var(owner, name)
-                .map(|sort| Term::Val(Self::var(frame, owner, name), sort)),
-            Operand::Len(_) => None,
+                .map(|sort| Term::Val(Self::var(frame, owner, name), sort))
+                .ok_or_else(|| self.why_not(owner, name)),
+            Operand::Len(name) => Err(format!("the length of a list ({owner}.{name})")),
             Operand::CrossStatus {
                 entity_type,
                 id_field,
-            } if same_id(id_field) && self.v.scope.contains(entity_type) => Some(Term::Status(
+            } if same_id(id_field) && self.v.scope.contains(entity_type) => Ok(Term::Status(
                 entity_type.clone(),
                 Self::status(frame, entity_type),
             )),
@@ -177,12 +230,25 @@ impl<'v, 'a> Enc<'v, 'a> {
                 entity_type,
                 id_field,
                 field,
-            } if same_id(id_field) => self
+            } if same_id(id_field) && self.v.scope.contains(entity_type) => self
                 .v
                 .var(entity_type, field)
-                .map(|sort| Term::Val(Self::var(frame, entity_type, field), sort)),
-            Operand::CrossStatus { .. } | Operand::CrossField { .. } => None,
-            Operand::Lit(l) => Some(Term::Lit(l.clone())),
+                .map(|sort| Term::Val(Self::var(frame, entity_type, field), sort))
+                .ok_or_else(|| self.why_not(entity_type, field)),
+            Operand::CrossStatus {
+                entity_type,
+                id_field,
+            }
+            | Operand::CrossField {
+                entity_type,
+                id_field,
+                ..
+            } => Err(if same_id(id_field) {
+                format!("a record of a type the specs do not define ({entity_type})")
+            } else {
+                format!("a record found through a field ({entity_type}[{id_field}])")
+            }),
+            Operand::Lit(l) => Ok(Term::Lit(l.clone())),
         }
     }
 
@@ -278,9 +344,9 @@ pub(super) fn int(n: i64) -> String {
 }
 
 /// The declarations every obligation shares.
-pub(super) fn prelude(v: &Vocab<'_>) -> String {
+pub(super) fn prelude(v: &Vocab<'_>, literals: &BTreeSet<String>) -> String {
     let mut out = String::from("(declare-sort Str 0)\n");
-    let literals: Vec<String> = v.literals.iter().map(|l| Enc::lit(l)).collect();
+    let literals: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
     for l in &literals {
         out.push_str(&format!("(declare-const {l} Str)\n"));
     }
