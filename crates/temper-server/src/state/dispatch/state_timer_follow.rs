@@ -8,9 +8,9 @@
 //! [`TimerFollow::WaitsForCaller`]).
 //!
 //! At boot, after the rows are re-armed, a walk makes each record that had a
-//! row follow the state it replays into: a row of `Waiting` on a record that
-//! now replays into `Review` gets `Review`'s timer at once, not when the stale
-//! one fires. A record in a timed state with no row is not armed: it waits for
+//! row follow the state it replays into: a row armed under an older spec, on
+//! a record whose state now declares another timer, gets the new timer at
+//! once, not when the stale one fires. A record in a timed state with no row is not armed: it waits for
 //! its next action ([`Arming::FromRow`]). The walk counts those records, and
 //! ends with one log line of counts per tenant and type.
 //!
