@@ -575,6 +575,8 @@ fn a_rule_that_breaks_with_every_sender_allowed_proves_nothing() {
     let verdict = invariant_under(&gate("status in ['Shut'] => locked == false"), "");
     assert_eq!(verdict.tag(), "VACUOUS", "{verdict}");
     assert!(!verdict.holds(), "{verdict}");
+    let text = verdict.to_string();
+    assert!(!text.contains("every sender allowed"), "{text}");
 }
 
 #[test]
@@ -582,4 +584,6 @@ fn a_premise_dead_in_the_spec_proves_nothing() {
     let verdict = invariant_under(&gate("status in ['Sealed'] => locked == true"), "");
     assert_eq!(verdict.tag(), "VACUOUS", "{verdict}");
     assert!(!verdict.holds(), "{verdict}");
+    let text = verdict.to_string();
+    assert!(!text.contains("every sender allowed"), "{text}");
 }
