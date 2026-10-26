@@ -27,6 +27,7 @@ mod files;
 mod pool;
 mod push;
 mod remote;
+mod restore;
 use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::Remote;
@@ -98,9 +99,6 @@ const REMOTE_STATEMENT_FAILED: &str = "failed to execute sql";
 /// One push attempt. The engine's HTTP client has no timeout of its own.
 const PUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long opening the engine (a restore included) may take.
-const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
-
 impl std::fmt::Debug for SyncCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncCopy").finish_non_exhaustive()
@@ -159,14 +157,12 @@ impl SyncCopy {
             .with_client_name("temper")
             .bootstrap_if_empty(true)
             .build();
-        // A restore downloads the whole database; the engine sets no timeout.
-        let db = tokio::time::timeout(BUILD_TIMEOUT, opening)
+        let db = restore::while_progressing(opening, || restore::footprint(path))
             .await
-            .map_err(|_| {
+            .ok_or_else(|| {
                 DriverError::SyncSetup(format!(
-                    "opening {} with its remote copy took over {} s",
-                    path.display(),
-                    BUILD_TIMEOUT.as_secs()
+                    "opening {} with its remote copy took over 120 s",
+                    path.display()
                 ))
             })??;
         let state = match std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {

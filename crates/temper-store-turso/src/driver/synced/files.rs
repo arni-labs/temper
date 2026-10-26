@@ -7,6 +7,11 @@ use super::DriverError;
 /// Written next to the database when the remote refused a change.
 pub(super) const DIVERGED_SUFFIX: &str = "-sync-diverged";
 
+/// Written next to the database while it is restored from the remote, and
+/// removed once the restore has finished. A file found with it holds only part
+/// of the remote, and nothing of its own.
+pub(super) const RESTORING_SUFFIX: &str = "-sync-restoring";
+
 /// Move the database file and every file the engine keeps beside it to
 /// `<name>.behind-<unix seconds>`, so the next open restores from the remote.
 pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
@@ -98,6 +103,9 @@ pub(super) fn describe(path: &Path) -> Result<String, DriverError> {
         )),
         Err(_) => lines.push("synced: no sync metadata".to_string()),
     }
+    if sidecar(path, RESTORING_SUFFIX).exists() {
+        lines.push("restoring: a restore from the remote started and has not finished".to_string());
+    }
     if let Some(opened_at) = unchecked_since(path) {
         lines.push(format!(
             "unchecked: since a start with changes up to {opened_at}"
@@ -177,5 +185,48 @@ mod tests {
         std::fs::write(&path, b"SQLite format 3\0").expect("write db");
         std::fs::write(sidecar(&path, "-info"), b"{}").expect("write info");
         check_local_files(&path).expect("a synced file opens as it is");
+    }
+
+    #[test]
+    fn a_restore_cut_short_is_moved_aside_and_run_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        std::fs::write(&path, b"SQLite format 3\0part of the remote").expect("write db");
+        std::fs::write(sidecar(&path, RESTORING_SUFFIX), b"").expect("write marker");
+
+        check_local_files(&path).expect("a partial restore is restored again");
+        assert!(!path.exists(), "the next restore starts from no file");
+        let aside = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").path())
+            .find(|entry| entry.is_dir())
+            .expect("the partial file is kept aside");
+        assert_eq!(
+            std::fs::read(aside.join("app.db")).expect("kept"),
+            b"SQLite format 3\0part of the remote"
+        );
+        assert!(
+            aside.join("app.db-sync-restoring").exists(),
+            "the marker goes with the file it describes"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_wrote_nothing_or_finished_stays_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        std::fs::write(sidecar(&path, RESTORING_SUFFIX), b"").expect("write marker");
+        check_local_files(&path).expect("nothing was written, so nothing to keep");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            1,
+            "only the marker"
+        );
+
+        // The engine writes its metadata only after the last page is on disk.
+        std::fs::write(&path, b"SQLite format 3\0").expect("write db");
+        std::fs::write(sidecar(&path, "-info"), b"{}").expect("write info");
+        check_local_files(&path).expect("a finished restore opens as it is");
+        assert!(path.exists());
     }
 }

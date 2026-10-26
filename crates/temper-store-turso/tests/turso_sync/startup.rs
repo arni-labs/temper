@@ -107,6 +107,40 @@ async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
 }
 
 #[tokio::test]
+async fn a_restore_cut_short_is_kept_aside_and_run_again_at_the_next_start() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_a_dir, a_path) = machine();
+    let a = server.open(&a_path).await;
+    write(&a, "whole", 0).await;
+    push(&a).await;
+    drop(a);
+
+    // What a start stopped part way through a restore leaves: some of the
+    // remote's pages, the restore's marker, and no sync metadata.
+    let (b_dir, b_path) = machine();
+    std::fs::write(&b_path, vec![7u8; 64 * 1024]).expect("partial file");
+    std::fs::write(b_dir.path().join("app.db-sync-restoring"), b"").expect("marker");
+
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "whole").await, 1, "the restore ran again in full");
+    assert!(
+        !b_dir.path().join("app.db-sync-restoring").exists(),
+        "a finished restore clears its marker"
+    );
+    let kept = std::fs::read_dir(b_dir.path())
+        .expect("read dir")
+        .map(|entry| entry.expect("entry").path())
+        .find(|entry| entry.is_dir())
+        .expect("the partial file is kept aside");
+    assert_eq!(
+        std::fs::metadata(kept.join("app.db")).expect("kept").len(),
+        64 * 1024
+    );
+}
+
+#[tokio::test]
 async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
     let Some(server) = SyncServer::start() else {
         return;
