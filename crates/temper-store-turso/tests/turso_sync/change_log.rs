@@ -12,7 +12,7 @@ use super::support::*;
 const TRIM_BUDGET: Duration = Duration::from_secs(1);
 
 async fn trim(copy: &SyncCopy) -> u64 {
-    copy.trim_pushed(TRIM_BUDGET).await.expect("trim")
+    copy.trim_pushed(TRIM_BUDGET, || false).await.expect("trim")
 }
 
 #[tokio::test]

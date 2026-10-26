@@ -19,10 +19,15 @@ pub(super) const FIRST_BATCH_ROWS: i64 = 25;
 impl SyncCopy {
     /// Delete change log rows the remote has confirmed, for about `budget`,
     /// keeping the newest row. Returns the rows deleted.
+    /// After a quarter of the budget, stop when `requests_in_flight` is true.
+    /// The floor prevents starvation under constant load: the Factory grows
+    /// about 56 rows/s; even 250 ms at the old cold 290 rows/s nets only
+    /// about 19 rows/s, roughly 10 h to clear 667k rows. Idle ticks use the
+    /// whole budget. The caller supplies request pressure, without HTTP here.
     ///
     /// In 'full' mode each row holds whole row images, and nothing else
     /// trims the log, so it grows with every write. Only the background loop
-    /// calls this: an answer's push never trims, so no answer waits for it.
+    /// calls this: an answer's push never starts a trim.
     ///
     /// The engine reads the log only above the remote's record of this
     /// file's last push: a push scans from that record plus one
@@ -53,7 +58,11 @@ impl SyncCopy {
     /// `budget` and always runs to its end: one cut off mid-statement would
     /// be rolled back and its work lost. A failed call leaves the rows for
     /// the next.
-    pub async fn trim_pushed(&self, budget: Duration) -> Result<u64, PersistenceError> {
+    pub async fn trim_pushed(
+        &self,
+        budget: Duration,
+        requests_in_flight: impl Fn() -> bool,
+    ) -> Result<u64, PersistenceError> {
         self.require_copying()?;
         let started = Instant::now();
         let confirmed = self.last_pushed_hint().map_err(storage_error)?;
@@ -65,7 +74,10 @@ impl SyncCopy {
                 return Ok(trimmed);
             };
             let through = confirmed.min(newest - 1);
-            if through < oldest || started.elapsed() >= budget {
+            if through < oldest
+                || started.elapsed() >= budget
+                || (started.elapsed() >= budget / 4 && requests_in_flight())
+            {
                 break (through, oldest, newest);
             }
             let rows = self.inner.trim_batch.load(Ordering::Acquire);
@@ -86,6 +98,13 @@ impl SyncCopy {
             );
             trimmed += deleted;
             batches += 1;
+            // DELETE can complete without yielding on a warm disk. Always let
+            // waiting requests run before deciding whether to start another.
+            tokio::task::yield_now().await;
+            // yield_now alone may immediately repoll this task without driving
+            // timers or socket readiness. A 1 ms pause forces a driver turn,
+            // so a newly arriving request is noticed between 100 ms batches.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         };
         // Change numbers are consecutive (each one above the newest), and a
         // trim deletes from the oldest, so this is about the rows left.
