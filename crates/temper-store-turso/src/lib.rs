@@ -11,6 +11,8 @@ mod retry;
 pub mod router;
 pub mod schema;
 mod schema_event_history;
+#[doc(hidden)]
+pub mod stack_probe;
 pub mod store;
 
 /// Compute a SHA-256 hex digest of IOA spec content.

@@ -151,6 +151,7 @@ impl TursoEventStore {
         state: &serde_json::Value,
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
+        crate::stack_probe::mark(&crate::stack_probe::UPSERT_ENTRY);
         let projection = QueryProjectionUpsert {
             entity_type: entity_type.to_string(),
             entity_id: entity_id.to_string(),
@@ -208,6 +209,7 @@ impl TursoEventStore {
             let tx = conn.begin_immediate().await.map_err(storage_error)?;
             let mut stored = BTreeMap::new();
             if let Some(select) = stored_rows_statement(tenant, &projections) {
+                crate::stack_probe::mark(&crate::stack_probe::BEFORE_DRIVER);
                 let mut rows = tx
                     .query(&select.sql, params_from_iter(select.values))
                     .await
@@ -268,6 +270,7 @@ impl TursoEventStore {
                     &reindexed.into_values().collect::<Vec<_>>(),
                 ));
             for statement in statements {
+                crate::stack_probe::mark(&crate::stack_probe::BEFORE_DRIVER);
                 tx.execute(&statement.sql, params_from_iter(statement.values))
                     .await
                     .map_err(storage_error)?;
