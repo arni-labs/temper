@@ -149,6 +149,11 @@ struct SimEventStoreInner {
     /// events and then answer with a concurrency violation, as a store does when
     /// it retries a write whose first answer was lost. See `lose_next_append_answers`.
     pending_lost_append_answers: BTreeMap<String, usize>,
+    /// Each entry makes the next N appends that write that id (alone or in a
+    /// batch) write their events and rows and then answer with a storage
+    /// error, as a store does when a commit lands but its answer is lost. See
+    /// `land_next_appends_then_fail`.
+    pending_landed_failures: BTreeMap<String, usize>,
     /// One-shot append delays per `persistence_id`.
     ///
     /// Used by dispatch retry tests to deterministically model "the actor
@@ -212,6 +217,7 @@ impl SimEventStore {
                 pending_read_failures: BTreeMap::new(),
                 pending_append_failures: BTreeMap::new(),
                 pending_lost_append_answers: BTreeMap::new(),
+                pending_landed_failures: BTreeMap::new(),
                 pending_append_delays: BTreeMap::new(),
                 key_index: BTreeMap::new(),
                 key_index_watermark: BTreeMap::new(),
@@ -323,6 +329,23 @@ impl SimEventStore {
         } else {
             inner
                 .pending_lost_append_answers
+                .insert(persistence_id.to_string(), count);
+        }
+    }
+
+    /// Make the next `count` appends that write `persistence_id`, alone or in a
+    /// batch, write their events and every row they carry and then answer with
+    /// a storage error, then behave normally. This is a commit that landed
+    /// while its caller was told it failed: a connection lost after the
+    /// commit, or a commit abandoned by a timeout after it was published.
+    /// `count == 0` clears the injection.
+    pub fn land_next_appends_then_fail(&self, persistence_id: &str, count: usize) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if count == 0 {
+            inner.pending_landed_failures.remove(persistence_id);
+        } else {
+            inner
+                .pending_landed_failures
                 .insert(persistence_id.to_string(), count);
         }
     }
@@ -449,6 +472,15 @@ impl SimEventStoreInner {
     /// Consume one lost append answer for `persistence_id`, if one is set.
     fn take_lost_append_answer(&mut self, persistence_id: &str) -> bool {
         take_one(&mut self.pending_lost_append_answers, persistence_id)
+    }
+
+    /// Consume one landed-then-failed append for `persistence_id`, if one is set.
+    fn take_landed_failure(&mut self, persistence_id: &str) -> Option<PersistenceError> {
+        take_one(&mut self.pending_landed_failures, persistence_id).then(|| {
+            PersistenceError::Storage(format!(
+                "SimEventStore: the append to '{persistence_id}' landed and its answer was lost"
+            ))
+        })
     }
 }
 
@@ -755,6 +787,9 @@ impl EventStore for SimEventStore {
                 expected: expected_sequence,
                 actual: new_seq,
             });
+        }
+        if let Some(error) = inner.take_landed_failure(persistence_id) {
+            return Err(error);
         }
 
         Ok(new_seq)
@@ -1118,6 +1153,14 @@ impl EventStore for SimEventStore {
             }
         }
         if let Some(error) = lost {
+            return Err(error);
+        }
+        let mut landed_failure = None;
+        for append in appends {
+            let failed = inner.take_landed_failure(&append.persistence_id);
+            landed_failure = landed_failure.or(failed);
+        }
+        if let Some(error) = landed_failure {
             return Err(error);
         }
 

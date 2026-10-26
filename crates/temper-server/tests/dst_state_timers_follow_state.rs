@@ -33,6 +33,8 @@
 
 #[path = "dst_state_timers_follow_state/boot_burst.rs"]
 mod boot_burst;
+#[path = "dst_state_timers_follow_state/boot_logging.rs"]
+mod boot_logging;
 #[path = "dst_state_timers_follow_state/delete_race.rs"]
 mod delete_race;
 #[path = "dst_state_timers_follow_state/embedder.rs"]
