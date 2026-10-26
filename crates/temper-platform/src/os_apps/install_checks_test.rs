@@ -57,8 +57,8 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
     prove_joint_invariants(&state, "alice", "a-app", &[("A".into(), a.clone())])
         .await
         .unwrap();
-    let err = prove_joint_invariants(&state, "bob", "a-app", &[("A".into(), a)])
-        .await
-        .unwrap_err();
-    assert!(err.contains("B, which this app does not declare"), "{err}");
+    // Bob's tenant runs no B, so A's rule cannot be proved there: a warning,
+    // and the install goes ahead.
+    let checked = prove_joint_invariants(&state, "bob", "a-app", &[("A".into(), a)]).await;
+    assert!(checked.is_ok(), "{checked:?}");
 }
