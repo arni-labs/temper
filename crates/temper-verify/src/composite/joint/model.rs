@@ -393,9 +393,6 @@ impl JointModel {
                 }
             }
         }
-        for call in &state.calls {
-            values.extend(call.asked.values().filter(|v| !v.is_empty()).cloned());
-        }
         values
     }
 

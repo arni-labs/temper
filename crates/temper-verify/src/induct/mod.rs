@@ -456,3 +456,6 @@ fn prove_one(
         took: start.elapsed(),
     })
 }
+
+#[cfg(test)]
+mod answers_test;

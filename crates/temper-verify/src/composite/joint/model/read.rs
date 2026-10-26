@@ -103,6 +103,8 @@ pub(super) fn tracked(
 #[derive(Debug, Clone)]
 pub(super) struct CallSpec {
     pub(super) module: String,
+    /// The service answering when this call runs in the background.
+    pub(super) background: u32,
     pub(super) on_success: Option<String>,
     pub(super) on_failure: Option<String>,
 }
@@ -156,6 +158,10 @@ impl Kernel {
                         .or_default()
                         .push(CallSpec {
                             module: module.to_string(),
+                            background: match trigger.kind {
+                                TriggerKind::Adapter => senders::PLATFORM_DISPATCH,
+                                _ => senders::RUNTIME,
+                            },
                             on_success: trigger.on_success.clone(),
                             on_failure: trigger.on_failure.clone(),
                         });
@@ -253,8 +259,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
     reactions
 }
 
-/// The actions (entity, action) with a constraint the model cannot decide,
-/// and what a module call keeps to decide its answer's.
+/// The actions (entity, action) with a constraint the model cannot decide.
 #[derive(Debug, Default)]
 pub(super) struct Unchecked {
     /// Sent as a dispatch or a request: one on a counter the order does not
@@ -262,12 +267,9 @@ pub(super) struct Unchecked {
     pub(super) taken: BTreeSet<(String, String)>,
     /// Sent with parameters its sender chooses (a module's answer, or a
     /// request from outside): one that ties a parameter to a field the model
-    /// does not track. Any other constraint the sender can meet. A module
-    /// answers about the record as it was when the call started, so a call
-    /// keeps the tracked fields its answers are tied to (`asked`).
+    /// does not track. Any other constraint the sender can meet by choosing
+    /// a value against the record as it is when the answer arrives.
     pub(super) chosen: BTreeSet<(String, String)>,
-    /// Each (entity, action)'s tracked fields a parameter must equal.
-    pub(super) equals: BTreeMap<(String, String), BTreeSet<String>>,
     /// Each (entity, action)'s count parameters that must equal a counter
     /// the model holds as a value (not as a sequence number), with that
     /// counter. Decided when a dispatch carries the count, and only then.
@@ -309,16 +311,6 @@ impl Unchecked {
         self.nonempty
             .get(&(entity.to_string(), action.to_string()))
             .map_or(&[], Vec::as_slice)
-    }
-
-    /// The fields an `entity` record's module call keeps as it started:
-    /// those the actions it may answer with (`answers`) tie a parameter to.
-    pub(super) fn asked(&self, entity: &str, answers: impl Fn(&str) -> bool) -> BTreeSet<String> {
-        self.equals
-            .iter()
-            .filter(|((e, action), _)| e == entity && answers(action))
-            .flat_map(|(_, fields)| fields.iter().cloned())
-            .collect()
     }
 }
 
@@ -368,12 +360,7 @@ pub(super) fn unchecked_constraints(
                         .or_default()
                         .push((param.clone(), field.clone()));
                 }
-                if tracked(field) {
-                    out.equals
-                        .entry(key.clone())
-                        .or_default()
-                        .insert(field.clone());
-                } else {
+                if !tracked(field) {
                     out.chosen.insert(key.clone());
                 }
             }
