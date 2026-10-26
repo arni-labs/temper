@@ -136,12 +136,16 @@ fn check(nudge_from: &str, bring: &str) -> JointLivenessResult {
 }
 
 fn check_specs(app: &str, place: &str, bring: &str) -> JointLivenessResult {
+    check_specs_with_policies(app, place, &policies(bring))
+}
+
+fn check_specs_with_policies(app: &str, place: &str, policies: &str) -> JointLivenessResult {
     let automatons: Vec<Automaton> = [app, place]
         .iter()
         .map(|source| parse_automaton(source).expect("fixture parses"))
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let analysis = SendAnalysis::new(&policies(bring)).expect("fixture policies parse");
+    let analysis = SendAnalysis::new(policies).expect("fixture policies parse");
     let budget = Budget {
         time: Duration::from_secs(30),
         states: 100_000,
@@ -385,6 +389,49 @@ fn a_lost_call_after_a_one_shot_timer_leaves_the_record_stuck() {
                 .position(|a| a.contains("(timer)"))
                 .is_some_and(|timer| actions[timer + 1..].iter().any(|a| a.contains("is lost")))
         }),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_second_comparison_on_the_same_sequence_parameter_is_not_certain_progress() {
+    let app = COUNTING_APP.replace("from = [\"Unmade\", \"Live\"]", "from = [\"Unmade\"]");
+    let place = counting_place(true)
+        .replace(
+            "[[action]]\nname = \"Bring\"",
+            "[[state]]\nname = \"floor\"\ntype = \"counter\"\ninitial = 2\n\n[[action]]\nname = \"Bring\"",
+        )
+        .replace(
+            "field = \"brought\"",
+            "field = \"brought\"\n\n[[action.constraints]]\nkind = \"param_greater_than_field\"\nparam = \"brought\"\nfield = \"floor\"",
+        )
+        .replace(
+            "on_timeout = \"Again\"",
+            "on_timeout = \"Again\"\nreset_on = [\"Again\"]",
+        );
+    // Install sends 1: it exceeds brought=0, but not floor=2. The
+    // unmodelled second comparison must leave refusal as a possible outcome.
+    let result = check_specs(&app, &place, SAME_RECORD);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Place=Unplaced")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_reaction_forbidden_by_equal_cedar_sets_leaves_the_place_behind() {
+    let policies = r#"
+        permit(principal, action, resource);
+        forbid(principal, action == Action::"Bring", resource is Place)
+        when { [1, 2] == [2, 1, 1] };
+    "#;
+    let result = check_specs_with_policies(APP, &place(r#"["Waiting", "Stuck"]"#), policies);
+    assert!(
+        resting(&result)
+            .iter()
+            .any(|state| state.contains("Place=Unplaced")),
         "{result}"
     );
 }

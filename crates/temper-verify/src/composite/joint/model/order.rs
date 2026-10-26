@@ -176,11 +176,11 @@ impl Order {
         self.families.iter().any(|f| f.params.contains(&key))
     }
 
-    /// Whether the model decides `entity`'s `action` constraint on `param`.
-    pub(super) fn decides(&self, entity: &str, action: &str, param: &str) -> bool {
+    /// Whether the model decides this parameter's comparison with this field.
+    pub(super) fn decides(&self, entity: &str, action: &str, param: &str, field: &str) -> bool {
         self.compared
             .get(&(entity.to_string(), action.to_string()))
-            .is_some_and(|pairs| pairs.iter().any(|(p, _)| p == param))
+            .is_some_and(|pairs| pairs.iter().any(|(p, f)| p == param && f == field))
     }
 
     /// Whether `params` pass `entity`'s `action` constraints the model

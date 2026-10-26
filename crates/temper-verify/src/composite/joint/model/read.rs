@@ -289,8 +289,8 @@ pub(super) fn unchecked_constraints(
         for action in &by_name[entity.as_str()].actions {
             let key = (entity.clone(), action.name.clone());
             let decided = |constraint: &ActionConstraint| match constraint {
-                ActionConstraint::ParamGreaterThanField { param, .. } => {
-                    order.decides(entity, &action.name, param)
+                ActionConstraint::ParamGreaterThanField { param, field } => {
+                    order.decides(entity, &action.name, param, field)
                 }
                 _ => tracked(constraint.param()) && constraint.field().is_none_or(tracked),
             };
