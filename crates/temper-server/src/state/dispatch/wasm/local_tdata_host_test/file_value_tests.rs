@@ -174,8 +174,31 @@ async fn a_guest_reads_a_files_value_only_with_its_callers_read_grant() {
     assert_eq!((status, body.as_str()), (200, OWNER_TEXT));
 }
 
-#[tokio::test]
-async fn a_guest_writes_a_files_value_only_with_its_callers_update_grant() {
+#[test]
+fn a_guest_writes_a_files_value_only_with_its_callers_update_grant() {
+    let report = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    temper_store_turso::stack_probe::TEST_START.store(
+                        temper_store_turso::stack_probe::here(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    guest_writes_body().await;
+                });
+            temper_store_turso::stack_probe::report()
+        })
+        .expect("spawn")
+        .join()
+        .expect("body");
+    panic!("stack probe: {report}");
+}
+
+async fn guest_writes_body() {
     let (state, _dir) = owned_file_state("local-file-value-write").await;
     let before = file_content(&state).await;
     let headers = vec![("content-type".to_string(), "text/plain".to_string())];

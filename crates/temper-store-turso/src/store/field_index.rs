@@ -137,6 +137,7 @@ impl TursoEventStore {
         state: &serde_json::Value,
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
+        crate::stack_probe::mark(&crate::stack_probe::UPSERT_ENTRY);
         let status = canonical_projection_status(status, state);
         let _write_permit = self
             .acquire_write_permit("turso.upsert_query_projection", WritePriority::Low)
@@ -150,6 +151,7 @@ impl TursoEventStore {
         let updated_at = sim_now().to_rfc3339();
         let sequence_nr = i64::try_from(sequence_nr).unwrap_or(i64::MAX);
 
+        crate::stack_probe::mark(&crate::stack_probe::BEFORE_DRIVER);
         let unchanged_rows = conn
             .execute(
                 "UPDATE entity_catalog \
@@ -197,6 +199,7 @@ impl TursoEventStore {
             return Ok(());
         }
 
+        crate::stack_probe::mark(&crate::stack_probe::BEFORE_DRIVER);
         tx.execute(
             "INSERT INTO entity_catalog \
              (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
