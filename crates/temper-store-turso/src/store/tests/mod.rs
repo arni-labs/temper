@@ -9,6 +9,8 @@ use temper_runtime::persistence::{
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
+mod commit_outcome;
+mod commit_transport;
 mod evolution_tenant;
 mod policy_approval;
 mod projection_writes;
@@ -430,9 +432,11 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
     assert_eq!(events[0].event_type, "OrderCreated");
 }
 
+/// Every append is a write transaction, so it waits its turn at the write
+/// gate like any writer (as the first in line: it is high priority).
 #[tokio::test]
-async fn single_event_append_bypasses_process_write_gate() {
-    let mut store = make_store("single-append-bypasses-gate").await;
+async fn single_event_append_waits_for_the_write_gate() {
+    let mut store = make_store("single-append-waits-for-gate").await;
     store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let held_gate = store
         .write_gate
@@ -441,22 +445,19 @@ async fn single_event_append_bypasses_process_write_gate() {
         .await
         .expect("hold gate");
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        store.append(
-            "tenant-a:Order:ord-bypass",
-            0,
-            &[test_envelope(
-                "OrderCreated",
-                serde_json::json!({ "id": "ord-bypass" }),
-            )],
-        ),
-    )
-    .await;
-    drop(held_gate);
+    let created = [test_envelope(
+        "OrderCreated",
+        serde_json::json!({ "id": "ord-gated" }),
+    )];
+    let append = store.append("tenant-a:Order:ord-gated", 0, &created);
+    tokio::pin!(append);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(300), append.as_mut()).await;
+    assert!(waited.is_err(), "an append went ahead of a held write gate");
 
-    let new_seq = result
-        .expect("single-event append should not wait for the process write gate")
+    drop(held_gate);
+    let new_seq = tokio::time::timeout(std::time::Duration::from_secs(5), append)
+        .await
+        .expect("the append goes once the gate frees")
         .expect("append should succeed");
     assert_eq!(new_seq, 1);
 }

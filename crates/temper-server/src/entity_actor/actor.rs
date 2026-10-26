@@ -21,6 +21,7 @@
 //! - **Deterministic**: Same input -> same output. No randomness in transition logic.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -78,18 +79,31 @@ pub(super) fn persistence_failure(error: &PersistenceError) -> String {
 }
 
 /// The answer to an action whose event the store did not take. Only an event
-/// too large to write is a refusal: nothing was written. After any other
-/// failure the write may have landed. That includes a concurrency violation,
-/// which a store that retries a write whose answer was lost reports for a
-/// write that landed (the Turso store does).
+/// too large to write is a refusal. `persist_event` has already read the
+/// journal after any other failure: a write that landed is not answered
+/// here, a concurrency violation or a `not written` error did not land, and
+/// only an `outcome unknown` error may have. None of them is a refusal: the
+/// action itself was allowed, and a caller may try it again.
 fn persistence_failure_reply(state: EntityState, error: &PersistenceError) -> EntityResponse {
     let said = persistence_failure(error);
     match error {
         PersistenceError::EventTooLarge { .. } => EntityResponse::refused(state, said),
         PersistenceError::ConcurrencyViolation { .. }
         | PersistenceError::Storage(_)
+        | PersistenceError::OutcomeUnknown(_)
         | PersistenceError::Serialization(_) => EntityResponse::write_failed(state, said),
     }
+}
+
+/// What a write that answered with an error did, as the journal shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WriteOutcome {
+    /// The journal holds the event at `sequence_nr`.
+    Landed { sequence_nr: u64 },
+    /// The journal does not hold it, and never will.
+    NotWritten,
+    /// The journal cannot establish the outcome yet: why.
+    Unknown(String),
 }
 
 /// Why a concurrency retry (ADR-0046) gave up without writing the action.
@@ -177,6 +191,10 @@ pub struct EntityActor {
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
     /// Run once with the state this actor rehydrated from stored events.
     on_rehydrated: Option<RehydrateHook>,
+    /// A write's outcome could not be learned, so the state in memory may not
+    /// be the journal's. Once the message that wrote it is answered, the
+    /// actor restarts and rebuilds from the journal before the next one.
+    rebuild_from_journal: AtomicBool,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -318,6 +336,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            rebuild_from_journal: AtomicBool::new(false),
         }
     }
 
@@ -344,6 +363,7 @@ impl EntityActor {
             blob_store: None,
             legacy_blob_store: None,
             on_rehydrated: None,
+            rebuild_from_journal: AtomicBool::new(false),
         }
     }
 
@@ -423,6 +443,12 @@ impl EntityActor {
     /// Persist an event to the configured event store, with the rows of the
     /// scheduled actions it arms and the removal of the one it fires in the
     /// same commit.
+    ///
+    /// The answer is what the write did. `Ok` is the event's sequence: it
+    /// landed, also when the store answered an error and the journal, read
+    /// again, holds the event. A concurrency violation or a `not written`
+    /// storage error: it did not land. An `outcome unknown` storage error:
+    /// the journal cannot yet establish whether the failed commit landed.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
@@ -432,6 +458,7 @@ impl EntityActor {
         scheduled: &ScheduledRows,
     ) -> Result<u64, PersistenceError> {
         let persistence_id = self.persistence_id();
+        let event_id = sim_uuid();
         let payload = super::bootstrap::event_payload(event, state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
         let envelope = PersistenceEnvelope {
@@ -439,7 +466,7 @@ impl EntityActor {
             event_type: event.action.clone(),
             payload,
             metadata: EventMetadata {
-                event_id: sim_uuid(),
+                event_id,
                 causation_id: sim_uuid(),
                 correlation_id: sim_uuid(),
                 timestamp: event.timestamp,
@@ -523,21 +550,102 @@ impl EntityActor {
             "append",
             append_start.elapsed(),
         );
-        match result {
+        let error = match result {
             Ok(new_seq) => {
                 state.sequence_nr = new_seq;
                 tracing::debug!(entity = %state.entity_id, seq = new_seq, "event persisted");
-                Ok(new_seq)
+                return Ok(new_seq);
             }
-            // Refused for its size: the event store logged it once, with its words.
-            Err(e @ PersistenceError::EventTooLarge { .. }) => Err(e),
-            Err(e) => {
-                tracing::error!(
-                    entity = %state.entity_id, error = %e,
-                    "failed to persist event — state advanced but not durable"
-                );
-                Err(e)
+            // Refused before writing: nothing to learn. The event store logged
+            // a refusal for size once, with its words.
+            Err(
+                e @ (PersistenceError::EventTooLarge { .. } | PersistenceError::Serialization(_)),
+            ) => {
+                return Err(e);
             }
+            Err(e) => e,
+        };
+        // Any other answer can hide a write that landed: a commit whose answer
+        // was lost, or a store that retried one and met its own event as a
+        // concurrency violation. An unknown commit may still be running;
+        // journal absence cannot turn that into a definite failure.
+        let outcome =
+            Self::learn_write_outcome(store, &persistence_id, state.sequence_nr, event_id, &error)
+                .await;
+        self.log_write_outcome(&event.action, &outcome, &error);
+        match outcome {
+            WriteOutcome::Landed { sequence_nr } => {
+                state.sequence_nr = sequence_nr;
+                Ok(sequence_nr)
+            }
+            WriteOutcome::NotWritten => match error {
+                PersistenceError::ConcurrencyViolation { .. } => Err(error),
+                error => Err(PersistenceError::Storage(format!("not written: {error}"))),
+            },
+            WriteOutcome::Unknown(reason) => {
+                self.rebuild_from_journal.store(true, Ordering::Release);
+                Err(PersistenceError::OutcomeUnknown(format!(
+                    "{error}; the journal cannot establish the outcome: {reason}"
+                )))
+            }
+        }
+    }
+
+    /// What a write of `event_id` after `from_sequence` that answered with an
+    /// error did, read from the journal.
+    async fn learn_write_outcome(
+        store: &BoxedEventStore,
+        persistence_id: &str,
+        from_sequence: u64,
+        event_id: uuid::Uuid,
+        append_error: &PersistenceError,
+    ) -> WriteOutcome {
+        match store.read_events(persistence_id, from_sequence).await {
+            Ok(events) => match events
+                .iter()
+                .find(|event| event.metadata.event_id == event_id)
+            {
+                Some(event) => WriteOutcome::Landed {
+                    sequence_nr: event.sequence_nr,
+                },
+                None if matches!(append_error, PersistenceError::OutcomeUnknown(_)) => {
+                    WriteOutcome::Unknown(
+                        "the event is absent but its commit may still finish".into(),
+                    )
+                }
+                None => WriteOutcome::NotWritten,
+            },
+            Err(error) => WriteOutcome::Unknown(error.to_string()),
+        }
+    }
+
+    /// Log what a write whose store answered `error` did, once it is known:
+    /// the entity, its type and the action, never the action's parameters.
+    fn log_write_outcome(&self, action: &str, outcome: &WriteOutcome, error: &PersistenceError) {
+        let conflict = matches!(error, PersistenceError::ConcurrencyViolation { .. });
+        match outcome {
+            WriteOutcome::Landed { sequence_nr } => tracing::warn!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, sequence_nr, error = %error,
+                "event landed: its write answered an error, and the journal holds it"
+            ),
+            // A conflict is the record moving on; the caller replays it.
+            WriteOutcome::NotWritten if conflict => tracing::debug!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, error = %error,
+                "event not written: the journal moved on"
+            ),
+            WriteOutcome::NotWritten => tracing::error!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, error = %error,
+                "event rolled back: not written, the record keeps its state"
+            ),
+            WriteOutcome::Unknown(reason) => tracing::error!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id, action, error = %error,
+                reason = %reason,
+                "event outcome unknown: the journal cannot establish whether the write landed"
+            ),
         }
     }
 
@@ -1172,6 +1280,45 @@ impl Actor for EntityActor {
         state: &mut Self::State,
         ctx: &mut ActorContext<Self>,
     ) -> Result<(), ActorError> {
+        let handled = Box::pin(self.handle_message(msg, state, ctx)).await;
+        // The message is answered. A write whose outcome could not be learned
+        // leaves memory that may not be the journal's: restart, so the next
+        // message is answered from the journal (`pre_start` replays it, and
+        // fails until it can read it).
+        if self.rebuild_from_journal.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                tenant = %self.tenant, entity_type = %self.entity_type,
+                entity_id = %self.entity_id,
+                "rebuilding from the journal: a write's outcome could not be learned"
+            );
+            return Err(ActorError::custom(format!(
+                "{}:{} rebuilds from its journal: a write's outcome could not be learned",
+                self.entity_type, self.entity_id
+            )));
+        }
+        handled
+    }
+
+    async fn post_stop(&self, state: Self::State, _ctx: &mut ActorContext<Self>) {
+        tracing::info!(
+            entity = %state.entity_id,
+            status = %state.status,
+            events_total = state.total_event_count,
+            events_recent = state.events.len(),
+            "entity actor stopped"
+        );
+    }
+}
+
+impl EntityActor {
+    /// Handle one message (`Actor::handle` restarts the actor after it when
+    /// a write's outcome could not be learned).
+    async fn handle_message(
+        &self,
+        msg: EntityMsg,
+        state: &mut EntityState,
+        ctx: &mut ActorContext<Self>,
+    ) -> Result<(), ActorError> {
         match msg {
             EntityMsg::Action {
                 name,
@@ -1516,13 +1663,12 @@ impl Actor for EntityActor {
                                     state_before = state.clone();
                                     event_count_before = state.total_event_count;
 
-                                    // A store that retries a write whose answer
-                                    // was lost reports that write as a
-                                    // concurrency violation. If the journal now
-                                    // holds this action's key, an earlier attempt
-                                    // landed: writing it again would apply it
-                                    // twice, and its guard refusing it now is
-                                    // not a refusal.
+                                    // This attempt's own write did not land
+                                    // (`persist_event` read the journal). If the
+                                    // journal holds this action's key, another
+                                    // ask carrying the same key wrote it: writing
+                                    // it again would apply it twice, and its
+                                    // guard refusing it now is not a refusal.
                                     if let Some(key) = idempotency_key.as_deref()
                                         && state.has_processed_idempotency_key(key)
                                     {
@@ -1675,8 +1821,9 @@ impl Actor for EntityActor {
                                             continue;
                                         }
                                         Err(PersistenceError::ConcurrencyViolation { .. }) => {
-                                            // The last attempt is not replayed,
-                                            // so it may have landed.
+                                            // The last attempt did not land
+                                            // either (`persist_event` read the
+                                            // journal); the record kept moving.
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
                                                 Some(RetryGaveUp::WriteFailed(
@@ -2005,16 +2152,6 @@ impl Actor for EntityActor {
             }
         }
         Ok(())
-    }
-
-    async fn post_stop(&self, state: Self::State, _ctx: &mut ActorContext<Self>) {
-        tracing::info!(
-            entity = %state.entity_id,
-            status = %state.status,
-            events_total = state.total_event_count,
-            events_recent = state.events.len(),
-            "entity actor stopped"
-        );
     }
 }
 
