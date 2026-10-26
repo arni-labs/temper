@@ -113,12 +113,14 @@ permit(principal == Agent::"service:chain", action, resource) when {
         let moves = model.moves(&state);
         assert_eq!(moves.len(), 1);
         let (next, _) = model.next(&state, &moves[0]);
-        // A field hop is conservatively unknown, including when the IDs
-        // happen to match. It must include Cedar's refusal for id1 != id2.
-        assert!(
-            next.iter()
-                .any(|n| n.state.records["C"].status == "Ready" && n.state.inflight.is_empty())
-        );
-        assert!(next.iter().any(|n| n.state.records["C"].status == "Done"));
+        // A field hop forgets that the source id is the receiver's, so the
+        // precomputed answer is Maybe. It is decided when it lands, from A's
+        // id (the one the inherited service keeps) and C's: Cedar refuses
+        // id1 != id2 and allows id1 == id1.
+        let refused = next
+            .iter()
+            .any(|n| n.state.records["C"].status == "Ready" && n.state.inflight.is_empty());
+        let done = next.iter().any(|n| n.state.records["C"].status == "Done");
+        assert_eq!((refused, done), (!same_id, same_id), "same_id {same_id}");
     }
 }

@@ -1,7 +1,7 @@
 //! One policy evaluated for a kind of sender: each condition as the set of
 //! results it can have, given what the question leaves unknown.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as Json;
 
@@ -75,7 +75,10 @@ enum Val {
     /// The id of the record the request acts on.
     ResourceId,
     /// A string known only by which others it equals ([`Attr::Same`]).
-    Same(String),
+    Same {
+        name: String,
+        unlike: BTreeSet<String>,
+    },
     /// Any value, or an error.
     Unknown,
     /// Certainly an error.
@@ -242,7 +245,7 @@ impl Request<'_> {
             | Val::Resource
             | Val::Context
             | Val::ResourceId
-            | Val::Same(_) => ERROR,
+            | Val::Same { .. } => ERROR,
             Val::Error => ERROR,
             Val::Unknown => ANY,
         }
@@ -341,7 +344,7 @@ impl Request<'_> {
             (Val::Known(Json::Object(record)), _) if !record.contains_key("__entity") => {
                 record.get(attr).cloned().map_or(Val::Error, Val::Known)
             }
-            (Val::Known(_) | Val::Action | Val::Error | Val::Same(_), _) => Val::Error,
+            (Val::Known(_) | Val::Action | Val::Error | Val::Same { .. }, _) => Val::Error,
             _ => Val::Unknown,
         }
     }
@@ -353,10 +356,13 @@ impl Request<'_> {
             Attr::Value(value) => Val::Known(value),
             Attr::ResourceId => match self.record.get("id") {
                 Some(Attr::Value(value)) => Val::Known(value.clone()),
-                Some(Attr::Same(name)) => Val::Same(name.clone()),
+                Some(Attr::Same { name, unlike }) => Val::Same {
+                    name: name.clone(),
+                    unlike: unlike.clone(),
+                },
                 _ => Val::ResourceId,
             },
-            Attr::Same(name) => Val::Same(name),
+            Attr::Same { name, unlike } => Val::Same { name, unlike },
             Attr::Unknown => Val::Unknown,
         }
     }
@@ -376,7 +382,7 @@ impl Request<'_> {
             (Val::Action, _) => FALSE,
             (Val::Resource, _) if matches!(attr, "id" | "Id") => TRUE,
             (Val::Resource, _) if self.record.contains_key(attr) => TRUE,
-            (Val::Known(_) | Val::Error | Val::ResourceId | Val::Same(_), _) => ERROR,
+            (Val::Known(_) | Val::Error | Val::ResourceId | Val::Same { .. }, _) => ERROR,
             (Val::Unknown, _) => ANY,
             _ => TRUE_OR_FALSE,
         }
@@ -390,16 +396,16 @@ impl Request<'_> {
             (Val::ResourceId, Val::Known(Json::String(_)))
             | (Val::Known(Json::String(_)), Val::ResourceId) => TRUE_OR_FALSE,
             (Val::ResourceId, Val::Known(_)) | (Val::Known(_), Val::ResourceId) => FALSE,
-            (Val::Same(a), Val::Same(b)) => Results::of(a == b),
-            (Val::Same(_), Val::Known(Json::String(text)))
-            | (Val::Known(Json::String(text)), Val::Same(_)) => {
-                if text.is_empty() {
+            (Val::Same { name: a, .. }, Val::Same { name: b, .. }) => Results::of(a == b),
+            (Val::Same { unlike, .. }, Val::Known(Json::String(text)))
+            | (Val::Known(Json::String(text)), Val::Same { unlike, .. }) => {
+                if text.is_empty() || unlike.contains(text) {
                     FALSE
                 } else {
                     TRUE_OR_FALSE
                 }
             }
-            (Val::Same(_), Val::Known(_)) | (Val::Known(_), Val::Same(_)) => FALSE,
+            (Val::Same { .. }, Val::Known(_)) | (Val::Known(_), Val::Same { .. }) => FALSE,
             (Val::Principal, Val::Known(entity)) | (Val::Known(entity), Val::Principal) => {
                 match (self.asker, entity_parts(entity)) {
                     (Asker::Service { name, .. }, Some((kind, id))) => {
