@@ -160,7 +160,9 @@ impl ServerState {
                     }
                 };
                 timer.boot_gate = Some(gate.clone());
-                let delay = remaining_budget(timer.started_at, timer.after_seconds, now);
+                // SCRATCH DEFECT (never merge): a timer re-armed at boot waits a full budget.
+                let _ = (remaining_budget, now);
+                let delay = std::time::Duration::from_secs(timer.after_seconds);
                 let label = if delay.is_zero() {
                     "overdue"
                 } else {
