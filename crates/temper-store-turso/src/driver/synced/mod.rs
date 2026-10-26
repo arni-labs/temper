@@ -96,6 +96,9 @@ struct Inner {
     unsure: AtomicBool,
     /// Rows the next trim batch deletes, sized by how long the last one took.
     trim_batch: AtomicI64,
+    /// Extra time each trim batch holds the write lock: (DELETE, COMMIT).
+    #[cfg(feature = "test-support")]
+    simulated_trim: std::sync::Mutex<(Duration, Duration)>,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -201,6 +204,8 @@ impl SyncCopy {
                 timeouts: AtomicU32::new(0),
                 unsure: AtomicBool::new(true),
                 trim_batch: AtomicI64::new(trim::FIRST_BATCH_ROWS),
+                #[cfg(feature = "test-support")]
+                simulated_trim: std::sync::Mutex::new((Duration::ZERO, Duration::ZERO)),
             }),
         };
         // Change numbers follow commit order only with one writer at a time

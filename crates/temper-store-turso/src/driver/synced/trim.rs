@@ -89,11 +89,8 @@ impl SyncCopy {
             let batch_started = Instant::now();
             // Changes to the change log itself are not captured, so this adds no
             // row of its own (turso_core 0.7.2 `translate/emitter/mod.rs` 1083-1091).
-            let deleted = conn
-                .execute(
-                    "DELETE FROM turso_cdc WHERE change_id <= ?1",
-                    crate::driver::params![upper],
-                )
+            let deleted = self
+                .delete_batch(&conn, upper)
                 .await
                 .map_err(storage_error)?;
             self.inner.trim_batch.store(
@@ -135,6 +132,47 @@ impl SyncCopy {
             );
         }
         Ok(trimmed)
+    }
+}
+
+impl SyncCopy {
+    /// Main's DELETE, unchanged unless a test slows it: then the same DELETE
+    /// in a transaction that holds the write lock that much longer.
+    async fn delete_batch(&self, conn: &Connection, upper: i64) -> Result<u64, DriverError> {
+        #[cfg(feature = "test-support")]
+        {
+            let (work, commit) = *self.inner.simulated_trim.lock().unwrap();
+            if !work.is_zero() || !commit.is_zero() {
+                let tx = conn.begin_immediate().await?;
+                tokio::time::sleep(work).await;
+                let deleted = tx
+                    .execute(
+                        "DELETE FROM turso_cdc WHERE change_id <= ?1",
+                        crate::driver::params![upper],
+                    )
+                    .await?;
+                tokio::time::sleep(commit).await;
+                tx.commit().await?;
+                return Ok(deleted);
+            }
+        }
+        conn.execute(
+            "DELETE FROM turso_cdc WHERE change_id <= ?1",
+            crate::driver::params![upper],
+        )
+        .await
+    }
+
+    /// Make every trim batch hold the write lock this much longer. Test hook.
+    #[cfg(feature = "test-support")]
+    pub fn simulate_slow_trim(&self, work: Duration, commit: Duration) {
+        *self.inner.simulated_trim.lock().unwrap() = (work, commit);
+    }
+
+    /// Rows the next trim batch deletes. Test hook.
+    #[cfg(feature = "test-support")]
+    pub fn next_trim_rows(&self) -> i64 {
+        self.inner.trim_batch.load(Ordering::Acquire)
     }
 }
 

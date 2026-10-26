@@ -191,6 +191,19 @@ impl TursoEventStore {
         self.sync_copy.as_ref()
     }
 
+    /// Main's trim as the fixed branch's tests call it. Main's trim learns
+    /// only of HTTP requests in flight; a store write (a timer's, a
+    /// reaction's, these tests') is not one.
+    pub async fn trim_change_log(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<u64, PersistenceError> {
+        match &self.sync_copy {
+            Some(copy) => copy.trim_pushed(budget, || false).await,
+            None => Ok(0),
+        }
+    }
+
     /// Obtain a connection configured for local-SQLite concurrency.
     ///
     /// WAL mode is set in `migrate()` (persists in the DB file). `busy_timeout`
