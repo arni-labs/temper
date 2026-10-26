@@ -174,8 +174,11 @@ pub const BIG_LOG: i64 = 300_000;
 /// the log. Pushing 300,000 changes for real is one request of one
 /// statement per change, far past a push's 10 s limit, so the confirmed
 /// part is written into the log directly, numbered below the first real
-/// change. Most rows hold a 1 KB image; every hundredth holds 30 KB, the
-/// size of the Factory's catalog images, which spill onto overflow pages.
+/// change. Most rows hold a 100-byte image; every thousandth holds 30 KB,
+/// the size of the Factory's catalog images, which spill onto overflow
+/// pages. Writing the log costs about its size: with 1 KB rows and every
+/// hundredth at 30 KB (about 390 MB) the insert alone took 93 s on a CI
+/// runner, past the 120 s a sync test may run once two run side by side.
 pub async fn confirmed_log(
     server: &SyncServer,
     path: &Path,
@@ -191,7 +194,7 @@ pub async fn confirmed_log(
             "INSERT INTO turso_cdc \
              (change_id, change_time, change_type, table_name, id, before, after, updates) \
              SELECT value - {rows}, 0, 1, 'events', value, NULL, \
-             CASE WHEN value % 100 = 0 THEN randomblob(30000) ELSE randomblob(1000) END, NULL \
+             CASE WHEN value % 1000 = 0 THEN randomblob(30000) ELSE randomblob(100) END, NULL \
              FROM generate_series(1, {rows})"
         ))
         .await
