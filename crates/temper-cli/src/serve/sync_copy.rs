@@ -3,11 +3,16 @@
 //! With `TURSO_SYNC_URL` set, the database stays a local file and every
 //! request that can change it is answered only after its changes reach the
 //! remote copy. Requests that finish together share one push. A background
-//! loop also pushes changes no request waits for (timers, reactions), keeps
-//! the local write-ahead log short, and checks a file the start could not
-//! check. While writes cannot be confirmed, requests that can change data are
-//! refused before they run and reads are served as usual.
+//! loop also pushes changes no request waits for (timers, reactions), trims
+//! the change log the remote has confirmed, keeps the local write-ahead log
+//! short, and checks a file the start could not check. While writes cannot
+//! be confirmed, requests that can change data are refused before they run
+//! and reads are served as usual.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -27,6 +32,11 @@ const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The 1 s ceiling lets the background push run once each tick. With a
+/// request in flight the trim stops after its 250 ms floor and current batch;
+/// idle ticks use the whole second to drain the backlog.
+const TRIM_BUDGET: Duration = Duration::from_secs(1);
+
 /// Checkpoint the local log once it passes this size. Turso Sync turns the
 /// engine's automatic checkpoints off.
 const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -42,9 +52,10 @@ pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Route
     let Some(copy) = copy else {
         return router;
     };
-    spawn_upkeep(copy.clone());
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    spawn_upkeep(copy.clone(), in_flight.clone());
     router.layer(axum::middleware::from_fn_with_state(
-        copy,
+        (copy, in_flight),
         push_before_answering,
     ))
 }
@@ -52,13 +63,16 @@ pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Route
 /// Refuse a request that can change data while writes cannot be confirmed;
 /// otherwise run it and push what it committed before answering.
 async fn push_before_answering(
-    State(copy): State<SyncCopy>,
+    State((copy, in_flight)): State<(SyncCopy, Arc<AtomicUsize>)>,
     request: Request,
     next: Next,
 ) -> Response {
     if reads_only(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
+    // Count through the answer's push, including cancellation and refusals.
+    in_flight.fetch_add(1, Ordering::AcqRel);
+    let _request = InFlight(in_flight);
     if let Some(refusal) = refusal(&copy.state()) {
         return refusal;
     }
@@ -79,6 +93,15 @@ async fn push_before_answering(
                  It may still have been saved here; read it back before trying again.",
             )
         }
+    }
+}
+
+/// Drop also handles a cancelled request, so upkeep never sees a stale count.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -131,7 +154,7 @@ fn reads_only(method: &Method, path: &str) -> bool {
 
 /// Push changes no request waited for, check a file the start could not
 /// check, checkpoint the local log, and restart when only a restart helps.
-fn spawn_upkeep(copy: SyncCopy) {
+fn spawn_upkeep(copy: SyncCopy, in_flight: Arc<AtomicUsize>) {
     let interval = std::env::var("TEMPER_TURSO_SYNC_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -164,6 +187,12 @@ fn spawn_upkeep(copy: SyncCopy) {
                     "turso.sync pushes keep timing out; exiting so the restart opens a fresh connection"
                 );
                 std::process::exit(75);
+            }
+            if let Err(error) = copy
+                .trim_pushed(TRIM_BUDGET, || in_flight.load(Ordering::Acquire) > 0)
+                .await
+            {
+                tracing::warn!(%error, "turso.sync could not trim the change log; the next tick will");
             }
             if let Err(error) = copy.checkpoint_if_wal_over(MAX_WAL_BYTES).await {
                 tracing::warn!(%error, "turso.sync checkpoint failed");

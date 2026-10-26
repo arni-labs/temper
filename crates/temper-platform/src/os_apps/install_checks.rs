@@ -43,7 +43,7 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// `BUDGET_STATES`). The time cap comes first: a liveness walk of the
 /// Katagami control specs reached 2.2M states in 120 s and held 1.5 GB on a
 /// Mac. A check that runs out refuses the install, since the bundle declared
-/// a rule nobody proved.
+/// a rule nobody proved. Intermediate expansion work also spends the state allowance.
 const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
     time: std::time::Duration::from_secs(120),
     states: 10_000_000,
@@ -56,7 +56,8 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// is not proven. Both run when the install brings `new_specs` (added or
 /// changed types) or policies: who Cedar lets send each move decides whether
 /// a rule holds and whether a record gets where it should. A named type the
-/// bundle does not carry is taken from what the tenant already runs. It runs
+/// bundle does not carry is taken from what the tenant already runs. Policy
+/// and spec changes check every active tenant spec, overlaid with the incoming specs. It runs
 /// before the install writes or swaps anything, so a refused bundle leaves
 /// the tenant as it was and reads keep serving the old specs meanwhile, and
 /// on a blocking thread, since a large joint model takes seconds.
@@ -142,7 +143,8 @@ pub(super) async fn prove(
 
 /// The bundle's types parsed, with each type `names` returns for them taken
 /// from what the tenant already runs when the bundle does not carry it.
-/// `None` when no bundle type names one.
+/// Include active tenant types before finding properties;
+/// incoming types take precedence. `None` when no checked type names one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
@@ -156,6 +158,19 @@ fn bundle_with_named(
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
         automatons.insert(entity_type.clone(), automaton);
     }
+    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+    // Include installed rule owners and all their supporting types.
+    for entity_type in registry.entity_types(&tenant_id) {
+        if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
+            automatons
+                .entry(entity_type.to_string())
+                .or_insert_with(|| spec.automaton.clone());
+        }
+    }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
         .flat_map(&names)
@@ -164,17 +179,9 @@ fn bundle_with_named(
     if named.is_empty() {
         return Ok(None);
     }
-    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
-    let registry = state
-        .registry
-        .read()
-        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
-    for entity_type in &named {
-        if !automatons.contains_key(entity_type)
-            && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
-        {
-            automatons.insert(entity_type.clone(), spec.automaton.clone());
-        }
-    }
     Ok(Some(automatons))
 }
+
+#[cfg(test)]
+#[path = "install_checks_test.rs"]
+mod tests;
