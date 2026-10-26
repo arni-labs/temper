@@ -29,6 +29,9 @@ mod run;
 mod solver;
 mod vocab;
 
+#[cfg(test)]
+mod regression_test;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Instant;
