@@ -113,9 +113,13 @@ impl HealthCell {
     }
 
     /// Keep `next`, logging once when the store starts or stops taking writes.
+    /// Only a landed append ends a failure: a refusal for room on a store that
+    /// failed keeps it failing, so freeing the disk does not hide a store that
+    /// still needs a restart.
     fn set(&self, next: WriteHealth) {
         let mut health = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match (&*health, &next) {
+            (WriteHealth::Failing(_), WriteHealth::Refusing(_)) => return,
             (WriteHealth::Writing, WriteHealth::Writing)
             | (WriteHealth::Refusing(_), WriteHealth::Refusing(_))
             | (WriteHealth::Failing(_), WriteHealth::Failing(_)) => {}

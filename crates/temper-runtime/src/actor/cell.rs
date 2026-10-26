@@ -80,7 +80,7 @@ impl<A: Actor> ActorCell<A> {
                 // instead of finding it stopped.
                 Err(ActorError::InitFailed(reason)) => {
                     warn!(actor = %id, reason = %reason, "actor did not start");
-                    rx.close();
+                    rx.close_not_started(&reason);
                     while let Some(envelope) = rx.recv().await {
                         if let Envelope::Ask { reply, .. } = envelope {
                             let _ = reply.send(Err(ActorError::InitFailed(reason.clone())));

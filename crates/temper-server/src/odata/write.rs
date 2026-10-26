@@ -1191,6 +1191,14 @@ pub async fn handle_odata_patch(
                     }
                     .into_response()
                 }
+                Ok(response) if response.store_unavailable => {
+                    crate::write_health::store_unavailable(
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("the store did not take the write"),
+                    )
+                }
                 Ok(response) => odata_error(
                     StatusCode::CONFLICT,
                     "ConcurrentModification",
@@ -1426,6 +1434,14 @@ pub async fn handle_odata_put(
                     }
                     .into_response()
                 }
+                Ok(response) if response.store_unavailable => {
+                    crate::write_health::store_unavailable(
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("the store did not take the write"),
+                    )
+                }
                 Ok(response) => odata_error(
                     StatusCode::CONFLICT,
                     "ConcurrentModification",
@@ -1592,6 +1608,14 @@ pub async fn handle_odata_delete(
                     }
                     state.clear_commons_storage_projection_cache_for_entity(&entity_type);
                     (StatusCode::NO_CONTENT, "").into_response()
+                }
+                Ok(response) if response.store_unavailable => {
+                    crate::write_health::store_unavailable(
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("the store did not take the write"),
+                    )
                 }
                 Ok(response) => odata_error(
                     StatusCode::CONFLICT,

@@ -278,6 +278,17 @@ mod tests {
             actor.is_closed(),
             "an actor that did not start takes no messages"
         );
+        // On a multi-threaded runtime the start can be refused before the
+        // creator's first ask is sent; that ask is told why all the same.
+        match actor
+            .ask::<u32>(FaultyMsg::Ping, Duration::from_secs(5))
+            .await
+        {
+            Err(ActorError::InitFailed(reason)) => {
+                assert_eq!(reason, "its first write was not taken");
+            }
+            other => panic!("an ask sent after the refusal is told why, got {other:?}"),
+        }
     }
 
     // --- An ask is handled inside the asker's span ---

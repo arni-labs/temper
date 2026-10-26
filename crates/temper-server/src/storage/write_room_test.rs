@@ -126,6 +126,36 @@ async fn a_failed_append_makes_writes_fail_until_one_lands_on_any_clone() {
 }
 
 #[tokio::test]
+async fn a_store_that_failed_stays_failing_through_a_refusal_for_room() {
+    let available = Arc::new(AtomicU64::new(STORAGE_FLOOR_BYTES));
+    let (store, journal) = store_on_disk(&available);
+    store.fail_next_appends(JOURNAL, 1);
+    journal
+        .append(JOURNAL, 0, &[envelope(1)])
+        .await
+        .unwrap_err();
+
+    available.store(STORAGE_FLOOR_BYTES - 1, Ordering::SeqCst);
+    let refused = journal
+        .append(JOURNAL, 0, &[envelope(1)])
+        .await
+        .unwrap_err();
+    assert!(
+        is_storage_full(&refused, STORAGE_FLOOR_BYTES - 1),
+        "{refused}"
+    );
+    available.store(STORAGE_FLOOR_BYTES, Ordering::SeqCst);
+    assert!(
+        matches!(journal.write_health(), WriteHealth::Failing(_)),
+        "room again is not a landed append: {:?}",
+        journal.write_health()
+    );
+
+    journal.append(JOURNAL, 0, &[envelope(1)]).await.unwrap();
+    assert_eq!(journal.write_health(), WriteHealth::Writing);
+}
+
+#[tokio::test]
 async fn a_disk_that_cannot_be_read_refuses_nothing() {
     let store = Arc::new(SimEventStore::no_faults(11));
     let room = StorageRoom::read_with("/sim/gone", |_| {

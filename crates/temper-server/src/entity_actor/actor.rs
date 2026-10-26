@@ -40,6 +40,7 @@ use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::field_updates::NotUpdated;
 use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
@@ -72,7 +73,7 @@ impl ReplayPolicy {
 /// What the caller of a refused write is told. An oversized change and a full
 /// disk are told in their own words (what to do about it); anything else
 /// failed to persist.
-pub(super) fn persistence_failure(error: &PersistenceError) -> String {
+fn persistence_failure(error: &PersistenceError) -> String {
     match error {
         PersistenceError::EventTooLarge { .. } | PersistenceError::StorageFull { .. } => {
             error.to_string()
@@ -2092,17 +2093,25 @@ impl EntityActor {
                     expected_precondition,
                 )
                 .await;
-                ctx.reply(EntityResponse {
-                    success: outcome.is_ok(),
-                    refusal: None,
-                    state: state.clone(),
-                    error: outcome.err(),
-                    custom_effects: vec![],
-                    scheduled_actions: vec![],
-                    spawn_requests: vec![],
-                    spec_governed: true,
-                    refused: false,
-                    store_unavailable: false,
+                ctx.reply(match outcome {
+                    Ok(()) => EntityResponse {
+                        success: true,
+                        refusal: None,
+                        state: state.clone(),
+                        error: None,
+                        custom_effects: vec![],
+                        scheduled_actions: vec![],
+                        spawn_requests: vec![],
+                        spec_governed: true,
+                        refused: false,
+                        store_unavailable: false,
+                    },
+                    Err(NotUpdated::Failed(reason)) => {
+                        EntityResponse::write_failed(state.clone(), reason)
+                    }
+                    Err(NotUpdated::Store(error)) => {
+                        persistence_failure_reply(state.clone(), &error)
+                    }
                 });
             }
 

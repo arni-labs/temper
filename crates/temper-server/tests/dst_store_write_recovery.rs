@@ -8,7 +8,8 @@
 //!
 //! Invariants:
 //! - during the stretch every move answers `store_unavailable` and lands
-//!   nothing; `/healthz` answers 503 while appends fail, and 200 with the
+//!   nothing, as does a `PATCH`, `PUT` or `DELETE` over OData (503
+//!   `StoreUnavailable`); `/healthz` answers 503 while appends fail, and 200 with the
 //!   refusal while the disk is under the floor; a new record whose first
 //!   write the store does not take answers store unavailable, writes nothing
 //!   and is not listed (its actor neither restarts nor stays failed);
@@ -24,20 +25,25 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{Method, Request, StatusCode};
 use serde_json::json;
+use temper_authz::{AuthenticatedRequestContext, SecurityContext};
 use temper_runtime::ActorSystem;
 use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::{DeterministicRng, install_deterministic_context};
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::SpecRegistry;
+use temper_server::registry::{
+    EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
+};
 use temper_server::request_context::AgentContext;
 use temper_server::state::CreateError;
 use temper_server::storage::{STORAGE_FLOOR_BYTES, StorageRoom};
-use temper_server::{ServerState, StorageStack};
+use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
+use tower::ServiceExt;
 
 const SEEDS: u64 = 48;
 const RECORDS: usize = 3;
@@ -81,6 +87,7 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 <edmx:DataServices><Schema Namespace="Tallies" xmlns="http://docs.oasis-open.org/odata/ns/edm">
 <EntityType Name="Tally"><Key><PropertyRef Name="Id"/></Key>
 <Property Name="Id" Type="Edm.String" Nullable="false"/>
+<Property Name="Note" Type="Edm.String"/>
 </EntityType>
 <EntityContainer Name="Default"><EntitySet Name="Tallies" EntityType="Tallies.Tally"/></EntityContainer>
 </Schema></edmx:DataServices></edmx:Edmx>"#;
@@ -122,7 +129,65 @@ fn server(store: &SimEventStore, available: &Arc<AtomicU64>, seed: u64) -> Serve
     let available = Arc::clone(available);
     let room = StorageRoom::read_with("/sim/disk", move |_| Ok(available.load(Ordering::SeqCst)));
     state.set_storage_stack(StorageStack::from_sim(store.clone(), None).with_storage_room(room));
+    // OData writes pass the verification gate and Cedar; this test is about
+    // what the store does with them.
+    state.registry.write().unwrap().set_verification_status(
+        &TenantId::new(TENANT),
+        "Tally",
+        VerificationStatus::Completed(EntityVerificationResult {
+            all_passed: true,
+            levels: vec![EntityLevelSummary {
+                level: "L0 SMT".to_string(),
+                passed: true,
+                summary: "OK".to_string(),
+                details: None,
+            }],
+            verified_at: "2026-10-26T00:00:00Z".to_string(),
+        }),
+    );
     state
+        .authz
+        .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
+        .expect("the policy parses");
+    state
+}
+
+/// A `PATCH`, `PUT` or `DELETE` of the record over OData: its status and
+/// error code.
+async fn odata_write(state: &ServerState, method: Method, id: &str) -> (StatusCode, String) {
+    let body = if method == Method::DELETE {
+        Body::empty()
+    } else {
+        Body::from(json!({ "Id": id, "Note": "written" }).to_string())
+    };
+    let mut request = Request::builder()
+        .method(method)
+        .uri(format!("/tdata/Tallies('{id}')"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .expect("the request builds");
+    request
+        .extensions_mut()
+        .insert(AuthenticatedRequestContext::new(
+            TenantId::new(TENANT),
+            SecurityContext::from_resolved_identity("recovery", "test-agent", None),
+        ));
+    let response = build_router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    (
+        status,
+        body["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 /// `/healthz`: its status and body.
@@ -299,6 +364,18 @@ fn run_seed(seed: u64) -> Result<(), String> {
                     format!("{code} {body}"),
                 ));
             }
+            let id = ids[rng.next_bound(RECORDS)].clone();
+            let method = [Method::PATCH, Method::PUT, Method::DELETE][rng.next_bound(3)].clone();
+            let (before, _, _) = journal_state(&store, &id).await;
+            let (code, error) = odata_write(&state, method.clone(), &id).await;
+            let (after, _, _) = journal_state(&store, &id).await;
+            run.trace.push(format!("{method} {id}: {code} {error}, journal {before} -> {after}"));
+            if code != StatusCode::SERVICE_UNAVAILABLE || error != "StoreUnavailable" || after != before {
+                return Err(run.fail(
+                    "an OData write the store cannot take answers 503 StoreUnavailable and lands nothing",
+                    format!("{method} {id}: {code} {error}, landed {}", after - before),
+                ));
+            }
         }
         // A new record whose first write the store does not take is not
         // created: its creator is told, and nothing is left behind.
@@ -345,6 +422,15 @@ fn run_seed(seed: u64) -> Result<(), String> {
                     format!("{id}: {answer:?}, landed {landed}"),
                 ));
             }
+        }
+        let (before, _, _) = journal_state(&store, &ids[0]).await;
+        let (code, error) = odata_write(&state, Method::PATCH, &ids[0]).await;
+        let (after, _, _) = journal_state(&store, &ids[0]).await;
+        if code != StatusCode::OK || after != before + 1 {
+            return Err(run.fail(
+                "an OData write lands once the store takes writes",
+                format!("PATCH {}: {code} {error}, landed {}", ids[0], after - before),
+            ));
         }
         let created = state
             .get_or_create_tenant_entity(&tenant, "Tally", LATE, json!({ "Id": LATE }))
