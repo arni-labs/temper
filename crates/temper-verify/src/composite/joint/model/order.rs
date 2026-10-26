@@ -447,7 +447,7 @@ fn merge(grown: Vec<Option<Family>>) -> Vec<Family> {
         .collect()
 }
 
-/// The counter fields a guard, a reaction's guard or a property reads.
+/// The fields read by guards, properties, or effect arguments.
 fn fields_read(specs: &Specs<'_>) -> BTreeSet<Field> {
     let mut read: BTreeSet<Field> = specs
         .read
@@ -470,6 +470,11 @@ fn fields_read(specs: &Specs<'_>) -> BTreeSet<Field> {
     for (entity, model) in specs.models {
         for t in &model.transitions {
             note(entity, &t.guard);
+            for effect in &t.effects {
+                if let Some(field) = super::super::slice::effect_reads(effect) {
+                    note(entity, &Expr::Var(field.to_string()));
+                }
+            }
         }
     }
     for reaction in specs.reactions {

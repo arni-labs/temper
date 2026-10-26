@@ -327,9 +327,7 @@ impl JointModel {
     /// outside, who armed it.
     fn arm_at_start(&self, state: &mut JointState) {
         for (entity, record) in &state.records {
-            if self.sender_matters.contains(entity)
-                && self.timeout(entity, &record.status).is_some()
-            {
+            if self.timeout(entity, &record.status).is_some() {
                 state.armed.insert(entity.clone(), OUTSIDE);
             }
         }

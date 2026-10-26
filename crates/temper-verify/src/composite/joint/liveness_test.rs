@@ -343,7 +343,11 @@ eventually = "App[Id].status == 'Live' => (status == 'Placed' && App[Id].commit 
 
 #[test]
 fn a_place_that_takes_only_newer_counts_settles() {
-    let result = check_specs(COUNTING_APP, &counting_place(true), SAME_RECORD);
+    let place = counting_place(true).replace(
+        "on_timeout = \"Again\"",
+        "on_timeout = \"Again\"\nreset_on = [\"Again\"]",
+    );
+    let result = check_specs(COUNTING_APP, &place, SAME_RECORD);
     assert!(result.holds(), "{result}");
 }
 
@@ -354,6 +358,33 @@ fn a_late_bring_for_an_older_commit_leaves_the_place_behind() {
         resting(&result)
             .iter()
             .any(|state| state.contains("Place=Placed")),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_lost_call_after_a_one_shot_timer_leaves_the_record_stuck() {
+    // A reported failure retries the module; a lost call has no callback.
+    let place = counting_place(true).replace(
+        "on_success = \"Placed\"",
+        "on_success = \"Placed\"\non_failure = \"Again\"",
+    );
+    let result = check_specs(COUNTING_APP, &place, SAME_RECORD);
+    let LivenessOutcome::Stuck { cases, .. } = &result.outcome else {
+        panic!("a lost call after the timer must stay stuck: {result}");
+    };
+    assert!(
+        cases.iter().any(|case| {
+            let actions: Vec<&str> = case
+                .path
+                .iter()
+                .filter_map(|step| step.action.as_deref())
+                .collect();
+            actions
+                .iter()
+                .position(|a| a.contains("(timer)"))
+                .is_some_and(|timer| actions[timer + 1..].iter().any(|a| a.contains("is lost")))
+        }),
         "{result}"
     );
 }

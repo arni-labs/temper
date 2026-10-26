@@ -56,7 +56,8 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// is not proven. Both run when the install brings `new_specs` (added or
 /// changed types) or policies: who Cedar lets send each move decides whether
 /// a rule holds and whether a record gets where it should. A named type the
-/// bundle does not carry is taken from what the tenant already runs. It runs
+/// bundle does not carry is taken from what the tenant already runs. Policy
+/// changes check every active tenant spec, overlaid with the incoming specs. It runs
 /// before the install writes or swaps anything, so a refused bundle leaves
 /// the tenant as it was and reads keep serving the old specs meanwhile, and
 /// on a blocking thread, since a large joint model takes seconds.
@@ -73,21 +74,22 @@ pub(super) async fn prove(
     }
     // A liveness property's own type counts as named, so one that reads no
     // other type is still checked.
-    let Some(automatons) = bundle_with_named(state, tenant, app_name, specs, |a| {
-        let invariants = a
-            .invariants
-            .iter()
-            .flat_map(|inv| inv.assert.related_types());
-        let liveness = a
-            .liveness
-            .iter()
-            .filter_map(|live| live.eventually.as_ref())
-            .flat_map(|goal| {
-                let own = (a.automaton.name.clone(), String::new());
-                goal.related_types().into_iter().chain(std::iter::once(own))
-            });
-        invariants.chain(liveness).collect()
-    })?
+    let Some(automatons) =
+        bundle_with_named(state, tenant, app_name, specs, policies.is_some(), |a| {
+            let invariants = a
+                .invariants
+                .iter()
+                .flat_map(|inv| inv.assert.related_types());
+            let liveness = a
+                .liveness
+                .iter()
+                .filter_map(|live| live.eventually.as_ref())
+                .flat_map(|goal| {
+                    let own = (a.automaton.name.clone(), String::new());
+                    goal.related_types().into_iter().chain(std::iter::once(own))
+                });
+            invariants.chain(liveness).collect()
+        })?
     else {
         return Ok(());
     };
@@ -142,12 +144,14 @@ pub(super) async fn prove(
 
 /// The bundle's types parsed, with each type `names` returns for them taken
 /// from what the tenant already runs when the bundle does not carry it.
-/// `None` when no bundle type names one.
+/// With `tenant_wide`, include active tenant types before finding properties;
+/// incoming types take precedence. `None` when no checked type names one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     specs: &[(String, String)],
+    tenant_wide: bool,
     names: impl Fn(&temper_spec::automaton::Automaton) -> Vec<(String, String)>,
 ) -> Result<Option<std::collections::BTreeMap<String, temper_spec::automaton::Automaton>>, String> {
     let mut automatons = std::collections::BTreeMap::new();
@@ -155,6 +159,20 @@ fn bundle_with_named(
         let automaton = temper_spec::automaton::parse_automaton(ioa_source)
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
         automatons.insert(entity_type.clone(), automaton);
+    }
+    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+    if tenant_wide {
+        for entity_type in registry.entity_types(&tenant_id) {
+            if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
+                automatons
+                    .entry(entity_type.to_string())
+                    .or_insert_with(|| spec.automaton.clone());
+            }
+        }
     }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
@@ -164,11 +182,6 @@ fn bundle_with_named(
     if named.is_empty() {
         return Ok(None);
     }
-    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
-    let registry = state
-        .registry
-        .read()
-        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
     for entity_type in &named {
         if !automatons.contains_key(entity_type)
             && let Some(spec) = registry.get_spec(&tenant_id, entity_type)

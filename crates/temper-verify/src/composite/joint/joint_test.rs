@@ -349,3 +349,95 @@ fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
         "{result}"
     );
 }
+
+#[test]
+fn a_sequence_copied_by_effect_keeps_its_actual_value() {
+    let parent = r#"
+[automaton]
+name = "Parent"
+states = ["Zero", "One", "Two", "Copied"]
+initial = "Zero"
+[[state]]
+name = "sequence"
+type = "counter"
+initial = 0
+[[state]]
+name = "snapshot"
+type = "counter"
+initial = 0
+[[action]]
+name = "First"
+kind = "input"
+from = ["Zero"]
+to = "One"
+effect = ["sequence += 1"]
+[[action.triggers]]
+name = "tell"
+kind = "entity"
+target_entity = "Child"
+target_action = "Copy"
+principal = "counter"
+[action.triggers.args]
+sequence = "sequence"
+[action.triggers.resolve_target]
+kind = "same_id"
+[[action]]
+name = "Second"
+kind = "input"
+from = ["One"]
+to = "Two"
+effect = ["sequence += 1"]
+[[action]]
+name = "Snapshot"
+kind = "input"
+from = ["Two"]
+to = "Copied"
+effect = ["snapshot = sequence"]
+"#;
+    let child = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Done"]
+initial = "Waiting"
+[[state]]
+name = "sequence"
+type = "counter"
+initial = 0
+[[action]]
+name = "Copy"
+kind = "input"
+from = ["Waiting", "Done"]
+to = "Done"
+params = [{ name = "sequence", type = "counter" }]
+effect = ["sequence = params.sequence"]
+[[action.constraints]]
+kind = "param_greater_than_field"
+param = "sequence"
+field = "sequence"
+[[invariant]]
+name = "snapshot_bound"
+assert = "status == 'Done' => Parent[Id].snapshot <= 1"
+"#;
+    let policies = r#"
+permit(principal, action in [Action::"First", Action::"Second", Action::"Snapshot"], resource);
+permit(principal, action == Action::"Copy", resource is Child) when {
+    principal == Agent::"service:counter" && context has triggerSourceEntityId &&
+    resource has id && context.triggerSourceEntityId == resource.id
+};
+"#;
+    let result = check_under(&[parent, child], Some(policies));
+    let JointOutcome::Broken { path } = &result.outcome else {
+        panic!("the copied sequence must violate the invariant: {result}");
+    };
+    assert!(
+        path.iter().any(|step| step
+            .action
+            .as_deref()
+            .is_some_and(|a| a.starts_with("Parent.Snapshot"))),
+        "{result}"
+    );
+    assert!(
+        path.last().unwrap().state.contains("snapshot=2"),
+        "{result}"
+    );
+}

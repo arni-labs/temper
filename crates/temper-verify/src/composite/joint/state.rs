@@ -21,7 +21,8 @@ pub struct JointState {
     /// the model makes the kernel's moves itself.
     pub calls: Vec<Call>,
     /// Who armed each record's state timer, by sender number, for the
-    /// records in a state that has one: its timer fires as them.
+    /// records whose timer is still armed. Presence tracks arming even when
+    /// sender identity does not affect any reaction.
     pub armed: BTreeMap<String, u32>,
 }
 

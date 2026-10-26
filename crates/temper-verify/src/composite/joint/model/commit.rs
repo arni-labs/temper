@@ -122,12 +122,15 @@ impl JointModel {
         by: u32,
     ) {
         let entered = state.records[entity].status != moved.status;
-        let timeout = self
-            .timeout(entity, &moved.status)
-            .filter(|_| self.sender_matters.contains(entity));
+        let timeout = self.timeout(entity, &moved.status);
         match timeout {
             Some(timeout) if entered || timeout.reset_on.iter().any(|a| a == action) => {
-                state.armed.insert(entity.to_string(), by);
+                let sender = if self.sender_matters.contains(entity) {
+                    by
+                } else {
+                    super::super::senders::OUTSIDE
+                };
+                state.armed.insert(entity.to_string(), sender);
             }
             Some(_) => {}
             None => {

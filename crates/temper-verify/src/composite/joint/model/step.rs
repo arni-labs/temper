@@ -127,7 +127,9 @@ impl JointModel {
                     });
                 }
             }
-            if let Some(timeout) = self.timeout(entity, &local.status) {
+            if state.armed.contains_key(entity)
+                && let Some(timeout) = self.timeout(entity, &local.status)
+            {
                 out.push(Move::Timer(entity.clone(), timeout.action.clone()));
             }
         }
@@ -193,7 +195,9 @@ impl JointModel {
                 } else {
                     format!("{entity}.{name} (timer)")
                 };
-                outcomes.extend(self.fire(state.clone(), entity, name, &text, by));
+                let mut next = state.clone();
+                next.armed.remove(entity);
+                outcomes.extend(self.fire(next, entity, name, &text, by));
             }
             Move::Answer(call, action) => {
                 let mut next = state.clone();
