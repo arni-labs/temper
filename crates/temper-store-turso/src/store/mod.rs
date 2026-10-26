@@ -36,7 +36,6 @@ macro_rules! tombstone_sql {
 mod append_config;
 mod authz;
 mod blobs;
-mod catalog_write;
 mod constraints;
 mod entity_listing;
 mod event_store;
@@ -61,6 +60,7 @@ pub mod sync_adopt;
 mod tests;
 mod trajectory;
 mod trajectory_queries;
+mod unchanged_projections;
 mod wasm;
 mod write_gate;
 
@@ -482,6 +482,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_ENTITY_CATALOG_STATUS_INDEX, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_ENTITY_CATALOG_COUNTERS_TABLE, ())
             .await
             .map_err(storage_error)?;
         let _ = conn

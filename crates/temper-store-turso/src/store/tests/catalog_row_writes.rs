@@ -1,9 +1,11 @@
-//! A record's catalog row holds each field once, and a move writes only the
-//! columns it changes.
+//! A record's catalog row holds each field once, in its `fields` column and
+//! not again inside its `state`.
 //!
 //! Turso's change log keeps the whole row before and after every UPDATE, plus
 //! the value of each column the UPDATE sets. The triggers below record those
-//! same sizes, so each test reads what a move adds to that log.
+//! same sizes, so each test reads what a move adds to that log. A move that
+//! rewrites the row logs its fields three times: in the row before, in the row
+//! after, and as the value set; a row that held them twice logged six.
 
 use serde_json::{Value, json};
 
@@ -134,6 +136,15 @@ async fn loaded_state(store: &TursoEventStore, tenant: &str, entity_id: &str) ->
     (row.fields, row.state.expect("catalog row has a state"))
 }
 
+/// A move that rewrote the row logged the body three times, not six.
+fn assert_logged_body_three_times(logged: i64, what: &str) {
+    let body = BODY_BYTES as i64;
+    assert!(
+        (2 * body..3 * body + body / 10).contains(&logged),
+        "{what} logged {logged} bytes for a {body}-byte body"
+    );
+}
+
 fn assert_holds_body_once(lengths: (i64, i64)) {
     let (fields_len, state_len) = lengths;
     let body = BODY_BYTES as i64;
@@ -145,11 +156,10 @@ fn assert_holds_body_once(lengths: (i64, i64)) {
 }
 
 #[tokio::test]
-async fn a_move_writes_each_field_once_and_skips_columns_it_does_not_change() {
+async fn a_move_writes_each_field_once() {
     let store = make_store("catalog-row-writes").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let id = "note-large";
-    let body = BODY_BYTES as i64;
     log_catalog_writes(&store).await;
 
     let (fields, created) = note(id, "Plan", "Draft", 1);
@@ -157,15 +167,10 @@ async fn a_move_writes_each_field_once_and_skips_columns_it_does_not_change() {
     assert_holds_body_once(stored_lengths(&store, &tenant, id).await);
     take_logged_bytes(&store).await;
 
-    // A move that changes the status and counters but no field: the change
-    // log keeps the row before and after, each with one copy of the body.
+    // A move that changes the status and counters but no field.
     let (_, moved) = note(id, "Plan", "Active", 2);
     upsert(&store, &tenant, id, &fields, &moved, 2).await;
-    let logged = take_logged_bytes(&store).await;
-    assert!(
-        logged < 2 * body + body / 10,
-        "a move that changes no field logged {logged} bytes for a {body}-byte body"
-    );
+    assert_logged_body_three_times(take_logged_bytes(&store).await, "a status move");
     assert_eq!(
         loaded_state(&store, &tenant, id).await,
         (fields.clone(), moved.clone())
@@ -179,14 +184,10 @@ async fn a_move_writes_each_field_once_and_skips_columns_it_does_not_change() {
         "a write that changes nothing writes nothing"
     );
 
-    // A move that changes a small field rewrites the fields column once.
+    // A move that changes a small field.
     let (edited_fields, edited) = note(id, "Plan v2", "Active", 3);
     upsert(&store, &tenant, id, &edited_fields, &edited, 3).await;
-    let logged = take_logged_bytes(&store).await;
-    assert!(
-        logged < 3 * body + body / 10,
-        "a move that changes one field logged {logged} bytes for a {body}-byte body"
-    );
+    assert_logged_body_three_times(take_logged_bytes(&store).await, "a field edit");
     assert_holds_body_once(stored_lengths(&store, &tenant, id).await);
     assert_eq!(
         loaded_state(&store, &tenant, id).await,
@@ -248,7 +249,6 @@ async fn a_batched_move_writes_each_field_once() {
     let store = make_store("catalog-row-batch").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let id = "note-batch";
-    let body = BODY_BYTES as i64;
     log_catalog_writes(&store).await;
     let batch = |state: &Value, sequence_nr: u64, known_new: bool| QueryProjectionUpsert {
         entity_type: ENTITY_TYPE.to_string(),
@@ -274,11 +274,7 @@ async fn a_batched_move_writes_each_field_once() {
         .upsert_query_projections(&tenant, &[batch(&moved, 2, false)])
         .await
         .expect("batched move");
-    let logged = take_logged_bytes(&store).await;
-    assert!(
-        logged < 2 * body + body / 10,
-        "a batched move that changes no field logged {logged} bytes for a {body}-byte body"
-    );
+    assert_logged_body_three_times(take_logged_bytes(&store).await, "a batched status move");
     assert_holds_body_once(stored_lengths(&store, &tenant, id).await);
     assert_eq!(loaded_state(&store, &tenant, id).await, (fields, moved));
 
