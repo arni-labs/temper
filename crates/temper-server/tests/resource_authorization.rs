@@ -255,7 +255,7 @@ permit(
 
 #[tokio::test]
 async fn authorize_api_evaluates_the_claimed_resource_id_not_context_spoofing() {
-    let (state, _store, _temp) = state_with_turso("authorize-exact-resource").await;
+    let (state, store, _temp) = state_with_turso("authorize-exact-resource").await;
     state
         .authz
         .reload_tenant_policies(
@@ -322,7 +322,26 @@ permit(
         serde_json::from_slice::<serde_json::Value>(&denied_body).expect("denied response JSON")["allowed"],
         false
     );
+    assert!(
+        store
+            .query_decisions(TENANT, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an offer check must not file a pending decision"
+    );
+    assert!(
+        store
+            .load_policy_denial_patterns(TENANT)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an offer check must not record a denial pattern"
+    );
 }
 
 #[path = "resource_authorization/artifact_authorization.rs"]
 mod artifact_authorization;
+
+#[path = "resource_authorization/offer_checks.rs"]
+mod offer_checks;

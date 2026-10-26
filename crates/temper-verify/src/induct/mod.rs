@@ -19,6 +19,7 @@
 
 mod alone;
 mod cedar;
+mod declare;
 mod effects;
 mod encode;
 mod general;
@@ -33,6 +34,9 @@ mod run;
 mod solver;
 mod vocab;
 
+#[cfg(test)]
+mod regression_test;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -43,7 +47,8 @@ use temper_spec::predicate::{Expr, Name};
 
 pub use alone::prove_alone;
 pub(crate) use alone::prove_alone_indexed;
-use encode::{Enc, initial};
+use declare::initial;
+use encode::Enc;
 use guess::Guess;
 pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};

@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use super::Obligation;
 use super::Shared;
-use super::encode::{Enc, prelude};
+use super::declare::prelude;
+use super::encode::Enc;
 use super::run::{Ask, Clauses, Goal, Kept, check, few_in_flight, plain, quoted_literals};
 use super::solver::Z3;
 use super::vocab::Vocab;
@@ -138,9 +139,26 @@ pub(super) fn with_pool<R>(
     let taken = &Mutex::new(taken);
     let (says, said) = channel();
     std::thread::scope(|scope| {
+        let mut width = 0;
         for i in 0..solvers {
+            // A solver is admitted before its thread is made, so a rule
+            // waiting for seats holds no threads. The first waits for a
+            // seat; the rest start only while seats are free, so the proof
+            // does not wait on them.
+            let seat = if i == 0 {
+                Seat::take(session.deadline)
+            } else {
+                Seat::try_take()
+            };
+            let Some(seat) = seat else {
+                break;
+            };
+            #[cfg(test)]
+            tests::WORKERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            width += 1;
             let says = says.clone();
             scope.spawn(move || {
+                let _seat = seat;
                 let name = format!("{rule}.{i}");
                 if let Err(error) = serve(session, asks, taken, &says, &name) {
                     let _ = says.send(Said::Failed(error));
@@ -151,7 +169,8 @@ pub(super) fn with_pool<R>(
         let mut pool = Pool {
             jobs,
             said,
-            width: solvers,
+            // With no solver, every ask comes back unchecked.
+            width: width.max(1),
             refused: BTreeMap::new(),
             errors: Vec::new(),
         };
@@ -162,8 +181,8 @@ pub(super) fn with_pool<R>(
     })
 }
 
-/// One solver: read the session, then check each ask it is given, until
-/// there are no more or the deadline passes.
+/// One solver, holding its seat: read the session, then check each ask it
+/// is given, until there are no more or the deadline passes.
 fn serve(
     session: &Session<'_>,
     asks: &[Ask],
@@ -171,10 +190,7 @@ fn serve(
     says: &Sender<Said>,
     name: &str,
 ) -> std::io::Result<()> {
-    let Some(_seat) = Seat::take(session.deadline) else {
-        return Ok(());
-    };
-    let mut z3 = Z3::start()?;
+    let mut z3 = Z3::start(session.deadline)?;
     z3.send(session.prelude)?;
     z3.send(session.few)?;
     let refused = session.clauses.define(&mut z3)?;
@@ -249,8 +265,22 @@ impl Seat {
                 }
             };
         }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
+        }
         *free -= 1;
         Some(Seat)
+    }
+
+    /// A seat, if one is free now.
+    fn try_take() -> Option<Self> {
+        let (free, _) = Self::seats();
+        let mut free = free.lock().unwrap_or_else(PoisonError::into_inner);
+        let some = *free > 0;
+        if some {
+            *free -= 1;
+        }
+        some.then_some(Seat)
     }
 }
 
@@ -261,3 +291,6 @@ impl Drop for Seat {
         freed.notify_one();
     }
 }
+
+#[cfg(test)]
+mod tests;

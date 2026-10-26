@@ -37,7 +37,9 @@ pub(super) fn check_boot_counts(
 /// Invariant: each record has exactly the timer row its current state
 /// declares, and none when nothing armed it ([`Run::unarmed`]) or it was
 /// deleted. Rows are captured before any read. At restart the expected state
-/// is derived from storage, so the timer-only wait keeps untouched records.
+/// is derived from storage, so the timer-only wait keeps untouched records:
+/// the status of the snapshot, then each later event's stored `to_status`,
+/// which replay keeps whatever the active spec says the action targets.
 pub(super) async fn check_rows_follow_state(
     state: &ServerState,
     world: &World,
@@ -63,17 +65,11 @@ pub(super) async fn check_rows_follow_state(
                 None => (0, "Idle".to_string()),
             };
             for event in world.events.read_events(&key, seq).await.unwrap() {
-                match event.event_type.as_str() {
-                    "Start" => {
-                        expected = if job.tenant.as_str() == "alpha" {
-                            "Review"
-                        } else {
-                            "Waiting"
-                        }
-                        .to_string()
-                    }
-                    "Expire" | "Approve" => expected = "Done".to_string(),
-                    _ => {}
+                if let Some(to) = event.payload["to_status"]
+                    .as_str()
+                    .filter(|to| !to.is_empty())
+                {
+                    expected = to.to_string();
                 }
             }
             expected

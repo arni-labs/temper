@@ -3,10 +3,12 @@
 //! Contains the state, action, transition, invariant, liveness, and model struct
 //! definitions used by the Stateright model checker.
 
+pub use super::string::ModelString;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use std::collections::BTreeSet;
@@ -35,7 +37,7 @@ pub struct TemperModelState {
     /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
     /// invariants read no string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub strings: BTreeMap<String, String>,
+    pub strings: BTreeMap<String, ModelString>,
 }
 
 impl fmt::Display for TemperModelState {
@@ -89,8 +91,8 @@ pub enum ParamValue {
     Count(usize),
     /// A boolean.
     Bool(bool),
-    /// A string some guard or invariant compares a list against.
-    Str(String),
+    /// A concrete string or a fresh equality symbol.
+    Str(ModelString),
     /// A string no guard or invariant mentions.
     Fresh,
 }
@@ -259,7 +261,7 @@ pub struct TemperModel {
     /// Initial list values from [[state]] declarations.
     pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
     /// Initial values of the tracked string variables.
-    pub(crate) initial_strings: BTreeMap<String, String>,
+    pub(crate) initial_strings: BTreeMap<String, ModelString>,
     /// The string variables the verifier tracks: those an invariant reads,
     /// and those whose value reaches one through a constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
@@ -290,6 +292,10 @@ pub(crate) struct ExploreLimit {
     /// Set once a walk is over, so the model offers its actions again:
     /// Stateright rebuilds a found path by stepping the model from the start.
     pub(crate) lifted: Arc<AtomicBool>,
+    /// Remaining expansion work shared by all callers in this walk.
+    pub(crate) work: Arc<AtomicUsize>,
+    /// Expansion stopped before all assignments were generated.
+    pub(crate) exhausted: Arc<AtomicBool>,
 }
 
 impl ExploreLimit {
@@ -298,6 +304,8 @@ impl ExploreLimit {
     pub(crate) fn for_one_walk(&self) -> Self {
         Self {
             lifted: Arc::new(AtomicBool::new(false)),
+            work: Arc::new(AtomicUsize::new(self.states)),
+            exhausted: Arc::new(AtomicBool::new(false)),
             ..self.clone()
         }
     }
@@ -308,10 +316,11 @@ impl ExploreLimit {
 }
 
 impl TemperModel {
-    /// Whether the time this model may be explored for is spent.
+    /// Whether the model has spent its time or expansion work allowance.
     pub fn out_of_time(&self) -> bool {
         self.limit.as_ref().is_some_and(|limit| {
-            !limit.lifted.load(Ordering::Relaxed) && Instant::now() >= limit.until
+            !limit.lifted.load(Ordering::Relaxed)
+                && (Instant::now() >= limit.until || limit.exhausted.load(Ordering::Relaxed))
         })
     }
 
