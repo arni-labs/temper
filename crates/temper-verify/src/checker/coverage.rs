@@ -52,6 +52,9 @@ pub(super) fn find_dead_transitions(model: &TemperModel) -> Option<Coverage> {
         let mut fired = false;
         for (index, transition) in model.transitions.iter().enumerate() {
             let next_states = step(model, transition, &state);
+            if model.out_of_time() {
+                return None;
+            }
             if next_states.is_empty() {
                 continue;
             }

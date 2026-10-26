@@ -13,11 +13,9 @@ use z3_sys::{
     Z3_get_error_code, Z3_get_error_msg, Z3_mk_config, Z3_mk_context, Z3_set_error_handler,
 };
 
-/// How long one check may run before the solver answers unknown.
-const CHECK_TIMEOUT_MS: &str = "2000";
-
 pub(super) struct Z3 {
     context: Z3_context,
+    deadline: Option<Instant>,
     /// Everything sent, to replay a session by hand, when `INDUCT_SCRIPT`
     /// asks for it.
     pub(super) script: Option<String>,
@@ -35,7 +33,7 @@ pub(super) enum Answer {
 }
 
 impl Z3 {
-    pub(super) fn start() -> std::io::Result<Self> {
+    pub(super) fn start(deadline: Option<Instant>) -> std::io::Result<Self> {
         // JUSTIFICATION: the z3 crate has no safe way to read SMT-LIB
         // commands, and the obligations are SMT-LIB text.
         //
@@ -53,12 +51,11 @@ impl Z3 {
         };
         let mut z3 = Self {
             context,
+            deadline,
             script: std::env::var("INDUCT_SCRIPT").ok().map(|_| String::new()),
             errors: Vec::new(),
         };
-        z3.send(&format!(
-            "(set-option :print-success false)\n(set-option :produce-models true)\n(set-option :timeout {CHECK_TIMEOUT_MS})\n"
-        ))?;
+        z3.send("(set-option :print-success false)\n(set-option :produce-models true)\n")?;
         Ok(z3)
     }
 
@@ -69,7 +66,20 @@ impl Z3 {
     /// Check what was asserted, and how long the solver took.
     pub(super) fn check(&mut self) -> std::io::Result<(Answer, Duration)> {
         let start = Instant::now();
-        let answer = self.eval("(check-sat)\n")?;
+        let timeout = match self.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(start);
+                if remaining.is_zero() {
+                    return Ok((Answer::Unknown, start.elapsed()));
+                }
+                // Z3 takes milliseconds; zero disables its timeout. Use the
+                // shared budget remaining for every check, including checks
+                // made within an obligation, with one millisecond minimum.
+                remaining.as_millis().clamp(1, u32::MAX as u128)
+            }
+            None => 0,
+        };
+        let answer = self.eval(&format!("(set-option :timeout {timeout})\n(check-sat)\n"))?;
         let took = start.elapsed();
         let sat = match answer.trim() {
             "sat" => Answer::Sat,
@@ -156,5 +166,58 @@ impl Drop for Z3 {
         // SAFETY: the context was made in `start`, is owned by this session
         // alone, and is not used again.
         unsafe { Z3_del_context(self.context) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_check_uses_the_remaining_shared_budget() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut z3 = Z3::start(Some(deadline)).unwrap();
+        z3.script = Some(String::new());
+        assert_eq!(z3.check().unwrap().0, Answer::Sat);
+        let script = z3.script.take().unwrap();
+        let timeout: u128 = script
+            .split(":timeout ")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(timeout > 2_000 && timeout <= 30_000);
+
+        // A later check in the same session must use the updated budget.
+        z3.deadline = Some(Instant::now() + Duration::from_secs(1));
+        z3.script = Some(String::new());
+        assert_eq!(z3.check().unwrap().0, Answer::Sat);
+        let script = z3.script.take().unwrap();
+        let timeout: u128 = script
+            .split(":timeout ")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=1_000).contains(&timeout));
+
+        z3.deadline = Some(Instant::now());
+        z3.script = Some(String::new());
+        assert_eq!(z3.check().unwrap().0, Answer::Unknown);
+        assert!(z3.script.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_deadline_has_no_check_timeout() {
+        let mut z3 = Z3::start(None).unwrap();
+        z3.script = Some(String::new());
+        assert_eq!(z3.check().unwrap().0, Answer::Sat);
+        assert!(z3.script.as_ref().unwrap().contains(":timeout 0)"));
     }
 }

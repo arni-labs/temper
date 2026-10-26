@@ -1,6 +1,6 @@
 //! Concrete call answers must be possible in the proof as in the kernel.
 
-use super::encode::prelude;
+use super::declare::prelude;
 use super::moves::Step;
 use super::solver::{Answer, Z3};
 use super::*;
@@ -77,7 +77,7 @@ fn a_proof_allows_returned_parameters_to_differ_from_call_time_fields() {
                 .collect::<Vec<_>>();
             format!("(mk/{} {})", flight.name, values.join(" "))
         };
-        let mut z3 = Z3::start().unwrap();
+        let mut z3 = Z3::start(None).unwrap();
         z3.send(&prelude(
             &v,
             &BTreeSet::from(["old".to_string(), "new".to_string()]),

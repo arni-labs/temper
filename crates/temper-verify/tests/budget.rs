@@ -241,3 +241,69 @@ effect = ["x += params.n"]
         "{stopped}"
     );
 }
+
+#[test]
+fn work_exhaustion_after_l1_stops_the_affected_level() {
+    let spec = r#"
+[automaton]
+name = "Strings"
+states = ["On"]
+initial = "On"
+
+[[state]]
+name = "value"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Write"
+kind = "input"
+from = ["On"]
+to = "On"
+params = [{ name = "value", type = "string" }]
+
+[[invariant]]
+name = "tracked"
+assert = "value == value"
+"#;
+    // No simulation seeds leaves the work for L3. Both callers of ran_out
+    // must notice exhaustion without relying on a model-check completion flag.
+    for (seeds, states, level, count, label) in [
+        (5, 1000, CascadeLevel::Simulation, 3, "L2 Simulation"),
+        (0, 100, CascadeLevel::PropertyTest, 4, "L3 Property Tests"),
+    ] {
+        let started = Instant::now();
+        let result = VerificationCascade::from_ioa(spec)
+            .with_sim_seeds(seeds)
+            .with_prop_test_cases(20)
+            .with_budget(Budget {
+                time: Duration::from_secs(600),
+                states,
+            })
+            .run();
+        assert!(started.elapsed() < Duration::from_secs(60));
+        let l1 = &result.levels[1];
+        assert_eq!(l1.level, CascadeLevel::ModelCheck);
+        assert!(l1.passed, "{}", l1.summary);
+        assert!(l1.verification.as_ref().unwrap().is_complete);
+        assert!(!result.all_passed);
+        assert_eq!(
+            result.levels.len(),
+            count,
+            "no levels after the cut may run"
+        );
+        let last = result.levels.last().unwrap();
+        assert_eq!(last.level, level);
+        assert!(!last.passed);
+        let stopped = result
+            .stopped
+            .as_deref()
+            .expect("work exhaustion must stop the cascade");
+        assert!(
+            stopped.contains(&format!(
+                "{label} STOPPED: reached its limit of {states} generated states or expansion steps"
+            )),
+            "{stopped}"
+        );
+    }
+}

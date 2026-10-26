@@ -176,11 +176,11 @@ impl Order {
         self.families.iter().any(|f| f.params.contains(&key))
     }
 
-    /// Whether the model decides `entity`'s `action` constraint on `param`.
-    pub(super) fn decides(&self, entity: &str, action: &str, param: &str) -> bool {
+    /// Whether the model decides this parameter's comparison with this field.
+    pub(super) fn decides(&self, entity: &str, action: &str, param: &str, field: &str) -> bool {
         self.compared
             .get(&(entity.to_string(), action.to_string()))
-            .is_some_and(|pairs| pairs.iter().any(|(p, _)| p == param))
+            .is_some_and(|pairs| pairs.iter().any(|(p, f)| p == param && f == field))
     }
 
     /// Whether `params` pass `entity`'s `action` constraints the model
@@ -447,7 +447,7 @@ fn merge(grown: Vec<Option<Family>>) -> Vec<Family> {
         .collect()
 }
 
-/// The counter fields a guard, a reaction's guard or a property reads.
+/// The fields read by guards, properties, or effect arguments.
 fn fields_read(specs: &Specs<'_>) -> BTreeSet<Field> {
     let mut read: BTreeSet<Field> = specs
         .read
@@ -470,6 +470,11 @@ fn fields_read(specs: &Specs<'_>) -> BTreeSet<Field> {
     for (entity, model) in specs.models {
         for t in &model.transitions {
             note(entity, &t.guard);
+            for effect in &t.effects {
+                if let Some(field) = super::super::slice::effect_reads(effect) {
+                    note(entity, &Expr::Var(field.to_string()));
+                }
+            }
         }
     }
     for reaction in specs.reactions {
