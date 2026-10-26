@@ -14,11 +14,12 @@ impl Vocab<'_> {
     /// What Cedar answers `asker` sending `action` to `entity`.
     fn ask(&self, policies: &SendAnalysis, asker: &Asker, action: &str, entity: &str) -> May {
         let question = format!("{asker:?} {action} {entity}");
-        if let Some(may) = self.answered.borrow().get(&question) {
+        let answered = || self.answered.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(may) = answered().get(&question) {
             return *may;
         }
         let may = policies.may(asker, action, entity, &BTreeMap::new());
-        self.answered.borrow_mut().insert(question, may);
+        answered().insert(question, may);
         may
     }
 
