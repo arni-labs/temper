@@ -7,6 +7,8 @@
 //! not bounded: a walk that fits finishes, since each state it walks is one
 //! more it holds.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Memory joint walks take as they grow and give back when they end.
@@ -161,4 +163,40 @@ pub(super) fn block(size: usize) -> usize {
 /// bucket and a control byte for each, at most seven of eight buckets full.
 pub(super) fn map_bytes<K, V>(capacity: usize) -> usize {
     (capacity * 8).div_ceil(7) * (size_of::<(K, V)>() + 1)
+}
+
+/// Bytes `list` takes at its capacity.
+pub(super) fn bytes<T>(list: &Vec<T>) -> usize {
+    list.capacity() * size_of::<T>()
+}
+
+/// Make `list` hold `spare` more, doubling it when it must grow, with the
+/// memory of its new copy taken while the old one is still held.
+pub(super) fn grow<T>(list: &mut Vec<T>, spare: usize, held: &mut Held<'_>) -> Result<(), String> {
+    let len = list.len();
+    if list.capacity() - len >= spare {
+        return Ok(());
+    }
+    let wanted = (len + spare).max(list.capacity() * 2);
+    held.add(wanted * size_of::<T>())?;
+    list.reserve_exact(wanted - len);
+    held.sub(wanted * size_of::<T>());
+    Ok(())
+}
+
+/// Make `map` hold `spare` more, as [`grow`] does a list.
+pub(super) fn grow_map<K: Eq + Hash, V, S: BuildHasher>(
+    map: &mut HashMap<K, V, S>,
+    spare: usize,
+    held: &mut Held<'_>,
+) -> Result<(), String> {
+    let len = map.len();
+    if map.capacity() - len >= spare {
+        return Ok(());
+    }
+    let wanted = (len + spare).max(map.capacity() * 2);
+    held.add(map_bytes::<K, V>(wanted))?;
+    map.reserve(wanted - len);
+    held.sub(map_bytes::<K, V>(wanted));
+    Ok(())
 }

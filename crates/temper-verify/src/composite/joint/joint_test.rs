@@ -430,3 +430,35 @@ fn a_proof_gets_a_new_digest_from_a_change_its_walk_reads() {
         "Cedar that decides who may send Copy"
     );
 }
+
+#[test]
+fn initial_states_take_their_block_before_an_invariant_can_stop_the_walk() {
+    let child = child_with("Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let automatons = parse(&[&parent, &child]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    for limit in [4 << 10, 2 << 20] {
+        let room = Bytes::new(limit);
+        let progress = Progress::default();
+        let results = verify_joint_invariants(
+            &refs,
+            None,
+            Bound {
+                room: &room,
+                progress: &progress,
+            },
+        );
+        assert_eq!(results.len(), 1);
+        if limit < 1 << 20 {
+            assert!(matches!(
+                results[0].outcome,
+                JointOutcome::Incomplete { .. }
+            ));
+            assert_eq!(results[0].states, 0);
+        } else {
+            assert!(matches!(results[0].outcome, JointOutcome::Broken { .. }));
+            assert!(progress.bytes.load(std::sync::atomic::Ordering::Relaxed) >= 1 << 20);
+        }
+        assert_eq!(room.held(), 0);
+    }
+}

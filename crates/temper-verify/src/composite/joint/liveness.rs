@@ -351,35 +351,41 @@ fn settle(
         .iter()
         .map(|made| made.by_system || (made.relied && failing[made.from as usize]))
         .collect();
-    // For each state, the states with a sure move to it, and the covered
-    // moves that may end in it; for each covered move, how many of the
-    // states it may end in do not reach the goal yet.
-    let mut sure_from: Vec<Vec<u32>> = vec![Vec::new(); count];
-    let mut covering: Vec<Vec<u32>> = vec![Vec::new(); count];
+    // For each state, the states with a sure move to it.
+    let sure_from = Lists::build(count, |put| {
+        for edge in &explored.edges {
+            if edge.sure && usable[edge.made as usize] {
+                put(edge.to, explored.made[edge.made as usize].from);
+            }
+        }
+    });
+    // For each state, the covered moves that may end in it. A move's edges
+    // are walked one after another, so the states it ends in are told apart
+    // with a short list.
+    let covering = Lists::build(count, |put| {
+        let mut ends: (u32, Vec<u32>) = (u32::MAX, Vec::new());
+        for edge in &explored.edges {
+            if !usable[edge.made as usize] || !explored.made[edge.made as usize].covered {
+                continue;
+            }
+            if ends.0 != edge.made {
+                ends = (edge.made, Vec::new());
+            }
+            if !ends.1.contains(&edge.to) {
+                ends.1.push(edge.to);
+                put(edge.to, edge.made);
+            }
+        }
+    });
+    // For each covered move, how many of the states it may end in do not
+    // reach the goal yet.
     let mut open = vec![0u32; explored.made.len()];
-    // A move's edges are walked one after another, so the states it ends in
-    // are told apart with a short list.
-    let mut ends: (u32, Vec<u32>) = (u32::MAX, Vec::new());
-    for edge in &explored.edges {
-        let made = &explored.made[edge.made as usize];
-        if !usable[edge.made as usize] {
-            continue;
-        }
-        if edge.sure {
-            sure_from[edge.to as usize].push(made.from);
-        }
-        if ends.0 != edge.made {
-            ends = (edge.made, Vec::new());
-        }
-        if made.covered && !ends.1.contains(&edge.to) {
-            ends.1.push(edge.to);
-            covering[edge.to as usize].push(edge.made);
-            open[edge.made as usize] += 1;
-        }
+    for &made in &covering.items {
+        open[made as usize] += 1;
     }
     while let Some(index) = queue.pop_front() {
-        let mut reached: Vec<u32> = sure_from[index].clone();
-        for &made in &covering[index] {
+        let mut reached: Vec<u32> = sure_from.get(index).to_vec();
+        for &made in covering.get(index) {
             open[made as usize] -= 1;
             if open[made as usize] == 0 {
                 reached.push(explored.made[made as usize].from);
@@ -435,13 +441,53 @@ fn settle(
     }
 }
 
+/// A list of numbers for each state, kept in one table.
+struct Lists {
+    /// Where each state's list starts in `items`; it ends where the next
+    /// one starts.
+    starts: Vec<usize>,
+    items: Vec<u32>,
+}
+
+impl Lists {
+    /// The lists `add` fills. It is called twice, and gives the same pairs
+    /// of a state and a number for its list both times: once to count each
+    /// list, then to fill it.
+    fn build(count: usize, add: impl Fn(&mut dyn FnMut(u32, u32))) -> Self {
+        let mut starts = vec![0; count];
+        add(&mut |state, _| starts[state as usize] += 1);
+        let mut total = 0;
+        for start in &mut starts {
+            total += *start;
+            *start = total;
+        }
+        // Each list is filled from its end, which leaves its start where
+        // the list begins.
+        let mut items = vec![0; total];
+        add(&mut |state, number| {
+            let start = &mut starts[state as usize];
+            *start -= 1;
+            items[*start] = number;
+        });
+        Self { starts, items }
+    }
+
+    fn get(&self, state: usize) -> &[u32] {
+        let end = self
+            .starts
+            .get(state + 1)
+            .copied()
+            .unwrap_or(self.items.len());
+        &self.items[self.starts[state]..end]
+    }
+}
+
 /// The bytes [`settle`] holds for `explored`: per state, its marks, its
-/// place in the queue and the stuck list, and its two lists of moves in; per
-/// move, its mark and count; per edge, its place in one of those lists.
+/// place in the queue and the stuck list, and where its two lists of moves
+/// in start; per move, its mark and count; per edge, its place in each of
+/// those lists.
 fn settle_bytes(explored: &model::Explored<'_>) -> usize {
-    let per_state = 2 * size_of::<bool>()
-        + 2 * size_of::<usize>()
-        + 2 * (size_of::<Vec<u32>>() + super::room::block(4 * size_of::<u32>()));
+    let per_state = 2 * size_of::<bool>() + 4 * size_of::<usize>();
     let per_move = size_of::<bool>() + size_of::<u32>();
     explored.len() * per_state
         + explored.made.len() * per_move
