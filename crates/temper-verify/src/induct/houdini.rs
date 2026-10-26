@@ -82,6 +82,10 @@ pub(super) fn settle(
             let batch: Vec<usize> = due.drain(..due.len().min(pool.width)).collect();
             let out = left_out.iter().chain(dropped.keys()).cloned().collect();
             let checked = pool.check(&batch, &Kept::new(clauses, out))?;
+            // What the solvers refused as they started comes first, in every
+            // try: a clause they refuse may only name what that left
+            // undeclared.
+            note(&mut errors, pool.errors.iter().cloned());
             for (&i, error) in &pool.refused {
                 let name = &clauses.named[i].0;
                 if droppable.contains(name) {
@@ -91,7 +95,6 @@ pub(super) fn settle(
                     note(&mut errors, [error.clone()]);
                 }
             }
-            note(&mut errors, pool.errors.drain(..));
             let mut broken = BTreeMap::new();
             let mut instead = Vec::new();
             for (&i, checked) in batch.iter().zip(checked) {
