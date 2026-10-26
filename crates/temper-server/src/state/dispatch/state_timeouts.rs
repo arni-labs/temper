@@ -410,6 +410,20 @@ impl crate::state::ServerState {
             );
         }
         let now = sim_now();
+        // SCRATCH DEFECT (never merge): a repeating timer counts its ticks
+        // from the state's entry, so the ticks it missed replay.
+        let started_at = if state_changed {
+            now
+        } else {
+            let entry = response.state.status_clock.entered_at.unwrap_or(now);
+            let ticks = response
+                .state
+                .events
+                .iter()
+                .filter(|event| event.action == st.on_timeout && event.timestamp >= entry)
+                .count() as i64;
+            entry + chrono::Duration::seconds(st.after_seconds as i64 * ticks)
+        };
         let timer = declared_timer(
             ctx.tenant,
             ctx.entity_type,
@@ -417,9 +431,9 @@ impl crate::state::ServerState {
             &st,
             &response.state,
             ctx.agent_ctx,
-            now,
+            started_at,
         );
-        let delay = Duration::from_secs(st.after_seconds);
+        let delay = remaining_budget(started_at, st.after_seconds, now);
         self.start_armed_timer(timer, delay, Reservation::Fresh)
             .await;
     }
