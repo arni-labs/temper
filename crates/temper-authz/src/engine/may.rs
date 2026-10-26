@@ -92,14 +92,20 @@ impl SendAnalysis {
             .map(|policy| {
                 // A template-linked policy has no JSON form of its own; an
                 // unknown condition makes it a policy that may apply.
-                let json = policy.to_json().unwrap_or(Json::Null);
+                let mut json = policy.to_json().unwrap_or(Json::Null);
+                // An annotation such as an install's `@source` label decides
+                // nothing.
+                if let Some(fields) = json.as_object_mut() {
+                    fields.remove("annotations");
+                }
                 (policy.effect(), json)
             })
             .collect();
-        // In one order whatever order the set holds them in, so the same
-        // policies print the same: a joint proof's digest reads them.
-        // `may` reads them in any order.
+        // In one order whatever order the set holds them in, and each once,
+        // so the same rules print the same: a joint proof's digest reads
+        // them. `may` reads them in any order, and a copy changes no answer.
         policies.sort_by_cached_key(|(effect, json)| format!("{effect:?} {json}"));
+        policies.dedup();
         Ok(Self { policies })
     }
 
