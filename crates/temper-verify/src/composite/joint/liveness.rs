@@ -35,6 +35,11 @@
 //! reaction carries, which the receiver takes only when it is greater than
 //! its own, is kept as a sequence number: the newest, or behind it
 //! (`model/order.rs`).
+//!
+//! A pass that checked nothing is not one. Where a module may answer with an
+//! action the walk never takes, the property is not checked; a stuck verdict
+//! names those answers, since one may be the way out. And a condition written
+//! `premise => conclusion` whose premise no walked state meets proves nothing.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -65,9 +70,12 @@ pub struct JointLivenessResult {
     /// When the walk held a move back because it would have put more than
     /// this many dispatches and module calls in flight.
     pub in_flight_bound: Option<usize>,
-    /// Settles, stuck (with a shortest path to a state it cannot leave), or
-    /// not fully checked.
+    /// Settles, stuck (with a shortest path to a state it cannot leave),
+    /// proves nothing, or not fully checked.
     pub outcome: LivenessOutcome,
+    /// The answers a module may give that the walk never takes, each as
+    /// `Entity.Action (from Status, ...)`.
+    pub unwalked: Vec<String>,
 }
 
 impl JointLivenessResult {
@@ -91,7 +99,14 @@ pub enum LivenessOutcome {
         /// record statuses among the stuck states with nothing in flight.
         cases: Vec<StuckCase>,
     },
-    /// The walk stopped before every state was seen, or could not start.
+    /// Every walked state reaches the condition, but none meets its premise,
+    /// so that proves nothing.
+    Vacuous {
+        /// The premise, as written.
+        premise: String,
+    },
+    /// The walk stopped before every state was seen, never took an answer
+    /// a module may give, or could not start.
     Incomplete {
         /// Why.
         reason: String,
@@ -157,6 +172,13 @@ impl fmt::Display for JointLivenessResult {
                     self.eventually,
                     cases.len()
                 )?;
+                if !self.unwalked.is_empty() {
+                    writeln!(
+                        f,
+                        "  Some of them may not be stuck in the runtime: {}.",
+                        model::unwalked_reason(&self.unwalked)
+                    )?;
+                }
                 for (number, case) in cases.iter().enumerate() {
                     writeln!(
                         f,
@@ -168,6 +190,11 @@ impl fmt::Display for JointLivenessResult {
                 }
                 Ok(())
             }
+            LivenessOutcome::Vacuous { premise } => write!(
+                f,
+                "{}.{} PROVES NOTHING: its premise `{premise}` holds in none of the {} joint states walked ({scope}{relying}{bound})",
+                self.entity, self.name, self.states
+            ),
             LivenessOutcome::Incomplete { reason } => write!(
                 f,
                 "{}.{} NOT CHECKED ({scope}, {} joint states walked): {reason}",
@@ -213,6 +240,7 @@ pub fn verify_joint_liveness(
                 states: 0,
                 in_flight_bound: None,
                 outcome: LivenessOutcome::Holds,
+                unwalked: Vec::new(),
             };
             if !missing.is_empty() {
                 result.outcome = LivenessOutcome::Incomplete {
@@ -237,11 +265,24 @@ pub fn verify_joint_liveness(
             let explored = model.walk_with(budget, true, |_, _| false);
             result.states = explored.len();
             result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
+            result.unwalked = explored.unwalked();
             result.outcome = match &explored.stopped {
                 Some(reason) => LivenessOutcome::Incomplete {
                     reason: reason.clone(),
                 },
-                None => settle(&model, name, goal, &explored),
+                None => match settle(&model, name, goal, &explored) {
+                    (LivenessOutcome::Holds, _) if !result.unwalked.is_empty() => {
+                        LivenessOutcome::Incomplete {
+                            reason: model::unwalked_reason(&result.unwalked),
+                        }
+                    }
+                    (LivenessOutcome::Holds, false) => LivenessOutcome::Vacuous {
+                        premise: super::premise(goal)
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    },
+                    (outcome, _) => outcome,
+                },
             };
             results.push(result);
         }
@@ -252,7 +293,8 @@ pub fn verify_joint_liveness(
 /// Whether every walked state reaches `goal` through the system's moves,
 /// and if not, each way the stuck states come to rest: the first stuck state
 /// with nothing in flight (in walk order, so with a shortest path) for each
-/// set of record statuses.
+/// set of record statuses. With it, whether a walked state meets the goal's
+/// premise (always, when it has none).
 ///
 /// A state reaches it when it holds there with nothing in flight, or when a
 /// move the system makes there either can lead to a state that reaches it,
@@ -263,14 +305,20 @@ fn settle(
     owner: &str,
     goal: &temper_spec::predicate::Expr,
     explored: &model::Explored,
-) -> LivenessOutcome {
+) -> (LivenessOutcome, bool) {
     let count = explored.len();
     let mut good = vec![false; count];
     let mut failing = vec![false; count];
     let mut queue = VecDeque::new();
+    let premise = super::premise(goal);
+    let mut met = premise.is_none();
     for index in 0..count {
         let state = explored.state(index);
-        let truth = eval(goal, &model.env(owner, &state));
+        let env = model.env(owner, &state);
+        let truth = eval(goal, &env);
+        if let (false, Some(premise)) = (met, premise) {
+            met = eval(premise, &env) != Truth::False;
+        }
         failing[index] = truth != Truth::True;
         if truth == Truth::True && state.settled() {
             good[index] = true;
@@ -325,7 +373,7 @@ fn settle(
     }
     let stuck: Vec<usize> = (0..count).filter(|&index| !good[index]).collect();
     let Some(&first) = stuck.first() else {
-        return LivenessOutcome::Holds;
+        return (LivenessOutcome::Holds, met);
     };
     let mut seen = BTreeSet::new();
     let mut resting: Vec<usize> = stuck
@@ -360,10 +408,13 @@ fn settle(
             }
         })
         .collect();
-    LivenessOutcome::Stuck {
-        stuck: stuck.len(),
-        cases,
-    }
+    (
+        LivenessOutcome::Stuck {
+            stuck: stuck.len(),
+            cases,
+        },
+        met,
+    )
 }
 
 #[cfg(test)]

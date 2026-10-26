@@ -1,6 +1,6 @@
 //! The breadth-first walk over joint states.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
 use super::super::pack::{Packed, Packer};
@@ -47,6 +47,9 @@ pub(in crate::composite::joint) struct Explored {
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
+    /// The answers a call open in a walked state may get that the walk
+    /// never takes, as (entity, action, the record's status).
+    unwalked: BTreeSet<(String, String, String)>,
 }
 
 impl Explored {
@@ -77,6 +80,28 @@ impl Explored {
         steps.reverse();
         steps
     }
+
+    /// The answers a module may give that the walk never took, each as
+    /// `Entity.Action (from Status, ...)`.
+    pub(in crate::composite::joint) fn unwalked(&self) -> Vec<String> {
+        let mut from: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for (entity, action, status) in &self.unwalked {
+            from.entry(format!("{entity}.{action}"))
+                .or_default()
+                .push(status);
+        }
+        from.into_iter()
+            .map(|(action, statuses)| format!("{action} (from {})", statuses.join(", ")))
+            .collect()
+    }
+}
+
+/// Why a walk that never took the answers `unwalked` proves nothing.
+pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
+    format!(
+        "the walk never takes {}: a module whose trigger names no on_success may answer with them, and nothing in the model sends them. Declare them internal if only the module sends them, or name the answer in the trigger's on_success",
+        unwalked.join(", ")
+    )
 }
 
 impl JointModel {
@@ -106,6 +131,7 @@ impl JointModel {
             edges: Vec::new(),
             stopped: None,
             held_back: false,
+            unwalked: BTreeSet::new(),
         };
         let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
@@ -119,6 +145,7 @@ impl JointModel {
         }
         while let Some(index) = queue.pop_front() {
             let state = explored.state(index);
+            self.note_unwalked(&state, &mut explored.unwalked);
             if visit(index, &state) {
                 break;
             }
