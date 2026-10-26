@@ -1276,6 +1276,16 @@ impl Actor for EntityActor {
                     return Ok(());
                 }
 
+                // A state timer's fire applies only at the journal sequence
+                // its timer was armed at (`timer_fire`): past it, another
+                // writer handled this arming or the record moved on.
+                let timer_armed_seq =
+                    super::timer_fire::armed_seq(caller.as_deref(), &self.tenant, state, &name);
+                if let Some(error) = super::timer_fire::moved_past(timer_armed_seq, state) {
+                    ctx.reply(EntityResponse::refused(state.clone(), error));
+                    return Ok(());
+                }
+
                 // Captured BEFORE the action applies. The retry path (ADR-0046)
                 // updates these in lockstep with replay so postconditions hold
                 // across the race window.
@@ -1390,13 +1400,24 @@ impl Actor for EntityActor {
                                     outcome = tracing::field::Empty,
                                 );
 
-                                tracing::warn!(
-                                    parent: &retry_span,
-                                    entity = %state.entity_id,
-                                    action = %name,
-                                    actual_seq = actual,
-                                    "persist hit optimistic-concurrency violation; entering ADR-0046 retry"
-                                );
+                                if timer_armed_seq.is_some_and(|armed| actual > armed) {
+                                    // The replay below drops this fire.
+                                    tracing::info!(
+                                        parent: &retry_span,
+                                        entity = %state.entity_id,
+                                        action = %name,
+                                        actual_seq = actual,
+                                        "state timer fire found its record past its arming; replaying to drop it"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        parent: &retry_span,
+                                        entity = %state.entity_id,
+                                        action = %name,
+                                        actual_seq = actual,
+                                        "persist hit optimistic-concurrency violation; entering ADR-0046 retry"
+                                    );
+                                }
 
                                 // 2 retries + 1 initial = 3 total attempts (ADR-0046).
                                 const MAX_RETRIES: u32 = 2;
@@ -1466,6 +1487,27 @@ impl Actor for EntityActor {
                                             Some(RetryGaveUp::WriteFailed(format!(
                                                 "action {name} may have been written: the journal holds its key after a concurrency violation"
                                             ))),
+                                        ));
+                                        break;
+                                    }
+
+                                    // A timer's fire is not evaluated again on
+                                    // a record that moved past its arming: the
+                                    // move was another writer's fire of the same
+                                    // arming, or a change the timer's next arm
+                                    // follows. With its key absent from the
+                                    // journal, this fire did not land.
+                                    if let Some(error) =
+                                        super::timer_fire::moved_past(timer_armed_seq, state)
+                                    {
+                                        let gave_up = if idempotency_key.is_some() {
+                                            RetryGaveUp::Refused(error)
+                                        } else {
+                                            RetryGaveUp::WriteFailed(error)
+                                        };
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::TimerSuperseded,
+                                            Some(gave_up),
                                         ));
                                         break;
                                     }
