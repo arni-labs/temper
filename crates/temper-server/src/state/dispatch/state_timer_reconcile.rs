@@ -9,7 +9,9 @@
 //!   a newer spec can declare another timer, or none, for the state it
 //!   replays into than the one its timer was armed for;
 //! - after a spec install, for every record of each type whose spec changed;
-//! - when a timer fires on a record that is no longer in its state;
+//! - when a timer fires on a record that is no longer in its state, or whose
+//!   journal moved past the sequence the timer was armed at (another writer
+//!   fired it, or an action it does not reset on came first);
 //! - after a dispatch that neither entered nor reset a timed state, after a
 //!   create, and after a delete.
 //!
