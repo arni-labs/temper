@@ -14,9 +14,8 @@ fn keyed_filter_resolves_to_bounded_candidate_on_postgres() {
     };
     use temper_runtime::scheduler::{sim_now, sim_uuid as runtime_sim_uuid};
 
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {

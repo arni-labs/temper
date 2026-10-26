@@ -89,6 +89,10 @@ pub struct AgentContext {
     /// the fire's event, and only for that record, so a child dispatch that
     /// inherits this context removes nothing.
     pub fires_scheduled_action: Option<ScheduledFire>,
+    /// Runtime-owned; never populated from request headers. The state timer
+    /// this dispatch fires: the actor applies its action only while the
+    /// record's journal is at the sequence the timer was armed at.
+    pub fires_state_timer: Option<StateTimerFire>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -110,7 +114,51 @@ pub struct ScheduledFire {
     pub arm_id: String,
 }
 
+/// A state timer's fire: its record, its action, and the record's journal
+/// sequence when the timer was armed.
+///
+/// An arming is read from the journal at `armed_seq`, so every writer that
+/// holds it (an old and a new process during a deploy, or a fire sent again
+/// after a lost answer) fires at that sequence. The first to commit moves the
+/// journal past it; the store's sequence check picks that writer. Every other
+/// fire of the arming then finds the record moved and is dropped, so an
+/// arming commits its action at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTimerFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The timer's `on_timeout` action.
+    pub action: String,
+    /// The record's journal sequence when the timer was armed.
+    pub armed_seq: u64,
+}
+
 impl AgentContext {
+    /// The sequence this dispatch's state timer was armed at, when the
+    /// dispatch fires `action` on this record. A child dispatch that inherits
+    /// the context, on another record or with another action, is not the fire.
+    pub(crate) fn state_timer_armed_seq(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+    ) -> Option<u64> {
+        self.fires_state_timer
+            .as_ref()
+            .filter(|fire| {
+                fire.tenant == tenant
+                    && fire.entity_type == entity_type
+                    && fire.entity_id == entity_id
+                    && fire.action == action
+            })
+            .map(|fire| fire.armed_seq)
+    }
+
     /// Admit a callback only within both the inline and cumulative budgets.
     pub(crate) fn for_callback(&self) -> Result<Self, CallbackBudgetExceeded> {
         if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
@@ -156,6 +204,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -194,6 +243,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -331,6 +381,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_run_id,
         idempotency_key,
         fires_scheduled_action: None,
+        fires_state_timer: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }

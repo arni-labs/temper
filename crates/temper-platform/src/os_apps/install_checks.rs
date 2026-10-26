@@ -42,8 +42,9 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// validate-ioa's caps for the same attack (its `MAX_BUDGET_MS` and
 /// `BUDGET_STATES`). The time cap comes first: a liveness walk of the
 /// Katagami control specs reached 2.2M states in 120 s and held 1.5 GB on a
-/// Mac. A check that runs out refuses the install, since the bundle declared
-/// a rule nobody proved.
+/// Mac. A check that runs out leaves its rule unproved, which is a warning:
+/// the install goes ahead. Intermediate expansion work also spends the state
+/// allowance.
 const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
     time: std::time::Duration::from_secs(120),
     states: 10_000_000,
@@ -52,17 +53,25 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// Prove every `[[invariant]]` and `[[liveness]]` of `specs` (a bundle's
 /// types) that reads a related record, on the joint model of its type and
 /// the types it names, with `policies` (the tenant's Cedar as the install
-/// leaves it) deciding each move as its sender, and refuse the install if one
-/// is not proven. Each rule is proved by induction first, for every run (an
-/// invariant with its lemmas or the prover's guesses, an `eventually` rule
-/// with its measure), and walked only when the proof does not hold
-/// (`check_joint`). Both run when the install brings `new_specs` (added or
-/// changed types) or policies: who Cedar lets send each move decides whether
-/// a rule holds and whether a record gets where it should. A named type the
-/// bundle does not carry is taken from what the tenant already runs. It runs
-/// before the install writes or swaps anything, so a refused bundle leaves
-/// the tenant as it was and reads keep serving the old specs meanwhile, and
-/// on a blocking thread, since a large joint model takes seconds.
+/// leaves it) deciding each move as its sender. Each rule is proved by
+/// induction first, for every run (an invariant with its lemmas or the
+/// prover's guesses, an `eventually` rule with its measure), and walked only
+/// when the proof does not hold (`check_joint`). Both run when the install
+/// brings `new_specs` (added or changed types) or policies: who Cedar lets
+/// send each move decides whether a rule holds and whether a record gets
+/// where it should. A named type the bundle does not carry is taken from what
+/// the tenant already runs. Policy and spec changes check every active tenant
+/// spec, overlaid with the incoming specs.
+///
+/// Only a rule the check finds broken refuses the install: an invariant with
+/// a path of moves that breaks it, or a liveness rule with a path to a state
+/// from which no move reaches its condition. A rule it could not prove (out
+/// of budget, reading a type nobody declares, a module answer not walked, or
+/// a premise no state meets) is a warning and the install goes ahead; those
+/// rules are returned for the install's answer. It runs before the install
+/// writes or swaps anything, so a refused bundle leaves the tenant as it was
+/// and reads keep serving the old specs meanwhile, and on a blocking thread,
+/// since a large joint model takes seconds.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -70,9 +79,9 @@ pub(super) async fn prove(
     specs: &[(String, String)],
     new_specs: bool,
     policies: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if !new_specs && policies.is_none() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // A liveness property's own type counts as named, so one that reads no
     // other type is still checked.
@@ -92,7 +101,7 @@ pub(super) async fn prove(
         invariants.chain(liveness).collect()
     })?
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let policy_text = policies.map_or_else(
         || super::cached_or_active_tenant_policy_text(state, tenant),
@@ -106,27 +115,33 @@ pub(super) async fn prove(
     })
     .await
     .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
-    let mut unproven = Vec::new();
+    let (mut broken, mut unproved) = (Vec::new(), Vec::new());
     for verdict in check.invariants.iter().chain(&check.liveness) {
         if verdict.holds() {
             tracing::info!(tenant, app = %app_name, "{verdict}");
+        } else if verdict.broken() {
+            broken.push(verdict.to_string());
         } else {
-            unproven.push(verdict.to_string());
+            unproved.push(verdict.to_string());
         }
     }
-    if unproven.is_empty() {
-        Ok(())
+    for text in &unproved {
+        tracing::warn!(tenant, app = %app_name, "{text}");
+    }
+    if broken.is_empty() {
+        Ok(unproved)
     } else {
         Err(format!(
-            "os-app '{app_name}' declares rules over several records that are not proven:\n{}",
-            unproven.join("\n")
+            "os-app '{app_name}' would break tenant rules over several records:\n{}",
+            broken.join("\n")
         ))
     }
 }
 
 /// The bundle's types parsed, with each type `names` returns for them taken
 /// from what the tenant already runs when the bundle does not carry it.
-/// `None` when no bundle type names one.
+/// Include active tenant types before finding properties;
+/// incoming types take precedence. `None` when no checked type names one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
@@ -140,6 +155,19 @@ fn bundle_with_named(
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
         automatons.insert(entity_type.clone(), automaton);
     }
+    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+    // Include installed rule owners and all their supporting types.
+    for entity_type in registry.entity_types(&tenant_id) {
+        if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
+            automatons
+                .entry(entity_type.to_string())
+                .or_insert_with(|| spec.automaton.clone());
+        }
+    }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
         .flat_map(&names)
@@ -148,17 +176,9 @@ fn bundle_with_named(
     if named.is_empty() {
         return Ok(None);
     }
-    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
-    let registry = state
-        .registry
-        .read()
-        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
-    for entity_type in &named {
-        if !automatons.contains_key(entity_type)
-            && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
-        {
-            automatons.insert(entity_type.clone(), spec.automaton.clone());
-        }
-    }
     Ok(Some(automatons))
 }
+
+#[cfg(test)]
+#[path = "install_checks_test.rs"]
+mod tests;

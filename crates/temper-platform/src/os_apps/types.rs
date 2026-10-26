@@ -35,6 +35,10 @@ pub struct InstallResult {
     /// Seed data instances created.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub seed_instances: Vec<String>,
+    /// Rules over several entities the install check could not prove, with
+    /// why. A warning: only a rule found broken refuses an install.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unproved_rules: Vec<String>,
 }
 
 /// Component phases an OS-app install/reconcile should execute.

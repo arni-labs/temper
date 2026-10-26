@@ -3,12 +3,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
+use super::super::JointOutcome;
+use super::super::env::Blind;
 use super::super::pack::{Packed, Packer};
 use super::super::state::render;
-use super::super::{JointState, JointStep};
-use super::JointModel;
+use super::super::{JointState, JointStep, premise};
 use super::step::Certainty;
+use super::{JointModel, Walk};
 use crate::Budget;
+use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 /// One move made from a walked state.
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +127,7 @@ impl JointModel {
         mut visit: impl FnMut(usize, &JointState) -> bool,
     ) -> Explored {
         let started = Instant::now();
+        self.expansion.reset(budget.states, Some(budget.time));
         let mut explored = Explored {
             nodes: Vec::new(),
             packer: Packer::default(),
@@ -133,9 +137,28 @@ impl JointModel {
             held_back: false,
             unwalked: BTreeSet::new(),
         };
+        // Check the sliced models before either caller can expand a move.
+        let oversized: Vec<_> = self
+            .models
+            .iter()
+            .filter_map(|(entity, model)| {
+                crate::model::semantics::oversized_transition(model)
+                    .map(|(action, _)| format!("{entity}.{action} parameter expansion"))
+            })
+            .collect();
+        if !oversized.is_empty() {
+            explored.stopped = Some(format!(
+                "unsupported reads or expansion: {}",
+                oversized.join(", ")
+            ));
+            return explored;
+        }
         let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {
+            if !self.expansion.take() {
+                break;
+            }
             let packed = explored.packer.pack(&init);
             if !seen.contains_key(&packed) {
                 seen.insert(packed.clone(), explored.nodes.len() as u32);
@@ -159,6 +182,9 @@ impl JointModel {
                 break;
             }
             for mv in self.moves(&state) {
+                if !self.expansion.take() {
+                    break;
+                }
                 let (nexts, held) = self.next(&state, &mv);
                 explored.held_back |= held;
                 if edges {
@@ -195,6 +221,147 @@ impl JointModel {
                 }
             }
         }
+        if self.expansion.exhausted.get() {
+            explored.stopped = Some("the joint expansion exhausted its work or time budget".into());
+        }
         explored
+    }
+
+    /// Note each answer a call open in `state` may get that the walk never
+    /// takes, as (entity, action, the record's status).
+    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<(String, String, String)>) {
+        for call in state.calls.iter().filter(|call| call.on_success.is_empty()) {
+            let Some(actions) = self.unwalked_answers.get(&call.to) else {
+                continue;
+            };
+            for t in &self.models[&call.to].transitions {
+                if actions.contains(&t.name) && self.enabled(&call.to, t, state, Blind::Nothing) {
+                    unwalked.insert((
+                        call.to.clone(),
+                        t.name.clone(),
+                        state.records[&call.to].status.clone(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl JointModel {
+    /// Walk every reachable joint state breadth first, checking `invariants`
+    /// of `owner` in each settled one (nothing in flight).
+    pub(in crate::composite::joint) fn walk(
+        &self,
+        owner: &str,
+        invariants: &[&Expr],
+        budget: Budget,
+    ) -> Walk {
+        let mut unsupported = BTreeSet::new();
+        let modeled = |entity: &str, field: &str| {
+            self.models.get(entity).is_some_and(|model| {
+                matches!(field, "Id" | "id")
+                    || match model.var_kinds.get(field) {
+                        Some(temper_spec::predicate::VarKind::Str) => {
+                            model.tracked_strings.contains(field)
+                        }
+                        Some(
+                            temper_spec::predicate::VarKind::Counter
+                            | temper_spec::predicate::VarKind::Bool
+                            | temper_spec::predicate::VarKind::List,
+                        ) => true,
+                        _ => false,
+                    }
+            })
+        };
+        for inv in invariants {
+            inv.for_each_name(&mut |name| {
+                let mut check = |entity: &str, field: &str| {
+                    if !modeled(entity, field) {
+                        unsupported.insert(format!("{entity}.{field}"));
+                    }
+                };
+                match name {
+                    Name::Var(field) => check(owner, field),
+                    Name::CrossStatus { id_field, .. } => check(owner, id_field),
+                    Name::CrossField {
+                        entity_type,
+                        id_field,
+                        field,
+                    } => {
+                        check(owner, id_field);
+                        check(entity_type, field);
+                    }
+                    Name::Status | Name::Param(_) => {}
+                }
+            });
+        }
+        if !unsupported.is_empty() {
+            let reason = format!(
+                "unsupported reads or expansion: {}",
+                unsupported.into_iter().collect::<Vec<_>>().join(", ")
+            );
+            return Walk {
+                states: 0,
+                held_back: false,
+                outcomes: invariants
+                    .iter()
+                    .map(|_| JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            };
+        }
+        let mut unknown = vec![false; invariants.len()];
+        let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
+        let premises: Vec<Option<&Expr>> = invariants.iter().map(|inv| premise(inv)).collect();
+        let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
+        let explored = self.walk_with(budget, false, |index, state| {
+            if state.settled() {
+                let env = self.env(owner, state);
+                for (i, inv) in invariants.iter().enumerate() {
+                    match eval(inv, &env) {
+                        Truth::False if broken[i].is_none() => broken[i] = Some(index),
+                        Truth::Unknown => unknown[i] = true,
+                        _ => {}
+                    }
+                    if let (false, Some(premise)) = (met[i], premises[i]) {
+                        met[i] = eval(premise, &env) != Truth::False;
+                    }
+                }
+            }
+            broken.iter().all(Option::is_some)
+        });
+        let unwalked = explored.unwalked();
+        let outcomes = broken
+            .iter()
+            .enumerate()
+            .map(|(i, found)| match found {
+                Some(index) => JointOutcome::Broken {
+                    path: explored.path(*index),
+                },
+                None if unknown[i] => JointOutcome::Incomplete {
+                    reason: "an invariant read is unknown".into(),
+                },
+                None => match &explored.stopped {
+                    Some(reason) => JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    },
+                    None if !unwalked.is_empty() => JointOutcome::Incomplete {
+                        reason: unwalked_reason(&unwalked),
+                    },
+                    None => match premises[i] {
+                        Some(premise) if !met[i] => JointOutcome::Vacuous {
+                            premise: premise.to_string(),
+                        },
+                        _ => JointOutcome::Holds,
+                    },
+                },
+            })
+            .collect();
+        Walk {
+            states: explored.len(),
+            outcomes,
+            held_back: explored.held_back,
+        }
     }
 }

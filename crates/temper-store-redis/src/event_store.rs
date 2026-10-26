@@ -528,10 +528,6 @@ mod tests {
     use super::*;
     use temper_runtime::persistence::EventMetadata;
 
-    fn redis_url() -> Option<String> {
-        std::env::var("REDIS_URL").ok()
-    }
-
     fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
         PersistenceEnvelope {
             sequence_nr: 0,
@@ -553,7 +549,7 @@ mod tests {
     }
 
     async fn make_store() -> Option<RedisEventStore> {
-        let url = redis_url()?;
+        let url = temper_test_resource::env_var("REDIS_URL")?;
         Some(
             RedisEventStore::new(&url)
                 .await
@@ -564,7 +560,6 @@ mod tests {
     #[tokio::test]
     async fn append_and_read_events_roundtrip() {
         let Some(store) = make_store().await else {
-            eprintln!("REDIS_URL not set, skipping test");
             return;
         };
         let pid = unique_persistence_id();
@@ -601,7 +596,6 @@ mod tests {
     #[tokio::test]
     async fn append_with_wrong_sequence_fails() {
         let Some(store) = make_store().await else {
-            eprintln!("REDIS_URL not set, skipping test");
             return;
         };
         let pid = unique_persistence_id();
@@ -642,7 +636,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_save_and_load_roundtrip() {
         let Some(store) = make_store().await else {
-            eprintln!("REDIS_URL not set, skipping test");
             return;
         };
         let pid = unique_persistence_id();
@@ -668,7 +661,6 @@ mod tests {
     #[tokio::test]
     async fn list_entity_ids_returns_distinct_pairs() {
         let Some(store) = make_store().await else {
-            eprintln!("REDIS_URL not set, skipping test");
             return;
         };
         let unique = uuid::Uuid::new_v4();
@@ -748,7 +740,6 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends_detect_conflict() {
         let Some(store) = make_store().await else {
-            eprintln!("REDIS_URL not set, skipping test");
             return;
         };
         let pid = unique_persistence_id();

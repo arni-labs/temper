@@ -12,8 +12,8 @@ use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::step::{Certainty, Move};
 use super::{JointModel, MAX_REACTION_DEPTH, Reaction};
-use crate::model::semantics::successors_among;
-use crate::model::{ParamValue, TemperModelAction};
+use crate::model::semantics::successors_budgeted;
+use crate::model::{ModelString, ParamValue, TemperModelAction};
 
 impl JointModel {
     /// What follows `source.action` committing, sent by `by`: its
@@ -45,16 +45,21 @@ impl JointModel {
         let asked: Vec<BTreeSet<String>> = specs
             .iter()
             .map(|spec| {
-                self.unchecked
-                    .asked(source, |action| match &spec.on_success {
-                        Some(name) => name == action,
-                        None => internal.is_some_and(|names| names.contains(action)),
-                    })
+                self.unchecked.asked(source, |action| {
+                    if spec.on_success.is_empty() {
+                        internal.is_some_and(|names| names.contains(action))
+                    } else {
+                        spec.on_success.iter().any(|name| name == action)
+                    }
+                })
             })
             .collect();
         let mut started = Vec::new();
         for (outcome, known) in outcomes {
             for &answer_as in &answering {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let mut outcome = outcome.clone();
                 for (spec, asked) in specs.iter().zip(&asked) {
                     let strings = &outcome.records[source].strings;
@@ -86,25 +91,25 @@ impl JointModel {
         &self,
         state: &JointState,
         call: &Call,
-        values: &BTreeSet<String>,
+        values: &BTreeSet<ModelString>,
         out: &mut Vec<Move>,
     ) {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            let answers = match &call.on_success {
-                Some(name) => &t.name == name,
-                None => self
-                    .kernel
+            let answers = if call.on_success.is_empty() {
+                self.kernel
                     .internal
                     .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name)),
+                    .is_some_and(|names| names.contains(&t.name))
+            } else {
+                call.on_success.contains(&t.name)
             };
             if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
                 continue;
             }
             let mut seen = BTreeSet::new();
-            for (mut params, _) in successors_among(model, t, local, values) {
+            for (mut params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
                 // A parameter tied to a field carries it as the call found it.
                 for param in &t.string_params {
                     if let Some(value) = param.equals.as_ref().and_then(|f| call.asked.get(f)) {
@@ -166,6 +171,9 @@ impl JointModel {
         {
             let mut after = Vec::new();
             for (state, known) in outcomes {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let fires = match &reaction.guard {
                     Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
                     None => Truth::True,
@@ -208,7 +216,11 @@ impl JointModel {
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
                     depth: depth + 1,
                     via: Some(index),
-                    by: self.senders.reaction(reaction.principal.as_ref(), by),
+                    by: self.senders.reaction(
+                        reaction.principal.as_ref(),
+                        by,
+                        matches!(reaction.resolve, Some(TargetResolver::SameId)),
+                    ),
                     inline: false,
                 };
                 let mut next = state;
@@ -278,8 +290,8 @@ impl JointModel {
                 }
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone()),
-                    Arg::Lit(Literal::Null) => Some(String::new()),
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Null) => Some("".into()),
                     _ => None,
                 }?;
                 Some((param.clone(), ParamValue::Str(value)))
