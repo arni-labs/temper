@@ -30,6 +30,7 @@ fn embedder_boot(world: &World, name: &str) -> Process {
     });
     Process {
         runtime,
+        changes: state.event_tx.subscribe(),
         state,
         booted: BootTimers::new(),
     }

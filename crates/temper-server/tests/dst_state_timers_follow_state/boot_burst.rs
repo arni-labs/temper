@@ -127,10 +127,10 @@ fn run_seed(seed: u64) -> Result<(), String> {
             .inject_append_delay(&format!("{}:Job:{}", job.tenant, job.id), FIRE_APPEND);
     }
 
-    let (mut second, walk) = Process::boot(&world, &job_v2(), JOB_V1, &format!("burst-{seed}-b"));
-    // Subscribed before any fire commits: the first one takes FIRE_APPEND.
-    let mut changes = second.state.event_tx.subscribe();
-    second.booted = second.runtime.block_on(walk).unwrap();
+    let mut second = Process::start(&world, &job_v2(), JOB_V1, &format!("burst-{seed}-b"));
+    // The moves since before the boot armed any timer; the process keeps a
+    // fresh subscription it does not read.
+    let mut changes = std::mem::replace(&mut second.changes, second.state.event_tx.subscribe());
     second.runtime.block_on(async {
         let state = &second.state;
         let moved: BTreeSet<String> = jobs
@@ -166,12 +166,25 @@ fn run_seed(seed: u64) -> Result<(), String> {
             }
         }
         let mut fired_as: BTreeMap<(String, String), Vec<Option<String>>> = BTreeMap::new();
-        while let Ok(change) = changes.try_recv() {
-            if change.action == "Expire" {
-                fired_as
-                    .entry((change.tenant.clone(), change.entity_id.clone()))
-                    .or_default()
-                    .push(change.agent_id.clone());
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+        loop {
+            match changes.try_recv() {
+                Ok(change) => {
+                    *seen.entry(change.action.clone()).or_default() += 1;
+                    if change.action == "Expire" {
+                        fired_as
+                            .entry((change.tenant.clone(), change.entity_id.clone()))
+                            .or_default()
+                            .push(change.agent_id.clone());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(missed)) => {
+                    return Err(run.fail(
+                        "the simulation sees every move",
+                        format!("{missed} moves were not seen"),
+                    ));
+                }
+                Err(_) => break,
             }
         }
         let mut fired_at: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -221,7 +234,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
             {
                 return Err(run.fail(
                     "a timer fires as whoever armed it",
-                    format!("{name}: fired as {by:?}, wanted {wanted_by}"),
+                    format!("{name}: fired as {by:?}, wanted {wanted_by}; moves seen: {seen:?}"),
                 ));
             }
             for fire in fires {
