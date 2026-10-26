@@ -481,3 +481,7 @@ mod vacuous_tests;
 #[cfg(test)]
 #[path = "outside_test.rs"]
 mod outside_tests;
+
+#[cfg(test)]
+#[path = "caller_test.rs"]
+mod caller_tests;
