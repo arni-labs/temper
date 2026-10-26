@@ -503,7 +503,7 @@ impl crate::state::ServerState {
 
         // Pre-resolve cross-entity state gates (Gap 1: Agent OS).
         let related = self
-            .resolve_cross_entity_guards(tenant, entity_type, entity_id, action)
+            .resolve_related_statuses(tenant, entity_type, entity_id, action)
             .await;
 
         let action_params = params.clone();
