@@ -589,7 +589,8 @@ fn a_premise_dead_in_the_spec_proves_nothing() {
 }
 
 /// Four counters stepped in Start by a move each, and a chain of statuses
-/// down to End, which Finish reaches with `done` set.
+/// down to End, which Finish reaches with `done` set. Go comes first, so a
+/// search that takes the latest state found first goes down the counters.
 const DEEP: &str = r#"
 [automaton]
 name = "Deep"
@@ -622,6 +623,12 @@ type = "counter"
 initial = 0
 
 [[action]]
+name = "Go"
+kind = "input"
+from = ["Start"]
+to = "One"
+
+[[action]]
 name = "A"
 kind = "input"
 from = ["Start"]
@@ -644,12 +651,6 @@ name = "D"
 kind = "input"
 from = ["Start"]
 effect = ["d += 1"]
-
-[[action]]
-name = "Go"
-kind = "input"
-from = ["Start"]
-to = "One"
 
 [[action]]
 name = "OnToTwo"

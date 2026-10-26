@@ -367,7 +367,8 @@ guard = "empty(other_id) || Other[other_id].status in ['Ok']"
 }
 
 /// Four counters, each stepped in Start by its own move, and a chain of
-/// statuses from Start to End, a move each.
+/// statuses from Start to End, a move each. Go comes first, so a search
+/// that takes the latest state found first goes down the counters.
 const DEEP: &str = r#"
 [automaton]
 name = "Deep"
@@ -395,6 +396,11 @@ type = "counter"
 initial = 0
 
 [[action]]
+name = "Go"
+from = ["Start"]
+to = "One"
+
+[[action]]
 name = "A"
 from = ["Start"]
 effect = ["a += 1"]
@@ -413,11 +419,6 @@ effect = ["c += 1"]
 name = "D"
 from = ["Start"]
 effect = ["d += 1"]
-
-[[action]]
-name = "Go"
-from = ["Start"]
-to = "One"
 
 [[action]]
 name = "OnToTwo"
