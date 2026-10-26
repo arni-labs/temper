@@ -13,9 +13,10 @@ pub const CARRY_PREFIX: &str = "carry:";
 
 /// Where this version moves the stored records in `from` that it would
 /// otherwise leave with no way forward: `from` is a state it drops, or one
-/// where none of its moves is possible for them. Installing the version
-/// applies the carry to each such record as one move made by the platform
-/// and journaled like any other. Records with a way forward are not moved.
+/// where none of its moves is possible for them. Once an install of the
+/// version has answered, and at each start while the version holds it, the
+/// platform applies the carry to each such record as one move journaled like
+/// any other. Records with a way forward are not moved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Carry {

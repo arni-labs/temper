@@ -97,6 +97,33 @@ fn a_blocked_record_says_why() {
     }
 }
 
+/// A guard that reads the caller's parameters may hold for some call, so it
+/// does not block a stored record; its parts that read none still do.
+#[test]
+fn a_guard_on_the_callers_parameters_blocks_only_through_its_other_parts() {
+    let retire_when = |guard: &str| {
+        table(&PLACE.replace(
+            "guard = \"brought > 2\"",
+            &format!("guard = \"{guard}\"\nparams = [{{ name = \"rain\", type = \"counter\" }}]"),
+        ))
+    };
+    let place = retire_when("params.rain >= 50");
+    let stored = place.stored_context(&values(json!({})));
+    assert_eq!(place.blocked("Placed", &stored, "Retire"), None);
+
+    let place = retire_when("ready && params.rain >= 50");
+    let ready = place.stored_context(&values(json!({ "ready": true })));
+    assert_eq!(place.blocked("Placed", &ready, "Retire"), None);
+    let not_ready = place.stored_context(&values(json!({})));
+    assert!(
+        matches!(
+            place.blocked("Placed", &not_ready, "Retire"),
+            Some(Blocked::Guard(_))
+        ),
+        "ready is false whatever the call"
+    );
+}
+
 #[test]
 fn a_record_stands_free_rests_stuck_or_gone() {
     let place = table(PLACE);

@@ -305,7 +305,9 @@ guard = "!ready"          # optional: which of them
 set = { ready = true }    # optional: counters, flags, strings, numbers
 ```
 
-`from` may be a state the new version drops. `to` defaults to `from`. A carry applies only to records that would otherwise have no way forward; the others are not moved. The install first tries each carry on each record it applies to, with the same move code every move runs: the carried record must satisfy the new version's invariants and have a way forward, or nothing is installed. After the new version is in place, the platform makes each carry as an ordinary journaled move named `carry:<from>:<n>`. Callers cannot make these moves, and they are not listed among a record's actions.
+`from` may be a state the new version drops. `to` defaults to `from`. A carry applies only to records that would otherwise have no way forward; the others are not moved. The install first tries each carry on each record it applies to, with the same move code every move runs: the carried record must satisfy the new version's invariants and have a way forward, or nothing is installed. Then the install answers and the new version serves. The platform makes the carries after that, in the background, each as an ordinary journaled move named `carry:<from>:<n>`; until its carry is made, a record waits in its old state, where no caller move is possible for it. The install's warnings say how many records each carry moves. Callers cannot make these moves, and they are not listed among a record's actions.
+
+A carry stays in effect while the version holds it: every install into the tenant and every start makes it on the records it applies to then. So a start finishes the carries a stopped process left unmade, and a record carried once is not moved again. Remove the carry in a later version once its records have moved.
 
 Reported, not refused: records already without a way forward under the installed version, and moves that are no longer possible for records that keep another one. Not checked: moves whose guard reads a related record, and an install that removes a whole type.
 

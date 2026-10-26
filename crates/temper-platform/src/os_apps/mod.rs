@@ -1210,9 +1210,10 @@ pub(super) async fn install_os_app_with_plan(
     } else {
         Vec::new()
     };
-    let spec_change =
+    warnings.extend(
         install_checks::check_spec_changes(state, &tenant_id, app_name, &bundle.specs, plan.specs)
-            .await?;
+            .await?,
+    );
 
     // Build the full Cedar policy text for this tenant: the live text without
     // what this app's previous install wrote, plus the bundle's policies.
@@ -1401,7 +1402,6 @@ pub(super) async fn install_os_app_with_plan(
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
-    warnings.extend(install_checks::carry_records(state, &tenant_id, app_name, spec_change).await);
 
     // ── Step 3: Load Cedar policies into memory. ────────────────────
     if let Some(ref policy_text) = combined_policy {

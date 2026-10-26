@@ -20,16 +20,15 @@ impl crate::state::ServerState {
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        let mut result = RelatedMap::new();
         let refs: Vec<(String, String)> = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
-                return result;
+                return RelatedMap::new();
             };
             spec.table().related_refs(action)
         };
         if refs.is_empty() {
-            return result;
+            return RelatedMap::new();
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -38,9 +37,22 @@ impl crate::state::ServerState {
             .await
         {
             Ok(resp) => resp.state.fields,
-            Err(_) => return result,
+            Err(_) => return RelatedMap::new(),
         };
+        self.related_statuses_of(tenant, refs, &current_fields)
+            .await
+    }
 
+    /// The statuses of the records `fields` refers to through each of
+    /// `refs`, `(related type, id field)`, as [`Self::resolve_related_statuses`]
+    /// resolves them.
+    pub(in crate::state) async fn related_statuses_of(
+        &self,
+        tenant: &TenantId,
+        refs: Vec<(String, String)>,
+        current_fields: &serde_json::Value,
+    ) -> RelatedMap {
+        let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
             let ids: Vec<&str> = match current_fields.get(&id_field) {
                 Some(serde_json::Value::Array(items)) => items

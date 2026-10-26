@@ -12,15 +12,16 @@ use crate::storage::CatalogGroup;
 impl ServerState {
     /// The stored records of `entity_type` in one of `statuses`, grouped by
     /// status and the values of `names` they hold, with how many records
-    /// could not be read. One grouped catalog query covers each record whose
-    /// catalog row is current and unwrapped; each other record is read on
-    /// its own.
+    /// could not be read. One grouped catalog query over `every_state` covers
+    /// each record whose catalog row is current and unwrapped, and so says
+    /// itself which records it covers; each other record is read on its own.
     pub(super) async fn record_groups(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         names: &[String],
         statuses: &BTreeSet<String>,
+        every_state: &BTreeSet<String>,
     ) -> Result<(Vec<CatalogGroup>, usize), String> {
         self.ensure_type_indexed(tenant, entity_type).await?;
         let ids: BTreeSet<String> = self
@@ -33,22 +34,18 @@ impl ServerState {
         let mut groups = Vec::new();
         let mut covered = BTreeSet::new();
         if let Some(store) = self.query_plane_store() {
-            let wanted: Vec<String> = statuses.iter().cloned().collect();
+            // Coverage from a second query could disagree with this one: a
+            // row that catches up between them would be in neither.
+            let every_state: Vec<String> = every_state.iter().cloned().collect();
             let found = store
-                .catalog_groups(tenant.as_str(), entity_type, names, &wanted)
+                .catalog_groups(tenant.as_str(), entity_type, names, &every_state)
                 .await
                 .map_err(|error| error.to_string())?;
-            let freshness = store
-                .projection_catalog_freshness(tenant.as_str(), entity_type)
-                .await
-                .map_err(|error| error.to_string())?;
-            if let (Some(found), Some(freshness)) = (found, freshness) {
-                groups = found;
-                covered = freshness
-                    .into_iter()
-                    .filter(|row| row.current && row.wrapped_fields.is_none())
-                    .map(|row| row.entity_id)
-                    .collect();
+            for group in found.into_iter().flatten() {
+                covered.extend(group.ids.iter().cloned());
+                if statuses.contains(&group.status) {
+                    groups.push(group);
+                }
             }
         }
         for group in &mut groups {

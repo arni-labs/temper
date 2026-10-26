@@ -5,7 +5,8 @@
 //! could move on under the installed version must still be able to under the
 //! new one, or be carried to where it can. A move is possible when its rule
 //! starts from the record's status and its guard holds on the record's
-//! values. A declared value the record lacks reads as its initial value, so a
+//! values; a guard that reads the caller's parameters is decided by its parts
+//! that read none. A declared value the record lacks reads as its initial value, so a
 //! parameter constraint can always read its field and depends only on the
 //! caller's parameters.
 
@@ -15,7 +16,7 @@ use serde_json::Value;
 use temper_spec::automaton::{ActionConstraint, is_carry_move};
 use temper_spec::predicate::{Expr, Name};
 
-use super::guard::{EvalContext, GuardFailure};
+use super::guard::{self, EvalContext, GuardFailure};
 use super::types::TransitionTable;
 
 /// Why a record cannot make a move.
@@ -66,12 +67,13 @@ enum Declared {
 
 impl TransitionTable {
     /// Why a record in `status` with the values in `ctx` cannot make
-    /// `action`, or `None` when it can.
+    /// `action`, or `None` when it can, for some call when a guard reads the
+    /// caller's parameters.
     pub fn blocked(&self, status: &str, ctx: &EvalContext, action: &str) -> Option<Blocked> {
         let Some(result) = self.evaluate_ctx(status, ctx, action) else {
             return Some(Blocked::NoAction);
         };
-        if result.success {
+        if result.success || self.holds_for_some_call(status, ctx, action) {
             return None;
         }
         Some(if self.starts_from(action, status) {
@@ -79,6 +81,28 @@ impl TransitionTable {
         } else {
             Blocked::NotFrom
         })
+    }
+
+    /// Whether a rule for `action` from `status` has a guard that reads the
+    /// caller's parameters and whose parts that read none hold: the record
+    /// alone cannot say that no call makes the move.
+    fn holds_for_some_call(&self, status: &str, ctx: &EvalContext, action: &str) -> bool {
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.name == action
+                    && (rule.from_states.is_empty() || rule.from_states.iter().any(|s| s == status))
+            })
+            .any(|rule| {
+                reads_params(&rule.guard)
+                    && guard::check_detailed(
+                        &without_params(&rule.guard),
+                        status,
+                        ctx,
+                        &self.initial_values,
+                    )
+                    .is_none()
+            })
     }
 
     /// Where a record in `status` with the values in `ctx` stands. A
@@ -215,6 +239,29 @@ impl TransitionTable {
             }
         }
         ctx
+    }
+}
+
+/// Whether `expr` reads a parameter of the call.
+fn reads_params(expr: &Expr) -> bool {
+    let mut reads = false;
+    expr.for_each_name(&mut |name| reads |= matches!(name, Name::Param(_)));
+    reads
+}
+
+/// The parts of a guard that hold whatever the call: its conjuncts that read
+/// no parameter, or nothing when the whole of it reads one.
+fn without_params(guard: &Expr) -> Expr {
+    match guard {
+        Expr::And(parts) => Expr::and(
+            parts
+                .iter()
+                .filter(|part| !reads_params(part))
+                .cloned()
+                .collect(),
+        ),
+        _ if reads_params(guard) => Expr::always(),
+        _ => guard.clone(),
     }
 }
 

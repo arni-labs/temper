@@ -8,9 +8,9 @@
 //! `[[carry]]` sections. Before anything is written, each carry is tried on
 //! each record it applies to with the move code every move runs
 //! ([`process_action`]): the carried record must hold to the new version's
-//! invariants and have a way forward. After the swap the install makes the
-//! carries as moves of the platform ([`ServerState::apply_carries`]),
-//! journaled like any other.
+//! invariants and have a way forward. The install then answers and the
+//! version serves; the carries run after it in the background, as moves of
+//! the platform journaled like any other ([`carry_pass`]).
 //!
 //! Records are read once per type, and only in the states a change can
 //! affect: those the version drops, those a move with changed conditions
@@ -25,6 +25,7 @@
 //! cannot be read. An install that removes a whole type is not checked.
 
 mod answer;
+mod carry_pass;
 mod records;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,11 +36,13 @@ use temper_runtime::tenant::TenantId;
 use temper_spec::automaton::{Automaton, Carry, parse_automaton};
 use temper_spec::predicate::Name;
 
-use crate::entity_actor::{broken_invariant, build_eval_context, process_action};
-use crate::request_context::AgentContext;
+use crate::entity_actor::{
+    broken_invariant, build_eval_context_with_xref, process_action_with_xref,
+};
 use crate::state::ServerState;
 
 pub use answer::{SpecChangeRefused, StuckRecords};
+pub use carry_pass::CarryReport;
 
 /// A new version of one entity type's spec, to be checked against the
 /// version installed for it.
@@ -51,7 +54,7 @@ pub struct SpecChange {
     pub proposed: Automaton,
 }
 
-/// One `[[carry]]` move the install makes on one record after the swap.
+/// One `[[carry]]` move on one record, made after the swap.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CarryMove {
     /// The record's type.
@@ -64,7 +67,7 @@ pub struct CarryMove {
     pub params: Value,
 }
 
-/// What a checked install does after the swap, and what it reports.
+/// What a check found: the carries it tried, and what it reports.
 #[derive(Debug, Clone, Default)]
 pub struct SpecChangePlan {
     /// The carry moves, each tried already on the record as it is now.
@@ -139,42 +142,6 @@ impl ServerState {
         }
     }
 
-    /// Make each carry as a move of the platform, once the new versions are
-    /// installed. Returns why each carry that did not move its record failed;
-    /// a record that moved on since the check is no longer in the carry's
-    /// state and refuses it.
-    pub async fn apply_carries(&self, tenant: &TenantId, carries: &[CarryMove]) -> Vec<String> {
-        let platform = AgentContext::system();
-        let mut failed = Vec::new();
-        for carry in carries {
-            let result = self
-                .dispatch_tenant_action_core(
-                    tenant,
-                    &carry.entity_type,
-                    &carry.entity_id,
-                    &carry.action,
-                    carry.params.clone(),
-                    &platform,
-                    false,
-                    None,
-                )
-                .await;
-            let error = match result {
-                Ok(response) if response.success => continue,
-                Ok(response) => response.error.unwrap_or_default(),
-                Err(error) => error.to_string(),
-            };
-            tracing::warn!(tenant = %tenant, entity_type = %carry.entity_type,
-                entity_id = %carry.entity_id, action = %carry.action, %error,
-                "carry move failed after the new spec version was installed");
-            failed.push(format!(
-                "{} {}: {} failed: {error}",
-                carry.entity_type, carry.entity_id, carry.action
-            ));
-        }
-        failed
-    }
-
     /// Check one type's new version, adding its carries and warnings to
     /// `plan` and what stops it to `refused`.
     async fn check_type(
@@ -186,14 +153,37 @@ impl ServerState {
         refused: &mut SpecChangeRefused,
     ) {
         let entity_type = change.entity_type.as_str();
+        // Whether a stored record's moves keep a new invariant depends on
+        // their effects and the caller's parameters, which the check does
+        // not have; each such move is checked when it is made.
+        for invariant in &new.invariants {
+            if !old
+                .invariants
+                .iter()
+                .any(|before| before.name == invariant.name && before.assert == invariant.assert)
+            {
+                plan.warnings.push(format!(
+                    "{entity_type}: invariant '{}' is new or changed. Stored records are not \
+                     checked against it; a move that would break it is refused when it is made",
+                    invariant.name
+                ));
+            }
+        }
         let carries = change.proposed.carry_moves();
         let statuses = affected_states(old, new, &carries);
         if statuses.is_empty() {
             return;
         }
         let names = read_names(old, new, &carries);
+        let every_state: BTreeSet<String> = old
+            .states
+            .iter()
+            .chain(&new.states)
+            .chain(&statuses)
+            .cloned()
+            .collect();
         let (groups, unreadable) = match self
-            .record_groups(tenant, entity_type, &names, &statuses)
+            .record_groups(tenant, entity_type, &names, &statuses, &every_state)
             .await
         {
             Ok(found) => found,
@@ -293,8 +283,9 @@ impl ServerState {
     }
 
     /// Try one carry on each record it applies to, as it is stored now, with
-    /// the move code every move runs. Each record it moves must hold to the
-    /// new version's invariants and have a way forward.
+    /// the move code every move runs and the related records it reads, as a
+    /// move resolves them. Each record it moves must hold to the new
+    /// version's invariants and have a way forward.
     async fn try_carry(
         &self,
         tenant: &TenantId,
@@ -305,6 +296,14 @@ impl ServerState {
         refused: &mut SpecChangeRefused,
     ) {
         let params = serde_json::to_value(&carried.carry.set).unwrap_or_default();
+        let mut refs = new.related_refs(&carried.action);
+        for action in new.caller_moves() {
+            for reference in new.related_refs(action) {
+                if !refs.contains(&reference) {
+                    refs.push(reference);
+                }
+            }
+        }
         let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for id in carried.ids {
             let Some(mut record) = self.current_record_state(tenant, entity_type, &id).await else {
@@ -314,7 +313,11 @@ impl ServerState {
                     .push(id);
                 continue;
             };
-            let moved = process_action(&mut record, new, &carried.action, &params);
+            let related = self
+                .related_statuses_of(tenant, refs.clone(), &record.fields)
+                .await;
+            let moved =
+                process_action_with_xref(&mut record, new, &carried.action, &params, &related);
             let why = if !moved.success {
                 Some(format!(
                     "the carry is refused: {}",
@@ -323,7 +326,7 @@ impl ServerState {
             } else if let Some(broken) = broken_invariant(&record, new) {
                 Some(format!("once carried it would break {broken}"))
             } else {
-                let ctx = build_eval_context(&record, new, None);
+                let ctx = build_eval_context_with_xref(&record, &related, new, None);
                 match new.standing(&record.status, &ctx) {
                     Standing::Free | Standing::Rests => None,
                     Standing::Stuck(blocked) => Some(format!(

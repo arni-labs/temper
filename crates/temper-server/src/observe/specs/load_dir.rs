@@ -464,7 +464,9 @@ pub(super) async fn load_specs_from_directory(
     }
     state.rebuild_reaction_dispatcher();
     state.spawn_follow_spec_changes();
-    let carry_failures = state.apply_carries(&tenant_id, &spec_change.carries).await;
+    // The records the check carries wait in their old states until this pass
+    // has made their carries, after the answer.
+    state.spawn_carry_stranded(vec![tenant_id]);
 
     if !state.data_dir.as_os_str().is_empty() {
         let registry_path = state.data_dir.join("specs-registry.json");
@@ -500,12 +502,12 @@ pub(super) async fn load_specs_from_directory(
         .collect();
     if !spec_change.carries.is_empty() {
         lint_warning_lines.push(serde_json::json!({
-            "type": "carried",
-            "records": spec_change.carries.len() - carry_failures.len(),
+            "type": "carrying",
+            "records": spec_change.carries.len(),
         }));
     }
     lint_warning_lines.extend(
-        spec_change.warnings.iter().chain(&carry_failures).map(
+        spec_change.warnings.iter().map(
             |message| serde_json::json!({ "type": "spec_change_warning", "message": message }),
         ),
     );

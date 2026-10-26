@@ -3,8 +3,9 @@
 //! A bundle that cannot be registered must leave no stored row for the next
 //! start to restore, so these refuse it before the first write.
 
+use std::collections::BTreeMap;
+
 use temper_runtime::tenant::TenantId;
-use temper_server::state::SpecChangePlan;
 use temper_spec::cross_invariant;
 use temper_verify::composite::JointOutcome;
 
@@ -123,17 +124,18 @@ pub(super) async fn prove_joint_invariants(
 /// Check each new version in `specs`, when the install writes specs, against
 /// the records stored under the version installed for its type, before
 /// anything is written (see temper-server's `spec_change`): refuse it when it
-/// leaves records with no way forward that no `[[carry]]` moves, and return
-/// the carries to make after the swap.
+/// leaves records with no way forward that no `[[carry]]` moves. Returns what
+/// the check reports, and how many records each carry moves once the install
+/// has answered (the server's carry pass makes them in the background).
 pub(super) async fn check_spec_changes(
     state: &PlatformState,
     tenant: &TenantId,
     app_name: &str,
     specs: &[(String, String)],
     writes_specs: bool,
-) -> Result<SpecChangePlan, String> {
+) -> Result<Vec<InstallWarning>, String> {
     if !writes_specs {
-        return Ok(SpecChangePlan::default());
+        return Ok(Vec::new());
     }
     let sources: Vec<(&str, &str)> = specs
         .iter()
@@ -143,39 +145,36 @@ pub(super) async fn check_spec_changes(
         .server
         .spec_changes(tenant, &sources)
         .map_err(|error| format!("os-app '{app_name}': {error}"))?;
-    state
+    let plan = state
         .server
         .check_spec_changes(tenant, &changes)
         .await
-        .map_err(|refused| format!("os-app '{app_name}' was not installed. {refused}"))
-}
-
-/// Make the carries `plan` holds, once the new versions are installed, and
-/// return what the check found and the carries that failed.
-pub(super) async fn carry_records(
-    state: &PlatformState,
-    tenant: &TenantId,
-    app_name: &str,
-    plan: SpecChangePlan,
-) -> Vec<InstallWarning> {
-    let mut warnings: Vec<InstallWarning> = plan
+        .map_err(|refused| format!("os-app '{app_name}' was not installed. {refused}"))?;
+    let mut carrying: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for carry in &plan.carries {
+        *carrying
+            .entry((carry.entity_type.as_str(), carry.action.as_str()))
+            .or_default() += 1;
+    }
+    let carrying = carrying
+        .into_iter()
+        .map(|((entity_type, action), records)| {
+            let records = if records == 1 {
+                "1 record".to_string()
+            } else {
+                format!("{records} records")
+            };
+            format!(
+                "{entity_type}: {action} carries {records} once the install has answered; \
+             until then they wait in their old state"
+            )
+        });
+    Ok(plan
         .warnings
         .into_iter()
+        .chain(carrying)
         .map(InstallWarning::spec_change)
-        .collect();
-    if plan.carries.is_empty() {
-        return warnings;
-    }
-    let failed = state.server.apply_carries(tenant, &plan.carries).await;
-    tracing::info!(
-        tenant = %tenant,
-        app = %app_name,
-        carried = plan.carries.len() - failed.len(),
-        failed = failed.len(),
-        "carried stored records to the new spec versions"
-    );
-    warnings.extend(failed.into_iter().map(InstallWarning::spec_change));
-    warnings
+        .collect())
 }
 
 #[cfg(test)]
