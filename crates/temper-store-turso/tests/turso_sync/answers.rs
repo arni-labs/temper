@@ -51,7 +51,10 @@ async fn background_trim_leaves_room_for_answers() {
         return;
     };
     let (_dir, path) = machine();
-    let (a, copy) = confirmed_log(&server, &path, BIG_LOG).await;
+    // This tests scheduling, not backlog capacity (the separate long-log
+    // tests retain 300,000 rows). Keep setup cheap on slower CI runners;
+    // assert a backlog remains so exhaustion cannot satisfy the timings.
+    let (a, copy) = confirmed_log(&server, &path, 30_000).await;
     let tick = Duration::from_secs(1);
 
     let started = Instant::now();
@@ -66,6 +69,11 @@ async fn background_trim_leaves_room_for_answers() {
         "idle batch overran: {idle:?}"
     );
     eprintln!("idle: {idle_rows} rows in {} ms", idle.as_millis());
+
+    assert!(
+        copy.change_log_rows().await.expect("rows") > 1,
+        "idle backlog exhausted"
+    );
 
     let in_flight = AtomicBool::new(false);
     let started = Instant::now();
@@ -83,6 +91,11 @@ async fn background_trim_leaves_room_for_answers() {
         let arrived = started.elapsed();
         in_flight.store(true, Ordering::Release);
         write(&a, "overlap", 0).await;
+        let write_wait = started.elapsed() - arrived;
+        assert!(
+            write_wait < Duration::from_millis(200),
+            "answer write waited longer than about one batch: {write_wait:?}"
+        );
         copy.push_committed_within(ANSWER_BUDGET)
             .await
             .expect("overlapping push");
@@ -111,6 +124,11 @@ async fn background_trim_leaves_room_for_answers() {
     let held = started.elapsed();
     assert!(held >= Duration::from_millis(250), "floor: {held:?}");
     assert!(held < Duration::from_millis(450), "held request: {held:?}");
+
+    assert!(
+        copy.change_log_rows().await.expect("rows") > 1,
+        "busy backlog exhausted"
+    );
 
     let (_b_dir, b_path) = machine();
     let b = server.open(&b_path).await;
