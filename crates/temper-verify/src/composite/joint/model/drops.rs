@@ -5,11 +5,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 
 use temper_spec::automaton::{Automaton, TargetResolver};
+use temper_spec::predicate::Truth;
 
 use super::super::JointState;
 use super::super::env::Records;
+use super::commit::Arrival;
 use super::step::{Move, remove};
-use super::{Delivery, JointModel, tracked};
+use super::{Delivery, JointModel, Sending, tracked};
 
 /// A reaction its target refused when it landed: the target was not in a
 /// state its action is allowed from, or a guard or constraint said no.
@@ -60,7 +62,8 @@ pub(crate) struct Drops {
 impl JointModel {
     /// The joint model of every type in `scope`, whole (nothing sliced), one
     /// record of each that every reference finds, the dispatches a move
-    /// sends landing before the next move from outside.
+    /// sends landing before the next move from outside. Anyone sends
+    /// anything, as ADR-0150's check assumed.
     pub(in crate::composite::joint) fn whole(
         by_name: &BTreeMap<&str, &Automaton>,
         scope: BTreeSet<String>,
@@ -91,16 +94,18 @@ impl JointModel {
                     .insert(id_field.clone());
             }
         }
-        Self {
-            expansion: Default::default(),
-            id_literals: BTreeSet::new(),
-            models,
-            reactions,
-            records: Records::One,
-            refs,
-            delivery: Delivery::BeforeNextRequest,
+        let mut model = Self::compose(
+            by_name,
             scope,
-        }
+            (models, reactions),
+            &BTreeMap::new(),
+            Sending::anyone(),
+            false,
+        );
+        model.records = Records::One;
+        model.refs = refs;
+        model.delivery = Delivery::BeforeNextRequest;
+        model
     }
 
     /// Walk the settled joint states (nothing in flight) breadth first, at
@@ -196,9 +201,9 @@ impl JointModel {
         let refused = if dispatch.read {
             let mut rest = state.clone();
             remove(&mut rest, dispatch);
-            self.arrive(&rest, dispatch).is_none()
+            matches!(self.arrive(&rest, dispatch), Arrival::Refused)
         } else {
-            !self.read_allows(dispatch, state)
+            self.read_allows(dispatch, state) == Truth::False
         };
         (refused && !self.expansion.exhausted.get()).then(|| DroppedReaction {
             source_entity: reaction.from.clone(),
@@ -259,6 +264,8 @@ to = "Ready"
                 read: true,
                 depth,
                 via: None,
+                by: super::super::super::senders::OUTSIDE,
+                inline: false,
             })
             .collect();
         model.expansion.reset(3, None);

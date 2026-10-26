@@ -96,7 +96,7 @@ impl TransitionTable {
             .any(|rule| {
                 reads_params(&rule.guard)
                     && guard::check_detailed(
-                        &without_params(&rule.guard),
+                        &without_params(&rule.guard, true),
                         status,
                         ctx,
                         &self.initial_values,
@@ -249,19 +249,30 @@ fn reads_params(expr: &Expr) -> bool {
     reads
 }
 
-/// The parts of a guard that hold whatever the call: its conjuncts that read
-/// no parameter, or nothing when the whole of it reads one.
-fn without_params(guard: &Expr) -> Expr {
+/// `guard` with each part that reads a parameter replaced by the value some
+/// call could give it: `holds` where the part counts toward the guard
+/// holding, its opposite under a `!` or left of a `=>`. It holds on a record
+/// when some call could make `guard` hold, so the parts that read none still
+/// decide, in whichever branch they sit.
+fn without_params(guard: &Expr, holds: bool) -> Expr {
+    if !reads_params(guard) {
+        return guard.clone();
+    }
+    let each = |parts: &[Expr]| -> Vec<Expr> {
+        parts
+            .iter()
+            .map(|part| without_params(part, holds))
+            .collect()
+    };
     match guard {
-        Expr::And(parts) => Expr::and(
-            parts
-                .iter()
-                .filter(|part| !reads_params(part))
-                .cloned()
-                .collect(),
+        Expr::Not(inner) => Expr::Not(Box::new(without_params(inner, !holds))),
+        Expr::And(parts) => Expr::And(each(parts)),
+        Expr::Or(parts) => Expr::Or(each(parts)),
+        Expr::Implies(when, then) => Expr::Implies(
+            Box::new(without_params(when, !holds)),
+            Box::new(without_params(then, holds)),
         ),
-        _ if reads_params(guard) => Expr::always(),
-        _ => guard.clone(),
+        _ => Expr::Const(holds),
     }
 }
 

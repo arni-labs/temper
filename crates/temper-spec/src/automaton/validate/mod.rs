@@ -246,6 +246,41 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             ));
         }
     }
+    for live in &automaton.liveness {
+        let slot = format!("liveness '{}'", live.name);
+        let Some(eventually) = &live.eventually else {
+            if !live.relies_on.is_empty() {
+                return Err(invalid(slot, "`relies_on` needs `eventually`".into()));
+            }
+            continue;
+        };
+        if !live.from.is_empty() || !live.reaches.is_empty() || live.has_actions.is_some() {
+            return Err(invalid(
+                slot,
+                "`eventually` takes no `from`, `reaches` or `has_actions`".into(),
+            ));
+        }
+        check(eventually, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
+        if let Some(culprit) = crate::predicate::unverifiable(eventually, &vars) {
+            return Err(invalid(
+                slot,
+                format!(
+                    "`{culprit}` reads a value the verification cascade cannot model \
+                     (a number that is not a counter, an undeclared field, or null)"
+                ),
+            ));
+        }
+        if let Some(unknown) = live
+            .relies_on
+            .iter()
+            .find(|name| !automaton.actions.iter().any(|a| &a.name == *name))
+        {
+            return Err(invalid(
+                slot,
+                format!("`relies_on` names no action '{unknown}'"),
+            ));
+        }
+    }
     for inv in &automaton.field_invariants {
         let slot = format!("field_invariant '{}'", inv.name);
         check(&inv.assert, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;

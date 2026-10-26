@@ -205,10 +205,19 @@ fn wanted_values(blocked: &[(String, Blocked)]) -> Option<String> {
     })
 }
 
-/// Where a dropped state's records obviously go: the one state `new` adds
-/// when it drops exactly one, or else the one state every move of `old`
-/// from `status` led to.
+/// Where a dropped state's records obviously go: where the installed
+/// version's carry from `status` takes them, the one state `new` adds when
+/// it drops exactly one, or else the one state every move of `old` from
+/// `status` led to.
 fn obvious_target(old: &TransitionTable, new: &TransitionTable, status: &str) -> Option<String> {
+    let carried_to = old
+        .rules
+        .iter()
+        .find(|rule| is_carry_move(&rule.name) && rule.from_states.iter().any(|s| s == status))
+        .and_then(|rule| rule.to_state.as_deref());
+    if let Some(target) = carried_to.filter(|target| new.states.iter().any(|s| s == target)) {
+        return Some(target.to_string());
+    }
     let dropped = old
         .states
         .iter()

@@ -111,6 +111,20 @@ fn needs_ready(ready_move: bool) -> String {
         )
 }
 
+/// Settles, under a parent: Settled places may only Leave, and only while
+/// their parent is open. `carries` are appended.
+fn leaves_while_open(carries: &str) -> String {
+    format!(
+        "{}\n[[state]]\nname = \"parent_id\"\ntype = \"string\"\ninitial = \"\"\n\n\
+         [[action]]\nname = \"Leave\"\nkind = \"input\"\nfrom = [\"Settled\"]\n\
+         to = \"Unplaced\"\nguard = \"Parent[parent_id].status == 'Open'\"\n{carries}",
+        settles().replace(
+            "from = [\"Unplaced\", \"Bringing\", \"Settled\"]",
+            "from = [\"Unplaced\", \"Bringing\"]",
+        )
+    )
+}
+
 /// katagami #1130's change: each Bring carries a count higher than the last.
 fn counts_brings() -> String {
     PLACE
@@ -250,6 +264,31 @@ impl Fixture {
             .expect("create the place");
     }
 
+    /// Two parents, `open` and `closed`, the second closed.
+    async fn open_and_closed_parents(&self) {
+        for parent in ["open", "closed"] {
+            self.state
+                .server
+                .get_or_create_tenant_entity(&self.tenant, "Parent", parent, serde_json::json!({}))
+                .await
+                .expect("create the parent");
+        }
+        let closed = self
+            .state
+            .server
+            .dispatch_tenant_action(
+                &self.tenant,
+                "Parent",
+                "closed",
+                "Close",
+                serde_json::json!({}),
+                &AgentContext::system(),
+            )
+            .await
+            .expect("close the parent");
+        assert!(closed.success, "{:?}", closed.error);
+    }
+
     /// A place stored under the first version, brought to a commit and placed.
     async fn placed(&self, id: &str) {
         self.placed_with(id, serde_json::json!({})).await;
@@ -318,8 +357,17 @@ async fn a_carry_moves_stored_records_out_of_a_dropped_state() {
           until then they wait in their old state"
         ]
     );
-    // The install answered before carrying: p1 waits where it was.
+    // The install answered before carrying: p1 waits where it was, in a state
+    // the version dropped, and no caller move starts there.
     assert_eq!(places.status("p1").await, "Placed");
+    let waiting = places
+        .act("p1", "Bring", serde_json::json!({ "commit": "c2" }))
+        .await;
+    assert_eq!(
+        waiting,
+        (false, "Placed".to_string()),
+        "p1 waits for its carry"
+    );
 
     let report = places.carry().await;
     assert_eq!((report.carried, report.failed), (1, Vec::new()));
@@ -334,6 +382,36 @@ async fn a_carry_moves_stored_records_out_of_a_dropped_state() {
         .act("p1", "Bring", serde_json::json!({ "commit": "c2" }))
         .await;
     assert_eq!(brought, (true, "Bringing".to_string()));
+}
+
+/// A record waiting for its carry keeps it: a later version that drops the
+/// carry before the record has moved is refused, with the carry to keep.
+#[tokio::test]
+async fn a_version_that_drops_a_carry_its_records_still_wait_for_is_refused() {
+    let places = Fixture::new("dropped-carry").await;
+    places.install(PLACE).await.expect("first version");
+    places.placed("p1").await;
+    places
+        .install(&settles_carried())
+        .await
+        .expect("a version that says where Placed records go is installed");
+    assert_eq!(places.status("p1").await, "Placed");
+
+    let refused = places
+        .install(&settles())
+        .await
+        .expect_err("p1 still waits in Placed for the carry this version drops");
+    assert!(
+        refused.contains("[[carry]]\nfrom = \"Placed\"\nto = \"Settled\"")
+            && refused.contains("p1"),
+        "{refused}"
+    );
+    assert_eq!(
+        places.carry().await.carried,
+        1,
+        "the installed carry still runs"
+    );
+    assert_eq!(places.status("p1").await, "Settled");
 }
 
 /// An install into a running server answers, then carries in the background.
@@ -501,46 +579,13 @@ async fn a_carry_that_would_break_an_invariant_is_refused_and_nothing_is_written
 async fn a_carry_is_tried_with_the_related_records_its_rules_read() {
     let places = Fixture::new("related").await;
     places.install(PLACE).await.expect("first version");
-    for parent in ["open", "closed"] {
-        places
-            .state
-            .server
-            .get_or_create_tenant_entity(&places.tenant, "Parent", parent, serde_json::json!({}))
-            .await
-            .expect("create the parent");
-    }
-    let closed = places
-        .state
-        .server
-        .dispatch_tenant_action(
-            &places.tenant,
-            "Parent",
-            "closed",
-            "Close",
-            serde_json::json!({}),
-            &AgentContext::system(),
-        )
-        .await
-        .expect("close the parent");
-    assert!(closed.success, "{:?}", closed.error);
+    places.open_and_closed_parents().await;
     places
         .placed_with("p1", serde_json::json!({ "parent_id": "open" }))
         .await;
     places
         .placed_with("p2", serde_json::json!({ "parent_id": "closed" }))
         .await;
-    // Settled places may only Leave, and only while their parent is open.
-    let leaves_while_open = |carries: &str| {
-        format!(
-            "{}\n[[state]]\nname = \"parent_id\"\ntype = \"string\"\ninitial = \"\"\n\n\
-             [[action]]\nname = \"Leave\"\nkind = \"input\"\nfrom = [\"Settled\"]\n\
-             to = \"Unplaced\"\nguard = \"Parent[parent_id].status == 'Open'\"\n{carries}",
-            settles().replace(
-                "from = [\"Unplaced\", \"Bringing\", \"Settled\"]",
-                "from = [\"Unplaced\", \"Bringing\"]",
-            )
-        )
-    };
 
     let refused = places
         .install(&leaves_while_open(
@@ -567,6 +612,64 @@ async fn a_carry_is_tried_with_the_related_records_its_rules_read() {
     assert_eq!(places.carry().await.carried, 2);
     assert_eq!(places.status("p1").await, "Settled");
     assert_eq!(places.status("p2").await, "Unplaced");
+}
+
+/// A carry that points a record at another related record is judged with
+/// that one: p1 sits under a closed parent, and a carry that moves it under
+/// the open one lets it Leave from Settled.
+#[tokio::test]
+async fn a_carry_that_repoints_a_record_is_judged_with_its_new_related_record() {
+    let places = Fixture::new("repointed").await;
+    places.install(PLACE).await.expect("first version");
+    places.open_and_closed_parents().await;
+    places
+        .placed_with("p1", serde_json::json!({ "parent_id": "closed" }))
+        .await;
+
+    places
+        .install(&leaves_while_open(
+            "\n[[carry]]\nfrom = \"Placed\"\nto = \"Settled\"\nset = { parent_id = \"open\" }\n",
+        ))
+        .await
+        .expect("carried under the open parent, p1 can Leave");
+    assert_eq!(places.carry().await.carried, 1);
+    assert_eq!(places.status("p1").await, "Settled");
+    assert_eq!(
+        places.act("p1", "Leave", serde_json::json!({})).await,
+        (true, "Unplaced".to_string())
+    );
+}
+
+/// The check tries one record for each group of records that hold the same
+/// values of what it reads, and a value only a new invariant reads still
+/// splits a group: carried to Settled, the big place breaks the rule and the
+/// small one does not.
+#[tokio::test]
+async fn records_that_differ_only_in_what_an_invariant_reads_are_tried_apart() {
+    let places = Fixture::new("grouped").await;
+    places.install(PLACE).await.expect("first version");
+    places
+        .placed_with("p1", serde_json::json!({ "size": "small" }))
+        .await;
+    places
+        .placed_with("p2", serde_json::json!({ "size": "big" }))
+        .await;
+
+    let refused = places
+        .install(&format!(
+            "{}\n[[state]]\nname = \"size\"\ntype = \"string\"\ninitial = \"\"\n\n\
+             [[invariant]]\nname = \"OnlySmallSettles\"\n\
+             assert = \"status == 'Settled' => size != 'big'\"\n\n\
+             [[carry]]\nfrom = \"Placed\"\nto = \"Settled\"\n",
+            settles()
+        ))
+        .await
+        .expect_err("p2 is big, so carried to Settled it would break the rule");
+    assert!(
+        refused.contains("OnlySmallSettles") && refused.contains("p2"),
+        "{refused}"
+    );
+    assert!(!refused.contains("p1"), "p1 is small: {refused}");
 }
 
 /// katagami #1130's shape: a new counter, and a constraint on an existing
