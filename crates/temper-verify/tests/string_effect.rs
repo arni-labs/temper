@@ -167,3 +167,21 @@ assert = "status in ['Failed'] => !empty(error) && error == reason"
         .run();
     assert!(result.all_passed, "{result:#?}");
 }
+
+#[test]
+fn string_parameters_override_effects_in_every_cascade_level() {
+    let source = include_str!("../../../test-fixtures/specs/string_effect_param_order.ioa.toml");
+    let result = VerificationCascade::from_ioa(source)
+        .with_sim_seeds(20)
+        .with_prop_test_cases(100)
+        .run();
+    assert!(result.all_passed, "{result:#?}");
+    for level in [
+        CascadeLevel::SymbolicVerification,
+        CascadeLevel::ModelCheck,
+        CascadeLevel::Simulation,
+        CascadeLevel::PropertyTest,
+    ] {
+        assert!(result.level_result(level).unwrap().passed);
+    }
+}

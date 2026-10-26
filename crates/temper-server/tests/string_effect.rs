@@ -17,13 +17,13 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EntitySet Name="StringRecords" EntityType="Test.StringRecord"/>
 </EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"#;
 
-fn server(store: SimEventStore) -> ServerState {
+fn server(store: SimEventStore, source: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
         parse_csdl(CSDL).unwrap(),
         CSDL.into(),
-        &[("StringRecord", SPEC)],
+        &[("StringRecord", source)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new("string-effect"), registry);
     state.set_storage_stack(StorageStack::from_sim(store, None));
@@ -35,7 +35,7 @@ async fn dispatch_clears_a_string_and_replay_keeps_it_cleared() {
     for seed in 0..20 {
         let (_guard, _clock, _ids) = install_deterministic_context(seed);
         let store = SimEventStore::no_faults(seed);
-        let state = server(store.clone());
+        let state = server(store.clone(), SPEC);
         let tenant = TenantId::default();
         let id = format!("record-{seed}");
         for (action, params, expected) in [
@@ -77,7 +77,7 @@ async fn dispatch_clears_a_string_and_replay_keeps_it_cleared() {
             .unwrap();
         assert_eq!(read.state.fields["reason"], "recovered");
         drop(state);
-        let restarted = server(store);
+        let restarted = server(store, SPEC);
         let read = restarted
             .get_tenant_entity_state(&tenant, "StringRecord", &id)
             .await
@@ -106,5 +106,57 @@ fn installation_refuses_wrong_or_undeclared_string_targets() {
             )
             .unwrap_err();
         assert!(error.to_string().contains(reason), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn dispatch_and_replay_keep_parameters_over_string_effects() {
+    let source = include_str!("../../../test-fixtures/specs/string_effect_param_order.ioa.toml");
+    for seed in 0..20 {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let store = SimEventStore::no_faults(seed);
+        let state = server(store.clone(), source);
+        let tenant = TenantId::default();
+        let id = format!("param-order-{seed}");
+        for (action, params, status) in [
+            ("Write", serde_json::json!({"error": "detail"}), "Written"),
+            ("Read", serde_json::json!({}), "Read"),
+        ] {
+            let response = state
+                .dispatch_tenant_action(
+                    &tenant,
+                    "StringRecord",
+                    &id,
+                    action,
+                    params,
+                    &AgentContext::default(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                response.success,
+                "seed {seed}, {action}: {:?}",
+                response.error
+            );
+            let read = state
+                .get_tenant_entity_state(&tenant, "StringRecord", &id)
+                .await
+                .unwrap();
+            assert_eq!(
+                read.state.fields["error"], "detail",
+                "seed {seed}, {action}"
+            );
+            assert_eq!(read.state.fields["reason"], "last", "seed {seed}, {action}");
+            assert_eq!(read.state.status, status, "seed {seed}, {action}");
+        }
+        drop(state);
+        let restarted = server(store, source);
+        let read = restarted
+            .get_tenant_entity_state(&tenant, "StringRecord", &id)
+            .await
+            .unwrap();
+        assert_eq!(read.state.fields["error"], "detail", "seed {seed}, replay");
+        assert_eq!(read.state.fields["reason"], "last", "seed {seed}, replay");
+        assert_eq!(read.state.status, "Read", "seed {seed}, replay");
     }
 }

@@ -72,3 +72,35 @@ async fn string_effect_accepts_legacy_non_object_params_without_panicking() {
     assert_eq!(decoded.fields["error"], "");
     assert_eq!(decoded.fields["reason"], "recovered");
 }
+
+#[tokio::test]
+async fn string_parameters_override_effects_on_the_same_action() {
+    let source = include_str!("../../../../test-fixtures/specs/string_effect_param_order.ioa.toml");
+    for strict in [false, true] {
+        let source = source.replace(
+            "strict_action_params = true",
+            &format!("strict_action_params = {strict}"),
+        );
+        let actor = SpecDrivenActor::from_ioa(&source).unwrap();
+        let mut state = actor.initial_state();
+        for (action, params, status) in [
+            ("Write", json!({"error": "detail"}), "Written"),
+            ("Read", json!({}), "Read"),
+        ] {
+            actor
+                .handle(&context(), &mut state, &message(action, params))
+                .await
+                .unwrap();
+            let decoded: SpecActorState = serde_json::from_slice(&state).unwrap();
+            assert_eq!(
+                decoded.fields["error"], "detail",
+                "strict={strict}, {action}"
+            );
+            assert_eq!(
+                decoded.fields["reason"], "last",
+                "strict={strict}, {action}"
+            );
+            assert_eq!(decoded.status, status, "strict={strict}, {action}");
+        }
+    }
+}
