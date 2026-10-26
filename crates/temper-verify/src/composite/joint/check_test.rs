@@ -384,6 +384,31 @@ fn a_scheduled_action_fires_in_the_proof() {
     assert!(why.contains("after Parent.Unlock.scheduled fires"), "{why}");
 }
 
+/// An action nothing outside may send: a sealing or closed parent locks.
+const LOCK: &str = r#"
+[[action]]
+name = "Lock"
+kind = "internal"
+from = ["Sealing", "Closed"]
+effect = ["locked = true"]
+"#;
+
+#[test]
+fn a_record_waiting_for_a_scheduled_action_is_settled() {
+    // Sealing leaves the parent unlocked and locks it a minute later; it
+    // may close in that minute, and the rule must hold while it waits.
+    let locks_later = format!(
+        "{}{LOCK}",
+        parent(", \"locked = false\", \"schedule('Lock', 60)\"")
+    );
+    let verdict = invariant(&[&locks_later, &child(&[LOCKED_PAST_OPEN])], budget());
+    let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
+        panic!("proved while the lock waits: {verdict}");
+    };
+    let why = tried.shortfall().expect("not proved");
+    assert!(why.contains("after Parent.Seal"), "{why}");
+}
+
 #[test]
 fn a_spawned_records_first_action_is_a_move_of_the_proof() {
     let rule = child(&[LOCKED_PAST_OPEN]);
