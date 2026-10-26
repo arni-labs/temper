@@ -107,7 +107,6 @@ pub(super) async fn prove(
     })?;
     let mut held = Vec::new();
     let mut unproven = Vec::new();
-    let mut running = None;
     for joint_proof in joint {
         let name = joint_proof.name();
         let keys = Keys {
@@ -124,7 +123,9 @@ pub(super) async fn prove(
                 unproven.extend(verdict.refused);
             }
             Proof::Running(wait) => {
-                running.get_or_insert(wait);
+                // Each walk uses the same host room. Wait before starting
+                // another, so this install's proofs do not crowd each other out.
+                return Ok(Some(wait));
             }
         }
     }
@@ -133,9 +134,6 @@ pub(super) async fn prove(
             "os-app '{app_name}' declares rules over several records that are not proven:\n{}",
             unproven.join("\n")
         ));
-    }
-    if running.is_some() {
-        return Ok(running);
     }
     for line in &held {
         tracing::info!(tenant, app = %app_name, "{line}");
