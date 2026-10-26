@@ -532,21 +532,25 @@ jobs:
         run: cargo test --doc --workspace
 
   # ─────────────────────────────────────────────────────
-  # A rollback boots: a release runs on a Postgres schema a newer release
-  # migrated (crates/temper-store-postgres/migrations/README.md). Store tests
-  # that need a real database run here too.
+  # Tests that need a disposable PostgreSQL of their own: each is #[ignore]d with a
+  # reason naming TEMPER_TEST_POSTGRES_URL or TEST_POLICY_DATABASE_URL, and this job
+  # runs every such test in the packages this run tests (scripts/ci/postgres_ignored.py
+  # finds them by that reason). Among them: a rollback boots, a release runs on a
+  # Postgres schema a newer release migrated (crates/temper-store-postgres/migrations/README.md).
   # ─────────────────────────────────────────────────────
   postgres-migrations:
     name: Postgres rollback migrations
     needs: changes
-    if: needs.changes.outputs.lane == 'full' || contains(format(' {0} ', needs.changes.outputs.packages), ' temper-store-postgres ')
+    if: needs.changes.outputs.packages != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:18
         env:
           POSTGRES_PASSWORD: temper
+          # The policy-replacement test checks it runs on a database of this name.
+          POSTGRES_DB: morrow_temper
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U postgres"
@@ -554,38 +558,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select the tests that need a disposable PostgreSQL
+        id: select
+        env:
+          PACKAGES: ${{ needs.changes.outputs.packages }}
+        run: python3 scripts/ci/postgres_ignored.py
+
       - name: Install system dependencies
+        if: steps.select.outputs.args != ''
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
       - name: Install pinned Rust toolchain
+        if: steps.select.outputs.args != ''
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Set up mold linker
+        if: steps.select.outputs.args != ''
         uses: rui314/setup-mold@v1
 
       - name: Cache Rust build
+        if: steps.select.outputs.args != ''
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
+        if: steps.select.outputs.args != ''
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
-      - name: A release boots on a schema a newer release migrated
+      # One at a time: each test expects the database to itself while it runs.
+      - name: Ignored tests that need a disposable PostgreSQL
+        if: steps.select.outputs.args != ''
         env:
           TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
-        run: >-
-          cargo nextest run -p temper-store-postgres --run-ignored only
-          -E 'test(a_release_boots_on_a_schema_a_newer_release_migrated)'
-
-      - name: Scheduled-action rows commit with their events
-        env:
-          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
-        run: >-
-          cargo nextest run -p temper-store-postgres --run-ignored only
-          -E 'test(scheduled_action_rows_commit_with_their_events)'
+          TEST_POLICY_DATABASE_URL: postgres://postgres:temper@localhost:5432/morrow_temper
+          ARGS: ${{ steps.select.outputs.args }}
+          FILTER: ${{ steps.select.outputs.filter }}
+        run: cargo nextest run $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
