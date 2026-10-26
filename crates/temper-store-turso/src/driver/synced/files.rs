@@ -100,9 +100,29 @@ pub(super) fn sync_metadata(path: &Path) -> Result<serde_json::Value, DriverErro
 /// the file holds. A read that finds an incomplete file reads it again until
 /// it parses: a prefix of a JSON object never parses, so what parses is one
 /// whole version.
+///
+/// A missing file fails at once: no rewrite removes it. A record still
+/// incomplete after [`REWRITE_BUDGET`] fails with what the last read found.
 pub(super) async fn read_sync_metadata(path: &Path) -> Result<serde_json::Value, DriverError> {
-    sync_metadata(path)
+    let started = std::time::Instant::now();
+    loop {
+        match sync_metadata(path) {
+            Ok(info) => return Ok(info),
+            Err(error) if !sidecar(path, "-info").exists() => return Err(error),
+            Err(error) if started.elapsed() >= REWRITE_BUDGET => return Err(error),
+            Err(_) => tokio::time::sleep(REWRITE_POLL).await,
+        }
+    }
 }
+
+/// How long a read waits for the engine to finish rewriting its record. The
+/// rewrite is one write of a few hundred bytes, so a record incomplete for
+/// this long is not being rewritten but broken, and the push that needs it
+/// fails with the cause. It stays well inside an answer's 10 s for its push.
+const REWRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a read looks at a record that was incomplete.
+const REWRITE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Remove the recorded stop, returning the cause it held.
 pub(super) fn clear_stop(path: &Path) -> Result<Option<String>, DriverError> {
