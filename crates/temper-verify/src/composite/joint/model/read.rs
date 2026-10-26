@@ -40,7 +40,7 @@ pub(super) fn tracked(
 ) -> (BTreeMap<String, TemperModel>, Vec<Reaction>) {
     let reactions = reactions_in(by_name, scope);
     loop {
-        let models: BTreeMap<String, TemperModel> = scope
+        let mut models: BTreeMap<String, TemperModel> = scope
             .iter()
             .map(|entity| {
                 let extra = also.get(entity).cloned().unwrap_or_default();
@@ -50,6 +50,38 @@ pub(super) fn tracked(
                 )
             })
             .collect();
+        let mut literals = BTreeSet::new();
+        for entity in scope {
+            let a = by_name[entity.as_str()];
+            for inv in &a.invariants {
+                collect_literals(&inv.assert, &mut literals);
+            }
+            for action in &a.actions {
+                collect_literals(&action.guard, &mut literals);
+            }
+        }
+        for model in models.values() {
+            literals.extend(model.initial_strings.values().filter_map(|v| match v {
+                crate::model::ModelString::Literal(s) => Some(s.clone()),
+                _ => None,
+            }));
+        }
+        for reaction in &reactions {
+            for arg in reaction.args.values() {
+                if let Arg::Lit(temper_spec::predicate::Literal::Str(s)) = arg {
+                    literals.insert(s.clone());
+                }
+            }
+        }
+        for model in models.values_mut() {
+            for field in &model.tracked_strings {
+                model
+                    .string_literals
+                    .entry(field.clone())
+                    .or_default()
+                    .extend(literals.clone());
+            }
+        }
         let mut grew = false;
         let mut track = |entity: &str, field: &str| {
             !matches!(field, "Id" | "id")
@@ -123,4 +155,43 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
         }
     }
     reactions
+}
+
+/// Literals must remain distinct even when compared with related operands.
+fn collect_literals(expr: &Expr, out: &mut BTreeSet<String>) {
+    use temper_spec::predicate::{Literal, Operand, Set};
+    let mut operand = |o: &Operand| {
+        if let Operand::Lit(Literal::Str(s)) = o {
+            out.insert(s.clone());
+        }
+    };
+    match expr {
+        Expr::Compare { lhs, rhs, .. } => {
+            operand(lhs);
+            operand(rhs);
+        }
+        Expr::In {
+            value,
+            set: Set::List(items),
+            ..
+        } => {
+            operand(value);
+            for item in items {
+                if let Literal::Str(s) = item {
+                    out.insert(s.clone());
+                }
+            }
+        }
+        Expr::Not(e) => collect_literals(e, out),
+        Expr::And(parts) | Expr::Or(parts) => {
+            for e in parts {
+                collect_literals(e, out);
+            }
+        }
+        Expr::Implies(a, b) => {
+            collect_literals(a, out);
+            collect_literals(b, out);
+        }
+        _ => {}
+    }
 }

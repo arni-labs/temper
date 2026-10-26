@@ -15,8 +15,8 @@ use super::env::{Blind, ID, JointEnv, Records};
 use super::slice::slice;
 use super::{JointOutcome, JointState, path_to};
 use crate::Budget;
-use crate::model::semantics::{canonical_strings, string_values};
-use crate::model::{ParamValue, ResolvedTransition, TemperModel, TemperModelState};
+use crate::model::semantics::{Expansion, canonical_strings, string_values};
+use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
@@ -61,6 +61,7 @@ pub(super) struct Walk {
 
 /// The joint model of one entity's invariants that read related entities.
 pub(super) struct JointModel {
+    expansion: Expansion,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
     records: Records,
@@ -114,6 +115,7 @@ impl JointModel {
             })
             .collect();
         Self {
+            expansion: Expansion::default(),
             models,
             reactions,
             records: Records::ById,
@@ -139,31 +141,28 @@ impl JointModel {
 
     /// The starting states: one per way the records' ids can be equal or
     /// differ, or the one start when there is one record of a type.
-    fn inits(&self) -> Vec<JointState> {
+    fn inits(&self) -> Box<dyn Iterator<Item = JointState> + '_> {
         let blank = self.blank();
         if self.records == Records::One {
-            return vec![JointState {
+            return Box::new(std::iter::once(JointState {
                 records: blank,
                 inflight: Vec::new(),
-            }];
+            }));
         }
-        partitions(blank.len())
-            .into_iter()
-            .map(|blocks| {
-                let mut records = blank.clone();
-                for (record, block) in records.values_mut().zip(blocks) {
-                    record
-                        .strings
-                        .insert(ID.to_string(), format!("#{}", block + 1));
-                }
-                let mut state = JointState {
-                    records,
-                    inflight: Vec::new(),
-                };
-                canonical(&mut state);
-                state
-            })
-            .collect()
+        Box::new(partitions(blank.len()).map(move |blocks| {
+            let mut records = blank.clone();
+            for (record, block) in records.values_mut().zip(blocks) {
+                record
+                    .strings
+                    .insert(ID.to_string(), ModelString::Symbol(block + 1));
+            }
+            let mut state = JointState {
+                records,
+                inflight: Vec::new(),
+            };
+            canonical(&mut state);
+            state
+        }))
     }
 
     /// The starting state whose ids are `ids` (entity type to a trace name;
@@ -172,15 +171,15 @@ impl JointModel {
     pub(super) fn init_with_ids(
         &self,
         ids: &BTreeMap<String, String>,
-    ) -> (JointState, BTreeMap<String, String>) {
-        let mut names: BTreeMap<String, String> = BTreeMap::new();
+    ) -> (JointState, BTreeMap<String, ModelString>) {
+        let mut names: BTreeMap<String, ModelString> = BTreeMap::new();
         let mut records = self.blank();
         for (entity, record) in &mut records {
             let name = ids
                 .get(entity)
                 .cloned()
                 .unwrap_or_else(|| format!("{entity}#id"));
-            let next = format!("#{}", names.len() + 1);
+            let next = ModelString::Symbol(names.len() + 1);
             let value = names.entry(name).or_insert(next).clone();
             record.strings.insert(ID.to_string(), value);
         }
@@ -198,7 +197,7 @@ impl JointModel {
     }
 
     /// The strings `state` holds, in records and in dispatches.
-    pub(super) fn values(&self, state: &JointState) -> BTreeSet<String> {
+    pub(super) fn values(&self, state: &JointState) -> BTreeSet<ModelString> {
         let mut values = string_values(state.records.values());
         for dispatch in &state.inflight {
             for value in dispatch.params.values() {
@@ -265,27 +264,98 @@ impl JointModel {
     /// Walk every reachable joint state breadth first, checking `invariants`
     /// of `owner` in each settled one (nothing in flight).
     pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], budget: Budget) -> Walk {
+        let mut unsupported = BTreeSet::new();
+        let modeled = |entity: &str, field: &str| {
+            self.models.get(entity).is_some_and(|model| {
+                matches!(field, "Id" | "id")
+                    || match model.var_kinds.get(field) {
+                        Some(temper_spec::predicate::VarKind::Str) => {
+                            model.tracked_strings.contains(field)
+                        }
+                        Some(
+                            temper_spec::predicate::VarKind::Counter
+                            | temper_spec::predicate::VarKind::Bool
+                            | temper_spec::predicate::VarKind::List,
+                        ) => true,
+                        _ => false,
+                    }
+            })
+        };
+        for inv in invariants {
+            inv.for_each_name(&mut |name| {
+                let mut check = |entity: &str, field: &str| {
+                    if !modeled(entity, field) {
+                        unsupported.insert(format!("{entity}.{field}"));
+                    }
+                };
+                match name {
+                    Name::Var(field) => check(owner, field),
+                    Name::CrossStatus { id_field, .. } => check(owner, id_field),
+                    Name::CrossField {
+                        entity_type,
+                        id_field,
+                        field,
+                    } => {
+                        check(owner, id_field);
+                        check(entity_type, field);
+                    }
+                    Name::Status => {}
+                }
+            });
+        }
+        for (entity, model) in &self.models {
+            if let Some((action, _)) = crate::model::semantics::oversized_transition(model) {
+                unsupported.insert(format!("{entity}.{action} parameter expansion"));
+            }
+        }
+        if !unsupported.is_empty() {
+            let reason = format!(
+                "unsupported reads or expansion: {}",
+                unsupported.into_iter().collect::<Vec<_>>().join(", ")
+            );
+            return Walk {
+                states: 0,
+                held_back: false,
+                outcomes: invariants
+                    .iter()
+                    .map(|_| JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            };
+        }
         let started = Instant::now();
+        self.expansion.reset(budget.states, Some(budget.time));
         let mut nodes: Vec<(JointState, Option<(usize, String)>)> = Vec::new();
         let mut seen: HashMap<JointState, usize> = HashMap::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {
+            if !self.expansion.take() {
+                break;
+            }
             if !seen.contains_key(&init) {
                 seen.insert(init.clone(), nodes.len());
                 queue.push_back(nodes.len());
                 nodes.push((init, None));
             }
         }
+        let mut unknown = vec![false; invariants.len()];
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
         let mut stopped = None;
         let mut held_back = false;
         while let Some(index) = queue.pop_front() {
+            if self.expansion.exhausted.get() {
+                stopped = Some("the walk exhausted its expansion budget".to_string());
+                break;
+            }
             let state = nodes[index].0.clone();
             if state.inflight.is_empty() {
                 let env = self.env(owner, &state);
                 for (i, inv) in invariants.iter().enumerate() {
-                    if broken[i].is_none() && eval(inv, &env) == Truth::False {
-                        broken[i] = Some(index);
+                    match eval(inv, &env) {
+                        Truth::False if broken[i].is_none() => broken[i] = Some(index),
+                        Truth::Unknown => unknown[i] = true,
+                        _ => {}
                     }
                 }
             }
@@ -301,6 +371,9 @@ impl JointModel {
                 break;
             }
             for mv in self.moves(&state) {
+                if self.expansion.exhausted.get() {
+                    break;
+                }
                 let (nexts, held) = self.next(&state, &mv);
                 held_back |= held;
                 for next in nexts {
@@ -314,11 +387,18 @@ impl JointModel {
                 }
             }
         }
+        if self.expansion.exhausted.get() {
+            stopped = Some("the walk exhausted its expansion budget".to_string());
+        }
         let outcomes = broken
             .iter()
-            .map(|found| match found {
+            .enumerate()
+            .map(|(i, found)| match found {
                 Some(index) => JointOutcome::Broken {
                     path: path_to(&nodes, *index),
+                },
+                None if unknown[i] => JointOutcome::Incomplete {
+                    reason: "the assertion reads an unsupported or untracked value".to_string(),
                 },
                 None => match &stopped {
                     Some(reason) => JointOutcome::Incomplete {
@@ -338,29 +418,30 @@ impl JointModel {
 
 /// Every way to split `n` items into blocks, as each item's block number,
 /// blocks numbered in order of first use.
-fn partitions(n: usize) -> Vec<Vec<usize>> {
-    let mut out: Vec<Vec<usize>> = vec![Vec::new()];
-    for _ in 0..n {
-        out = out
-            .into_iter()
-            .flat_map(|blocks| {
-                let used = blocks.iter().max().map_or(0, |most| most + 1);
-                (0..=used).map(move |block| {
-                    let mut more = blocks.clone();
-                    more.push(block);
-                    more
-                })
-            })
-            .collect();
-    }
-    out
+fn partitions(n: usize) -> impl Iterator<Item = Vec<usize>> {
+    // Restricted-growth strings enumerate partitions with O(n) storage.
+    let mut blocks = Some(vec![0; n]);
+    std::iter::from_fn(move || {
+        let current = blocks.take()?;
+        let mut next = current.clone();
+        for i in (1..n).rev() {
+            let largest = next[..i].iter().max().copied().unwrap_or(0) + 1;
+            if next[i] < largest {
+                next[i] += 1;
+                next[i + 1..].fill(0);
+                blocks = Some(next);
+                break;
+            }
+        }
+        Some(current)
+    })
 }
 
 /// Renumber new strings over the whole joint state, records first, then
 /// the dispatches in flight; returns each value's new name.
-fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
+fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
     let mut dispatches = std::mem::take(&mut state.inflight);
-    let mut strings: Vec<BTreeMap<String, String>> = dispatches
+    let mut strings: Vec<BTreeMap<String, ModelString>> = dispatches
         .iter()
         .map(|d| {
             d.params
@@ -373,7 +454,7 @@ fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
         })
         .collect();
     let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, String>> = state
+        let mut maps: Vec<&mut BTreeMap<String, ModelString>> = state
             .records
             .values_mut()
             .map(|s| &mut s.strings)
@@ -389,4 +470,19 @@ fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
     dispatches.sort();
     state.inflight = dispatches;
     renamed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partitions;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn incremental_partitions_are_exhaustive_and_unique() {
+        for (n, expected) in [1, 1, 2, 5, 15, 52].into_iter().enumerate() {
+            let all: Vec<_> = partitions(n).collect();
+            assert_eq!(all.len(), expected);
+            assert_eq!(all.into_iter().collect::<BTreeSet<_>>().len(), expected);
+        }
+    }
 }

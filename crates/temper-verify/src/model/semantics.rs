@@ -7,11 +7,15 @@ use temper_spec::predicate::{
 };
 
 use super::types::{
-    ModelEffect, ParamValue, ResolvedTransition, StringParam, TemperModel, TemperModelState,
+    ModelEffect, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
 };
 
+pub(crate) use super::expansion::Expansion;
+use super::strings::string_assignments;
+pub use super::strings::{apply_string_params, canonical_strings, string_values};
+
 /// Parameter assignments explored per step for one transition, at most
-/// (TigerStyle budget: `successors` materializes every assignment).
+/// (numeric/list parameters; joint string products also consume expansion work).
 pub const MAX_PARAM_ASSIGNMENTS: usize = 4096;
 
 /// A model state as a predicate environment. Status, counters, booleans,
@@ -48,7 +52,7 @@ impl Env for ModelEnv<'_> {
                 .state
                 .strings
                 .get(name)
-                .map_or(Val::Unknown, |value| Val::Str(value)),
+                .map_or(Val::Unknown, |value| value.val()),
             Some(VarKind::Num) | None => Val::Unknown,
         }
     }
@@ -117,12 +121,25 @@ pub fn successors_among(
     model: &TemperModel,
     t: &ResolvedTransition,
     state: &TemperModelState,
-    values: &BTreeSet<String>,
+    values: &BTreeSet<ModelString>,
+) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    successors_budgeted(model, t, state, values, &Expansion::default())
+}
+
+pub(crate) fn successors_budgeted(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<ModelString>,
+    budget: &Expansion,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
-    let strings = string_assignments(model, t, state, values);
+    let strings = string_assignments(model, t, state, values, budget);
     for params in param_assignments(model, t) {
         for chosen in &strings {
+            if !budget.take() {
+                return out;
+            }
             let mut params = params.clone();
             params.extend(
                 chosen
@@ -162,117 +179,6 @@ pub fn step(
     apply_effects(&resolved.effects, &mut next, name, params);
     apply_string_params(&resolved.string_params, &mut next, params);
     Some(next)
-}
-
-/// The tracked string values held by `states`, `''` left out.
-pub fn string_values<'a>(
-    states: impl IntoIterator<Item = &'a TemperModelState>,
-) -> BTreeSet<String> {
-    states
-        .into_iter()
-        .flat_map(|state| state.strings.values())
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .collect()
-}
-
-/// A value equal to none of `values`: `#n` past the largest `#n` in use.
-fn fresh_string(values: &BTreeSet<String>) -> String {
-    let largest = values
-        .iter()
-        .filter_map(|value| value.strip_prefix('#')?.parse::<usize>().ok())
-        .max()
-        .unwrap_or(0);
-    format!("#{}", largest + 1)
-}
-
-/// The values one string parameter may take in `state`.
-fn string_candidates(
-    model: &TemperModel,
-    param: &StringParam,
-    state: &TemperModelState,
-    values: &BTreeSet<String>,
-) -> Vec<String> {
-    let tracked = |var: &str| state.strings.get(var).cloned();
-    let mut candidates: BTreeSet<String> = match param.equals.as_deref().and_then(tracked) {
-        Some(value) => BTreeSet::from([value]),
-        None => {
-            let mut all: BTreeSet<String> = values.clone();
-            all.insert(String::new());
-            all.insert(fresh_string(values));
-            if let Some(literals) = model.string_literals.get(&param.name) {
-                all.extend(literals.iter().cloned());
-            }
-            all
-        }
-    };
-    if param.nonempty {
-        candidates.remove("");
-    }
-    for var in &param.not_equals {
-        if let Some(value) = tracked(var) {
-            candidates.remove(&value);
-        }
-    }
-    candidates.into_iter().collect()
-}
-
-/// Every choice of values for `t`'s string parameters (one empty choice when
-/// it has none; none when a constraint leaves a parameter no value).
-fn string_assignments(
-    model: &TemperModel,
-    t: &ResolvedTransition,
-    state: &TemperModelState,
-    values: &BTreeSet<String>,
-) -> Vec<BTreeMap<String, String>> {
-    let mut assignments = vec![BTreeMap::new()];
-    for param in &t.string_params {
-        let candidates = string_candidates(model, param, state, values);
-        assignments = assignments
-            .into_iter()
-            .flat_map(|assignment| {
-                candidates.iter().map(move |value| {
-                    let mut next = assignment.clone();
-                    next.insert(param.name.clone(), value.clone());
-                    next
-                })
-            })
-            .collect();
-    }
-    assignments
-}
-
-/// Write each string parameter into its tracked variable, as the runtime
-/// writes every parameter into the field of its name.
-pub fn apply_string_params(
-    string_params: &[StringParam],
-    state: &mut TemperModelState,
-    params: &BTreeMap<String, ParamValue>,
-) {
-    for param in string_params {
-        if let Some(ParamValue::Str(value)) = params.get(&param.name) {
-            state.strings.insert(param.name.clone(), value.clone());
-        }
-    }
-}
-
-/// Renumber the `#n` values of `maps`, in order, by first use: two states
-/// that differ only in which new values they made up are one state. Equality
-/// between values is all an invariant can see of them, so nothing is lost.
-/// Returns each value's new name.
-pub fn canonical_strings(maps: &mut [&mut BTreeMap<String, String>]) -> BTreeMap<String, String> {
-    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
-    for map in maps.iter_mut() {
-        for value in map.values_mut() {
-            if !value.starts_with('#') {
-                continue;
-            }
-            let next = format!("#{}", renamed.len() + 1);
-            let name = renamed.entry(value.clone()).or_insert(next).clone();
-            *value = name;
-        }
-    }
-    renamed
 }
 
 /// The transition with more parameter assignments than one step explores
@@ -319,7 +225,7 @@ fn param_candidates(
         ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
         ParamKind::Str => string_literals(model, t, name)
             .into_iter()
-            .map(ParamValue::Str)
+            .map(|s| ParamValue::Str(s.into()))
             .chain(std::iter::once(ParamValue::Fresh))
             .collect(),
     }
@@ -441,7 +347,7 @@ pub fn apply_effects(
                 let element = match value {
                     Arg::Lit(Literal::Str(text)) => text.clone(),
                     Arg::Param(name) => match params.get(name) {
-                        Some(ParamValue::Str(text)) => text.clone(),
+                        Some(ParamValue::Str(ModelString::Literal(text))) => text.clone(),
                         _ => format!("{action_name}#{}", entry.len() + 1),
                     },
                     _ => format!("{action_name}#{}", entry.len() + 1),

@@ -42,19 +42,21 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// validate-ioa's caps for the same attack (its `MAX_BUDGET_MS` and
 /// `BUDGET_STATES`, about 1.1 GB at the state cap). A check that runs out
 /// refuses the install, since the bundle declared a rule nobody proved.
+/// Intermediate expansion work consumes the state allowance too, so products
+/// cannot escape it before the walk counts their resulting states.
 const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
     time: std::time::Duration::from_secs(120),
     states: 10_000_000,
 };
 
-/// Prove every `[[invariant]]` of `specs` (a bundle's types) that reads a
-/// related entity, on the joint model of its type and the types it names,
+/// Prove the proposed tenant model, including installed rules, for every
+/// `[[invariant]]` reading a related entity, on its type and the types it names,
 /// and refuse the install if one is not proven. A named type the bundle does
 /// not carry is taken from what the tenant already runs. It runs before the
 /// install writes or swaps anything, so a refused bundle leaves the tenant as
 /// it was and reads keep serving the old specs meanwhile, and on a blocking
 /// thread, since a large joint model takes seconds. A bundle that declares no
-/// such rule costs one walk over its invariants.
+/// such rule still checks affected installed rules in the proposed tenant model.
 pub(super) async fn prove_joint_invariants(
     state: &PlatformState,
     tenant: &str,
@@ -67,26 +69,19 @@ pub(super) async fn prove_joint_invariants(
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
         automatons.insert(entity_type.clone(), automaton);
     }
-    let named: std::collections::BTreeSet<String> = automatons
-        .values()
-        .flat_map(|a| &a.invariants)
-        .flat_map(|inv| inv.assert.related_types())
-        .map(|(entity_type, _)| entity_type)
-        .collect();
-    if named.is_empty() {
-        return Ok(());
-    }
+    // Check the proposed tenant model, including installed rule owners. Loading
+    // all tenant types also closes dependencies of supporting specs transitively.
     {
         let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
         let registry = state
             .registry
             .read()
             .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
-        for entity_type in &named {
-            if !automatons.contains_key(entity_type)
-                && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
-            {
-                automatons.insert(entity_type.clone(), spec.automaton.clone());
+        for entity_type in registry.entity_types(&tenant_id) {
+            if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
+                automatons
+                    .entry(entity_type.to_string())
+                    .or_insert_with(|| spec.automaton.clone());
             }
         }
     }
@@ -108,8 +103,12 @@ pub(super) async fn prove_joint_invariants(
         Ok(())
     } else {
         Err(format!(
-            "os-app '{app_name}' declares rules over several entities that are not proven:\n{}",
+            "os-app '{app_name}' would leave tenant rules over several entities unproven:\n{}",
             unproven.join("\n")
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "install_checks_test.rs"]
+mod tests;

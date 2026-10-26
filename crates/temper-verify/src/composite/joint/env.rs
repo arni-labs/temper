@@ -100,6 +100,9 @@ pub(super) struct JointEnv<'a> {
 }
 
 fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> Val<'a> {
+    if matches!(name, "Id" | "id") {
+        return state.strings.get(ID).map_or(Val::Unknown, |s| s.val());
+    }
     match model.var_kinds.get(name) {
         Some(VarKind::Counter) => Val::Num(state.counters.get(name).copied().unwrap_or(0) as f64),
         Some(VarKind::Bool) => Val::Bool(state.booleans.get(name).copied().unwrap_or(false)),
@@ -110,7 +113,7 @@ fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> V
         Some(VarKind::Str) => state
             .strings
             .get(name)
-            .map_or(Val::Unknown, |value| Val::Str(value)),
+            .map_or(Val::Unknown, |value| value.val()),
         Some(VarKind::Num) | None => Val::Unknown,
     }
 }

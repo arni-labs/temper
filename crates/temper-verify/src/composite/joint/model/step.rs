@@ -10,9 +10,9 @@ use temper_spec::predicate::{Arg, Literal, Truth, eval};
 use super::super::env::{Blind, Found, ID, resolve};
 use super::super::{Dispatch, JointState};
 use super::{Delivery, JointModel, MAX_IN_FLIGHT, MAX_REACTION_DEPTH, Reaction, canonical};
-use crate::model::semantics::{step, successors_among};
+use crate::model::semantics::{step, successors_budgeted};
 use crate::model::{
-    ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
+    ModelString, ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
 };
 
 /// One move of the walk.
@@ -35,7 +35,7 @@ pub(in crate::composite::joint) enum Move {
 pub(in crate::composite::joint) struct Next {
     pub(in crate::composite::joint) state: JointState,
     /// The new names of the values the old state held.
-    pub(in crate::composite::joint) renamed: BTreeMap<String, String>,
+    pub(in crate::composite::joint) renamed: BTreeMap<ModelString, ModelString>,
     /// The move, named as in the new state.
     pub(in crate::composite::joint) label: String,
 }
@@ -52,11 +52,14 @@ impl JointModel {
         for (entity, model) in self.models.iter().filter(|_| asked) {
             let local = &state.records[entity];
             for t in &model.transitions {
+                if !self.expansion.take() {
+                    return out;
+                }
                 if !self.enabled(entity, t, state, Blind::Nothing) {
                     continue;
                 }
                 let reads = self.reads_related(t);
-                for (params, _) in successors_among(model, t, local, &values) {
+                for (params, _) in successors_budgeted(model, t, local, &values, &self.expansion) {
                     let action = TemperModelAction {
                         name: t.name.clone(),
                         target_state: t.to_state.clone(),
@@ -92,6 +95,9 @@ impl JointModel {
         state: &JointState,
         mv: &Move,
     ) -> (Vec<Next>, bool) {
+        if !self.expansion.take() {
+            return (Vec::new(), false);
+        }
         let mut outcomes: Vec<(JointState, String)> = Vec::new();
         match mv {
             Move::Take(entity, action) => {
@@ -168,7 +174,7 @@ impl JointModel {
                 let renamed = canonical(&mut outcome);
                 Next {
                     state: outcome,
-                    label: rename_label(&text, &renamed),
+                    label: rename_label(&text, mv, &renamed),
                     renamed,
                 }
             })
@@ -217,11 +223,12 @@ impl JointModel {
         // carry: the first choice, as the composite check takes. A string
         // parameter it does not carry leaves the field as it is.
         let values = self.values(state);
-        let mut params: BTreeMap<String, ParamValue> = successors_among(model, t, target, &values)
-            .into_iter()
-            .next()
-            .map(|(params, _)| params)
-            .unwrap_or_default();
+        let mut params: BTreeMap<String, ParamValue> =
+            successors_budgeted(model, t, target, &values, &self.expansion)
+                .into_iter()
+                .next()
+                .map(|(params, _)| params)
+                .unwrap_or_default();
         for param in &t.string_params {
             params.remove(&param.name);
         }
@@ -253,6 +260,9 @@ impl JointModel {
         {
             let mut after = Vec::new();
             for state in outcomes {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let fires = match &reaction.guard {
                     Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
                     None => Truth::True,
@@ -316,8 +326,8 @@ impl JointModel {
             .filter_map(|(param, arg)| {
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone()),
-                    Arg::Lit(Literal::Null) => Some(String::new()),
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Null) => Some("".into()),
                     _ => None,
                 }?;
                 Some((param.clone(), ParamValue::Str(value)))
@@ -337,20 +347,34 @@ pub(super) fn remove(state: &mut JointState, dispatch: &Dispatch) {
     }
 }
 
-/// `text` with each `'#n'` value named as `renamed` says.
-fn rename_label(text: &str, renamed: &BTreeMap<String, String>) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("'#") {
-        out.push_str(&rest[..=start]);
-        rest = &rest[start + 1..];
-        let end = rest.find('\'').unwrap_or(rest.len());
-        let value = &rest[..end];
-        out.push_str(renamed.get(value).map_or(value, String::as_str));
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
+/// Render the move with renamed symbol parameters, preserving concrete literals.
+fn rename_label(text: &str, mv: &Move, renamed: &BTreeMap<ModelString, ModelString>) -> String {
+    let rename_params = |params: &mut BTreeMap<String, ParamValue>| {
+        for value in params.values_mut() {
+            if let ParamValue::Str(s) = value
+                && let Some(new) = renamed.get(s)
+            {
+                *s = new.clone();
+            }
+        }
+    };
+    let (before, after) = match mv {
+        Move::Take(entity, action) | Move::Send(entity, action) => {
+            let mut new = action.clone();
+            rename_params(&mut new.params);
+            (format!("{entity}.{action}"), format!("{entity}.{new}"))
+        }
+        Move::Read(dispatch) | Move::Arrive(dispatch) => {
+            let mut new = dispatch.clone();
+            rename_params(&mut new.params);
+            (dispatch.to_string(), new.to_string())
+        }
+    };
+    format!(
+        "{after}{}",
+        text.strip_prefix(&before)
+            .expect("label starts with its move")
+    )
 }
 
 /// Whether the string parameters `params` passes satisfy the action's
@@ -379,4 +403,28 @@ fn constraints_hold(
                 .filter_map(tracked)
                 .all(|v| v != value)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renaming_a_move_preserves_a_literal_that_spells_a_symbol() {
+        let action = TemperModelAction {
+            name: "Set".into(),
+            target_state: None,
+            params: BTreeMap::from([
+                ("a".into(), ParamValue::Str(ModelString::from("#2"))),
+                ("b".into(), ParamValue::Str(ModelString::Symbol(2))),
+            ]),
+        };
+        let text = format!("T.{action} sent");
+        let label = rename_label(
+            &text,
+            &Move::Send("T".into(), action),
+            &BTreeMap::from([(ModelString::Symbol(2), ModelString::Symbol(1))]),
+        );
+        assert_eq!(label, "T.Set(a='#2', b='#1') sent");
+    }
 }

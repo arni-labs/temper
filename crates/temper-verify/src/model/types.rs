@@ -3,6 +3,8 @@
 //! Contains the state, action, transition, invariant, liveness, and model struct
 //! definitions used by the Stateright model checker.
 
+pub use super::string::ModelString;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -35,7 +37,7 @@ pub struct TemperModelState {
     /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
     /// invariants read no string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub strings: BTreeMap<String, String>,
+    pub strings: BTreeMap<String, ModelString>,
 }
 
 impl fmt::Display for TemperModelState {
@@ -89,8 +91,8 @@ pub enum ParamValue {
     Count(usize),
     /// A boolean.
     Bool(bool),
-    /// A string some guard or invariant compares a list against.
-    Str(String),
+    /// A concrete string or a fresh equality symbol.
+    Str(ModelString),
     /// A string no guard or invariant mentions.
     Fresh,
 }
@@ -259,7 +261,7 @@ pub struct TemperModel {
     /// Initial list values from [[state]] declarations.
     pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
     /// Initial values of the tracked string variables.
-    pub(crate) initial_strings: BTreeMap<String, String>,
+    pub(crate) initial_strings: BTreeMap<String, ModelString>,
     /// The string variables the verifier tracks: those an invariant reads,
     /// and those whose value reaches one through a constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
