@@ -21,7 +21,8 @@ use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_si
 use temper_runtime::tenant::TenantId;
 use temper_store_sim::SimEventStore;
 
-use super::world::{ProcessClock, SimTimerRows};
+use super::process_clock::ProcessClock;
+use super::world::SimTimerRows;
 use super::{
     JOB_V1, Job, Process, Run, World, act, advance, check_seeds, job_untimed, job_v2, settle,
 };
