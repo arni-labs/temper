@@ -174,14 +174,13 @@ pub const BIG_LOG: i64 = 300_000;
 /// the log. Pushing 300,000 changes for real is one request of one
 /// statement per change, far past a push's 10 s limit, so the confirmed
 /// part is written into the log directly, numbered below the first real
-/// change. Most rows hold a 100-byte image and every thousandth holds
-/// 30 KB, the size of the Factory's catalog images, which spill onto
-/// overflow pages. The small images exist only to fit the 120 s a sync
-/// test may run in CI: with 1 KB rows and every hundredth at 30 KB (about
-/// 390 MB), writing the log alone took 93 s on a CI runner, and two such
-/// tests run side by side. CI's disk is warm: the cold rate of 34.2 s per
-/// 10,000 rows is roll3's production measurement on a Tensorlake drive,
-/// not this test's.
+/// change. Most rows hold a 1 KB image and every hundredth holds 30 KB,
+/// the size of the Factory's catalog images, which spill onto overflow
+/// pages. The images are zeros: turso stores them uncompressed, so they
+/// take the same pages as real ones, and `randomblob` made building the
+/// log several times slower on a CI runner. CI's disk is warm: the cold
+/// rate of 34.2 s per 10,000 rows is roll3's production measurement on a
+/// Tensorlake drive, not this test's.
 pub async fn confirmed_log(
     server: &SyncServer,
     path: &Path,
@@ -197,7 +196,7 @@ pub async fn confirmed_log(
             "INSERT INTO turso_cdc \
              (change_id, change_time, change_type, table_name, id, before, after, updates) \
              SELECT value - {rows}, 0, 1, 'events', value, NULL, \
-             CASE WHEN value % 1000 = 0 THEN randomblob(30000) ELSE randomblob(100) END, NULL \
+             CASE WHEN value % 100 = 0 THEN zeroblob(30000) ELSE zeroblob(1000) END, NULL \
              FROM generate_series(1, {rows})"
         ))
         .await
