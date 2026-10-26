@@ -1205,9 +1205,11 @@ pub(super) async fn install_os_app_with_plan(
     added.sort();
     updated.sort();
     skipped.sort();
-    if plan.specs && !(added.is_empty() && updated.is_empty()) {
-        install_checks::prove_joint_invariants(state, tenant, app_name, &bundle.specs).await?;
-    }
+    let mut warnings = if plan.specs && !(added.is_empty() && updated.is_empty()) {
+        install_checks::prove_joint_invariants(state, tenant, app_name, &bundle.specs).await?
+    } else {
+        Vec::new()
+    };
     let spec_change =
         install_checks::check_spec_changes(state, &tenant_id, app_name, &bundle.specs, plan.specs)
             .await?;
@@ -1399,7 +1401,7 @@ pub(super) async fn install_os_app_with_plan(
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
-    let warnings = install_checks::carry_records(state, &tenant_id, app_name, spec_change).await;
+    warnings.extend(install_checks::carry_records(state, &tenant_id, app_name, spec_change).await);
 
     // ── Step 3: Load Cedar policies into memory. ────────────────────
     if let Some(ref policy_text) = combined_policy {

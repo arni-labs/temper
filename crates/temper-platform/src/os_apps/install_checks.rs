@@ -6,6 +6,7 @@
 use temper_runtime::tenant::TenantId;
 use temper_server::state::SpecChangePlan;
 use temper_spec::cross_invariant;
+use temper_verify::composite::JointOutcome;
 
 use super::InstallWarning;
 
@@ -45,7 +46,7 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// one install would hold a core and gigabytes for hours. These are
 /// validate-ioa's caps for the same attack (its `MAX_BUDGET_MS` and
 /// `BUDGET_STATES`, about 1.1 GB at the state cap). A check that runs out
-/// refuses the install, since the bundle declared a rule nobody proved.
+/// leaves its rule unproved, which is a warning: the install goes ahead.
 /// Intermediate expansion work consumes the state allowance too, so products
 /// cannot escape it before the walk counts their resulting states.
 const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
@@ -54,9 +55,12 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 };
 
 /// Prove the proposed tenant model, including installed rules, for every
-/// `[[invariant]]` reading a related entity, on its type and the types it names,
-/// and refuse the install if one is not proven. A named type the bundle does
-/// not carry is taken from what the tenant already runs. It runs before the
+/// `[[invariant]]` reading a related entity, on its type and the types it names.
+/// Only a rule the check finds broken, with a path of moves that breaks it,
+/// refuses the install. A rule it could not prove (out of budget, or reading a
+/// type nobody declares) is a warning and the install goes ahead; those rules
+/// are returned as warnings for the install's answer. A named type the bundle does not
+/// carry is taken from what the tenant already runs. It runs before the
 /// install writes or swaps anything, so a refused bundle leaves the tenant as
 /// it was and reads keep serving the old specs meanwhile, and on a blocking
 /// thread, since a large joint model takes seconds. A bundle that declares no
@@ -66,7 +70,7 @@ pub(super) async fn prove_joint_invariants(
     tenant: &str,
     app_name: &str,
     specs: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<Vec<InstallWarning>, String> {
     let mut automatons = std::collections::BTreeMap::new();
     for (entity_type, ioa_source) in specs {
         let automaton = temper_spec::automaton::parse_automaton(ioa_source)
@@ -95,20 +99,23 @@ pub(super) async fn prove_joint_invariants(
     })
     .await
     .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
-    for result in results.iter().filter(|result| result.holds()) {
-        tracing::info!(tenant, app = %app_name, "{result}");
+    let (mut broken, mut unproved) = (Vec::new(), Vec::new());
+    for result in &results {
+        match result.outcome {
+            JointOutcome::Holds => tracing::info!(tenant, app = %app_name, "{result}"),
+            JointOutcome::Incomplete { .. } => {
+                tracing::warn!(tenant, app = %app_name, "{result}");
+                unproved.push(InstallWarning::joint_invariants(result.to_string()));
+            }
+            JointOutcome::Broken { .. } => broken.push(result.to_string()),
+        }
     }
-    let unproven: Vec<String> = results
-        .iter()
-        .filter(|result| !result.holds())
-        .map(ToString::to_string)
-        .collect();
-    if unproven.is_empty() {
-        Ok(())
+    if broken.is_empty() {
+        Ok(unproved)
     } else {
         Err(format!(
-            "os-app '{app_name}' would leave tenant rules over several entities unproven:\n{}",
-            unproven.join("\n")
+            "os-app '{app_name}' would break tenant rules over several entities:\n{}",
+            broken.join("\n")
         ))
     }
 }

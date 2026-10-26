@@ -62,6 +62,16 @@ impl InstallWarning {
             detail: None,
         }
     }
+
+    /// A rule over several entities the install check could not prove,
+    /// with why: only a rule found broken refuses an install.
+    pub fn joint_invariants(message: String) -> Self {
+        Self {
+            check: "joint_invariants".to_string(),
+            message,
+            detail: None,
+        }
+    }
 }
 
 /// Component phases an OS-app install/reconcile should execute.
