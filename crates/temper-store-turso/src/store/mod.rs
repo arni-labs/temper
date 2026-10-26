@@ -64,6 +64,7 @@ mod tests;
 mod trajectory;
 mod trajectory_batch;
 mod trajectory_queries;
+mod unchanged_projections;
 mod wasm;
 mod write_gate;
 
@@ -493,6 +494,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_ENTITY_CATALOG_STATUS_INDEX, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_ENTITY_CATALOG_COUNTERS_TABLE, ())
             .await
             .map_err(storage_error)?;
         let _ = conn

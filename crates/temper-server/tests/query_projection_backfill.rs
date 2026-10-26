@@ -443,9 +443,11 @@ async fn replay_parity_verifier_detects_projection_drift() {
         .expect("load active state");
     let mut catalog_state = serde_json::to_value(&actor_state.state).expect("serialize state");
     if let Some(obj) = catalog_state.as_object_mut() {
-        // The projection's own shape (query_projection_state): no events, no status clock.
+        // The projection's own shape (query_projection_state): no events, no
+        // status clock, no idempotency keys.
         obj.insert("events".to_string(), serde_json::json!([]));
         obj.remove("status_clock");
+        obj.remove("processed_idempotency_keys");
     }
     store
         .upsert_query_projection_with_state(
