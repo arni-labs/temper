@@ -590,7 +590,7 @@ jobs:
       # The store's tests one at a time against this database. The Tests run also
       # runs them, in parallel; this step keeps a serial run of the whole crate.
       - name: Store tests that need a real database
-        run: cargo nextest run -p temper-store-postgres --test-threads 1
+        run: cargo nextest run -p temper-store-postgres --test-threads 1 --no-fail-fast
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
