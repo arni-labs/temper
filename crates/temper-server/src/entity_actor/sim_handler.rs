@@ -223,10 +223,13 @@ impl SimActorHandler for EntityActorHandler {
 
     fn state_value(&self, name: &str) -> Option<serde_json::Value> {
         let state = &self.state;
-        if name == "items" && !state.counters.contains_key(name) {
-            return Some(serde_json::Value::from(state.item_count));
-        }
         let declared = &self.table.initial_values;
+        if name == "items"
+            && !state.counters.contains_key(name)
+            && let Some(items) = super::effects::stored_item_count(state, declared)
+        {
+            return Some(serde_json::Value::from(items));
+        }
         if let Some(value) = declared.counter(&state.counters, name) {
             return Some(serde_json::Value::from(value));
         }

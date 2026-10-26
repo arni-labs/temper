@@ -140,7 +140,9 @@ pub fn build_eval_context_with_xref(
     action: Option<&str>,
 ) -> EvalContext {
     let mut ctx = EvalContext::default();
-    ctx.counters.insert("items".to_string(), state.item_count);
+    if let Some(items) = stored_item_count(state, &table.initial_values) {
+        ctx.counters.insert("items".to_string(), items);
+    }
     for (k, v) in &state.counters {
         ctx.counters.insert(k.clone(), *v);
     }
@@ -810,6 +812,15 @@ pub fn apply_effects(
         spawn_requests,
         schedule_at_requests,
     )
+}
+
+/// The legacy `item_count` field, when it holds the record's `items`
+/// counter. It starts at 0 whether or not the record wrote `items`, so a 0
+/// on a record that never wrote a declared `items` is not a stored value:
+/// readers then take the declared initial value, as for any other counter.
+pub(crate) fn stored_item_count(state: &EntityState, declared: &InitialValues) -> Option<usize> {
+    let unwritten = state.item_count == 0 && !state.counters.contains_key("items");
+    (!(unwritten && declared.counters.contains_key("items"))).then_some(state.item_count)
 }
 
 /// Write a counter, keeping the legacy `item_count` field in sync with the
