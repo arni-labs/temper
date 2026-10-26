@@ -1,6 +1,9 @@
 //! Who sends each move, as the kernel sends it, and whether Cedar lets them.
 //!
-//! - An action sent from outside: whoever sent it, someone outside the kernel.
+//! - An action sent from outside: whoever sent it, someone outside the kernel
+//!   whom Cedar let send it. Where a reaction runs as that sender, it is
+//!   told apart by the action it sent (`SendAnalysis::caller`), since Cedar
+//!   decides the reaction for the same principal.
 //! - A reaction with a declared principal: that service, with the trigger's
 //!   source in its context (`resolve_trigger_principal` in the trigger
 //!   dispatcher). Without one: whoever sent its source action, which for a
@@ -44,8 +47,18 @@ pub(super) const RUNTIME: u32 = 1;
 /// The senders a model knows, by number, and what Cedar lets each send.
 pub(super) struct Senders {
     askers: Vec<Asker>,
-    /// Entity, then action, then each sender's answer.
+    /// How many of `askers` are not callers of a certain action.
+    base: usize,
+    /// The sender of each action from outside, by entity and action, where
+    /// it is told apart from [`OUTSIDE`].
+    callers: BTreeMap<(String, String), u32>,
+    /// The actions each caller sends, as `Entity.Action`, to name it.
+    sends: BTreeMap<u32, Vec<String>>,
+    /// Entity, then action, then each sender's answer, for all but the
+    /// callers.
     may: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>>,
+    /// The callers' answers, read from the policies as the walk asks.
+    callers_may: RefCell<HashMap<(u32, String, String), May>>,
     /// The policies, to decide again a move whose answer depends on the
     /// request.
     policies: Option<SendAnalysis>,
@@ -68,11 +81,13 @@ type Question = (
 impl Senders {
     /// The senders of the moves among `entities`, with `also` (the services
     /// reactions from outside them run as), and what `policies` lets each
-    /// send.
+    /// send. The sender of each action in `sent`, as (entity, action), from
+    /// outside is the caller Cedar lets send it.
     pub(super) fn new<'a>(
         by_name: &BTreeMap<&str, &Automaton>,
         entities: impl IntoIterator<Item = &'a String> + Clone,
         also: impl IntoIterator<Item = Asker>,
+        sent: impl IntoIterator<Item = (String, String)>,
         policies: Option<&SendAnalysis>,
     ) -> Self {
         let mut askers = vec![Asker::Outside, service("wasm-runtime", BTreeMap::new())];
@@ -113,19 +128,65 @@ impl Senders {
                 })
                 .collect()
         });
+        let base = askers.len();
+        let (mut callers, mut sends) = (BTreeMap::new(), BTreeMap::<u32, Vec<String>>::new());
+        for (entity, action) in sent.into_iter().filter(|_| policies.is_some()) {
+            let caller = policies.map_or(Asker::Outside, |p| p.caller(&action, &entity));
+            let by = match askers.iter().position(|a| *a == caller) {
+                Some(at) => at as u32,
+                None => {
+                    askers.push(caller);
+                    (askers.len() - 1) as u32
+                }
+            };
+            if by != OUTSIDE {
+                sends
+                    .entry(by)
+                    .or_default()
+                    .push(format!("{entity}.{action}"));
+                callers.insert((entity, action), by);
+            }
+        }
         Self {
             askers,
+            base,
+            callers,
+            sends,
             may,
+            callers_may: RefCell::default(),
             policies: policies.cloned(),
             decided: RefCell::default(),
         }
     }
 
+    /// The sender of `action` to an `entity` record from outside.
+    pub(super) fn outside(&self, entity: &str, action: &str) -> u32 {
+        self.callers
+            .get(&(entity.to_string(), action.to_string()))
+            .copied()
+            .unwrap_or(OUTSIDE)
+    }
+
+    /// Whether sender `by` is someone outside the kernel.
+    pub(super) fn is_outside(&self, by: u32) -> bool {
+        by == OUTSIDE || by as usize >= self.base
+    }
+
     /// Whether Cedar lets sender `by` send `action` to an `entity` record.
     pub(super) fn may(&self, by: u32, entity: &str, action: &str) -> May {
-        let Some(may) = &self.may else {
+        let (Some(may), Some(policies)) = (&self.may, &self.policies) else {
             return May::Yes;
         };
+        if by as usize >= self.base {
+            let question = (by, entity.to_string(), action.to_string());
+            if let Some(may) = self.callers_may.borrow().get(&question) {
+                return *may;
+            }
+            let asker = &self.askers[by as usize];
+            let may = policies.may(asker, action, entity, &BTreeMap::new());
+            self.callers_may.borrow_mut().insert(question, may);
+            return may;
+        }
         may.get(entity)
             .and_then(|actions| actions.get(action))
             .and_then(|answers| answers.get(by as usize))
@@ -157,7 +218,7 @@ impl Senders {
                     .and_then(|record| record.strings.get(ID)),
                 _ => None,
             },
-            Asker::Outside => None,
+            Asker::Outside | Asker::Caller(_) => None,
         };
         let question = (
             by,
@@ -199,15 +260,22 @@ impl Senders {
             .map_or(invoker, |at| at as u32)
     }
 
-    /// Every sender's number.
+    /// Every sender's number but the callers of a certain action: someone
+    /// outside covers them.
     pub(super) fn all(&self) -> impl Iterator<Item = u32> {
-        0..self.askers.len() as u32
+        0..self.base as u32
     }
 
     /// Who sender `by` is, in words.
     pub(super) fn name(&self, by: u32) -> String {
         match self.askers.get(by as usize) {
             Some(Asker::Outside) => "an outside caller".to_string(),
+            Some(Asker::Caller(_)) => format!(
+                "an outside caller who may send {}",
+                self.sends
+                    .get(&by)
+                    .map_or(String::new(), |sent| sent.join(" or "))
+            ),
             Some(Asker::Service { name, .. }) => format!("service:{name}"),
             None => format!("sender {by}"),
         }

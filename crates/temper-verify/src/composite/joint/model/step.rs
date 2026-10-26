@@ -201,8 +201,8 @@ impl JointModel {
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
                 let text = format!("{entity}.{action}");
-                for (outcome, then) in self.commit(state.clone(), entity, action, 0, OUTSIDE, true)
-                {
+                let by = self.senders.outside(entity, &action.name);
+                for (outcome, then) in self.commit(state.clone(), entity, action, 0, by, true) {
                     let certainty = Certainty::unless(known, Unsure).then(then);
                     outcomes.push((outcome, text.clone(), certainty));
                 }
@@ -212,7 +212,8 @@ impl JointModel {
                 // actor, which decide it later.
                 let known = self.outside_may(entity, &action.name) == May::Yes;
                 let mut next = state.clone();
-                add(&mut next, sent(entity, action, OUTSIDE, true));
+                let by = self.senders.outside(entity, &action.name);
+                add(&mut next, sent(entity, action, by, true));
                 let text = format!("{entity}.{action} sent");
                 outcomes.push((next, text, Certainty::unless(known, Unsure)));
             }
@@ -270,7 +271,7 @@ impl JointModel {
                     call.module,
                     self.senders.name(call.by)
                 );
-                let inline = call.by == OUTSIDE;
+                let inline = self.senders.is_outside(call.by);
                 if self.action_reads_related(&call.to, &action.name) {
                     add(&mut next, sent(&call.to, action, call.by, inline));
                     outcomes.push((next, format!("{text} sent"), Sure));

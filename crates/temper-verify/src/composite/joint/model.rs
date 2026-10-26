@@ -213,19 +213,47 @@ impl JointModel {
         } else {
             Vec::new()
         };
+        let sender_matters: BTreeSet<String> = reactions
+            .iter()
+            .filter(|r| r.principal.is_none())
+            .map(|r| r.from.clone())
+            .collect();
+        // Where a reaction runs as whoever sent its source's action, Cedar
+        // decides it for the one who sent that action from outside.
+        let actions_of = |entity: &String| {
+            by_name[entity.as_str()]
+                .actions
+                .iter()
+                .map(|action| (entity.clone(), action.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        let sent = sender_matters.iter().flat_map(actions_of).chain(
+            outer_reactions
+                .iter()
+                .filter(|r| r.principal.is_none())
+                .map(|r| (r.from.clone(), r.source_action.clone())),
+        );
         let senders = Senders::new(
             by_name,
             &scope,
             outer_reactions.iter().filter_map(|r| r.principal.clone()),
+            sent,
             sending.policies,
         );
         let mut outer = OuterSends::new();
         for reaction in &outer_reactions {
             // Without a principal it runs as whoever sent its source's
-            // action, and the model does not hold its source.
+            // action, and the model does not hold its source: someone
+            // outside Cedar lets send it, or any of the kernel's senders.
             let by: Vec<u32> = match &reaction.principal {
                 Some(asker) => vec![senders.reaction(Some(asker), OUTSIDE)],
-                None => senders.all().collect(),
+                None => senders
+                    .all()
+                    .map(|by| match by {
+                        OUTSIDE => senders.outside(&reaction.from, &reaction.source_action),
+                        by => by,
+                    })
+                    .collect(),
             };
             let senders = outer
                 .entry(reaction.to.clone())
@@ -261,11 +289,6 @@ impl JointModel {
             })
             .collect();
         let unchecked = unchecked_constraints(by_name, &models, &order);
-        let sender_matters = reactions
-            .iter()
-            .filter(|r| r.principal.is_none())
-            .map(|r| r.from.clone())
-            .collect();
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()

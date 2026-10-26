@@ -14,7 +14,15 @@
 //! unknowns are and no forbid can, [`May::No`] when no permit can apply or a
 //! forbid always does, and [`May::Maybe`] otherwise. A caller that knows some
 //! of the record's attributes passes them, and those are unknown no longer.
+//!
+//! A reaction with no declared principal runs as whoever sent its source's
+//! action, so a model asks too what such a sender may send when it is
+//! someone outside: [`SendAnalysis::caller`] makes that sender, as the
+//! classes of outside principals the policies may let send the source's
+//! action (`class.rs`).
 
+mod class;
+mod json;
 mod request;
 
 use std::collections::BTreeMap;
@@ -24,7 +32,8 @@ use serde_json::Value as Json;
 
 use super::platform_policy::merge_system_platform_policy;
 use crate::error::AuthzError;
-use request::{Request, TRUE};
+use class::Class;
+use request::{Request, TRUE, may_act};
 
 /// A kind of sender.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +52,14 @@ pub enum Asker {
         /// Context attributes the kernel adds, such as a declared trigger's.
         context: BTreeMap<String, Attr>,
     },
+    /// Someone outside the kernel whom Cedar may let send a certain action,
+    /// as [`SendAnalysis::caller`] makes it.
+    Caller(Callers),
 }
+
+/// The classes of outside principals the policies may let send an action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Callers(Vec<Class>);
 
 /// A context attribute the kernel sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,9 +117,58 @@ impl SendAnalysis {
 
     /// Whether `asker` may send `action` to a record of `resource_type`, of
     /// which the caller knows the attributes in `record` (`id` its id).
+    /// For a [`Asker::Caller`], the answer for each of its classes when
+    /// they all agree, and [`May::Maybe`] when they do not.
     pub fn may(
         &self,
         asker: &Asker,
+        action: &str,
+        resource_type: &str,
+        record: &BTreeMap<String, Attr>,
+    ) -> May {
+        let Asker::Caller(Callers(classes)) = asker else {
+            return self.decide(asker, None, action, resource_type, record);
+        };
+        classes
+            .iter()
+            .map(|class| self.decide(&Asker::Outside, Some(class), action, resource_type, record))
+            .reduce(|one, other| if one == other { one } else { May::Maybe })
+            .unwrap_or(May::No)
+    }
+
+    /// Someone outside whom Cedar may let send `action` to a record of
+    /// `resource_type`: [`Asker::Outside`] when it may let anyone outside.
+    /// The classes are those of the policies that may apply to `action`, so
+    /// another action is decided for them with the attributes those policies
+    /// do not read unknown.
+    pub fn caller(&self, action: &str, resource_type: &str) -> Asker {
+        let policies = self
+            .policies
+            .iter()
+            .map(|(_, policy)| policy)
+            .filter(|policy| may_act(policy, action));
+        let every = class::classes(policies);
+        let none = BTreeMap::new();
+        let classes: Vec<Class> = every
+            .iter()
+            .filter(|class| {
+                self.decide(&Asker::Outside, Some(class), action, resource_type, &none) != May::No
+            })
+            .cloned()
+            .collect();
+        if classes.len() == every.len() {
+            Asker::Outside
+        } else {
+            Asker::Caller(Callers(classes))
+        }
+    }
+
+    /// Whether `asker`, of `class` when it is someone outside of one, may
+    /// send `action` to a record of `resource_type`.
+    fn decide(
+        &self,
+        asker: &Asker,
+        class: Option<&Class>,
         action: &str,
         resource_type: &str,
         record: &BTreeMap<String, Attr>,
@@ -113,6 +178,7 @@ impl SendAnalysis {
             action,
             resource_type,
             record,
+            class,
         };
         let (mut permit_can, mut permit_always) = (false, false);
         let (mut forbid_can, mut forbid_always) = (false, false);

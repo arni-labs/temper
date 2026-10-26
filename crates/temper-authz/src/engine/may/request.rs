@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as Json;
 
+use super::class::{Class, Held, Other};
+use super::json::{entity_parts, like, same, single};
 use super::{Asker, Attr};
 
 /// The results a condition can have, as a set: true, false, an error.
@@ -15,6 +17,7 @@ pub(super) const TRUE: Results = Results(1);
 const FALSE: Results = Results(2);
 const ERROR: Results = Results(4);
 const TRUE_OR_FALSE: Results = Results(3);
+const FALSE_OR_ERROR: Results = Results(6);
 const ANY: Results = Results(7);
 
 impl Results {
@@ -75,6 +78,9 @@ enum Val {
     ResourceId,
     /// A string known only by which others it equals ([`Attr::Same`]).
     Same(String),
+    /// A principal's attribute that is none of the values the policies
+    /// compare it with.
+    Other(Other),
     /// Any value, or an error.
     Unknown,
     /// Certainly an error.
@@ -87,6 +93,32 @@ pub(super) struct Request<'a> {
     pub(super) resource_type: &'a str,
     /// The record's attributes the caller knows.
     pub(super) record: &'a BTreeMap<String, Attr>,
+    /// The class an outside principal is of, when the question names one.
+    pub(super) class: Option<&'a Class>,
+}
+
+/// Whether a policy's action scope may hold for `action`.
+pub(super) fn may_act(policy: &Json, action: &str) -> bool {
+    action_scope(action, &policy["action"]).can(TRUE)
+}
+
+fn action_scope(action: &str, scope: &Json) -> Results {
+    match scope["op"].as_str() {
+        Some("All") => TRUE,
+        Some("==") => Results::of(is_action(action, &scope["entity"])),
+        Some("in") => match (scope.get("entities"), scope.get("entity")) {
+            (Some(Json::Array(list)), _) => {
+                Results::of(list.iter().any(|entity| is_action(action, entity)))
+            }
+            (_, Some(entity)) => Results::of(is_action(action, entity)),
+            _ => ANY,
+        },
+        _ => ANY,
+    }
+}
+
+fn is_action(action: &str, entity: &Json) -> bool {
+    entity_parts(entity).is_some_and(|(kind, id)| kind == "Action" && id == action)
 }
 
 impl Request<'_> {
@@ -97,7 +129,7 @@ impl Request<'_> {
         };
         let scope = self
             .principal_scope(&object["principal"])
-            .and_then(|| self.action_scope(&object["action"]))
+            .and_then(|| action_scope(self.action, &object["action"]))
             .and_then(|| self.resource_scope(&object["resource"]));
         let conditions = object
             .get("conditions")
@@ -125,21 +157,6 @@ impl Request<'_> {
         }
     }
 
-    fn action_scope(&self, scope: &Json) -> Results {
-        match scope["op"].as_str() {
-            Some("All") => TRUE,
-            Some("==") => Results::of(self.is_action(&scope["entity"])),
-            Some("in") => match (scope.get("entities"), scope.get("entity")) {
-                (Some(Json::Array(list)), _) => {
-                    Results::of(list.iter().any(|entity| self.is_action(entity)))
-                }
-                (_, Some(entity)) => Results::of(self.is_action(entity)),
-                _ => ANY,
-            },
-            _ => ANY,
-        }
-    }
-
     fn resource_scope(&self, scope: &Json) -> Results {
         match scope["op"].as_str() {
             Some("All") => TRUE,
@@ -155,15 +172,15 @@ impl Request<'_> {
         }
     }
 
-    fn is_action(&self, entity: &Json) -> bool {
-        entity_parts(entity).is_some_and(|(kind, id)| kind == "Action" && id == self.action)
-    }
-
     fn principal_is(&self, kind: Option<&str>) -> Results {
-        match self.asker {
-            Asker::Service { .. } => Results::of(kind == Some("Agent")),
-            Asker::Outside if kind == Some("System") => FALSE,
-            Asker::Outside => TRUE_OR_FALSE,
+        match (self.asker, kind) {
+            (Asker::Service { .. }, _) => Results::of(kind == Some("Agent")),
+            (_, Some("System")) => FALSE,
+            (_, Some(kind)) => self
+                .class
+                .and_then(|class| class.is(kind))
+                .map_or(TRUE_OR_FALSE, Results::of),
+            (_, None) => TRUE_OR_FALSE,
         }
     }
 
@@ -208,11 +225,21 @@ impl Request<'_> {
                     None => ANY,
                 },
                 Val::Known(_) | Val::Error => ERROR,
+                // A string matches the patterns its class says; any other
+                // value is an error.
+                Val::Other(other) => other
+                    .patterns
+                    .iter()
+                    .find(|(pattern, _)| *pattern == arg["pattern"])
+                    .map_or(ANY, |(_, yes)| if *yes { TRUE } else { FALSE_OR_ERROR }),
                 _ => ANY,
             },
             "contains" => match (self.value(&arg["left"]), self.value(&arg["right"])) {
                 (Val::Known(Json::Array(set)), Val::Known(item)) => {
                     Results::of(set.iter().any(|member| same(member, &item)))
+                }
+                (set @ Val::Known(Json::Array(_)), item @ Val::Other(_)) => {
+                    self.within(&item, &set)
                 }
                 (Val::Error, _) | (_, Val::Error) => ERROR,
                 _ => ANY,
@@ -243,7 +270,7 @@ impl Request<'_> {
             | Val::ResourceId
             | Val::Same(_) => ERROR,
             Val::Error => ERROR,
-            Val::Unknown => ANY,
+            Val::Other(_) | Val::Unknown => ANY,
         }
     }
 
@@ -322,6 +349,14 @@ impl Request<'_> {
     }
 
     fn attribute(&self, of: &Val, attr: &str) -> Val {
+        if let (Val::Principal, Some(class)) = (of, self.class) {
+            return match class.attribute(attr) {
+                Some(Held::Absent) => Val::Error,
+                Some(Held::Value(value)) => Val::Known(value.clone()),
+                Some(Held::Other(other)) => Val::Other(other.clone()),
+                None => Val::Unknown,
+            };
+        }
         match (of, self.asker) {
             (Val::Principal, Asker::Service { name, .. }) => {
                 Self::service_attribute(name, attr).map_or(Val::Error, Val::Known)
@@ -361,6 +396,13 @@ impl Request<'_> {
     }
 
     fn has(&self, of: &Val, attr: &str) -> Results {
+        if let (Val::Principal, Some(class)) = (of, self.class) {
+            return match class.attribute(attr) {
+                Some(Held::Absent) => FALSE,
+                Some(_) => TRUE,
+                None => TRUE_OR_FALSE,
+            };
+        }
         match (of, self.asker) {
             (Val::Principal, Asker::Service { name, .. }) => {
                 Results::of(Self::service_attribute(name, attr).is_some())
@@ -376,7 +418,7 @@ impl Request<'_> {
             (Val::Resource, _) if matches!(attr, "id" | "Id") => TRUE,
             (Val::Resource, _) if self.record.contains_key(attr) => TRUE,
             (Val::Known(_) | Val::Error | Val::ResourceId | Val::Same(_), _) => ERROR,
-            (Val::Unknown, _) => ANY,
+            (Val::Unknown | Val::Other(_), _) => ANY,
             _ => TRUE_OR_FALSE,
         }
     }
@@ -385,6 +427,13 @@ impl Request<'_> {
         match (left, right) {
             (Val::Error, _) | (_, Val::Error) => ERROR,
             (Val::Known(a), Val::Known(b)) => Results::of(same(a, b)),
+            (Val::Other(other), Val::Known(value)) | (Val::Known(value), Val::Other(other)) => {
+                if other.named.iter().any(|named| same(named, value)) {
+                    FALSE
+                } else {
+                    TRUE_OR_FALSE
+                }
+            }
             (Val::ResourceId, Val::ResourceId) => TRUE,
             (Val::ResourceId, Val::Known(Json::String(_)))
             | (Val::Known(Json::String(_)), Val::ResourceId) => TRUE_OR_FALSE,
@@ -404,17 +453,18 @@ impl Request<'_> {
                     (Asker::Service { name, .. }, Some((kind, id))) => {
                         Results::of(kind == "Agent" && id == format!("service:{name}"))
                     }
-                    (Asker::Outside, Some((kind, id)))
-                        if kind == "System" || id.starts_with("service:") =>
-                    {
+                    (_, Some((kind, id))) if kind == "System" || id.starts_with("service:") => {
                         FALSE
                     }
                     (_, None) => FALSE,
-                    (Asker::Outside, Some(_)) => TRUE_OR_FALSE,
+                    (_, Some((kind, _))) => self
+                        .class
+                        .and_then(|class| class.is(kind))
+                        .map_or(TRUE_OR_FALSE, |is| if is { TRUE_OR_FALSE } else { FALSE }),
                 }
             }
             (Val::Action, Val::Known(entity)) | (Val::Known(entity), Val::Action) => {
-                Results::of(self.is_action(entity))
+                Results::of(is_action(self.action, entity))
             }
             (Val::Resource, Val::Known(entity)) | (Val::Known(entity), Val::Resource) => {
                 match entity_parts(entity) {
@@ -436,65 +486,11 @@ impl Request<'_> {
                 .map(|member| self.equal(left, &Val::Known(member.clone())))
                 .fold(FALSE, |sofar, next| sofar.or_else(|| next)),
             Val::Known(entity) if entity_parts(entity).is_some() => match (left, self.asker) {
-                (Val::Principal, Asker::Outside) => TRUE_OR_FALSE,
+                (Val::Principal, Asker::Outside | Asker::Caller(_)) => TRUE_OR_FALSE,
                 _ => self.equal(left, right),
             },
             Val::Error => ERROR,
             _ => ANY,
         }
     }
-}
-
-/// The one key and value of a JSON expression node.
-fn single(expr: &Json) -> Option<(&str, &Json)> {
-    let object = expr.as_object()?;
-    if object.len() != 1 {
-        return None;
-    }
-    object.iter().next().map(|(k, v)| (k.as_str(), v))
-}
-
-/// An entity's type and id, from `{"__entity": {...}}` or `{"type", "id"}`.
-fn entity_parts(value: &Json) -> Option<(&str, &str)> {
-    let entity = value.get("__entity").unwrap_or(value);
-    Some((entity.get("type")?.as_str()?, entity.get("id")?.as_str()?))
-}
-
-fn same(a: &Json, b: &Json) -> bool {
-    match (entity_parts(a), entity_parts(b)) {
-        (Some(x), Some(y)) => x == y,
-        (None, None) => a == b,
-        _ => false,
-    }
-}
-
-/// Whether `text` matches a `like` pattern: literal characters, and
-/// wildcards that match any run of characters.
-fn like(text: &str, pattern: &[Json]) -> bool {
-    let text: Vec<char> = text.chars().collect();
-    // Which prefixes of `text` the pattern so far can match.
-    let mut matched = vec![false; text.len() + 1];
-    matched[0] = true;
-    for element in pattern {
-        match element.get("Literal").and_then(Json::as_str) {
-            Some(literal) => {
-                let literal: Vec<char> = literal.chars().collect();
-                let mut next = vec![false; text.len() + 1];
-                for (at, &yes) in matched.iter().enumerate() {
-                    let end = at + literal.len();
-                    if yes && end <= text.len() && text[at..end] == literal[..] {
-                        next[end] = true;
-                    }
-                }
-                matched = next;
-            }
-            None => {
-                let first = matched.iter().position(|&yes| yes);
-                matched = (0..=text.len())
-                    .map(|at| first.is_some_and(|f| at >= f))
-                    .collect();
-            }
-        }
-    }
-    matched[text.len()]
 }

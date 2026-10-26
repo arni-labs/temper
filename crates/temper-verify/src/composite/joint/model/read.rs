@@ -199,6 +199,8 @@ impl Kernel {
 #[derive(Debug, Clone)]
 pub(super) struct Outer {
     pub(super) from: String,
+    /// The action of `from` that sets it off.
+    pub(super) source_action: String,
     pub(super) to: String,
     pub(super) target_action: String,
     /// The service it runs as, when it declares one.
@@ -222,6 +224,7 @@ pub(super) fn outer_reactions(
                 {
                     outer.push(Outer {
                         from: from.to_string(),
+                        source_action: action.name.clone(),
                         to: to.clone(),
                         target_action: target_action.clone(),
                         principal: senders::declared(trigger, from, &action.name),
