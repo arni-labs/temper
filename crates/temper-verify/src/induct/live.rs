@@ -173,6 +173,18 @@ pub(super) fn obligations(
                 continue;
             }
         };
+        // A lone move whose guard reads what the proof does not hold (a
+        // list, a record found through a field) would let the solver say
+        // it can happen by choosing that value; one with a refusal beside
+        // it goes one way or the other whatever the value is.
+        let unknown = |text: &String| text.split([' ', '(', ')']).any(|t| t.starts_with("h!"));
+        if outcomes.len() == 1 && outcomes[0].guard.iter().any(unknown) {
+            errors.push(format!(
+                "region {}: whether `{}` can happen reads what the proof does not hold",
+                region.name, region.step
+            ));
+            continue;
+        }
         let decls: Vec<String> = outcomes.iter().flat_map(|m| m.decls.clone()).collect();
         let at_w = region.read_at_w("pre");
         let can: Vec<String> = outcomes

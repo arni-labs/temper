@@ -414,18 +414,23 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                     out.push(format!("(not (= {} {}))", p.term, Enc::lit("")));
                 }
                 None => {}
-                Some(field) if self.enc.v.var(entity, field).is_some() => {
-                    out.push(format!(
-                        "({rel} {} {})",
-                        p.term,
-                        Enc::var("pre", entity, field)
-                    ));
-                }
                 Some(field) => {
-                    self.limits.borrow_mut().insert(format!(
-                        "{entity}.{}: a constraint reads {field}, which the proof does not hold",
-                        action.name
-                    ));
+                    let Some(sort) = self.enc.v.var(entity, field) else {
+                        self.limits.borrow_mut().insert(format!(
+                            "{entity}.{}: a constraint reads {field}, which the proof does not hold",
+                            action.name
+                        ));
+                        continue;
+                    };
+                    // A parameter of another sort, or with no type, is
+                    // converted by the kernel: any value of the field's.
+                    let same = self.enc.v.param(action, param).map(Sort::smt) == Some(sort.smt());
+                    let term = if same {
+                        p.term.clone()
+                    } else {
+                        self.enc.fresh(&format!("p.{param}"), sort.smt())
+                    };
+                    out.push(format!("({rel} {term} {})", Enc::var("pre", entity, field)));
                 }
             }
         }
