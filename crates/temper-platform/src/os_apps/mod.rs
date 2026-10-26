@@ -1205,9 +1205,11 @@ pub(super) async fn install_os_app_with_plan(
     added.sort();
     updated.sort();
     skipped.sort();
-    if plan.specs && !(added.is_empty() && updated.is_empty()) {
-        install_checks::prove_joint_invariants(state, tenant, app_name, &bundle.specs).await?;
-    }
+    let unproved_rules = if plan.specs && !(added.is_empty() && updated.is_empty()) {
+        install_checks::prove_joint_invariants(state, tenant, app_name, &bundle.specs).await?
+    } else {
+        Vec::new()
+    };
 
     // Build the full Cedar policy text for this tenant: the live text without
     // what this app's previous install wrote, plus the bundle's policies.
@@ -1632,6 +1634,7 @@ pub(super) async fn install_os_app_with_plan(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        unproved_rules,
     })
 }
 
