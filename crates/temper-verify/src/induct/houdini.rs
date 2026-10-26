@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use super::pool::Pool;
-use super::run::{Ask, Clauses, Kept};
+use super::run::{Ask, Clauses, Goal, Kept};
 use super::{Obligation, Outcome};
 
 /// Where a proof's clauses ended.
@@ -27,9 +27,9 @@ pub(super) struct Settled {
     /// What the solvers refused.
     pub(super) errors: Vec<String>,
     /// The clauses dropped on the way, each with why.
-    pub(super) dropped: BTreeMap<String, String>,
+    pub(super) dropped: BTreeMap<usize, String>,
     /// Every clause not held at the end: dropped, or left out from the start.
-    pub(super) out: BTreeSet<String>,
+    pub(super) out: BTreeSet<usize>,
 }
 
 impl Settled {
@@ -54,8 +54,8 @@ enum Stop {
 pub(super) fn settle(
     pool: &mut Pool,
     (clauses, asks): (&Clauses, &[Ask]),
-    droppable: &BTreeSet<String>,
-    (left_out, may_end_bare): (&BTreeSet<String>, bool),
+    droppable: &BTreeSet<usize>,
+    (left_out, may_end_bare): (&BTreeSet<usize>, bool),
 ) -> std::io::Result<Option<Settled>> {
     let n = asks.len();
     // A general move's members stand in for it while a clause it broke is
@@ -65,7 +65,7 @@ pub(super) fn settle(
     for &m in asks.iter().flat_map(|a| &a.members) {
         stands[m] = false;
     }
-    let mut broke: Vec<Option<Vec<String>>> = vec![None; n];
+    let mut broke: Vec<Option<Vec<Goal>>> = vec![None; n];
     // How many drops there had been when each ask last held.
     let mut held: Vec<Option<usize>> = vec![None; n];
     let mut last: Vec<Option<Obligation>> = vec![None; n];
@@ -87,10 +87,9 @@ pub(super) fn settle(
             // undeclared.
             note(&mut errors, pool.errors.iter().cloned());
             for (&i, error) in &pool.refused {
-                let name = &clauses.named[i].0;
-                if droppable.contains(name) {
+                if droppable.contains(&i) {
                     let why = || format!("the solver refuses: {error}");
-                    dropped.entry(name.clone()).or_insert_with(why);
+                    dropped.entry(i).or_insert_with(why);
                 } else {
                     note(&mut errors, [error.clone()]);
                 }
@@ -98,7 +97,7 @@ pub(super) fn settle(
             let mut broken = BTreeMap::new();
             let mut instead = Vec::new();
             for (&i, checked) in batch.iter().zip(checked) {
-                let Some((obligation, refused)) = checked else {
+                let Some((obligation, failed, refused)) = checked else {
                     break 'proof Some(Stop::Late);
                 };
                 note(&mut errors, refused);
@@ -107,9 +106,7 @@ pub(super) fn settle(
                     outcome if !asks[i].members.is_empty() => {
                         stands[i] = false;
                         broke[i] = match outcome {
-                            Outcome::Fails { clauses, .. } if !clauses.is_empty() => {
-                                Some(clauses.clone())
-                            }
+                            Outcome::Fails { .. } if !failed.is_empty() => Some(failed.clone()),
                             _ => None,
                         };
                         for &m in &asks[i].members {
@@ -117,13 +114,18 @@ pub(super) fn settle(
                             instead.push(m);
                         }
                     }
-                    Outcome::Fails { clauses, .. }
-                        if !clauses.is_empty() && clauses.iter().all(|c| droppable.contains(c)) =>
+                    Outcome::Fails { .. }
+                        if !failed.is_empty()
+                            && failed
+                                .iter()
+                                .all(|g| matches!(g, Goal::Clause(i) if droppable.contains(i))) =>
                     {
                         held[i] = None;
-                        for c in clauses {
-                            let why = || format!("fails after {}", obligation.name);
-                            broken.entry(c.clone()).or_insert_with(why);
+                        for goal in failed {
+                            if let Goal::Clause(c) = goal {
+                                let why = || format!("fails after {}", obligation.name);
+                                broken.entry(c).or_insert_with(why);
+                            }
                         }
                     }
                     _ => {
@@ -144,7 +146,11 @@ pub(super) fn settle(
                 dropped.extend(broken);
                 drops += 1;
                 for i in 0..n {
-                    let gone = |c: &Vec<String>| c.iter().all(|c| dropped.contains_key(c));
+                    let gone = |goals: &Vec<Goal>| {
+                        goals
+                            .iter()
+                            .all(|g| matches!(g, Goal::Clause(i) if dropped.contains_key(i)))
+                    };
                     if broke[i].as_ref().is_some_and(gone) {
                         broke[i] = None;
                         stands[i] = true;

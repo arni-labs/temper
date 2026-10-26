@@ -10,7 +10,7 @@ use std::time::Instant;
 use super::Obligation;
 use super::Shared;
 use super::encode::{Enc, prelude};
-use super::run::{Ask, Clauses, Kept, check, few_in_flight, plain, quoted_literals};
+use super::run::{Ask, Clauses, Goal, Kept, check, few_in_flight, plain, quoted_literals};
 use super::solver::Z3;
 use super::vocab::Vocab;
 
@@ -39,14 +39,14 @@ enum Said {
     /// It started: the clauses it refused, and what else it refused.
     Ready(Vec<(usize, String)>, Vec<String>),
     /// The ask at that place in the batch, and what the solver refused.
-    Checked(usize, Obligation, Vec<String>),
+    Checked(usize, Obligation, Vec<Goal>, Vec<String>),
     /// No solver checked the ask at that place by the deadline.
     Late,
     Failed(std::io::Error),
 }
 
-/// An ask checked: its obligation, and what the solver refused there.
-pub(super) type Checked = (Obligation, Vec<String>);
+/// An ask checked: its obligation, failed goal identities, and solver errors.
+pub(super) type Checked = (Obligation, Vec<Goal>, Vec<String>);
 
 /// The solvers of one rule, which check its asks a batch at a time.
 pub(super) struct Pool {
@@ -85,8 +85,9 @@ impl Pool {
                     }
                     self.errors.extend(errors.into_iter().map(plain));
                 }
-                Said::Checked(place, obligation, errors) => {
-                    out[place] = Some((obligation, errors.into_iter().map(plain).collect()));
+                Said::Checked(place, obligation, failed, errors) => {
+                    out[place] =
+                        Some((obligation, failed, errors.into_iter().map(plain).collect()));
                     left -= 1;
                 }
                 Said::Late => left -= 1,
@@ -189,8 +190,11 @@ fn serve(
             break;
         }
         let ask = &asks[at];
-        let goal: Vec<(String, String)> = (ask.goal.iter())
-            .filter(|(name, _)| !kept.out.contains(name))
+        let goal: Vec<(Goal, String)> = (ask.goal.iter())
+            .filter(|(goal, _)| match goal {
+                Goal::Clause(i) => !kept.out.contains(i),
+                Goal::Required(_) => true,
+            })
             .cloned()
             .collect();
         let assume = if ask.assumes {
@@ -198,9 +202,15 @@ fn serve(
         } else {
             ""
         };
-        let obligation = check(&mut z3, session.literals, ask, (assume, &goal))?;
+        let (obligation, failed) = check(
+            &mut z3,
+            session.literals,
+            ask,
+            (assume, &goal),
+            session.clauses,
+        )?;
         let errors = std::mem::take(&mut z3.errors);
-        let _ = says.send(Said::Checked(place, obligation, errors));
+        let _ = says.send(Said::Checked(place, obligation, failed, errors));
     }
     if let (Ok(path), Some(script)) = (std::env::var("INDUCT_SCRIPT"), &z3.script) {
         std::fs::write(format!("{path}.{name}.smt2"), script)?;

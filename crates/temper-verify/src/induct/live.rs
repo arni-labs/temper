@@ -26,7 +26,7 @@ use temper_spec::predicate::Expr;
 
 use super::encode::{Enc, counted};
 use super::moves::{Move, Moves, Step};
-use super::run::{Ask, Reads};
+use super::run::{Ask, Goal, Reads};
 use super::vocab::Vocab;
 
 /// The measure of an `eventually` rule: terms over `$`-framed names,
@@ -135,7 +135,14 @@ pub(super) fn asks(
         let reads = Reads::new(v, before, &goal);
         Ask {
             assumes: true,
-            ..Ask::new(name, text, goal.into(), &reads)
+            ..Ask::new(
+                name,
+                text,
+                goal.into_iter()
+                    .map(|(name, text)| (Goal::Required(name), text))
+                    .collect(),
+                &reads,
+            )
         }
     };
     let any: Vec<String> = live.regions.iter().map(|r| r.read("pre")).collect();

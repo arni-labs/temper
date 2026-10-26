@@ -10,6 +10,23 @@ use super::solver::{Answer, Z3};
 use super::vocab::Vocab;
 use super::{Obligation, Outcome};
 
+/// The identity of a proof goal. Only a clause in the rule's clause list
+/// can be dropped; a required goal's name is only for the verdict.
+#[derive(Clone)]
+pub(super) enum Goal {
+    Clause(usize),
+    Required(String),
+}
+
+impl Goal {
+    fn name<'a>(&'a self, clauses: &'a Clauses) -> &'a str {
+        match self {
+            Self::Clause(i) => &clauses.named[*i].0,
+            Self::Required(name) => name,
+        }
+    }
+}
+
 /// One obligation written out: what it assumes, what must follow, and what
 /// a counterexample shows.
 pub(super) struct Ask {
@@ -17,7 +34,7 @@ pub(super) struct Ask {
     /// Starts with `(push 1)`: its declarations and what it assumes.
     pub(super) text: String,
     /// Shared by the asks that check the same clauses.
-    pub(super) goal: Arc<[(String, String)]>,
+    pub(super) goal: Arc<[(Goal, String)]>,
     pub(super) show: Arc<[String]>,
     /// Whether it assumes the clauses the proof holds before the move.
     pub(super) assumes: bool,
@@ -32,7 +49,7 @@ impl Ask {
     pub(super) fn new(
         name: &str,
         text: String,
-        goal: Arc<[(String, String)]>,
+        goal: Arc<[(Goal, String)]>,
         reads: &Reads,
     ) -> Self {
         Self {
@@ -81,11 +98,9 @@ pub(super) struct Clauses {
 }
 
 impl Clauses {
-    /// Each clause by name, read as `frame!i`.
-    pub(super) fn read(&self, frame: &str) -> Vec<(String, String)> {
-        let at = |(i, (name, ..)): (usize, &(String, String, String))| {
-            (name.clone(), format!("{frame}!{i}"))
-        };
+    /// Each clause by its place, read as `frame!i`.
+    pub(super) fn read(&self, frame: &str) -> Vec<(Goal, String)> {
+        let at = |(i, _)| (Goal::Clause(i), format!("{frame}!{i}"));
         self.named.iter().enumerate().map(at).collect()
     }
 
@@ -115,13 +130,13 @@ impl Clauses {
 /// they neither assume nor must keep.
 pub(super) struct Kept {
     pub(super) assume: String,
-    pub(super) out: BTreeSet<String>,
+    pub(super) out: BTreeSet<usize>,
 }
 
 impl Kept {
-    pub(super) fn new(clauses: &Clauses, out: BTreeSet<String>) -> Arc<Self> {
+    pub(super) fn new(clauses: &Clauses, out: BTreeSet<usize>) -> Arc<Self> {
         let held: Vec<String> = (clauses.named.iter().enumerate())
-            .filter(|(_, (name, ..))| !out.contains(name))
+            .filter(|(i, _)| !out.contains(i))
             .map(|(i, _)| format!("pre!{i}"))
             .collect();
         let assume = format!("(assert (and true {}))\n", held.join(" "));
@@ -152,13 +167,15 @@ pub(super) fn quoted_literals(text: &str) -> Vec<String> {
 }
 
 /// Check that `goal` holds after `ask` given what it assumes and `assume`;
-/// on a failure, which clauses fail and the state it shows.
+/// on a failure, which goals fail by identity and the state it shows.
 pub(super) fn check(
     z3: &mut Z3,
     literals: &[String],
     ask: &Ask,
-    (assume, goal): (&str, &[(String, String)]),
-) -> std::io::Result<Obligation> {
+    (assume, goal): (&str, &[(Goal, String)]),
+    clauses: &Clauses,
+) -> std::io::Result<(Obligation, Vec<Goal>)> {
+    let names = |failed: &[Goal]| failed.iter().map(|g| g.name(clauses).to_string()).collect();
     let show = [&ask.show[..], literals].concat();
     let all: Vec<&str> = goal.iter().map(|(_, c)| c.as_str()).collect();
     let negated = format!("(assert (not (and true {})))\n", all.join(" "));
@@ -181,14 +198,20 @@ pub(super) fn check(
         if fails == Answer::Sat {
             let cti = z3.values(&show)?;
             z3.send("(pop 1)\n(push 1)\n(assert few!)\n")?;
-            let clauses = failing(z3, goal)?;
+            let failed = failing(z3, goal)?;
             z3.send("(pop 1)\n(pop 1)\n")?;
-            return Ok(Obligation {
-                name: ask.name.clone(),
-                took,
-                outcome: Outcome::Fails { clauses, cti },
-                possible: true,
-            });
+            return Ok((
+                Obligation {
+                    name: ask.name.clone(),
+                    took,
+                    outcome: Outcome::Fails {
+                        clauses: names(&failed),
+                        cti,
+                    },
+                    possible: true,
+                },
+                failed,
+            ));
         }
     }
     if few_first {
@@ -202,6 +225,7 @@ pub(super) fn check(
     z3.send(&negated)?;
     let (sat, also) = z3.check()?;
     took += also;
+    let mut failed = Vec::new();
     let outcome = match sat {
         Answer::Unsat => Outcome::Holds,
         Answer::Unknown => Outcome::Unknown,
@@ -209,24 +233,30 @@ pub(super) fn check(
             let cti = z3.values(&show)?;
             z3.send("(pop 1)\n")?;
             z3.send(&text)?;
-            let clauses = failing(z3, goal)?;
-            Outcome::Fails { clauses, cti }
+            failed = failing(z3, goal)?;
+            Outcome::Fails {
+                clauses: names(&failed),
+                cti,
+            }
         }
     };
     z3.send("(pop 1)\n")?;
-    Ok(Obligation {
-        name: ask.name.clone(),
-        took,
-        outcome,
-        possible,
-    })
+    Ok((
+        Obligation {
+            name: ask.name.clone(),
+            took,
+            outcome,
+            possible,
+        },
+        failed,
+    ))
 }
 
 /// The clauses of `goal` that fail on their own, given what is asserted.
 /// Each model that breaks one of those left shows every clause it breaks,
 /// so a few checks find them all; a clause the models leave undecided is
 /// checked on its own.
-fn failing(z3: &mut Z3, goal: &[(String, String)]) -> std::io::Result<Vec<String>> {
+fn failing(z3: &mut Z3, goal: &[(Goal, String)]) -> std::io::Result<Vec<Goal>> {
     let named = |i: usize| format!("goal!{i}");
     let mut text = String::from("(push 1)\n");
     for (i, (_, c)) in goal.iter().enumerate() {

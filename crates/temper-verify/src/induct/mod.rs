@@ -48,7 +48,7 @@ pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};
 use moves::Moves;
 pub use proof::{Obligation, Outcome, RuleProof};
-use run::{Ask, Clauses, Kept, Reads};
+use run::{Ask, Clauses, Goal, Kept, Reads};
 use vocab::Vocab;
 
 /// Prove each invariant and `eventually` rule of `automatons` with the hints
@@ -291,7 +291,7 @@ fn prove_one(
         asks.push(Ask::new("start", text, clauses.read("pre").into(), &reads));
     }
     let moved = Reads::new(&v, &before, &after);
-    let post: Arc<[(String, String)]> = clauses.read("post").into();
+    let post: Arc<[(Goal, String)]> = clauses.read("post").into();
     let ask = |mv: &moves::Move| {
         let mut text = String::from("(push 1)\n");
         mv.decls
@@ -334,7 +334,14 @@ fn prove_one(
         let reads = Reads::new(&v, &before, &goal);
         asks.push(Ask {
             assumes: true,
-            ..Ask::new("premise", text, goal.into(), &reads)
+            ..Ask::new(
+                "premise",
+                text,
+                goal.into_iter()
+                    .map(|(name, text)| (Goal::Required(name), text))
+                    .collect(),
+                &reads,
+            )
         });
     }
     // Every try holds the agent's lemmas, and drops each a move breaks. An
@@ -342,14 +349,24 @@ fn prove_one(
     // with the rule at every state, then with every guess of the prover's.
     // A failure with more clauses held replaces the one before.
     let guessed: BTreeSet<String> = guesses.iter().map(|g| g.name(rule)).collect();
-    let droppable: BTreeSet<String> = (guessed.iter().cloned())
-        .chain(lemmas.iter().map(|l| l.name.clone()))
-        .filter(|name| name != rule)
+    let droppable: BTreeSet<usize> = clauses
+        .named
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, ..))| {
+            name != rule && (guessed.contains(name) || lemmas.iter().any(|l| l.name == *name))
+        })
+        .map(|(i, _)| i)
         .collect();
     let everywhere = Guess::Everywhere.name(rule);
-    let first: BTreeSet<String> = (guessed.iter())
-        .filter(|g| !lemmas.is_empty() || **g != everywhere)
-        .cloned()
+    let first: BTreeSet<usize> = clauses
+        .named
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, ..))| {
+            guessed.contains(name) && (!lemmas.is_empty() || *name != everywhere)
+        })
+        .map(|(i, _)| i)
         .collect();
     let mut tries = Vec::new();
     if !first.is_empty() {
@@ -376,7 +393,8 @@ fn prove_one(
                 Some(_) if last.proved() => {
                     let kept = Kept::new(&clauses, last.out.clone());
                     let checked = pool.check(&[proof], &kept)?;
-                    let holds = |(o, _): &(Obligation, _)| matches!(o.outcome, Outcome::Holds);
+                    let holds =
+                        |(o, _, _): &(Obligation, _, _)| matches!(o.outcome, Outcome::Holds);
                     checked.first().and_then(Option::as_ref).is_some_and(holds)
                 }
                 _ => false,
@@ -384,14 +402,20 @@ fn prove_one(
             Ok((last, excluded))
         })?;
     let proved = settled.proved();
+    let out: BTreeSet<&str> = settled
+        .out
+        .iter()
+        .map(|&i| clauses.named[i].0.as_str())
+        .collect();
     let found = match proved {
         true => (guesses.iter())
-            .filter(|g| !settled.out.contains(&g.name(rule)))
+            .filter(|g| !out.contains(g.name(rule).as_str()))
             .map(pinned)
             .collect(),
         false => Vec::new(),
     };
     let dropped = (settled.dropped.into_iter())
+        .map(|(i, why)| (clauses.named[i].0.clone(), why))
         .filter(|(name, _)| lemmas.iter().any(|l| &l.name == name))
         .collect();
     let mut limits: Vec<String> = builder.limits.into_inner().into_iter().collect();

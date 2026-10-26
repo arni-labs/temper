@@ -504,6 +504,51 @@ fn an_eventually_rule_with_its_measure_is_proved() {
     );
 }
 
+#[test]
+fn a_lemma_named_like_a_liveness_goal_cannot_drop_the_goal() {
+    let spec = r#"
+[automaton]
+name = "Job"
+states = ["Idle", "Done"]
+initial = "Idle"
+
+[[liveness]]
+name = "finishes"
+eventually = "status == 'Done'"
+measure = ["0"]
+
+[[liveness.lemma]]
+name = "some region"
+assert = "true"
+"#;
+    for assertion in ["true", "false"] {
+        // A true lemma must not be confused with the failing goal. A false
+        // lemma really is dropped, but must not take that goal with it.
+        let spec = spec.replace("assert = \"true\"", &format!("assert = {assertion:?}"));
+        let verdict = check(&[&spec], TIME).liveness.remove(0);
+        let JointVerdict::Liveness(walked, Some(proof)) = &verdict else {
+            panic!("an unreachable target must remain unproved and be walked: {verdict}");
+        };
+        assert!(!walked.holds(), "{verdict}");
+        assert!(!proof.proved(), "{verdict}");
+        assert_eq!(
+            proof.shortfall().as_deref(),
+            Some("some region fails after covers")
+        );
+        if assertion == "true" {
+            assert!(
+                proof.dropped.is_empty(),
+                "a true lemma still holds: {verdict}"
+            );
+        } else {
+            assert_eq!(
+                proof.dropped.get("some region").map(String::as_str),
+                Some("fails after start")
+            );
+        }
+    }
+}
+
 /// A counter whose rule reads only its own count, which goes up by one from
 /// zero.
 fn counter(rule: &str) -> String {
