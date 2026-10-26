@@ -171,9 +171,12 @@ pub const BIG_LOG: i64 = 300_000;
 /// the size of the Factory's catalog images, which spill onto overflow
 /// pages. The images are zeros: turso stores them uncompressed, so they
 /// take the same pages as real ones, and `randomblob` made building the
-/// log several times slower on a CI runner. CI's disk is warm: the cold
-/// rate of 34.2 s per 10,000 rows is roll3's production measurement on a
-/// Tensorlake drive, not this test's.
+/// log several times slower on a CI runner. The pinned release `tursodb`
+/// builds the fixture with the same engine and SQL, avoiding minutes of
+/// debug-build inserts before the behavior under test starts. The store
+/// is closed first: the CLI must be the only writer of this database.
+/// CI's disk is warm: the cold rate of 34.2 s per 10,000 rows is roll3's
+/// production measurement on a Tensorlake drive, not this test's.
 pub async fn confirmed_log(
     server: &SyncServer,
     path: &Path,
@@ -184,19 +187,38 @@ pub async fn confirmed_log(
     write(&store, "pushed", 0).await;
     push(&store).await;
     let before = copy.change_log_rows().await.expect("rows");
-    let added = copy
-        .execute_local(&format!(
+    let newest = copy.last_change().await.expect("newest change");
+    drop(copy);
+    drop(store);
+    let bin = temper_test_resource::env_var("TEMPER_TEST_TURSODB")
+        .expect("the running sync server's binary");
+    let output = tokio::process::Command::new(bin)
+        .arg("--quiet")
+        .arg(path)
+        .arg(format!(
             "INSERT INTO turso_cdc \
              (change_id, change_time, change_type, table_name, id, before, after, updates) \
              SELECT value - {rows}, 0, 1, 'events', value, NULL, \
              CASE WHEN value % 100 = 0 THEN zeroblob(30000) ELSE zeroblob(1000) END, NULL \
              FROM generate_series(1, {rows})"
         ))
+        .output()
         .await
         .expect("fill the change log");
-    assert_eq!(added, rows as u64);
+    assert!(
+        output.status.success(),
+        "fill the change log: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = server.open(path).await;
+    let copy = store.sync_copy().expect("copy").clone();
     copy.checkpoint_if_wal_over(0).await.expect("checkpoint");
     assert_eq!(copy.change_log_rows().await.expect("rows"), before + rows);
+    assert!(
+        copy.last_change().await.expect("newest change") >= newest,
+        "reopening the fixture must not rewind change numbers"
+    );
     (store, copy)
 }
 

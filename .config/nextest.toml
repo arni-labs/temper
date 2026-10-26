@@ -1,7 +1,7 @@
-# The tests over a 300,000-row change log spend about 95 s building it on
-# a CI runner (one INSERT ... SELECT of 300,000 rows measured 93 s and 96 s,
-# with the other long-log test building beside it), so they get four periods
-# instead of two. Their output is kept on success too: each trim's log line
+# The tests over a 300,000-row change log keep four periods for draining it
+# with production trim code. The pinned release tursodb builds the fixture
+# so debug-build inserts do not consume that budget before trimming starts.
+# Their output is kept on success too: each trim's log line
 # shows the drain rate. This entry comes first because the first matching
 # override sets each setting.
 [[profile.default.overrides]]
