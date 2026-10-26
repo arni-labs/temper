@@ -108,7 +108,13 @@ impl JointModel {
     /// when it lands. A move from outside settles through every order its
     /// dispatches can land in before the next one.
     pub(in crate::composite::joint) fn drops(&self, states: usize) -> Drops {
-        self.expansion.reset(states, None);
+        // `states` bounds distinct settled states, not the work needed to
+        // reach them. Give the default 250,000-state walk 10M expansion
+        // steps, the install check's work cap; scale smaller requests down.
+        // Parameter products, reaction branches and settling still spend
+        // this finite allowance and exhaustion still refuses proof.
+        let work = states.saturating_mul(40).min(10_000_000);
+        self.expansion.reset(work, None);
         let mut seen: HashSet<JointState> = HashSet::new();
         let mut queue = VecDeque::new();
         for init in self.inits() {

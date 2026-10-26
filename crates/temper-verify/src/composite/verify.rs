@@ -171,7 +171,7 @@ pub fn verify_composite_with_budget(
         states_explored: found.states,
         dropped_reactions: found.drops,
         incomplete: (!found.complete)
-            .then(|| format!("the walk reached its {state_budget} joint states")),
+            .then(|| format!("the walk exhausted its settled-state or expansion-work allowance (state cap: {state_budget})")),
     })
 }
 
