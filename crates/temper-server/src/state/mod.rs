@@ -1237,6 +1237,10 @@ impl ServerState {
             // The status clock is the actor's, for its timers; a query never
             // reads it, and rows written before it was kept stay comparable.
             obj.remove("status_clock");
+            // The actor's retry dedupe set, up to a thousand keys on a busy
+            // record. The actor restores it from its snapshot and journal, never
+            // from this row, and carrying it here rewrote all of it on every move.
+            obj.remove("processed_idempotency_keys");
         }
         projected
     }
