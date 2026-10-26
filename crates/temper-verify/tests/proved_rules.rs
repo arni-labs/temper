@@ -255,3 +255,106 @@ has_actions = true
     // 'reserved' and an unmentioned tag must both remain candidates.
     assert_model_preserved(spec, "ReservedHasStatus", 3);
 }
+
+#[test]
+fn a_proof_keeps_an_unproved_assertion_with_the_same_name() {
+    for (first, second) in [
+        ("status == 'Open'", "ready == true"),
+        ("ready == true", "status == 'Open'"),
+    ] {
+        let spec = format!(
+            r#"
+[automaton]
+name = "Job"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "ready"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Wait"
+kind = "input"
+from = ["Open"]
+
+[[invariant]]
+name = "I"
+assert = "{first}"
+
+[[invariant]]
+name = "I"
+assert = "{second}"
+"#
+        );
+        assert_duplicate_name_violation_is_walked(&spec);
+    }
+}
+
+#[test]
+fn a_proof_keeps_a_same_named_assertion_that_an_action_breaks() {
+    for (first, second) in [
+        ("status == 'Open'", "ready == false"),
+        ("ready == false", "status == 'Open'"),
+    ] {
+        let spec = format!(
+            r#"
+[automaton]
+name = "Job"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "ready"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Ready"
+kind = "input"
+from = ["Open"]
+effect = ["ready = true"]
+
+[[invariant]]
+name = "I"
+assert = "{first}"
+
+[[invariant]]
+name = "I"
+assert = "{second}"
+"#
+        );
+        assert_duplicate_name_violation_is_walked(&spec);
+    }
+}
+
+fn assert_duplicate_name_violation_is_walked(spec: &str) {
+    let original = temper_verify::model::build_model_from_ioa(spec, 2).expect("fixture parses");
+    let baseline = temper_verify::checker::check_model(&original);
+    assert!(!baseline.all_properties_hold, "{baseline:?}");
+    assert!(!baseline.counterexamples.is_empty(), "{baseline:?}");
+
+    let automaton = temper_spec::automaton::parse_automaton(spec).expect("fixture parses");
+    let proofs = temper_verify::induct::prove_alone(&automaton, None);
+    assert_eq!(proofs.len(), 2);
+    assert_eq!(proofs.iter().filter(|proof| proof.proved()).count(), 1);
+
+    let result = VerificationCascade::from_ioa(spec)
+        .with_sim_seeds(1)
+        .with_prop_test_cases(10)
+        .run();
+    let l1 = model_check(&result);
+    assert!(
+        l1.summary.contains("I proved by induction"),
+        "{}",
+        l1.summary
+    );
+    assert!(!l1.passed, "{}", l1.summary);
+    let verification = l1.verification.as_ref().expect("a model check");
+    assert!(!verification.counterexamples.is_empty(), "{verification:?}");
+    assert_eq!(
+        verification.all_properties_hold,
+        baseline.all_properties_hold
+    );
+}
