@@ -59,11 +59,11 @@ fn invariant(slot: &str, table: &Table) -> Result<Invariant, AutomatonParseError
     }
     if let Some(key) = table
         .keys()
-        .find(|key| !matches!(key.as_str(), "name" | "assert"))
+        .find(|key| !matches!(key.as_str(), "name" | "assert" | "lemma"))
     {
         return Err(invalid(
             slot,
-            format!("unknown field `{key}`, expected `name` or `assert`"),
+            format!("unknown field `{key}`, expected `name`, `assert` or `lemma`"),
         ));
     }
     let name = table
@@ -90,9 +90,14 @@ fn invariant(slot: &str, table: &Table) -> Result<Invariant, AutomatonParseError
         predicate::parse(text).is_err() && legacy::invariant_to_expr(&[], text).is_ok()
     });
     let assert = expression(slot, value, legacy)?;
+    let lemma = match table.get("lemma") {
+        Some(lemmas) => typed(lemmas.clone(), &format!("{slot} lemma"))?,
+        None => Vec::new(),
+    };
     Ok(Invariant {
         name: name.to_string(),
         assert,
+        lemma,
     })
 }
 

@@ -32,8 +32,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use temper_authz::{May, SendAnalysis};
-use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Expr, Name};
+use temper_spec::automaton::{Automaton, ProofLemma, ProofRegion};
+use temper_spec::predicate::{Effect, Expr, Name};
 
 use encode::{Enc, initial, prelude};
 use guess::Guess;
@@ -52,6 +52,57 @@ pub struct Hints {
     pub measure: Vec<Measure>,
     #[serde(default)]
     pub region: Vec<Region>,
+}
+
+impl Hints {
+    /// The hints for `rule`: those written beside it, then those `extra`
+    /// gives by its name; a measure beside it replaces `extra`'s.
+    fn given(
+        extra: &Hints,
+        rule: &str,
+        lemma: &[ProofLemma],
+        measure: &[String],
+        region: &[ProofRegion],
+    ) -> Hints {
+        let lemma = lemma
+            .iter()
+            .map(|l| Lemma {
+                rule: rule.to_string(),
+                name: l.name.clone(),
+                assert: l.assert.clone(),
+            })
+            .chain(extra.lemma.iter().filter(|l| l.rule == rule).cloned())
+            .collect();
+        let measure = match measure {
+            [] => extra
+                .measure
+                .iter()
+                .filter(|m| m.rule == rule)
+                .cloned()
+                .collect(),
+            terms => vec![Measure {
+                rule: rule.to_string(),
+                terms: terms.to_vec(),
+            }],
+        };
+        let region = region
+            .iter()
+            .map(|r| Region {
+                rule: rule.to_string(),
+                name: r.name.clone(),
+                region: r.region.clone(),
+                witness: r.witness.clone(),
+                step: r.step.clone(),
+                params: r.params.clone(),
+            })
+            .chain(extra.region.iter().filter(|r| r.rule == rule).cloned())
+            .collect();
+        Hints {
+            lemma,
+            measure,
+            region,
+        }
+    }
 }
 
 /// A lemma: a clause the proof holds alongside the rule.
@@ -90,11 +141,16 @@ pub enum Outcome {
 /// A rule's proof.
 #[derive(Debug, Clone)]
 pub struct RuleProof {
+    /// The type that declares the rule.
+    pub owner: String,
     pub rule: String,
     pub scope: BTreeSet<String>,
     pub obligations: Vec<Obligation>,
-    /// What the encoding could not express.
+    /// What the encoding could not express; each only weakens the proof.
     pub limits: Vec<String>,
+    /// Effects that make moves the proof does not, such as a scheduled
+    /// action; a proof with any is not a proof.
+    pub unmodelled: Vec<String>,
     /// What the rule itself reads that the proof does not hold, each read
     /// as an unknown.
     pub unheld: BTreeSet<String>,
@@ -110,6 +166,7 @@ pub struct RuleProof {
 impl RuleProof {
     pub fn proved(&self) -> bool {
         self.errors.is_empty()
+            && self.unmodelled.is_empty()
             && self
                 .obligations
                 .iter()
@@ -136,11 +193,21 @@ impl Attempt {
 }
 
 /// Prove each invariant and `eventually` rule of `automatons` with the hints
-/// given for it.
+/// written beside it, and those `extra` gives by the rule's name.
 pub fn prove(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    hints: &Hints,
+    extra: &Hints,
+) -> std::io::Result<Vec<RuleProof>> {
+    prove_some(automatons, policies, extra, |_, _| true)
+}
+
+/// [`prove`], for the rules `wanted` picks by their type and name.
+pub fn prove_some(
+    automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
+    extra: &Hints,
+    wanted: impl Fn(&str, &str) -> bool,
 ) -> std::io::Result<Vec<RuleProof>> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
@@ -149,17 +216,26 @@ pub fn prove(
     let mut rules = Vec::new();
     for automaton in automatons {
         let owner = automaton.automaton.name.as_str();
-        for invariant in &automaton.invariants {
-            rules.push((
-                owner,
-                invariant.name.as_str(),
-                Rule::Always(&invariant.assert),
-            ));
+        for invariant in automaton
+            .invariants
+            .iter()
+            .filter(|i| wanted(owner, &i.name))
+        {
+            let given = Hints::given(extra, &invariant.name, &invariant.lemma, &[], &[]);
+            let rule = Rule::Always(&invariant.assert);
+            rules.push((owner, invariant.name.as_str(), rule, given));
         }
-        for liveness in &automaton.liveness {
+        for liveness in automaton.liveness.iter().filter(|l| wanted(owner, &l.name)) {
             if let Some(goal) = &liveness.eventually {
+                let given = Hints::given(
+                    extra,
+                    &liveness.name,
+                    &liveness.lemma,
+                    &liveness.measure,
+                    &liveness.region,
+                );
                 let rule = Rule::Eventually(goal, &liveness.relies_on);
-                rules.push((owner, liveness.name.as_str(), rule));
+                rules.push((owner, liveness.name.as_str(), rule, given));
             }
         }
     }
@@ -172,11 +248,11 @@ pub fn prove(
     std::thread::scope(|scope| {
         let proofs: Vec<_> = rules
             .iter()
-            .map(|&(owner, name, rule)| {
+            .map(|(owner, name, rule, given)| {
                 let by_name = &by_name;
                 scope.spawn(move || {
                     prove_one(
-                        by_name, owner, name, rule, hints, policies, answered, solvers,
+                        by_name, owner, name, *rule, given, policies, answered, solvers,
                     )
                 })
             })
@@ -388,11 +464,27 @@ fn prove_one(
             .into_iter()
             .map(|reason| format!("a guard, effect or reaction reads {reason}")),
     );
+    let mut unmodelled: Vec<String> = builder.unmodelled.into_inner().into_iter().collect();
+    // A record of the scope spawned from outside it is made by a move the
+    // proof does not make either.
+    for (source, automaton) in by_name.iter().filter(|(n, _)| !scope.contains(**n)) {
+        for action in &automaton.actions {
+            for effect in &action.effect {
+                if let Effect::Spawn { entity_type, .. } = effect
+                    && scope.contains(entity_type)
+                {
+                    unmodelled.push(format!("{source}.{}: effect {effect}", action.name));
+                }
+            }
+        }
+    }
     Ok(RuleProof {
+        owner: owner.to_string(),
         rule: rule.to_string(),
         scope,
         obligations,
         limits,
+        unmodelled,
         unheld,
         found,
         errors,

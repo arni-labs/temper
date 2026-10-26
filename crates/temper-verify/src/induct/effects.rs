@@ -87,8 +87,10 @@ impl Moves<'_, '_, '_> {
                             .insert(format!("{entity}.{}: list {list}", action.name));
                     }
                 }
+                // A scheduled action or a spawned record is a move the
+                // proof does not make, so it cannot stand for the walk.
                 other => {
-                    self.limits
+                    self.unmodelled
                         .borrow_mut()
                         .insert(format!("{entity}.{}: effect {other}", action.name));
                 }

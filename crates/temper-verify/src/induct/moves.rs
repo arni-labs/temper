@@ -98,6 +98,8 @@ pub(super) struct Moves<'e, 'v, 'a> {
     pub(super) enc: &'e Enc<'v, 'a>,
     /// What the encoding could not express, in words.
     pub(super) limits: RefCell<BTreeSet<String>>,
+    /// Effects of the scope's records that make moves the proof does not.
+    pub(super) unmodelled: RefCell<BTreeSet<String>>,
     /// Parameters a liveness proof chooses for a helpful move, by name, as
     /// terms over `pre` and `w`; `passed.<name>` says whether it is passed.
     pins: BTreeMap<String, String>,
@@ -112,6 +114,7 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         Self {
             enc,
             limits: RefCell::default(),
+            unmodelled: RefCell::default(),
             pins,
         }
     }
