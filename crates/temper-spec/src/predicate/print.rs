@@ -83,6 +83,7 @@ impl fmt::Display for Operand {
                 id_field,
                 field,
             } => write!(f, "{entity_type}[{id_field}].{field}"),
+            Operand::Param(name) => write!(f, "params.{name}"),
             Operand::Lit(lit) => write!(f, "{lit}"),
         }
     }
