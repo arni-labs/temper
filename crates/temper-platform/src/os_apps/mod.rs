@@ -1205,15 +1205,10 @@ pub(super) async fn install_os_app_with_plan(
     added.sort();
     updated.sort();
     skipped.sort();
-    let mut warnings = if plan.specs && !(added.is_empty() && updated.is_empty()) {
-        install_checks::prove_joint_invariants(state, tenant, app_name, &bundle.specs).await?
-    } else {
-        Vec::new()
-    };
-    warnings.extend(
+    let new_specs = plan.specs && !(added.is_empty() && updated.is_empty());
+    let mut warnings =
         install_checks::check_spec_changes(state, &tenant_id, app_name, &bundle.specs, plan.specs)
-            .await?,
-    );
+            .await?;
 
     // Build the full Cedar policy text for this tenant: the live text without
     // what this app's previous install wrote, plus the bundle's policies.
@@ -1235,6 +1230,13 @@ pub(super) async fn install_os_app_with_plan(
         tenant,
         combined_policy.as_deref(),
     )?;
+    let policies = combined_policy.as_deref();
+    warnings.extend(
+        install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies)
+            .await?
+            .into_iter()
+            .map(InstallWarning::joint_invariants),
+    );
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
