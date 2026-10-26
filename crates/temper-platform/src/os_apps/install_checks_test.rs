@@ -34,9 +34,17 @@ async fn dependency_update_rechecks_installed_rules_before_writes() {
     let updated = format!(
         "{parent}\n[[action]]\nname = 'Close'\nkind = 'input'\nfrom = ['Open']\nto = 'Closed'\n"
     );
-    let err = prove_joint_invariants(&state, "alice", "parent-app", &[("Parent".into(), updated)])
-        .await
-        .unwrap_err();
+    let err = prove(
+        &state,
+        "alice",
+        "parent-app",
+        &[("Parent".into(), updated)],
+        true,
+        // The dependency change must be reachable under the proposed Cedar.
+        Some("permit(principal, action, resource);"),
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("Child.rule BROKEN"), "{err}");
     let registry = state.registry.read().unwrap();
     let installed = registry
@@ -54,13 +62,20 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
     let c = spec("C", None);
     let state = state("alice", &[("B", &b), ("C", &c)]);
     let a = spec("A", Some("B[Id].status != 'Closed'"));
-    let unproved = prove_joint_invariants(&state, "alice", "a-app", &[("A".into(), a.clone())])
-        .await
-        .unwrap();
+    let unproved = prove(
+        &state,
+        "alice",
+        "a-app",
+        &[("A".into(), a.clone())],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(unproved.is_empty(), "{unproved:?}");
     // Bob's tenant runs no B, so A's rule cannot be proved there: the install
     // goes ahead and names the rule it could not prove.
-    let unproved = prove_joint_invariants(&state, "bob", "a-app", &[("A".into(), a)])
+    let unproved = prove(&state, "bob", "a-app", &[("A".into(), a)], true, None)
         .await
         .unwrap();
     assert_eq!(unproved.len(), 1, "{unproved:?}");
