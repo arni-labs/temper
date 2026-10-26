@@ -124,6 +124,20 @@ impl ServerState {
         runtime.spawn(async move { server.follow_spec_changes().await }); // determinism-ok: install follow-up runs in the background
     }
 
+    /// Keep recovery's saved rows and callers until the installation is ready.
+    pub(super) async fn wait_for_timer_install(&self, tenant: &TenantId) {
+        let mut wait = FOLLOW_RETRY_FIRST;
+        while self
+            .registry
+            .read()
+            .expect("registry lock poisoned")
+            .is_installing(tenant)
+        {
+            tokio::time::sleep(wait).await; // determinism-ok: install readiness retry on runtime clock
+            wait = (wait * 2).min(FOLLOW_RETRY_MAX);
+        }
+    }
+
     /// Reconcile every record of each of `types` from their recorded clocks, and
     /// return how many records of each type wait for their next action. A type
     /// whose records the store cannot list or read is tried again after a
@@ -141,6 +155,18 @@ impl ServerState {
         loop {
             let mut pending = Vec::new();
             for (tenant, entity_type) in types {
+                // Recovery supplies its own types and saved callers, rather
+                // than taking changed types from the registry. It must honor
+                // the same installation boundary before arming them.
+                if self
+                    .registry
+                    .read()
+                    .expect("registry lock poisoned")
+                    .is_installing(&tenant)
+                {
+                    pending.push((tenant, entity_type));
+                    continue;
+                }
                 if let Err(error) = self.ensure_type_indexed(&tenant, &entity_type).await {
                     tracing::warn!(tenant = %tenant, entity_type, %error,
                         retry_in_secs = wait.as_secs(),
@@ -214,6 +240,15 @@ impl ServerState {
         else {
             return TimerFollow::RetryRead;
         };
+        // An install may have started while the record read was in flight.
+        if self
+            .registry
+            .read()
+            .expect("registry lock poisoned")
+            .is_installing(tenant)
+        {
+            return TimerFollow::RetryRead;
+        }
         if current.total_event_count == 0 {
             return TimerFollow::Settled;
         }

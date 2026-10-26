@@ -74,6 +74,11 @@ impl SpecRegistry {
         ready.into_iter().collect()
     }
 
+    /// Whether a tenant is still loading an installation's policies and modules.
+    pub(crate) fn is_installing(&self, tenant: &TenantId) -> bool {
+        self.installing.contains_key(tenant)
+    }
+
     /// An installation into `tenant` starts. It registers its specs before
     /// its policies and modules, and a record whose timer a walk reconciled
     /// in between could fire before they exist, so the tenant's changed

@@ -206,6 +206,9 @@ impl ServerState {
                 }
             };
             for row in rows {
+                // Row reads may have retried across an install. Saved rows
+                // must not fire before its policies and modules are loaded.
+                self.wait_for_timer_install(tenant).await;
                 // Installs can change declarations while the row read retries.
                 // Check the current spec before dropping a durable caller.
                 let declared = {

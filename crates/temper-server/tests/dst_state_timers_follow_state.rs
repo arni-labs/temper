@@ -39,6 +39,8 @@ mod boot_logging;
 mod delete_race;
 #[path = "dst_state_timers_follow_state/embedder.rs"]
 mod embedder;
+#[path = "dst_state_timers_follow_state/install_recovery.rs"]
+mod install_recovery;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
 #[path = "dst_state_timers_follow_state/missing_row.rs"]
