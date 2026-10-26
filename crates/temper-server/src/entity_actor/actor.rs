@@ -45,6 +45,13 @@ use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
 };
 
+/// Routine walk recovery is quieter than hydration of a live actor.
+#[derive(Clone, Copy)]
+pub(super) enum ReplayLogging {
+    Actor,
+    Walk,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReplayPolicy {
     StrictSnapshot,
@@ -602,8 +609,19 @@ impl EntityActor {
         state: &mut EntityState,
         tenant: &str,
         blob_store: Option<&crate::blob_store::BlobStore>,
-        replay_policy: ReplayPolicy,
+        replay_options: (ReplayPolicy, ReplayLogging),
     ) -> Result<(), ActorError> {
+        let (replay_policy, logging) = replay_options;
+        // Keep failures visible for both callers; only successful replay
+        // diagnostics are reduced during a record walk.
+        macro_rules! replay_log {
+            ($($fields:tt)*) => {
+                match logging {
+                    ReplayLogging::Actor => tracing::info!($($fields)*),
+                    ReplayLogging::Walk => tracing::debug!($($fields)*),
+                }
+            };
+        }
         let replay_start = Instant::now(); // determinism-ok: wall-clock for production replay duration metric only
         let persistence_id = format!("{tenant}:{}:{}", state.entity_type, state.entity_id);
         let persistence_id = persistence_id.as_str();
@@ -616,7 +634,7 @@ impl EntityActor {
                     if Self::apply_snapshot_bytes(state, snapshot_seq, &snapshot_bytes) {
                         from_sequence = snapshot_seq;
                         loaded_snapshot = true;
-                        tracing::info!(
+                        replay_log!(
                             entity = %state.entity_id,
                             seq = snapshot_seq,
                             "loaded snapshot before replay"
@@ -940,7 +958,7 @@ impl EntityActor {
                             "snapshot tail exceeds bounded replay cap"
                         );
                     }
-                    tracing::info!(
+                    replay_log!(
                         entity = %state.entity_id,
                         snapshot_loaded = loaded_snapshot,
                         replayed = envelopes.len(),
@@ -954,7 +972,7 @@ impl EntityActor {
                         "state rebuilt from event journal via TransitionTable"
                     );
                 } else if loaded_snapshot {
-                    tracing::info!(
+                    replay_log!(
                         entity = %state.entity_id,
                         seq = state.sequence_nr,
                         total_events = state.total_event_count,
@@ -1008,7 +1026,33 @@ pub(crate) async fn recover_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictSnapshot,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
+    )
+    .await?;
+    Ok(state)
+}
+
+/// Replay for a record walk without emitting per-record info diagnostics.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recover_entity_state_for_walk(
+    tenant: &str,
+    entity_type: &str,
+    entity_id: &str,
+    table: &TransitionTable,
+    store: &BoxedEventStore,
+    backend: BackendLabel,
+    initial_fields: &serde_json::Value,
+    blob_store: Option<&crate::blob_store::BlobStore>,
+) -> Result<EntityState, ActorError> {
+    let mut state = EntityActor::build_initial_state(entity_type, entity_id, table, initial_fields);
+    EntityActor::replay_events(
+        table,
+        store,
+        backend,
+        &mut state,
+        tenant,
+        blob_store,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Walk),
     )
     .await?;
     Ok(state)
@@ -1039,7 +1083,7 @@ pub(crate) async fn recover_authoritative_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictFullJournal,
+        (ReplayPolicy::StrictFullJournal, ReplayLogging::Actor),
     )
     .await?;
     Ok(state)
@@ -1450,7 +1494,7 @@ impl Actor for EntityActor {
                                         state,
                                         &self.tenant,
                                         self.blob_store.as_ref(),
-                                        ReplayPolicy::StrictSnapshot,
+                                        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
                                     )
                                     .await?;
 
