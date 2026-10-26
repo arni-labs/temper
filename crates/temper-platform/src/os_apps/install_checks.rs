@@ -65,8 +65,8 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// a path of moves that breaks it, or a liveness rule with a path to a state
 /// from which no move reaches its condition. A rule it could not prove (out
 /// of budget, reading a type nobody declares, a module answer not walked, or
-/// a premise no state meets) is a warning and the install goes ahead; those rules are returned for the install's answer.
-/// It runs before the install writes or swaps anything, so a refused bundle
+/// a premise no state meets) is a warning and the install goes ahead; those
+/// rules are returned for the install's answer. It runs before the install writes or swaps anything, so a refused bundle
 /// leaves the tenant as it was and reads keep serving the old specs
 /// meanwhile, and on a blocking thread, since a large joint model takes
 /// seconds.
