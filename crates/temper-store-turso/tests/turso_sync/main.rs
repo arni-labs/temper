@@ -6,6 +6,7 @@
 //! the tests are skipped locally and fail in CI.
 
 mod answers;
+mod build_speed;
 mod change_log;
 mod projection;
 mod startup;

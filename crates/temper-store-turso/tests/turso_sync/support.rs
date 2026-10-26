@@ -197,7 +197,7 @@ pub async fn confirmed_log(
             "INSERT INTO turso_cdc \
              (change_id, change_time, change_type, table_name, id, before, after, updates) \
              SELECT value - {rows}, 0, 1, 'events', value, NULL, \
-             CASE WHEN value % 1000 = 0 THEN randomblob(30000) ELSE randomblob(100) END, NULL \
+             CASE WHEN value % 100 = 0 THEN randomblob(30000) ELSE randomblob(1000) END, NULL \
              FROM generate_series(1, {rows})"
         ))
         .await
