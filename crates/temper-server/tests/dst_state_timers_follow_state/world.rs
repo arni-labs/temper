@@ -16,7 +16,7 @@ use temper_server::storage::StateTimerStore;
 pub(crate) struct SimTimerRows {
     rows: Mutex<BTreeMap<(String, String, String), StateTimerRecord>>,
     rng: Mutex<DeterministicRng>,
-    listing_failures: Mutex<BTreeMap<String, usize>>,
+    pub(super) listing_failures: Mutex<BTreeMap<String, usize>>,
     /// A write takes fewer scheduler turns than this to land.
     round_trip_turns: usize,
 }
@@ -36,24 +36,6 @@ impl SimTimerRows {
             listing_failures: Mutex::new(BTreeMap::new()),
             round_trip_turns: turns,
         }
-    }
-
-    /// Fail the next `count` boot listings for one tenant.
-    pub(crate) fn fail_listings(&self, tenant: &str, count: usize) {
-        self.listing_failures
-            .lock()
-            .unwrap()
-            .insert(tenant.to_string(), count);
-    }
-
-    /// How many injected listing failures this tenant has yet to encounter.
-    pub(crate) fn remaining_listing_failures(&self, tenant: &str) -> usize {
-        self.listing_failures
-            .lock()
-            .unwrap()
-            .get(tenant)
-            .copied()
-            .unwrap_or(0)
     }
 
     /// The record's row now.

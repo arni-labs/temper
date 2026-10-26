@@ -5,6 +5,28 @@
 use super::*;
 use temper_authz::{PrincipalKind, SecurityContext};
 
+// These fault controls belong only to this workload; the timer-row store is
+// also compiled by the scheduled-action DST, which does not use them.
+impl SimTimerRows {
+    /// Fail the next `count` boot listings for one tenant.
+    fn fail_listings(&self, tenant: &str, count: usize) {
+        self.listing_failures
+            .lock()
+            .unwrap()
+            .insert(tenant.to_string(), count);
+    }
+
+    /// How many injected listing failures this tenant has yet to encounter.
+    fn remaining_listing_failures(&self, tenant: &str) -> usize {
+        self.listing_failures
+            .lock()
+            .unwrap()
+            .get(tenant)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 #[test]
 fn dst_boot_listing_retries_keep_saved_callers() {
     check_seeds(run_seed);
