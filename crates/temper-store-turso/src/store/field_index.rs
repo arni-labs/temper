@@ -11,7 +11,9 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
-use super::projection_rows::{ProjectionWrite, remove_projection, write_projection};
+use super::projection_rows::{
+    ProjectionWrite, remove_projection, sync_field_index, write_projection,
+};
 use super::unchanged_projections::{
     ExistingProjection, apply_event_counters, drop_event_counters, projection_hash,
     store_event_counters,
@@ -314,31 +316,22 @@ impl TursoEventStore {
                 .map_err(storage_error)?;
         }
 
+        // An entity that may have rows rewrites only the ones that changed; a
+        // known-new entity has none, so its rows go in one insert below.
+        let (new_indexes, existing_indexes): (Vec<_>, Vec<_>) = changed_indexes
+            .into_iter()
+            .partition(|(_, _, _, _, known_new)| *known_new);
+        for (entity_type, entity_id, status, indexed_fields, _) in &existing_indexes {
+            sync_field_index(
+                &tx,
+                [tenant, entity_type.as_str(), entity_id.as_str()],
+                status,
+                indexed_fields,
+            )
+            .await?;
+        }
+        let changed_indexes = new_indexes;
         if !changed_indexes.is_empty() {
-            let delete_targets = changed_indexes
-                .iter()
-                .filter(|(_, _, _, _, known_new)| !known_new)
-                .collect::<Vec<_>>();
-            if !delete_targets.is_empty() {
-                let mut delete_sql =
-                    String::from("DELETE FROM entity_field_index WHERE tenant = ? AND (");
-                let mut delete_values = Vec::with_capacity(1 + delete_targets.len() * 2);
-                delete_values.push(Value::from(tenant.to_string()));
-                for (index, (entity_type, entity_id, _, _, _)) in delete_targets.iter().enumerate()
-                {
-                    if index > 0 {
-                        delete_sql.push_str(" OR ");
-                    }
-                    delete_sql.push_str("(entity_type = ? AND entity_id = ?)");
-                    delete_values.push(Value::from(entity_type.clone()));
-                    delete_values.push(Value::from(entity_id.clone()));
-                }
-                delete_sql.push(')');
-                tx.execute(&delete_sql, params_from_iter(delete_values))
-                    .await
-                    .map_err(storage_error)?;
-            }
-
             let indexed_field_count = changed_indexes
                 .iter()
                 .map(|(_, _, _, fields, _)| fields.len())
