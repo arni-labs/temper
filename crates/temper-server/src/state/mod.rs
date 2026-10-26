@@ -530,8 +530,12 @@ pub struct ServerState {
     /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
+    /// Shared pacing for timers recovered at boot or rehydration.
+    pub(crate) state_timer_boot_gate: Arc<tokio::sync::Semaphore>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
+    /// Tenants whose saved timer rows have been restored successfully.
+    pub(crate) timer_recovered_tenants: Arc<RwLock<std::collections::BTreeSet<TenantId>>>,
     /// Set once [`Self::start_runtime`] has run in this process.
     pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
     /// Eventual invariant convergence tracker.
@@ -833,7 +837,11 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            state_timer_boot_gate: Arc::new(tokio::sync::Semaphore::new(
+                dispatch::BOOT_FIRES_AT_ONCE,
+            )),
             timer_recovery_complete: Arc::default(),
+            timer_recovered_tenants: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
@@ -1113,7 +1121,11 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            state_timer_boot_gate: Arc::new(tokio::sync::Semaphore::new(
+                dispatch::BOOT_FIRES_AT_ONCE,
+            )),
             timer_recovery_complete: Arc::default(),
+            timer_recovered_tenants: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),

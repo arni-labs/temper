@@ -10,10 +10,11 @@ impl ServerState {
     /// WASM modules are loaded and its apps installed, and before requests can
     /// act on records: a timer re-armed here may fire at once.
     ///
-    /// It arms again the state timers and scheduled actions the last process
-    /// left waiting, from their rows (`rearm_state_timers`), and starts the runtime
-    /// metrics loop. Returns the background walk that makes records with a
-    /// row follow their state and counts those in a timed state with no row;
+    /// It starts recovery of the state timers and scheduled actions the last
+    /// process left waiting (`rearm_state_timers`), and the runtime metrics loop.
+    /// Returns immediately with the background recovery, including retries for
+    /// unreadable timer rows. Each tenant's records follow their state after
+    /// its saved callers have been restored, including records with no row;
     /// it ends with the counts per tenant and type, which it also logs as
     /// `state timers after boot`. A second call in the same process starts
     /// nothing and returns None: a second re-arm would arm every row again.

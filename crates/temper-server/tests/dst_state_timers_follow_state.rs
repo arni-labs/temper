@@ -39,10 +39,16 @@ mod boot_logging;
 mod delete_race;
 #[path = "dst_state_timers_follow_state/embedder.rs"]
 mod embedder;
+#[path = "dst_state_timers_follow_state/install_recovery.rs"]
+mod install_recovery;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
+#[path = "dst_state_timers_follow_state/missing_row.rs"]
+mod missing_row;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
+#[path = "dst_state_timers_follow_state/recovered_arguments.rs"]
+mod recovered_arguments;
 #[path = "dst_state_timers_follow_state/specs.rs"]
 mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
@@ -255,6 +261,22 @@ async fn status(state: &ServerState, job: &Job) -> String {
         .unwrap_or_else(|error| format!("<unreadable: {error}>"))
 }
 
+/// A read of a nonresident record now arms its missing timer on rehydration.
+async fn read_and_follow(state: &ServerState, job: &Job, run: &mut Run) {
+    let key = format!("{}:Job:{}", job.tenant, job.id);
+    let resident = state
+        .actor_registry
+        .read()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|actor| !actor.is_closed());
+    status(state, job).await;
+    if !resident {
+        run.unarmed
+            .remove(&(job.tenant.to_string(), job.id.clone()));
+    }
+}
+
 /// Passivate a random part of the records: the rest are read first, so only
 /// the untouched ones are idle long enough.
 async fn passivate_some(
@@ -265,9 +287,12 @@ async fn passivate_some(
 ) {
     advance(Duration::from_secs(301)).await;
     let mut kept = Vec::new();
-    for job in jobs.iter().filter(|job| !run.is_deleted(job)) {
+    for job in jobs {
+        if run.is_deleted(job) {
+            continue;
+        }
         if rng.chance(0.5) {
-            status(state, job).await;
+            read_and_follow(state, job, run).await;
             kept.push(job.id.clone());
         }
     }
@@ -382,7 +407,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
                     run.note(format!("poked {}/{}", job.tenant, job.id));
                 }
                 _ => {
-                    status(state, job).await;
+                    read_and_follow(state, job, &mut run).await;
                     run.note(format!("read {}/{}", job.tenant, job.id));
                 }
             }
@@ -400,10 +425,10 @@ fn run_seed(seed: u64) -> Result<(), String> {
     let second = Process::start(&world, &v2, JOB_V1, &format!("follow-{seed}-b"));
     second.runtime.block_on(async {
         let state = &second.state;
+        run.unarmed.clear();
         check_boot_counts(&second.booted, &jobs, &run)?;
         check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
-        // A read rehydrates a record: one with a row follows its state, one
-        // without stays unarmed.
+        // Rehydration keeps the timer recovered by the boot walk.
         let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
         run.note(format!(
             "rehydrated {:?}",

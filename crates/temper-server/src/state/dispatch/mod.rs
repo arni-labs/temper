@@ -24,6 +24,7 @@ pub(crate) mod state_timeouts;
 mod state_timer_follow;
 mod state_timer_reconcile;
 mod state_timer_rows;
+pub(super) use state_timer_rows::BOOT_FIRES_AT_ONCE;
 #[cfg(test)]
 #[path = "strict_support_test.rs"]
 mod strict_test_support;
