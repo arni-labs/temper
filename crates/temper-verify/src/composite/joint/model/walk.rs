@@ -47,9 +47,20 @@ pub(in crate::composite::joint) struct Explored {
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
-    /// The answers a call open in a walked state may get that the walk
-    /// never takes, as (entity, action, the record's status).
-    unwalked: BTreeSet<(String, String, String)>,
+    /// The moves the runtime could make in a walked state that the walk
+    /// never takes.
+    unwalked: BTreeSet<Unwalked>,
+}
+
+/// A move the runtime could make that the walk never takes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::composite::joint) struct Unwalked {
+    /// `Entity.Action`.
+    pub(in crate::composite::joint) action: String,
+    /// Who sends it in the runtime.
+    pub(in crate::composite::joint) sender: String,
+    /// The record's status where it could.
+    pub(in crate::composite::joint) from: String,
 }
 
 impl Explored {
@@ -81,26 +92,28 @@ impl Explored {
         steps
     }
 
-    /// The answers a module may give that the walk never took, each as
-    /// `Entity.Action (from Status, ...)`.
+    /// The moves the runtime could make that the walk never took, each as
+    /// `Entity.Action (from Status, ...), sent by who`.
     pub(in crate::composite::joint) fn unwalked(&self) -> Vec<String> {
-        let mut from: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-        for (entity, action, status) in &self.unwalked {
-            from.entry(format!("{entity}.{action}"))
+        let mut from: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+        for found in &self.unwalked {
+            from.entry((&found.action, &found.sender))
                 .or_default()
-                .push(status);
+                .push(&found.from);
         }
         from.into_iter()
-            .map(|(action, statuses)| format!("{action} (from {})", statuses.join(", ")))
+            .map(|((action, sender), statuses)| {
+                format!("{action} (from {}), sent by {sender}", statuses.join(", "))
+            })
             .collect()
     }
 }
 
-/// Why a walk that never took the answers `unwalked` proves nothing.
+/// Why a walk that never took the moves `unwalked` proves nothing.
 pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
     format!(
-        "the walk never takes {}: a module whose trigger names no on_success may answer with them, and nothing in the model sends them. Declare them internal if only the module sends them, or name the answer in the trigger's on_success",
-        unwalked.join(", ")
+        "the walk never takes {}, so it never goes where they lead. Declare an action only a module answers with as internal, or name it in its trigger's on_success; the walk does not send a reaction from a type outside the rule's scope",
+        unwalked.join("; ")
     )
 }
 

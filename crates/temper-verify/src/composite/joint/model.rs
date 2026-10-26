@@ -28,9 +28,11 @@ pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
-use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
+use read::{
+    Kernel, Reaction, Unchecked, named_literals, reactions_into, tracked, unchecked_constraints,
+};
 pub(super) use step::Move;
-pub(super) use walk::{Explored, unwalked_reason};
+pub(super) use walk::{Explored, Unwalked, unwalked_reason};
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
@@ -123,11 +125,36 @@ pub(super) struct JointModel {
     /// Elsewhere who armed a timer or answers a call changes nothing, so the
     /// model does not tell them apart.
     sender_matters: BTreeSet<String>,
-    /// For each entity with a module call whose trigger names no
-    /// `on_success`, the actions nothing in the model sends. The kernel
-    /// takes whatever action such a module's result names, and the model
-    /// answers only with internal actions, so the walk never takes these.
-    unwalked_answers: BTreeMap<String, BTreeSet<String>>,
+    /// Each entity's transitions (by index) that nothing in the model sends
+    /// and something in the runtime does, with who.
+    unsent: BTreeMap<String, Vec<(usize, Unsent)>>,
+}
+
+/// Who in the runtime sends an action nothing in the model sends.
+#[derive(Debug, Clone)]
+enum Unsent {
+    /// A module whose trigger names no `on_success`, while its call is open:
+    /// the kernel takes whatever action the module's result names, and the
+    /// model answers only with internal actions. Only for an action nothing
+    /// else sends.
+    Answer,
+    /// Reactions from these types, outside the scope.
+    Reactions(BTreeSet<String>),
+}
+
+impl Unsent {
+    fn sender(&self) -> String {
+        match self {
+            Unsent::Answer => "a module's answer (its trigger names no on_success)".to_string(),
+            Unsent::Reactions(from) => format!(
+                "a reaction from {}",
+                from.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+        }
+    }
 }
 
 impl JointModel {
@@ -227,30 +254,33 @@ impl JointModel {
             .filter(|r| r.principal.is_none())
             .map(|r| r.from.clone())
             .collect();
+        let into = reactions_into(by_name, &scope);
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()
             .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_none()))
             .map(|((entity, _), _)| entity)
             .collect();
-        let unwalked_answers = open
-            .into_iter()
-            .map(|entity| {
-                let actions: BTreeSet<String> = models[entity]
+        let unsent = models
+            .iter()
+            .filter_map(|(entity, model)| {
+                let ways: Vec<(usize, Unsent)> = model
                     .transitions
                     .iter()
-                    .map(|t| &t.name)
-                    .filter(|action| {
-                        !chosen(entity, action)
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        !chosen(entity, &t.name)
                             && !reactions
                                 .iter()
-                                .any(|r| &r.to == entity && &r.target_action == *action)
+                                .any(|r| &r.to == entity && r.target_action == t.name)
                     })
-                    .cloned()
+                    .filter_map(|(i, t)| match into.get(&(entity.clone(), t.name.clone())) {
+                        Some(from) => Some((i, Unsent::Reactions(from.clone()))),
+                        None => open.contains(entity).then_some((i, Unsent::Answer)),
+                    })
                     .collect();
-                (entity.clone(), actions)
+                (!ways.is_empty()).then(|| (entity.clone(), ways))
             })
-            .filter(|(_, actions)| !actions.is_empty())
             .collect();
         Self {
             models,
@@ -266,24 +296,28 @@ impl JointModel {
             order,
             senders,
             sender_matters,
-            unwalked_answers,
+            unsent,
         }
     }
 
-    /// Note each answer a call open in `state` may get that the walk never
-    /// takes, as (entity, action, the record's status).
-    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<(String, String, String)>) {
-        for call in state.calls.iter().filter(|call| call.on_success.is_none()) {
-            let Some(actions) = self.unwalked_answers.get(&call.to) else {
-                continue;
-            };
-            for t in &self.models[&call.to].transitions {
-                if actions.contains(&t.name) && self.enabled(&call.to, t, state, Blind::Nothing) {
-                    unwalked.insert((
-                        call.to.clone(),
-                        t.name.clone(),
-                        state.records[&call.to].status.clone(),
-                    ));
+    /// Note each move the runtime could make in `state` that the walk never
+    /// takes.
+    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<Unwalked>) {
+        for (entity, ways) in &self.unsent {
+            let open = state
+                .calls
+                .iter()
+                .any(|call| &call.to == entity && call.on_success.is_none());
+            for (index, sender) in ways {
+                let t = &self.models[entity].transitions[*index];
+                if (open || !matches!(sender, Unsent::Answer))
+                    && self.enabled(entity, t, state, Blind::Nothing)
+                {
+                    unwalked.insert(Unwalked {
+                        action: format!("{entity}.{}", t.name),
+                        sender: sender.sender(),
+                        from: state.records[entity].status.clone(),
+                    });
                 }
             }
         }
