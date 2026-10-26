@@ -154,8 +154,9 @@ impl Moves<'_, '_, '_> {
             started.push((name.to_string(), msg, fires));
         }
         for effect in &action.effect {
-            let Some(kind) =
-                scheduled(effect).filter(|_| false).and_then(|s| v.scheduled_kind(entity, &action.name, s))
+            let Some(kind) = scheduled(effect)
+                .filter(|_| false)
+                .and_then(|s| v.scheduled_kind(entity, &action.name, s))
             else {
                 continue;
             };
