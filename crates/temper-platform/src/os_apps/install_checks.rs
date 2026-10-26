@@ -118,7 +118,6 @@ pub(super) async fn prove(
     let mut held = Vec::new();
     let mut refused = Vec::new();
     let mut unproved = Vec::new();
-    let mut running = None;
     for joint_proof in joint {
         let name = joint_proof.name();
         let keys = Keys {
@@ -143,7 +142,9 @@ pub(super) async fn prove(
                 refused.extend(verdict.refused.map(|why| (name, digest, why)));
             }
             Proof::Running(wait) => {
-                running.get_or_insert(wait);
+                // Each walk uses the same host room. Wait before starting
+                // another, so this install's proofs do not crowd each other out.
+                return Ok(Proved::Waiting(wait));
             }
         }
     }
@@ -171,9 +172,6 @@ pub(super) async fn prove(
             "os-app '{app_name}' would break tenant rules over several records:\n{}",
             broken.join("\n")
         ));
-    }
-    if let Some(wait) = running {
-        return Ok(Proved::Waiting(wait));
     }
     for line in &held {
         tracing::info!(tenant, app = %app_name, "{line}");
@@ -207,7 +205,7 @@ pub(super) async fn prove_to_the_end(
             &mut attempt,
         );
         match proved.await? {
-            Proved::Waiting(wait) => wait.ended().await,
+            Proved::Waiting(wait) => wait.ended(&mut attempt).await?,
             Proved::Unproved(rules) => return Ok(rules),
         }
     }

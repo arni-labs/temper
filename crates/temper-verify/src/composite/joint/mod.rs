@@ -61,6 +61,7 @@
 
 mod check;
 mod env;
+mod lists;
 mod liveness;
 mod model;
 mod pack;
@@ -70,6 +71,7 @@ mod room;
 mod senders;
 mod slice;
 mod state;
+mod store;
 mod vacuity;
 
 pub use check::{JointCheck, JointVerdict, PROOF_TIME, check_joint};

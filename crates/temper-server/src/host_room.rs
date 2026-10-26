@@ -76,39 +76,94 @@ fn linux_free_memory(read: &impl Fn(&std::path::Path) -> Option<String>) -> Opti
     use std::path::Path;
 
     let mut free = field(&read(Path::new("/proc/meminfo"))?, "MemAvailable:")?.saturating_mul(1024);
-    let groups = read(Path::new("/proc/self/cgroup"))?;
-    // Each memory hierarchy names this process's group. Every ancestor can
-    // impose a tighter limit, shared with the other processes below it.
-    for line in groups.lines() {
+    // Both versions may mount only a subtree. Resolve the process's group
+    // through mountinfo before checking every visible ancestor's limit.
+    if let (Some(groups), Some(mounts)) = (
+        read(Path::new("/proc/self/cgroup")),
+        read(Path::new("/proc/self/mountinfo")),
+    ) {
+        free = cgroup_free(read, &groups, &mounts, free, true);
+        free = cgroup_free(read, &groups, &mounts, free, false);
+    }
+    Some(free)
+}
+
+/// Apply every visible memory limit from this process up to its mount.
+#[cfg(target_os = "linux")]
+fn cgroup_free(
+    read: &impl Fn(&std::path::Path) -> Option<String>,
+    groups: &str,
+    mounts: &str,
+    mut free: usize,
+    v2: bool,
+) -> usize {
+    use std::path::Path;
+
+    let own = groups.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
         let hierarchy = parts.next()?;
         let controllers = parts.next()?;
-        let path = parts.next()?;
-        let (root, files) = if hierarchy == "0" && controllers.is_empty() {
-            (
-                Path::new("/sys/fs/cgroup"),
-                ["memory.max", "memory.current", "inactive_file"],
-            )
-        } else if controllers.split(',').any(|c| c == "memory") {
-            (
-                Path::new("/sys/fs/cgroup/memory"),
-                [
-                    "memory.limit_in_bytes",
-                    "memory.usage_in_bytes",
-                    "total_inactive_file",
-                ],
-            )
-        } else {
+        if v2 {
+            return (hierarchy == "0" && controllers.is_empty())
+                .then(|| parts.next())
+                .flatten();
+        }
+        controllers
+            .split(',')
+            .any(|c| c == "memory")
+            .then(|| parts.next())
+            .flatten()
+    });
+    let Some(own) = own else { return free };
+    // mountinfo escapes whitespace and backslashes in paths.
+    let unescape = |path: &str| {
+        path.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    };
+    let files = if v2 {
+        ["memory.max", "memory.current", "inactive_file"]
+    } else {
+        [
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            "total_inactive_file",
+        ]
+    };
+    for line in mounts.lines() {
+        let Some((mount, kind)) = line.split_once(" - ") else {
             continue;
         };
-        let own = root.join(path.trim_start_matches('/'));
-        for dir in own.ancestors().take_while(|dir| dir.starts_with(root)) {
+        let kind: Vec<_> = kind.split_whitespace().collect();
+        let matches = if v2 {
+            kind.first() == Some(&"cgroup2")
+        } else {
+            kind.first() == Some(&"cgroup")
+                && kind
+                    .get(2)
+                    .is_some_and(|options| options.split(',').any(|c| c == "memory"))
+        };
+        if !matches {
+            continue;
+        }
+        let mount: Vec<_> = mount.split_whitespace().collect();
+        let (Some(base), Some(root)) = (mount.get(3), mount.get(4)) else {
+            continue;
+        };
+        let base = unescape(base);
+        let root = unescape(root);
+        let Ok(relative) = Path::new(own).strip_prefix(&base) else {
+            continue;
+        };
+        let own = Path::new(&root).join(relative);
+        for dir in own.ancestors().take_while(|dir| dir.starts_with(&root)) {
             if let Some(left) = group_free(read, dir, files) {
                 free = free.min(left);
             }
         }
     }
-    Some(free)
+    free
 }
 
 /// What the cgroup at `dir` leaves under its limit, from its limit, usage
@@ -134,40 +189,54 @@ fn field(text: &str, name: &str) -> Option<usize> {
         .ok()
 }
 
-/// Free and inactive pages across the host, after every process's usage.
-/// Speculative pages are already included in `free_count`; active, wired
-/// and compressed pages are not available for a walk.
+/// Pages macOS currently leaves free or purgeable without swapping.
+/// Inactive pages can still hold non-purgeable application memory, so the
+/// whole inactive list is not an allowance for a new proof.
 #[cfg(target_os = "macos")]
 fn free_memory() -> Option<usize> {
+    // libc exposes the statistics layout, but not these Mach port APIs.
     unsafe extern "C" {
+        fn mach_host_self() -> libc::mach_port_t;
+        static mach_task_self_: libc::mach_port_t;
         fn mach_port_deallocate(
             task: libc::mach_port_t,
             name: libc::mach_port_t,
         ) -> libc::kern_return_t;
+        fn host_page_size(
+            host: libc::mach_port_t,
+            size: *mut libc::vm_size_t,
+        ) -> libc::kern_return_t;
     }
-    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
-    let mut count = libc::HOST_VM_INFO64_COUNT;
-    // SAFETY: the output buffer and count match HOST_VM_INFO64. The host
-    // port returned by mach_host_self is released after the call.
-    #[allow(deprecated)] // libc's Mach API is deprecated in favor of mach2.
-    let (status, page_size) = unsafe {
-        let host = libc::mach_host_self();
+
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64_data_t>::zeroed();
+    let mut count = (size_of::<libc::vm_statistics64_data_t>() / size_of::<libc::integer_t>())
+        as libc::mach_msg_type_number_t;
+    let mut page_size: libc::vm_size_t = 0;
+    // SAFETY: both calls receive writable buffers of the sizes their APIs
+    // require. The statistics buffer is read only after a successful call.
+    let status = unsafe {
+        let host = mach_host_self();
+        if host_page_size(host, &mut page_size) != libc::KERN_SUCCESS {
+            mach_port_deallocate(mach_task_self_, host);
+            return None;
+        }
         let status = libc::host_statistics64(
             host,
             libc::HOST_VM_INFO64,
             stats.as_mut_ptr().cast(),
             &mut count,
         );
-        mach_port_deallocate(libc::mach_task_self(), host);
-        (status, libc::sysconf(libc::_SC_PAGESIZE))
+        mach_port_deallocate(mach_task_self_, host);
+        status
     };
-    if status != libc::KERN_SUCCESS || count != libc::HOST_VM_INFO64_COUNT {
+    if status != libc::KERN_SUCCESS {
         return None;
     }
-    // SAFETY: a successful host_statistics64 call initialized the buffer.
+    // SAFETY: the buffer was zeroed and host_statistics64 succeeded.
     let stats = unsafe { stats.assume_init() };
-    let pages = (stats.free_count as usize).saturating_add(stats.inactive_count as usize);
-    pages.checked_mul(usize::try_from(page_size).ok()?)
+    (stats.free_count as usize)
+        .checked_add(stats.purgeable_count as usize)?
+        .checked_mul(page_size as usize)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

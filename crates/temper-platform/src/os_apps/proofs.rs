@@ -5,8 +5,8 @@
 //! the memory this host leaves it ([`HOST_ROOM`]), not a clock. It runs as
 //! its own task, so an install whose client gives up does not stop it, and
 //! without the tenant's install lock, so the tenant's other installs go on
-//! meanwhile: the install waits for it, then starts again under the lock and
-//! finds its verdict.
+//! meanwhile: every install waiting for it receives its verdict, then
+//! starts again under the lock and checks its current inputs.
 //!
 //! A verdict is kept by two digests ([`Keys`]): of what its walk read, and of
 //! the specs and Cedar it was read from. An install that changes a spec or
@@ -112,23 +112,35 @@ pub(super) enum Proof {
 }
 
 /// A walk that is running: the install waits for it without its lock.
-pub(super) struct Wait(watch::Receiver<bool>);
+pub(super) struct Wait {
+    digest: String,
+    ended: watch::Receiver<Option<Verdict>>,
+}
 
 impl Wait {
-    /// The walk has ended and its verdict is kept or waiting to be read.
-    pub(super) async fn ended(mut self) {
-        // A sender dropped without saying so is a walk that panicked: its
-        // task put the verdict in place first all the same.
-        let _ = self.0.wait_for(|ended| *ended).await;
+    /// Wait for the walk to end, and keep its verdict in `attempt`, where
+    /// the install's next try finds it. Every install waiting on the walk
+    /// gets the verdict so, even one of a walk that did not fit, which is
+    /// kept nowhere else.
+    pub(super) async fn ended(mut self, attempt: &mut Attempt) -> Result<(), String> {
+        let verdict = self
+            .ended
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| "the proof job stopped without a verdict".to_string())?
+            .clone()
+            .expect("an ended proof has a verdict");
+        attempt.0.insert(self.digest, verdict);
+        Ok(())
     }
 }
 
-/// Verdicts this process reached, each with whether its walk fit, and walks
+/// Verdicts about specs this process reached, and walks
 /// running now, by digest.
 #[derive(Default)]
 struct Proofs {
-    reached: BTreeMap<String, (Verdict, bool)>,
-    running: BTreeMap<String, watch::Receiver<bool>>,
+    reached: BTreeMap<String, Verdict>,
+    running: BTreeMap<String, watch::Receiver<Option<Verdict>>>,
 }
 
 /// Each holder of the lock inserts or removes whole entries, so one that
@@ -186,21 +198,25 @@ pub(super) async fn proof(
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(verdict) = stored {
         attempt.0.insert(digest.clone(), verdict.clone());
-        proofs.reached.insert(digest, (verdict.clone(), true));
+        proofs.reached.insert(digest, verdict.clone());
         return Proof::Done(verdict);
     }
-    if let Some((verdict, fit)) = proofs.reached.get(&digest).cloned() {
-        attempt.0.insert(digest.clone(), verdict.clone());
-        if !fit {
-            proofs.reached.remove(&digest);
-        }
+    if let Some(verdict) = proofs.reached.get(&digest).cloned() {
+        attempt.0.insert(digest, verdict.clone());
         return Proof::Done(verdict);
     }
     if let Some(running) = proofs.running.get(&digest) {
-        return Proof::Running(Wait(running.clone()));
+        return Proof::Running(Wait {
+            digest,
+            ended: running.clone(),
+        });
     }
-    let (ended, wait) = watch::channel(false);
+    let (ended, wait) = watch::channel(None);
     proofs.running.insert(digest.clone(), wait.clone());
+    let waiting = Wait {
+        digest: digest.clone(),
+        ended: wait,
+    };
     drop(proofs);
     tracing::info!(tenant, app = %app_name, %proof, %digest, "a proof starts");
     tokio::spawn(run(
@@ -212,7 +228,7 @@ pub(super) async fn proof(
         walk,
         ended,
     ));
-    Proof::Running(Wait(wait))
+    Proof::Running(waiting)
 }
 
 /// Walk on a blocking thread, saying how far it got as it goes, then keep
@@ -225,7 +241,7 @@ async fn run(
     proof: String,
     [digest, source]: [String; 2],
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
-    ended: watch::Sender<bool>,
+    ended: watch::Sender<Option<Verdict>>,
 ) {
     let progress = Arc::new(Progress::default());
     let reports = tokio::spawn(report(
@@ -287,9 +303,11 @@ async fn run(
     .await;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     proofs.running.remove(&digest);
-    proofs.reached.insert(digest, (walked.verdict, walked.fit));
+    if walked.fit {
+        proofs.reached.insert(digest, walked.verdict.clone());
+    }
     drop(proofs);
-    let _ = ended.send(true);
+    let _ = ended.send(Some(walked.verdict));
 }
 
 /// Say every [`PROGRESS_EVERY`] how many joint states the walk has and the

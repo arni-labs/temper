@@ -1116,7 +1116,7 @@ pub(super) async fn install_os_app_with_plan(
     loop {
         match install_once(state, tenant, app_name, plan, &mut attempt).await? {
             ControlFlow::Break(result) => return Ok(result),
-            ControlFlow::Continue(proof) => proof.ended().await,
+            ControlFlow::Continue(proof) => proof.ended(&mut attempt).await?,
         }
     }
 }

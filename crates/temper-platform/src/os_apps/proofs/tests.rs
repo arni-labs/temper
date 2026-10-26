@@ -1,4 +1,5 @@
-//! Incomplete results belong to an entire install, including staggered retries.
+//! A walk's verdict reaches every install waiting on it, and stays with
+//! each through its retries; one that did not fit is walked again later.
 
 use super::*;
 use std::sync::atomic::AtomicUsize;
@@ -52,7 +53,7 @@ async fn staggered_incomplete_rules_are_retained_for_every_install_retry() {
     else {
         panic!("first rule starts")
     };
-    first.ended().await;
+    first.ended(&mut attempt).await.unwrap();
 
     let (finish_b, wait_b) = std::sync::mpsc::channel();
     let count = Arc::clone(&starts);
@@ -67,7 +68,7 @@ async fn staggered_incomplete_rules_are_retained_for_every_install_retry() {
     else {
         panic!("second rule starts")
     };
-    // First retry consumes A's shared result while B still runs.
+    // A's verdict stays with the install while B still runs.
     assert!(matches!(
         request(&state, &mut attempt, &a, |_| panic!("A restarted")).await,
         Proof::Done(_)
@@ -77,8 +78,8 @@ async fn staggered_incomplete_rules_are_retained_for_every_install_retry() {
         Proof::Running(_)
     ));
     finish_b.send(()).expect("finish B");
-    second.ended().await;
-    // Every later retry still sees A, even after the shared entry was consumed.
+    second.ended(&mut attempt).await.unwrap();
+    // Every later retry still sees both.
     for _ in 0..3 {
         for digest in [&a, &b] {
             let Proof::Done(verdict) = request(&state, &mut attempt, digest, |_| {
@@ -98,5 +99,40 @@ async fn staggered_incomplete_rules_are_retained_for_every_install_retry() {
     else {
         panic!("later install retries incomplete work")
     };
-    retried.ended().await;
+    retried.ended(&mut Attempt::default()).await.unwrap();
+}
+
+#[tokio::test]
+async fn every_install_waiting_on_a_walk_gets_its_verdict() {
+    let state = PlatformState::new(None);
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let key = format!("shared-{}", uuid::Uuid::new_v4());
+    let (mut one, mut two) = (Attempt::default(), Attempt::default());
+    let Proof::Running(first) = request(&state, &mut one, &key, move |_| {
+        blocked.recv().expect("release the walk");
+        incomplete()
+    })
+    .await
+    else {
+        panic!("the first install starts the walk")
+    };
+    let Proof::Running(second) = request(&state, &mut two, &key, |_| {
+        panic!("an install waiting on a walk must not start another")
+    })
+    .await
+    else {
+        panic!("the second install waits on the same walk")
+    };
+    release.send(()).expect("release the walk");
+    first.ended(&mut one).await.unwrap();
+    // The first install has read its verdict before the second reads its own.
+    second.ended(&mut two).await.unwrap();
+    for attempt in [&mut one, &mut two] {
+        let Proof::Done(verdict) =
+            request(&state, attempt, &key, |_| panic!("the walk ran again")).await
+        else {
+            panic!("each install keeps the verdict it waited for")
+        };
+        assert_eq!(verdict.unproved.as_deref(), Some("no room"));
+    }
 }
