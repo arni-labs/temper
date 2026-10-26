@@ -479,22 +479,6 @@ impl EventStore for TursoEventStore {
         .await
         .map_err(storage_error)?;
 
-        tx.execute(
-            "INSERT INTO snapshot_history (tenant, entity_type, entity_id, sequence_nr, snapshot)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (tenant, entity_type, entity_id, sequence_nr)
-             DO UPDATE SET snapshot = excluded.snapshot, created_at = datetime('now')",
-            params![
-                tenant,
-                entity_type,
-                entity_id,
-                sequence_nr as i64,
-                snapshot.to_vec()
-            ],
-        )
-        .await
-        .map_err(storage_error)?;
-
         let mut segment_rows = tx
             .query(
                 "SELECT COALESCE(MAX(segment_index), 0)
