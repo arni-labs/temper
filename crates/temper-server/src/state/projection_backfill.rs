@@ -166,7 +166,8 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
         // replay checkpoint, never evidence that the query projection is current.
         tokio::task::yield_now().await;
         let Some(table) = transition_table_for(state, tenant, entity_type) else {
-            tracing::debug!(
+            tracing::warn!(
+                tenant = %tenant,
                 entity_type = %entity_type,
                 entity_id = %entity_id,
                 "field index backfill: no transition table available for replay"
@@ -197,7 +198,8 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
         let replayed = match replayed {
             Ok(state) => state,
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
+                    tenant = %tenant,
                     error = %e,
                     entity_type = %entity_type,
                     entity_id = %entity_id,
@@ -229,7 +231,8 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
                 "empty",
                 1,
             );
-            tracing::debug!(
+            tracing::warn!(
+                tenant = %tenant,
                 entity_type = %entity_type,
                 entity_id = %entity_id,
                 "field index backfill: persistence replay produced no state"
@@ -240,7 +243,8 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
                 .remove_projection(tenant.as_str(), entity_type, entity_id)
                 .await
             {
-                tracing::debug!(
+                tracing::warn!(
+                    tenant = %tenant,
                     error = %e,
                     entity_type = %entity_type,
                     entity_id = %entity_id,
@@ -319,7 +323,8 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
                     );
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
+                        tenant = %tenant,
                         error = %e,
                         entity_type = %entity_type,
                         entity_id = %entity_id,
