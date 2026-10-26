@@ -36,14 +36,15 @@ impl Vocab<'_> {
 
     /// Whether Cedar lets `entity`'s timer in `state` fire `action`. A
     /// timer fires as whoever armed it: whoever made the record in its
-    /// initial state, or sent an action that brought it into `state` or
-    /// resets the timer (the joint walk's reading).
+    /// initial state, or sent an action that brought it into `state`,
+    /// resets the timer, or leaves it there when reconciliation arms a
+    /// missing timer.
     pub(super) fn timer_may(&self, entity: &str, state: &str, action: &str) -> May {
         let Some(policies) = self.policies else {
             return May::Yes;
         };
         let mut askers = Vec::new();
-        self.armers(entity, state, &mut BTreeSet::new(), &mut askers);
+        self.armers(entity, state, true, &mut BTreeSet::new(), &mut askers);
         self.answer(policies, &askers, action, entity)
     }
 
@@ -55,7 +56,7 @@ impl Vocab<'_> {
             return May::Yes;
         };
         let mut askers = Vec::new();
-        self.senders(entity, arming, &mut BTreeSet::new(), &mut askers);
+        self.senders(entity, arming, true, &mut BTreeSet::new(), &mut askers);
         self.answer(policies, &askers, action, entity)
     }
 
@@ -73,9 +74,18 @@ impl Vocab<'_> {
         }
     }
 
-    /// The senders that may bring `entity`'s record into `state`.
-    fn armers(&self, entity: &str, state: &str, seen: &mut BTreeSet<String>, out: &mut Vec<Asker>) {
-        if self.policies.is_none() || !seen.insert(format!("in {state}")) {
+    /// The senders that may arm `entity`'s timer in `state`.
+    fn armers(
+        &self,
+        entity: &str,
+        state: &str,
+        same_id: bool,
+        seen: &mut BTreeSet<(String, String, bool)>,
+        out: &mut Vec<Asker>,
+    ) {
+        if self.policies.is_none()
+            || !seen.insert((entity.to_string(), format!("in {state}"), same_id))
+        {
             return;
         }
         let automaton = self.automaton(entity);
@@ -88,26 +98,31 @@ impl Vocab<'_> {
             .filter(|t| t.state == state)
             .flat_map(|t| t.reset_on.iter().map(String::as_str))
             .collect();
-        let enters = automaton.actions.iter().filter(|a| {
-            let from_elsewhere = a.from.is_empty() || a.from.iter().any(|f| f != state);
-            (a.to.as_deref() == Some(state) && from_elsewhere) || resets.contains(a.name.as_str())
+        let arms = automaton.actions.iter().filter(|a| {
+            // Reconciliation can arm a missing timer even without an entry
+            // or reset, including a new record's same-state initializer.
+            let stays = a.to.is_none() && (a.from.is_empty() || a.from.iter().any(|f| f == state));
+            a.to.as_deref() == Some(state) || stays || resets.contains(a.name.as_str())
         });
-        for action in enters {
-            self.senders(entity, &action.name, seen, out);
+        for action in arms {
+            self.senders(entity, &action.name, same_id, seen, out);
         }
     }
 
     /// The senders of `entity`'s `action`: someone outside, a module's
     /// answer, a reaction or a spawn, and a timer or a scheduled fire as
-    /// whoever armed it.
+    /// whoever armed it. `same_id` says the sender still acts on the id
+    /// this search started from; a spawn or a differently routed reaction
+    /// loses any context attribute's equality to that record's id.
     fn senders(
         &self,
         entity: &str,
         action: &str,
-        seen: &mut BTreeSet<String>,
+        same_id: bool,
+        seen: &mut BTreeSet<(String, String, bool)>,
         out: &mut Vec<Asker>,
     ) {
-        if !seen.insert(format!("sends {action}")) {
+        if !seen.insert((entity.to_string(), format!("sends {action}"), same_id)) {
             return;
         }
         let automaton = self.automaton(entity);
@@ -120,7 +135,7 @@ impl Vocab<'_> {
         }
         for trigger in automaton.actions.iter().flat_map(|a| &a.triggers) {
             if trigger.callee().is_some()
-                && (call_may_answer(trigger.on_success.as_deref(), action)
+                && (call_may_answer(&trigger.on_success, action)
                     || trigger.on_failure.as_deref() == Some(action))
             {
                 out.push(Asker::Service {
@@ -141,10 +156,25 @@ impl Vocab<'_> {
                     {
                         // Without a principal it runs as whoever sent
                         // its source.
-                        out.push(
-                            declared(trigger, source, &source_action.name)
-                                .unwrap_or(Asker::Outside),
-                        );
+                        match declared(trigger, source, &source_action.name) {
+                            Some(mut asker) => {
+                                if !same_id && let Asker::Service { context, .. } = &mut asker {
+                                    for attr in context.values_mut() {
+                                        if *attr == Attr::ResourceId {
+                                            *attr = Attr::Unknown;
+                                        }
+                                    }
+                                }
+                                out.push(asker);
+                            }
+                            None => self.senders(
+                                source,
+                                &source_action.name,
+                                same_id && trigger.resolve_target == Some(TargetResolver::SameId),
+                                seen,
+                                out,
+                            ),
+                        }
                     }
                 }
                 // A spawn's first action runs as whoever sent its source.
@@ -153,7 +183,7 @@ impl Vocab<'_> {
                         if entity_type == entity && initial_action == action)
                 });
                 if spawns {
-                    out.push(Asker::Outside);
+                    self.senders(source, &source_action.name, false, seen, out);
                 }
             }
         }
@@ -162,14 +192,14 @@ impl Vocab<'_> {
             .iter()
             .filter(|t| t.on_timeout == action)
         {
-            self.armers(entity, &timeout.state, seen, out);
+            self.armers(entity, &timeout.state, same_id, seen, out);
         }
         for arming in automaton
             .actions
             .iter()
             .filter(|a| a.effect.iter().any(|e| scheduled(e) == Some(action)))
         {
-            self.senders(entity, &arming.name, seen, out);
+            self.senders(entity, &arming.name, same_id, seen, out);
         }
     }
 

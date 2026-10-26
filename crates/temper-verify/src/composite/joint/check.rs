@@ -73,6 +73,22 @@ impl JointVerdict {
         }
     }
 
+    /// Whether a walk found a run that breaks the rule: a path to a state
+    /// that breaks an invariant, or to one from which an `eventually` rule's
+    /// condition is out of reach. Only such a rule refuses an install.
+    pub fn broken(&self) -> bool {
+        match self {
+            JointVerdict::Proved(..) => false,
+            JointVerdict::Invariant(walked, _) => {
+                matches!(walked.outcome, JointOutcome::Broken { .. })
+            }
+            JointVerdict::Liveness(walked, _) => {
+                matches!(walked.outcome, LivenessOutcome::Stuck { .. })
+            }
+            JointVerdict::WaitsOnCedar(open, _) => open.broken(),
+        }
+    }
+
     /// The rule, as `Type.name`.
     pub fn rule(&self) -> String {
         match self {
@@ -154,11 +170,11 @@ fn proved(
         )?,
         Premise::Excluded { premise } => write!(
             f,
-            "{rule} PROVES NOTHING: proved by induction, and the proof shows no state meets its premise `{premise}` ({scope})"
+            "{rule} CHECKS NOTHING AS WRITTEN: proved by induction, and the proof shows no state meets its premise `{premise}` ({scope})"
         )?,
         Premise::Never { premise, states } => write!(
             f,
-            "{rule} PROVES NOTHING: proved by induction, but its premise `{premise}` holds in none of the {states} joint states walked ({scope})"
+            "{rule} CHECKS NOTHING AS WRITTEN: proved by induction, but its premise `{premise}` holds in none of the {states} joint states walked ({scope})"
         )?,
         Premise::Unknown { premise, reason } => write!(
             f,

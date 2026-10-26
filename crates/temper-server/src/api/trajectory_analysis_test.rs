@@ -1711,13 +1711,13 @@ async fn a_trajectory_with_no_steps_is_not_exported_as_stepless_atif() {
     );
 }
 
-/// A denied `POST /api/authorize` pre-flight must never poison another run's
-/// conformance verdict. The probe's action, resource type, and session are all
-/// caller-chosen, so its denial row is written `spec_governed = false` and the
-/// walk skips it — otherwise any agent could flip a victim session's verdict
-/// by probing garbage actions under that session id.
+/// A denied `POST /api/authorize` pre-flight is a question and writes no
+/// trajectory row, so it cannot poison another run's conformance verdict. The
+/// probe's action, resource type, and session are all caller-chosen: if it
+/// wrote a row, any agent could add rows to a victim session by probing
+/// garbage actions under that session id.
 #[tokio::test]
-async fn a_denied_preflight_probe_cannot_poison_a_sessions_verdict() {
+async fn a_denied_preflight_probe_writes_no_row_into_a_sessions_verdict() {
     let (app, store) = policy_permitted_app().await;
 
     // A genuine governed dispatch in the victim session: verdict passes.
@@ -1734,6 +1734,13 @@ async fn a_denied_preflight_probe_cannot_poison_a_sessions_verdict() {
     // session (in production the session rides the correlation header), probing
     // an undeclared action against the victim's entity type. The engine only
     // permits read_trajectories, so Cedar denies the probe.
+    let in_session = || {
+        temper_authz::AuthenticatedRequestContext::new(
+            temper_runtime::tenant::TenantId::default(),
+            agent_context(),
+        )
+        .with_session_id(Some("session-1".to_string()))
+    };
     let mut probe = Request::post("/api/authorize")
         .header("Content-Type", "application/json")
         .body(Body::from(
@@ -1746,13 +1753,7 @@ async fn a_denied_preflight_probe_cannot_poison_a_sessions_verdict() {
             .to_string(),
         ))
         .unwrap();
-    probe.extensions_mut().insert(
-        temper_authz::AuthenticatedRequestContext::new(
-            temper_runtime::tenant::TenantId::default(),
-            agent_context(),
-        )
-        .with_session_id(Some("session-1".to_string())),
-    );
+    probe.extensions_mut().insert(in_session());
     // The oracle answers 200 with the decision; denial is in the body.
     let denied = app.clone().oneshot(probe).await.unwrap();
     assert_eq!(denied.status(), StatusCode::OK);
@@ -1763,25 +1764,45 @@ async fn a_denied_preflight_probe_cannot_poison_a_sessions_verdict() {
         "the probe must be denied: {decision}"
     );
 
-    // Wait for the denial row to drain into the store, then pin the call site:
-    // it must arrive marked ungoverned.
-    let mut denial_row = None;
+    // Rows drain in the order they were queued, so once a row recorded after
+    // the probe is stored, a row the probe queued would be stored too.
+    let mut audit = Request::post("/api/audit")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "agent_id": "agent-1",
+                "action": "AfterTheProbe",
+                "resource_type": "Order",
+                "resource_id": "order-1",
+                "success": true,
+                "session_id": "session-1",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    audit.extensions_mut().insert(in_session());
+    assert_eq!(
+        app.clone().oneshot(audit).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let mut rows = Vec::new();
     for _ in 0..200 {
-        let rows = store
+        rows = store
             .query_trajectories_by_session("session-1", Some("default"), None, 50)
             .await
             .expect("query session rows");
-        if let Some(row) = rows.iter().find(|r| r.action == "GarbageAction") {
-            denial_row = Some(row.clone());
+        if rows.iter().any(|r| r.action == "AfterTheProbe") {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    let denial_row = denial_row.expect("the denied probe's trajectory row must be persisted");
-    assert_eq!(
-        denial_row.spec_governed,
-        Some(false),
-        "a pre-flight denial row must be explicitly ungoverned"
+    assert!(
+        rows.iter().any(|r| r.action == "AfterTheProbe"),
+        "the row recorded after the probe must be stored"
+    );
+    assert!(
+        rows.iter().all(|r| r.action != "GarbageAction"),
+        "a denied pre-flight probe must write no row"
     );
 
     // And end to end: the victim session's verdict is untouched by the probe.
@@ -1805,9 +1826,4 @@ async fn a_denied_preflight_probe_cannot_poison_a_sessions_verdict() {
         "a denied pre-flight probe must not add violations: {body}"
     );
     assert_eq!(body["report"]["violations"], serde_json::json!([]));
-    assert_eq!(
-        body["report"]["stats"]["non_governed_rows_skipped"],
-        serde_json::json!(1),
-        "the probe's row must be present and skipped, not absent: {body}"
-    );
 }

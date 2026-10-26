@@ -9,8 +9,11 @@ use temper_runtime::persistence::{
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
+mod commit_outcome;
+mod commit_transport;
 mod evolution_tenant;
 mod policy_approval;
+mod projection_writes;
 mod scheduled_actions;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
@@ -429,9 +432,11 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
     assert_eq!(events[0].event_type, "OrderCreated");
 }
 
+/// Every append is a write transaction, so it waits its turn at the write
+/// gate like any writer (as the first in line: it is high priority).
 #[tokio::test]
-async fn single_event_append_bypasses_process_write_gate() {
-    let mut store = make_store("single-append-bypasses-gate").await;
+async fn single_event_append_waits_for_the_write_gate() {
+    let mut store = make_store("single-append-waits-for-gate").await;
     store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let held_gate = store
         .write_gate
@@ -440,22 +445,19 @@ async fn single_event_append_bypasses_process_write_gate() {
         .await
         .expect("hold gate");
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        store.append(
-            "tenant-a:Order:ord-bypass",
-            0,
-            &[test_envelope(
-                "OrderCreated",
-                serde_json::json!({ "id": "ord-bypass" }),
-            )],
-        ),
-    )
-    .await;
-    drop(held_gate);
+    let created = [test_envelope(
+        "OrderCreated",
+        serde_json::json!({ "id": "ord-gated" }),
+    )];
+    let append = store.append("tenant-a:Order:ord-gated", 0, &created);
+    tokio::pin!(append);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(300), append.as_mut()).await;
+    assert!(waited.is_err(), "an append went ahead of a held write gate");
 
-    let new_seq = result
-        .expect("single-event append should not wait for the process write gate")
+    drop(held_gate);
+    let new_seq = tokio::time::timeout(std::time::Duration::from_secs(5), append)
+        .await
+        .expect("the append goes once the gate frees")
         .expect("append should succeed");
     assert_eq!(new_seq, 1);
 }
@@ -1271,100 +1273,6 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
     assert!(
         canonical_matches.is_empty(),
         "filtered fields should stay out of entity_field_index"
-    );
-}
-
-#[tokio::test]
-async fn unchanged_projection_updates_catalog_without_rebuilding_field_rows() {
-    let store = make_store("query-projection-stable-hash").await;
-    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
-    let entity_type = "Order";
-    let entity_id = "ord-stable-projection";
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            7,
-        )
-        .await
-        .expect("initial projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query initial title row");
-    let initial_row = rows
-        .next()
-        .await
-        .expect("read initial title row")
-        .expect("title row should exist");
-    let initial_rowid = initial_row.get::<i64>(0).expect("initial rowid");
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            8,
-        )
-        .await
-        .expect("second projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query updated title row");
-    let updated_row = rows
-        .next()
-        .await
-        .expect("read updated title row")
-        .expect("title row should still exist");
-    let updated_rowid = updated_row.get::<i64>(0).expect("updated rowid");
-
-    let mut catalog_rows = conn
-        .query(
-            "SELECT sequence_nr FROM entity_catalog \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .expect("query catalog row");
-    let catalog_row = catalog_rows
-        .next()
-        .await
-        .expect("read catalog row")
-        .expect("catalog row should exist");
-    let sequence_nr = catalog_row.get::<i64>(0).expect("catalog sequence_nr");
-
-    assert_eq!(
-        updated_rowid, initial_rowid,
-        "unchanged projections should keep existing field index rows"
-    );
-    assert_eq!(
-        sequence_nr, 8,
-        "entity catalog should still advance to the latest sequence number"
     );
 }
 

@@ -5,8 +5,8 @@
 //! the memory this host leaves it ([`HOST_ROOM`]), not a clock. It runs as
 //! its own task, so an install whose client gives up does not stop it, and
 //! without the tenant's install lock, so the tenant's other installs go on
-//! meanwhile: the install waits for it, then starts again under the lock and
-//! finds its verdict.
+//! meanwhile: every install waiting for it receives its verdict, then
+//! starts again under the lock and checks its current inputs.
 //!
 //! A verdict is kept by two digests ([`Keys`]): of what its walk read, and of
 //! the specs and Cedar it was read from. An install that changes a spec or
@@ -19,7 +19,7 @@
 //! it: those specs already run. A refusal is kept only while this process runs,
 //! so a later checker decides it again. A walk that did not fit in its
 //! memory says nothing of the specs: the install that waited for it reads it
-//! once, and the next walks again.
+//! throughout its retries, and the next independent install walks again.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -41,12 +41,24 @@ const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 const MB: usize = 1 << 20;
 
-/// What a proof found: the results that held, in words, and why the
-/// install is refused when one did not.
+/// What a proof found, in words: the results that held, why the install is
+/// refused when the walk found the rule broken, and why the rule is not
+/// proven when the check could not decide it (a warning).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Verdict {
     pub(super) held: Vec<String>,
     pub(super) refused: Option<String>,
+    /// Kept verdicts are proven ones, written before this field, so it
+    /// reads as absent there.
+    #[serde(default)]
+    pub(super) unproved: Option<String>,
+}
+
+impl Verdict {
+    /// Whether the rule was proven: neither broken nor left undecided.
+    pub(super) fn proven(&self) -> bool {
+        self.refused.is_none() && self.unproved.is_none()
+    }
 }
 
 /// What a walk returns: its verdict, and whether the walk fit in its memory
@@ -88,6 +100,11 @@ pub(super) fn digest(
     format!("{:x}", hasher.finalize())
 }
 
+/// Results one install has read, retained across all its retries. Incomplete
+/// work may be tried again by a later independent install.
+#[derive(Default)]
+pub(super) struct Attempt(BTreeMap<String, Verdict>);
+
 /// A proof's verdict, or the walk an install must wait for.
 pub(super) enum Proof {
     Done(Verdict),
@@ -95,23 +112,35 @@ pub(super) enum Proof {
 }
 
 /// A walk that is running: the install waits for it without its lock.
-pub(super) struct Wait(watch::Receiver<bool>);
+pub(super) struct Wait {
+    digest: String,
+    ended: watch::Receiver<Option<Verdict>>,
+}
 
 impl Wait {
-    /// The walk has ended and its verdict is kept or waiting to be read.
-    pub(super) async fn ended(mut self) {
-        // A sender dropped without saying so is a walk that panicked: its
-        // task put the verdict in place first all the same.
-        let _ = self.0.wait_for(|ended| *ended).await;
+    /// Wait for the walk to end, and keep its verdict in `attempt`, where
+    /// the install's next try finds it. Every install waiting on the walk
+    /// gets the verdict so, even one of a walk that did not fit, which is
+    /// kept nowhere else.
+    pub(super) async fn ended(mut self, attempt: &mut Attempt) -> Result<(), String> {
+        let verdict = self
+            .ended
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| "the proof job stopped without a verdict".to_string())?
+            .clone()
+            .expect("an ended proof has a verdict");
+        attempt.0.insert(self.digest, verdict);
+        Ok(())
     }
 }
 
-/// Verdicts this process reached, each with whether its walk fit, and walks
+/// Verdicts about specs this process reached, and walks
 /// running now, by digest.
 #[derive(Default)]
 struct Proofs {
-    reached: BTreeMap<String, (Verdict, bool)>,
-    running: BTreeMap<String, watch::Receiver<bool>>,
+    reached: BTreeMap<String, Verdict>,
+    running: BTreeMap<String, watch::Receiver<Option<Verdict>>>,
 }
 
 /// Each holder of the lock inserts or removes whole entries, so one that
@@ -134,8 +163,12 @@ pub(super) async fn proof(
     app_name: &str,
     proof: String,
     keys: Keys,
+    attempt: &mut Attempt,
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
 ) -> Proof {
+    if let Some(verdict) = attempt.0.get(&keys.model) {
+        return Proof::Done(verdict.clone());
+    }
     let mut stored = None;
     if let Some(store) = state.server.platform_metadata_store() {
         let mut missing = Vec::new();
@@ -164,20 +197,26 @@ pub(super) async fn proof(
     let digest = keys.model;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(verdict) = stored {
-        proofs.reached.insert(digest, (verdict.clone(), true));
+        attempt.0.insert(digest.clone(), verdict.clone());
+        proofs.reached.insert(digest, verdict.clone());
         return Proof::Done(verdict);
     }
-    if let Some((verdict, fit)) = proofs.reached.get(&digest).cloned() {
-        if !fit {
-            proofs.reached.remove(&digest);
-        }
+    if let Some(verdict) = proofs.reached.get(&digest).cloned() {
+        attempt.0.insert(digest, verdict.clone());
         return Proof::Done(verdict);
     }
     if let Some(running) = proofs.running.get(&digest) {
-        return Proof::Running(Wait(running.clone()));
+        return Proof::Running(Wait {
+            digest,
+            ended: running.clone(),
+        });
     }
-    let (ended, wait) = watch::channel(false);
+    let (ended, wait) = watch::channel(None);
     proofs.running.insert(digest.clone(), wait.clone());
+    let waiting = Wait {
+        digest: digest.clone(),
+        ended: wait,
+    };
     drop(proofs);
     tracing::info!(tenant, app = %app_name, %proof, %digest, "a proof starts");
     tokio::spawn(run(
@@ -189,7 +228,7 @@ pub(super) async fn proof(
         walk,
         ended,
     ));
-    Proof::Running(Wait(wait))
+    Proof::Running(waiting)
 }
 
 /// Walk on a blocking thread, saying how far it got as it goes, then keep
@@ -202,7 +241,7 @@ async fn run(
     proof: String,
     [digest, source]: [String; 2],
     walk: impl FnOnce(Bound<'_>) -> Walked + Send + 'static,
-    ended: watch::Sender<bool>,
+    ended: watch::Sender<Option<Verdict>>,
 ) {
     let progress = Arc::new(Progress::default());
     let reports = tokio::spawn(report(
@@ -223,7 +262,8 @@ async fn run(
     .unwrap_or_else(|error| Walked {
         verdict: Verdict {
             held: Vec::new(),
-            refused: Some(format!(
+            refused: None,
+            unproved: Some(format!(
                 "os-app '{app_name}': the check of {proof} stopped: {error}"
             )),
         },
@@ -231,7 +271,7 @@ async fn run(
     });
     reports.abort();
     if walked.fit
-        && walked.verdict.refused.is_none()
+        && walked.verdict.proven()
         && let Some(store) = server.platform_metadata_store()
         && let Ok(bytes) = serde_json::to_vec(&walked.verdict)
     {
@@ -242,7 +282,12 @@ async fn run(
         }
     }
     let states = progress.states.load(Ordering::Relaxed);
-    let summary = match &walked.verdict.refused {
+    let summary = match walked
+        .verdict
+        .refused
+        .as_ref()
+        .or(walked.verdict.unproved.as_ref())
+    {
         None => format!("os-app '{app_name}': {proof}: proven ({states} joint states)"),
         Some(why) => format!("os-app '{app_name}': {proof}: not proven: {why}"),
     };
@@ -253,14 +298,16 @@ async fn run(
         &app_name,
         "proof_done",
         summary,
-        Some(walked.verdict.refused.is_none()),
+        Some(walked.verdict.proven()),
     )
     .await;
     let mut proofs = proofs().lock().unwrap_or_else(PoisonError::into_inner);
     proofs.running.remove(&digest);
-    proofs.reached.insert(digest, (walked.verdict, walked.fit));
+    if walked.fit {
+        proofs.reached.insert(digest, walked.verdict.clone());
+    }
     drop(proofs);
-    let _ = ended.send(true);
+    let _ = ended.send(Some(walked.verdict));
 }
 
 /// Say every [`PROGRESS_EVERY`] how many joint states the walk has and the
@@ -311,3 +358,6 @@ async fn emit(
         tracing::warn!(tenant, app = %app_name, %error, "a proof event could not be kept");
     }
 }
+
+#[cfg(test)]
+mod tests;

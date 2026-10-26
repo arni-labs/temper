@@ -18,6 +18,7 @@
 //! (`live.rs`).
 
 mod cedar;
+mod declare;
 mod effects;
 mod encode;
 mod guess;
@@ -29,6 +30,9 @@ mod run;
 mod solver;
 mod vocab;
 
+#[cfg(test)]
+mod regression_test;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -37,7 +41,8 @@ use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name};
 
-use encode::{Enc, initial, prelude};
+use declare::{initial, prelude};
+use encode::Enc;
 use guess::Guess;
 pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};

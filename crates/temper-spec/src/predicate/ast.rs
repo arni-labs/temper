@@ -64,6 +64,9 @@ pub enum Operand {
         /// The related entity's field.
         field: String,
     },
+    /// `params.p`: the parameter `p` of the move being taken. Only an
+    /// action's guard reads one, and only a parameter the action declares.
+    Param(String),
     /// A literal value.
     Lit(Literal),
 }
@@ -257,6 +260,20 @@ impl Expr {
         refs
     }
 
+    /// The parameters the expression reads (`params.p`), deduplicated in
+    /// first-use order.
+    pub fn params_read(&self) -> Vec<String> {
+        let mut params: Vec<String> = Vec::new();
+        self.for_each_name(&mut |name| {
+            if let Name::Param(param) = name
+                && !params.iter().any(|p| p == param)
+            {
+                params.push(param.to_string());
+            }
+        });
+        params
+    }
+
     /// Whether the expression reads a related entity's field
     /// (`Type[id].field`).
     pub fn reads_related_field(&self) -> bool {
@@ -295,6 +312,7 @@ impl Operand {
                     field,
                 });
             }
+            Operand::Param(name) => visit(Name::Param(name)),
             Operand::Lit(_) => {}
         }
     }
@@ -323,4 +341,6 @@ pub enum Name<'a> {
         /// The related entity's field.
         field: &'a str,
     },
+    /// `params.p`, a parameter of the move being taken.
+    Param(&'a str),
 }

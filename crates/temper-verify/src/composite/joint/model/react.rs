@@ -11,8 +11,8 @@ use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::step::{Certainty, Move};
 use super::{JointModel, MAX_REACTION_DEPTH, Reaction};
-use crate::model::semantics::successors_among;
-use crate::model::{ParamValue, TemperModelAction};
+use crate::model::semantics::successors_budgeted;
+use crate::model::{ModelString, ParamValue, TemperModelAction};
 
 impl JointModel {
     /// What follows `source.action` committing, sent by `by`: its
@@ -46,6 +46,9 @@ impl JointModel {
         let mut started = Vec::new();
         for (outcome, known) in outcomes {
             for &answer_inline in &answering {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let mut outcome = outcome.clone();
                 for spec in specs {
                     let call = Call {
@@ -72,20 +75,20 @@ impl JointModel {
         &self,
         state: &JointState,
         call: &Call,
-        values: &BTreeSet<String>,
+        values: &BTreeSet<ModelString>,
         out: &mut Vec<Move>,
     ) {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            if !call_may_answer(call.on_success.as_deref(), &t.name)
+            if !call_may_answer(&call.on_success, &t.name)
                 || !self.enabled(&call.to, t, state, Blind::Nothing)
             {
                 continue;
             }
             // Returned values are chosen by the callee. Constraints compare
             // them with the record now, independently of call-time fields.
-            for (params, _) in successors_among(model, t, local, values) {
+            for (params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
                 let action = TemperModelAction {
                     name: t.name.clone(),
                     target_state: t.to_state.clone(),
@@ -124,6 +127,9 @@ impl JointModel {
         {
             let mut after = Vec::new();
             for (state, known) in outcomes {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let fires = match &reaction.guard {
                     Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
                     None => Truth::True,
@@ -166,7 +172,11 @@ impl JointModel {
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
                     depth: depth + 1,
                     via: Some(index),
-                    by: self.senders.reaction(reaction.principal.as_ref(), by),
+                    by: self.senders.reaction(
+                        reaction.principal.as_ref(),
+                        by,
+                        matches!(reaction.resolve, Some(TargetResolver::SameId)),
+                    ),
                     inline: false,
                 };
                 let mut next = state;
@@ -236,8 +246,8 @@ impl JointModel {
                 }
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone()),
-                    Arg::Lit(Literal::Null) => Some(String::new()),
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Null) => Some("".into()),
                     _ => None,
                 }?;
                 Some((param.clone(), ParamValue::Str(value)))
