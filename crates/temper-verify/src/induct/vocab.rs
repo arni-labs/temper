@@ -114,7 +114,7 @@ pub(super) struct Call {
     pub(super) name: String,
     pub(super) to: String,
     pub(super) module: String,
-    pub(super) on_success: Option<String>,
+    pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
     pub(super) kind: TriggerKind,
 }
@@ -357,7 +357,7 @@ impl<'a> Vocab<'a> {
         self.automaton(&call.to)
             .actions
             .iter()
-            .filter(|a| call_may_answer(call.on_success.as_deref(), &a.name))
+            .filter(|a| call_may_answer(&call.on_success, &a.name))
             .collect()
     }
 

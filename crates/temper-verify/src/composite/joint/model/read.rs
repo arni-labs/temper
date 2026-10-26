@@ -105,7 +105,7 @@ pub(super) struct CallSpec {
     pub(super) module: String,
     /// The service answering when this call runs in the background.
     pub(super) background: u32,
-    pub(super) on_success: Option<String>,
+    pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
 }
 
@@ -136,7 +136,7 @@ impl Kernel {
             || self.calls_on.iter().any(|((e, _), specs)| {
                 e == entity
                     && specs.iter().any(|spec| {
-                        call_may_answer(spec.on_success.as_deref(), action)
+                        call_may_answer(&spec.on_success, action)
                             || spec.on_failure.as_deref() == Some(action)
                     })
             })
