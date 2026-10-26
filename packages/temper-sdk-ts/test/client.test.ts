@@ -171,3 +171,27 @@ describe("TemperClient.list pagination", () => {
     expect(headerSink[0]["x-tenant-id"]).toBe("default");
   });
 });
+
+describe("TemperClient.authorizeBatch", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("checks a hundred moves with one request and preserves their answers", async () => {
+    const records = [{ resource_type: "Release", resource_id: "r1", actions: Array.from({ length: 100 }, (_, i) => `Move${i}`), context: { owner: "person-1" } }];
+    const response = { records: [{ ...records[0], actions: records[0].actions.map((action, i) => ({ action, allowed: i % 2 === 0, reason: i % 2 === 0 ? null : "person only" })) }] };
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => response });
+    vi.stubGlobal("fetch", fetch);
+    const client = new TemperClient({ baseUrl: "http://srv:4200", tenant: "test" });
+    expect(await client.authorizeBatch("agent-1", records)).toEqual(response);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toBe("http://srv:4200/api/authorize");
+    expect(JSON.parse(init.body)).toEqual({ agent_id: "agent-1", records });
+    expect(init.headers["x-tenant-id"]).toBe("test");
+  });
+
+  it("rejects an HTTP failure rather than treating it as an empty batch", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 403, statusText: "Forbidden" }));
+    const client = new TemperClient({ baseUrl: "http://srv:4200" });
+    await expect(client.authorizeBatch("agent-1", [])).rejects.toThrow(/403/);
+  });
+});

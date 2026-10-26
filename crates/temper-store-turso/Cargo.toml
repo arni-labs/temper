@@ -25,6 +25,7 @@ default = []
 cloud = []
 
 [dev-dependencies]
+temper-test-resource = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
