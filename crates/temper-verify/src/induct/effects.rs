@@ -44,10 +44,7 @@ impl Moves<'_, '_, '_> {
                         continue;
                     };
                     let value = match value {
-                        Arg::Param(p) => params
-                            .get(p)
-                            .map(|p| p.term.clone())
-                            .unwrap_or_else(|| self.enc.fresh(&format!("p.{p}"), sort.smt())),
+                        Arg::Param(p) => self.passed(action, params, p, sort),
                         other => self.arg(entity, other, sort, "pre", &terms),
                     };
                     let now = terms[var].clone();
@@ -105,10 +102,7 @@ impl Moves<'_, '_, '_> {
                     .fields
                     .iter()
                     .map(|(field, sort)| match &trigger.args[field] {
-                        Arg::Param(p) => params
-                            .get(p)
-                            .map(|p| p.term.clone())
-                            .unwrap_or_else(|| self.enc.fresh(&format!("p.{p}"), sort.smt())),
+                        Arg::Param(p) => self.passed(action, params, p, *sort),
                         other => self.arg(entity, other, *sort, "post", &BTreeMap::new()),
                     })
                     .collect();
@@ -144,6 +138,23 @@ impl Moves<'_, '_, '_> {
                 };
                 changed.insert(key, next);
             }
+        }
+    }
+
+    /// The value of `action`'s parameter `name` where a value of `sort` is
+    /// read. A parameter declared with no type, or of another sort, is
+    /// converted by the kernel; the proof takes any value of `sort`.
+    fn passed(
+        &self,
+        action: &Action,
+        params: &BTreeMap<String, Param>,
+        name: &str,
+        sort: Sort,
+    ) -> String {
+        let same = self.enc.v.param(action, name).map(Sort::smt) == Some(sort.smt());
+        match params.get(name) {
+            Some(param) if same => param.term.clone(),
+            _ => self.enc.fresh(&format!("p.{name}"), sort.smt()),
         }
     }
 
