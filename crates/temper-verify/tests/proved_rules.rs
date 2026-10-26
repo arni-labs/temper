@@ -133,3 +133,125 @@ fn a_false_invariant_is_walked_to_a_counterexample_and_says_why_it_was_not_prove
         l1.diagnostics
     );
 }
+
+#[test]
+fn a_proved_invariant_keeps_the_strings_a_remaining_liveness_rule_needs() {
+    let spec = r#"
+[automaton]
+name = "Job"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "token"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Work"
+kind = "input"
+from = ["Open"]
+guard = "token == ''"
+
+[[invariant]]
+name = "TokenStaysEmpty"
+assert = "token == ''"
+
+[[liveness]]
+name = "WorkIsEnabled"
+from = ["Open"]
+has_actions = true
+"#;
+    assert_model_preserved(spec, "TokenStaysEmpty", 1);
+}
+
+fn assert_model_preserved(spec: &str, rule: &str, states: usize) {
+    let original = temper_verify::model::build_model_from_ioa(spec, 2).expect("fixture parses");
+    let baseline = temper_verify::checker::check_model(&original);
+    assert!(baseline.all_properties_hold, "{baseline:?}");
+    assert_eq!(baseline.states_explored, states, "{baseline:?}");
+
+    let result = VerificationCascade::from_ioa(spec)
+        .with_sim_seeds(1)
+        .with_prop_test_cases(10)
+        .run();
+    let l1 = model_check(&result);
+    assert!(
+        l1.summary.contains(&format!("{rule} proved by induction")),
+        "{}",
+        l1.summary
+    );
+    assert!(l1.passed, "{}; {:?}", l1.summary, l1.diagnostics);
+    let verification = l1.verification.as_ref().expect("a model check");
+    assert!(verification.is_complete, "{verification:?}");
+    assert!(verification.counterexamples.is_empty(), "{verification:?}");
+    assert!(verification.dead_transitions.is_empty(), "{verification:?}");
+    assert_eq!(verification.states_explored, baseline.states_explored);
+}
+
+#[test]
+fn a_proved_invariant_keeps_string_parameter_candidates() {
+    let spec = r#"
+[automaton]
+name = "Job"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "token"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Work"
+kind = "input"
+from = ["Open"]
+params = [{ name = "token", type = "string" }]
+
+[[invariant]]
+name = "ReservedIsOpen"
+assert = "token == 'reserved' => status == 'Open'"
+
+[[liveness]]
+name = "WorkIsEnabled"
+from = ["Open"]
+has_actions = true
+"#;
+    // The walk must still see empty, 'reserved' and a fresh token, even
+    // though only the proved invariant mentions that literal.
+    assert_model_preserved(spec, "ReservedIsOpen", 3);
+}
+
+#[test]
+fn a_proved_invariant_keeps_list_parameter_candidates() {
+    let spec = r#"
+[automaton]
+name = "Job"
+states = ["Open", "Done"]
+initial = "Open"
+terminal = ["Done"]
+
+[[state]]
+name = "tags"
+type = "list"
+initial = []
+
+[[action]]
+name = "Work"
+kind = "input"
+from = ["Open"]
+to = "Done"
+effect = ["append(tags, params.tag)"]
+
+[[invariant]]
+name = "ReservedHasStatus"
+assert = "'reserved' in tags => status in ['Open', 'Done']"
+
+[[liveness]]
+name = "WorkIsEnabled"
+from = ["Open"]
+has_actions = true
+"#;
+    // 'reserved' and an unmentioned tag must both remain candidates.
+    assert_model_preserved(spec, "ReservedHasStatus", 3);
+}

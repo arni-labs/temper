@@ -465,7 +465,7 @@ impl VerificationCascade {
     /// ([`crate::induct::prove_alone`]); Stateright walks for the rest.
     fn run_model_check(
         &self,
-        mut automaton: Automaton,
+        automaton: Automaton,
         model: &TemperModel,
         spending: Option<&Spending>,
     ) -> LevelResult {
@@ -473,14 +473,16 @@ impl VerificationCascade {
         let (proved, unproved): (Vec<_>, Vec<_>) = crate::induct::prove_alone(&automaton, deadline)
             .into_iter()
             .partition(|proof| proof.proved());
-        let walked;
+        let mut walked;
         let model = if proved.is_empty() {
             model
         } else {
-            automaton
+            // A proof removes an obligation, not model data: rebuilding
+            // without its assertion would lose tracked fields and candidates.
+            walked = model.clone();
+            walked
                 .invariants
                 .retain(|i| !proved.iter().any(|proof| proof.rule == i.name));
-            walked = self.build_temper_model(&automaton, self.max_counter, spending);
             &walked
         };
         let verification = checker::check_model(model);
