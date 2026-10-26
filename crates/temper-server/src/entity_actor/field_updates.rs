@@ -123,6 +123,7 @@ pub(super) async fn commit_field_update(
                 state,
                 &event,
                 &super::scheduled_rows::ScheduledRows::default(),
+                None,
             )
             .await
         {

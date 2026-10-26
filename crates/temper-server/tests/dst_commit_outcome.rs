@@ -8,7 +8,13 @@
 //! lost); conflict before writing; write it late, past the dispatch timeout;
 //! or write it, fail the answer and fail the next journal read too, so the
 //! outcome cannot be learned. Some callers hang up: their dispatch is dropped
-//! after a seeded number of scheduler turns.
+//! after a seeded number of scheduler turns, or the moment its commit lands,
+//! while the server writes the state timer's row (a slow store step: on the
+//! 25 Oct production trace a timer row took 7.5-13 s, and the site gave up
+//! after 20 s).
+//!
+//! A `Hold` schedules a `Note` an hour later and, through a reaction, counts
+//! itself on the record's `Ledger`.
 //!
 //! Invariants, after every move:
 //! - a move lands at most once;
@@ -17,9 +23,36 @@
 //!   not be read when it was answered;
 //! - the record's state in memory is the state its journal gives: when a
 //!   write's outcome could not be learned, the record rebuilds from its
-//!   journal before its next answer.
+//!   journal before its next answer;
+//! - a move takes one commit;
+//! - the record's query-plane row and its timer row are what its journal
+//!   says (`rows::rows_follow_journal`), whatever the answer and whether
+//!   the caller hung up.
+//!
+//! And once the moves are done, a day later, whoever hung up:
+//! - every timer has fired, so no record is still `Busy`;
+//! - every `Hold` that landed has had its scheduled `Note` and its `Ledger`
+//!   count, except one whose outcome could not be learned (its caller was
+//!   answered "outcome unknown", so nothing ran after it; see `unknown`).
 //!
 //! The server runs in one single-threaded, paused-clock Tokio runtime.
+
+#[path = "dst_commit_outcome/committed_deadline.rs"]
+mod committed_deadline;
+#[path = "dst_commit_outcome/faults.rs"]
+mod faults;
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
+#[path = "dst_commit_outcome/reset_recovery.rs"]
+mod reset_recovery;
+#[path = "dst_commit_outcome/rows.rs"]
+mod rows;
+#[path = "dst_commit_outcome/specs.rs"]
+mod specs;
+#[path = "dst_commit_outcome/workload.rs"]
+mod workload;
+
+use workload::run_seed;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -35,119 +68,21 @@ use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
 
+use faults::Fault;
+use specs::{CSDL, LEDGER, TALLY};
+
 const SEEDS: u64 = 64;
 const RECORDS: usize = 3;
 const MOVES: usize = 24;
 const TENANT: &str = "default";
 
-const TALLY: &str = r#"
-[automaton]
-name = "Tally"
-states = ["Open", "Busy"]
-initial = "Open"
-allow_indefinite_states = ["Open"]
-
-[[key]]
-name = "code"
-properties = ["Code"]
-
-[[state]]
-name = "bumps"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "Bump"
-kind = "input"
-from = ["Open", "Busy"]
-params = ["Mark"]
-effect = ["bumps += 1"]
-
-[[action]]
-name = "Hold"
-kind = "input"
-from = ["Open"]
-to = "Busy"
-params = ["Mark"]
-
-[[action]]
-name = "Release"
-kind = "input"
-from = ["Busy"]
-to = "Open"
-params = ["Mark"]
-
-[[action]]
-name = "Expire"
-kind = "internal"
-from = ["Busy"]
-to = "Open"
-
-[[state_timeout]]
-state = "Busy"
-after_seconds = 86400
-on_timeout = "Expire"
-"#;
-
-const CSDL: &str = r#"<?xml version="1.0"?>
-<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
-<edmx:DataServices><Schema Namespace="Tallies" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-<EntityType Name="Tally"><Key><PropertyRef Name="Id"/></Key>
-<Property Name="Id" Type="Edm.String" Nullable="false"/>
-<Property Name="Code" Type="Edm.String"/>
-<Property Name="Mark" Type="Edm.String"/>
-</EntityType>
-<EntityContainer Name="Default"><EntitySet Name="Tallies" EntityType="Tallies.Tally"/></EntityContainer>
-</Schema></edmx:DataServices></edmx:Edmx>"#;
-
-/// What the store does with a move's commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Fault {
-    None,
-    FailBeforeWriting,
-    LandThenFail,
-    LandThenConflict,
-    ConflictBeforeWriting,
-    LandLate,
-    LandThenFailUnreadable,
-}
-
-impl Fault {
-    fn draw(rng: &mut DeterministicRng) -> Self {
-        match rng.next_bound(10) {
-            0 => Self::FailBeforeWriting,
-            1 => Self::LandThenFail,
-            2 => Self::LandThenConflict,
-            3 => Self::ConflictBeforeWriting,
-            4 => Self::LandLate,
-            5 => Self::LandThenFailUnreadable,
-            _ => Self::None,
-        }
-    }
-
-    fn apply(self, store: &SimEventStore, journal: &str) {
-        match self {
-            Self::None => {}
-            Self::FailBeforeWriting => store.fail_next_appends(journal, 1),
-            Self::LandThenFail => store.land_next_appends_then_fail(journal, 1),
-            Self::LandThenConflict => store.lose_next_append_answers(journal, 1),
-            Self::ConflictBeforeWriting => store.inject_concurrency_violations(journal, 1),
-            Self::LandLate => store.inject_append_delay(journal, Duration::from_millis(40)),
-            Self::LandThenFailUnreadable => {
-                store.land_next_appends_then_fail(journal, 1);
-                store.fail_next_reads(journal, 1);
-            }
-        }
-    }
-
-    /// Clear what the move did not use up, so it cannot reach the next move.
-    fn clear(store: &SimEventStore, journal: &str) {
-        store.fail_next_appends(journal, 0);
-        store.land_next_appends_then_fail(journal, 0);
-        store.lose_next_append_answers(journal, 0);
-        store.inject_concurrency_violations(journal, 0);
-        store.fail_next_reads(journal, 0);
-    }
+/// When a caller hangs up.
+#[derive(Debug, Clone, Copy)]
+enum HangUp {
+    /// After this many scheduler turns.
+    AfterTurns(usize),
+    /// The moment the move's commit lands.
+    AfterCommit,
 }
 
 /// How a move was answered.
@@ -164,6 +99,9 @@ enum Answer {
 struct Run {
     seed: u64,
     trace: Vec<String>,
+    /// Broken invariants the run goes on past, so the ones after them are
+    /// checked too: the first break of each.
+    noted: BTreeMap<&'static str, String>,
 }
 
 impl Run {
@@ -173,6 +111,14 @@ impl Run {
             self.seed,
             self.trace.join("\n  ")
         )
+    }
+
+    /// Note a broken invariant and go on.
+    fn note(&mut self, invariant: &'static str, detail: String) {
+        if !self.noted.contains_key(invariant) {
+            let report = self.fail(invariant, detail);
+            self.noted.insert(invariant, report);
+        }
     }
 }
 
@@ -188,13 +134,34 @@ async fn settle() {
 }
 
 fn server(store: &SimEventStore, seed: u64) -> ServerState {
+    server_with_tally(store, seed, TALLY)
+}
+
+fn server_with_tally(store: &SimEventStore, seed: u64, tally: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(CSDL).expect("CSDL parses");
-    registry.register_tenant(TENANT, csdl, CSDL.to_string(), &[("Tally", TALLY)]);
+    registry.register_tenant(
+        TENANT,
+        csdl,
+        CSDL.to_string(),
+        &[("Tally", tally), ("Ledger", LEDGER)],
+    );
     let mut state =
         ServerState::from_registry(ActorSystem::new(format!("commit-{seed}")), registry);
-    state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
+    // The sim store keeps each record's rows itself, and the server reads its
+    // timer rows through it: its commits write the rows this server reads.
+    state.set_storage_stack(
+        StorageStack::from_sim(store.clone(), None).with_entity_rows_in_journal(),
+    );
+    state.state_timer_rows = Some(std::sync::Arc::new(rows::SimTimerRows(store.clone())));
     state.action_dispatch_timeout = Duration::from_millis(25);
+    // A reaction is authorized as its own move: with no tenant policy, Cedar
+    // refuses every `Ledger.Count`, and no hold could ever be counted.
+    state
+        .authz
+        .reload_tenant_policies(TENANT, "permit(principal, action, resource);")
+        .expect("the tenant policy parses");
+    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -211,10 +178,11 @@ async fn landed(store: &SimEventStore, id: &str, mark: &str) -> usize {
 
 async fn move_once(
     state: &ServerState,
+    store: &SimEventStore,
     id: &str,
     action: &str,
     mark: &str,
-    hang_up_after: Option<usize>,
+    hang_up: Option<HangUp>,
 ) -> Answer {
     let dispatch = {
         let state = state.clone();
@@ -234,12 +202,28 @@ async fn move_once(
                 .await
         }
     };
-    let result = match hang_up_after {
+    let result = match hang_up {
         None => dispatch.await,
-        Some(turns) => {
+        Some(hang_up) => {
             let handle = tokio::spawn(dispatch); // determinism-ok: the caller, on this runtime's one thread
-            for _ in 0..turns {
-                tokio::task::yield_now().await;
+            match hang_up {
+                HangUp::AfterTurns(turns) => {
+                    for _ in 0..turns {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                HangUp::AfterCommit => {
+                    // Watch the store's commit count, not the journal: a
+                    // read here would use up a read fault meant for the move.
+                    let journal = journal_of(id);
+                    let before = store.commits(&journal);
+                    for _ in 0..2_000 {
+                        if handle.is_finished() || store.commits(&journal) > before {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
             }
             if !handle.is_finished() {
                 handle.abort();
@@ -256,8 +240,37 @@ async fn move_once(
     }
 }
 
+/// How many `Note`s the record's journal holds.
+async fn noted(store: &SimEventStore, id: &str) -> i64 {
+    let events = store
+        .read_events(&journal_of(id), 0)
+        .await
+        .expect("the journal reads");
+    events
+        .iter()
+        .filter(|event| event.event_type == "Note")
+        .count() as i64
+}
+
+/// The `Hold`s the record's `Ledger` counted.
+async fn ledger_count(state: &ServerState, id: &str) -> i64 {
+    match state
+        .get_tenant_entity_state(&TenantId::new(TENANT), "Ledger", id)
+        .await
+    {
+        Ok(ledger) => ledger.state.counters.get("holds").copied().unwrap_or(0) as i64,
+        Err(_) => 0,
+    }
+}
+
 /// The record's journal, replayed: (sequence, bumps, status).
 async fn journal_state(store: &SimEventStore, id: &str) -> (u64, i64, String) {
+    let (journal, bumps) = journal(store, id).await;
+    (journal.sequence, bumps, journal.status)
+}
+
+/// The record's journal, replayed, and its bumps.
+async fn journal(store: &SimEventStore, id: &str) -> (rows::Journal, i64) {
     let events = store
         .read_events(&journal_of(id), 0)
         .await
@@ -265,121 +278,35 @@ async fn journal_state(store: &SimEventStore, id: &str) -> (u64, i64, String) {
     let sequence = events.last().map(|event| event.sequence_nr).unwrap_or(0);
     let mut bumps = 0;
     let mut status = "Open".to_string();
+    let mut busy_since = None;
     for event in &events {
         match event.event_type.as_str() {
             "Bump" => bumps += 1,
-            "Hold" => status = "Busy".to_string(),
-            "Release" | "Expire" => status = "Open".to_string(),
+            "Hold" => {
+                status = "Busy".to_string();
+                busy_since = Some(event.sequence_nr);
+            }
+            "Release" | "Expire" => {
+                status = "Open".to_string();
+                busy_since = None;
+            }
             _ => {}
         }
     }
-    (sequence, bumps, status)
+    let journal = rows::Journal {
+        sequence,
+        status,
+        busy_since,
+    };
+    (journal, bumps)
 }
 
-fn run_seed(seed: u64) -> Result<usize, String> {
-    let (_guard, _clock, _ids) = install_deterministic_context(seed);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("runtime builds");
-    let store = SimEventStore::no_faults(seed);
-    let mut rng = DeterministicRng::new(seed ^ 0xc0_33_17);
-    let mut run = Run {
-        seed,
-        trace: Vec::new(),
-    };
-    runtime.block_on(async {
-        let state = server(&store, seed);
-        let tenant = TenantId::new(TENANT);
-        let mut status: BTreeMap<String, String> = BTreeMap::new();
-        for i in 0..RECORDS {
-            let id = format!("t-{i}");
-            state
-                .get_or_create_tenant_entity(
-                    &tenant,
-                    "Tally",
-                    &id,
-                    json!({ "Id": id, "Code": format!("code-{i}") }),
-                )
-                .await
-                .map_err(|error| run.fail("records are created", error.to_string()))?;
-            status.insert(id, "Open".to_string());
-        }
-        let mut faulted = 0;
-        for n in 0..MOVES {
-            let id = format!("t-{}", rng.next_bound(RECORDS));
-            let journal = journal_of(&id);
-            let action = match (status[&id].as_str(), rng.next_bound(3)) {
-                (_, 0) => "Bump",
-                ("Open", _) => "Hold",
-                _ => "Release",
-            };
-            let mark = format!("m-{n}");
-            let fault = Fault::draw(&mut rng);
-            let hang_up_after = (rng.next_bound(5) == 0).then(|| rng.next_bound(40));
-            fault.apply(&store, &journal);
-            faulted += usize::from(fault != Fault::None);
-
-            let answer = move_once(&state, &id, action, &mark, hang_up_after).await;
-            // A hung-up move's actor keeps going; let its late writes land.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            settle().await;
-            Fault::clear(&store, &journal);
-            run.trace.push(format!(
-                "{mark}: {action} {id}, {fault:?}, hang up {hang_up_after:?}: {answer:?}"
-            ));
-
-            let landings = landed(&store, &id, &mark).await;
-            if landings > 1 {
-                return Err(run.fail(
-                    "a move lands at most once",
-                    format!("{mark} landed {landings} times"),
-                ));
-            }
-            match &answer {
-                Answer::Success if landings != 1 => {
-                    return Err(run.fail(
-                        "a successful answer is a move that landed",
-                        format!("{mark} answered success, landed {landings} times"),
-                    ));
-                }
-                Answer::Refused(error) | Answer::Failed(error) if landings != 0 => {
-                    let unreadable = fault == Fault::LandThenFailUnreadable;
-                    if !unreadable {
-                        return Err(run.fail(
-                            "a failed answer is a move that did not land",
-                            format!("{mark} answered {error:?} and landed"),
-                        ));
-                    }
-                }
-                _ => {}
-            }
-
-            {
-                let (sequence, bumps, journal_status) = journal_state(&store, &id).await;
-                let memory = state
-                    .get_tenant_entity_state(&tenant, "Tally", &id)
-                    .await
-                    .map_err(|error| run.fail("the record reads", error))?;
-                let memory_bumps = memory.state.counters.get("bumps").copied().unwrap_or(0);
-                if memory.state.sequence_nr != sequence
-                    || memory_bumps as i64 != bumps
-                    || memory.state.status != journal_status
-                {
-                    return Err(run.fail(
-                        "the record's state in memory is the state its journal gives",
-                        format!(
-                            "{id} after {mark}: memory seq {} bumps {memory_bumps} {}, journal seq {sequence} bumps {bumps} {journal_status}",
-                            memory.state.sequence_nr, memory.state.status
-                        ),
-                    ));
-                }
-                status.insert(id.clone(), journal_status);
-            }
-        }
-        Ok(faulted)
-    })
+/// Note it when `id`'s rows do not say what its journal says.
+async fn check_rows(run: &mut Run, store: &SimEventStore, id: &str) {
+    let (journal, _) = journal(store, id).await;
+    if let Err((invariant, detail)) = rows::rows_follow_journal(store, id, &journal) {
+        run.note(invariant, detail);
+    }
 }
 
 #[test]
@@ -389,12 +316,14 @@ fn dst_a_moves_answer_is_what_its_commit_did() {
     for seed in 0..SEEDS {
         match run_seed(seed) {
             Ok(moves) => faulted += moves,
-            Err(report) => {
-                let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
-                let entry = broken
-                    .entry(invariant)
-                    .or_insert_with(|| (Vec::new(), report));
-                entry.0.push(seed);
+            Err(reports) => {
+                for report in reports {
+                    let invariant = report.split(": ").nth(1).unwrap_or("unknown").to_string();
+                    let entry = broken
+                        .entry(invariant)
+                        .or_insert_with(|| (Vec::new(), report));
+                    entry.0.push(seed);
+                }
             }
         }
     }
