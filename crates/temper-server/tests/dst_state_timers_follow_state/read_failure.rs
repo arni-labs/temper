@@ -333,6 +333,17 @@ fn dst_unreadable_tenant_does_not_block_later_timeout_install() {
 /// An install during an untimed tenant's row retry must keep durable callers.
 #[test]
 fn dst_timeout_added_during_row_retry_keeps_saved_caller() {
+    timeout_added_during_row_retry::<false>();
+}
+
+/// A stale row from another state must hand its caller to the new timer, even
+/// when the type had no timeouts at the start of recovery.
+#[test]
+fn dst_timeout_added_during_row_retry_keeps_dropped_row_caller() {
+    timeout_added_during_row_retry::<true>();
+}
+
+fn timeout_added_during_row_retry<const STALE_ROW: bool>() {
     check_seeds(|seed| {
         let clock = Arc::new(ProcessClock::new());
         let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
@@ -355,7 +366,15 @@ fn dst_timeout_added_during_row_retry_keeps_saved_caller() {
             assert!(act(&first.state, &job, "Start").await);
             settle().await;
         });
-        let saved = world.rows.row("gamma", &job.id).unwrap();
+        let mut saved = world.rows.row("gamma", &job.id).unwrap();
+        if STALE_ROW {
+            // A failed row update can leave the previous state's arm durable.
+            saved.state = "Idle".into();
+            first.runtime.block_on(async {
+                use temper_server::storage::StateTimerStore;
+                world.rows.upsert_state_timer(&saved).await.unwrap();
+            });
+        }
         first.kill(&world, Duration::ZERO);
         world
             .rows
@@ -373,7 +392,10 @@ fn dst_timeout_added_during_row_retry_keeps_saved_caller() {
                 recovered.armed_by, saved.armed_by,
                 "queued install must retain the saved identity"
             );
-            assert_eq!(counts[&(job.tenant.clone(), "Job".into())].rearmed, 1);
+            let counted = counts[&(job.tenant.clone(), "Job".into())];
+            assert_eq!(counted.rearmed, usize::from(!STALE_ROW));
+            assert_eq!(counted.dropped, usize::from(STALE_ROW));
+            assert_eq!(counted.armed, usize::from(STALE_ROW));
             advance(Duration::from_secs(3601)).await;
             assert_eq!(status(&second.state, &job).await, "Done");
             let record = second

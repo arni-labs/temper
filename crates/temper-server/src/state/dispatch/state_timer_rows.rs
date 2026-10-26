@@ -123,16 +123,29 @@ impl ServerState {
         for (tenant, timeouts) in self.declared_state_timeouts() {
             let gate = gate.clone();
             tenants.push(async move {
-                let types = timeouts
+                let mut types = timeouts
                     .keys()
                     .map(|(kind, _)| (tenant.clone(), kind.clone()))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
+                    .collect::<std::collections::BTreeSet<_>>();
                 let (callers, mut counts) = self.recover_tenant_state_timers(&tenant).await;
+                // A type can gain its first timeout while row reads retry.
+                // Reconcile it before releasing the saved callers to queued
+                // installs, including callers from rows just dropped above.
+                {
+                    let registry = self.registry.read().expect("registry lock poisoned");
+                    types.extend(registry.entity_types(&tenant).into_iter().filter_map(
+                        |entity_type| {
+                            let spec = registry.get_spec(&tenant, entity_type)?;
+                            (!spec.automaton.state_timeouts.is_empty())
+                                .then(|| (tenant.clone(), entity_type.to_string()))
+                        },
+                    ));
+                }
                 // Only this tenant's saved identities are now known. Other
                 // tenants may still be retrying; their records stay untouched.
-                let followed = self.follow_types(types, &callers, Some(gate)).await;
+                let followed = self
+                    .follow_types(types.into_iter().collect(), &callers, Some(gate))
+                    .await;
                 self.timer_recovered_tenants
                     .write()
                     .expect("timer recovery lock poisoned")
