@@ -19,7 +19,7 @@ mod handle;
 use handle::DriverHandle;
 mod synced;
 use synced::ConnectionPool;
-pub use synced::{BackupStatus, CopyState, SyncCopy};
+pub use synced::{BackupStatus, CopyState, PUSH_LAG_BUDGET, SyncCopy};
 
 /// Driver failures retain the original engine or transport error.
 #[derive(Debug, Error)]

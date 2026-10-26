@@ -49,6 +49,7 @@ pub(crate) fn classify_error(kind: EventKind, error: &str) -> &'static str {
             EventKind::AuthzDecision => "authorization_error",
             EventKind::InvariantCheck => "invariant_error",
             EventKind::Transition => "transition_error",
+            EventKind::Durability => "durability_error",
         }
     }
 }
@@ -112,6 +113,7 @@ pub fn emit_span(event: &WideEvent) {
         EventKind::InvariantCheck => format!("invariant.{}", event.operation),
         EventKind::LlmCall => format!("llm.{}", event.operation),
         EventKind::ToolCall => format!("tool.{}", event.operation),
+        EventKind::Durability => format!("durability.{}", event.operation),
     };
 
     let mut attrs: Vec<KeyValue> = Vec::new();

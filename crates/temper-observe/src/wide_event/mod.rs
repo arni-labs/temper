@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 
 mod agent;
+mod durability;
 mod otel;
 mod runtime;
 mod transition;
@@ -40,6 +41,7 @@ mod transition;
 mod tests;
 
 pub use agent::{LlmCallInput, ToolCallInput, from_llm_call, from_tool_call};
+pub use durability::{DurabilityChangeInput, from_durability_change};
 pub use otel::{emit_metrics, emit_span};
 pub use runtime::{
     AuthzDecisionInput, InvariantCheckInput, WasmInvocationInput, from_authz_decision,
@@ -65,6 +67,9 @@ pub enum EventKind {
     LlmCall,
     /// Agent tool invocation (tool_use block execution).
     ToolCall,
+    /// A store stopped or started confirming moves because its backup fell
+    /// behind or caught up.
+    Durability,
 }
 
 /// A wide event: the unified telemetry primitive emitted by entity actors.

@@ -147,7 +147,8 @@ pub(super) fn describe(path: &Path) -> Result<String, DriverError> {
         Ok(cause) => format!("stopped: {}", cause.trim()),
         Err(_) => "stopped: no".to_string(),
     });
-    // The file serves and confirms writes in every case; only the backup waits.
+    // The file serves in every case; moves are refused once one has waited
+    // for the remote past the push-lag budget.
     lines.push(
         match (&stop, unchecked) {
             (Ok(_), _) => {

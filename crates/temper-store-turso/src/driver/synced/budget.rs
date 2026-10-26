@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use temper_observe::wide_event::{self, DurabilityChangeInput};
 use temper_runtime::persistence::PersistenceError;
 use tokio::time::Instant;
 
@@ -27,7 +28,7 @@ use super::SyncCopy;
 /// 23.6 s, losing the file costs less than the drive alone already risks.
 /// Over 11 s, a push that times out (10 s) and the retry on the next tick
 /// (1 s) fit inside it, so one hung request refuses nothing.
-pub(super) const PUSH_LAG_BUDGET: Duration = Duration::from_secs(20);
+pub const PUSH_LAG_BUDGET: Duration = Duration::from_secs(20);
 
 /// Confirmed moves the remote lacks, and whether new moves are refused for
 /// them.
@@ -72,11 +73,10 @@ impl PushBudget {
         }
     }
 
-    /// Record a move confirmed at `now`; returns its number.
-    pub(super) fn confirmed(&mut self, now: Instant) -> u64 {
+    /// Record a move confirmed at `now`.
+    pub(super) fn confirmed(&mut self, now: Instant) {
         self.newest += 1;
         self.unpushed.push_back((self.newest, now));
-        self.newest
     }
 
     /// The newest confirmed move. Its commit came before this call, so a
@@ -89,6 +89,10 @@ impl PushBudget {
     /// A push carried every move up to `through`; returns the turn if that
     /// ends a refusal.
     pub(super) fn pushed(&mut self, through: u64, now: Instant) -> Option<Turn> {
+        debug_assert!(
+            through <= self.newest,
+            "a push carried a move not yet confirmed"
+        );
         while self.unpushed.front().is_some_and(|(n, _)| *n <= through) {
             self.unpushed.pop_front();
         }
@@ -97,9 +101,18 @@ impl PushBudget {
 
     /// Bring the refusal up to date at `now`; returns the turn if it changed.
     pub(super) fn observe(&mut self, now: Instant) -> Option<Turn> {
-        // No gate yet: every move is confirmed.
-        let _ = (now, Turn::Refusing, Turn::Confirming);
-        None
+        let over = self
+            .oldest_wait(now)
+            .is_some_and(|waited| waited > self.budget);
+        if over == self.refusing {
+            return None;
+        }
+        self.refusing = over;
+        Some(if over {
+            Turn::Refusing
+        } else {
+            Turn::Confirming
+        })
     }
 
     /// How long the oldest confirmed move the remote lacks has waited.
@@ -145,10 +158,8 @@ impl SyncCopy {
         self.turned(turn);
         admitted.map_err(|waited| {
             PersistenceError::Storage(format!(
-                "turso.sync not durable: the remote copy has lacked a confirmed move for {} s, \
-                 past the {} s budget; moves are confirmed again once a push carries it",
-                waited.as_secs(),
-                budget.as_secs()
+                "turso.sync not durable: {}; moves are confirmed again once a push carries it",
+                why_refused(waited, budget)
             ))
         })
     }
@@ -165,12 +176,9 @@ impl SyncCopy {
 
     /// A push carried every move up to `through`.
     pub(super) fn moves_pushed(&self, through: u64) {
-        let turn = self
-            .inner
-            .budget
-            .lock()
-            .unwrap()
-            .pushed(through, Instant::now());
+        let mut ledger = self.inner.budget.lock().unwrap();
+        let turn = ledger.pushed(through, Instant::now());
+        drop(ledger);
         self.turned(turn);
     }
 
@@ -204,22 +212,48 @@ impl SyncCopy {
                 ledger.budget(),
             )
         };
-        match turn {
-            Turn::Refusing => tracing::error!(
-                event = "turso.sync.moves_refused",
-                unpushed,
-                waited_ms = waited.as_millis() as u64,
-                budget_ms = budget.as_millis() as u64,
-                "turso.sync moves are refused as not durable until a push catches up"
-            ),
-            Turn::Confirming => tracing::warn!(
+        let confirming = turn == Turn::Confirming;
+        let why = if confirming {
+            "a push carried every confirmed move that had waited past the budget".to_string()
+        } else {
+            why_refused(waited, budget)
+        };
+        let database = self.inner.path.to_string_lossy();
+        let wide = wide_event::from_durability_change(DurabilityChangeInput {
+            database: &database,
+            guard: "push_budget",
+            confirming,
+            why: &why,
+            unpushed_moves: unpushed as u64,
+            oldest_wait_ms: waited.as_millis() as u64,
+            budget_ms: budget.as_millis() as u64,
+        });
+        wide_event::emit_span(&wide);
+        wide_event::emit_metrics(&wide);
+        if confirming {
+            tracing::warn!(
                 event = "turso.sync.moves_confirmed",
                 unpushed,
-                budget_ms = budget.as_millis() as u64,
-                "turso.sync a push caught up; moves are confirmed again"
-            ),
+                why = %why,
+                "turso.sync moves are confirmed again"
+            );
+        } else {
+            tracing::error!(
+                event = "turso.sync.moves_refused",
+                unpushed,
+                why = %why,
+                "turso.sync moves are refused as not durable until a push catches up"
+            );
         }
     }
+}
+
+fn why_refused(waited: Duration, budget: Duration) -> String {
+    format!(
+        "the remote copy has lacked a confirmed move for {} s, past the {} s budget",
+        waited.as_secs(),
+        budget.as_secs()
+    )
 }
 
 #[cfg(test)]

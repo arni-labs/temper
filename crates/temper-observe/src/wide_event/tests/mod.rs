@@ -406,3 +406,44 @@ fn test_emit_span_all_event_kinds() {
         emit_metrics(event);
     }
 }
+
+#[test]
+fn a_store_that_stops_confirming_moves_reports_a_failure_and_one_that_resumes_success() {
+    let refusing = from_durability_change(DurabilityChangeInput {
+        database: "/data/app.db",
+        guard: "push_budget",
+        confirming: false,
+        why: "the remote copy has lacked a confirmed move for 21 s",
+        unpushed_moves: 4,
+        oldest_wait_ms: 21_000,
+        budget_ms: 20_000,
+    });
+    assert_eq!(refusing.event_kind, EventKind::Durability);
+    assert_eq!(
+        (refusing.from_status.as_str(), refusing.to_status.as_str()),
+        ("confirming", "refusing")
+    );
+    assert!(!refusing.success);
+    assert_eq!(
+        refusing.attributes["error.message"],
+        "the remote copy has lacked a confirmed move for 21 s"
+    );
+    assert_eq!(refusing.measurements["oldest_wait_ms"], 21_000.0);
+    assert!(
+        !refusing.tags.contains_key("database"),
+        "a path is no metric tag"
+    );
+
+    let confirming = from_durability_change(DurabilityChangeInput {
+        database: "/data/app.db",
+        guard: "push_budget",
+        confirming: true,
+        why: "a push caught up",
+        unpushed_moves: 0,
+        oldest_wait_ms: 0,
+        budget_ms: 20_000,
+    });
+    assert!(confirming.success);
+    assert_eq!(confirming.to_status, "confirming");
+    assert!(!confirming.attributes.contains_key("error.message"));
+}

@@ -8,6 +8,7 @@ description = "Turso storage backend for Temper entity services"
 
 [dependencies]
 temper-runtime = { workspace = true }
+temper-observe = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 turso = { version = "=0.7.2", default-features = false, features = ["sync"] }

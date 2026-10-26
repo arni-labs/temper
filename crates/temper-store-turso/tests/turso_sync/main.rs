@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use support::*;
 
-use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
+use temper_runtime::persistence::EventStore;
+use temper_store_turso::{CopyState, PUSH_LAG_BUDGET, SyncCopy, TursoEventStore};
 
 #[tokio::test]
 async fn a_pushed_write_is_restored_on_a_fresh_machine_and_an_unpushed_one_is_not() {
@@ -333,6 +334,63 @@ async fn push_lag_rises_while_the_remote_is_down_and_falls_to_zero_once_it_retur
     let (_b_dir, b_path) = machine();
     let b = server.open(&b_path).await;
     assert_eq!(count(&b, "l1").await, 4, "the backup caught up");
+}
+
+#[tokio::test]
+async fn a_move_is_refused_once_an_unpushed_one_waited_past_the_budget_until_a_push_carries_it() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let outage = Outage::new(&server.url).await;
+    let (_a_dir, a_path) = machine();
+    let a = TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &outage.url, TOKEN)
+        .await
+        .expect("open through the outage");
+    let copy = a.sync_copy().expect("copy").clone();
+    write(&a, "g1", 0).await;
+    push(&a).await;
+
+    outage.down();
+    write(&a, "g1", 1).await;
+    copy.push_committed().await.expect_err("the remote is down");
+    write(&a, "g1", 2).await;
+    assert!(
+        !copy.refusing_moves(),
+        "within the budget moves are confirmed"
+    );
+
+    past_the_budget().await;
+    let refused = a
+        .append("default:Note:g1", 3, &[event(4)])
+        .await
+        .expect_err("a confirmed move has waited past the budget");
+    assert!(refused.to_string().contains("not durable"), "{refused}");
+    let status = copy.backup_status().await.expect("status");
+    assert!(status.refusing_moves, "{status:?}");
+    assert_eq!(count(&a, "g1").await, 3, "a refused move writes nothing");
+
+    outage.back();
+    copy.push_committed().await.expect("the remote is back");
+    assert!(
+        !copy.refusing_moves(),
+        "the push carried every waiting move"
+    );
+    write(&a, "g1", 3).await;
+    let (_b_dir, b_path) = machine();
+    push(&a).await;
+    let b = server.open(&b_path).await;
+    assert_eq!(
+        count(&b, "g1").await,
+        4,
+        "every confirmed move reached the remote"
+    );
+}
+
+/// Moves the clock past the push-lag budget without waiting it out.
+async fn past_the_budget() {
+    tokio::time::pause();
+    tokio::time::advance(PUSH_LAG_BUDGET + Duration::from_secs(1)).await;
+    tokio::time::resume();
 }
 
 #[tokio::test]
