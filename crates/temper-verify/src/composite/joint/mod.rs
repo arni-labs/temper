@@ -184,7 +184,7 @@ impl fmt::Display for JointInvariantResult {
             }
             JointOutcome::Vacuous { premise } => write!(
                 f,
-                "{}.{} PROVES NOTHING: its premise `{premise}` holds in no settled state of the {} joint states walked ({scope})",
+                "{}.{} CHECKS NOTHING AS WRITTEN: its premise `{premise}` holds in no settled state of the {} joint states walked ({scope})",
                 self.entity, self.invariant, self.states
             ),
             JointOutcome::Incomplete { reason } => write!(

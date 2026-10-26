@@ -290,7 +290,7 @@ impl JointModel {
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()
-            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_none()))
+            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_empty()))
             .map(|((entity, _), _)| entity)
             .collect();
         let unsent = models
@@ -341,7 +341,7 @@ impl JointModel {
             let open = state
                 .calls
                 .iter()
-                .any(|call| &call.to == entity && call.on_success.is_none());
+                .any(|call| &call.to == entity && call.on_success.is_empty());
             for (index, sender) in ways {
                 let t = &self.models[entity].transitions[*index];
                 if (open || !matches!(sender, Unsent::Answer))

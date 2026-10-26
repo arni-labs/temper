@@ -192,7 +192,7 @@ impl fmt::Display for JointLivenessResult {
             }
             LivenessOutcome::Vacuous { premise } => write!(
                 f,
-                "{}.{} PROVES NOTHING: its premise `{premise}` holds in none of the {} joint states walked ({scope}{relying}{bound})",
+                "{}.{} CHECKS NOTHING AS WRITTEN: its premise `{premise}` holds in none of the {} joint states walked ({scope}{relying}{bound})",
                 self.entity, self.name, self.states
             ),
             LivenessOutcome::Incomplete { reason } => write!(
