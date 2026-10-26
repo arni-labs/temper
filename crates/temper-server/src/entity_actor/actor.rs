@@ -602,7 +602,6 @@ impl EntityActor {
     /// as a spawned child's id), and its params. Replay mints, spawns, schedules
     /// and calls out nothing. Events journaled before outcomes were recorded
     /// re-derive their effects from the `TransitionTable`, minting nothing.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn replay_events(
         table: &TransitionTable,
         store: &BoxedEventStore,
@@ -610,9 +609,9 @@ impl EntityActor {
         state: &mut EntityState,
         tenant: &str,
         blob_store: Option<&crate::blob_store::BlobStore>,
-        replay_policy: ReplayPolicy,
-        logging: ReplayLogging,
+        replay_options: (ReplayPolicy, ReplayLogging),
     ) -> Result<(), ActorError> {
+        let (replay_policy, logging) = replay_options;
         // Keep failures visible for both callers; only successful replay
         // diagnostics are reduced during a record walk.
         macro_rules! replay_log {
@@ -1027,8 +1026,7 @@ pub(crate) async fn recover_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictSnapshot,
-        ReplayLogging::Actor,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
     )
     .await?;
     Ok(state)
@@ -1054,8 +1052,7 @@ pub(crate) async fn recover_entity_state_for_walk(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictSnapshot,
-        ReplayLogging::Walk,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Walk),
     )
     .await?;
     Ok(state)
@@ -1086,8 +1083,7 @@ pub(crate) async fn recover_authoritative_entity_state_from_store(
         &mut state,
         tenant,
         blob_store,
-        ReplayPolicy::StrictFullJournal,
-        ReplayLogging::Actor,
+        (ReplayPolicy::StrictFullJournal, ReplayLogging::Actor),
     )
     .await?;
     Ok(state)
@@ -1477,8 +1473,7 @@ impl Actor for EntityActor {
                                         state,
                                         &self.tenant,
                                         self.blob_store.as_ref(),
-                                        ReplayPolicy::StrictSnapshot,
-                                        ReplayLogging::Actor,
+                                        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
                                     )
                                     .await?;
 

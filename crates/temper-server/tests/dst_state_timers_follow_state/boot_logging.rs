@@ -54,25 +54,29 @@ fn boot_logs_scale_with_types_and_export_summary() {
         .build();
     let lines = Lines::default();
     let debug_lines = Lines::default();
-    let subscriber = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(debug_lines.clone())
-                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    let capture = || {
+        tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(debug_lines.clone())
+                        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(lines.clone())
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                )
+                .with(
+                    opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                        &provider,
+                    )
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                ),
         )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(lines.clone())
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        )
-        .with(
-            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider)
-                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-        );
-
-    let dispatch = tracing::Dispatch::new(subscriber);
+    };
     let mut line_counts = Vec::new();
     for records in [4, 256] {
         let clock = Arc::new(ProcessClock::new());
@@ -132,6 +136,9 @@ fn boot_logs_scale_with_types_and_export_summary() {
         first.kill(&world, Duration::ZERO);
         lines.0.lock().unwrap().clear();
         debug_lines.0.lock().unwrap().clear();
+        // Register after the unobserved setup boot so per-layer callsite
+        // interests are rebuilt for the subscriber used by the measured boot.
+        let dispatch = capture();
         let _logs = tracing::dispatcher::set_default(&dispatch);
         let second = Process::start(&world, JOB_V1, &job_untimed(), "logging-second");
         let captured: Vec<Value> = lines
@@ -155,7 +162,8 @@ fn boot_logs_scale_with_types_and_export_summary() {
                     |line| line["fields"]["message"] == "state timers follow the records' states"
                 )
                 .count(),
-            2
+            2,
+            "captured boot logs: {captured:?}"
         );
         assert_eq!(
             captured

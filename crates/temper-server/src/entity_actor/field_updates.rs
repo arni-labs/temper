@@ -276,8 +276,7 @@ async fn catch_up(
         &mut caught_up,
         &actor.tenant,
         actor.blob_store.as_ref(),
-        ReplayPolicy::StrictSnapshot,
-        ReplayLogging::Actor,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
     )
     .await
     .map_err(|e| format!("conflict recovery replay failed: {e}"))?;
