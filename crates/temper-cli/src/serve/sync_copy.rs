@@ -3,10 +3,11 @@
 //! With `TURSO_SYNC_URL` set, the database stays a local file and every
 //! request that can change it is answered only after its changes reach the
 //! remote copy. Requests that finish together share one push. A background
-//! loop also pushes changes no request waits for (timers, reactions), keeps
-//! the local write-ahead log short, and checks a file the start could not
-//! check. While writes cannot be confirmed, requests that can change data are
-//! refused before they run and reads are served as usual.
+//! loop also pushes changes no request waits for (timers, reactions), trims
+//! the change log the remote has confirmed, keeps the local write-ahead log
+//! short, and checks a file the start could not check. While writes cannot
+//! be confirmed, requests that can change data are refused before they run
+//! and reads are served as usual.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,11 @@ const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
 
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Trimming each upkeep tick. With the 1 s tick, a long confirmed change
+/// log is cleared in about half the loop's time, in batches short enough
+/// that writes waiting behind one barely notice.
+const TRIM_BUDGET: Duration = Duration::from_secs(1);
 
 /// Checkpoint the local log once it passes this size. Turso Sync turns the
 /// engine's automatic checkpoints off.
@@ -164,6 +170,9 @@ fn spawn_upkeep(copy: SyncCopy) {
                     "turso.sync pushes keep timing out; exiting so the restart opens a fresh connection"
                 );
                 std::process::exit(75);
+            }
+            if let Err(error) = copy.trim_pushed(TRIM_BUDGET).await {
+                tracing::warn!(%error, "turso.sync could not trim the change log; the next tick will");
             }
             if let Err(error) = copy.checkpoint_if_wal_over(MAX_WAL_BYTES).await {
                 tracing::warn!(%error, "turso.sync checkpoint failed");
