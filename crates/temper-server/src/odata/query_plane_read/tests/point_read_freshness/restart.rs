@@ -1,6 +1,7 @@
 //! A process exit after the event commits must not leave a cold record stale.
 use super::*;
 
+mod retired_type;
 mod unavailable_type;
 use crate::storage::{BackendLabel, BoxedEventStore, StateTimerStore};
 use std::collections::BTreeMap;

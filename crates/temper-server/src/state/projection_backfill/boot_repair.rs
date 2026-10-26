@@ -41,6 +41,17 @@ impl ServerState {
             };
             {
                 let mut registry = self.registry.write().expect("registry lock poisoned");
+                // Replace-mode installs retire a type's spec and routes but keep
+                // its journal and catalog. Those histories no longer serve.
+                // Keep types still exposed by CSDL even if their spec failed to
+                // restore: they must withhold the tenant below, not serve stale rows.
+                pending.retain(|candidate| {
+                    let entity_type = &candidate.journal.entity_type;
+                    registry.get_tenant(&tenant).is_some_and(|config| {
+                        config.entities.contains_key(entity_type)
+                            || config.entity_set_map.values().any(|ty| ty == entity_type)
+                    }) || self.transition_tables.contains_key(entity_type)
+                });
                 // Match transition_table_for's registry and legacy table lookup.
                 if let Some(candidate) = pending.iter().find(|candidate| {
                     registry
