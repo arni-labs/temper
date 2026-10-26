@@ -381,7 +381,10 @@ pub(crate) fn process_action_with_xref_and_field_mode(
             let sanitized_params = sanitize_action_params(effective_params.as_ref());
             let params = sanitized_params.as_ref();
 
-            let invariants = InvariantsBefore::of(state, table, related);
+            let invariants = match InvariantsBefore::of(state, table, related, comparison_fields) {
+                Ok(before) => before,
+                Err(error) => return ProcessResult::refused(error),
+            };
             let start = MoveStart::of(state);
             let (
                 (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests),
@@ -401,11 +404,18 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 field_sync_mode,
                 Some(&table.state_var_metadata),
             );
-            if let Some((error, refusal)) =
-                invariants.and_then(|before| before.refusal(state, table, related, action))
-            {
-                start.restore(state);
-                return ProcessResult::refused_with(error, Some(refusal));
+            if let Some(before) = invariants {
+                match before.refusal(state, table, related, action, &overflow_blobs) {
+                    Ok(Some((error, refusal))) => {
+                        start.restore(state);
+                        return ProcessResult::refused_with(error, Some(refusal));
+                    }
+                    Err(error) => {
+                        start.restore(state);
+                        return ProcessResult::refused(error);
+                    }
+                    Ok(None) => {}
+                }
             }
 
             // Resolve deferred schedule_at requests now that fields are synced

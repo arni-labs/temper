@@ -208,15 +208,11 @@ impl SimActorHandler for EntityActorHandler {
         self.related = refs
             .into_iter()
             .map(|(entity_type, id_field)| {
-                let ids: Vec<&str> = match self.state.fields.get(&id_field) {
-                    Some(serde_json::Value::Array(items)) => items
-                        .iter()
-                        .filter_map(|item| item.as_str())
-                        .filter(|id| !id.is_empty())
-                        .collect(),
-                    Some(serde_json::Value::String(id)) if !id.is_empty() => vec![id.as_str()],
-                    _ => Vec::new(),
-                };
+                let ids = super::related::reference_ids(
+                    &self.state.fields,
+                    &self.table.initial_values,
+                    &id_field,
+                );
                 let resolved = ids
                     .into_iter()
                     .map(|id| statuses.get(&(entity_type.clone(), id.to_owned())).cloned())
@@ -296,3 +292,7 @@ impl SimActorHandler for EntityActorHandler {
 #[cfg(test)]
 #[path = "sim_handler_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sim_invariants_test.rs"]
+mod invariant_tests;

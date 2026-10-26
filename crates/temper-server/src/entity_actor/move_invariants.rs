@@ -2,6 +2,10 @@
 //! ([`temper_jit::table::invariant`]): refuse a move that would break one that
 //! held, and warn about those the record already breaks.
 
+use futures_util::FutureExt;
+use serde_json::Value;
+use std::collections::BTreeMap;
+
 use temper_jit::table::{EvalContext, Refusal, RelatedMap, TransitionTable};
 use temper_spec::predicate::Name;
 
@@ -11,6 +15,8 @@ use super::types::EntityState;
 pub(super) struct InvariantsBefore {
     status: String,
     ctx: EvalContext,
+    /// Stored representations replaced by verified logical values.
+    stored_blobs: BTreeMap<String, Value>,
 }
 
 impl InvariantsBefore {
@@ -20,11 +26,27 @@ impl InvariantsBefore {
         state: &EntityState,
         table: &TransitionTable,
         related: &RelatedMap,
-    ) -> Option<Self> {
-        (!table.invariants.is_empty()).then(|| Self {
+        logical_fields: Option<&Value>,
+    ) -> Result<Option<Self>, String> {
+        if table.invariants.is_empty() {
+            return Ok(None);
+        }
+        let mut ctx = invariant_context(state, table, related);
+        let mut stored_blobs = BTreeMap::new();
+        for (name, value) in &mut ctx.fields {
+            if let Some(logical) = logical_fields.and_then(|fields| fields.get(name))
+                && value != logical
+            {
+                stored_blobs.insert(name.clone(), value.clone());
+                *value = logical.clone();
+            }
+        }
+        resolve_pending_fields(&mut ctx, &[])?;
+        Ok(Some(Self {
             status: state.status.clone(),
-            ctx: invariant_context(state, table, related),
-        })
+            ctx,
+            stored_blobs,
+        }))
     }
 
     /// Why the move that left `state` must be refused: it broke an invariant
@@ -36,8 +58,19 @@ impl InvariantsBefore {
         table: &TransitionTable,
         related: &RelatedMap,
         action: &str,
-    ) -> Option<(String, Refusal)> {
-        let after = invariant_context(state, table, related);
+        pending_blobs: &[crate::blobs::OverflowBlobWrite],
+    ) -> Result<Option<(String, Refusal)>, String> {
+        let mut after = invariant_context(state, table, related);
+        // Reuse verified prestate bytes only while the stored value is unchanged.
+        // New references must resolve from this move's pending writes.
+        for (name, stored) in &self.stored_blobs {
+            if after.fields.get(name) == Some(stored) {
+                after
+                    .fields
+                    .insert(name.clone(), self.ctx.fields[name].clone());
+            }
+        }
+        resolve_pending_fields(&mut after, pending_blobs)?;
         let across =
             table.invariants_across_move((&self.status, &self.ctx), (&state.status, &after));
         if let Some((invariant, failure)) = across.broken {
@@ -53,14 +86,14 @@ impl InvariantsBefore {
                     .collect();
                 message.push_str(&format!(" ({})", found.join(", ")));
             }
-            return Some((
+            return Ok(Some((
                 message,
                 Refusal::InvariantViolated {
                     invariant: invariant.name.clone(),
                     assert: failure.expr,
                     conditions: failure.conditions,
                 },
-            ));
+            )));
         }
         for (invariant, failure) in across.already_broken {
             tracing::warn!(
@@ -73,8 +106,41 @@ impl InvariantsBefore {
                 "record already breaks this invariant, so the move was not held to it"
             );
         }
-        None
+        Ok(None)
     }
+}
+
+/// Hydrate locally generated writes through the same verified decoder as stored
+/// blobs. With no external store this future always completes synchronously.
+fn resolve_pending_fields(
+    ctx: &mut EvalContext,
+    pending: &[crate::blobs::OverflowBlobWrite],
+) -> Result<(), String> {
+    // Primitive values cannot contain references; keep the ordinary inline
+    // move free of hydration allocations.
+    if ctx
+        .fields
+        .values()
+        .all(|value| !value.is_object() && !value.is_array())
+    {
+        return Ok(());
+    }
+    let mut fields = Value::Object(std::mem::take(&mut ctx.fields).into_iter().collect());
+    let result = crate::blobs::hydrate_comparison_fields(
+        &crate::blobs::BlobReadSource::Staged {
+            store: None,
+            legacy: None,
+            blobs: pending,
+        },
+        &mut fields,
+    )
+    .now_or_never()
+    .expect("invariant pending blob reads must be memory-only");
+    let Value::Object(fields) = fields else {
+        unreachable!("hydration preserves the selected fields object")
+    };
+    ctx.fields = fields.into_iter().collect();
+    result
 }
 
 /// The values the type's invariants read from `state`, and nothing else: a
@@ -93,9 +159,11 @@ fn invariant_context(
             let Name::Var(var) = name else { return };
             if let Some(value) = state.counters.get(var) {
                 ctx.counters.insert(var.to_string(), *value);
-            } else if var == "items" {
-                // The legacy item count; a counter named `items` wins.
-                ctx.counters.insert(var.to_string(), state.item_count);
+            } else if var == "items"
+                && let Some(items) = super::effects::stored_item_count(state, &table.initial_values)
+            {
+                // A missing legacy count must leave declared defaults visible.
+                ctx.counters.insert(var.to_string(), items);
             } else if let Some(value) = state.booleans.get(var) {
                 ctx.booleans.insert(var.to_string(), *value);
             } else if let Some(value) = state.lists.get(var) {
