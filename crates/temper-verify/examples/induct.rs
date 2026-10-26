@@ -130,9 +130,6 @@ fn main() -> std::io::Result<()> {
         for reason in &proof.unheld {
             writeln!(out, "  the rule reads {reason}")?;
         }
-        for effect in &proof.unmodelled {
-            writeln!(out, "  not modelled, so not a proof: {effect}")?;
-        }
         for limit in &proof.limits {
             writeln!(out, "  limit: {limit}")?;
         }

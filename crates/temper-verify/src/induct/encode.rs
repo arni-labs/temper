@@ -397,7 +397,11 @@ pub(super) fn prelude(v: &Vocab<'_>, literals: &BTreeSet<String>) -> String {
             out.push_str(&format!(
                 "(define-fun {frame}.has.{k} ((m Msg/{k})) Bool (> (select {frame}.pend.{k} m) 0))\n"
             ));
-            if v.kinds.iter().any(|kind| kind.name == k) {
+            let kind = v.kinds.iter().find(|kind| kind.name == k);
+            if kind.is_some_and(|kind| kind.scheduled) {
+                continue;
+            }
+            if kind.is_some() {
                 settled.push(format!(
                     "(= {frame}.pend.{k} ((as const (Array Msg/{k} Int)) 0))"
                 ));
@@ -406,7 +410,8 @@ pub(super) fn prelude(v: &Vocab<'_>, literals: &BTreeSet<String>) -> String {
         }
         // An invariant is read where no dispatch is in flight; an
         // `eventually` where nothing is, calls included (the joint walk's
-        // settled state).
+        // settled state). A scheduled action may wait as long as a state
+        // timer, so a record waiting for one is both.
         out.push_str(&format!(
             "(define-fun {frame}.settled () Bool (and true {}))\n(define-fun {frame}.quiet () Bool (and true {}))\n",
             settled.join(" "),

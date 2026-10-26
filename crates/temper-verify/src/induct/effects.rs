@@ -9,7 +9,7 @@ use temper_spec::predicate::{Arg, AssignOp, Effect};
 
 use super::encode::Enc;
 use super::moves::{Moves, Param};
-use super::vocab::Sort;
+use super::vocab::{Sort, scheduled};
 
 impl Moves<'_, '_, '_> {
     /// `entity`'s record after `action`: the string parameters it is passed
@@ -87,13 +87,17 @@ impl Moves<'_, '_, '_> {
                             .insert(format!("{entity}.{}: list {list}", action.name));
                     }
                 }
-                // A scheduled action or a spawned record is a move the
-                // proof does not make, so it cannot stand for the walk.
-                other => {
-                    self.unmodelled
-                        .borrow_mut()
-                        .insert(format!("{entity}.{}: effect {other}", action.name));
+                // The child's id, fresh or passed: any string. Its first
+                // action is a move of its own (`Moves::all`).
+                Effect::Spawn {
+                    store_id_in: Some(field),
+                    ..
+                } if v.var(entity, field) == Some(Sort::Str) => {
+                    terms.insert(field.clone(), self.enc.fresh("spawned", "Str"));
                 }
+                Effect::Spawn { .. } => {}
+                // Armed as the move commits (`Moves::sends`).
+                Effect::Schedule { .. } | Effect::ScheduleAt { .. } => {}
             }
         }
         for (var, term) in terms {
@@ -107,7 +111,7 @@ impl Moves<'_, '_, '_> {
     }
 
     /// The dispatches and module calls `action`'s triggers put in flight,
-    /// read from the record as it committed.
+    /// read from the record as it committed, and the actions it schedules.
     pub(super) fn sends(
         &self,
         entity: &str,
@@ -116,6 +120,7 @@ impl Moves<'_, '_, '_> {
         changed: &mut BTreeMap<String, String>,
     ) {
         let v = self.enc.v;
+        let mut started: Vec<(String, String, Option<String>)> = Vec::new();
         for trigger in &action.triggers {
             let (name, args): (&str, Vec<String>) = if let Some(call) = v.call_of(entity, trigger) {
                 let asked = call
@@ -146,6 +151,21 @@ impl Moves<'_, '_, '_> {
                 .guard
                 .as_ref()
                 .map(|guard| self.enc.expr(guard, entity, "post"));
+            started.push((name.to_string(), msg, fires));
+        }
+        for effect in &action.effect {
+            let Some(kind) =
+                scheduled(effect).and_then(|s| v.scheduled_kind(entity, &action.name, s))
+            else {
+                continue;
+            };
+            // `schedule_at` arms only when its field holds a timestamp,
+            // which the proof does not know.
+            let fires = matches!(effect, Effect::ScheduleAt { .. })
+                .then(|| self.enc.fresh("armed", "Bool"));
+            started.push((kind.name.clone(), format!("mk/{}", kind.name), fires));
+        }
+        for (name, msg, fires) in started {
             for (part, add) in [
                 (
                     "pend",

@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Effect, Expr, Name};
+use temper_spec::predicate::{Expr, Name};
 
 use encode::{Enc, initial, prelude};
 use guess::Guess;
@@ -146,7 +146,6 @@ pub fn prove_some(
                         scope: BTreeSet::from([owner.to_string()]),
                         obligations: Vec::new(),
                         limits: Vec::new(),
-                        unmodelled: Vec::new(),
                         unheld: BTreeSet::new(),
                         found: Vec::new(),
                         premise_excluded: false,
@@ -395,27 +394,12 @@ fn prove_one(
             .into_iter()
             .map(|reason| format!("a guard, effect or reaction reads {reason}")),
     );
-    let mut unmodelled: Vec<String> = builder.unmodelled.into_inner().into_iter().collect();
-    // A record of the scope spawned from outside it is made by a move the
-    // proof does not make either.
-    for (source, automaton) in by_name.iter().filter(|(n, _)| !scope.contains(**n)) {
-        for action in &automaton.actions {
-            for effect in &action.effect {
-                if let Effect::Spawn { entity_type, .. } = effect
-                    && scope.contains(entity_type)
-                {
-                    unmodelled.push(format!("{source}.{}: effect {effect}", action.name));
-                }
-            }
-        }
-    }
     Ok(RuleProof {
         owner: owner.to_string(),
         rule: rule.to_string(),
         scope,
         obligations,
         limits,
-        unmodelled,
         unheld,
         found,
         premise_excluded,

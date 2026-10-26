@@ -327,15 +327,78 @@ fn a_rule_without_a_premise_has_none_to_meet() {
     assert!(!verdict.to_string().contains("premise"), "{verdict}");
 }
 
+/// An action nothing outside may send: a closed parent unlocks.
+const UNLOCK: &str = r#"
+[[action]]
+name = "Unlock"
+kind = "internal"
+from = ["Closed"]
+to = "Closed"
+effect = ["locked = false"]
+"#;
+
+/// An action nothing outside may send: an open parent closes unlocked.
+const FORCE: &str = r#"
+[[action]]
+name = "Force"
+kind = "internal"
+from = ["Open"]
+to = "Closed"
+"#;
+
+/// A type outside the rule's scope whose move spawns a parent and runs
+/// `first` on it.
+fn maker(first: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Maker"
+states = ["Idle"]
+initial = "Idle"
+
+[[action]]
+name = "Make"
+kind = "input"
+from = ["Idle"]
+to = "Idle"
+effect = ["spawn('Parent', '{first}')"]
+"#
+    )
+}
+
 #[test]
-fn a_scheduled_move_is_not_a_proof() {
-    let scheduled = parent(", \"schedule('Close', 60)\"");
-    let verdict = invariant(&[&scheduled, &child(&[LOCKED_PAST_OPEN])], budget());
+fn a_scheduled_action_fires_in_the_proof() {
+    let closes_itself = parent(", \"schedule('Close', 60)\"");
+    let verdict = invariant(&[&closes_itself, &child(&[LOCKED_PAST_OPEN])], budget());
+    assert!(matches!(&verdict, JointVerdict::Proved(..)), "{verdict}");
+    // Closing schedules an unlock a minute later, which breaks the rule.
+    let unlocks = format!(
+        "{}effect = [\"schedule('Unlock', 60)\"]\n{UNLOCK}",
+        parent("")
+    );
+    let verdict = invariant(&[&unlocks, &child(&[LOCKED_PAST_OPEN])], budget());
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
-        panic!("walked with the proof that did not count: {verdict}");
+        panic!("proved without the scheduled unlock: {verdict}");
     };
     let why = tried.shortfall().expect("not proved");
-    assert!(why.contains("makes a move the proof does not"), "{why}");
+    assert!(why.contains("after Parent.Unlock.scheduled fires"), "{why}");
+}
+
+#[test]
+fn a_spawned_records_first_action_is_a_move_of_the_proof() {
+    let rule = child(&[LOCKED_PAST_OPEN]);
+    let parent = format!("{}{FORCE}", parent(""));
+    let verdict = invariant(&[&parent, &rule, &maker("Seal")], budget());
+    assert!(matches!(&verdict, JointVerdict::Proved(..)), "{verdict}");
+    let verdict = invariant(&[&parent, &rule, &maker("Force")], budget());
+    let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
+        panic!("proved without the spawn's first action: {verdict}");
+    };
+    let why = tried.shortfall().expect("not proved");
+    assert!(
+        why.contains("after Parent.Force (a spawn from Maker.Make)"),
+        "{why}"
+    );
 }
 
 #[test]
