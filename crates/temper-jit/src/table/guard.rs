@@ -161,6 +161,15 @@ pub fn check_detailed(
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
+            // Refused in guards at load (validate_predicates).
+            Name::CrossField {
+                entity_type,
+                id_field,
+                field,
+            } => (
+                format!("{entity_type}[{id_field}].{field}"),
+                "?".to_string(),
+            ),
         };
         if !found.iter().any(|(existing, _)| *existing == label) {
             found.push((label, value));
@@ -286,6 +295,7 @@ fn to_json(value: Val<'_>) -> serde_json::Value {
         Val::Num(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 => (n as i64).into(),
         Val::Num(n) => serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, Into::into),
         Val::Str(s) => s.into(),
+        Val::Symbol(n) => serde_json::json!({ "symbol": n }),
         Val::Strs(items) => items.to_vec().into(),
         Val::Json(json) => json.clone(),
     }
@@ -298,6 +308,7 @@ fn render(value: Val<'_>) -> String {
         Val::Bool(b) => b.to_string(),
         Val::Num(n) => n.to_string(),
         Val::Str(s) => s.to_string(),
+        Val::Symbol(n) => format!("<symbol:{n}>"),
         Val::Strs(items) => format!("[{}]", items.join(", ")),
         Val::Json(json) => json.to_string(),
     }

@@ -6,7 +6,10 @@
 
 use stateright::{Model, Property};
 
-use super::semantics::{apply_effects, evaluate_guard, guard_may_hold, successors, truth};
+use super::semantics::{
+    apply_effects, apply_string_params, canonical_strings, evaluate_guard, guard_may_hold,
+    successors, truth,
+};
 use temper_spec::predicate::Truth;
 
 use super::types::{
@@ -147,6 +150,7 @@ impl Model for TemperModel {
             counters: self.initial_counters.clone(),
             booleans: self.initial_booleans.clone(),
             lists: self.initial_lists.clone(),
+            strings: self.initial_strings.clone(),
         }]
     }
 
@@ -182,6 +186,8 @@ impl Model for TemperModel {
         let mut next = state.clone();
         next.status = new_status;
         apply_effects(&resolved.effects, &mut next, &action.name, &action.params);
+        apply_string_params(&resolved.string_params, &mut next, &action.params);
+        canonical_strings(&mut [&mut next.strings]);
         Some(next)
     }
 

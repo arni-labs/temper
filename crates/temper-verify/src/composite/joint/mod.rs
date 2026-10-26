@@ -1,0 +1,485 @@
+//! Invariants over several entities.
+//!
+//! An `[[invariant]]` may read a related entity: its status
+//! (`Type[id].status`) or a field (`Type[id].field`). One entity's model
+//! cannot know those values, so the per-entity cascade reads them as unknown
+//! and never fails on them. They are checked here, on the joint state of the
+//! invariant's entity and every type it names, one record of each, run the
+//! way the runtime runs them:
+//!
+//! - every action of every entity in scope is offered, as in the per-entity
+//!   model, with its guard resolved against the joint state;
+//! - each record has an id, and a reference finds a record only when its id
+//!   field holds that record's id; walks start from every way the records'
+//!   ids can be equal or differ, so a design that works only when two ids
+//!   happen to match is found;
+//! - an action whose guard reads a related record (`Type[id].status`)
+//!   reads it on the dispatch path and is written later by its record's
+//!   actor, which checks only its own state; other moves can land in
+//!   between;
+//! - an entity reaction is a dispatch of its own, sent after its source
+//!   commits with `args` copied from the source as committed, and taken by
+//!   its target later, in any order with other dispatches;
+//! - string variables are tracked as symbols (equality only) when an
+//!   invariant reads them, when a reference uses them as an id, or when
+//!   their value reaches one that is read
+//!   ([`crate::model::build_model_tracking`]);
+//! - each entity is sliced to what the invariants depend on: a counter,
+//!   boolean or list nothing read can be influenced by is dropped, and a
+//!   guard that read it becomes a free choice. That only adds behaviour, so
+//!   an invariant that holds here holds in the full model; a broken one
+//!   comes with the path that breaks it, to read against the spec.
+//!
+//! Records disagree while a dispatch is on its way, so invariants are
+//! checked in settled states: those with nothing in flight. The walk is
+//! breadth first, so each broken invariant's path is a shortest one. A walk
+//! that runs out of its [`Budget`] says so and is never a pass.
+//!
+//! The drop check (ADR-0150, [`dropped_reactions`]) walks the same model over
+//! a whole trigger-graph component, unsliced, one record of each type that
+//! every reference finds, with a move's dispatches landing before the next
+//! move from outside, and names each reaction a target refuses.
+
+mod env;
+mod model;
+mod slice;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use temper_spec::automaton::Automaton;
+use temper_spec::predicate::{Expr, Truth, eval};
+
+use crate::Budget;
+use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
+
+pub use model::DroppedReaction;
+pub(crate) use model::dropped_reactions;
+use model::{JointModel, Move};
+
+/// The records in scope, one per type, and the dispatches on their way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JointState {
+    /// Each type's record.
+    pub records: BTreeMap<String, TemperModelState>,
+    /// Dispatches sent and not yet taken, sorted; the same dispatch may be
+    /// in flight twice.
+    pub inflight: Vec<Dispatch>,
+}
+
+/// A dispatch on its way to a record's actor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Dispatch {
+    /// The target entity type.
+    pub to: String,
+    /// The action.
+    pub action: String,
+    /// The transition's target status, when the sender chose one.
+    pub target_state: Option<String>,
+    /// The parameters sent; a reaction's are its `args` as the source
+    /// committed them.
+    pub params: BTreeMap<String, ParamValue>,
+    /// Whether the dispatch path has read the related records it needs.
+    pub read: bool,
+    /// The reaction depth that sent it (0 for a request from outside).
+    pub depth: u32,
+    /// The reaction that sent it, by its place among the model's reactions;
+    /// `None` for a request from outside.
+    pub via: Option<usize>,
+}
+
+impl fmt::Display for Dispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let action = TemperModelAction {
+            name: self.action.clone(),
+            target_state: None,
+            params: self.params.clone(),
+        };
+        write!(f, "{}.{action}", self.to)?;
+        if !self.read {
+            f.write_str(" (unread)")?;
+        }
+        Ok(())
+    }
+}
+
+/// What the joint check found for one invariant.
+#[derive(Debug, Clone)]
+pub struct JointInvariantResult {
+    /// The entity type that declares the invariant.
+    pub entity: String,
+    /// The invariant's name.
+    pub invariant: String,
+    /// Its assertion, as written.
+    pub assert: String,
+    /// The entity types composed to check it.
+    pub scope: Vec<String>,
+    /// Distinct joint states walked.
+    pub states: usize,
+    /// When the walk held a move back because it would have put more than
+    /// this many dispatches in flight: what it found holds only up to that.
+    pub in_flight_bound: Option<usize>,
+    /// Holds, broken (with a shortest path), or not fully checked.
+    pub outcome: JointOutcome,
+}
+
+impl JointInvariantResult {
+    /// Whether the invariant was checked over every reachable joint state and
+    /// held in all of them.
+    pub fn holds(&self) -> bool {
+        matches!(self.outcome, JointOutcome::Holds)
+    }
+}
+
+/// The outcome of checking one invariant on the joint model.
+#[derive(Debug, Clone)]
+pub enum JointOutcome {
+    /// It held in every reachable joint state.
+    Holds,
+    /// A reachable joint state breaks it. `path` starts at the initial joint
+    /// state; each later step names the move that led to it.
+    Broken {
+        /// The moves and the joint states they reach.
+        path: Vec<JointStep>,
+    },
+    /// The walk stopped before every state was seen, or could not start.
+    Incomplete {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// One step of a counterexample path.
+#[derive(Debug, Clone)]
+pub struct JointStep {
+    /// The move, `Entity.Action(params) -> Status`; `None` for the start.
+    pub action: Option<String>,
+    /// The joint state after it.
+    pub state: String,
+}
+
+impl fmt::Display for JointInvariantResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scope = self.scope.join(" + ");
+        match &self.outcome {
+            JointOutcome::Holds => {
+                write!(
+                    f,
+                    "{}.{} HOLDS over {} joint states ({scope}",
+                    self.entity, self.invariant, self.states
+                )?;
+                match self.in_flight_bound {
+                    Some(bound) => write!(f, "; with at most {bound} dispatches in flight)"),
+                    None => f.write_str(")"),
+                }
+            }
+            JointOutcome::Broken { path } => {
+                writeln!(
+                    f,
+                    "{}.{} BROKEN after {} moves ({scope}, {} joint states walked): {}",
+                    self.entity,
+                    self.invariant,
+                    path.len().saturating_sub(1),
+                    self.states,
+                    self.assert
+                )?;
+                for step in path {
+                    match &step.action {
+                        Some(action) => writeln!(f, "  {action}\n      {}", step.state)?,
+                        None => writeln!(f, "  start\n      {}", step.state)?,
+                    }
+                }
+                Ok(())
+            }
+            JointOutcome::Incomplete { reason } => write!(
+                f,
+                "{}.{} NOT CHECKED ({scope}, {} joint states walked): {reason}",
+                self.entity, self.invariant, self.states
+            ),
+        }
+    }
+}
+
+/// Check every `[[invariant]]` in `automatons` that reads a related entity,
+/// on the joint model of its entity and the types it names.
+pub fn verify_joint_invariants(
+    automatons: &[&Automaton],
+    budget: Budget,
+) -> Vec<JointInvariantResult> {
+    let by_name: BTreeMap<&str, &Automaton> = automatons
+        .iter()
+        .map(|a| (a.automaton.name.as_str(), *a))
+        .collect();
+    let mut results = Vec::new();
+    for (name, automaton) in &by_name {
+        let joint: Vec<&temper_spec::automaton::Invariant> = automaton
+            .invariants
+            .iter()
+            .filter(|inv| !inv.assert.related_types().is_empty())
+            .collect();
+        if joint.is_empty() {
+            continue;
+        }
+        let mut scope: BTreeSet<String> = BTreeSet::from([name.to_string()]);
+        let mut missing = Vec::new();
+        for inv in &joint {
+            for (entity_type, _) in inv.assert.related_types() {
+                if by_name.contains_key(entity_type.as_str()) {
+                    scope.insert(entity_type);
+                } else {
+                    missing.push(entity_type);
+                }
+            }
+        }
+        let result =
+            |inv: &temper_spec::automaton::Invariant, scope: &BTreeSet<String>, states, outcome| {
+                JointInvariantResult {
+                    entity: name.to_string(),
+                    invariant: inv.name.clone(),
+                    assert: inv.assert.to_string(),
+                    scope: scope.iter().cloned().collect(),
+                    states,
+                    in_flight_bound: None,
+                    outcome,
+                }
+            };
+        if !missing.is_empty() {
+            for inv in &joint {
+                let reason = format!(
+                    "it reads {}, which this app does not declare",
+                    missing.join(", ")
+                );
+                results.push(result(inv, &scope, 0, JointOutcome::Incomplete { reason }));
+            }
+            continue;
+        }
+        let model = JointModel::new(&by_name, scope, name, &joint);
+        let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
+        let walk = model.walk(name, &exprs, budget);
+        for (inv, outcome) in joint.iter().zip(walk.outcomes) {
+            let mut found = result(inv, &model.scope, walk.states, outcome);
+            found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+            results.push(found);
+        }
+    }
+    results
+}
+
+/// One move of a trace: an entity's action with the string parameters it
+/// was sent. Values are names for this trace only: equal names are equal
+/// values, `''` is the empty string, and a name not seen before is a value
+/// nothing holds yet. A parameter the model does not track is not checked.
+#[derive(Debug, Clone)]
+pub struct TraceMove {
+    /// The entity type.
+    pub entity: String,
+    /// The action.
+    pub action: String,
+    /// String parameters by name; parameters left out may take any value.
+    pub params: BTreeMap<String, String>,
+}
+
+/// A trace walked through the joint model of `entity`'s cross-entity
+/// invariants.
+#[derive(Debug, Clone)]
+pub struct JointReplay {
+    /// The start and the state after each step.
+    pub steps: Vec<JointStep>,
+    /// The invariants false in the last state.
+    pub broken: Vec<String>,
+}
+
+/// Walk `trace` through the joint model of `entity`'s invariants that read
+/// related entities, as the check does: whether the spec allows each move,
+/// and which invariants the last state breaks. `ids` names each record's id
+/// in the trace's names (equal names, equal ids); a type left out gets an
+/// id of its own. A move the trace names takes a dispatch in flight to that
+/// action when there is one, and is otherwise sent from outside; when it is
+/// not allowed yet, dispatches in flight land first, oldest first. A
+/// reaction whose guard the model cannot decide is taken as not firing. Use
+/// it to ask whether what happened in production is a path of the spec.
+pub fn replay_joint_invariants(
+    automatons: &[&Automaton],
+    entity: &str,
+    ids: &BTreeMap<String, String>,
+    trace: &[TraceMove],
+) -> Result<JointReplay, String> {
+    let by_name: BTreeMap<&str, &Automaton> = automatons
+        .iter()
+        .map(|a| (a.automaton.name.as_str(), *a))
+        .collect();
+    let automaton = by_name
+        .get(entity)
+        .ok_or_else(|| format!("no entity type {entity}"))?;
+    let joint: Vec<&temper_spec::automaton::Invariant> = automaton
+        .invariants
+        .iter()
+        .filter(|inv| !inv.assert.related_types().is_empty())
+        .collect();
+    let mut scope = BTreeSet::from([entity.to_string()]);
+    for inv in &joint {
+        for (entity_type, _) in inv.assert.related_types() {
+            if !by_name.contains_key(entity_type.as_str()) {
+                return Err(format!(
+                    "{entity} reads {entity_type}, which is not declared"
+                ));
+            }
+            scope.insert(entity_type);
+        }
+    }
+    let model = JointModel::new(&by_name, scope, entity, &joint);
+    let (mut state, mut names) = model.init_with_ids(ids);
+    let mut steps = vec![JointStep {
+        action: None,
+        state: render(&state),
+    }];
+    for (i, wanted) in trace.iter().enumerate() {
+        loop {
+            let fits = |params: &BTreeMap<String, ParamValue>| {
+                let mut bindings = names.clone();
+                let mut used = model.values(&state);
+                wanted.params.iter().all(|(param, name)| {
+                    // A parameter the model does not track takes any value.
+                    let Some(ParamValue::Str(value)) = params.get(param) else {
+                        return true;
+                    };
+                    match bindings.get(name) {
+                        Some(bound) => value == bound,
+                        None if name.is_empty() => value.is_empty(),
+                        None if matches!(value, ModelString::Symbol(_))
+                            && !used.contains(value) =>
+                        {
+                            bindings.insert(name.clone(), value.clone());
+                            used.insert(value.clone());
+                            true
+                        }
+                        None => false,
+                    }
+                })
+            };
+            let wanted_dispatch = |d: &Dispatch| {
+                d.to == wanted.entity && d.action == wanted.action && fits(&d.params)
+            };
+            let moves = model.moves(&state);
+            let named = moves
+                .iter()
+                .find(|mv| match mv {
+                    Move::Read(d) | Move::Arrive(d) => wanted_dispatch(d),
+                    _ => false,
+                })
+                .or_else(|| {
+                    moves.iter().find(|mv| match mv {
+                        Move::Take(e, action) | Move::Send(e, action) => {
+                            e == &wanted.entity
+                                && action.name == wanted.action
+                                && fits(&action.params)
+                        }
+                        _ => false,
+                    })
+                });
+            let (mv, done) = match named {
+                Some(mv @ (Move::Take(..) | Move::Arrive(_))) => (mv.clone(), true),
+                Some(mv) => (mv.clone(), false),
+                None => match moves
+                    .iter()
+                    .find(|mv| matches!(mv, Move::Read(_) | Move::Arrive(_)))
+                {
+                    Some(mv) => (mv.clone(), false),
+                    None => {
+                        return Err(format!(
+                            "move {} ({}.{}) is not allowed in {}",
+                            i + 1,
+                            wanted.entity,
+                            wanted.action,
+                            render(&state)
+                        ));
+                    }
+                },
+            };
+            if let Move::Take(_, action) | Move::Send(_, action) = &mv {
+                for (param, name) in &wanted.params {
+                    if let Some(ParamValue::Str(value)) = action.params.get(param)
+                        && !name.is_empty()
+                    {
+                        names.entry(name.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            let next = model
+                .next(&state, &mv)
+                .0
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "move {} ({}.{}) cannot be taken",
+                        i + 1,
+                        wanted.entity,
+                        wanted.action
+                    )
+                })?;
+            names = names
+                .into_iter()
+                .filter_map(|(name, value)| match next.renamed.get(&value) {
+                    Some(new) => Some((name, new.clone())),
+                    None if matches!(value, ModelString::Literal(_)) => Some((name, value)),
+                    None => None,
+                })
+                .collect();
+            steps.push(JointStep {
+                action: Some(next.label),
+                state: render(&next.state),
+            });
+            state = next.state;
+            if done {
+                break;
+            }
+        }
+    }
+    let env = model.env(entity, &state);
+    let broken = joint
+        .iter()
+        .filter(|inv| eval(&inv.assert, &env) == Truth::False)
+        .map(|inv| inv.name.clone())
+        .collect();
+    Ok(JointReplay { steps, broken })
+}
+
+/// The moves from the start to `nodes[index]`.
+pub(super) fn path_to(
+    nodes: &[(JointState, Option<(usize, String)>)],
+    mut index: usize,
+) -> Vec<JointStep> {
+    let mut steps = Vec::new();
+    loop {
+        let (state, parent) = &nodes[index];
+        steps.push(JointStep {
+            action: parent.as_ref().map(|(_, action)| action.clone()),
+            state: render(state),
+        });
+        match parent {
+            Some((from, _)) => index = *from,
+            None => break,
+        }
+    }
+    steps.reverse();
+    steps
+}
+
+pub(super) fn render(state: &JointState) -> String {
+    let mut text = state
+        .records
+        .iter()
+        .map(|(entity, s)| format!("{entity}={s}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if !state.inflight.is_empty() {
+        let inflight: Vec<String> = state.inflight.iter().map(ToString::to_string).collect();
+        text.push_str(&format!(" | in flight: {}", inflight.join(", ")));
+    }
+    text
+}
+
+#[cfg(test)]
+#[path = "joint_test.rs"]
+mod tests;

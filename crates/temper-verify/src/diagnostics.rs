@@ -270,6 +270,7 @@ mod tests {
             counters,
             booleans: BTreeMap::new(),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         }
     }
 
