@@ -1,10 +1,12 @@
 # Authorization questions
 
 `POST /api/authorize` asks Cedar about offers without making a move. A question
-is a read, and a read writes nothing: no PendingDecision, GovernanceDecision,
-denial-pattern or trajectory row, and nothing for the suggestion engine. The
-same holds for a refused GET (an OData read, a policy read). Only a refused
-change, such as a dispatch someone sent, files a decision.
+writes nothing: no PendingDecision, GovernanceDecision, denial-pattern or
+trajectory row, and nothing for the suggestion engine. A real request an agent
+sends and is refused (a read by id, a list it may not make, a dispatch) still
+files one decision its person can approve. While that decision waits, the same
+agent refused the same action on the same resource gets it back instead of a
+new one.
 Authentication and tenant resolution use the same credential-derived context as
 before. `agent_id` must match that principal (including person principals).
 

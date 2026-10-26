@@ -150,7 +150,6 @@ pub(crate) fn authorize_read(
             response
                 .extensions_mut()
                 .insert(crate::authz::DeniedResource {
-                    asked: crate::authz::Asked::Read,
                     action: action.to_string(),
                     resource_type: entity_type.to_string(),
                     resource_id: entity_id.to_string(),

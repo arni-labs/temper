@@ -117,12 +117,28 @@ fn get(uri: &str) -> Request<Body> {
         .expect("request should build")
 }
 
-/// Asking is a read. An agent in a session that is refused an offer check, a
-/// record read and a policy read many times over writes nothing; the move it
-/// then sends and is refused files exactly one decision.
+/// The decision a refused request answered with, read from its 403 body.
+async fn refused_with(response: axum::response::Response) -> String {
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    body["decision_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a refused request offers a decision: {body}"))
+        .to_string()
+}
+
+/// An agent in a session asks 20 times whether it may add an item, which files
+/// nothing. It then reads the record 20 times and is refused each time: the
+/// first refusal files one decision and every retry gets that same decision
+/// back. The move it then sends and is refused files one more.
 #[tokio::test]
-async fn refused_reads_and_questions_write_nothing_and_a_refused_move_files_one() {
-    let (state, store, _temp) = state_with_turso("reads-write-nothing").await;
+async fn questions_file_nothing_and_a_retried_refusal_reuses_its_waiting_decision() {
+    let (state, store, _temp) = state_with_turso("retry-reuses-decision").await;
     register_governance(&state);
     order_only_a_person_may_add_to(&state).await;
     let app = build_router(state.clone());
@@ -142,24 +158,31 @@ async fn refused_reads_and_questions_write_nothing_and_a_refused_move_files_one(
             .await
             .unwrap();
         assert_eq!(offer.status(), StatusCode::OK);
-        for uri in ["/tdata/Orders('order-1')", "/api/tenants/default/policies"] {
-            let read = app
-                .clone()
-                .oneshot(as_agent_in_session(get(uri)))
-                .await
-                .unwrap();
-            assert_eq!(read.status(), StatusCode::FORBIDDEN, "{uri}");
-            let body: serde_json::Value = serde_json::from_slice(
-                &axum::body::to_bytes(read.into_body(), 65536).await.unwrap(),
-            )
-            .unwrap();
-            assert!(body.get("decision_id").is_none(), "{uri}: {body}");
-        }
     }
     assert_eq!(
         filed(&state, &store).await,
         (0, 0, 0),
-        "a refused read or question wrote"
+        "a question filed a decision"
+    );
+
+    let mut read_decisions = std::collections::BTreeSet::new();
+    for _ in 0..20 {
+        let read = app
+            .clone()
+            .oneshot(as_agent_in_session(get("/tdata/Orders('order-1')")))
+            .await
+            .unwrap();
+        read_decisions.insert(refused_with(read).await);
+    }
+    assert_eq!(
+        read_decisions.len(),
+        1,
+        "every retry answers with the waiting decision"
+    );
+    assert_eq!(
+        filed(&state, &store).await,
+        (1, 1, 1),
+        "20 refused reads of one record file one decision"
     );
 
     let refused = app
@@ -172,11 +195,12 @@ async fn refused_reads_and_questions_write_nothing_and_a_refused_move_files_one(
         )))
         .await
         .unwrap();
-    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let move_decision = refused_with(refused).await;
+    assert!(!read_decisions.contains(&move_decision));
     assert_eq!(
         filed(&state, &store).await,
-        (1, 1, 1),
-        "the refused move files one decision"
+        (2, 2, 2),
+        "a refused move is its own decision"
     );
 }
 

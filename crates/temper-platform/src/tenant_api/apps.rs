@@ -3,7 +3,6 @@ use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use temper_authz::AuthenticatedRequestContext;
-use temper_server::authz::Asked;
 use temper_server::platform_store::InstalledAppRecord;
 
 use super::auth::{
@@ -25,7 +24,6 @@ pub(crate) async fn list_os_apps(
     if let Err(denial) = require_requested_resource_authorization(
         &state,
         authenticated,
-        Asked::Read,
         PlatformResourceAuthorization {
             action: "read_app_catalog",
             resource_type: "AppCatalog",
@@ -54,7 +52,6 @@ pub(crate) async fn get_os_app_guide(
     if let Err(denial) = require_requested_resource_authorization(
         &state,
         authenticated,
-        Asked::Read,
         PlatformResourceAuthorization {
             action: "read_app_catalog",
             resource_type: "AppCatalogEntry",
@@ -228,7 +225,6 @@ pub(crate) async fn install_genesis_app(
     if let Err(denial) = require_requested_resource_authorization(
         &state,
         authenticated,
-        Asked::Change,
         PlatformResourceAuthorization {
             action: "install_app",
             resource_type: "App",
