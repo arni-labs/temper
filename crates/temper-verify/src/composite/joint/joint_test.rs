@@ -285,7 +285,7 @@ fn unknown_related_reads_cannot_be_proven() {
     ] {
         let parent = "[automaton]\nname = 'Parent'\nstates = ['Open']\ninitial = 'Open'\n[[state]]\nname = 'score'\ntype = 'int'\ninitial = 1\n";
         let child = child_with(assertion);
-        let result = check(&[&parent, &child]);
+        let result = check(&[parent, &child]);
         assert!(
             matches!(result.outcome, JointOutcome::Incomplete { .. }),
             "{result}"
