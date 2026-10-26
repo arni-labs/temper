@@ -142,6 +142,7 @@ impl SyncCopy {
 
     /// [`Self::backup_status`], also recorded as the gauges in the module docs.
     pub async fn record_backup(&self) -> Result<BackupStatus, PersistenceError> {
+        self.observe_budget();
         let status = self.backup_status().await?;
         let metrics = metrics();
         metrics.lag_changes.record(status.unpushed_changes, &[]);

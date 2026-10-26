@@ -31,6 +31,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use super::{Connection, DriverError, DriverHandle, Lease};
 
 mod backup;
+mod budget;
 mod files;
 mod pool;
 mod push;
@@ -110,6 +111,8 @@ struct Inner {
     failures: AtomicU64,
     /// Since when the remote has lacked a committed change.
     lag: std::sync::Mutex<backup::LagClock>,
+    /// Confirmed moves the remote lacks, and whether moves are refused.
+    budget: std::sync::Mutex<budget::PushBudget>,
 }
 
 /// The sync engine's text for a statement the remote refused.

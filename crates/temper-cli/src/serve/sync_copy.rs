@@ -106,7 +106,10 @@ fn spawn_backup(copy: SyncCopy) {
                 );
                 std::process::exit(75);
             }
-            if copy.state() == CopyState::Copying && retry.due() {
+            // A move waiting long for the remote is pushed on every tick, so
+            // the remote carries it as soon as it is back.
+            let due = retry.due() || copy.push_is_pressing();
+            if copy.state() == CopyState::Copying && due {
                 match copy.push_committed().await {
                     Ok(()) => retry.succeeded(),
                     Err(error) => {

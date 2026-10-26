@@ -399,6 +399,9 @@ impl EventStore for TursoEventStore {
             }]);
         }
 
+        if let Some(copy) = &self.sync_copy {
+            copy.admit_move()?;
+        }
         let attempt_timeout = append_attempt_timeout();
         let total_attempts = append_max_attempts();
         let mut last_err: Option<PersistenceError> = None;
@@ -428,6 +431,9 @@ impl EventStore for TursoEventStore {
                 Ok(result) => {
                     if attempt > 0 {
                         record_turso_write_retry("turso.append_batch", attempt as u64, "succeeded");
+                    }
+                    if let Some(copy) = &self.sync_copy {
+                        copy.move_confirmed();
                     }
                     return Ok(result);
                 }
@@ -1013,6 +1019,9 @@ impl TursoEventStore {
         if events.is_empty() {
             return Ok(expected_sequence);
         }
+        if let Some(copy) = &self.sync_copy {
+            copy.admit_move()?;
+        }
 
         // Retry transient Hrana BLOCKED / stream errors with backoff (ADR-0056).
         // Each attempt is a complete append unit. Single-event appends use an
@@ -1064,6 +1073,9 @@ impl TursoEventStore {
                 Ok(seq) => {
                     if attempt > 0 {
                         record_turso_write_retry("turso.append", attempt as u64, "succeeded");
+                    }
+                    if let Some(copy) = &self.sync_copy {
+                        copy.move_confirmed();
                     }
                     return Ok(seq);
                 }
