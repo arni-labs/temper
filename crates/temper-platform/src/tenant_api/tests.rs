@@ -220,7 +220,7 @@ permit(
 }
 
 #[tokio::test]
-async fn requested_app_guide_denial_has_an_agent_decision() {
+async fn refused_app_guide_read_files_no_decision() {
     let state = PlatformState::new(None);
     let mut decisions = state.server.pending_decision_tx.subscribe();
     let mut request = typed_request(
@@ -242,21 +242,14 @@ async fn requested_app_guide_denial_has_an_agent_decision() {
         .await
         .expect("body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    let id = body["decision_id"]
-        .as_str()
-        .expect("requested guide denial must offer a decision");
+    // Asking is a read: an agent in a session is refused with the reason and
+    // nothing is filed.
+    assert_eq!(body["error"]["code"], "AuthorizationDenied");
+    assert!(body.get("decision_id").is_none(), "{body}");
     assert!(
-        body["error"]["message"].as_str().unwrap().contains(id),
-        "existing MCP clients extract the decision ID from the error message"
+        decisions.try_recv().is_err(),
+        "a refused read files no decision"
     );
-    let decision = decisions.try_recv().expect("decision broadcast");
-    assert_eq!(decision.id, id);
-    assert_eq!(decision.tenant, "tenant-a");
-    assert_eq!(decision.agent_id, "agent-1");
-    assert_eq!(decision.action, "read_app_catalog");
-    assert_eq!(decision.resource_type, "AppCatalogEntry");
-    assert_eq!(decision.resource_id, "project-management");
-    assert_eq!(decision.session_id.as_deref(), Some("catalog-session"));
     assert!(body.get("guide").is_none());
 }
 

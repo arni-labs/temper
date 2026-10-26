@@ -1030,7 +1030,7 @@ async fn patched_fields_survive_a_server_restart_over_the_http_stack() {
 }
 
 #[tokio::test]
-async fn requested_agent_read_denials_create_decisions() {
+async fn refused_agent_reads_file_no_decisions() {
     let (state, _sim) = build_default_state(947, "read-approval-boundary");
     let tenant = TenantId::default();
     dispatch(
@@ -1048,10 +1048,7 @@ async fn requested_agent_read_denials_create_decisions() {
         .reload_tenant_policies("default", "")
         .expect("deny by default");
     let mut decisions = state.pending_decision_tx.subscribe();
-    for (path, action, resource_id) in [
-        ("/tdata/Orders", "list", ""),
-        ("/tdata/Orders('private-order')", "read", "private-order"),
-    ] {
+    for path in ["/tdata/Orders", "/tdata/Orders('private-order')"] {
         let mut request = Request::get(path).body(Body::empty()).unwrap();
         request.extensions_mut().insert(
             temper_authz::AuthenticatedRequestContext::new(
@@ -1071,16 +1068,10 @@ async fn requested_agent_read_denials_create_decisions() {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let id = body["decision_id"]
-            .as_str()
-            .expect("agent read must surface a decision");
-        let decision = decisions.try_recv().expect("decision broadcast");
-        assert_eq!(decision.id, id);
-        assert_eq!(decision.action, action);
-        assert_eq!(decision.resource_id, resource_id);
-        assert_eq!(decision.tenant, "default");
-        assert_eq!(decision.agent_id, "read-agent");
-        assert_eq!(decision.session_id.as_deref(), Some("read-session"));
+        // Asking is a read: an agent in a session is refused and nothing is filed.
+        assert_eq!(body["error"]["code"], "AuthorizationDenied", "{path}");
+        assert!(body.get("decision_id").is_none(), "{path}: {body}");
+        assert!(decisions.try_recv().is_err(), "{path} filed a decision");
         assert!(
             !body.to_string().contains("total_amount"),
             "denial must not expose row data"

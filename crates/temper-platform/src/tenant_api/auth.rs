@@ -73,7 +73,7 @@ fn check_resource_authorization(
     authenticated: &AuthenticatedRequestContext,
     asked: Asked,
     mut input: PlatformResourceAuthorization<'_>,
-) -> Result<(), temper_server::authz::DeniedResource> {
+) -> Result<(), Box<temper_server::authz::DeniedResource>> {
     input.attrs.insert(
         "id".to_string(),
         serde_json::Value::String(input.resource_id.to_string()),
@@ -101,13 +101,13 @@ fn check_resource_authorization(
                 resource_id = input.resource_id,
                 "platform management operation denied"
             );
-            temper_server::authz::DeniedResource {
+            Box::new(temper_server::authz::DeniedResource {
                 asked,
                 action: input.action.to_string(),
                 resource_type: input.resource_type.to_string(),
                 resource_id: input.resource_id.to_string(),
                 resource_attrs: input.attrs,
                 reason: denial.to_string(),
-            }
+            })
         })
 }
