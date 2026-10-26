@@ -49,7 +49,7 @@ fn fixture_with_place(place: &str) -> PlatformState {
     let csdl = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
     state.registry.write().unwrap().register_tenant(
         "policy-owner",
-        parse_csdl(csdl).unwrap(),
+        parse_csdl(csdl).expect("the CSDL parses"),
         csdl.to_string(),
         &[("App", APP), ("Place", place)],
     );
