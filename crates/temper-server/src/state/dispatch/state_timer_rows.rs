@@ -129,8 +129,7 @@ impl ServerState {
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                let (callers, mut counts) =
-                    self.recover_tenant_state_timers(&tenant, &timeouts).await;
+                let (callers, mut counts) = self.recover_tenant_state_timers(&tenant).await;
                 // Only this tenant's saved identities are now known. Other
                 // tenants may still be retrying; their records stay untouched.
                 let followed = self.follow_types(types, &callers, Some(gate)).await;
@@ -171,11 +170,7 @@ impl ServerState {
     }
 
     /// Restore a tenant's saved rows before allowing its rowless recovery.
-    async fn recover_tenant_state_timers(
-        &self,
-        tenant: &TenantId,
-        timeouts: &DeclaredTimeouts,
-    ) -> (BootCallers, BootTimers) {
+    async fn recover_tenant_state_timers(&self, tenant: &TenantId) -> (BootCallers, BootTimers) {
         let started = Instant::now();
         let gate = self.state_timer_boot_gate.clone();
         let mut callers = BootCallers::new();
@@ -199,10 +194,23 @@ impl ServerState {
             };
             let now = sim_now();
             for row in rows {
-                let declared = timeouts.get(&(row.entity_type.clone(), row.state.clone()));
+                // Installs can change declarations while the row read retries.
+                // Check the current spec before dropping a durable caller.
+                let declared = {
+                    let registry = self.registry.read().expect("registry lock poisoned");
+                    registry
+                        .get_spec(tenant, &row.entity_type)
+                        .and_then(|spec| {
+                            spec.automaton
+                                .state_timeouts
+                                .iter()
+                                .find(|timeout| timeout.state == row.state)
+                        })
+                        .map(|timeout| (timeout.after_seconds, timeout.on_timeout.clone()))
+                };
                 let timer = match declared {
                     Some((after_seconds, action)) => {
-                        armed_timer(&tenant, &row, action, *after_seconds)
+                        armed_timer(&tenant, &row, &action, after_seconds)
                     }
                     None => {
                         if let Some(armed_by) = row_armed_by(&row) {

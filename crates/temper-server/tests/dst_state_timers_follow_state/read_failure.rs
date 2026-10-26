@@ -329,3 +329,69 @@ fn dst_unreadable_tenant_does_not_block_later_timeout_install() {
         Ok(())
     });
 }
+
+/// An install during an untimed tenant's row retry must keep durable callers.
+#[test]
+fn dst_timeout_added_during_row_retry_keeps_saved_caller() {
+    check_seeds(|seed| {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = World {
+            events: SimEventStore::no_faults(seed),
+            rows: Arc::new(SimTimerRows::new(seed)),
+            clock,
+        };
+        let job = Job {
+            tenant: TenantId::new("gamma"),
+            id: "queued-caller".into(),
+        };
+        let first = Process::start(&world, JOB_V1, JOB_V1, "queued-a");
+        first.runtime.block_on(async {
+            first
+                .state
+                .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
+                .await
+                .unwrap();
+            assert!(act(&first.state, &job, "Start").await);
+            settle().await;
+        });
+        let saved = world.rows.row("gamma", &job.id).unwrap();
+        first.kill(&world, Duration::ZERO);
+        world
+            .rows
+            .fail_next_listings("gamma", 1 + seed as usize % 3);
+        let (second, walk) = Process::boot(&world, JOB_V1, &job_untimed(), "queued-b");
+        second.runtime.block_on(async {
+            settle().await;
+            assert!(!walk.is_finished());
+            install(&second.state, "gamma", JOB_V1);
+            second.state.follow_spec_changes().await;
+            let counts = walk.await.unwrap();
+            settle().await;
+            let recovered = world.rows.row("gamma", &job.id).expect("timer restored");
+            assert_eq!(
+                recovered.armed_by, saved.armed_by,
+                "queued install must retain the saved identity"
+            );
+            assert_eq!(counts[&(job.tenant.clone(), "Job".into())].rearmed, 1);
+            advance(Duration::from_secs(3601)).await;
+            assert_eq!(status(&second.state, &job).await, "Done");
+            let record = second
+                .state
+                .get_tenant_entity_state(&job.tenant, "Job", &job.id)
+                .await
+                .unwrap()
+                .state;
+            assert_eq!(
+                record
+                    .events
+                    .iter()
+                    .filter(|event| event.action == "Expire")
+                    .count(),
+                1
+            );
+        });
+        second.kill(&world, Duration::ZERO);
+        Ok(())
+    });
+}
