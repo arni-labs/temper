@@ -52,7 +52,10 @@ pub(crate) async fn handle_get_decision(
     let security_ctx = authenticated.security_context();
     let owner_agent = matches!(security_ctx.principal.kind, PrincipalKind::Agent)
         && security_ctx.principal.id == decision.agent_id;
-    if !owner_agent && let Some(resp) = require_policy_auth(&state, authenticated).await {
+    if !owner_agent
+        && let Some(resp) =
+            require_policy_auth(&state, authenticated, crate::authz::Asked::Read).await
+    {
         return resp;
     }
 

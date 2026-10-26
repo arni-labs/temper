@@ -74,7 +74,7 @@ pub(crate) async fn decision_list_access(
         });
     }
 
-    match require_policy_auth(state, authenticated).await {
+    match require_policy_auth(state, authenticated, crate::authz::Asked::Read).await {
         Some(response) => Err(response),
         None => Ok(DecisionListAccess::Full),
     }
