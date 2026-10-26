@@ -84,6 +84,45 @@ pub fn prove_some(
     wanted: impl Fn(&str, &str) -> bool,
     deadline: Option<Instant>,
 ) -> Vec<RuleProof> {
+    let answered = Answered::default();
+    prove_with(automatons, policies, &answered, extra, wanted, deadline)
+}
+
+/// What Cedar answered the proofs of one app's rules, which every proof
+/// reads the same: a proof made one rule at a time keeps it between them.
+#[derive(Default)]
+pub struct Answered(Mutex<BTreeMap<String, May>>);
+
+/// The proof of `owner`'s rule `rule` with the lemmas written beside it,
+/// `None` when it is no invariant or `eventually` rule of `automatons`.
+/// `answered` is what Cedar answered the app's other proofs.
+pub fn prove_rule(
+    automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
+    answered: &Answered,
+    (owner, rule): (&str, &str),
+    deadline: Option<Instant>,
+) -> Option<RuleProof> {
+    let wanted = |o: &str, r: &str| o == owner && r == rule;
+    prove_with(
+        automatons,
+        policies,
+        answered,
+        &Hints::default(),
+        wanted,
+        deadline,
+    )
+    .pop()
+}
+
+fn prove_with(
+    automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
+    answered: &Answered,
+    extra: &Hints,
+    wanted: impl Fn(&str, &str) -> bool,
+    deadline: Option<Instant>,
+) -> Vec<RuleProof> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
         .map(|a| (a.automaton.name.as_str(), *a))
@@ -120,7 +159,7 @@ pub fn prove_some(
     let shared = &Shared {
         by_name,
         policies,
-        answered: Mutex::new(BTreeMap::new()),
+        answered: &answered.0,
         solvers: (cores / rules.len().max(1)).max(1),
         deadline,
     };
@@ -162,7 +201,7 @@ struct Shared<'a> {
     by_name: BTreeMap<&'a str, &'a Automaton>,
     policies: Option<&'a SendAnalysis>,
     /// What Cedar answers is the same for every rule.
-    answered: Mutex<BTreeMap<String, May>>,
+    answered: &'a Mutex<BTreeMap<String, May>>,
     /// Solvers for each rule.
     solvers: usize,
     deadline: Option<Instant>,
@@ -203,7 +242,7 @@ fn prove_one(
         by_name.clone(),
         scope.clone(),
         shared.policies,
-        &shared.answered,
+        shared.answered,
     );
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);

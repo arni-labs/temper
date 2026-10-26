@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::encode::Enc;
@@ -89,6 +90,9 @@ pub(super) fn run(
         let workers: Vec<_> = (0..solvers)
             .map(|i| {
                 scope.spawn(move || -> std::io::Result<Checked> {
+                    let Some(_seat) = Seat::take(deadline) else {
+                        return Ok((Vec::new(), Vec::new()));
+                    };
                     let mut z3 = Z3::start()?;
                     z3.send(prelude)?;
                     z3.send(few)?;
@@ -148,6 +152,50 @@ pub(super) fn run(
         });
     }
     Ok((out, errors))
+}
+
+/// One of the solvers this process runs at once: as many as it has cores.
+/// A solver keeps one core busy, so more only share them, and each holds
+/// memory the walks' room does not count. An install proves each rule on
+/// its own, all at once, so this is what bounds them.
+struct Seat;
+
+impl Seat {
+    fn seats() -> &'static (Mutex<usize>, Condvar) {
+        static SEATS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+        SEATS.get_or_init(|| {
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            (Mutex::new(cores), Condvar::new())
+        })
+    }
+
+    /// Wait for a seat, `None` once `deadline` has passed.
+    fn take(deadline: Option<Instant>) -> Option<Self> {
+        let (free, freed) = Self::seats();
+        let mut free = free.lock().unwrap_or_else(PoisonError::into_inner);
+        while *free == 0 {
+            free = match deadline {
+                None => freed.wait(free).unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let left = deadline.checked_duration_since(Instant::now())?;
+                    freed
+                        .wait_timeout(free, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+        *free -= 1;
+        Some(Seat)
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        let (free, freed) = Self::seats();
+        *free.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        freed.notify_one();
+    }
 }
 
 /// Check that `ask`'s goal holds given what it assumes; on a failure, which

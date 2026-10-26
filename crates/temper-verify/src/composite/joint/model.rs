@@ -16,11 +16,11 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 use super::env::{Blind, ID, JointEnv, Records};
+use super::room::Bound;
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState, premise};
-use crate::Budget;
 use crate::model::semantics::string_values;
 use crate::model::{ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
@@ -99,6 +99,7 @@ pub(super) struct Walk {
 }
 
 /// The joint model of one entity's properties that read related entities.
+#[derive(Debug)]
 pub(super) struct JointModel {
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
@@ -107,9 +108,6 @@ pub(super) struct JointModel {
     /// use: each holds that record's id.
     refs: BTreeMap<String, BTreeSet<String>>,
     delivery: Delivery,
-    /// The types composed: those the properties name, or a trigger-graph
-    /// component for the drop check.
-    pub(super) scope: BTreeSet<String>,
     /// Whether the kernel's own moves are made as the kernel makes them.
     kernel_moves: bool,
     kernel: Kernel,
@@ -146,7 +144,7 @@ impl JointModel {
     /// behaviour.
     pub(super) fn new(
         by_name: &BTreeMap<&str, &Automaton>,
-        scope: BTreeSet<String>,
+        scope: &BTreeSet<String>,
         owner: &str,
         reads: &[&Expr],
         sending: Sending<'_>,
@@ -177,7 +175,7 @@ impl JointModel {
                 Name::Status => {}
             });
         }
-        let (mut models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
+        let (mut models, reactions) = tracked(by_name, scope, read.clone(), Records::ById);
         for ((entity, field), literals) in named_literals(owner, reads, &models, &reactions) {
             if let Some(model) = models.get_mut(&entity) {
                 model
@@ -195,27 +193,27 @@ impl JointModel {
     /// read; with `cut`, each entity is cut down to that.
     fn compose(
         by_name: &BTreeMap<&str, &Automaton>,
-        scope: BTreeSet<String>,
+        scope: &BTreeSet<String>,
         (models, reactions): (BTreeMap<String, TemperModel>, Vec<Reaction>),
         read: &BTreeMap<String, BTreeSet<String>>,
         sending: Sending<'_>,
         cut: bool,
     ) -> Self {
         let kernel = if sending.kernel_moves {
-            Kernel::read(by_name, &scope)
+            Kernel::read(by_name, scope)
         } else {
             Kernel::default()
         };
         // A reaction from outside the scope is one of the kernel's moves:
         // without them anyone may send any action, which covers it.
         let outer_reactions = if sending.kernel_moves {
-            outer_reactions(by_name, &scope)
+            outer_reactions(by_name, scope)
         } else {
             Vec::new()
         };
         let senders = Senders::new(
             by_name,
-            &scope,
+            scope,
             outer_reactions.iter().filter_map(|r| r.principal.clone()),
             sending.policies,
         );
@@ -300,7 +298,6 @@ impl JointModel {
             records: Records::ById,
             refs: BTreeMap::new(),
             delivery: Delivery::Any,
-            scope,
             kernel_moves: sending.kernel_moves,
             kernel,
             relies_on: sending.relies_on,
@@ -507,11 +504,11 @@ impl JointModel {
 
     /// Walk every reachable joint state breadth first, checking `invariants`
     /// of `owner` in each settled one (nothing in flight).
-    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], budget: Budget) -> Walk {
+    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], bound: Bound<'_>) -> Walk {
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
         let premises: Vec<Option<&Expr>> = invariants.iter().map(|inv| premise(inv)).collect();
         let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
-        let explored = self.walk_with(budget, false, |index, state| {
+        let explored = self.walk_with(bound, false, |index, state| {
             if state.settled() {
                 let env = self.env(owner, state);
                 for (i, inv) in invariants.iter().enumerate() {

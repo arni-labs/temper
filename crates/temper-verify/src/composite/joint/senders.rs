@@ -30,7 +30,8 @@
 //! that record is one its source may act on.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
@@ -55,6 +56,18 @@ pub(super) struct Senders {
     /// The answers decided again so far: a walk asks the same few questions
     /// over and over, and reading the policies takes far longer than a step.
     decided: RefCell<HashMap<Question, May>>,
+}
+
+/// A proof's digest prints the senders and the policies that decide them
+/// (those about the model's actions), not the answers read so far, which
+/// depend on what was asked.
+impl fmt::Debug for Senders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Senders")
+            .field("askers", &self.askers)
+            .field("policies", &self.policies)
+            .finish()
+    }
 }
 
 /// Each action's answers by sender, read from the policies when first asked.
@@ -98,6 +111,15 @@ impl Senders {
                 askers.push(asker);
             }
         }
+        let sent: BTreeSet<&str> = entities
+            .clone()
+            .into_iter()
+            .flat_map(|entity| by_name[entity.as_str()].actions.iter())
+            .map(|action| action.name.as_str())
+            .collect();
+        // What the policies say of other actions decides no move here, and
+        // a proof's digest is of what its walk reads.
+        let policies = policies.map(|policies| policies.for_actions(|a| sent.contains(a)));
         let may = entities
             .into_iter()
             .map(|entity| {
@@ -112,7 +134,7 @@ impl Senders {
         Self {
             askers,
             may: RefCell::new(may),
-            policies: policies.cloned(),
+            policies,
             decided: RefCell::default(),
         }
     }

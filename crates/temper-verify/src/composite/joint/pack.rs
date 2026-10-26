@@ -18,6 +18,8 @@ pub(super) type Packed = Rc<[u32]>;
 pub(super) struct Packer {
     ids: HashMap<String, u32>,
     names: Vec<String>,
+    /// Bytes the strings take on the heap, each held twice.
+    pub(super) heap: usize,
 }
 
 impl Packer {
@@ -39,11 +41,20 @@ impl Packer {
         let id = u32::try_from(self.names.len()).expect("fewer than 2^32 strings");
         self.ids.insert(name.to_string(), id);
         self.names.push(name.to_string());
+        self.heap += 2 * super::room::block(name.len());
         id
     }
 
     pub(super) fn name(&self, id: u32) -> &str {
         &self.names[id as usize]
+    }
+
+    /// Bytes the table holds: its strings, and its list and index at their
+    /// capacity.
+    pub(super) fn bytes(&self) -> usize {
+        self.heap
+            + self.names.capacity() * size_of::<String>()
+            + super::room::map_bytes::<String, u32>(self.ids.capacity())
     }
 }
 

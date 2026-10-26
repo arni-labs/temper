@@ -455,7 +455,7 @@ fn single(expr: &Json) -> Option<(&str, &Json)> {
 }
 
 /// An entity's type and id, from `{"__entity": {...}}` or `{"type", "id"}`.
-fn entity_parts(value: &Json) -> Option<(&str, &str)> {
+pub(super) fn entity_parts(value: &Json) -> Option<(&str, &str)> {
     let entity = value.get("__entity").unwrap_or(value);
     Some((entity.get("type")?.as_str()?, entity.get("id")?.as_str()?))
 }

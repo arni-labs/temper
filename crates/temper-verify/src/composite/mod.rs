@@ -17,13 +17,14 @@ pub mod joint;
 pub mod verify;
 
 pub use joint::{
-    DroppedReaction, JointCheck, JointInvariantResult, JointLivenessResult, JointOutcome,
-    JointReplay, JointStep, JointVerdict, LivenessOutcome, Premise, StuckCase, TraceMove,
-    check_joint, replay_joint_invariants, verify_joint_invariants, verify_joint_liveness,
+    Bound, Bytes, DroppedReaction, InvariantProof, JointCheck, JointInvariantResult,
+    JointLivenessResult, JointOutcome, JointProof, JointReplay, JointStep, JointVerdict,
+    LivenessOutcome, LivenessProof, PROOF_TIME, Premise, Progress, Room, StuckCase, TraceMove,
+    check_joint, joint_proofs, replay_joint_invariants, verify_joint_invariants,
+    verify_joint_liveness,
 };
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,
-    verify_composite_with_budget,
 };
 
 use std::collections::BTreeMap;
