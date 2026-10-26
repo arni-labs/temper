@@ -7,18 +7,22 @@
 //! budget, and `gamma`'s, which gains the timeouts. Records that already
 //! started keep their stored `Waiting` on replay, so their timers must follow
 //! `Waiting`'s new declaration and never `Review`'s. In some seeds the process
-//! stops before the install's walk reaches `gamma`. The server restarts, so
-//! records that were never snapshotted replay under the new specs, and
-//! `gamma`'s records may have no row at all.
+//! stops before the install's walk reaches `gamma`, so `gamma`'s records have
+//! no row until their next action or rehydration arms one. The server
+//! restarts, so records that were never snapshotted replay under the new
+//! specs, and some of `gamma`'s records still have no row at all.
 //!
 //! Invariants:
-//! - after a record rehydrates, it has exactly one armed timer row, for its
-//!   current state, when that state declares a timeout, and none otherwise
-//!   (none for a deleted record);
+//! - a record has exactly one armed timer row, for its current state, when
+//!   that state declares a timeout and something armed it (an action, an
+//!   install walk, a rehydration or a boot), and none otherwise (none for a
+//!   deleted record);
+//! - a boot arms every record in a timed state, those with no row from when
+//!   they entered it, and leaves none waiting;
 //! - timers fire only in their state: every `Expire` left `Waiting` and every
 //!   `Approve` left `Review`, once;
 //! - with nobody touching the records after the restart, every record still
-//!   reaches `Done` on its timers alone.
+//!   reaches `Done` on its timers alone, `gamma`'s with no row included.
 //!
 //! Each server runs in its own single-threaded, paused-clock Tokio runtime;
 //! dropping the runtime is the process exit. The simulation clock reads that
@@ -177,8 +181,9 @@ struct Run {
     seed: u64,
     trace: Vec<String>,
     deleted: BTreeSet<(String, String)>,
-    /// Records in a timed state that nothing armed: no dispatch since their
-    /// type gained its timeouts, and no install walk. They wait, with no row.
+    /// Records in a timed state that nothing armed yet: no dispatch since
+    /// their type gained its timeouts, no install walk, no rehydration. They
+    /// have no row until the next of those, or a boot, arms them.
     unarmed: BTreeSet<(String, String)>,
 }
 
@@ -250,6 +255,24 @@ async fn status(state: &ServerState, job: &Job) -> String {
         .unwrap_or_else(|error| format!("<unreadable: {error}>"))
 }
 
+/// Read a record, as [`status`] does. A record not in memory rehydrates, and
+/// a rehydration arms the timer its state declares: one nothing armed before
+/// is armed now.
+async fn look(state: &ServerState, job: &Job, run: &mut Run) -> String {
+    let key = format!("{}:Job:{}", job.tenant, job.id);
+    let resident = state
+        .actor_registry
+        .read()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|actor| !actor.is_closed());
+    if !resident {
+        run.unarmed
+            .remove(&(job.tenant.to_string(), job.id.clone()));
+    }
+    status(state, job).await
+}
+
 /// Passivate a random part of the records: the rest are read first, so only
 /// the untouched ones are idle long enough.
 async fn passivate_some(
@@ -260,9 +283,10 @@ async fn passivate_some(
 ) {
     advance(Duration::from_secs(301)).await;
     let mut kept = Vec::new();
-    for job in jobs.iter().filter(|job| !run.is_deleted(job)) {
+    let live: Vec<&Job> = jobs.iter().filter(|job| !run.is_deleted(job)).collect();
+    for job in live {
         if rng.chance(0.5) {
-            status(state, job).await;
+            look(state, job, run).await;
             kept.push(job.id.clone());
         }
     }
@@ -377,7 +401,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
                     run.note(format!("poked {}/{}", job.tenant, job.id));
                 }
                 _ => {
-                    status(state, job).await;
+                    look(state, job, &mut run).await;
                     run.note(format!("read {}/{}", job.tenant, job.id));
                 }
             }
@@ -385,7 +409,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
         if rng.chance(0.7) {
             passivate_some(state, &jobs, &mut rng, &mut run).await;
         }
-        check_rows_follow_state(state, &world, &jobs, &run, "after the install").await
+        check_rows_follow_state(&world, &jobs, &run, "after the install").await
     })?;
 
     let downtime = Duration::from_secs(rng.next_bound(600) as u64);
@@ -396,9 +420,12 @@ fn run_seed(seed: u64) -> Result<(), String> {
     second.runtime.block_on(async {
         let state = &second.state;
         check_boot_counts(&second.booted, &jobs, &run)?;
-        check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
-        // A read rehydrates a record: one with a row follows its state, one
-        // without stays unarmed.
+        // The boot armed the records that had no row, from when they entered
+        // their state.
+        run.unarmed.clear();
+        check_rows_follow_state(&world, &jobs, &run, "after the restart").await?;
+        // A read rehydrates a record: its timer stays the one its state
+        // declares.
         let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
         run.note(format!(
             "rehydrated {:?}",
