@@ -673,7 +673,7 @@ effect = ["done = true"]
 
 [[invariant]]
 name = "EndIsDone"
-assert = "status == 'End' => done == true"
+assert = "status == 'End' => done == true && a >= 0 && b >= 0 && c >= 0 && d >= 0"
 "#;
 
 #[test]
@@ -682,7 +682,8 @@ fn the_walk_for_a_premise_heads_for_the_statuses_where_it_may_hold() {
     let JointVerdict::Proved(_, Premise::Met { states, .. }) = &verdict else {
         panic!("proved, and a run meets its premise: {verdict}");
     };
-    // Start's counters alone make hundreds of states; the walk takes Start,
-    // then each status down the chain.
+    // The rule reads Start's counters, so the walk keeps them, and they
+    // alone make over a hundred states; the walk takes Start, then each
+    // status down the chain.
     assert!(*states <= 12, "{verdict}");
 }

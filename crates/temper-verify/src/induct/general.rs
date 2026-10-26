@@ -39,41 +39,44 @@ impl Moves<'_, '_, '_> {
     /// `moves`, with those that take the same action on the same record
     /// grouped under one general move, in the order each first appears.
     pub(super) fn groups(&self, moves: &[Move]) -> Vec<Group> {
-        let mut groups: Vec<Group> = Vec::new();
+        let v = self.enc.v;
+        let mut groups: Vec<(Group, Option<&Action>)> = Vec::new();
         let mut at: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         for (i, mv) in moves.iter().enumerate() {
-            if !takes_action(mv.step) {
-                groups.push(Group {
-                    general: None,
-                    members: vec![i],
-                });
-                continue;
-            }
-            match at.get(&(mv.entity.as_str(), mv.action.as_str())) {
-                Some(&g) => groups[g].members.push(i),
+            // A move that takes no action of its record, such as a call
+            // failing with none to fire, stands alone.
+            let action = (takes_action(mv.step))
+                .then(|| v.action(&mv.entity, &mv.action))
+                .flatten();
+            let key = (mv.entity.as_str(), mv.action.as_str());
+            match action.and(at.get(&key)) {
+                Some(&g) => groups[g].0.members.push(i),
                 None => {
-                    at.insert((&mv.entity, &mv.action), groups.len());
-                    groups.push(Group {
-                        general: None,
-                        members: vec![i],
-                    });
+                    if action.is_some() {
+                        at.insert(key, groups.len());
+                    }
+                    let members = vec![i];
+                    groups.push((
+                        Group {
+                            general: None,
+                            members,
+                        },
+                        action,
+                    ));
                 }
             }
         }
-        let v = self.enc.v;
-        for group in groups.iter_mut().filter(|g| g.members.len() > 1) {
-            let first = &moves[group.members[0]];
-            let Some(action) = v.action(&first.entity, &first.action) else {
-                continue;
-            };
-            let ends: Vec<Option<&str>> = group
-                .members
-                .iter()
-                .map(|&i| moves[i].witness.as_deref())
-                .collect();
-            group.general = Some(self.general(&first.entity, action, &ends));
-        }
-        groups
+        let general = |(mut group, action): (Group, Option<&Action>)| {
+            if let (Some(action), [first, _, ..]) = (action, group.members.as_slice()) {
+                let first = &moves[*first];
+                let ends: Vec<Option<&str>> = (group.members.iter())
+                    .map(|&i| moves[i].witness.as_deref())
+                    .collect();
+                group.general = Some(self.general(&first.entity, action, &ends));
+            }
+            group
+        };
+        groups.into_iter().map(general).collect()
     }
 
     /// `entity` takes `action` with any parameters, ending a dispatch or
@@ -165,3 +168,7 @@ pub(super) fn lay_out(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "general_test.rs"]
+mod tests;
