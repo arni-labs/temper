@@ -7105,6 +7105,7 @@ dependencies = [
  "temper-store-postgres",
  "temper-store-redis",
  "temper-store-turso",
+ "temper-test-resource",
  "temper-transport",
  "temper-verify",
  "temper-wasm",
@@ -7396,6 +7397,7 @@ dependencies = [
  "temper-store-redis",
  "temper-store-sim",
  "temper-store-turso",
+ "temper-test-resource",
  "temper-verify",
  "temper-wasm",
  "tempfile",
@@ -7441,6 +7443,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "temper-runtime",
+ "temper-test-resource",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7458,6 +7461,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temper-runtime",
+ "temper-test-resource",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -7488,6 +7492,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "temper-runtime",
+ "temper-store-turso",
+ "temper-test-resource",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -7498,6 +7504,10 @@ dependencies = [
  "uuid",
  "wiremock",
 ]
+
+[[package]]
+name = "temper-test-resource"
+version = "0.1.0"
 
 [[package]]
 name = "temper-transport"
