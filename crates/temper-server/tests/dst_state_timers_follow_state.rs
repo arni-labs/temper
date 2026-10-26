@@ -84,6 +84,9 @@ struct Process {
     state: ServerState,
     /// What its boot did with each timed type's timers, once its walk ended.
     booted: BootTimers,
+    /// The moves it published, subscribed before its boot armed any timer:
+    /// who each one ran as.
+    changes: tokio::sync::broadcast::Receiver<temper_server::events::EntityStateChange>,
 }
 
 impl Process {
@@ -110,7 +113,7 @@ impl Process {
             .start_paused(true)
             .build()
             .unwrap();
-        let (state, walk) = runtime.block_on(async {
+        let booted = runtime.block_on(async {
             world.clock.begin();
             let mut registry = SpecRegistry::new();
             // Restore the persisted specs before reinstalling the current app
@@ -146,15 +149,17 @@ impl Process {
                 saved_rows.map(|row| (row.state, row.armed_by)),
                 "startup installs must leave saved timer rows untouched",
             );
+            let changes = state.event_tx.subscribe();
             let walk = state.start_runtime().await.expect("the first start");
-            (state, walk)
+            (state, changes, walk)
         });
-        let booted = BootTimers::new();
+        let (state, changes, walk) = booted;
         (
             Self {
                 runtime,
                 state,
-                booted,
+                booted: BootTimers::new(),
+                changes,
             },
             walk,
         )
