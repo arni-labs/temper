@@ -524,6 +524,12 @@ pub struct ServerState {
     /// Where armed timer rows are kept when the storage stack has no metadata
     /// store to keep them, as under simulation. None: the metadata store.
     pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
+    /// The scheduled actions armed in this process: how many live timers
+    /// each row has. A row is armed only while it has none, however many
+    /// replies hand it back (a cached reply to a retried fire carries the
+    /// schedules it armed), and leaves the map when its fire ends.
+    pub(crate) scheduled_armed:
+        Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
@@ -826,6 +832,7 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
@@ -1105,6 +1112,7 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
@@ -1229,6 +1237,11 @@ impl ServerState {
             // The status clock is the actor's, for its timers; a query never
             // reads it, and rows written before it was kept stay comparable.
             obj.remove("status_clock");
+            // The idempotency keys are the actor's, to drop a repeated
+            // request; a query never reads them. Every dispatch records one
+            // (up to 1,000 per entity), so keeping them would make every
+            // action, a poll that changes nothing included, change the row.
+            obj.remove("processed_idempotency_keys");
         }
         projected
     }

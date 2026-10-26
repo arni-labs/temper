@@ -94,15 +94,29 @@ pub trait DynEventStore: Send + Sync {
         key_rows: &'a [temper_runtime::persistence::EntityKeyRow],
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
 
-    fn append_with_index_rows<'a>(
+    fn append_with_rows<'a>(
         &'a self,
         persistence_id: &'a str,
         expected_sequence: u64,
         events: &'a [PersistenceEnvelope],
-        key_rows: &'a [temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &'a [temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'a>,
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
+
+    fn list_scheduled_actions<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError>,
+    >;
+
+    fn delete_scheduled_action<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        arm_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<(), PersistenceError>>;
 
     fn backfill_entity_vectors<'a>(
         &'a self,
@@ -256,23 +270,45 @@ where
         ))
     }
 
-    fn append_with_index_rows<'a>(
+    fn append_with_rows<'a>(
         &'a self,
         persistence_id: &'a str,
         expected_sequence: u64,
         events: &'a [PersistenceEnvelope],
-        key_rows: &'a [temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &'a [temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'a>,
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>> {
-        Box::pin(EventStore::append_with_index_rows(
+        Box::pin(EventStore::append_with_rows(
             self,
             persistence_id,
             expected_sequence,
             events,
-            key_rows,
-            vector_rows,
-            reconcile_vectors,
+            rows,
+        ))
+    }
+
+    fn list_scheduled_actions<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError>,
+    > {
+        Box::pin(EventStore::list_scheduled_actions(self, tenant))
+    }
+
+    fn delete_scheduled_action<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        arm_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<(), PersistenceError>> {
+        Box::pin(EventStore::delete_scheduled_action(
+            self,
+            tenant,
+            entity_type,
+            entity_id,
+            arm_id,
         ))
     }
 
@@ -544,25 +580,37 @@ impl BoxedEventStore {
             .await
     }
 
-    pub async fn append_with_index_rows(
+    pub async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
         self.store
-            .append_with_index_rows(
-                persistence_id,
-                expected_sequence,
-                events,
-                key_rows,
-                vector_rows,
-                reconcile_vectors,
-            )
+            .append_with_rows(persistence_id, expected_sequence, events, rows)
+            .await
+    }
+
+    /// Every pending scheduled action of `tenant`, kept with its journal.
+    pub async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError> {
+        self.store.list_scheduled_actions(tenant).await
+    }
+
+    /// Remove one scheduled action's row once it has fired.
+    pub async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        self.store
+            .delete_scheduled_action(tenant, entity_type, entity_id, arm_id)
             .await
     }
 

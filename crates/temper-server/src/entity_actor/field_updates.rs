@@ -103,7 +103,13 @@ pub(super) async fn commit_field_update(
     let mut attempt: u32 = 0;
     loop {
         match actor
-            .persist_event(store, backend, &actor.persistence_id(), state, &event)
+            .persist_event(
+                store,
+                backend,
+                state,
+                &event,
+                &super::scheduled_rows::ScheduledRows::default(),
+            )
             .await
         {
             Ok(_) => break,
@@ -184,6 +190,7 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         params: fields.clone(),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     }
 }
 

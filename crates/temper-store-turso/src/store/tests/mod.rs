@@ -11,6 +11,8 @@ use crate::TursoSpecVerificationUpdate;
 
 mod evolution_tenant;
 mod policy_approval;
+mod projection_writes;
+mod scheduled_actions;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
     PersistenceEnvelope {
@@ -199,36 +201,42 @@ async fn vector_index_write_behind_candidates_and_partitioning() {
     };
 
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-b",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![0.0, 1.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![0.0, 1.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     // A different model tag — must not appear in an m1 scan.
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-c",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m2", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m2", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -286,13 +294,15 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
 
     // Write-behind reconcile with a row, then a delete transition (empty rows).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            std::slice::from_ref(&row(vec![1.0, 0.0])),
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: std::slice::from_ref(&row(vec![1.0, 0.0])),
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -306,13 +316,14 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
     );
     // A Deleted transition emits no vector rows but still reconciles (purge).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             1,
             &[test_envelope("Delete", serde_json::json!({}))],
-            &[],
-            &[],
-            true,
+            temper_runtime::persistence::CommitRows {
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -1261,100 +1272,6 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
     assert!(
         canonical_matches.is_empty(),
         "filtered fields should stay out of entity_field_index"
-    );
-}
-
-#[tokio::test]
-async fn unchanged_projection_updates_catalog_without_rebuilding_field_rows() {
-    let store = make_store("query-projection-stable-hash").await;
-    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
-    let entity_type = "Order";
-    let entity_id = "ord-stable-projection";
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            7,
-        )
-        .await
-        .expect("initial projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query initial title row");
-    let initial_row = rows
-        .next()
-        .await
-        .expect("read initial title row")
-        .expect("title row should exist");
-    let initial_rowid = initial_row.get::<i64>(0).expect("initial rowid");
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            8,
-        )
-        .await
-        .expect("second projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query updated title row");
-    let updated_row = rows
-        .next()
-        .await
-        .expect("read updated title row")
-        .expect("title row should still exist");
-    let updated_rowid = updated_row.get::<i64>(0).expect("updated rowid");
-
-    let mut catalog_rows = conn
-        .query(
-            "SELECT sequence_nr FROM entity_catalog \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .expect("query catalog row");
-    let catalog_row = catalog_rows
-        .next()
-        .await
-        .expect("read catalog row")
-        .expect("catalog row should exist");
-    let sequence_nr = catalog_row.get::<i64>(0).expect("catalog sequence_nr");
-
-    assert_eq!(
-        updated_rowid, initial_rowid,
-        "unchanged projections should keep existing field index rows"
-    );
-    assert_eq!(
-        sequence_nr, 8,
-        "entity catalog should still advance to the latest sequence number"
     );
 }
 

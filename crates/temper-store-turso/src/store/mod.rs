@@ -50,6 +50,7 @@ mod policy_replace;
 mod projection_freshness;
 mod published_artifacts;
 mod query_page;
+mod scheduled_actions;
 mod secrets;
 mod spec_versions;
 mod specs;
@@ -59,6 +60,7 @@ pub mod sync_adopt;
 mod tests;
 mod trajectory;
 mod trajectory_queries;
+mod unchanged_projections;
 mod wasm;
 mod write_gate;
 
@@ -390,6 +392,9 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_STATE_TIMERS_TABLE, ())
             .await
             .map_err(storage_error)?;
+        conn.execute(schema::CREATE_SCHEDULED_ACTIONS_TABLE, ())
+            .await
+            .map_err(storage_error)?;
 
         // Specs table extensions — add content_hash column for verification caching.
         let _ = conn.execute(schema::ALTER_SPECS_ADD_CONTENT_HASH, ()).await;
@@ -477,6 +482,9 @@ impl TursoEventStore {
             .await
             .map_err(storage_error)?;
         conn.execute(schema::CREATE_ENTITY_CATALOG_STATUS_INDEX, ())
+            .await
+            .map_err(storage_error)?;
+        conn.execute(schema::CREATE_ENTITY_CATALOG_COUNTERS_TABLE, ())
             .await
             .map_err(storage_error)?;
         let _ = conn

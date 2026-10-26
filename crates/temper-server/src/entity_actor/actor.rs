@@ -28,7 +28,7 @@ use temper_jit::table::{Effect, TransitionTable};
 use temper_observe::wide_event;
 use temper_runtime::actor::{Actor, ActorContext, ActorError};
 use temper_runtime::persistence::{
-    COMPOSITE_EVENT_TYPE, EventMetadata, PersistenceEnvelope, PersistenceError,
+    COMPOSITE_EVENT_TYPE, CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError,
 };
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 pub(super) use tokio::time::sleep as sleep_persistence_retry; // determinism-ok: production persistence retry backoff
@@ -39,6 +39,7 @@ use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
@@ -412,15 +413,18 @@ impl EntityActor {
         }
     }
 
-    /// Persist an event to the configured event store.
+    /// Persist an event to the configured event store, with the rows of the
+    /// scheduled actions it arms and the removal of the one it fires in the
+    /// same commit.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
         backend: BackendLabel,
-        persistence_id: &str,
         state: &mut EntityState,
         event: &EntityEvent,
+        scheduled: &ScheduledRows,
     ) -> Result<u64, PersistenceError> {
+        let persistence_id = self.persistence_id();
         let payload = super::bootstrap::event_payload(event, state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
         let envelope = PersistenceEnvelope {
@@ -432,7 +436,7 @@ impl EntityActor {
                 causation_id: sim_uuid(),
                 correlation_id: sim_uuid(),
                 timestamp: event.timestamp,
-                actor_id: persistence_id.to_string(),
+                actor_id: persistence_id.clone(),
             },
         };
 
@@ -494,13 +498,17 @@ impl EntityActor {
         };
         let append_start = Instant::now(); // determinism-ok: production-only event-store wait metric
         let result = store
-            .append_with_index_rows(
-                persistence_id,
+            .append_with_rows(
+                &persistence_id,
                 state.sequence_nr,
                 &[envelope],
-                &key_rows,
-                &vector_rows,
-                reconcile_vectors,
+                CommitRows {
+                    key_rows: &key_rows,
+                    vector_rows: &vector_rows,
+                    reconcile_vectors,
+                    scheduled_actions: &scheduled.armed,
+                    fired_scheduled_action: scheduled.fired.as_deref(),
+                },
             )
             .await;
         crate::runtime_metrics::record_event_store_append_wait(
@@ -582,10 +590,11 @@ impl EntityActor {
 
     /// Replay events from the configured store to rebuild state (called in pre_start).
     ///
-    /// Re-evaluates each event through the `TransitionTable` to reconstruct
-    /// all state variables (status, counters, booleans). This is option 2 from
-    /// the replay design: the TransitionTable is the authoritative source of
-    /// effects, so replay produces the same state as the original execution.
+    /// Each event restores what it committed: its stored `to_status`, the
+    /// outcome its effects recorded (counters, booleans, lists, and fields such
+    /// as a spawned child's id), and its params. Replay mints, spawns, schedules
+    /// and calls out nothing. Events journaled before outcomes were recorded
+    /// re-derive their effects from the `TransitionTable`, minting nothing.
     pub(super) async fn replay_events(
         table: &TransitionTable,
         store: &BoxedEventStore,
@@ -717,6 +726,7 @@ impl EntityActor {
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
+                                outcome: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -826,40 +836,37 @@ impl EntityActor {
                             event.params =
                                 super::effects::sanitize_action_params(&event.params).into_owned();
                             // A persisted event is a historical fact: its guard
-                            // already passed at commit time and its `to_status`
-                            // is authoritative. Replay therefore re-derives the
-                            // transition's EFFECTS from the table but never
-                            // re-gates it — guards (especially cross-entity ones,
-                            // whose related-entity context is not reconstructed
-                            // here) must not silently drop committed history.
-                            // `replay_effects` returns the matching rule's
-                            // effects ignoring guards; `None` means the table no
-                            // longer knows this action/from-state, in which case
-                            // the stored `to_status` alone carries the state.
-                            let from_status = event.from_status.clone();
-                            if !frozen_bootstrap
+                            // already passed, and its stored outcome and target
+                            // status are authoritative. Never re-run recorded
+                            // effects against the active spec or mint child ids.
+                            // Legacy events select effects using the stored
+                            // from-status so earlier replay drift cannot prevent
+                            // later events from matching their original rule.
+                            let rule_from = if event.from_status.is_empty() {
+                                state.status.as_str()
+                            } else {
+                                event.from_status.as_str()
+                            };
+                            if !frozen_bootstrap && let Some(outcome) = event.outcome.as_ref() {
+                                outcome.restore(state);
+                            } else if !frozen_bootstrap
                                 && let Some(effects) =
-                                    table.replay_effects(&state.status, &event.action)
+                                    table.replay_effects(rule_from, &event.action)
                             {
+                                // Events predating outcomes re-derive effects,
+                                // ignoring guards and never minting child ids.
                                 let effects = effects.to_vec();
-                                // Shared effect application — same code as handle() and simulation.
-                                let (
-                                    _custom_effects,
-                                    _scheduled_actions,
-                                    _spawn_requests,
-                                    _schedule_at_requests,
-                                ) = super::effects::apply_effects(state, &effects, &event.params);
+                                super::effects::apply_legacy_replay_effects(
+                                    state,
+                                    &effects,
+                                    &event.params,
+                                );
                             }
-                            // Always honor the durably-stored target status. This
-                            // is safe (status is always persisted on the event)
-                            // and is the single source of truth for the post-
-                            // transition state across both the known-action and
-                            // unknown-action cases.
-                            super::effects::apply_new_state_fallback(
-                                state,
-                                &from_status,
-                                &event.to_status,
-                            );
+                            // The stored target always wins over the active
+                            // spec's SetState, including for legacy events.
+                            if !event.to_status.is_empty() {
+                                state.status.clone_from(&event.to_status);
+                            }
 
                             // Sync action params into fields — mirrors the live
                             // process_action() path (effects.rs:155) so data fields
@@ -1089,18 +1096,25 @@ impl Actor for EntityActor {
                 params: initial_params,
                 idempotency_key: None,
                 kind: temper_runtime::persistence::EventKind::Transition,
+                outcome: None,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
             {
-                self.persist_event(store, backend, &self.persistence_id(), &mut state, &created)
-                    .await
-                    .map_err(|e| {
-                        ActorError::custom(format!(
-                            "failed to persist bootstrap Created event for {}:{}: {}",
-                            self.entity_type, self.entity_id, e
-                        ))
-                    })?;
+                self.persist_event(
+                    store,
+                    backend,
+                    &mut state,
+                    &created,
+                    &ScheduledRows::default(),
+                )
+                .await
+                .map_err(|e| {
+                    ActorError::custom(format!(
+                        "failed to persist bootstrap Created event for {}:{}: {}",
+                        self.entity_type, self.entity_id, e
+                    ))
+                })?;
             }
             state.push_event_bounded(created);
         }
@@ -1121,6 +1135,7 @@ impl Actor for EntityActor {
                 related,
                 idempotency_key,
                 expected_authorization_precondition,
+                caller,
             } => {
                 // Capture start time for span duration (DST-safe: sim_now()
                 // returns logical clock in simulation, wall clock in production).
@@ -1337,11 +1352,19 @@ impl Actor for EntityActor {
                     // replay events, re-evaluate the action against the caught-up
                     // state, and retry the persist up to two more times. Other
                     // error variants fail immediately (same as before).
+                    // The rows of the scheduled actions it arms are written
+                    // with the event, so a restart arms them again.
+                    let scheduled = self.arm_scheduled_actions(
+                        &mut result.scheduled_actions,
+                        state,
+                        &event,
+                        caller.as_deref(),
+                    );
                     if let (Some(store), Some(backend)) =
                         (self.event_journal.as_ref(), self.event_backend)
                     {
                         let first_persist = self
-                            .persist_event(store, backend, &self.persistence_id(), state, &event)
+                            .persist_event(store, backend, state, &event, &scheduled)
                             .await;
 
                         match first_persist {
@@ -1452,7 +1475,7 @@ impl Actor for EntityActor {
                                     // terminal state during the race) — if so,
                                     // surface that error rather than silently
                                     // dropping the caller.
-                                    let retry_result = process_action_with_blob_prestate(
+                                    let mut retry_result = process_action_with_blob_prestate(
                                         state,
                                         &table,
                                         &name,
@@ -1519,13 +1542,19 @@ impl Actor for EntityActor {
                                     ))
                                     .await;
 
+                                    let retry_scheduled = self.arm_scheduled_actions(
+                                        &mut retry_result.scheduled_actions,
+                                        state,
+                                        &retry_event,
+                                        caller.as_deref(),
+                                    );
                                     match self
                                         .persist_event(
                                             store,
                                             backend,
-                                            &self.persistence_id(),
                                             state,
                                             &retry_event,
+                                            &retry_scheduled,
                                         )
                                         .await
                                     {
@@ -1854,12 +1883,13 @@ impl Actor for EntityActor {
                     params: serde_json::json!({}),
                     idempotency_key: None,
                     kind: temper_runtime::persistence::EventKind::Tombstone,
+                    outcome: None,
                 };
 
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
                     && let Err(e) = self
-                        .persist_event(store, backend, &self.persistence_id(), state, &deleted)
+                        .persist_event(store, backend, state, &deleted, &ScheduledRows::default())
                         .await
                 {
                     ctx.reply(persistence_failure_reply(state.clone(), &e));

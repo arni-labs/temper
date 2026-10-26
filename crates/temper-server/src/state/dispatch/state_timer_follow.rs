@@ -8,9 +8,9 @@
 //! [`TimerFollow::WaitsForCaller`]).
 //!
 //! At boot, after the rows are re-armed, a walk makes each record that had a
-//! row follow the state it replays into: a row of `Waiting` on a record that
-//! now replays into `Review` gets `Review`'s timer at once, not when the stale
-//! one fires. A record in a timed state with no row is not armed: it waits for
+//! row follow the state it replays into: a row armed under an older spec, on
+//! a record whose state now declares another timer, gets the new timer at
+//! once, not when the stale one fires. A record in a timed state with no row is not armed: it waits for
 //! its next action ([`Arming::FromRow`]). The walk counts those records, and
 //! ends with one log line of counts per tenant and type.
 //!
@@ -51,6 +51,9 @@ pub struct BootTimerCounts {
     /// Records in a timed state with no row: not armed, they wait for their
     /// next action.
     pub waiting: usize,
+    /// Scheduled actions (`schedule`, `schedule_at`) armed again from their
+    /// rows.
+    pub scheduled: usize,
 }
 
 /// The boot's [`BootTimerCounts`] by tenant and entity type.
@@ -159,8 +162,8 @@ impl ServerState {
             .iter()
             .map(|((tenant, entity_type), counts)| {
                 format!(
-                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={}",
-                    counts.rearmed, counts.dropped, counts.waiting
+                    "{tenant}/{entity_type} rearmed={} dropped={} waiting={} scheduled={}",
+                    counts.rearmed, counts.dropped, counts.waiting, counts.scheduled
                 )
             })
             .collect::<Vec<_>>()
@@ -169,6 +172,7 @@ impl ServerState {
             rearmed = counts.values().map(|c| c.rearmed).sum::<usize>(),
             dropped = counts.values().map(|c| c.dropped).sum::<usize>(),
             waiting = counts.values().map(|c| c.waiting).sum::<usize>(),
+            scheduled = counts.values().map(|c| c.scheduled).sum::<usize>(),
             by_type,
             "state timers after boot"
         );

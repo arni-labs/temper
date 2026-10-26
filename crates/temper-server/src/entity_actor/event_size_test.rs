@@ -48,6 +48,7 @@ async fn add_item(
     actor
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "AddItem".into(),
                 params: serde_json::json!({ "ProductId": product }),
                 related: BTreeMap::new(),
