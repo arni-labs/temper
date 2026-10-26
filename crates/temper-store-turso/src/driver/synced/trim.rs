@@ -8,13 +8,17 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use super::{Connection, DriverError, SyncCopy};
 
 /// How long one trim batch should hold the database's write lock. Writers
-/// wait behind a batch, so this is about the most a write waits on a trim.
-const BATCH_TARGET: Duration = Duration::from_millis(100);
+/// wait behind a batch, and a request arriving mid-batch is noticed only when
+/// it ends. A batch is sized from the last one's rate, and may double it, so
+/// one fast batch followed by the usual rate runs twice this long: on CI, a
+/// 100 ms target ran a 170 ms batch. Half of 100 ms keeps that case near
+/// 100 ms, the most a write should wait on a trim.
+const BATCH_TARGET: Duration = Duration::from_millis(50);
 
 /// Rows the first batch deletes. At the slowest rate measured, a cold log on
-/// a Tensorlake drive (10,000 rows in 34.2 s, about 290 rows a second), 25
-/// rows take about 90 ms, within [`BATCH_TARGET`].
-pub(super) const FIRST_BATCH_ROWS: i64 = 25;
+/// a Tensorlake drive (10,000 rows in 34.2 s, about 290 rows a second), 12
+/// rows take about 41 ms, within [`BATCH_TARGET`].
+pub(super) const FIRST_BATCH_ROWS: i64 = 12;
 
 impl SyncCopy {
     /// Delete change log rows the remote has confirmed, for about `budget`,
@@ -52,7 +56,7 @@ impl SyncCopy {
     ///
     /// Each batch is its own short DELETE, so the write lock is free between
     /// batches. Batches are sized by time: each deletes as many rows as the
-    /// last one's rate fits in 100 ms, at most twice the rows the
+    /// last one's rate fits in [`BATCH_TARGET`], at most twice the rows the
     /// last one deleted, so a cold stretch of the log shrinks them at once
     /// and a warm one grows them step by step. A batch starts only within
     /// `budget` and always runs to its end: one cut off mid-statement would
@@ -100,11 +104,12 @@ impl SyncCopy {
             batches += 1;
             // DELETE can complete without yielding on a warm disk. Always let
             // waiting requests run before deciding whether to start another.
+            // A yielded task is woken only after the scheduler turns the
+            // driver without blocking, which fires due timers and reads ready
+            // sockets (tokio 1.50 `scheduler/current_thread/mod.rs` 794-798
+            // and 421-434, `multi_thread/worker.rs` 586-590,
+            // `time/mod.rs` 254-255), so no pause is needed for that.
             tokio::task::yield_now().await;
-            // yield_now alone may immediately repoll this task without driving
-            // timers or socket readiness. A 1 ms pause forces a driver turn,
-            // so a newly arriving request is noticed between 100 ms batches.
-            tokio::time::sleep(Duration::from_millis(1)).await;
         };
         // Change numbers are consecutive (each one above the newest), and a
         // trim deletes from the oldest, so this is about the rows left.
@@ -168,9 +173,9 @@ mod tests {
 
     #[test]
     fn a_slow_batch_shrinks_the_next_and_a_fast_one_at_most_doubles_it() {
-        // 25 rows in 1 s: about 2 fit in 100 ms.
-        assert_eq!(next_batch(25, Duration::from_secs(1)), 2);
-        // 25 rows in 1 ms: 2,500 would fit, but growth is at most double.
+        // 25 rows in 1 s: about 1 fits in 50 ms.
+        assert_eq!(next_batch(25, Duration::from_secs(1)), 1);
+        // 25 rows in 1 ms: 1,250 would fit, but growth is at most double.
         assert_eq!(next_batch(25, Duration::from_millis(1)), 50);
         // Exactly on target keeps the size.
         assert_eq!(next_batch(400, BATCH_TARGET), 400);
