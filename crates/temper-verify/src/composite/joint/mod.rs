@@ -441,3 +441,7 @@ pub fn replay_joint_invariants(
 #[cfg(test)]
 #[path = "joint_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vacuous_test.rs"]
+mod vacuous_tests;
