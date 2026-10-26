@@ -224,7 +224,9 @@ impl Server {
 
     /// Run for `by` on the simulation clock (see [`Self::run_until`]).
     pub(crate) fn run_for(&self, by: Duration) {
-        self.runtime.block_on(tokio::time::sleep(by));
+        // The sleep is made inside the runtime, so it reads the paused clock.
+        self.runtime
+            .block_on(async move { tokio::time::sleep(by).await });
     }
 
     /// Send `action` to the record as `who`, creating the record first.
