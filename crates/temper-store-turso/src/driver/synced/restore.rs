@@ -8,7 +8,7 @@ use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use super::files::belongs_to;
+use super::files::{belongs_to, dir_of};
 
 /// How long opening may go without writing to the database's files before it
 /// fails. A healthy restore writes pages as they arrive; it goes quiet only
@@ -55,7 +55,7 @@ pub(super) async fn while_progressing<T, S: PartialEq>(
 /// database before the first page arrives, so while the pages download only
 /// the allocated space and the write time move.
 pub(super) fn footprint(path: &Path) -> BTreeMap<String, (u64, u64, Option<SystemTime>)> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = dir_of(path);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return BTreeMap::new();
@@ -73,6 +73,20 @@ pub(super) fn footprint(path: &Path) -> BTreeMap<String, (u64, u64, Option<Syste
         .collect()
 }
 
+/// Bytes of the database written so far, and its length. While a restore
+/// downloads, the length is already the whole database's.
+pub(super) fn written(path: &Path) -> (u64, u64) {
+    std::fs::metadata(path)
+        .map(|meta| {
+            (
+                allocated(&meta).saturating_mul(512).min(meta.len()),
+                meta.len(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// The space allocated to the file, in 512-byte blocks.
 #[cfg(unix)]
 fn allocated(meta: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::blocks(meta)

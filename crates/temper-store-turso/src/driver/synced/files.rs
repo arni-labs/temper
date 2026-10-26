@@ -17,7 +17,7 @@ pub(super) const RESTORING_SUFFIX: &str = "-sync-restoring";
 pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
     let failed =
         |error: std::io::Error| DriverError::SyncSetup(format!("move {}: {error}", path.display()));
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = dir_of(path);
     let name = path
         .file_name()
         .unwrap_or_default()
@@ -37,6 +37,14 @@ pub(super) fn move_aside(path: &Path) -> Result<PathBuf, DriverError> {
         }
     }
     Ok(aside)
+}
+
+/// The directory that holds `path` and the files kept beside it. A bare file
+/// name is in the working directory (its parent is the empty path).
+pub(super) fn dir_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 /// Whether `file` in the database's directory is the database `name` or one of
@@ -174,7 +182,20 @@ pub(super) fn restored(path: &Path) {
 
 /// Refuse a fetch into `path` when the database or any file kept beside it is
 /// already there: a fetch never overwrites.
-pub(super) fn refuse_existing(_path: &Path) -> Result<(), DriverError> {
+pub(super) fn refuse_existing(path: &Path) -> Result<(), DriverError> {
+    let dir = dir_of(path);
+    let failed =
+        |error: std::io::Error| DriverError::SyncSetup(format!("read {}: {error}", dir.display()));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for entry in std::fs::read_dir(dir).map_err(failed)? {
+        let file = entry.map_err(failed)?.file_name();
+        if belongs_to(&name, &file.to_string_lossy()) {
+            return Err(DriverError::SyncSetup(format!(
+                "{} already exists; a fetch never overwrites, so fetch into a new path",
+                dir.join(file).display()
+            )));
+        }
+    }
     Ok(())
 }
 
