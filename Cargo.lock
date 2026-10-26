@@ -7519,6 +7519,7 @@ dependencies = [
  "temper-authz",
  "temper-runtime",
  "temper-spec",
+ "toml",
  "z3",
 ]
 
