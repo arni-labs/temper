@@ -38,7 +38,7 @@ const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 const TIMEOUTS_BEFORE_RESTART: u32 = 6;
 
 /// With a copy, answer changes only after they reach it and keep it current.
-pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Router {
+pub(super) fn with_backup(router: Router, copy: Option<SyncCopy>) -> Router {
     let Some(copy) = copy else {
         return router;
     };
@@ -173,37 +173,5 @@ fn spawn_upkeep(copy: SyncCopy) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_reads_of_temper_routes_skip_the_push() {
-        assert!(reads_only(&Method::GET, "/tdata/Notes('a')"));
-        assert!(reads_only(&Method::GET, "/tdata"));
-        assert!(reads_only(&Method::HEAD, "/healthz"));
-        assert!(reads_only(&Method::GET, "/static/temper-client.js"));
-        assert!(!reads_only(&Method::POST, "/tdata/Notes('a')/Ns.Write"));
-        assert!(!reads_only(&Method::GET, "/webhooks/default/callback"));
-        assert!(!reads_only(&Method::GET, "/oauth/callback"));
-        assert!(!reads_only(&Method::GET, "/static/app-page"));
-        assert!(!reads_only(&Method::GET, "/observer"));
-        assert!(!reads_only(&Method::GET, "/genesisx"));
-    }
-
-    #[test]
-    fn only_a_copying_database_runs_requests_that_can_change_data() {
-        assert!(refusal(&CopyState::Copying).is_none());
-        for state in [
-            CopyState::Unchecked,
-            CopyState::Behind,
-            CopyState::Stopped("refused".to_string()),
-        ] {
-            let refused = refusal(&state).expect("refused");
-            assert_eq!(
-                refused.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{state:?}"
-            );
-        }
-    }
-}
+#[path = "sync_copy_test.rs"]
+mod tests;

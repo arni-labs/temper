@@ -67,3 +67,4 @@ pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{
 [dev-dependencies]
 tempfile = "3"
 temper-wasm = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

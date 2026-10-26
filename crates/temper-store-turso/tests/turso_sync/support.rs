@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{EventMetadata, EventStore, PersistenceEnvelope};
-use temper_store_turso::TursoEventStore;
+use temper_store_turso::{SyncCopy, TursoEventStore};
 
 pub const TOKEN: &str = "local-sync-server-ignores-tokens";
 
@@ -171,6 +171,26 @@ pub fn copy_files(from: &Path, to: &Path) {
     }
 }
 
+/// The client id the sync engine gave the file at `path`: a restore gives a
+/// new one, so the same id means the same file.
+pub fn client_of(path: &Path) -> String {
+    let report = SyncCopy::describe(path.to_str().expect("utf-8")).expect("describe");
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix("synced: client "))
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or_else(|| panic!("no client in {report}"))
+        .to_string()
+}
+
+/// Directories in `dir`: files a start moved aside, kept.
+pub fn aside_dirs(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter(|entry| entry.as_ref().expect("entry").path().is_dir())
+        .count()
+}
+
 pub fn remove_files(dir: &Path) {
     for entry in std::fs::read_dir(dir).expect("read dir") {
         let entry = entry.expect("entry");
@@ -224,6 +244,52 @@ pub async fn valve(upstream: &str) -> (String, std::sync::Arc<std::sync::atomic:
         }
     });
     (url, open)
+}
+
+/// A remote that goes away and comes back: forwards to the sync server while
+/// up; going down closes every connection, open ones included, and closes
+/// each new one at once.
+pub struct Outage {
+    pub url: String,
+    up: tokio::sync::watch::Sender<bool>,
+}
+
+impl Outage {
+    pub async fn new(upstream: &str) -> Self {
+        let (up, seen) = tokio::sync::watch::channel(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let upstream = upstream.trim_start_matches("http://").to_string();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                if !*seen.borrow() {
+                    continue;
+                }
+                let mut seen = seen.clone();
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                        _ = seen.wait_for(|up| !*up) => {}
+                    }
+                });
+            }
+        });
+        Self { url, up }
+    }
+
+    pub fn down(&self) {
+        self.up.send_replace(false);
+    }
+
+    pub fn back(&self) {
+        self.up.send_replace(true);
+    }
 }
 
 /// Forwards to the sync server while on; while off, closes every new

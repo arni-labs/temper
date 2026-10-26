@@ -25,11 +25,13 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 
 use super::{Connection, DriverError, DriverHandle, Lease};
 
+mod backup;
 mod files;
 mod pool;
 mod push;
 mod remote;
 mod restore;
+pub use backup::BackupStatus;
 use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::Remote;
