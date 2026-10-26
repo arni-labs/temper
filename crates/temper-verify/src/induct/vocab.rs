@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::{
     Action, ActionConstraint, ActionParam, ActionTrigger, Automaton, TriggerKind, VarType,
-    call_may_answer,
 };
 use temper_spec::predicate::{Arg, Effect, Literal};
 
@@ -366,13 +365,13 @@ impl<'a> Vocab<'a> {
         })
     }
 
-    /// The actions the kernel takes as a call's answer: its declared
-    /// answer, or else any action of its record (`call_may_answer`).
+    /// The actions the kernel takes as a call's answer: its trigger's
+    /// `on_success` (several rules may share its name).
     pub(super) fn answer_actions(&self, call: &Call) -> Vec<&'a Action> {
         self.automaton(&call.to)
             .actions
             .iter()
-            .filter(|a| call_may_answer(call.on_success.as_deref(), &a.name))
+            .filter(|a| call.on_success.as_deref() == Some(a.name.as_str()))
             .collect()
     }
 

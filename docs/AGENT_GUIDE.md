@@ -598,7 +598,7 @@ Work outside the entity is declared as `[[action.triggers]]` on the action that 
 | `kind` | Does | Required fields |
 |---|---|---|
 | `entity` | Dispatches an action on another Temper entity (a *reaction*) | `target_entity`, `target_action`, `resolve_target` |
-| `wasm` | Runs a sandboxed WASM module, then optionally `on_success` / `on_failure` on this entity | `module` (`config = { ... }` is passed to it) |
+| `wasm` | Runs a sandboxed WASM module, then `on_success` (with its values) or `on_failure` on this entity | `module`, `on_success` (`config = { ... }` is passed to it) |
 | `adapter` | Runs a native platform adapter, then `on_success` / `on_failure` | `adapter`, `config` |
 | `webhook` | Refused at load: no dispatcher sends it (ADR-0182). Make the call with `kind = "wasm"`, `module = "http_fetch"` | |
 | `hook` | A platform hook registered by the host | `hook` (e.g. `"DispatchCallback"`) |
@@ -625,7 +625,7 @@ on_failure = "RefreshFailed"
 config = { method = "POST", url = "https://oauth2.googleapis.com/token" }
 ```
 
-`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition. Without `on_success`, the module's result may name any action of the entity, and the kernel dispatches it with no Cedar check, so the checker takes every action the entity can take there as a possible answer. Name `on_success` to keep the answer to one.
+`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition. A module computes values; the spec decides the move. The kernel sends `on_success` with the module's values as its parameters, or `on_failure` when it fails, and reads no action from the result; a `wasm` trigger without `on_success` is refused at load. Where the values choose between moves, `on_success` stores them, and reactions guarded on them (`kind = "entity"`, `resolve_target = { kind = "same_id" }`, `guard = "chance >= 50"`) send the move each one leads to, the target action carrying the same guard. An adapter's result names no move either: without `on_success` it moves nothing.
 
 ### Deployment-level webhooks
 

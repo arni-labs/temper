@@ -127,8 +127,7 @@ impl Vocab<'_> {
         let answered = automaton.actions.iter().any(|a| {
             a.triggers.iter().any(|t| {
                 t.callee().is_some()
-                    && (call_may_answer(t.on_success.as_deref(), action)
-                        || t.on_failure.as_deref() == Some(action))
+                    && call_may_answer(t.on_success.as_deref(), t.on_failure.as_deref(), action)
             })
         });
         if answered {

@@ -300,6 +300,7 @@ OBSERVABILITY:\n\
 \x20 await temper.check_sentinel(tenant) -> trigger evolution engine\n\
 \n\
 TRIGGERS (ADR-0046): actions declare [[action.triggers]] inline with kind = \"entity\" | \"wasm\" | \"webhook\".\n\
+A wasm trigger names on_success (and on_failure): the module computes values, the spec's guards decide the move.\n\
 For HTTP, use kind = \"wasm\" with module = \"http_fetch\", url, and method config keys.\n\
 The webhook kind is parse-only today; use wasm + http_fetch instead.\n\
 \n\

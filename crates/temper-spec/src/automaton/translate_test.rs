@@ -155,6 +155,7 @@ effect = ["schedule('Refresh', 60)", "spawn('Child', 'Init', child_id)", "count 
 name = "run_wasm"
 kind = "wasm"
 module = "runner"
+on_success = "Refresh"
 
 [[action.triggers]]
 name = "callback"

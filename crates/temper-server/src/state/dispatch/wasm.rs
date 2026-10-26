@@ -1212,7 +1212,7 @@ impl crate::state::ServerState {
                                 "module": module_name,
                                 "trigger_action": ctx.action,
                                 "result": "success",
-                                "callback_action": result.callback_action.clone(),
+                                "callback_action": integration.on_success.clone(),
                                 "duration_ms": result.duration_ms,
                             }),
                         );
@@ -1310,6 +1310,13 @@ impl crate::state::ServerState {
                         .await;
                     }
                 };
+                // The kernel applied the composite's sub-writes; `on_success`
+                // takes the module's other values.
+                let callback_params = if composite_result_consumed {
+                    without_sub_writes(callback_params)
+                } else {
+                    callback_params
+                };
 
                 instrument_wasm_dispatch_phase(
                     phase_parent_span.clone(),
@@ -1320,7 +1327,7 @@ impl crate::state::ServerState {
                         ctx.entity_ref,
                         module_name,
                         ctx.action,
-                        Some(result.callback_action.clone()),
+                        integration.on_success.clone(),
                         true,
                         None,
                         result.duration_ms,
@@ -1329,23 +1336,11 @@ impl crate::state::ServerState {
                 )
                 .await;
 
-                // Determine callback action: prefer static on_success from spec,
-                // fall back to dynamic callback_action from WASM result. Composite
-                // integrations may return only a data envelope for the kernel to
-                // apply; the default SDK "callback" action should not become an
-                // implicit source-entity dispatch in that path.
-                let mut callback_action = integration
-                    .on_success
-                    .as_deref()
-                    .unwrap_or(&result.callback_action);
-                if composite_result_consumed
-                    && integration.on_success.is_none()
-                    && result.callback_action == "callback"
-                {
-                    callback_action = "";
-                }
-
-                if !callback_action.is_empty() {
+                // A module computes values; the spec decides the move. The
+                // kernel sends the trigger's `on_success` with them and reads
+                // no action from the result (the parser refuses a wasm trigger
+                // without one).
+                if let Some(callback_action) = integration.on_success.as_deref() {
                     let callback_response = instrument_wasm_dispatch_phase_result(
                         phase_parent_span.clone(),
                         ctx,
@@ -2125,6 +2120,15 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+}
+
+/// `params` without a composite's `sub_writes`, which the kernel applies.
+fn without_sub_writes(mut params: Value) -> Value {
+    if let Some(object) = params.as_object_mut() {
+        object.remove("sub_writes");
+        object.remove("SubWrites");
+    }
+    params
 }
 
 fn strip_private_observability_params(mut params: Value) -> Value {

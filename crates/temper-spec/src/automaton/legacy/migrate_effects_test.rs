@@ -211,6 +211,7 @@ effect = "trigger prepare"
 name = "prepare"
 kind = "wasm"
 module = "preparer"
+on_success = "Again"
 
 [action.triggers.config]
 url = "https://example.com"

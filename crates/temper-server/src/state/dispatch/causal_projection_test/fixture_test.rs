@@ -50,11 +50,17 @@ target_action="Verify"
 kind ="field"
 id_field ="verifier_id"
 "#;
+/// The module reads the source and answers what it saw; the Verifier's
+/// guards decide the move.
 const VERIFIER: &str = r#"
 [automaton]
 name="Verifier"
-states=["Idle","Checking","SawNew","SawOld"]
+states=["Idle","Checking","Seen","SawNew","SawOld"]
 initial="Idle"
+[[state]]
+name="seen"
+type="string"
+initial=""
 [[action]]
 name="Verify"
 from=["Idle"]
@@ -64,14 +70,38 @@ to="Checking"
 name = "check_source"
 kind = "wasm"
 module = "check_source"
+on_success = "Saw"
+[[action]]
+name="Saw"
+from=["Checking"]
+to="Seen"
+params=["seen"]
+
+[[action.triggers]]
+name = "new"
+kind = "entity"
+target_entity = "Verifier"
+target_action = "SawNew"
+resolve_target = { kind = "same_id" }
+guard = "seen == 'new'"
+
+[[action.triggers]]
+name = "old"
+kind = "entity"
+target_entity = "Verifier"
+target_action = "SawOld"
+resolve_target = { kind = "same_id" }
+guard = "seen == 'old'"
 [[action]]
 name="SawNew"
-from=["Checking"]
+from=["Seen"]
 to="SawNew"
+guard="seen == 'new'"
 [[action]]
 name="SawOld"
-from=["Checking"]
+from=["Seen"]
 to="SawOld"
+guard="seen == 'old'"
 "#;
 
 pub(super) struct FaultQueryPlane {
@@ -150,8 +180,8 @@ impl QueryPlaneStore for FaultQueryPlane {
 }
 
 fn verifier_wat() -> String {
-    let yes = r#"{"action":"SawNew","params":{},"success":true}"#;
-    let no = r#"{"action":"SawOld","params":{},"success":true}"#;
+    let yes = r#"{"params":{"seen":"new"},"success":true}"#;
+    let no = r#"{"params":{"seen":"old"},"success":true}"#;
     let encode = |s: &str| s.bytes().map(|b| format!("\\{b:02x}")).collect::<String>();
     let url = "http://localhost/tdata/Sources('source')";
     format!(

@@ -38,7 +38,8 @@ const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 </edmx:Edmx>"#;
 
 /// The owner's yes is a composite: its trigger answers with the Release's
-/// `Approve`. `Missed` records an answer that could not move the Release.
+/// `Approve`, and `Applied` once it lands. `Missed` records an answer that
+/// could not move the Release.
 const NOTICE_IOA: &str = r#"
 [automaton]
 name = "Notice"
@@ -63,11 +64,18 @@ params = []
 name = "yes"
 kind = "wasm"
 module = "answer"
+on_success = "Applied"
 on_failure = "Missed"
 
 [[action.sub_writes]]
 target_entity = "Release"
 action = "Approve"
+
+[[action]]
+name = "Applied"
+kind = "input"
+from = ["Answered"]
+params = []
 
 [[action]]
 name = "Missed"
@@ -349,6 +357,24 @@ impl QueryPlaneStore for ReleaseProjectionFails {
         &self,
     ) -> Result<Option<Vec<(String, u64)>>, PersistenceError> {
         Ok(None)
+    }
+}
+
+/// Whether the Notice takes `action` within twenty seconds.
+pub(super) async fn notice_took(state: &ServerState, action: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let entity = state
+            .get_tenant_entity_state(&TenantId::default(), "Notice", NOTICE)
+            .await
+            .expect("record should exist");
+        if entity.state.events.iter().any(|event| event.action == action) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

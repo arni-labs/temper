@@ -120,6 +120,7 @@ effect = ["ticks += 1"]
 name = "failing_job"
 kind = "wasm"
 module = "failing_job"
+on_success = "Fail"
 "#;
     let mut registry = SpecRegistry::new();
     registry.register_tenant(

@@ -33,6 +33,12 @@ action = "Create"
 name = "scm_ingest_pack"
 kind = "wasm"
 module = "scm_ingest_pack"
+on_success = "Ingested"
+
+[[action]]
+name = "Ingested"
+kind = "input"
+from = ["Active"]
 "#,
     )))
 }

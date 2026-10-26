@@ -62,7 +62,7 @@ fn check_verification_gate_or_423(
 /// 3. Use the native built-in File path when eligible
 /// 4. Otherwise register upload bytes in StreamRegistry
 /// 5. Invoke WASM blob_adapter
-/// 6. Dispatch whatever action WASM returns (e.g. StreamUpdated)
+/// 6. Dispatch the type's StreamUpdated with what WASM returns
 /// 7. Return 204 No Content with ETag
 #[instrument(skip_all, fields(otel.name = "PUT $value"))]
 pub(super) async fn handle_stream_put(
@@ -291,30 +291,28 @@ pub(super) async fn handle_stream_put(
         .into_response();
     }
 
-    if !wasm_result.callback_action.is_empty() {
-        match state
-            .dispatch_tenant_action_ext_typed_if_current(
-                DispatchCommand {
-                    tenant,
-                    entity_type: &entity_type,
-                    entity_id: &key,
-                    action: &wasm_result.callback_action,
-                    params: wasm_result.callback_params,
-                    agent_ctx,
-                    await_integration: false,
-                    await_reactions: true,
-                },
-                expected_authorization_precondition,
-            )
-            .await
-        {
-            Ok(entity_resp) => stream_put_success_response(&entity_resp),
-            Err(e) => {
-                odata_error(StatusCode::CONFLICT, "ActionRejected", &e.to_string()).into_response()
-            }
+    // The upload's move is the type's StreamUpdated, with what the adapter
+    // computed: the adapter names no move.
+    match state
+        .dispatch_tenant_action_ext_typed_if_current(
+            DispatchCommand {
+                tenant,
+                entity_type: &entity_type,
+                entity_id: &key,
+                action: "StreamUpdated",
+                params: wasm_result.callback_params,
+                agent_ctx,
+                await_integration: false,
+                await_reactions: true,
+            },
+            expected_authorization_precondition,
+        )
+        .await
+    {
+        Ok(entity_resp) => stream_put_success_response(&entity_resp),
+        Err(e) => {
+            odata_error(StatusCode::CONFLICT, "ActionRejected", &e.to_string()).into_response()
         }
-    } else {
-        StatusCode::NO_CONTENT.into_response()
     }
 }
 

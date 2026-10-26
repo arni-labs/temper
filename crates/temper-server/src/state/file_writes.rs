@@ -389,24 +389,12 @@ impl ServerState {
             ));
         }
 
-        if wasm_result.callback_action.is_empty() {
-            return self
-                .get_tenant_entity_state(tenant, "File", file_id)
-                .await
-                .map_err(|e| {
-                    FileStreamContentError::State(format!(
-                        "failed to load File('{file_id}') state after blob_adapter: {e}"
-                    ))
-                });
-        }
-
         // The adapter says what it stored; the File records the hash and size of the bytes this server was sent,
-        // and an adapter that names other bytes is refused.
+        // and an adapter that names other bytes is refused. The move is the upload's own, StreamUpdated: the
+        // adapter computes values and names none.
         let mut params = wasm_result.callback_params;
         let (content_hash, _) = content_hash_and_native_blob_key(body);
-        if let Some(fields) = params.as_object_mut()
-            && wasm_result.callback_action.rsplit('.').next() == Some("StreamUpdated")
-        {
+        if let Some(fields) = params.as_object_mut() {
             match fields.get("content_hash").and_then(|hash| hash.as_str()) {
                 Some(said) if !said.is_empty() && said != content_hash => {
                     return Err(FileStreamContentError::Wasm(format!(
@@ -428,7 +416,7 @@ impl ServerState {
         self.dispatch_file_stream_action(FileStreamAction {
             tenant,
             file_id,
-            action: &wasm_result.callback_action,
+            action: "StreamUpdated",
             params,
             agent_ctx,
             await_reactions: true,

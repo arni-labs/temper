@@ -43,7 +43,7 @@ commit = "commit"
 kind = "same_id"
 "#;
 
-/// The place: a module brings the commit, may make it wait or give up, and
+/// The place: a module brings the commit, or fails and waits, and the place
 /// gives up by itself after a while. `nudge_from` is where outside code may
 /// ask again.
 fn place(nudge_from: &str) -> String {
@@ -70,6 +70,7 @@ params = [{{ name = "commit", type = "string" }}]
 name = "place"
 kind = "wasm"
 module = "steps"
+on_success = "Placed"
 on_failure = "Waiting"
 
 [[action]]
@@ -82,6 +83,7 @@ to = "Bringing"
 name = "place"
 kind = "wasm"
 module = "steps"
+on_success = "Placed"
 on_failure = "Waiting"
 
 [[action]]
