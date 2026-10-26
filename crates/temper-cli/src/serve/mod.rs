@@ -249,8 +249,7 @@ pub async fn run(
     }
 
     // Phase 9: Bind, start background tasks, serve
-    let router =
-        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_sync_copy);
+    let router = sync_copy::with_backup(build_platform_router(state.clone()), turso_sync_copy);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
         .with_context(|| format!("Failed to bind to {bind}:{port}"))?;

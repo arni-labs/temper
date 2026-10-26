@@ -5,9 +5,11 @@ use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
 
+use super::remote::Mark;
 use super::{
     CopyState, DriverError, PUSH_ATTEMPT_TIMEOUT, REMOTE_STATEMENT_FAILED, SyncCopy, files,
 };
+use crate::driver::params;
 
 /// How long the remote may take to say how far it got, under the 10 s its
 /// HTTP client allows, so a hung remote is told from a refusing one.
@@ -17,10 +19,11 @@ impl SyncCopy {
     /// Copy every change committed before this call to the remote database.
     ///
     /// Returns without a network request when another push already carried
-    /// those changes, so writers that commit together share one push. An
-    /// error means some of them may be only local; they stay in the local
+    /// those changes, so changes committed together share one push. An error
+    /// means some of them are only in the file so far; they stay in its
     /// change log and the next successful push sends them. Nothing is pushed
-    /// unless the copy is [`CopyState::Copying`].
+    /// unless the copy is [`CopyState::Copying`]. Writes never wait for this:
+    /// the server calls it in the background.
     pub async fn push_committed(&self) -> Result<(), PersistenceError> {
         // Changes are numbered in commit order (one writer at a time), so
         // everything this caller committed is at or below `wanted`.
@@ -40,6 +43,7 @@ impl SyncCopy {
         let started = Instant::now();
         let pushed = {
             let _engine = self.inner.engine.lock().await;
+            let _running = self.push_running();
             tokio::time::timeout(PUSH_ATTEMPT_TIMEOUT, self.inner.db.push()).await
         };
         tracing::debug!(
@@ -54,6 +58,7 @@ impl SyncCopy {
                 self.inner.timeouts.store(0, Ordering::Release);
             }
             Ok(Err(error)) => {
+                self.push_failed();
                 self.inner.timeouts.store(0, Ordering::Release);
                 let message = error.to_string();
                 if message.contains(REMOTE_STATEMENT_FAILED) {
@@ -62,6 +67,7 @@ impl SyncCopy {
                 return Err(storage_error(error));
             }
             Err(_) => {
+                self.push_failed();
                 self.inner.timeouts.fetch_add(1, Ordering::AcqRel);
                 return Err(PersistenceError::Storage(format!(
                     "turso.sync push timed out after {} s",
@@ -72,13 +78,18 @@ impl SyncCopy {
         // The engine sends only changes numbered above the remote's record of
         // this file's last push. A record above everything the file holds
         // means the remote silently skipped what was just written: a second
-        // server is pushing as this file.
+        // server is pushing as this file, and each has changes the other lacks.
         let remote_has = self.last_pushed_hint().map_err(storage_error)?;
-        let local_has = self.last_change().await?;
+        let local_has = self.local_mark().await?;
         if remote_has > local_has {
-            self.enter(CopyState::Behind, &format!(
-                "after a push the remote has changes up to {remote_has}, the file only up to {local_has}"
-            ));
+            self.enter(
+                CopyState::Stopped(format!(
+                    "diverged: after a push the remote's record of this file is at change \
+                     {remote_has}, past the file's newest, {local_has}: another server is pushing \
+                     as this file"
+                )),
+                "the file and its remote copy each have changes the other lacks",
+            );
             return self.require_copying();
         }
         self.inner.pushed.fetch_max(covered, Ordering::AcqRel);
@@ -90,7 +101,7 @@ impl SyncCopy {
     /// from committed (it timed out, its answer was lost, or this server
     /// restarted after one), so then, and first after every start, the
     /// remote is asked.
-    async fn remote_had(&self) -> Result<i64, PersistenceError> {
+    async fn remote_had(&self) -> Result<Mark, PersistenceError> {
         let hint = self.last_pushed_hint().map_err(storage_error)?;
         if !self.inner.unsure.load(Ordering::Acquire) {
             return Ok(hint);
@@ -100,6 +111,7 @@ impl SyncCopy {
         match tokio::time::timeout(REMOTE_READ_TIMEOUT, self.inner.remote.last_change()).await {
             Ok(read) => Ok(hint.max(read.map_err(storage_error)?)),
             Err(_) => {
+                self.push_failed();
                 self.inner.timeouts.fetch_add(1, Ordering::AcqRel);
                 Err(PersistenceError::Storage(format!(
                     "turso.sync the remote did not say how far it got within {} s",
@@ -120,7 +132,7 @@ impl SyncCopy {
     /// its record of the push, so a retry would succeed with that change
     /// missing. Its record moving past where it was shows that happened; a
     /// refusal that committed nothing (a busy remote) leaves it in place.
-    async fn after_refusal(&self, remote_had: i64, message: &str) {
+    async fn after_refusal(&self, remote_had: Mark, message: &str) {
         match self.inner.remote.last_change().await {
             Ok(remote_has) if remote_has <= remote_had => {
                 tracing::warn!(
@@ -129,12 +141,16 @@ impl SyncCopy {
                 );
             }
             Ok(_) => self.enter(
-                CopyState::Stopped(message.to_string()),
+                CopyState::Stopped(format!(
+                    "the remote copy is missing a change: it refused one and committed the rest \
+                     of its push ({message})"
+                )),
                 "the remote refused a change and committed the rest",
             ),
             Err(error) => self.enter(
                 CopyState::Stopped(format!(
-                    "{message} (and its progress could not be read: {error})"
+                    "the remote copy may be missing a change: it refused one ({message}) and its \
+                     progress could not be read ({error})"
                 )),
                 "the remote refused a change and its progress could not be read",
             ),
@@ -148,20 +164,23 @@ impl SyncCopy {
                 "turso.sync the remote copy has not been reachable since this start".to_string(),
             )),
             CopyState::Behind => Err(PersistenceError::Storage(
-                "turso.sync the file is behind its remote copy; it is restored at the next start"
+                "turso.sync the file is behind its remote copy; the next start brings it level"
                     .to_string(),
             )),
             CopyState::Stopped(cause) => Err(PersistenceError::Storage(format!(
-                "turso.sync the remote copy is missing a change ({cause})"
+                "turso.sync the backup is stopped until an operator decides: {cause}"
             ))),
         }
     }
 
     /// The remote's record of this file's last pushed change, as the engine
-    /// saved it after its last successful push.
-    fn last_pushed_hint(&self) -> Result<i64, DriverError> {
+    /// saved it after its last successful push. A pull starts it over.
+    pub(super) fn last_pushed_hint(&self) -> Result<Mark, DriverError> {
         let info = files::sync_metadata(&self.inner.path)?;
-        Ok(info["last_pushed_change_id_hint"].as_i64().unwrap_or(0))
+        Ok(Mark {
+            generation: info["last_pushed_pull_gen_hint"].as_i64().unwrap_or(0),
+            change: info["last_pushed_change_id_hint"].as_i64().unwrap_or(0),
+        })
     }
 
     /// The number of the newest committed change in the local change log.
@@ -178,6 +197,35 @@ impl SyncCopy {
             .get::<Option<i64>>(0)
             .map_err(storage_error)?
             .unwrap_or(0))
+    }
+
+    /// Where the file's change log stands: the generation the engine is in
+    /// (it moves on with every pull) and the newest change in it.
+    pub(super) async fn local_mark(&self) -> Result<Mark, PersistenceError> {
+        let change = self.last_change().await?;
+        let client_id = files::sync_metadata(&self.inner.path)
+            .map(|info| super::remote::client_id(&info))
+            .map_err(storage_error)?;
+        let conn = self.connect().await.map_err(storage_error)?;
+        let generation = match conn
+            .query(
+                "SELECT pull_gen FROM turso_sync_last_change_id WHERE client_id = ?",
+                params![client_id],
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await.map_err(storage_error)? {
+                Some(row) => row
+                    .get::<Option<i64>>(0)
+                    .map_err(storage_error)?
+                    .unwrap_or(0),
+                None => 0,
+            },
+            // Never pulled, and restored from a remote nothing had pushed to.
+            Err(error) if error.to_string().contains("no such table") => 0,
+            Err(error) => return Err(storage_error(error)),
+        };
+        Ok(Mark { generation, change })
     }
 
     pub(super) async fn query_text(&self, sql: &str) -> Result<String, DriverError> {

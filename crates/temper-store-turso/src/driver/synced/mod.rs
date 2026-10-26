@@ -1,54 +1,65 @@
-//! A local database file whose committed changes are copied to its own
+//! A local database file whose committed changes are backed up to its own
 //! Turso Cloud database (Turso Sync).
 //!
-//! Reads and writes stay on the local file. [`SyncCopy::push_committed`]
-//! sends every change committed before the call to the remote database in one
-//! request, and returns only once the remote has committed it. Callers that
-//! answer a request after a write await it first, so a confirmed change is
-//! never only on this machine. A fresh machine with no local file starts from
-//! the remote copy. That restore runs as long as it keeps writing the file
-//! (see `restore`), and one stopped part way is kept aside and run again at
-//! the next start.
+//! The file is the database: reads and writes go to it, and a change is
+//! confirmed once it commits there. [`SyncCopy::push_committed`] sends every
+//! change committed before the call to the remote in one request; the server
+//! calls it in the background, so no answer waits for the remote and none is
+//! refused because of it. [`SyncCopy::backup_status`] says how far the remote
+//! is behind.
 //!
-//! Writes are confirmed only in [`CopyState::Copying`]. A start that cannot
-//! reach the remote serves reads and waits ([`CopyState::Unchecked`]); a file
-//! found behind the remote is restored from it at the next start
-//! ([`CopyState::Behind`]); a remote that refused a change stops confirmation
-//! until an operator rebuilds it ([`CopyState::Stopped`]).
+//! A start opens the file as it is when it is whole (see `start`). It
+//! restores from the remote only a file that is missing or damaged, brings a
+//! file that is only behind the remote level with it, and never replaces
+//! changes the file has that the remote lacks.
+//!
+//! Pushes run only in [`CopyState::Copying`]. A start that cannot reach the
+//! remote serves as usual and pushes once the remote has checked the file
+//! ([`CopyState::Unchecked`]); a file found behind the remote, with nothing of
+//! its own since, is brought level at the next start ([`CopyState::Behind`]);
+//! a remote that refused a change, or a file and remote that each have
+//! changes the other lacks, stop the backup until an operator decides
+//! ([`CopyState::Stopped`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
 
 use super::{Connection, DriverError, DriverHandle, Lease};
 
+mod backup;
 mod files;
 mod pool;
 mod push;
 mod remote;
 mod restore;
-use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
+mod start;
+pub use backup::BackupStatus;
+use files::{DIVERGED_SUFFIX, sidecar};
 pub(crate) use pool::ConnectionPool;
-use remote::Remote;
+use remote::{Mark, Remote};
 
-/// Whether writes to the file can be confirmed against its remote copy.
+/// What the backup of the file can do now. The file serves and confirms
+/// writes in every state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyState {
-    /// Every write is copied before it is confirmed.
+    /// Every committed change is pushed in the background.
     Copying,
     /// The remote could not be reached to check the file since this start.
-    /// Reads are served; nothing is pushed or confirmed until the check passes.
+    /// Nothing is pushed until the check passes; what the file commits
+    /// meanwhile is pushed after it.
     Unchecked,
-    /// The remote holds changes from this file's history that the file lacks:
-    /// it came back from an older copy, or a second server shares it. The
-    /// next start restores the file from the remote.
+    /// The remote holds changes from this file's history that the file lacks
+    /// (it came back from an older copy), and the file has nothing of its own
+    /// since. The next start brings the file level with the remote.
     Behind,
-    /// The remote refused a change and committed the rest of its push, so it
-    /// is missing one. Kept across restarts until an operator rebuilds the
-    /// remote and clears the stop ([`SyncCopy::clear_stop`]).
+    /// The backup is stopped, kept across restarts until an operator decides
+    /// ([`SyncCopy::clear_stop`], `temper sync-copy`): the remote refused a
+    /// change and committed the rest of its push, so it is missing one, or
+    /// the file and the remote each have changes the other lacks.
     Stopped(String),
 }
 
@@ -62,13 +73,13 @@ struct Inner {
     db: turso::sync::Database,
     path: PathBuf,
     remote: Remote,
-    /// Every call into the sync engine (connect, push, stats, checkpoint) goes
-    /// through this lock. The engine guards itself with a blocking mutex that
-    /// a push holds across its network wait, so an unguarded `connect` blocks
-    /// a runtime thread until the push ends, and on a one-thread runtime
-    /// never returns.
+    /// Every call into the sync engine (connect, push, pull, stats,
+    /// checkpoint) goes through this lock. The engine guards itself with a
+    /// blocking mutex that a push holds across its network wait, so an
+    /// unguarded `connect` blocks a runtime thread until the push ends, and
+    /// on a one-thread runtime never returns.
     engine: tokio::sync::Mutex<()>,
-    /// One push at a time. Writers that finish while a push is in flight wait
+    /// One push at a time. A caller that asks while a push is in flight waits
     /// here, not on `engine`, so a connection being opened waits for at most
     /// the push in flight, and the next push carries all of their changes.
     pushing: tokio::sync::Mutex<()>,
@@ -87,12 +98,18 @@ struct Inner {
     pushed: AtomicI64,
     /// The newest change in the file when it was opened, before this start
     /// committed anything. A file is behind when the remote has more.
-    opened_at: AtomicI64,
+    opened_at: std::sync::Mutex<Mark>,
     state: std::sync::Mutex<CopyState>,
     /// Push attempts that ran out of time in a row.
     timeouts: AtomicU32,
     /// Whether the remote may hold a push the engine never heard back from.
     unsure: AtomicBool,
+    /// Whether a push is running now.
+    in_flight: AtomicBool,
+    /// Push attempts that failed since this start.
+    failures: AtomicU64,
+    /// Since when the remote has lacked a committed change.
+    lag: std::sync::Mutex<backup::LagClock>,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -108,123 +125,7 @@ impl std::fmt::Debug for SyncCopy {
 }
 
 impl SyncCopy {
-    /// Open `path` as a synced database, restoring it from `remote_url` when
-    /// there is no local database yet.
-    ///
-    /// Before anything commits, the file is checked against the remote's
-    /// record of it. A file behind the remote (it came back from an older
-    /// copy) is moved aside and the database restored from the remote, which
-    /// holds everything the older copy did. A remote that cannot be reached
-    /// leaves the copy [`CopyState::Unchecked`] until [`Self::recheck`] passes.
-    /// A file that a stopped restore left part way is moved aside the same
-    /// way, and restored again.
-    pub(crate) async fn open(
-        path: &str,
-        remote_url: &str,
-        auth_token: &str,
-    ) -> Result<Self, DriverError> {
-        let path = Path::new(path);
-        check_local_files(path)?;
-        let copy = Self::build(path, remote_url, auth_token).await?;
-        match copy.recheck_inner().await {
-            Ok(CopyState::Behind) => {}
-            Ok(_) => return Ok(copy),
-            Err(error) => {
-                tracing::warn!(%error, "turso.sync remote unreachable at start; serving reads only until it answers");
-                files::mark_unchecked(path, copy.inner.opened_at.load(Ordering::Acquire))?;
-                return Ok(copy);
-            }
-        }
-        drop(copy);
-        let moved = files::move_aside(path)?;
-        tracing::warn!(
-            moved = %moved.display(),
-            "turso.sync local file is behind its remote copy; restoring from the remote"
-        );
-        let copy = Self::build(path, remote_url, auth_token).await?;
-        if let Err(error) = copy.recheck_inner().await {
-            tracing::warn!(%error, "turso.sync check after the restore failed");
-        }
-        Ok(copy)
-    }
-
-    async fn build(path: &Path, remote_url: &str, auth_token: &str) -> Result<Self, DriverError> {
-        // The engine's HTTPS client takes the process's rustls crypto provider,
-        // and rustls cannot choose one when the build carries two (the whole
-        // workspace does): the engine's IO thread then panics and every sync
-        // call waits forever. An error here means one is already installed.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        // Without sync metadata the engine restores the file from the remote,
-        // and writes the metadata only once every page is on disk. Until then
-        // the file is marked, so a start that stops part way is not taken
-        // for a database that was never synced.
-        if !sidecar(path, "-info").exists() {
-            files::mark_restoring(path)?;
-        }
-        let local = path.to_string_lossy();
-        let opening = turso::sync::Builder::new_remote(&local)
-            .with_remote_url(remote_url)
-            .with_auth_token(auth_token)
-            .with_client_name("temper")
-            .bootstrap_if_empty(true)
-            .build();
-        let db = restore::while_progressing(opening, || restore::footprint(path))
-            .await
-            .ok_or_else(|| {
-                DriverError::SyncSetup(format!(
-                    "opening {} with its remote copy made no progress for {} s",
-                    path.display(),
-                    restore::RESTORE_STALL_BUDGET.as_secs()
-                ))
-            })??;
-        files::restored(path);
-        let state = match std::fs::read_to_string(sidecar(path, DIVERGED_SUFFIX)) {
-            Ok(cause) => CopyState::Stopped(cause),
-            Err(_) => CopyState::Unchecked,
-        };
-        let client_id = remote::client_id(&files::sync_metadata(path)?);
-        let copy = Self {
-            inner: Arc::new(Inner {
-                db,
-                path: path.to_path_buf(),
-                remote: Remote::new(remote_url, auth_token, client_id),
-                engine: tokio::sync::Mutex::new(()),
-                pushing: tokio::sync::Mutex::new(()),
-                pushed: AtomicI64::new(0),
-                opened_at: AtomicI64::new(0),
-                pool: ConnectionPool::default(),
-                in_use: Arc::new(tokio::sync::RwLock::new(())),
-                state: std::sync::Mutex::new(state),
-                timeouts: AtomicU32::new(0),
-                unsure: AtomicBool::new(true),
-            }),
-        };
-        // Change numbers follow commit order only with one writer at a time
-        // (WAL). The engine can switch a file to MVCC for an MVCC remote.
-        let mode = copy.query_text("PRAGMA journal_mode").await?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(DriverError::SyncSetup(format!(
-                "{} is in journal mode {mode}; Temper's Turso Sync copy needs WAL",
-                path.display()
-            )));
-        }
-        let opened_at = match files::unchecked_since(path) {
-            Some(opened_at) => opened_at,
-            None => copy
-                .last_change()
-                .await
-                .map_err(|error| DriverError::SyncSetup(error.to_string()))?,
-        };
-        copy.inner.opened_at.store(opened_at, Ordering::Release);
-        let mut warm = Vec::with_capacity(WARM_CONNECTIONS);
-        for _ in 0..WARM_CONNECTIONS {
-            warm.push(copy.connect().await?);
-        }
-        drop(warm);
-        Ok(copy)
-    }
-
-    /// Whether writes can be confirmed now, and if not, why.
+    /// What the backup can do now, and if it cannot push, why.
     pub fn state(&self) -> CopyState {
         self.inner.state.lock().unwrap().clone()
     }
@@ -236,19 +137,8 @@ impl SyncCopy {
         self.inner.timeouts.load(Ordering::Acquire)
     }
 
-    /// Record for monitoring whether writes are paused: the gauge
-    /// `temper_turso_sync_writes_paused` is 1 in every state but
-    /// [`CopyState::Copying`]. The reason is in the log line of the change.
-    pub fn record_state(&self) {
-        static PAUSED: std::sync::OnceLock<opentelemetry::metrics::Gauge<u64>> =
-            std::sync::OnceLock::new();
-        let gauge = PAUSED.get_or_init(|| {
-            opentelemetry::global::meter("temper-store-turso")
-                .u64_gauge("temper_turso_sync_writes_paused")
-                .with_description("1 while a synced database cannot confirm writes.")
-                .build()
-        });
-        gauge.record(u64::from(self.state() != CopyState::Copying), &[]);
+    fn opened_at(&self) -> Mark {
+        *self.inner.opened_at.lock().unwrap()
     }
 
     /// Check an [`CopyState::Unchecked`] file against the remote and return
@@ -257,21 +147,40 @@ impl SyncCopy {
         self.recheck_inner().await.map_err(storage_error)
     }
 
+    /// The remote at or before the file's place at open: the file holds all
+    /// of its history the remote does, and what it has beyond is pushed. The
+    /// remote past it: the file is behind when it has committed nothing since
+    /// it opened, and the two have diverged when it has.
     async fn recheck_inner(&self) -> Result<CopyState, DriverError> {
         if self.state() != CopyState::Unchecked {
             return Ok(self.state());
         }
         let remote_has = self.inner.remote.last_change().await?;
-        let opened_at = self.inner.opened_at.load(Ordering::Acquire);
-        if remote_has > opened_at {
-            self.enter(CopyState::Behind, &format!(
-                "the remote has changes up to {remote_has} from this file's history, the file only \
-                 up to {opened_at}"
-            ));
-        } else {
+        let opened_at = self.opened_at();
+        if remote_has <= opened_at {
             self.enter(
                 CopyState::Copying,
                 "the file checks out against its remote copy",
+            );
+            return Ok(self.state());
+        }
+        let local_has = self
+            .local_mark()
+            .await
+            .map_err(|error| DriverError::SyncSetup(error.to_string()))?;
+        if local_has == opened_at {
+            self.enter(CopyState::Behind, &format!(
+                "the remote has changes up to {remote_has} from this file's history, the file only \
+                 up to {opened_at} and nothing of its own since"
+            ));
+        } else {
+            self.enter(
+                CopyState::Stopped(format!(
+                    "diverged: the remote has changes up to {remote_has} from this file's history \
+                     that the file lacks, and the file has changes of its own past {opened_at}, \
+                     up to {local_has}, that the remote lacks"
+                )),
+                "the file and its remote copy each have changes the other lacks",
             );
         }
         Ok(self.state())
@@ -289,14 +198,18 @@ impl SyncCopy {
         match &next {
             CopyState::Copying => {
                 files::mark_checked(&self.inner.path);
-                tracing::info!(why, "turso.sync writes are confirmed again");
+                tracing::info!(why, "turso.sync the backup is pushing");
             }
             CopyState::Unchecked => {}
-            CopyState::Behind | CopyState::Stopped(_) => tracing::error!(
-                event = "turso.sync.writes_stopped",
+            CopyState::Behind => tracing::warn!(
+                why,
+                "turso.sync the file is behind its remote copy; the next start brings it level"
+            ),
+            CopyState::Stopped(_) => tracing::error!(
+                event = "turso.sync.backup_stopped",
                 state = ?next,
                 why,
-                "turso.sync stopped confirming writes"
+                "turso.sync the backup stopped; the file keeps serving and confirming writes"
             ),
         }
         if let CopyState::Stopped(cause) = &next

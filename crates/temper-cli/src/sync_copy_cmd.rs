@@ -1,11 +1,14 @@
-//! `temper sync-copy`: inspect or repair a database whose changes are copied
-//! to Turso Cloud (`TURSO_SYNC_URL`).
+//! `temper sync-copy`: inspect or repair a database whose changes are backed
+//! up to Turso Cloud (`TURSO_SYNC_URL`).
 //!
-//! When the remote refuses a change it still commits the rest of that push,
-//! so it is missing one, and the server stops confirming writes (it answers
-//! "SavingStopped") until an operator acts, with the app stopped:
+//! The file serves and confirms writes whatever the backup does. The backup
+//! stops, and stays stopped across restarts, when the remote refused a change
+//! (it still commits the rest of that push, so it is missing one), or when the
+//! file and the remote each have changes the other lacks ("diverged"). Then
+//! an operator decides, with the app stopped:
 //!
-//! - `status` shows the stop and how far the file and its last push got.
+//! - `status` shows the stop, its cause, and how far the file and its last
+//!   push got. The server's metrics show how far the backup is behind.
 //! - If the file is right: rebuild the remote from a copy of it (drop the
 //!   copy's `turso_cdc` and `turso_cdc_version` tables, upload it as the app's
 //!   Turso database), then `restore` so the next start downloads that copy
@@ -13,7 +16,7 @@
 //! - If the remote is right: `restore` alone; the file is moved aside (kept
 //!   for inspection) and the next start downloads the remote.
 //! - If the stop was raised in error and the remote holds every change:
-//!   `resume` clears it and the next start confirms writes again.
+//!   `resume` clears it and the next start backs up again.
 //!
 //! A restore runs for as long as it keeps writing the file. One that stopped
 //! part way (`status` shows "restoring") needs nothing: the next start moves
@@ -45,7 +48,7 @@ pub enum Action {
         #[arg(long)]
         db: String,
     },
-    /// With the app stopped: clear the stop so the next start confirms writes again.
+    /// With the app stopped: clear the stop so the next start backs up again.
     Resume {
         #[arg(long)]
         db: String,
@@ -99,7 +102,7 @@ pub async fn run(action: Action) -> Result<()> {
     let report = match action {
         Action::Status { db } => SyncCopy::describe(&db)?,
         Action::Resume { db } => match SyncCopy::clear_stop(&db)? {
-            Some(cause) => format!("cleared the stop ({cause}); the next start confirms writes"),
+            Some(cause) => format!("cleared the stop ({cause}); the next start backs up again"),
             None => format!("{db} is not stopped"),
         },
         Action::Restore { db } => format!(

@@ -110,7 +110,7 @@ pub struct TursoPolicyApprovalCommit<'a> {
     pub created_by: &'a str,
 }
 
-pub use driver::{CopyState, SyncCopy};
+pub use driver::{BackupStatus, CopyState, SyncCopy};
 pub use metrics::init_metrics;
 pub use router::{TenantRegistryRow, TenantStoreRouter, TenantUserRow};
 pub use store::{

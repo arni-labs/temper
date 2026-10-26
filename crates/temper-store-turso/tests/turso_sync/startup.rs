@@ -1,5 +1,6 @@
-//! Starting a synced database: without the remote, from an older copy, from
-//! a restore cut short, by fetching, and from a database that was never synced.
+//! Starting a synced database: without the remote, from an older copy that
+//! wrote on its own, from a damaged file, from a restore cut short, by
+//! fetching, and from a database that was never synced.
 
 use std::path::PathBuf;
 
@@ -7,9 +8,11 @@ use super::support::*;
 use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 #[tokio::test]
-async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_answers() {
-    // Rita, 17 Oct: "Read only". Whether the file is behind the remote can be
-    // told only by asking the remote, so until then nothing is pushed.
+async fn a_start_without_the_remote_serves_and_backs_up_once_it_answers() {
+    // The drive is the database's home and the remote its backup, so a start
+    // without the remote serves as usual. Whether the file is behind the
+    // remote can be told only by asking the remote, so until then nothing is
+    // pushed; what the file commits meanwhile is pushed after the check.
     let Some(server) = SyncServer::start() else {
         return;
     };
@@ -29,22 +32,32 @@ async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_ans
     let copy = a.sync_copy().expect("copy").clone();
     assert_eq!(copy.state(), CopyState::Unchecked);
     assert_eq!(count(&a, "u1").await, 1, "reads are served");
+    write(&a, "u1", 1).await;
+    assert_eq!(count(&a, "u1").await, 2, "and writes");
     copy.push_committed()
         .await
-        .expect_err("nothing is confirmed unchecked");
+        .expect_err("nothing is pushed unchecked");
     copy.recheck().await.expect_err("still unreachable");
 
     on.store(true, std::sync::atomic::Ordering::Release);
     assert_eq!(copy.recheck().await.expect("recheck"), CopyState::Copying);
-    write(&a, "u1", 1).await;
+    write(&a, "u1", 2).await;
     push(&a).await;
     let (_b_dir, b_path) = machine();
     let b = server.open(&b_path).await;
-    assert_eq!(count(&b, "u1").await, 2);
+    assert_eq!(
+        count(&b, "u1").await,
+        3,
+        "the write made unchecked was backed up too"
+    );
 }
 
 #[tokio::test]
-async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
+async fn an_older_copy_that_wrote_without_the_remote_keeps_serving_and_stops_the_backup() {
+    // Each side then has changes the other lacks. Bringing the file level
+    // with the remote would drop the file's own; pushing them would have the
+    // remote skip the ones whose numbers it already holds. So the file keeps
+    // serving, the backup stops, and an operator decides.
     let Some(server) = SyncServer::start() else {
         return;
     };
@@ -77,9 +90,9 @@ async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
     let a = open(a_path.clone()).await;
     let copy = a.sync_copy().expect("copy").clone();
     assert_eq!(copy.state(), CopyState::Unchecked);
-    // Work the server does on its own still commits locally while unchecked,
-    // here more changes than the remote is ahead by, so the file's newest
-    // change number passes the remote's: only the number at open tells.
+    // Writes go on while unchecked, here more changes than the remote is
+    // ahead by, so the file's newest change number passes the remote's: only
+    // the number at open tells.
     for i in 0..10 {
         write(&a, "meanwhile", i).await;
     }
@@ -89,21 +102,91 @@ async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
     let copy = a.sync_copy().expect("copy").clone();
     assert_eq!(copy.state(), CopyState::Unchecked);
     on.store(true, std::sync::atomic::Ordering::Release);
-    assert_eq!(copy.recheck().await.expect("recheck"), CopyState::Behind);
-    copy.push_committed()
+    let state = copy.recheck().await.expect("recheck");
+    assert!(
+        matches!(&state, CopyState::Stopped(cause) if cause.contains("diverged")),
+        "{state:?}"
+    );
+    assert_eq!(count(&a, "meanwhile").await, 10, "the file keeps its own");
+    write(&a, "meanwhile", 10).await;
+    assert_eq!(count(&a, "meanwhile").await, 11, "and confirms new writes");
+    let error = copy
+        .push_committed()
         .await
-        .expect_err("a file behind confirms nothing");
+        .expect_err("the backup is stopped");
+    assert!(error.to_string().contains("diverged"), "{error}");
     drop((a, copy));
 
-    // The restart the server makes restores the file from the remote.
-    let a = open(a_path).await;
-    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
-    assert_eq!(count(&a, "later").await, 5);
-    write(&a, "after", 0).await;
+    let a = open(a_path.clone()).await;
+    assert!(
+        matches!(a.sync_copy().expect("copy").state(), CopyState::Stopped(_)),
+        "the stop is kept across a restart"
+    );
+    assert_eq!(count(&a, "meanwhile").await, 11);
+    assert_eq!(aside_dirs(a_dir.path()), 0, "nothing was replaced");
+    let status = SyncCopy::describe(a_path.to_str().expect("utf-8")).expect("status");
+    assert!(status.contains("stopped: diverged"), "{status}");
+}
+
+#[tokio::test]
+async fn a_damaged_file_is_set_aside_and_restored_from_the_remote() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (a_dir, a_path) = machine();
+    let a = server.open(&a_path).await;
+    for i in 0..20 {
+        write(&a, "kept", i).await;
+    }
     push(&a).await;
-    let (_b_dir, b_path) = machine();
-    let b = server.open(&b_path).await;
-    assert_eq!(count(&b, "after").await, 1);
+    // Every page in the database file, none in the log, so the damage below
+    // is what the next start reads.
+    while !a
+        .sync_copy()
+        .expect("copy")
+        .checkpoint_if_wal_over(0)
+        .await
+        .expect("checkpoint")
+    {
+        tokio::task::yield_now().await;
+    }
+    drop(a);
+
+    let root = {
+        let db = turso::Builder::new_local(a_path.to_str().expect("utf-8"))
+            .build()
+            .await
+            .expect("read the file");
+        let conn = db.connect().expect("connect");
+        let mut rows = conn
+            .query(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'events'",
+                (),
+            )
+            .await
+            .expect("query");
+        let row = rows.next().await.expect("row").expect("events table");
+        row.get::<i64>(0).expect("rootpage")
+    };
+    let bytes = std::fs::read(&a_path).expect("read db");
+    let page_size = match u16::from_be_bytes([bytes[16], bytes[17]]) {
+        1 => 65536,
+        size => usize::from(size),
+    };
+    let offset = (usize::try_from(root).expect("page") - 1) * page_size;
+    let mut damaged = bytes;
+    damaged[offset..offset + page_size].fill(0xFF);
+    std::fs::write(&a_path, damaged).expect("damage the file");
+
+    let a = server.open(&a_path).await;
+    assert_eq!(count(&a, "kept").await, 20, "restored from the remote");
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    let aside = std::fs::read_dir(a_dir.path())
+        .expect("read dir")
+        .map(|entry| entry.expect("entry").path())
+        .find(|entry| entry.is_dir())
+        .expect("the damaged file is kept aside");
+    assert!(aside.join("app.db").exists());
 }
 
 #[tokio::test]

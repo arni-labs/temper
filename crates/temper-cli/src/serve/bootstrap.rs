@@ -33,7 +33,7 @@ use super::storage::{
 /// Phase 1: Initialize the storage backend (Postgres, Turso, Redis, or memory).
 ///
 /// Also returns the Turso Cloud copy of a local Turso database when
-/// `TURSO_SYNC_URL` is set; the server answers changes only once they reach it.
+/// `TURSO_SYNC_URL` is set; the server backs the database up to it in the background.
 pub(super) async fn init_storage(
     storage: StorageBackend,
     storage_explicit: bool,
@@ -131,8 +131,7 @@ pub(super) async fn init_storage(
                             anyhow::anyhow!("Failed to open synced Turso database: {e}")
                         })?;
                     sync_copy = store.sync_copy().cloned();
-                    let copied =
-                        format!(", each change copied to {sync_url} before it is answered");
+                    let copied = format!(", backed up to {sync_url} in the background");
                     (store, copied)
                 } else {
                     let turso_token = std::env::var("TURSO_AUTH_TOKEN").ok();

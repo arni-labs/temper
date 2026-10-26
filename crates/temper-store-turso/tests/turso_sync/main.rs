@@ -1,4 +1,4 @@
-//! A synced store copies confirmed writes to its remote database, and a fresh
+//! A synced store backs its committed writes up to its remote database, and a fresh
 //! machine restores them from it.
 //!
 //! Runs against Turso's local sync server: set `TEMPER_TEST_TURSODB` to a
@@ -238,10 +238,13 @@ async fn checkpoints_between_writes_fail_none_of_them() {
 }
 
 #[tokio::test]
-async fn a_file_put_back_from_an_older_copy_is_restored_from_the_remote() {
-    // A restart can bring back an old snapshot of the disk. The engine would
-    // then reuse change numbers the remote already has and skip the new
-    // writes while reporting the push as done.
+async fn a_file_put_back_from_an_older_copy_catches_up_from_the_remote_in_place() {
+    // A restart can bring back an old snapshot of the disk: the drive
+    // publishes the database and its log at different moments, so a fresh
+    // mount can see an older file than the last push. The engine would then
+    // reuse change numbers the remote already has and skip the new writes
+    // while reporting the push as done. The remote holds everything the
+    // older file does, so the file pulls what it lacks and stays the file.
     let Some(server) = SyncServer::start() else {
         return;
     };
@@ -261,9 +264,22 @@ async fn a_file_put_back_from_an_older_copy_is_restored_from_the_remote() {
     drop(a);
     remove_files(a_dir.path());
     copy_files(older.path(), a_dir.path());
+    let client = client_of(&a_path);
 
     let a = server.open(&a_path).await;
-    assert_eq!(count(&a, "later").await, 5, "restored from the remote");
+    assert_eq!(count(&a, "old").await, 1, "the file keeps its rows");
+    assert_eq!(
+        count(&a, "later").await,
+        5,
+        "and has the remote's newer ones"
+    );
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    assert_eq!(
+        client_of(&a_path),
+        client,
+        "the same file, caught up, not a fresh restore"
+    );
+    assert_eq!(aside_dirs(a_dir.path()), 0, "nothing was moved aside");
     write(&a, "after", 0).await;
     push(&a).await;
 
@@ -278,9 +294,51 @@ async fn a_file_put_back_from_an_older_copy_is_restored_from_the_remote() {
 }
 
 #[tokio::test]
-async fn a_refused_change_still_blocks_confirmation_after_a_restart() {
+async fn push_lag_rises_while_the_remote_is_down_and_falls_to_zero_once_it_returns() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let outage = Outage::new(&server.url).await;
+    let (_a_dir, a_path) = machine();
+    let a = TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &outage.url, TOKEN)
+        .await
+        .expect("open through the outage");
+    let copy = a.sync_copy().expect("copy").clone();
+    write(&a, "l1", 0).await;
+    push(&a).await;
+    let level = copy.backup_status().await.expect("status");
+    assert_eq!(level.unpushed_changes, 0, "{level:?}");
+
+    outage.down();
+    for i in 1..4 {
+        write(&a, "l1", i).await;
+    }
+    copy.push_committed().await.expect_err("the remote is down");
+    let down = copy.backup_status().await.expect("status");
+    assert!(down.unpushed_changes >= 3, "{down:?}");
+    assert!(down.push_failures >= 1, "{down:?}");
+    assert!(!down.pushing, "{down:?}");
+    assert_eq!(
+        down.state,
+        CopyState::Copying,
+        "a remote that is down stops nothing"
+    );
+    assert_eq!(count(&a, "l1").await, 4, "every write is in the file");
+
+    outage.back();
+    copy.push_committed().await.expect("the remote is back");
+    let back = copy.backup_status().await.expect("status");
+    assert_eq!(back.unpushed_changes, 0, "{back:?}");
+    assert_eq!(back.behind_for, Duration::ZERO, "{back:?}");
+    let (_b_dir, b_path) = machine();
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "l1").await, 4, "the backup caught up");
+}
+
+#[tokio::test]
+async fn a_refused_change_keeps_the_backup_stopped_after_a_restart() {
     // The refused change is skipped on the remote for good, so after a
-    // restart writes that the remote does accept must still not be confirmed.
+    // restart the backup stays stopped, though the remote accepts later writes.
     let Some(server) = SyncServer::start() else {
         return;
     };
@@ -306,7 +364,7 @@ async fn a_refused_change_still_blocks_confirmation_after_a_restart() {
         .expect("copy")
         .push_committed()
         .await
-        .expect_err("still not confirmed after a restart");
+        .expect_err("still stopped after a restart");
     assert!(error.to_string().contains("missing a change"), "{error}");
     drop(a);
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Checks Temper's Turso Sync copy end to end with a real `temper serve`.
 //
-//   node scripts/turso-sync/check.mjs kill   # confirmed writes survive a killed server and a lost disk
-//   node scripts/turso-sync/check.mjs time   # time per write and per burst, with and without the copy
-//   node scripts/turso-sync/check.mjs readonly  # a start without the remote serves reads, refuses writes, recovers
+//   node scripts/turso-sync/check.mjs kill    # confirmed writes survive a killed server on the same drive
+//   node scripts/turso-sync/check.mjs time    # time per write and per burst, with and without the copy
+//   node scripts/turso-sync/check.mjs outage  # a start without the remote serves reads and writes, then backs up
 //
 // Env:
 //   TEMPER_BIN        temper binary (default: target/release/temper, then target/debug/temper)
@@ -16,9 +16,9 @@
 //                     at that distance (Tensorlake to Turso aws-us-east-2 is about 15 ms one way)
 //
 // kill: writers send writes with 32 in flight and log every write answered 2xx. The server is killed
-// with SIGKILL mid-burst and its whole data folder deleted. A new server on an empty folder restores
-// from the remote, and every logged write must be there. The background push is set to once an hour
-// for this run, so only the push each answer waits for can save the writes.
+// with SIGKILL mid-burst and started again on the same data folder, the drive the database lives on,
+// and every logged write must be there. The background push is set to once an hour for this run, so
+// only the commit on the drive can save the writes: a write is confirmed once it commits there.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
@@ -189,9 +189,8 @@ async function killCheck() {
   stop = true;
   await Promise.all(writers);
   const ackedTotal = [...acked.values()].reduce((x, y) => x + y, 0);
-  fs.rmSync(a.home, { recursive: true, force: true });
 
-  const b = await temper("b", sync);
+  const b = await temper("a", sync);
   let lost = 0;
   let extra = 0;
   const missing = [];
@@ -210,7 +209,7 @@ async function killCheck() {
     }
     extra += Math.max(0, have - n);
   }
-  out({ check: "kill", remote: process.env.SYNC_URL ? "turso cloud" : "local sync server", confirmed: ackedTotal, confirmed_before_kill: killedAt, failed_after_kill: failed, records: acked.size, lost, applied_but_not_confirmed: extra, restore_startup_ms: b.startup_ms, missing: missing.slice(0, 8) });
+  out({ check: "kill", remote: process.env.SYNC_URL ? "turso cloud" : "local sync server", confirmed: ackedTotal, confirmed_before_kill: killedAt, failed_after_kill: failed, records: acked.size, lost, applied_but_not_confirmed: extra, restart_startup_ms: b.startup_ms, missing: missing.slice(0, 8) });
   return lost === 0 && ackedTotal > 0;
 }
 
@@ -260,7 +259,7 @@ async function timeCheck() {
   return Object.values(results).every((r) => r.failed_writes === 0);
 }
 
-async function readonlyCheck() {
+async function outageCheck() {
   // The switch sits in front of the local sync server (or a real remote's host).
   const sync = await remote();
   const target = new URL(sync.url.replace(/^libsql:/, "https:"));
@@ -278,29 +277,26 @@ async function readonlyCheck() {
   on.value = false;
   const b = await temper("a", through);
   const read = await get(b.base, `/tdata/ProbeNotes('${run}-ro')`);
-  const paused = await write(b.base, `${run}-ro`, 5);
+  const down = await write(b.base, `${run}-ro`, 5);
   on.value = true;
-  const t0 = Date.now();
-  let resumed = null;
-  for (let i = 0; i < 100 && !resumed?.ok; i++) {
-    resumed = await write(b.base, `${run}-ro`, 6);
-    if (!resumed.ok) await sleep(200);
-  }
+  const back = await write(b.base, `${run}-ro`, 6);
+  // The backup checks the file once the remote answers, then pushes on its next tick.
+  await sleep(5000);
   b.child.kill("SIGKILL");
   fs.rmSync(b.home, { recursive: true, force: true });
   const c = await temper("c", sync);
   const restored = JSON.parse((await get(c.base, `/tdata/ProbeNotes('${run}-ro')`)).text);
   const n = Number(restored.counters?.n ?? restored.fields?.n ?? restored.n ?? 0);
   const result = {
-    check: "readonly",
+    check: "outage",
     read_while_down: read.status,
-    write_while_down: `${paused.status} ${paused.text.slice(0, 80)}`,
-    write_after_remote_back_ms: resumed?.ok ? Date.now() - t0 : null,
-    confirmed: 6,
+    write_while_down: `${down.status} ${down.text.slice(0, 80)}`,
+    write_after_remote_back: `${back.status} ${back.text.slice(0, 80)}`,
+    confirmed: 7,
     restored_n: n,
   };
   out(result);
-  return read.status === 200 && paused.status === 503 && resumed?.ok && n >= 6;
+  return read.status === 200 && down.ok && back.ok && n >= 7;
 }
 
 let ok = false;
@@ -309,8 +305,8 @@ try {
   const mode = process.argv[2];
   if (mode === "kill") ok = await killCheck();
   else if (mode === "time") ok = await timeCheck();
-  else if (mode === "readonly") ok = await readonlyCheck();
-  else throw new Error("usage: check.mjs kill|time|readonly");
+  else if (mode === "outage") ok = await outageCheck();
+  else throw new Error("usage: check.mjs kill|time|outage");
 } catch (error) {
   console.error(String(error));
 } finally {
