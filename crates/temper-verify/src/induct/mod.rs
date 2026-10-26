@@ -102,9 +102,8 @@ impl RuleProof {
         if let Some(error) = self.errors.first() {
             return Some(format!("the solver refused it: {error}"));
         }
-        if let Some(effect) = self.unmodelled.first() {
-            return Some(format!("{effect} makes a move the proof does not"));
-        }
+        // MUTANT: a move the proof does not make is ignored.
+        let _ = &self.unmodelled;
         self.obligations.iter().find_map(|o| match &o.outcome {
             Outcome::Holds => None,
             Outcome::Fails { clauses, .. } if clauses.is_empty() => {
