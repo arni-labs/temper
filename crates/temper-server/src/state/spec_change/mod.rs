@@ -348,7 +348,7 @@ impl ServerState {
             };
             let group: Vec<String> = std::iter::once(id).chain(ids).collect();
             let related = self
-                .related_statuses_of(tenant, refs.clone(), &record.fields)
+                .related_statuses_of(tenant, new, refs.clone(), &record.fields)
                 .await;
             let moved =
                 process_action_with_xref(&mut record, new, &carried.action, &params, &related);
@@ -368,7 +368,7 @@ impl ServerState {
                     .keys()
                     .any(|name| refs.iter().any(|(_, field)| field == name));
                 let related = if repointed {
-                    self.related_statuses_of(tenant, refs.clone(), &record.fields)
+                    self.related_statuses_of(tenant, new, refs.clone(), &record.fields)
                         .await
                 } else {
                     related
