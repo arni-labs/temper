@@ -373,7 +373,11 @@ fn param_assignments(
 
 /// Whether `next` stays within the exploration bounds, or at least grew no
 /// counter or list beyond them.
-fn within_bounds(model: &TemperModel, before: &TemperModelState, next: &TemperModelState) -> bool {
+pub(crate) fn within_bounds(
+    model: &TemperModel,
+    before: &TemperModelState,
+    next: &TemperModelState,
+) -> bool {
     let counters_ok = next.counters.iter().all(|(var, value)| {
         let bound = model
             .counter_bounds
