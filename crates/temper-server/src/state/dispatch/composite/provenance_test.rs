@@ -40,7 +40,8 @@ async fn composite_parent_event_records_its_maker_and_history_returns_it() {
         agent_id: Some("agent-1".to_string()),
         ..Default::default()
     }
-    .with_source(MoveSource::Module);
+    .with_source(MoveSource::Http);
+    let agent = super::super::wasm::agent_ctx_for_composite_wasm_result(&agent, None);
 
     let applied = state
         .apply_composite_integration_result(

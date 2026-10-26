@@ -239,11 +239,14 @@ struct WasmDispatchCtx<'a> {
     mode: WasmDispatchMode,
 }
 
-fn agent_ctx_for_composite_wasm_result(
+/// Preserve the verified caller while marking module-produced composite writes.
+pub(super) fn agent_ctx_for_composite_wasm_result(
     agent_ctx: &AgentContext,
     dispatch_idempotency_key: Option<&str>,
 ) -> AgentContext {
-    let mut composite_agent_ctx = agent_ctx.clone();
+    let mut composite_agent_ctx = agent_ctx
+        .clone()
+        .with_source(crate::entity_actor::MoveSource::Module);
     if composite_agent_ctx.idempotency_key.is_none()
         && let Some(idempotency_key) = dispatch_idempotency_key
     {
