@@ -335,9 +335,8 @@ async fn pg_seed_dir(
 #[test]
 fn directory_root_souls_scenario_on_postgres() {
     use temper_runtime::scheduler::sim_uuid as runtime_sim_uuid;
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
     sqlx::test_block_on(async {
         let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
@@ -518,9 +517,8 @@ fn directory_root_souls_scenario_on_postgres() {
 #[test]
 fn keyed_absence_ignores_a_lagging_projection_row_on_postgres() {
     use temper_runtime::scheduler::sim_uuid as runtime_sim_uuid;
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
     sqlx::test_block_on(async {
         let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
@@ -618,9 +616,8 @@ fn keyed_absence_ignores_a_lagging_projection_row_on_postgres() {
 #[test]
 fn field_index_backfill_bounds_non_keyed_path_lookup_on_postgres() {
     use temper_runtime::scheduler::sim_uuid as runtime_sim_uuid;
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
     sqlx::test_block_on(async {
         let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
