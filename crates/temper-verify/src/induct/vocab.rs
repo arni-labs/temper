@@ -320,13 +320,17 @@ impl<'a> Vocab<'a> {
                     if same {
                         continue;
                     }
+                    // The callee may be a template the kernel fills from a
+                    // field, such as `{field:adapter_type}`, which a solver's
+                    // name may not hold.
+                    let callee = symbol(module);
                     let taken = calls
                         .iter()
-                        .filter(|c| &c.to == to && c.module == module)
+                        .filter(|c| &c.to == to && symbol(&c.module) == callee)
                         .count();
                     let name = match taken {
-                        0 => format!("{to}@{module}"),
-                        n => format!("{to}@{module}{}", n + 1),
+                        0 => format!("{to}@{callee}"),
+                        n => format!("{to}@{callee}{}", n + 1),
                     };
                     let mut call = Call {
                         name,
@@ -388,6 +392,14 @@ impl<'a> Vocab<'a> {
         });
         dispatches.chain(calls).collect()
     }
+}
+
+/// `text` with `_` for each character an SMT-LIB symbol may not hold.
+fn symbol(text: &str) -> String {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || "~!@$%^&*_-+=<>.?/".contains(c);
+    text.chars()
+        .map(|c| if allowed(c) { c } else { '_' })
+        .collect()
 }
 
 /// The action an effect schedules on its own record, if it schedules one.

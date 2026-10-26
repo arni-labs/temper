@@ -108,3 +108,12 @@ fn a_call_answers_only_with_the_action_its_trigger_names() {
     let other = verdict(&job(WASM, Some("Finish"), NEVER_DROPPED));
     assert!(other.holds(), "{other}");
 }
+
+#[test]
+fn a_call_to_an_adapter_a_field_names_is_proved() {
+    // The kernel fills the adapter's name from the record; the proof names
+    // the call all the same.
+    let adapter = "kind = \"adapter\"\nadapter = \"{field:worker}\"";
+    let proved = verdict(&job(adapter, Some("Finish"), NEVER_DROPPED));
+    assert_eq!(proved.tag(), "PROVED", "{proved}");
+}
