@@ -1225,12 +1225,8 @@ mod tests {
 
     #[test]
     fn list_entity_ids_returns_distinct_pairs() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1446,12 +1442,8 @@ mod tests {
 
     #[test]
     fn load_query_projection_fields_many_returns_requested_fields() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1521,9 +1513,8 @@ mod tests {
 
     #[test]
     fn published_artifact_upsert_round_trips_and_updates_by_id() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => return,
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
