@@ -1,7 +1,7 @@
 {
   "name": "@temper/sdk",
   "version": "0.1.0",
-  "description": "Temper SDK \u2014 thin HTTP client for entity operations, governance, and SSE streaming",
+  "description": "Temper SDK — thin HTTP client for entity operations, governance, and SSE streaming",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
