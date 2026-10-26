@@ -141,7 +141,7 @@ pub enum JointOutcome {
 }
 
 /// The premise of a rule written `premise => conclusion`.
-fn premise(rule: &Expr) -> Option<&Expr> {
+pub(crate) fn premise(rule: &Expr) -> Option<&Expr> {
     match rule {
         Expr::Implies(premise, _) => Some(premise),
         _ => None,

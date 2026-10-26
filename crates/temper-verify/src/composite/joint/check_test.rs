@@ -1,7 +1,8 @@
 //! Every rule over several records is proved by induction first: with the
 //! lemmas its spec gives, or with the prover's guesses, which the verdict
 //! lists. A rule whose proof does not hold is walked as before and says why;
-//! a proved rule whose premise no run meets proves nothing.
+//! a proved rule whose premise no run meets proves nothing, found by the
+//! solver when the proof rules the premise out and by a walk otherwise.
 
 use std::time::Duration;
 
@@ -211,7 +212,7 @@ fn invariant(sources: &[&str], budget: Budget) -> JointVerdict {
 #[test]
 fn a_rule_with_its_lemmas_is_proved_and_not_walked() {
     let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN])], budget());
-    let JointVerdict::Proved(proof, Premise::Met) = &verdict else {
+    let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
         panic!("proved, and a run meets its premise: {verdict}");
     };
     assert!(proof.found.is_empty(), "{verdict}");
@@ -240,7 +241,7 @@ fn a_rule_whose_proof_fails_is_walked_and_says_why() {
 #[test]
 fn a_rule_without_hints_is_proved_with_the_provers_guesses() {
     let verdict = invariant(&[&parent(""), &child(&[])], budget());
-    let JointVerdict::Proved(proof, Premise::Met) = &verdict else {
+    let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
         panic!("proved with the prover's guesses: {verdict}");
     };
     assert!(verdict.holds());
@@ -260,7 +261,7 @@ fn a_rule_without_hints_is_proved_with_the_provers_guesses() {
     // Written beside the rule, the guesses prove it with no more guessing.
     let pinned: Vec<&str> = proof.found.iter().map(|l| l.assert.as_str()).collect();
     let verdict = invariant(&[&parent(""), &child(&pinned)], budget());
-    let JointVerdict::Proved(proof, Premise::Met) = &verdict else {
+    let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
         panic!("proved with the pinned guesses: {verdict}");
     };
     assert!(proof.found.is_empty(), "{verdict}");
@@ -290,6 +291,40 @@ fn a_proved_rule_whose_premise_no_run_meets_proves_nothing() {
     assert!(!verdict.holds());
     assert_eq!(verdict.tag(), "VACUOUS");
     assert!(verdict.to_string().contains("PROVES NOTHING"), "{verdict}");
+}
+
+#[test]
+fn a_premise_the_proof_rules_out_needs_no_walk() {
+    let never_closes = parent("").replace(CLOSE, "");
+    let not_closed = "(not (= $Parent.status Parent/Closed))";
+    let verdict = invariant(&[&never_closes, &child(&[not_closed])], budget());
+    assert!(
+        matches!(&verdict, JointVerdict::Proved(_, Premise::Excluded { .. })),
+        "{verdict}"
+    );
+    assert!(!verdict.holds());
+    assert_eq!(verdict.tag(), "VACUOUS");
+    assert!(
+        verdict
+            .to_string()
+            .contains("the proof shows no state meets"),
+        "{verdict}"
+    );
+}
+
+#[test]
+fn a_rule_without_a_premise_has_none_to_meet() {
+    let rule = child(&[LOCKED_PAST_OPEN]).replace(
+        "Parent[Id].status == 'Closed' => Parent[Id].locked == true",
+        "Parent[Id].status != 'Closed' || Parent[Id].locked == true",
+    );
+    let verdict = invariant(&[&parent(""), &rule], budget());
+    assert!(
+        matches!(&verdict, JointVerdict::Proved(_, Premise::None)),
+        "{verdict}"
+    );
+    assert!(verdict.holds());
+    assert!(!verdict.to_string().contains("premise"), "{verdict}");
 }
 
 #[test]
@@ -323,7 +358,7 @@ fn an_eventually_rule_with_its_measure_is_proved() {
     assert_eq!(hinted.len(), 1);
     let verdict = hinted.remove(0);
     assert!(
-        matches!(verdict, JointVerdict::Proved(_, Premise::Met)),
+        matches!(verdict, JointVerdict::Proved(_, Premise::Met { .. })),
         "{verdict}"
     );
     // Nothing guesses a measure, so a rule without one is walked.

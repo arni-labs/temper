@@ -24,13 +24,14 @@ mod guess;
 mod hints;
 mod live;
 mod moves;
+mod proof;
 mod run;
 mod solver;
 mod vocab;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
@@ -41,82 +42,9 @@ use guess::Guess;
 pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};
 use moves::Moves;
+pub use proof::{Obligation, Outcome, RuleProof};
 use run::{Ask, Session, few_in_flight, run};
 use vocab::Vocab;
-
-/// One obligation's outcome.
-#[derive(Debug, Clone)]
-pub struct Obligation {
-    /// The move, or `start`.
-    pub name: String,
-    pub took: Duration,
-    pub outcome: Outcome,
-    /// Whether the move can happen at all from a state where the clauses
-    /// hold. One that cannot holds trivially, which a reader should see.
-    pub possible: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum Outcome {
-    Holds,
-    /// Some clauses fail after it: their names, and the counterexample.
-    Fails {
-        clauses: Vec<String>,
-        cti: String,
-    },
-    Unknown,
-}
-
-/// A rule's proof.
-#[derive(Debug, Clone)]
-pub struct RuleProof {
-    /// The type that declares the rule.
-    pub owner: String,
-    pub rule: String,
-    pub scope: BTreeSet<String>,
-    pub obligations: Vec<Obligation>,
-    /// What the encoding could not express; each only weakens the proof.
-    pub limits: Vec<String>,
-    /// Effects that make moves the proof does not, such as a scheduled
-    /// action; a proof with any is not a proof.
-    pub unmodelled: Vec<String>,
-    /// What the rule itself reads that the proof does not hold, each read
-    /// as an unknown.
-    pub unheld: BTreeSet<String>,
-    /// The prover's own guesses the proof kept, when the agent gave no
-    /// lemmas, written as lemmas the agent can pin beside the rule.
-    pub found: Vec<Lemma>,
-    /// What the solver refused, such as a lemma naming an unknown kind.
-    pub errors: Vec<String>,
-    /// Wall time, from reading the specs to the last check.
-    pub took: Duration,
-}
-
-impl RuleProof {
-    pub fn proved(&self) -> bool {
-        self.shortfall().is_none()
-    }
-
-    /// Why the rule is not proved, in a line; `None` when it is.
-    pub fn shortfall(&self) -> Option<String> {
-        if let Some(error) = self.errors.first() {
-            return Some(format!("the solver refused it: {error}"));
-        }
-        if let Some(effect) = self.unmodelled.first() {
-            return Some(format!("{effect} makes a move the proof does not"));
-        }
-        self.obligations.iter().find_map(|o| match &o.outcome {
-            Outcome::Holds => None,
-            Outcome::Fails { clauses, .. } if clauses.is_empty() => {
-                Some(format!("its clauses fail after {}", o.name))
-            }
-            Outcome::Fails { clauses, .. } => {
-                Some(format!("{} fails after {}", clauses.join(", "), o.name))
-            }
-            Outcome::Unknown => Some(format!("the solver could not decide {}", o.name)),
-        })
-    }
-}
 
 /// One attempt at a rule: its obligations, what the solver refused, and the
 /// guesses it held.
@@ -124,6 +52,7 @@ struct Attempt {
     obligations: Vec<Obligation>,
     errors: Vec<String>,
     kept: Vec<Lemma>,
+    guesses: Vec<Guess>,
 }
 
 impl Attempt {
@@ -220,6 +149,7 @@ pub fn prove_some(
                         unmodelled: Vec::new(),
                         unheld: BTreeSet::new(),
                         found: Vec::new(),
+                        premise_excluded: false,
                         errors: vec![format!("the solver did not run: {e}")],
                         took: start.elapsed(),
                     })
@@ -291,32 +221,33 @@ fn prove_one(
         };
         guess.lemma(rule, &holds)
     };
+    // The clauses of J with `guesses`, by name, as functions of the frame.
+    let clauses = |guesses: &[Guess], frame: &str| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Rule::Always(assert) = kind {
+            let holds = enc.expr(assert, owner, frame);
+            out.push((rule.to_string(), format!("(=> {frame}.settled {holds})")));
+            out.extend(
+                guesses
+                    .iter()
+                    .map(|g| (g.name(rule), g.read(frame, &holds))),
+            );
+        }
+        out.extend(
+            lemmas
+                .iter()
+                .map(|l| (l.name.clone(), l.assert.replace('$', &format!("{frame}."))))
+                .collect::<Vec<_>>(),
+        );
+        out
+    };
     // One attempt with `guesses`, dropping those a move breaks until the
     // rest hold or the rule fails; `None` once every guess is dropped,
     // unless the attempt may go on with none.
     let attempt = |mut guesses: Vec<Guess>, bare: bool| -> std::io::Result<Option<Attempt>> {
         loop {
             let guessed: BTreeSet<String> = guesses.iter().map(|g| g.name(rule)).collect();
-            // The clauses of J, by name, as functions of the frame.
-            let clause = |frame: &str| -> Vec<(String, String)> {
-                let mut out = Vec::new();
-                if let Rule::Always(assert) = kind {
-                    let holds = enc.expr(assert, owner, frame);
-                    out.push((rule.to_string(), format!("(=> {frame}.settled {holds})")));
-                    out.extend(
-                        guesses
-                            .iter()
-                            .map(|g| (g.name(rule), g.read(frame, &holds))),
-                    );
-                }
-                out.extend(
-                    lemmas
-                        .iter()
-                        .map(|l| (l.name.clone(), l.assert.replace('$', &format!("{frame}."))))
-                        .collect::<Vec<_>>(),
-                );
-                out
-            };
+            let clause = |frame: &str| clauses(&guesses, frame);
             let mut asks = Vec::new();
             // The start.
             {
@@ -358,27 +289,7 @@ fn prove_one(
                 };
                 live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
             }
-            let solvers = shared.solvers.clamp(1, asks.len().max(1));
-            // The string literals the obligations name, each distinct from the
-            // others, and the empty string a parameter is checked against.
-            let mut literals = BTreeSet::from([String::new()]);
-            for ask in &asks {
-                literals.extend(quoted_literals(&ask.text));
-                for (_, c) in &ask.goal {
-                    literals.extend(quoted_literals(c));
-                }
-            }
-            let prelude = prelude(&v, &literals);
-            let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
-            let few = few_in_flight(&v);
-            let session = Session {
-                prelude: &prelude,
-                few: &few,
-                literals: &shown,
-                solvers,
-                deadline: shared.deadline,
-            };
-            let (mut obligations, mut refused) = run(rule, &session, &asks, &guessed)?;
+            let (mut obligations, mut refused) = solve(shared, &v, rule, &asks, &guessed)?;
             errors.append(&mut refused);
             fn broken(o: &Obligation) -> Option<&Vec<String>> {
                 match &o.outcome {
@@ -405,6 +316,7 @@ fn prove_one(
                     obligations,
                     errors,
                     kept: guesses.iter().map(pinned).collect(),
+                    guesses,
                 }));
             }
             guesses.retain(|g| !dropped.contains(&g.name(rule)));
@@ -438,11 +350,37 @@ fn prove_one(
             }
         }
     }
+    let last = last.expect("the first attempt holds no guess to drop");
+    // A proved rule whose premise no state of J meets says nothing.
+    let premise_excluded = match crate::composite::joint::premise(expr) {
+        Some(premise) if last.proved() => {
+            let at = clauses(&last.guesses, "pre");
+            let premise = enc.expr(premise, owner, "pre");
+            let mut text = String::from("(push 1)\n");
+            for d in enc.take_decls() {
+                text.push_str(&format!("{d}\n"));
+            }
+            for (_, c) in &at {
+                text.push_str(&format!("(assert {c})\n"));
+            }
+            text.push_str(&format!("(assert {premise})\n"));
+            // An invariant's premise counts where nothing is in flight.
+            if let Rule::Always(_) = kind {
+                text.push_str("(assert pre.settled)\n");
+            }
+            let goal = vec![("premise met".to_string(), "false".to_string())];
+            let ask = Ask::new(&v, "premise", text, goal, &at);
+            let (checked, _) = solve(shared, &v, rule, &[ask], &BTreeSet::new())?;
+            matches!(checked.first().map(|o| &o.outcome), Some(Outcome::Holds))
+        }
+        _ => false,
+    };
     let Attempt {
         obligations,
         errors,
         kept,
-    } = last.expect("the first attempt holds no guess to drop");
+        ..
+    } = last;
     let found = match errors.is_empty()
         && obligations
             .iter()
@@ -480,6 +418,7 @@ fn prove_one(
         unmodelled,
         unheld,
         found,
+        premise_excluded,
         errors,
         took: start.elapsed(),
     })
@@ -496,4 +435,34 @@ fn quoted_literals(text: &str) -> Vec<String> {
         rest = &after[end + 2..];
     }
     out
+}
+
+/// Check `asks` over the rule's solvers, sharing the string literals they
+/// name: each distinct from the others, and the empty string a parameter is
+/// checked against.
+fn solve(
+    shared: &Shared<'_>,
+    v: &Vocab<'_>,
+    rule: &str,
+    asks: &[Ask],
+    guessed: &BTreeSet<String>,
+) -> std::io::Result<(Vec<Obligation>, Vec<String>)> {
+    let mut literals = BTreeSet::from([String::new()]);
+    for ask in asks {
+        literals.extend(quoted_literals(&ask.text));
+        for (_, c) in &ask.goal {
+            literals.extend(quoted_literals(c));
+        }
+    }
+    let prelude = prelude(v, &literals);
+    let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
+    let few = few_in_flight(v);
+    let session = Session {
+        prelude: &prelude,
+        few: &few,
+        literals: &shown,
+        solvers: shared.solvers.clamp(1, asks.len().max(1)),
+        deadline: shared.deadline,
+    };
+    run(rule, &session, asks, guessed)
 }

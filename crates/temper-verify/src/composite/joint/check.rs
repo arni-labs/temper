@@ -9,10 +9,11 @@
 //! hold is walked as before and keeps the walk's verdict, with why the proof
 //! did not hold.
 //!
-//! A proved rule is walked only as far as a state that meets its premise
-//! ([`vacuity`](super::vacuity)), since a rule whose premise no run meets
-//! says nothing. The proofs get the budget's time between them, and each walk
-//! the budget it had before.
+//! A rule whose premise no run meets says nothing, proved or not
+//! ([`vacuity`](super::vacuity)): the solver rules that out first, and a
+//! walk to the first state that meets the premise is the fallback. The
+//! proofs get the budget's time between them, and each walk the budget it
+//! had before.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -53,7 +54,7 @@ impl JointVerdict {
     /// Whether the rule holds in every run, as proved or walked in full.
     pub fn holds(&self) -> bool {
         match self {
-            JointVerdict::Proved(_, premise) => *premise == Premise::Met,
+            JointVerdict::Proved(_, premise) => premise.met(),
             JointVerdict::Invariant(walked, _) => walked.holds(),
             JointVerdict::Liveness(walked, _) => walked.holds(),
         }
@@ -71,8 +72,8 @@ impl JointVerdict {
     /// The verdict in a word.
     pub fn tag(&self) -> &'static str {
         match self {
-            JointVerdict::Proved(_, Premise::Met) => "PROVED",
-            JointVerdict::Proved(_, Premise::Never { .. }) => "VACUOUS",
+            JointVerdict::Proved(_, Premise::None | Premise::Met { .. }) => "PROVED",
+            JointVerdict::Proved(_, Premise::Excluded { .. } | Premise::Never { .. }) => "VACUOUS",
             JointVerdict::Proved(_, Premise::Unknown { .. }) => "INCOMPLETE",
             JointVerdict::Invariant(walked, _) => match walked.outcome {
                 JointOutcome::Holds => "PASS",
@@ -113,12 +114,21 @@ fn proved(
     premise: &Premise,
 ) -> fmt::Result {
     let scope = proof.scope.iter().cloned().collect::<Vec<_>>().join(" + ");
+    let proved = format!(
+        "{rule} PROVED for every run by induction ({scope}; {} obligations in {} ms",
+        proof.obligations.len(),
+        proof.took.as_millis()
+    );
     match premise {
-        Premise::Met => write!(
+        Premise::None => write!(f, "{proved})")?,
+        Premise::Met { states, took } => write!(
             f,
-            "{rule} PROVED for every run by induction ({scope}; {} obligations in {} ms)",
-            proof.obligations.len(),
-            proof.took.as_millis()
+            "{proved}; a run meets its premise, found after {states} joint states in {} ms)",
+            took.as_millis()
+        )?,
+        Premise::Excluded { premise } => write!(
+            f,
+            "{rule} PROVES NOTHING: proved by induction, and the proof shows no state meets its premise `{premise}` ({scope})"
         )?,
         Premise::Never { premise, states } => write!(
             f,
@@ -213,8 +223,15 @@ pub fn check_joint(
                     eventually: Some(goal),
                     ..
                 },
-            ) => liveness_premise(&by_name, &proof.owner, live, goal, policies, budget),
-            _ => Premise::Met,
+            ) => liveness_premise(
+                &by_name,
+                &proof.owner,
+                (live, goal),
+                &proof,
+                policies,
+                budget,
+            ),
+            _ => Premise::None,
         };
         check.liveness.push(JointVerdict::Proved(proof, premise));
     }
@@ -222,7 +239,10 @@ pub fn check_joint(
         let automaton = by_name[owner.as_str()];
         let rules: Vec<_> = proofs
             .iter()
-            .filter_map(|p| automaton.invariants.iter().find(|i| i.name == p.rule))
+            .filter_map(|p| {
+                let rule = automaton.invariants.iter().find(|i| i.name == p.rule)?;
+                Some((rule, p))
+            })
             .collect();
         let premises = invariant_premises(&by_name, &owner, &rules, policies, budget);
         for (proof, premise) in proofs.into_iter().zip(premises) {
