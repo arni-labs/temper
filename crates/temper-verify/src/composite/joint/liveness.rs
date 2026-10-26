@@ -17,7 +17,8 @@
 //!
 //! Three choices keep a pass sound. The walk offers an outside move wherever
 //! Cedar may let someone outside the kernel send it, which only adds starting
-//! states. Each entity is cut down to what the condition depends on, which
+//! states. A reaction from a type the condition does not name is offered the
+//! same way, as its sender, and is not counted on: its source may never move. Each entity is cut down to what the condition depends on, which
 //! only adds behaviour too. And the model counts on a system move only for
 //! what it knows of it. Where it cannot decide a guard, a constraint or
 //! Cedar, the move leads to one of the ways it can go (taken or refused),

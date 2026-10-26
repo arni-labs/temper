@@ -126,7 +126,7 @@ fn a_reaction_from_outside_the_scope_is_walked() {
         "{text}"
     );
     assert!(
-        text.contains("Ask.Done (a reaction from Push, as service:pusher)"),
+        text.contains("Ask.Done -> Done (a reaction from Push, as service:pusher)"),
         "{text}"
     );
 }

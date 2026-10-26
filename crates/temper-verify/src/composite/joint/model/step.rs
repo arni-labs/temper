@@ -13,8 +13,8 @@ use super::super::state::canonical;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::{Delivery, JointModel, MAX_IN_FLIGHT};
+use crate::model::TemperModelAction;
 use crate::model::semantics::successors_among;
-use crate::model::{ParamValue, TemperModelAction};
 
 /// One move of the walk.
 #[derive(Debug, Clone)]
@@ -26,6 +26,11 @@ pub(in crate::composite::joint) enum Move {
     /// dispatch path read them and they allowed it; its actor takes it
     /// later.
     Send(String, TemperModelAction),
+    /// A reaction from a type outside the scope, run as sender `by`. The
+    /// model does not hold its source, so it may come whenever its record
+    /// can take it, with any parameters; as for an outside move, the
+    /// system is not counted on to make it.
+    Outer(String, TemperModelAction, u32),
     /// A record's state timer fires its action, with no parameters, as
     /// whoever armed it.
     Timer(String, String),
@@ -46,7 +51,10 @@ impl Move {
     /// Whether the system makes this move (a timer, a module, or the
     /// kernel's dispatches) rather than someone outside or a restart.
     pub(in crate::composite::joint) fn by_system(&self) -> bool {
-        !matches!(self, Move::Take(..) | Move::Send(..) | Move::Lost(..))
+        !matches!(
+            self,
+            Move::Take(..) | Move::Send(..) | Move::Outer(..) | Move::Lost(..)
+        )
     }
 
     /// The entity and action an outside move sends.
@@ -97,10 +105,11 @@ pub(in crate::composite::joint) struct Next {
 
 impl JointModel {
     /// Every move from `state`: each record's enabled actions someone
-    /// outside may send, with string parameters chosen among the values held
-    /// anywhere in the joint state, and each state timer due (when its
-    /// delivery lets a move from outside come now); each module call's
-    /// answers and failure; and each dispatch in flight.
+    /// outside may send, or a reaction from outside the scope, with string
+    /// parameters chosen among the values held anywhere in the joint state,
+    /// and each state timer due (when its delivery lets a move from outside
+    /// come now); each module call's answers and failure; and each dispatch
+    /// in flight.
     pub(in crate::composite::joint) fn moves(&self, state: &JointState) -> Vec<Move> {
         let values = self.values(state);
         let mut out = Vec::new();
@@ -125,6 +134,27 @@ impl JointModel {
                     } else {
                         Move::Take(entity.clone(), action)
                     });
+                }
+            }
+            for t in &model.transitions {
+                let Some(senders) = self.outer.get(entity).and_then(|o| o.get(&t.name)) else {
+                    continue;
+                };
+                if !self.enabled(entity, t, state, Blind::Nothing) {
+                    continue;
+                }
+                for &by in senders.keys() {
+                    if self.senders.may(by, entity, &t.name) == May::No {
+                        continue;
+                    }
+                    for (params, _) in successors_among(model, t, local, &values) {
+                        let action = TemperModelAction {
+                            name: t.name.clone(),
+                            target_state: t.to_state.clone(),
+                            params,
+                        };
+                        out.push(Move::Outer(entity.clone(), action, by));
+                    }
                 }
             }
             if let Some(timeout) = self.timeout(entity, &local.status) {
@@ -185,6 +215,42 @@ impl JointModel {
                 add(&mut next, sent(entity, action, OUTSIDE, true));
                 let text = format!("{entity}.{action} sent");
                 outcomes.push((next, text, Certainty::unless(known, Unsure)));
+            }
+            Move::Outer(entity, action, by) => {
+                let from: Vec<&str> = self.outer[entity][&action.name][by]
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let text = format!(
+                    "{entity}.{action} (a reaction from {}, as {})",
+                    from.join(" or "),
+                    self.senders.name(*by)
+                );
+                if self.action_reads_related(entity, &action.name) {
+                    // Like a send from outside, except that Cedar decides
+                    // it as its sender when it lands.
+                    let mut dispatch = sent(entity, action, *by, false);
+                    dispatch.depth = 1;
+                    let mut next = state.clone();
+                    add(&mut next, dispatch);
+                    outcomes.push((next, format!("{text} sent"), Sure));
+                } else {
+                    // Its sender is decided now, and its record takes it now.
+                    let may = self.senders.may_in(*by, entity, &action.name, state);
+                    let known = may == May::Yes
+                        && self.truth(entity, action, state) == Truth::True
+                        && self.unchecked.meets(entity, &action.name)
+                        && self.exact(entity, &action.name, state);
+                    let taken = if may == May::No {
+                        Vec::new()
+                    } else {
+                        self.commit(state.clone(), entity, action, 1, *by, false)
+                    };
+                    for (outcome, then) in taken {
+                        let certainty = Certainty::unless(known, Unsure).then(then);
+                        outcomes.push((outcome, text.clone(), certainty));
+                    }
+                }
             }
             Move::Timer(entity, name) => {
                 let by = state.armed.get(entity).copied().unwrap_or(OUTSIDE);
@@ -349,20 +415,6 @@ impl JointModel {
             .all(|t| self.order.exact(entity, &t.effects, state))
     }
 
-    /// Whether a field `action` ties a parameter to has changed since `call`
-    /// started, so its record refuses the module's answer.
-    fn stale(&self, call: &Call, action: &str, state: &JointState) -> bool {
-        let strings = &state.records[&call.to].strings;
-        self.unchecked
-            .equals
-            .get(&(call.to.clone(), action.to_string()))
-            .is_some_and(|fields| {
-                fields
-                    .iter()
-                    .any(|field| call.asked.get(field) != strings.get(field))
-            })
-    }
-
     /// Whether someone outside may send `action` to an `entity` record.
     fn sendable(&self, entity: &str, action: &str) -> bool {
         self.outside_may(entity, action) != May::No
@@ -393,52 +445,6 @@ impl JointModel {
                     && (t.from_states.is_empty() || t.from_states.contains(status))
             })
             .map_or(Truth::Unknown, |t| eval(&t.guard, &self.env(entity, state)))
-    }
-
-    /// The answers a module may give the call `call`: its trigger's
-    /// `on_success`, or else any internal action of its record. The module
-    /// itself is not modelled: it may give each of these answers, and gives
-    /// each it keeps being able to give at some point.
-    fn answers(
-        &self,
-        state: &JointState,
-        call: &Call,
-        values: &BTreeSet<String>,
-        out: &mut Vec<Move>,
-    ) {
-        let model = &self.models[&call.to];
-        let local = &state.records[&call.to];
-        for t in &model.transitions {
-            let answers = match &call.on_success {
-                Some(name) => &t.name == name,
-                None => self
-                    .kernel
-                    .internal
-                    .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name)),
-            };
-            if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
-                continue;
-            }
-            let mut seen = BTreeSet::new();
-            for (mut params, _) in successors_among(model, t, local, values) {
-                // A parameter tied to a field carries it as the call found it.
-                for param in &t.string_params {
-                    if let Some(value) = param.equals.as_ref().and_then(|f| call.asked.get(f)) {
-                        params.insert(param.name.clone(), ParamValue::Str(value.clone()));
-                    }
-                }
-                if !seen.insert(params.clone()) {
-                    continue;
-                }
-                let action = TemperModelAction {
-                    name: t.name.clone(),
-                    target_state: t.to_state.clone(),
-                    params,
-                };
-                out.push(Move::Answer(call.clone(), action));
-            }
-        }
     }
 }
 

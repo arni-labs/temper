@@ -3,7 +3,8 @@
 //! - An action sent from outside: whoever sent it, someone outside the kernel.
 //! - A reaction with a declared principal: that service, with the trigger's
 //!   source in its context (`resolve_trigger_principal` in the trigger
-//!   dispatcher). Without one: whoever sent its source action.
+//!   dispatcher). Without one: whoever sent its source action, which for a
+//!   reaction from a type outside the model may be any sender.
 //! - A module's answer, or its `on_failure`: `service:wasm-runtime` when the
 //!   call ran in the background, and the caller when it ran inline
 //!   (`WasmDispatchMode` in `invocation_artifacts.rs`). Only an outside
@@ -65,24 +66,30 @@ type Question = (
 );
 
 impl Senders {
-    /// The senders of the moves among `entities`, and what `policies` lets
-    /// each send.
+    /// The senders of the moves among `entities`, with `also` (the services
+    /// reactions from outside them run as), and what `policies` lets each
+    /// send.
     pub(super) fn new<'a>(
         by_name: &BTreeMap<&str, &Automaton>,
         entities: impl IntoIterator<Item = &'a String> + Clone,
+        also: impl IntoIterator<Item = Asker>,
         policies: Option<&SendAnalysis>,
     ) -> Self {
         let mut askers = vec![Asker::Outside, service("wasm-runtime", BTreeMap::new())];
-        for entity in entities.clone() {
-            for action in &by_name[entity.as_str()].actions {
-                for trigger in &action.triggers {
-                    let Some(asker) = declared(trigger, entity, &action.name) else {
-                        continue;
-                    };
-                    if !askers.contains(&asker) {
-                        askers.push(asker);
-                    }
-                }
+        let declared_in = entities.clone().into_iter().flat_map(|entity| {
+            by_name[entity.as_str()]
+                .actions
+                .iter()
+                .flat_map(move |action| {
+                    action
+                        .triggers
+                        .iter()
+                        .filter_map(move |trigger| declared(trigger, entity, &action.name))
+                })
+        });
+        for asker in declared_in.chain(also) {
+            if !askers.contains(&asker) {
+                askers.push(asker);
             }
         }
         let may = policies.map(|policies| {
@@ -190,6 +197,11 @@ impl Senders {
         declared_as
             .and_then(|asker| self.askers.iter().position(|a| a == asker))
             .map_or(invoker, |at| at as u32)
+    }
+
+    /// Every sender's number.
+    pub(super) fn all(&self) -> impl Iterator<Item = u32> {
+        0..self.askers.len() as u32
     }
 
     /// Who sender `by` is, in words.

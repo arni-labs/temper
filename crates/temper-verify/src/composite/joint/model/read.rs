@@ -1,7 +1,7 @@
 //! What the joint model reads once from the specs: each type's model with
-//! the strings it must track, the reactions between the types in scope, the
-//! module calls their actions start, their internal actions and state
-//! timers, and the constraints it does not check.
+//! the strings it must track, the reactions between the types in scope and
+//! those into them from outside, the module calls their actions start, their
+//! internal actions and state timers, and the constraints it does not check.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -194,29 +194,43 @@ impl Kernel {
     }
 }
 
-/// Each action of a type in `scope` that a reaction from a type outside it
-/// sends, with those types: the model, made of the types in `scope`, never
-/// sends it.
-pub(super) fn reactions_into(
+/// A reaction from a type outside the scope into one in it. The model does
+/// not hold its source, so it may come at any time.
+#[derive(Debug, Clone)]
+pub(super) struct Outer {
+    pub(super) from: String,
+    pub(super) to: String,
+    pub(super) target_action: String,
+    /// The service it runs as, when it declares one.
+    pub(super) principal: Option<Asker>,
+}
+
+/// The entity reactions from a type outside `scope` into one in it.
+pub(super) fn outer_reactions(
     by_name: &BTreeMap<&str, &Automaton>,
     scope: &BTreeSet<String>,
-) -> BTreeMap<(String, String), BTreeSet<String>> {
-    let mut into: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+) -> Vec<Outer> {
+    let mut outer = Vec::new();
     for (from, automaton) in by_name.iter().filter(|(name, _)| !scope.contains(**name)) {
-        for trigger in automaton.actions.iter().flat_map(|a| &a.triggers) {
-            if let (TriggerKind::Entity, Some(to), Some(action)) = (
-                &trigger.kind,
-                &trigger.target_entity,
-                &trigger.target_action,
-            ) && scope.contains(to)
-            {
-                into.entry((to.clone(), action.clone()))
-                    .or_default()
-                    .insert(from.to_string());
+        for action in &automaton.actions {
+            for trigger in &action.triggers {
+                if let (TriggerKind::Entity, Some(to), Some(target_action)) = (
+                    &trigger.kind,
+                    &trigger.target_entity,
+                    &trigger.target_action,
+                ) && scope.contains(to)
+                {
+                    outer.push(Outer {
+                        from: from.to_string(),
+                        to: to.clone(),
+                        target_action: target_action.clone(),
+                        principal: senders::declared(trigger, from, &action.name),
+                    });
+                }
             }
         }
     }
-    into
+    outer
 }
 
 /// The entity reactions whose source and target are both in `scope`.

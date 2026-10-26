@@ -29,10 +29,10 @@ pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
 use read::{
-    Kernel, Reaction, Unchecked, named_literals, reactions_into, tracked, unchecked_constraints,
+    Kernel, Reaction, Unchecked, named_literals, outer_reactions, tracked, unchecked_constraints,
 };
 pub(super) use step::Move;
-pub(super) use walk::{Explored, Unwalked, unwalked_reason};
+pub(super) use walk::{Explored, unwalked_reason};
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
@@ -125,37 +125,20 @@ pub(super) struct JointModel {
     /// Elsewhere who armed a timer or answers a call changes nothing, so the
     /// model does not tell them apart.
     sender_matters: BTreeSet<String>,
-    /// Each entity's transitions (by index) that nothing in the model sends
-    /// and something in the runtime does, with who.
-    unsent: BTreeMap<String, Vec<(usize, Unsent)>>,
+    /// For each entity with a module call whose trigger names no
+    /// `on_success`, the actions nothing in the model sends. The kernel
+    /// takes whatever action such a module's result names, and the model
+    /// answers only with internal actions, so the walk never takes these.
+    unwalked_answers: BTreeMap<String, BTreeSet<String>>,
+    /// The actions reactions from types outside the scope send. The model
+    /// does not hold their sources, so each may come at any time, as a move
+    /// from outside sent as its sender.
+    outer: OuterSends,
 }
 
-/// Who in the runtime sends an action nothing in the model sends.
-#[derive(Debug, Clone)]
-enum Unsent {
-    /// A module whose trigger names no `on_success`, while its call is open:
-    /// the kernel takes whatever action the module's result names, and the
-    /// model answers only with internal actions. Only for an action nothing
-    /// else sends.
-    Answer,
-    /// Reactions from these types, outside the scope.
-    Reactions(BTreeSet<String>),
-}
-
-impl Unsent {
-    fn sender(&self) -> String {
-        match self {
-            Unsent::Answer => "a module whose trigger names no on_success".to_string(),
-            Unsent::Reactions(from) => format!(
-                "a reaction from {}",
-                from.iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            ),
-        }
-    }
-}
+/// By entity, then action, then each sender the reactions may run as: the
+/// types outside the scope whose reactions send it.
+type OuterSends = BTreeMap<String, BTreeMap<String, BTreeMap<u32, BTreeSet<String>>>>;
 
 impl JointModel {
     /// The model of `owner`'s properties `reads` over `scope`. With `cut`,
@@ -223,7 +206,36 @@ impl JointModel {
         } else {
             Kernel::default()
         };
-        let senders = Senders::new(by_name, &scope, sending.policies);
+        // A reaction from outside the scope is one of the kernel's moves:
+        // without them anyone may send any action, which covers it.
+        let outer_reactions = if sending.kernel_moves {
+            outer_reactions(by_name, &scope)
+        } else {
+            Vec::new()
+        };
+        let senders = Senders::new(
+            by_name,
+            &scope,
+            outer_reactions.iter().filter_map(|r| r.principal.clone()),
+            sending.policies,
+        );
+        let mut outer = OuterSends::new();
+        for reaction in &outer_reactions {
+            // Without a principal it runs as whoever sent its source's
+            // action, and the model does not hold its source.
+            let by: Vec<u32> = match &reaction.principal {
+                Some(asker) => vec![senders.reaction(Some(asker), OUTSIDE)],
+                None => senders.all().collect(),
+            };
+            let senders = outer
+                .entry(reaction.to.clone())
+                .or_default()
+                .entry(reaction.target_action.clone())
+                .or_default();
+            for by in by {
+                senders.entry(by).or_default().insert(reaction.from.clone());
+            }
+        }
         let chosen = |entity: &str, action: &str| {
             sending
                 .relies_on
@@ -254,33 +266,33 @@ impl JointModel {
             .filter(|r| r.principal.is_none())
             .map(|r| r.from.clone())
             .collect();
-        let into = reactions_into(by_name, &scope);
         let open: BTreeSet<&String> = kernel
             .calls_on
             .iter()
             .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_none()))
             .map(|((entity, _), _)| entity)
             .collect();
-        let unsent = models
-            .iter()
-            .filter_map(|(entity, model)| {
-                let ways: Vec<(usize, Unsent)> = model
+        let unwalked_answers = open
+            .into_iter()
+            .map(|entity| {
+                let actions: BTreeSet<String> = models[entity]
                     .transitions
                     .iter()
-                    .enumerate()
-                    .filter(|(_, t)| {
-                        !chosen(entity, &t.name)
+                    .map(|t| &t.name)
+                    .filter(|action| {
+                        !chosen(entity, action)
                             && !reactions
                                 .iter()
-                                .any(|r| &r.to == entity && r.target_action == t.name)
+                                .any(|r| &r.to == entity && &r.target_action == *action)
+                            && !outer
+                                .get(entity.as_str())
+                                .is_some_and(|sent| sent.contains_key(action.as_str()))
                     })
-                    .filter_map(|(i, t)| match into.get(&(entity.clone(), t.name.clone())) {
-                        Some(from) => Some((i, Unsent::Reactions(from.clone()))),
-                        None => open.contains(entity).then_some((i, Unsent::Answer)),
-                    })
+                    .cloned()
                     .collect();
-                (!ways.is_empty()).then(|| (entity.clone(), ways))
+                (entity.clone(), actions)
             })
+            .filter(|(_, actions)| !actions.is_empty())
             .collect();
         Self {
             models,
@@ -296,28 +308,25 @@ impl JointModel {
             order,
             senders,
             sender_matters,
-            unsent,
+            unwalked_answers,
+            outer,
         }
     }
 
-    /// Note each move the runtime could make in `state` that the walk never
-    /// takes.
-    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<Unwalked>) {
-        for (entity, ways) in &self.unsent {
-            let open = state
-                .calls
-                .iter()
-                .any(|call| &call.to == entity && call.on_success.is_none());
-            for (index, sender) in ways {
-                let t = &self.models[entity].transitions[*index];
-                if (open || !matches!(sender, Unsent::Answer))
-                    && self.enabled(entity, t, state, Blind::Nothing)
-                {
-                    unwalked.insert(Unwalked {
-                        action: format!("{entity}.{}", t.name),
-                        sender: sender.sender(),
-                        from: state.records[entity].status.clone(),
-                    });
+    /// Note each answer a call open in `state` may get that the walk never
+    /// takes, as (entity, action, the record's status).
+    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<(String, String, String)>) {
+        for call in state.calls.iter().filter(|call| call.on_success.is_none()) {
+            let Some(actions) = self.unwalked_answers.get(&call.to) else {
+                continue;
+            };
+            for t in &self.models[&call.to].transitions {
+                if actions.contains(&t.name) && self.enabled(&call.to, t, state, Blind::Nothing) {
+                    unwalked.insert((
+                        call.to.clone(),
+                        t.name.clone(),
+                        state.records[&call.to].status.clone(),
+                    ));
                 }
             }
         }
