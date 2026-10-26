@@ -1,6 +1,7 @@
-//! The breadth-first walk over joint states.
+//! The walk over joint states: breadth first, or toward a status.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use super::super::pack::{Packed, Packer};
 use super::super::room::{Bound, Held, MB, block, map_bytes};
@@ -98,6 +99,44 @@ impl JointModel {
         &self,
         bound: Bound<'a>,
         edges: bool,
+        visit: impl FnMut(usize, &JointState) -> bool,
+    ) -> Explored<'a> {
+        self.walk_in(bound, edges, VecDeque::new(), |_| 0, visit)
+    }
+
+    /// Walk every reachable joint state as [`Self::walk_with`] does, with no
+    /// edges kept, taking next a state whose `owner` record is nearest a
+    /// status `target` picks, the latest found among the nearest. A search
+    /// for a state that may stand there finds one sooner, by a path that may
+    /// not be the shortest. When `target` picks every status, it walks
+    /// breadth first.
+    pub(in crate::composite::joint) fn walk_toward<'a>(
+        &self,
+        bound: Bound<'a>,
+        (owner, target): (&str, impl Fn(&str) -> bool),
+        visit: impl FnMut(usize, &JointState) -> bool,
+    ) -> Explored<'a> {
+        let model = self.models.get(owner);
+        let Some(model) = model.filter(|m| !m.states.iter().all(|s| target(s))) else {
+            return self.walk_with(bound, false, visit);
+        };
+        let near = model.distances(target);
+        let distance = |state: &JointState| {
+            let status = state.records.get(owner).map(|r| r.status.as_str());
+            status
+                .and_then(|s| near.get(s))
+                .copied()
+                .unwrap_or(usize::MAX)
+        };
+        self.walk_in(bound, false, BinaryHeap::new(), distance, visit)
+    }
+
+    fn walk_in<'a>(
+        &self,
+        bound: Bound<'a>,
+        edges: bool,
+        mut queue: impl Frontier,
+        distance: impl Fn(&JointState) -> usize,
         mut visit: impl FnMut(usize, &JointState) -> bool,
     ) -> Explored<'a> {
         let mut explored = Explored {
@@ -110,17 +149,16 @@ impl JointModel {
             held: Held::new(bound),
         };
         let mut seen: HashMap<Packed, u32> = HashMap::new();
-        let mut queue = VecDeque::new();
         let mut tables = Tables::default();
         for init in self.inits() {
             let packed = explored.packer.pack(&init);
             if !seen.contains_key(&packed) {
                 seen.insert(packed.clone(), explored.nodes.len() as u32);
-                queue.push_back(explored.nodes.len());
+                queue.add(explored.nodes.len(), distance(&init));
                 explored.nodes.push((packed, None));
             }
         }
-        while let Some(index) = queue.pop_front() {
+        while let Some(index) = queue.take() {
             let state = explored.state(index);
             if visit(index, &state) {
                 break;
@@ -164,7 +202,7 @@ impl JointModel {
                             tables.states += block(size_of::<[usize; 2]>() + 4 * packed.len());
                             seen.insert(packed.clone(), at);
                             explored.nodes.push((packed, Some((index as u32, label))));
-                            queue.push_back(at as usize);
+                            queue.add(at as usize, distance(&next.state));
                             at
                         }
                     };
@@ -212,7 +250,7 @@ impl Tables {
         &mut self,
         explored: &mut Explored<'_>,
         seen: &mut HashMap<Packed, u32>,
-        queue: &mut VecDeque<usize>,
+        queue: &mut impl List,
         edges: bool,
     ) -> Result<(), String> {
         let [states, made, ends] = self.most.map(|most| most.max(1));
@@ -267,6 +305,45 @@ impl<T> List for VecDeque<T> {
     }
     fn reserve_exact(&mut self, more: usize) {
         VecDeque::reserve_exact(self, more);
+    }
+}
+
+impl<T: Ord> List for BinaryHeap<T> {
+    const ENTRY: usize = size_of::<T>();
+    fn len(&self) -> usize {
+        BinaryHeap::len(self)
+    }
+    fn capacity(&self) -> usize {
+        BinaryHeap::capacity(self)
+    }
+    fn reserve_exact(&mut self, more: usize) {
+        BinaryHeap::reserve_exact(self, more);
+    }
+}
+
+/// The states found and not yet walked, by their index.
+trait Frontier: List {
+    fn add(&mut self, index: usize, distance: usize);
+    fn take(&mut self) -> Option<usize>;
+}
+
+/// The first found first.
+impl Frontier for VecDeque<usize> {
+    fn add(&mut self, index: usize, _: usize) {
+        self.push_back(index);
+    }
+    fn take(&mut self) -> Option<usize> {
+        self.pop_front()
+    }
+}
+
+/// The nearest first, and the latest found among the nearest.
+impl Frontier for BinaryHeap<(Reverse<usize>, usize)> {
+    fn add(&mut self, index: usize, distance: usize) {
+        self.push((Reverse(distance), index));
+    }
+    fn take(&mut self) -> Option<usize> {
+        self.pop().map(|(_, index)| index)
     }
 }
 

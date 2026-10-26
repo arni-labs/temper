@@ -5,13 +5,13 @@
 //! saying anything. The walk does not pass such a rule, and neither does a
 //! proof. The solver answers first ([`RuleProof::premise_excluded`]): when no
 //! state the proof covers meets the premise, no run does. Otherwise a state
-//! that meets it is looked for on the rule's own joint model, walked as its
-//! walk would walk it, stopping at the first; it costs the states up to it,
-//! never more than the rule's full walk.
+//! that meets it is looked for on the rule's own joint model, walked first
+//! toward the statuses where the premise may hold and stopping at the first
+//! state that meets it; it costs never more than the rule's full walk.
 
 use std::time::{Duration, Instant};
 
-use temper_spec::predicate::{Expr, Truth, eval};
+use temper_spec::predicate::{Env, Expr, Truth, Val, eval};
 
 use super::model::JointModel;
 use super::premise;
@@ -118,7 +118,14 @@ fn seek(
     let start = Instant::now();
     let premises: Vec<Option<&Expr>> = rules.iter().map(|rule| premise(rule)).collect();
     let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
-    let explored = model.walk_with(bound, false, |_, state| {
+    let may_meet = |status: &str| {
+        let status = Status(status);
+        premises
+            .iter()
+            .flatten()
+            .any(|p| eval(p, &status) != Truth::False)
+    };
+    let explored = model.walk_toward(bound, (owner, may_meet), |_, state| {
         if !settled || state.settled() {
             let env = model.env(owner, state);
             for (met, premise) in met.iter_mut().zip(&premises) {
@@ -154,4 +161,22 @@ fn seek(
             }
         })
         .collect()
+}
+
+/// A record whose status alone is known: a premise false there is false
+/// whatever its fields hold.
+struct Status<'a>(&'a str);
+
+impl Env for Status<'_> {
+    fn status(&self) -> Val<'_> {
+        Val::Str(self.0)
+    }
+
+    fn var(&self, _: &str) -> Val<'_> {
+        Val::Unknown
+    }
+
+    fn cross_statuses(&self, _: &str, _: &str) -> Option<Vec<Val<'_>>> {
+        None
+    }
 }

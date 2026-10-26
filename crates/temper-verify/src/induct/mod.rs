@@ -17,9 +17,11 @@
 //! `eventually` rule is proved with a measure and helpful moves
 //! (`live.rs`).
 
+mod alone;
 mod cedar;
 mod effects;
 mod encode;
+mod general;
 mod guess;
 mod hints;
 mod live;
@@ -37,13 +39,14 @@ use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name};
 
-use encode::{Enc, initial, prelude};
+pub use alone::prove_alone;
+use encode::{Enc, initial};
 use guess::Guess;
 pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};
 use moves::Moves;
 pub use proof::{Obligation, Outcome, RuleProof};
-use run::{Ask, Session, few_in_flight, run};
+use run::{Ask, solve};
 use vocab::Vocab;
 
 /// One attempt at a rule: its obligations, what the solver refused, and the
@@ -247,6 +250,7 @@ fn prove_one(
     let enc = Enc::new(&v);
     let builder = Moves::new(&enc);
     let moves = builder.all();
+    let groups = builder.groups(&moves);
     let read_by_moves = enc.take_unheld();
     enc.expr(expr, owner, "pre");
     let unheld = enc.take_unheld();
@@ -299,23 +303,24 @@ fn prove_one(
                 }
                 asks.push(Ask::new(&v, "start", text, at_start.clone(), &at_start));
             }
-            for mv in &moves {
-                let before = clause("pre");
-                let after = clause("post");
-                let decls = enc.take_decls();
+            let (before, after) = (clause("pre"), clause("post"));
+            let (j, named) = run::joint(&enc.take_decls(), &before, &after);
+            let ask = |mv: &moves::Move| {
                 let mut text = String::from("(push 1)\n");
-                decls
+                mv.decls
                     .iter()
-                    .chain(&mv.decls)
                     .for_each(|d| text.push_str(&format!("{d}\n")));
-                for (_, c) in &before {
-                    text.push_str(&format!("(assert {c})\n"));
-                }
+                text.push_str("(assert j!)\n");
                 for fact in mv.body() {
                     text.push_str(&format!("(assert {fact})\n"));
                 }
-                asks.push(Ask::new(&v, &mv.label, text, after, &before));
-            }
+                let goal = named.clone();
+                Ask {
+                    goal,
+                    ..Ask::new(&v, &mv.label, text, after.clone(), &before)
+                }
+            };
+            asks.extend(groups.iter().map(|group| group.ask(&moves, &ask)));
             let mut errors = Vec::new();
             if let Rule::Eventually(goal, relies_on) = kind {
                 let live = live::Live {
@@ -327,7 +332,12 @@ fn prove_one(
                 };
                 live::asks(&enc, &moves, &live, &clause, &mut asks, &mut errors);
             }
-            let (mut obligations, mut refused) = solve(shared, &v, rule, &asks, &guessed)?;
+            let (checked, mut refused) = solve(shared, &v, rule, (&j, &asks), &guessed)?;
+            errors.append(&mut refused);
+            let (mut obligations, mut refused) =
+                general::fall_back((&groups, &moves), (&asks, 1, checked), &ask, |asks| {
+                    solve(shared, &v, rule, (&j, asks), &guessed)
+                })?;
             errors.append(&mut refused);
             fn broken(o: &Obligation) -> Option<&Vec<String>> {
                 match &o.outcome {
@@ -408,7 +418,7 @@ fn prove_one(
             }
             let goal = vec![("premise met".to_string(), "false".to_string())];
             let ask = Ask::new(&v, "premise", text, goal, &at);
-            let (checked, _) = solve(shared, &v, rule, &[ask], &BTreeSet::new())?;
+            let (checked, _) = solve(shared, &v, rule, ("", &[ask]), &BTreeSet::new())?;
             matches!(checked.first().map(|o| &o.outcome), Some(Outcome::Holds))
         }
         _ => false,
@@ -445,47 +455,4 @@ fn prove_one(
         errors,
         took: start.elapsed(),
     })
-}
-
-/// The string literals `text` names, as `|'x'|`.
-fn quoted_literals(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("|'") {
-        let after = &rest[at + 2..];
-        let Some(end) = after.find("'|") else { break };
-        out.push(after[..end].to_string());
-        rest = &after[end + 2..];
-    }
-    out
-}
-
-/// Check `asks` over the rule's solvers, sharing the string literals they
-/// name: each distinct from the others, and the empty string a parameter is
-/// checked against.
-fn solve(
-    shared: &Shared<'_>,
-    v: &Vocab<'_>,
-    rule: &str,
-    asks: &[Ask],
-    guessed: &BTreeSet<String>,
-) -> std::io::Result<(Vec<Obligation>, Vec<String>)> {
-    let mut literals = BTreeSet::from([String::new()]);
-    for ask in asks {
-        literals.extend(quoted_literals(&ask.text));
-        for (_, c) in &ask.goal {
-            literals.extend(quoted_literals(c));
-        }
-    }
-    let prelude = prelude(v, &literals);
-    let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
-    let few = few_in_flight(v);
-    let session = Session {
-        prelude: &prelude,
-        few: &few,
-        literals: &shown,
-        solvers: shared.solvers.clamp(1, asks.len().max(1)),
-        deadline: shared.deadline,
-    };
-    run(rule, &session, asks, guessed)
 }

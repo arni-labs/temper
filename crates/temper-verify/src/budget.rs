@@ -57,6 +57,11 @@ impl Spending {
         model
     }
 
+    /// When the budget runs out.
+    pub(crate) fn until(&self) -> Instant {
+        self.limit.until
+    }
+
     pub(crate) fn spent(&self) -> bool {
         Instant::now() >= self.limit.until
     }

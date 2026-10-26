@@ -1,3 +1,6 @@
+use std::collections::{HashSet, VecDeque};
+
+use super::coverage::step;
 use super::*;
 use crate::model::build_model_from_ioa;
 
@@ -361,4 +364,107 @@ guard = "empty(other_id) || Other[other_id].status in ['Ok']"
         "a cross-entity transition out of an unreachable state must still be reported dead: {:?}",
         result.dead_transitions
     );
+}
+
+/// Four counters, each stepped in Start by its own move, and a chain of
+/// statuses from Start to End, a move each.
+const DEEP: &str = r#"
+[automaton]
+name = "Deep"
+states = ["Start", "One", "Two", "Three", "End"]
+initial = "Start"
+
+[[state]]
+name = "a"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "b"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "c"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "d"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "A"
+from = ["Start"]
+effect = ["a += 1"]
+
+[[action]]
+name = "B"
+from = ["Start"]
+effect = ["b += 1"]
+
+[[action]]
+name = "C"
+from = ["Start"]
+effect = ["c += 1"]
+
+[[action]]
+name = "D"
+from = ["Start"]
+effect = ["d += 1"]
+
+[[action]]
+name = "Go"
+from = ["Start"]
+to = "One"
+
+[[action]]
+name = "OnToTwo"
+from = ["One"]
+to = "Two"
+
+[[action]]
+name = "OnToThree"
+from = ["Two"]
+to = "Three"
+
+[[action]]
+name = "Finish"
+from = ["Three"]
+to = "End"
+"#;
+
+#[test]
+fn a_model_with_no_rule_to_walk_searches_only_until_every_move_has_fired() {
+    let result = check_model(&build_model_from_ioa(DEEP, 3).unwrap());
+    assert!(
+        result.is_complete && result.all_properties_hold,
+        "{result:?}"
+    );
+    // A rule needs every reachable state walked: 256 in Start alone.
+    let ruled = format!("{DEEP}\n[[invariant]]\nname = \"FewA\"\nassert = \"a <= 3\"\n");
+    let walked = check_model(&build_model_from_ioa(&ruled, 3).unwrap());
+    assert!(
+        walked.is_complete && walked.all_properties_hold,
+        "{walked:?}"
+    );
+    assert!(walked.states_explored > 256, "{}", walked.states_explored);
+    // Heading for the statuses the unfired moves start in, the search
+    // takes Start, then each status down the chain.
+    assert!(
+        result.states_explored <= 5,
+        "expanded {} states",
+        result.states_explored
+    );
+}
+
+#[test]
+fn a_move_no_reachable_state_enables_is_named_with_no_rule_to_walk() {
+    // Only Finish leads to End.
+    let dead = DEEP.replace("from = [\"Three\"]", "from = [\"End\"]");
+    let result = check_model(&build_model_from_ioa(&dead, 3).unwrap());
+    assert!(result.is_complete, "{result:?}");
+    assert!(!result.all_properties_hold);
+    assert_eq!(result.dead_transitions, ["Finish [End -> End]"]);
 }

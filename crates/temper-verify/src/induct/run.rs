@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::encode::Enc;
+use super::encode::{Enc, prelude};
 use super::solver::{Answer, Z3};
 use super::vocab::Vocab;
-use super::{Obligation, Outcome};
+use super::{Obligation, Outcome, Shared};
 
 /// One obligation written out: what it assumes, what must follow, and what
 /// a counterexample shows.
@@ -19,6 +19,11 @@ pub(super) struct Ask {
     pub(super) text: String,
     pub(super) goal: Vec<(String, String)>,
     pub(super) show: Vec<String>,
+    /// A general move's ([`super::general`]): when it does not hold, the
+    /// proof checks the moves it stands for, so it stops nothing.
+    pub(super) general: bool,
+    /// Whether a clause it reads is quantified.
+    pub(super) quantified: bool,
 }
 
 impl Ask {
@@ -30,11 +35,16 @@ impl Ask {
         before: &[(String, String)],
     ) -> Self {
         let show = shown(v, before, &goal);
+        let quantified = |t: &str| t.contains("(forall ") || t.contains("(exists ");
+        let quantified =
+            quantified(&text) || before.iter().chain(&goal).any(|(_, c)| quantified(c));
         Self {
             name: name.to_string(),
             text,
             goal,
             show,
+            general: false,
+            quantified,
         }
     }
 }
@@ -48,6 +58,8 @@ pub(super) struct Session<'s> {
     pub(super) prelude: &'s str,
     /// `few!`, sent after it.
     pub(super) few: &'s str,
+    /// The clauses the asks share ([`joint`]), sent last.
+    pub(super) clauses: &'s str,
     /// The literals a counterexample shows.
     pub(super) literals: &'s [String],
     pub(super) solvers: usize,
@@ -80,6 +92,7 @@ pub(super) fn run(
     let Session {
         prelude,
         few,
+        clauses,
         literals,
         solvers,
         deadline,
@@ -96,6 +109,7 @@ pub(super) fn run(
                     let mut z3 = Z3::start()?;
                     z3.send(prelude)?;
                     z3.send(few)?;
+                    z3.send(clauses)?;
                     let mut checked = Vec::new();
                     let late = || deadline.is_some_and(|d| Instant::now() >= d);
                     while !stop.load(Ordering::Relaxed) && !late() {
@@ -104,7 +118,7 @@ pub(super) fn run(
                             break;
                         };
                         let obligation = check(&mut z3, literals, ask)?;
-                        if ends(&obligation) {
+                        if !ask.general && ends(&obligation) {
                             stop.store(true, Ordering::Relaxed);
                         }
                         checked.push((at, obligation));
@@ -136,8 +150,11 @@ pub(super) fn run(
     done.sort_by_key(|(at, _)| *at);
     // Solvers already checking when one fails may fail too; the first is
     // the one reported.
+    let first = done
+        .iter()
+        .position(|(at, o)| !asks[*at].general && ends(o));
     let mut out: Vec<Obligation> = done.into_iter().map(|(_, o)| o).collect();
-    if let Some(first) = out.iter().position(ends) {
+    if let Some(first) = first {
         out.truncate(first + 1);
     } else if out.len() < asks.len() {
         out.push(Obligation {
@@ -152,6 +169,51 @@ pub(super) fn run(
         });
     }
     Ok((out, errors))
+}
+
+/// The string literals `text` names, as `|'x'|`.
+fn quoted_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("|'") {
+        let after = &rest[at + 2..];
+        let Some(end) = after.find("'|") else { break };
+        out.push(after[..end].to_string());
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+/// Check `asks` over the rule's solvers, which first read the `clauses`
+/// they share, sharing the string literals they name: each distinct from
+/// the others, and the empty string a parameter is checked against.
+pub(super) fn solve(
+    shared: &Shared<'_>,
+    v: &Vocab<'_>,
+    rule: &str,
+    (clauses, asks): (&str, &[Ask]),
+    guessed: &BTreeSet<String>,
+) -> std::io::Result<(Vec<Obligation>, Vec<String>)> {
+    let mut literals = BTreeSet::from([String::new()]);
+    literals.extend(quoted_literals(clauses));
+    for ask in asks {
+        literals.extend(quoted_literals(&ask.text));
+        for (_, c) in &ask.goal {
+            literals.extend(quoted_literals(c));
+        }
+    }
+    let prelude = prelude(v, &literals);
+    let shown: Vec<String> = literals.iter().map(|l| Enc::lit(l)).collect();
+    let few = few_in_flight(v);
+    let session = Session {
+        prelude: &prelude,
+        few: &few,
+        clauses,
+        literals: &shown,
+        solvers: shared.solvers.clamp(1, asks.len().max(1)),
+        deadline: shared.deadline,
+    };
+    run(rule, &session, asks, guessed)
 }
 
 /// One of the solvers this process runs at once: as many as it has cores.
@@ -209,8 +271,7 @@ fn check(z3: &mut Z3, literals: &[String], ask: &Ask) -> std::io::Result<Obligat
     // a model until its timeout. Among states with a few dispatches of each
     // kind in flight one is quick to find: first whether the move can
     // happen, then a failure, which is a real counterexample.
-    let quantified = |t: &str| t.contains("(forall ") || t.contains("(exists ");
-    let few_first = quantified(&ask.text) || all.iter().any(|c| quantified(c));
+    let few_first = ask.quantified;
     let (mut some, mut took) = (Answer::Unknown, Duration::ZERO);
     if few_first {
         z3.send("(push 1)\n(assert few!)\n")?;
@@ -265,16 +326,75 @@ fn check(z3: &mut Z3, literals: &[String], ask: &Ask) -> std::io::Result<Obligat
 }
 
 /// The clauses of `goal` that fail on their own, given what is asserted.
+/// Each model that breaks one of those left shows every clause it breaks,
+/// so a few checks find them all; a clause the models leave undecided is
+/// checked on its own.
 fn failing(z3: &mut Z3, goal: &[(String, String)]) -> std::io::Result<Vec<String>> {
-    let mut clauses = Vec::new();
-    for (clause_name, c) in goal {
-        z3.send(&format!("(push 1)\n(assert (not {c}))\n"))?;
-        if z3.check()?.0 != Answer::Unsat {
-            clauses.push(clause_name.clone());
-        }
-        z3.send("(pop 1)\n")?;
+    let named = |i: usize| format!("goal!{i}");
+    let mut text = String::from("(push 1)\n");
+    for (i, (_, c)) in goal.iter().enumerate() {
+        text.push_str(&format!("(define-fun {} () Bool {c})\n", named(i)));
     }
-    Ok(clauses)
+    z3.send(&text)?;
+    let mut fails = vec![false; goal.len()];
+    loop {
+        let left: Vec<String> = (0..goal.len()).filter(|&i| !fails[i]).map(named).collect();
+        z3.send(&format!(
+            "(push 1)\n(assert (not (and true {})))\n",
+            left.join(" ")
+        ))?;
+        let (answer, _) = z3.check()?;
+        let shown = match answer {
+            Answer::Sat => z3.values(&left)?,
+            _ => String::new(),
+        };
+        z3.send("(pop 1)\n")?;
+        let found = (0..goal.len())
+            .filter(|&i| !fails[i] && shown.contains(&format!("({} false)", named(i))))
+            .collect::<Vec<_>>();
+        if answer == Answer::Unsat {
+            break;
+        }
+        if found.is_empty() {
+            let undecided: Vec<usize> = (0..goal.len()).filter(|&i| !fails[i]).collect();
+            for i in undecided {
+                z3.send(&format!("(push 1)\n(assert (not {}))\n", named(i)))?;
+                fails[i] = z3.check()?.0 != Answer::Unsat;
+                z3.send("(pop 1)\n")?;
+            }
+            break;
+        }
+        found.into_iter().for_each(|i| fails[i] = true);
+    }
+    z3.send("(pop 1)\n")?;
+    Ok(goal
+        .iter()
+        .zip(fails)
+        .filter(|(_, fails)| *fails)
+        .map(|((name, _), _)| name.clone())
+        .collect())
+}
+
+/// J as every move's ask reads it, which each solver parses once: the
+/// clauses' declarations, `j!` for the clauses before the move, and
+/// `post!i` for each clause after it; with the goal that names those.
+pub(super) fn joint(
+    decls: &[String],
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> (String, Vec<(String, String)>) {
+    let mut text: String = decls.iter().map(|d| format!("{d}\n")).collect();
+    let held: Vec<&str> = before.iter().map(|(_, c)| c.as_str()).collect();
+    text.push_str(&format!(
+        "(define-fun j! () Bool (and true {}))\n",
+        held.join(" ")
+    ));
+    let mut goal = Vec::new();
+    for (i, (name, c)) in after.iter().enumerate() {
+        text.push_str(&format!("(define-fun post!{i} () Bool {c})\n"));
+        goal.push((name.clone(), format!("post!{i}")));
+    }
+    (text, goal)
 }
 
 /// `few!`: at most two distinct dispatches or calls of each kind in flight

@@ -2,7 +2,8 @@
 //!
 //! Levels:
 //! 0. **Symbolic Verification** — SMT-based algebraic verification (Z3)
-//! 1. **Model Check** — exhaustive state-space exploration via Stateright
+//! 1. **Model Check** — each invariant proved by induction where it can be,
+//!    then exhaustive state-space exploration via Stateright for the rest
 //! 2. **Deterministic Simulation** — FoundationDB/TigerBeetle-style fault injection
 //!    2b. **Actor Simulation** — real TransitionTable::evaluate() through SimActorSystem
 //! 3. **Property Tests** — random action sequences with invariant checking
@@ -18,6 +19,7 @@ use crate::simulation::{self, SimConfig, SimulationResult};
 use crate::smt::{self, SmtResult};
 
 use temper_runtime::scheduler::FaultConfig;
+use temper_spec::automaton::Automaton;
 
 /// Result of an actor simulation level (Level 2b).
 ///
@@ -272,8 +274,10 @@ impl VerificationCascade {
         let spending = self.budget.map(Spending::start);
         let spending = spending.as_ref();
         let mut levels = Vec::new();
-        let model = self.build_temper_model(self.max_counter, spending);
-        let prop_model = self.build_temper_model(2, spending);
+        let automaton = temper_spec::automaton::parse_automaton(&self.ioa_source)
+            .expect("cascade: IOA spec should have been validated before model building");
+        let model = self.build_temper_model(&automaton, self.max_counter, spending);
+        let prop_model = self.build_temper_model(&automaton, 2, spending);
 
         let mut warnings = Vec::new();
 
@@ -297,8 +301,8 @@ impl VerificationCascade {
             return finish(levels, warnings, None, None);
         }
 
-        // Level 1: Stateright model checking
-        let l1 = self.run_model_check(&model);
+        // Level 1: induction, then Stateright model checking
+        let l1 = self.run_model_check(automaton, &model, spending);
         let l1_passed = l1.passed;
         let explored = l1
             .verification
@@ -365,9 +369,13 @@ impl VerificationCascade {
     }
 
     /// The model the levels explore, limited by the budget being spent.
-    fn build_temper_model(&self, max_counter: usize, spending: Option<&Spending>) -> TemperModel {
-        let model = model::build_model_from_ioa(&self.ioa_source, max_counter)
-            .expect("cascade: IOA spec should have been validated before model building");
+    fn build_temper_model(
+        &self,
+        automaton: &Automaton,
+        max_counter: usize,
+        spending: Option<&Spending>,
+    ) -> TemperModel {
+        let model = model::build_model_from_automaton(automaton, max_counter);
         match spending {
             Some(spending) => spending.limit(model),
             None => model,
@@ -453,13 +461,38 @@ impl VerificationCascade {
         }
     }
 
-    /// Level 1: Stateright exhaustive model checking.
-    fn run_model_check(&self, model: &TemperModel) -> LevelResult {
+    /// Level 1: each invariant induction proves needs no walk
+    /// ([`crate::induct::prove_alone`]); Stateright walks for the rest.
+    fn run_model_check(
+        &self,
+        mut automaton: Automaton,
+        model: &TemperModel,
+        spending: Option<&Spending>,
+    ) -> LevelResult {
+        let deadline = spending.map(Spending::until);
+        let (proved, unproved): (Vec<_>, Vec<_>) = crate::induct::prove_alone(&automaton, deadline)
+            .into_iter()
+            .partition(|proof| proof.proved());
+        let walked;
+        let model = if proved.is_empty() {
+            model
+        } else {
+            automaton
+                .invariants
+                .retain(|i| !proved.iter().any(|proof| proof.rule == i.name));
+            walked = self.build_temper_model(&automaton, self.max_counter, spending);
+            &walked
+        };
         let verification = checker::check_model(model);
         let passed = verification.all_properties_hold;
+        let names: Vec<&str> = proved.iter().map(|p| p.rule.as_str()).collect();
+        let proved = match names.is_empty() {
+            true => String::new(),
+            false => format!("{} proved by induction; ", names.join(", ")),
+        };
         let summary = if passed {
             format!(
-                "L1 Model Check PASSED: {} states explored, all properties hold",
+                "L1 Model Check PASSED: {proved}{} states explored, all properties hold",
                 verification.states_explored,
             )
         } else {
@@ -478,21 +511,27 @@ impl VerificationCascade {
                 ));
             }
             format!(
-                "L1 Model Check FAILED: {} states explored, {}",
+                "L1 Model Check FAILED: {proved}{} states explored, {}",
                 verification.states_explored,
                 parts.join("; "),
             )
         };
+        // An invariant walked because its proof did not hold says why.
+        let unproved = unproved.iter().filter_map(|proof| {
+            let why = proof.shortfall()?;
+            Some(format!("{} not proved by induction: {why}", proof.rule))
+        });
+        let mut diagnostics = Vec::new();
+        if !passed {
+            diagnostics = diagnostics::model_check_diagnostics(&verification);
+            diagnostics.extend(unproved);
+        }
 
         LevelResult {
             level: CascadeLevel::ModelCheck,
             passed,
             summary,
-            diagnostics: if passed {
-                Vec::new()
-            } else {
-                diagnostics::model_check_diagnostics(&verification)
-            },
+            diagnostics,
             verification: Some(verification),
             simulation: None,
             prop_test: None,

@@ -326,7 +326,7 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         )
     }
 
-    fn made(
+    pub(super) fn made(
         &self,
         label: String,
         guard: Vec<String>,
@@ -407,7 +407,7 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
 
     /// What lets `entity`'s record take `action` with `params`: its state,
     /// its guard, and its constraints.
-    fn enabled(
+    pub(super) fn enabled(
         &self,
         entity: &str,
         action: &Action,
