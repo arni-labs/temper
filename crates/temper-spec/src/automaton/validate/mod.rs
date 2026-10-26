@@ -259,7 +259,6 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             ));
         }
         check(eventually, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
-        no_params(eventually, slot.clone())?;
         if let Some(culprit) = crate::predicate::unverifiable(eventually, &vars) {
             return Err(invalid(
                 slot,

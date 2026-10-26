@@ -20,12 +20,11 @@ fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnv
 
 /// ADR-0153 live verification: the real postgres store honors the same
 /// negative-existence + atomicity invariants the DST proved in SimEventStore.
-/// Gated on DATABASE_URL (skips otherwise); isolated by a unique tenant.
+/// Gated on DATABASE_URL (skips locally without it, fails in CI); isolated by a unique tenant.
 #[test]
 fn entity_key_index_present_absent_and_atomic_reject() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -109,9 +108,8 @@ fn entity_key_index_present_absent_and_atomic_reject() {
 /// 0010). Gated on DATABASE_URL; isolated by a unique tenant.
 #[test]
 fn key_index_backfill_and_watermark_methods_round_trip_on_postgres() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -198,9 +196,8 @@ fn key_index_backfill_and_watermark_methods_round_trip_on_postgres() {
 
 #[test]
 fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -320,9 +317,8 @@ fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
 
 #[test]
 fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -406,9 +402,8 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
 
 #[test]
 fn query_field_index_page_orders_and_limits_inside_postgres() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -543,9 +538,8 @@ fn query_field_index_page_orders_and_limits_inside_postgres() {
 
 #[test]
 fn upsert_query_projection_diffs_field_index_rows() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -707,9 +701,8 @@ fn upsert_query_projection_diffs_field_index_rows() {
 
 #[test]
 fn native_data_only_create_inserts_event_catalog_and_index_atomically() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -822,9 +815,8 @@ fn native_data_only_create_inserts_event_catalog_and_index_atomically() {
 
 #[test]
 fn upsert_query_projection_advances_sequence_without_rewriting_unchanged_index() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -907,9 +899,8 @@ fn upsert_query_projection_advances_sequence_without_rewriting_unchanged_index()
 
 #[test]
 fn upsert_query_projection_updates_index_status_when_fields_are_unchanged() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -983,9 +974,8 @@ fn upsert_query_projection_updates_index_status_when_fields_are_unchanged() {
 
 #[test]
 fn upsert_query_projection_clears_index_when_scalar_fields_disappear() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -1075,9 +1065,8 @@ fn upsert_query_projection_clears_index_when_scalar_fields_disappear() {
 
 #[test]
 fn upsert_query_projection_removes_index_row_when_value_becomes_too_long() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -1176,12 +1165,11 @@ fn upsert_query_projection_removes_index_row_when_value_becomes_too_long() {
 /// property in `temper-store-turso`; this is the Postgres half, so the two
 /// backends cannot drift into different replay orders.
 ///
-/// Gated on DATABASE_URL (skips otherwise); isolated by a unique tenant.
+/// Gated on DATABASE_URL (skips locally without it, fails in CI); isolated by a unique tenant.
 #[test]
 fn session_read_follows_capture_order_not_insert_order() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {
@@ -1249,9 +1237,8 @@ fn session_read_follows_capture_order_not_insert_order() {
 /// instead of scanning the whole journal. Gated on DATABASE_URL.
 #[test]
 fn migrations_create_the_tombstone_index() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
+    let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+        return;
     };
 
     sqlx::test_block_on(async {

@@ -1,13 +1,16 @@
 //! The breadth-first walk over joint states.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::BTreeSet;
 
-use super::super::pack::{Packed, Packer};
-use super::super::room::{Bound, Held, MB, block, map_bytes};
+use super::super::JointOutcome;
+use super::super::pack::Packer;
+use super::super::room::{Bound, Held, MB, bytes, grow};
 use super::super::state::render;
-use super::super::{JointState, JointStep};
-use super::JointModel;
+use super::super::store::States;
+use super::super::{JointState, JointStep, premise};
 use super::step::Certainty;
+use super::{JointModel, Walk};
+use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 /// One move made from a walked state.
 #[derive(Debug, Clone, Copy)]
@@ -34,9 +37,10 @@ pub(in crate::composite::joint) struct Edge {
 
 /// What a walk saw, and the memory it holds for it.
 pub(in crate::composite::joint) struct Explored<'a> {
-    /// Each state walked, packed, with the state and move (a name in
-    /// `packer`) it was first reached by.
-    nodes: Vec<(Packed, Option<(u32, u32)>)>,
+    /// Each state walked, packed.
+    states: States,
+    /// The state and move (a name in `packer`) each was first reached by.
+    firsts: Vec<Option<(u32, u32)>>,
     packer: Packer,
     /// Every move made from a walked state, when asked for.
     pub(in crate::composite::joint) made: Vec<Made>,
@@ -51,21 +55,30 @@ pub(in crate::composite::joint) struct Explored<'a> {
 }
 
 impl Explored<'_> {
+    fn stop_for_room(&mut self, reason: String) {
+        self.stopped = Some(format!(
+            "the walk does not fit in the memory it may hold: {reason} \
+             (it held {} MB at {} states)",
+            self.held.bytes / MB,
+            self.len()
+        ));
+    }
+
     /// How many states the walk saw.
     pub(in crate::composite::joint) fn len(&self) -> usize {
-        self.nodes.len()
+        self.states.len()
     }
 
     /// The state walked `index`th.
     pub(in crate::composite::joint) fn state(&self, index: usize) -> JointState {
-        self.packer.unpack(&self.nodes[index].0)
+        self.packer.unpack(self.states.get(index))
     }
 
     /// The moves from the start to the state walked `index`th.
     pub(in crate::composite::joint) fn path(&self, mut index: usize) -> Vec<JointStep> {
         let mut steps = Vec::new();
         loop {
-            let parent = self.nodes[index].1;
+            let parent = self.firsts[index];
             steps.push(JointStep {
                 action: parent.map(|(_, label)| self.packer.name(label).to_string()),
                 state: render(&self.state(index)),
@@ -100,8 +113,12 @@ impl JointModel {
         edges: bool,
         mut visit: impl FnMut(usize, &JointState) -> bool,
     ) -> Explored<'a> {
+        // The room bounds what the walk holds; a model's expansion work has
+        // no count or clock of its own here.
+        self.expansion.reset(usize::MAX, None);
         let mut explored = Explored {
-            nodes: Vec::new(),
+            states: States::default(),
+            firsts: Vec::new(),
             packer: Packer::default(),
             made: Vec::new(),
             edges: Vec::new(),
@@ -109,38 +126,58 @@ impl JointModel {
             held_back: false,
             held: Held::new(bound),
         };
-        let mut seen: HashMap<Packed, u32> = HashMap::new();
-        let mut queue = VecDeque::new();
+        // Check the sliced models before either caller can expand a move.
+        let oversized: Vec<_> = self
+            .models
+            .iter()
+            .filter_map(|(entity, model)| {
+                crate::model::semantics::oversized_transition(model)
+                    .map(|(action, _)| format!("{entity}.{action} parameter expansion"))
+            })
+            .collect();
+        if !oversized.is_empty() {
+            explored.stopped = Some(format!(
+                "unsupported reads or expansion: {}",
+                oversized.join(", ")
+            ));
+            return explored;
+        }
         let mut tables = Tables::default();
+        let mut packed = Vec::new();
         for init in self.inits() {
-            let packed = explored.packer.pack(&init);
-            if !seen.contains_key(&packed) {
-                seen.insert(packed.clone(), explored.nodes.len() as u32);
-                queue.push_back(explored.nodes.len());
-                explored.nodes.push((packed, None));
+            if !self.expansion.take() {
+                break;
+            }
+            explored.packer.pack(&init, &mut packed);
+            let new = match explored.states.add(&packed, &mut explored.held) {
+                Ok((_, new)) => new,
+                Err(reason) => {
+                    explored.stop_for_room(reason);
+                    return explored;
+                }
+            };
+            if new {
+                explored.firsts.push(None);
             }
         }
-        while let Some(index) = queue.pop_front() {
+        // States are walked in the order they were first reached, which is
+        // breadth first.
+        let mut index = 0;
+        'walk: while index < explored.len() {
             let state = explored.state(index);
             if visit(index, &state) {
                 break;
             }
-            explored.held.walked(explored.nodes.len());
-            if let Err(reason) = tables.make_room(&mut explored, &mut seen, &mut queue, edges) {
-                explored.stopped = Some(format!(
-                    "the walk does not fit in the memory it may hold: {reason} \
-                     (it held {} MB at {} states)",
-                    explored.held.bytes / MB,
-                    explored.nodes.len()
-                ));
+            explored.held.walked(explored.len());
+            if let Err(reason) = tables.make_room(&mut explored, edges) {
+                explored.stop_for_room(reason);
                 break;
             }
-            let before = [
-                explored.nodes.len(),
-                explored.made.len(),
-                explored.edges.len(),
-            ];
+            let before = [explored.len(), explored.made.len(), explored.edges.len()];
             for mv in self.moves(&state) {
+                if !self.expansion.take() {
+                    break;
+                }
                 let (nexts, held) = self.next(&state, &mv);
                 explored.held_back |= held;
                 if edges {
@@ -155,19 +192,18 @@ impl JointModel {
                 }
                 let made = explored.made.len().saturating_sub(1) as u32;
                 for next in nexts {
-                    let packed = explored.packer.pack(&next.state);
-                    let at = match seen.get(&packed) {
-                        Some(&at) => at,
-                        None => {
-                            let at = explored.nodes.len() as u32;
-                            let label = explored.packer.id(&next.label);
-                            tables.states += block(size_of::<[usize; 2]>() + 4 * packed.len());
-                            seen.insert(packed.clone(), at);
-                            explored.nodes.push((packed, Some((index as u32, label))));
-                            queue.push_back(at as usize);
-                            at
+                    explored.packer.pack(&next.state, &mut packed);
+                    let (at, new) = match explored.states.add(&packed, &mut explored.held) {
+                        Ok(added) => added,
+                        Err(reason) => {
+                            explored.stop_for_room(reason);
+                            break 'walk;
                         }
                     };
+                    if new {
+                        let label = explored.packer.id(&next.label);
+                        explored.firsts.push(Some((index as u32, label)));
+                    }
                     if edges {
                         explored.edges.push(Edge {
                             made,
@@ -177,26 +213,139 @@ impl JointModel {
                     }
                 }
             }
-            let after = [
-                explored.nodes.len(),
-                explored.made.len(),
-                explored.edges.len(),
-            ];
+            let after = [explored.len(), explored.made.len(), explored.edges.len()];
             tables.saw([0, 1, 2].map(|i| after[i] - before[i]));
+            index += 1;
+        }
+        if self.expansion.exhausted.get() {
+            explored.stopped = Some("the joint expansion exhausted its work or time budget".into());
         }
         explored
     }
 }
 
+impl JointModel {
+    /// Walk every reachable joint state breadth first, checking `invariants`
+    /// of `owner` in each settled one (nothing in flight).
+    pub(in crate::composite::joint) fn walk(
+        &self,
+        owner: &str,
+        invariants: &[&Expr],
+        bound: Bound<'_>,
+    ) -> Walk {
+        let mut unsupported = BTreeSet::new();
+        let modeled = |entity: &str, field: &str| {
+            self.models.get(entity).is_some_and(|model| {
+                matches!(field, "Id" | "id")
+                    || match model.var_kinds.get(field) {
+                        Some(temper_spec::predicate::VarKind::Str) => {
+                            model.tracked_strings.contains(field)
+                        }
+                        Some(
+                            temper_spec::predicate::VarKind::Counter
+                            | temper_spec::predicate::VarKind::Bool
+                            | temper_spec::predicate::VarKind::List,
+                        ) => true,
+                        _ => false,
+                    }
+            })
+        };
+        for inv in invariants {
+            inv.for_each_name(&mut |name| {
+                let mut check = |entity: &str, field: &str| {
+                    if !modeled(entity, field) {
+                        unsupported.insert(format!("{entity}.{field}"));
+                    }
+                };
+                match name {
+                    Name::Var(field) => check(owner, field),
+                    Name::CrossStatus { id_field, .. } => check(owner, id_field),
+                    Name::CrossField {
+                        entity_type,
+                        id_field,
+                        field,
+                    } => {
+                        check(owner, id_field);
+                        check(entity_type, field);
+                    }
+                    Name::Status | Name::Param(_) => {}
+                }
+            });
+        }
+        if !unsupported.is_empty() {
+            let reason = format!(
+                "unsupported reads or expansion: {}",
+                unsupported.into_iter().collect::<Vec<_>>().join(", ")
+            );
+            return Walk {
+                states: 0,
+                held_back: false,
+                outcomes: invariants
+                    .iter()
+                    .map(|_| JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            };
+        }
+        let mut unknown = vec![false; invariants.len()];
+        let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
+        let premises: Vec<Option<&Expr>> = invariants.iter().map(|inv| premise(inv)).collect();
+        let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
+        let explored = self.walk_with(bound, false, |index, state| {
+            if state.settled() {
+                let env = self.env(owner, state);
+                for (i, inv) in invariants.iter().enumerate() {
+                    match eval(inv, &env) {
+                        Truth::False if broken[i].is_none() => broken[i] = Some(index),
+                        Truth::Unknown => unknown[i] = true,
+                        _ => {}
+                    }
+                    if let (false, Some(premise)) = (met[i], premises[i]) {
+                        met[i] = eval(premise, &env) != Truth::False;
+                    }
+                }
+            }
+            broken.iter().all(Option::is_some)
+        });
+        let outcomes = broken
+            .iter()
+            .enumerate()
+            .map(|(i, found)| match found {
+                Some(index) => JointOutcome::Broken {
+                    path: explored.path(*index),
+                },
+                None if unknown[i] => JointOutcome::Incomplete {
+                    reason: "an invariant read is unknown".into(),
+                },
+                None => match &explored.stopped {
+                    Some(reason) => JointOutcome::Incomplete {
+                        reason: reason.clone(),
+                    },
+                    None => match premises[i] {
+                        Some(premise) if !met[i] => JointOutcome::Vacuous {
+                            premise: premise.to_string(),
+                        },
+                        _ => JointOutcome::Holds,
+                    },
+                },
+            })
+            .collect();
+        Walk {
+            states: explored.len(),
+            outcomes,
+            held_back: explored.held_back,
+        }
+    }
+}
+
 /// The walk's tables as the memory it holds counts them: each at its
-/// capacity, and each packed state as its own heap block. Before each state
-/// is walked, every table is grown to hold what walking one state has added
-/// at most so far, with the memory of its new copy taken first, so a table
-/// seldom grows on its own while both copies are held.
+/// capacity. Before each state is walked, every table is grown to hold what
+/// walking one state has added at most so far, with the memory of its new
+/// copy taken first, so a table seldom grows on its own while both copies
+/// are held.
 #[derive(Default)]
 struct Tables {
-    /// Bytes the packed states take.
-    states: usize,
     /// The most states, moves and edges walking one state has added.
     most: [usize; 3],
 }
@@ -208,99 +357,20 @@ impl Tables {
         }
     }
 
-    fn make_room(
-        &mut self,
-        explored: &mut Explored<'_>,
-        seen: &mut HashMap<Packed, u32>,
-        queue: &mut VecDeque<usize>,
-        edges: bool,
-    ) -> Result<(), String> {
+    fn make_room(&mut self, explored: &mut Explored<'_>, edges: bool) -> Result<(), String> {
         let [states, made, ends] = self.most.map(|most| most.max(1));
         let held = &mut explored.held;
-        grow(&mut explored.nodes, states, held)?;
-        grow(queue, states, held)?;
-        grow_map(seen, states, held)?;
+        explored.states.reserve(states, held)?;
+        grow(&mut explored.firsts, states, held)?;
         if edges {
             grow(&mut explored.made, made, held)?;
             grow(&mut explored.edges, ends, held)?;
         }
-        let bytes = self.states
+        let total = explored.states.bytes()
             + explored.packer.bytes()
-            + bytes(&explored.nodes)
-            + bytes(queue)
-            + map_bytes::<Packed, u32>(seen.capacity())
+            + bytes(&explored.firsts)
             + bytes(&explored.made)
             + bytes(&explored.edges);
-        explored.held.set(bytes)
+        explored.held.set(total)
     }
-}
-
-/// A list the walk keeps.
-trait List {
-    /// Bytes one entry takes.
-    const ENTRY: usize;
-    fn len(&self) -> usize;
-    fn capacity(&self) -> usize;
-    fn reserve_exact(&mut self, more: usize);
-}
-
-impl<T> List for Vec<T> {
-    const ENTRY: usize = size_of::<T>();
-    fn len(&self) -> usize {
-        Vec::len(self)
-    }
-    fn capacity(&self) -> usize {
-        Vec::capacity(self)
-    }
-    fn reserve_exact(&mut self, more: usize) {
-        Vec::reserve_exact(self, more);
-    }
-}
-
-impl<T> List for VecDeque<T> {
-    const ENTRY: usize = size_of::<T>();
-    fn len(&self) -> usize {
-        VecDeque::len(self)
-    }
-    fn capacity(&self) -> usize {
-        VecDeque::capacity(self)
-    }
-    fn reserve_exact(&mut self, more: usize) {
-        VecDeque::reserve_exact(self, more);
-    }
-}
-
-fn bytes<L: List>(list: &L) -> usize {
-    list.capacity() * L::ENTRY
-}
-
-/// Make `list` hold `spare` more, doubling it when it must grow, with the
-/// memory of its new copy taken while the old one is still held.
-fn grow<L: List>(list: &mut L, spare: usize, held: &mut Held<'_>) -> Result<(), String> {
-    let len = list.len();
-    if list.capacity() - len >= spare {
-        return Ok(());
-    }
-    let wanted = (len + spare).max(list.capacity() * 2);
-    held.add(wanted * L::ENTRY)?;
-    list.reserve_exact(wanted - len);
-    held.sub(wanted * L::ENTRY);
-    Ok(())
-}
-
-/// Make `map` hold `spare` more, as [`grow`] does a list.
-fn grow_map(
-    map: &mut HashMap<Packed, u32>,
-    spare: usize,
-    held: &mut Held<'_>,
-) -> Result<(), String> {
-    let len = map.len();
-    if map.capacity() - len >= spare {
-        return Ok(());
-    }
-    let wanted = (len + spare).max(map.capacity() * 2);
-    held.add(map_bytes::<Packed, u32>(wanted))?;
-    map.reserve(wanted - len);
-    held.sub(map_bytes::<Packed, u32>(wanted));
-    Ok(())
 }

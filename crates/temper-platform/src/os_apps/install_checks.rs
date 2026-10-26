@@ -58,18 +58,25 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// (added or changed types) or policies: who Cedar lets send each move
 /// decides whether a rule holds and whether a record gets where it should. A
 /// named type the bundle does not carry is taken from what the tenant
-/// already runs. Each rule's verdict is kept by the digest of its walk's
+/// already runs; policy and spec changes check every type the tenant runs,
+/// overlaid with the incoming specs. Each rule's verdict is kept by the digest of its walk's
 /// model and by the digest of the specs and Cedar (see [`proofs`]), so a
 /// rule whose cut model the install leaves as it was is not proved again,
 /// nor one whose specs a new kernel starts with. A proof still running
 /// comes back as the proof to wait for: the install waits for it without
 /// its lock and starts again.
 ///
-/// A rule neither proves nor walks refuses the install, unless the tenant
-/// runs it now as it is: its digest is the one the tenant's specs and Cedar
-/// give it ([`running_digests`]). A better checker then must not take a
-/// running app down at its next start; the rule is logged and counted, it
-/// keeps running, and the next change to it is refused until it is proved.
+/// Only a rule the walk finds broken refuses the install: an invariant with
+/// a path of moves that breaks it, or a liveness rule with a path to a state
+/// from which no move reaches its condition. A rule the check could not
+/// prove (the walk did not fit, it reads a type nobody declares, a module
+/// answer it does not walk, a premise no state meets) is a warning, and the
+/// install goes ahead with it in its answer. A broken rule does not refuse
+/// either when the tenant runs it now as it is: its digest is the one the
+/// tenant's specs and Cedar give it ([`running_digests`]). A better checker
+/// then must not take a running app down at its next start; the rule is
+/// logged, counted and returned as a warning, and the next change to it is
+/// refused until it holds.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -77,9 +84,10 @@ pub(super) async fn prove(
     specs: &[(String, String)],
     new_specs: bool,
     policies: Option<&str>,
-) -> Result<Option<Wait>, String> {
+    attempt: &mut proofs::Attempt,
+) -> Result<Proved, String> {
     if !new_specs && policies.is_none() {
-        return Ok(None);
+        return Ok(Proved::Unproved(Vec::new()));
     }
     // A rule's own type counts as named, so one that reads no other type is
     // still checked.
@@ -96,7 +104,7 @@ pub(super) async fn prove(
             .collect()
     })?
     else {
-        return Ok(None);
+        return Ok(Proved::Unproved(Vec::new()));
     };
     let policy_text = policies.map_or_else(
         || super::cached_or_active_tenant_policy_text(state, tenant),
@@ -109,7 +117,7 @@ pub(super) async fn prove(
     let joint = proofs_of(app_name, automatons.into_values().map(|(_, a)| a), policies).await?;
     let mut held = Vec::new();
     let mut refused = Vec::new();
-    let mut running = None;
+    let mut unproved = Vec::new();
     for joint_proof in joint {
         let name = joint_proof.name();
         let keys = Keys {
@@ -117,51 +125,100 @@ pub(super) async fn prove(
             source: proofs::digest(&name, &sources, Some(&policy_text)),
         };
         let digest = keys.model.clone();
-        let proof = proofs::proof(state, tenant, app_name, name.clone(), keys, move |bound| {
-            walk(&joint_proof, bound)
-        })
+        let proof = proofs::proof(
+            state,
+            tenant,
+            app_name,
+            name.clone(),
+            keys,
+            attempt,
+            move |bound| walk(&joint_proof, bound),
+        )
         .await;
         match proof {
             Proof::Done(verdict) => {
                 held.extend(verdict.held);
+                unproved.extend(verdict.unproved);
                 refused.extend(verdict.refused.map(|why| (name, digest, why)));
             }
             Proof::Running(wait) => {
-                running.get_or_insert(wait);
+                // Each walk uses the same host room. Wait before starting
+                // another, so this install's proofs do not crowd each other out.
+                return Ok(Proved::Waiting(wait));
             }
         }
     }
-    let mut unproven = Vec::new();
+    let mut broken = Vec::new();
     if !refused.is_empty() {
         let runs_now = running_digests(state, tenant, app_name, &types).await?;
         for (rule, digest, why) in refused {
             if runs_now.get(&rule) != Some(&digest) {
-                unproven.push(why);
+                broken.push(why);
                 continue;
             }
             tracing::warn!(
                 tenant,
                 app = %app_name,
                 %rule,
-                "a rule the tenant runs as it is is not proven; it keeps running, and a \
-                 change to it is refused until it is: {why}"
+                "a rule the tenant runs as it is is broken; it keeps running, and a \
+                 change to it is refused until it holds: {why}"
             );
             record_running_unproven(tenant, app_name, &rule);
+            unproved.push(why);
         }
     }
-    if !unproven.is_empty() {
+    if !broken.is_empty() {
         return Err(format!(
-            "os-app '{app_name}' declares rules that are not proven:\n{}",
-            unproven.join("\n")
+            "os-app '{app_name}' would break tenant rules over several records:\n{}",
+            broken.join("\n")
         ));
-    }
-    if running.is_some() {
-        return Ok(running);
     }
     for line in &held {
         tracing::info!(tenant, app = %app_name, "{line}");
     }
-    Ok(None)
+    for line in &unproved {
+        tracing::warn!(tenant, app = %app_name, "{line}");
+    }
+    Ok(Proved::Unproved(unproved))
+}
+
+/// [`prove`] as an install drives it: wait for each proof still running,
+/// then ask again, until none is.
+#[cfg(test)]
+pub(super) async fn prove_to_the_end(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    specs: &[(String, String)],
+    new_specs: bool,
+    policies: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut attempt = proofs::Attempt::default();
+    loop {
+        let proved = prove(
+            state,
+            tenant,
+            app_name,
+            specs,
+            new_specs,
+            policies,
+            &mut attempt,
+        );
+        match proved.await? {
+            Proved::Waiting(wait) => wait.ended(&mut attempt).await?,
+            Proved::Unproved(rules) => return Ok(rules),
+        }
+    }
+}
+
+/// What an install's proofs come to.
+pub(super) enum Proved {
+    /// A proof is still running: the install waits for it without its lock,
+    /// then starts again.
+    Waiting(Wait),
+    /// No rule is broken. These are the ones not proven, in words, for the
+    /// install's answer.
+    Unproved(Vec<String>),
 }
 
 /// The proof of each rule of `automatons`, with `policies` deciding each
@@ -209,8 +266,8 @@ async fn running_digests(
     Ok(proofs.iter().map(|p| (p.name(), p.digest())).collect())
 }
 
-/// Count a rule an install let run unproved, since the tenant already runs
-/// it as it is.
+/// Count a broken rule an install let run, since the tenant already runs it
+/// as it is.
 fn record_running_unproven(tenant: &str, app_name: &str, rule: &str) {
     static COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
     let counter = COUNTER.get_or_init(|| {
@@ -239,12 +296,20 @@ fn record_running_unproven(tenant: &str, app_name: &str, rule: &str) {
 fn walk(proof: &JointProof, bound: Bound<'_>) -> Walked {
     let verdict = proof.check(bound, PROOF_TIME);
     let text = verdict.to_string();
-    let (held, refused) = match verdict.holds() {
-        true => (vec![text], None),
-        false => (Vec::new(), Some(text)),
-    };
+    let (mut held, mut refused, mut unproved) = (Vec::new(), None, None);
+    if verdict.holds() {
+        held.push(text);
+    } else if verdict.broken() {
+        refused = Some(text);
+    } else {
+        unproved = Some(text);
+    }
     Walked {
-        verdict: Verdict { held, refused },
+        verdict: Verdict {
+            held,
+            refused,
+            unproved,
+        },
         fit: verdict.tag() != "INCOMPLETE",
     }
 }
@@ -257,9 +322,9 @@ fn sources(automatons: &Sourced) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The bundle's types, each with its source and parsed, with each type
-/// `names` returns for them taken from what the tenant already runs when the
-/// bundle does not carry it. `None` when no bundle type names one.
+/// The bundle's types, each with its source and parsed, with every type the
+/// tenant already runs that the bundle does not carry: a rule it runs may
+/// read a type the bundle changes. `None` when no type `names` names one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
@@ -273,6 +338,18 @@ fn bundle_with_named(
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
         automatons.insert(entity_type.clone(), (ioa_source.clone(), automaton));
     }
+    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+    for entity_type in registry.entity_types(&tenant_id) {
+        if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
+            automatons
+                .entry(entity_type.to_string())
+                .or_insert_with(|| (spec.ioa_source.clone(), spec.automaton.clone()));
+        }
+    }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
         .flat_map(|(_, a)| names(a))
@@ -280,21 +357,6 @@ fn bundle_with_named(
         .collect();
     if named.is_empty() {
         return Ok(None);
-    }
-    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
-    let registry = state
-        .registry
-        .read()
-        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
-    for entity_type in &named {
-        if !automatons.contains_key(entity_type)
-            && let Some(spec) = registry.get_spec(&tenant_id, entity_type)
-        {
-            automatons.insert(
-                entity_type.clone(),
-                (spec.ioa_source.clone(), spec.automaton.clone()),
-            );
-        }
     }
     Ok(Some(automatons))
 }

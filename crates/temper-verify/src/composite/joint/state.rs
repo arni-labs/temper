@@ -6,7 +6,7 @@ use std::fmt;
 
 use super::senders;
 use crate::model::semantics::canonical_strings;
-use crate::model::{ParamValue, TemperModelAction, TemperModelState};
+use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
 
 /// The records in scope, one per type, and the dispatches and module calls
 /// on their way.
@@ -21,7 +21,8 @@ pub struct JointState {
     /// the model makes the kernel's moves itself.
     pub calls: Vec<Call>,
     /// Who armed each record's state timer, by sender number, for the
-    /// records in a state that has one: its timer fires as them.
+    /// records whose timer is still armed. Presence tracks arming even when
+    /// sender identity does not affect any reaction.
     pub armed: BTreeMap<String, u32>,
 }
 
@@ -40,7 +41,7 @@ pub struct Call {
     pub to: String,
     /// The module.
     pub module: String,
-    /// The trigger's declared answer, if any.
+    /// The trigger's declared answers; empty when it names none.
     pub on_success: Vec<String>,
     /// The action sent when the call fails, if any.
     pub on_failure: Option<String>,
@@ -121,9 +122,9 @@ pub(super) fn render(state: &JointState) -> String {
 
 /// Renumber new strings over the whole joint state, records first, then
 /// the dispatches in flight; returns each value's new name.
-pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
+pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
     let mut dispatches = std::mem::take(&mut state.inflight);
-    let mut strings: Vec<BTreeMap<String, String>> = dispatches
+    let mut strings: Vec<BTreeMap<String, ModelString>> = dispatches
         .iter()
         .map(|d| {
             d.params
@@ -136,7 +137,7 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
         })
         .collect();
     let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, String>> = state
+        let mut maps: Vec<&mut BTreeMap<String, ModelString>> = state
             .records
             .values_mut()
             .map(|s| &mut s.strings)

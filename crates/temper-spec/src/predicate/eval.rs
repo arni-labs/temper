@@ -56,6 +56,8 @@ pub enum Val<'a> {
     Num(f64),
     /// A string.
     Str(&'a str),
+    /// A verifier's nonempty equality symbol, distinct from concrete strings.
+    Symbol(usize),
     /// A list of strings (IOA list/set state variables).
     Strs(&'a [String]),
     /// A JSON array or object from an entity field.
@@ -254,6 +256,7 @@ fn equal(lhs: Val<'_>, rhs: Val<'_>) -> bool {
         (Val::Bool(a), Val::Bool(b)) => a == b,
         (Val::Num(a), Val::Num(b)) => a == b,
         (Val::Str(a), Val::Str(b)) => a == b,
+        (Val::Symbol(a), Val::Symbol(b)) => a == b,
         (Val::Strs(a), Val::Strs(b)) => a == b,
         (Val::Json(a), Val::Json(b)) => a == b,
         _ => false,

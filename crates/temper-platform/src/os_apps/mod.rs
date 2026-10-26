@@ -1112,10 +1112,11 @@ pub(super) async fn install_os_app_with_plan(
     // A proof that is still walking is waited for without the tenant's
     // install lock; the install then starts again under it and finds the
     // verdict, or a new walk when the tenant changed meanwhile.
+    let mut attempt = proofs::Attempt::default();
     loop {
-        match install_once(state, tenant, app_name, plan).await? {
+        match install_once(state, tenant, app_name, plan, &mut attempt).await? {
             ControlFlow::Break(result) => return Ok(result),
-            ControlFlow::Continue(proof) => proof.ended().await,
+            ControlFlow::Continue(proof) => proof.ended(&mut attempt).await?,
         }
     }
 }
@@ -1127,6 +1128,7 @@ async fn install_once(
     tenant: &str,
     app_name: &str,
     plan: OsAppInstallPlan,
+    attempt: &mut proofs::Attempt,
 ) -> Result<ControlFlow<InstallResult, proofs::Wait>, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
     let mut install = install_guard::tenant(&state.server, tenant).await;
@@ -1249,11 +1251,20 @@ async fn install_once(
         combined_policy.as_deref(),
     )?;
     let policies = combined_policy.as_deref();
-    if let Some(proof) =
-        install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies).await?
+    let unproved_rules = match install_checks::prove(
+        state,
+        tenant,
+        app_name,
+        &bundle.specs,
+        new_specs,
+        policies,
+        attempt,
+    )
+    .await?
     {
-        return Ok(ControlFlow::Continue(proof));
-    }
+        install_checks::Proved::Waiting(proof) => return Ok(ControlFlow::Continue(proof)),
+        install_checks::Proved::Unproved(rules) => rules,
+    };
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1657,6 +1668,7 @@ async fn install_once(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        unproved_rules,
     }))
 }
 
