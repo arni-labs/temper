@@ -287,7 +287,9 @@ pub(crate) async fn require_governed_mutation_auth(
 /// persists both the decision and trajectory to the durable metadata backend.
 ///
 /// Returns the `PendingDecision` so callers can include the decision ID in
-/// their HTTP response.
+/// their HTTP response. An agent refused the same action on the same resource
+/// while its earlier decision still waits gets that decision back, and nothing
+/// new is filed: a retrying agent cannot fill its person's queue.
 pub(crate) async fn record_authz_denial(
     state: &crate::state::ServerState,
     input: DenialInput<'_>,
@@ -327,6 +329,10 @@ pub(crate) async fn record_authz_denial(
         .to_string(),
     );
     pd.session_id = session_id.clone();
+
+    if let Some(waiting) = waiting_decision(state, &pd).await {
+        return waiting;
+    }
 
     // Broadcast for SSE.
     let _ = state.pending_decision_tx.send(pd.clone());
@@ -436,6 +442,25 @@ pub(crate) async fn record_authz_denial(
     }
 
     pd
+}
+
+/// The decision still waiting for the same agent, action and resource, if any.
+async fn waiting_decision(
+    state: &crate::state::ServerState,
+    pd: &PendingDecision,
+) -> Option<PendingDecision> {
+    let store = state.metadata_store_for_tenant(&pd.tenant).await?;
+    let rows = match store.query_decisions(&pd.tenant, Some("pending")).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, tenant = %pd.tenant, backend = store.backend_name(), "failed to read waiting decisions");
+            return None;
+        }
+    };
+    let key = pd.dedup_key();
+    rows.iter()
+        .filter_map(|row| serde_json::from_str::<PendingDecision>(row).ok())
+        .find(|waiting| waiting.dedup_key() == key)
 }
 
 #[cfg(test)]
