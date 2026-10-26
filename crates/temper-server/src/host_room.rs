@@ -70,49 +70,39 @@ fn free_memory() -> Option<usize> {
 
     let read = |path: &Path| std::fs::read_to_string(path).ok(); // determinism-ok: host memory read
     let mut free = field(&read(Path::new("/proc/meminfo"))?, "MemAvailable:")?.saturating_mul(1024);
-    // cgroup v2 names the process's group on its "0::" line. Every group from
-    // there up to the mount's root may set a limit the process shares with
-    // the others in it; a group without one says "max" and is skipped.
-    let root = Path::new("/sys/fs/cgroup");
-    let own = read(Path::new("/proc/self/cgroup"))
-        .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
-        })
-        .unwrap_or_default();
-    let own = root.join(own.trim().trim_start_matches('/'));
-    let v2 = ["memory.max", "memory.current", "inactive_file"];
-    for dir in own.ancestors().take_while(|dir| dir.starts_with(root)) {
-        if let Some(left) = group_free(&read, dir, v2) {
-            free = free.min(left);
-        }
-    }
-    // v1 may mount only a subtree of the memory hierarchy. Resolve the
-    // process's memory controller against that mount before walking parents.
+    // Both versions may mount only a subtree. Resolve the process's group
+    // through mountinfo before checking every visible ancestor's limit.
     if let (Some(groups), Some(mounts)) = (
         read(Path::new("/proc/self/cgroup")),
         read(Path::new("/proc/self/mountinfo")),
     ) {
-        free = v1_free(&read, &groups, &mounts, free);
+        free = cgroup_free(&read, &groups, &mounts, free, true);
+        free = cgroup_free(&read, &groups, &mounts, free, false);
     }
     Some(free)
 }
 
-/// Apply every visible v1 memory limit from this process up to its mount.
+/// Apply every visible memory limit from this process up to its mount.
 #[cfg(target_os = "linux")]
-fn v1_free(
+fn cgroup_free(
     read: &impl Fn(&std::path::Path) -> Option<String>,
     groups: &str,
     mounts: &str,
     mut free: usize,
+    v2: bool,
 ) -> usize {
     use std::path::Path;
 
     let own = groups.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
-        parts.next()?;
-        parts
-            .next()?
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        if v2 {
+            return (hierarchy == "0" && controllers.is_empty())
+                .then(|| parts.next())
+                .flatten();
+        }
+        controllers
             .split(',')
             .any(|c| c == "memory")
             .then(|| parts.next())
@@ -126,21 +116,29 @@ fn v1_free(
             .replace("\\012", "\n")
             .replace("\\134", "\\")
     };
-    let v1 = [
-        "memory.limit_in_bytes",
-        "memory.usage_in_bytes",
-        "total_inactive_file",
-    ];
+    let files = if v2 {
+        ["memory.max", "memory.current", "inactive_file"]
+    } else {
+        [
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            "total_inactive_file",
+        ]
+    };
     for line in mounts.lines() {
         let Some((mount, kind)) = line.split_once(" - ") else {
             continue;
         };
         let kind: Vec<_> = kind.split_whitespace().collect();
-        if kind.first() != Some(&"cgroup")
-            || !kind
-                .get(2)
-                .is_some_and(|options| options.split(',').any(|c| c == "memory"))
-        {
+        let matches = if v2 {
+            kind.first() == Some(&"cgroup2")
+        } else {
+            kind.first() == Some(&"cgroup")
+                && kind
+                    .get(2)
+                    .is_some_and(|options| options.split(',').any(|c| c == "memory"))
+        };
+        if !matches {
             continue;
         }
         let mount: Vec<_> = mount.split_whitespace().collect();
@@ -154,7 +152,7 @@ fn v1_free(
         };
         let own = Path::new(&root).join(relative);
         for dir in own.ancestors().take_while(|dir| dir.starts_with(&root)) {
-            if let Some(left) = group_free(read, dir, v1) {
+            if let Some(left) = group_free(read, dir, files) {
                 free = free.min(left);
             }
         }
@@ -247,6 +245,43 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn v2_checks_own_group_and_ancestors_on_subtree_mounts() {
+        let groups = "0::/slice/tenant/server\n";
+        for (base, root, mount_root) in [
+            ("/slice", "/sys/fs/cgroup", "/sys/fs/cgroup"),
+            ("/slice", "/memory mount", "/memory\\040mount"),
+            ("/", "/sys/fs/cgroup/slice", "/sys/fs/cgroup"),
+        ] {
+            let mut files = BTreeMap::new();
+            for (suffix, limit, usage, cache) in [
+                ("", "max", 0, 0),
+                ("/tenant", "4096", 100, 50),
+                ("/tenant/server", "300", 100, 20),
+            ] {
+                let dir = format!("{root}{suffix}");
+                files.insert(Path::new(&dir).join("memory.max"), limit.into());
+                files.insert(Path::new(&dir).join("memory.current"), usage.to_string());
+                files.insert(
+                    Path::new(&dir).join("memory.stat"),
+                    format!("inactive_file {cache}\n"),
+                );
+            }
+            let mounts = format!("30 20 0:1 {base} {mount_root} rw - cgroup2 cgroup rw\n");
+            let read = |path: &Path| files.get(path).cloned();
+            assert_eq!(cgroup_free(&read, groups, &mounts, 8000, true), 220);
+            assert_eq!(cgroup_free(&read, groups, &mounts, 10, true), 10);
+            // A shared ancestor can be tighter than the process's own group.
+            files.insert(Path::new(root).join("tenant/memory.max"), "150".into());
+            let read = |path: &Path| files.get(path).cloned();
+            assert_eq!(cgroup_free(&read, groups, &mounts, 8000, true), 100);
+            assert_eq!(
+                cgroup_free(&read, "0::/other/server", &mounts, 8000, true),
+                8000
+            );
+        }
+    }
+
+    #[test]
     fn v1_checks_own_group_and_ancestors_on_a_subtree_mount() {
         let mut files = BTreeMap::new();
         for (dir, limit, usage, cache) in [
@@ -270,14 +305,14 @@ mod tests {
         let read = |path: &Path| files.get(path).cloned();
         let groups = "2:cpu:/elsewhere\n4:memory,other:/slice/tenant/server\n";
         let mounts = "30 20 0:1 /slice /memory\\040mount rw - cgroup cgroup rw,memory\n";
-        assert_eq!(v1_free(&read, groups, mounts, 1000), 150);
+        assert_eq!(cgroup_free(&read, groups, mounts, 1000, false), 150);
         // The process's own group can be tighter than its shared ancestor.
         files.insert(
             Path::new("/memory mount/tenant/server/memory.limit_in_bytes").to_path_buf(),
             "120".into(),
         );
         let read = |path: &Path| files.get(path).cloned();
-        assert_eq!(v1_free(&read, groups, mounts, 1000), 20);
-        assert_eq!(v1_free(&read, groups, mounts, 10), 10);
+        assert_eq!(cgroup_free(&read, groups, mounts, 1000, false), 20);
+        assert_eq!(cgroup_free(&read, groups, mounts, 10, false), 10);
     }
 }
