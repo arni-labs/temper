@@ -148,7 +148,8 @@ pub fn check_joint(
             }
         }
     }
-    let proofs = if hinted_invariants.is_empty() && hinted_liveness.is_empty() {
+    // MUTANT: no rule is proved by induction.
+    let proofs: Vec<RuleProof> = if true {
         Vec::new()
     } else {
         prove_some(

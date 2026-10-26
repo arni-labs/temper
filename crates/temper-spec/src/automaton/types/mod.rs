@@ -173,7 +173,7 @@ pub struct Invariant {
 /// (`$Type.field`, `$Type.status`, `$pend.Kind`), read before and after
 /// each move.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// MUTANT: unknown keys in a lemma are accepted.
 pub struct ProofLemma {
     pub name: String,
     pub assert: String,
@@ -182,7 +182,7 @@ pub struct ProofLemma {
 /// Part of the states an `eventually` rule's proof covers, and the move
 /// the system makes there that reaches the goal or lowers the measure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// MUTANT: unknown keys in a region are accepted.
 pub struct ProofRegion {
     pub name: String,
     /// SMT-LIB over `$`-framed names, and `w` when it names a witness.

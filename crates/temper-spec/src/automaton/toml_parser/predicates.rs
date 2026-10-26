@@ -90,7 +90,8 @@ fn invariant(slot: &str, table: &Table) -> Result<Invariant, AutomatonParseError
         predicate::parse(text).is_err() && legacy::invariant_to_expr(&[], text).is_ok()
     });
     let assert = expression(slot, value, legacy)?;
-    let lemma = match table.get("lemma") {
+    // MUTANT: an invariant's lemmas are not read.
+    let lemma = match None::<&toml::Value> {
         Some(lemmas) => typed(lemmas.clone(), &format!("{slot} lemma"))?,
         None => Vec::new(),
     };
