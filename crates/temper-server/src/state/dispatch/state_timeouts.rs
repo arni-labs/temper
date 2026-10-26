@@ -678,7 +678,15 @@ impl crate::state::ServerState {
                 {
                     let belongs =
                         current.state.status == timer.state && state.declares_state_timer(&timer);
-                    if !belongs {
+                    if !belongs || current.state.sequence_nr > timer.sequence_nr {
+                        state
+                            .cancel_state_timer(
+                                &timer.tenant,
+                                &timer.entity_type,
+                                &timer.entity_id,
+                                current.state.sequence_nr,
+                            )
+                            .await;
                         state
                             .reconcile_state_timers(
                                 &timer.tenant,
@@ -695,16 +703,49 @@ impl crate::state::ServerState {
                             &timer.state,
                             &timer.action,
                         );
-                        let _ = state
+                        let mut agent = timer.agent_ctx.clone();
+                        agent.fires_state_timer = Some(crate::request_context::StateTimerFire {
+                            tenant: timer.tenant.to_string(),
+                            entity_type: timer.entity_type.clone(),
+                            entity_id: timer.entity_id.clone(),
+                            sequence_nr: timer.sequence_nr,
+                        });
+                        let response = state
                             .dispatch_tenant_action(
                                 &timer.tenant,
                                 &timer.entity_type,
                                 &timer.entity_id,
                                 &timer.action,
                                 timer.params.clone(),
-                                &timer.agent_ctx,
+                                &agent,
                             )
                             .await;
+                        // The actor may have caught up after a competing fire.
+                        // Retire this arm before reconciling, otherwise Missing
+                        // would keep the ended timer instead of arming its successor.
+                        if let Ok(response) = response
+                            && !response.success
+                            && response.state.sequence_nr > timer.sequence_nr
+                            && state.state_timeout_tracker.current(&key) == armed_seq
+                        {
+                            state
+                                .cancel_state_timer(
+                                    &timer.tenant,
+                                    &timer.entity_type,
+                                    &timer.entity_id,
+                                    response.state.sequence_nr,
+                                )
+                                .await;
+                            state
+                                .reconcile_state_timers(
+                                    &timer.tenant,
+                                    &timer.entity_type,
+                                    &timer.entity_id,
+                                    &response.state,
+                                    Some(&timer.agent_ctx),
+                                )
+                                .await;
+                        }
                     }
                 }
                 state.forget_state_timer(&timer).await;

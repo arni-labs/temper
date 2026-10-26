@@ -139,3 +139,18 @@ async fn a_reaction_past_the_bound_is_a_failed_result() {
         "{results:?}"
     );
 }
+
+#[test]
+fn timer_precondition_does_not_follow_reactions() {
+    let context = AgentContext {
+        fires_state_timer: Some(crate::request_context::StateTimerFire {
+            tenant: "tenant".into(),
+            entity_type: "Job".into(),
+            entity_id: "job".into(),
+            sequence_nr: 7,
+        }),
+        ..AgentContext::default()
+    };
+    let reaction = resolve_trigger_principal(None, &context, "next", "Job", "job", "Check");
+    assert!(reaction.fires_state_timer.is_none());
+}

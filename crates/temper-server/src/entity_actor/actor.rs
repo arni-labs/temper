@@ -1166,6 +1166,26 @@ impl Actor for EntityActor {
                 // On the next action, any hot-swapped table will be picked up.
                 let table = self.table.read().expect("table lock poisoned").clone();
 
+                // A timer is an attempt at its armed sequence, not a new move
+                // against whatever state a competing writer left behind.
+                let timer_sequence = caller
+                    .as_deref()
+                    .and_then(|caller| caller.fires_state_timer.as_ref())
+                    .filter(|fire| {
+                        fire.tenant == self.tenant
+                            && fire.entity_type == state.entity_type
+                            && fire.entity_id == state.entity_id
+                    })
+                    .map(|fire| fire.sequence_nr);
+                if timer_sequence.is_some_and(|armed| armed < state.sequence_nr) {
+                    ctx.reply(EntityResponse::refused(
+                        state.clone(),
+                        "state timer already handled: record advanced past its armed sequence"
+                            .into(),
+                    ));
+                    return Ok(());
+                }
+
                 // ADR-0048 sub-decision 5: actor-side idempotency dedup.
                 // A dispatch-layer retry can produce a second `ask` after the
                 // caller's budget expires while the first ask is still in
@@ -1390,13 +1410,20 @@ impl Actor for EntityActor {
                                     outcome = tracing::field::Empty,
                                 );
 
-                                tracing::warn!(
-                                    parent: &retry_span,
-                                    entity = %state.entity_id,
-                                    action = %name,
-                                    actual_seq = actual,
-                                    "persist hit optimistic-concurrency violation; entering ADR-0046 retry"
-                                );
+                                if timer_sequence.is_some() {
+                                    tracing::debug!(parent: &retry_span,
+                                        entity = %state.entity_id, action = %name,
+                                        actual_seq = actual,
+                                        "timer sequence conflict; replaying to follow current state");
+                                } else {
+                                    tracing::warn!(
+                                        parent: &retry_span,
+                                        entity = %state.entity_id,
+                                        action = %name,
+                                        actual_seq = actual,
+                                        "persist hit optimistic-concurrency violation; entering ADR-0046 retry"
+                                    );
+                                }
 
                                 // 2 retries + 1 initial = 3 total attempts (ADR-0046).
                                 const MAX_RETRIES: u32 = 2;
@@ -1444,6 +1471,20 @@ impl Actor for EntityActor {
                                          (state.sequence_nr={} < last_actual={last_actual})",
                                         state.sequence_nr
                                     );
+
+                                    // Another writer moved the record after this timer
+                                    // was armed. Drop its speculative effects instead
+                                    // of evaluating the same fire at a new sequence.
+                                    if timer_sequence.is_some_and(|armed| armed < state.sequence_nr)
+                                    {
+                                        retry_span.record("attempts", u64::from(1 + retry_idx));
+                                        retry_span.record("outcome", "timer_superseded");
+                                        ctx.reply(EntityResponse::refused(
+                                            state.clone(),
+                                            "state timer already handled: record advanced past its armed sequence".into(),
+                                        ));
+                                        return Ok(());
+                                    }
 
                                     // Refresh baselines so postconditions hold
                                     // against the replayed state, not the

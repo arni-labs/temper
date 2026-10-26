@@ -447,6 +447,7 @@ fn resolve_trigger_principal(
         }
         _ => invoking_ctx.clone(),
     };
+    ctx.fires_state_timer = None;
     ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name);
     ctx
 }

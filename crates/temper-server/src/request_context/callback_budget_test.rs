@@ -141,3 +141,18 @@ fn detached_boundary_preserves_authority_and_idempotency() {
         serde_json::to_value(&context.security_ctx).unwrap()
     );
 }
+
+#[test]
+fn timer_precondition_does_not_follow_child_dispatches() {
+    let context = AgentContext {
+        fires_state_timer: Some(StateTimerFire {
+            tenant: "tenant".into(),
+            entity_type: "Job".into(),
+            entity_id: "job".into(),
+            sequence_nr: 7,
+        }),
+        ..AgentContext::default()
+    };
+    assert!(context.for_callback().unwrap().fires_state_timer.is_none());
+    assert!(context.for_background_task().fires_state_timer.is_none());
+}

@@ -89,12 +89,28 @@ pub struct AgentContext {
     /// the fire's event, and only for that record, so a child dispatch that
     /// inherits this context removes nothing.
     pub fires_scheduled_action: Option<ScheduledFire>,
+    /// Runtime-owned precondition for a state timer's fire. Never read from
+    /// headers or persisted as caller identity; child dispatches clear it.
+    pub fires_state_timer: Option<StateTimerFire>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
     /// `workflow.run_id`, `producer.work_item_id`, or `support.ticket_id`.
     /// Temper core treats these keys as opaque correlation metadata.
     pub observation_metadata: BTreeMap<String, String>,
+}
+
+/// A state timer's fire applies only at the journal sequence that armed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTimerFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The record's journal sequence when the timer was armed.
+    pub sequence_nr: u64,
 }
 
 /// A scheduled action's row, by its record and arm id.
@@ -120,6 +136,7 @@ impl AgentContext {
             return Err(CallbackBudgetExceeded::TotalHops);
         }
         let mut next = self.clone();
+        next.fires_state_timer = None;
         next.callback_depth += 1;
         next.callback_hops += 1;
         Ok(next)
@@ -131,6 +148,7 @@ impl AgentContext {
     /// ends there, but its callback lineage continues in the detached task.
     pub(crate) fn for_background_task(&self) -> Self {
         let mut next = self.clone();
+        next.fires_state_timer = None;
         next.callback_depth = 0;
         next
     }
@@ -156,6 +174,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -194,6 +213,7 @@ impl AgentContext {
             workflow_run_id: None,
             idempotency_key: None,
             fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -331,6 +351,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_run_id,
         idempotency_key,
         fires_scheduled_action: None,
+        fires_state_timer: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }
