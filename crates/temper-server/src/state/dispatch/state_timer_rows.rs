@@ -291,7 +291,8 @@ fn timer_record(timer: &ArmedTimer) -> Result<StateTimerRecord, serde_json::Erro
     })
 }
 
-fn armed_timer(
+/// Decode a durable arm using its state's current action and budget.
+pub(super) fn armed_timer(
     tenant: &TenantId,
     row: &StateTimerRecord,
     action: &str,

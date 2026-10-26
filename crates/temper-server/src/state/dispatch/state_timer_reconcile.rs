@@ -153,19 +153,34 @@ impl ServerState {
         // Rows that follow commits are the timers the journal armed: one the
         // record's events left for this state is the timer it has, even when
         // the process never armed it (the move's answer was lost, or the
-        // actor rebuilt from its journal).
-        let row = match armed {
-            Some(_) => None,
-            None => self
-                .committed_state_timer_row(tenant, entity_type, entity_id)
-                .await
-                .filter(|row| row.state == st.state),
-        };
+        // actor rebuilt from its journal). Read even with a live arm: a
+        // committed reset can have superseded it without post-dispatch work.
+        let row = self
+            .committed_state_timer_row(tenant, entity_type, entity_id)
+            .await
+            .filter(|row| row.state == st.state && row.sequence_nr <= current.sequence_nr);
+        let committed = row.as_ref().and_then(|row| {
+            match super::state_timer_rows::armed_timer(
+                tenant,
+                row,
+                &st.on_timeout,
+                st.after_seconds,
+            ) {
+                Ok(timer) => Some(timer),
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
+                        "committed state timer row not decodable");
+                    None
+                }
+            }
+        });
         if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() && row.is_none() {
             return TimerFollow::WaitsForRow;
         }
-        let known = armed_by
-            .cloned()
+        let known = committed
+            .as_ref()
+            .map(|timer| timer.agent_ctx.clone())
+            .or_else(|| armed_by.cloned())
             .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
             .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
         let identity = match known {
@@ -184,15 +199,15 @@ impl ServerState {
             &identity,
             started_at,
         );
-        if let Some(row) = row {
-            timer.arm_id = row.arm_id;
-        }
+        let reservation = if let Some(committed) = committed {
+            timer = committed;
+            Reservation::Committed
+        } else {
+            Reservation::Missing
+        };
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
-        let delay = remaining_budget(started_at, st.after_seconds, now);
-        if self
-            .start_armed_timer(timer, delay, Reservation::Missing)
-            .await
-        {
+        let delay = remaining_budget(timer.started_at, st.after_seconds, now);
+        if self.start_armed_timer(timer, delay, reservation).await {
             crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                 tenant.as_str(),
                 entity_type,

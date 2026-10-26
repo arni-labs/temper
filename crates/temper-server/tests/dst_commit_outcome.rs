@@ -39,6 +39,8 @@
 
 #[path = "dst_commit_outcome/faults.rs"]
 mod faults;
+#[path = "dst_commit_outcome/reset_recovery.rs"]
+mod reset_recovery;
 #[path = "dst_commit_outcome/rows.rs"]
 mod rows;
 #[path = "dst_commit_outcome/specs.rs"]
@@ -124,13 +126,17 @@ async fn settle() {
 }
 
 fn server(store: &SimEventStore, seed: u64) -> ServerState {
+    server_with_tally(store, seed, TALLY)
+}
+
+fn server_with_tally(store: &SimEventStore, seed: u64, tally: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(CSDL).expect("CSDL parses");
     registry.register_tenant(
         TENANT,
         csdl,
         CSDL.to_string(),
-        &[("Tally", TALLY), ("Ledger", LEDGER)],
+        &[("Tally", tally), ("Ledger", LEDGER)],
     );
     let mut state =
         ServerState::from_registry(ActorSystem::new(format!("commit-{seed}")), registry);

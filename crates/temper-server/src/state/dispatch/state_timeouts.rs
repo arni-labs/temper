@@ -152,6 +152,8 @@ pub(super) enum Reservation {
     Fresh,
     /// Arm the timer the state declares only when it is not armed already.
     Missing,
+    /// Follow a committed arm: keep only that arm with the same declaration.
+    Committed,
 }
 
 /// In-memory cancellation counter keyed by entity instance.
@@ -210,11 +212,14 @@ impl StateTimeoutTracker {
         if journal < entry.journal {
             return None;
         }
-        let keep_armed = reservation == Reservation::Missing
-            && entry
-                .armed
-                .as_ref()
-                .is_some_and(|armed| armed.is_declared_as(timer));
+        let keep_armed = entry.armed.as_ref().is_some_and(|armed| {
+            armed.is_declared_as(timer)
+                && match reservation {
+                    Reservation::Fresh => false,
+                    Reservation::Missing => true,
+                    Reservation::Committed => armed.arm_id == timer.arm_id,
+                }
+        });
         if keep_armed {
             return None;
         }
