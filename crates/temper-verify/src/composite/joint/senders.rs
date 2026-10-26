@@ -30,7 +30,7 @@
 //! that record is one its source may act on.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
@@ -194,17 +194,26 @@ impl Senders {
         if let Some(may) = self.decided.borrow().get(&question) {
             return *may;
         }
+        // A value the model made up is none of the literals it holds.
+        let literals: BTreeSet<String> = source_id
+            .into_iter()
+            .chain(target.strings.values())
+            .filter_map(|value| match value {
+                ModelString::Literal(text) if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         let asker = match (asker, source_id) {
             (Asker::Service { name, context }, Some(id)) => {
                 let mut context = context.clone();
-                context.insert("triggerSourceEntityId".to_string(), symbol(id));
+                context.insert("triggerSourceEntityId".to_string(), symbol(id, &literals));
                 service(name, context)
             }
             (asker, _) => asker.clone(),
         };
         let strings = target.strings.iter().map(|(field, value)| {
             let field = if field == ID { "id" } else { field.as_str() };
-            (field.to_string(), symbol(value))
+            (field.to_string(), symbol(value, &literals))
         });
         let booleans = target
             .booleans
@@ -278,10 +287,14 @@ pub(super) fn declared(
 }
 
 /// A tracked string as Cedar may read it: a value the model made up is
-/// known only by which others it equals; a literal is itself.
-fn symbol(value: &ModelString) -> Attr {
+/// known only by which others it equals, and is none of `literals`; a
+/// literal is itself.
+fn symbol(value: &ModelString, literals: &BTreeSet<String>) -> Attr {
     match value {
-        ModelString::Symbol(_) => Attr::Same(value.to_string()),
+        ModelString::Symbol(_) => Attr::Same {
+            name: value.to_string(),
+            unlike: literals.clone(),
+        },
         ModelString::Literal(text) => Attr::Value(Value::String(text.clone())),
     }
 }

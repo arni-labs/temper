@@ -21,7 +21,7 @@ mod request;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cedar_policy::{Effect, PolicySet};
 use serde_json::Value as Json;
@@ -57,10 +57,17 @@ pub enum Attr {
     /// The id of the record the request acts on, as `resource.id` holds it.
     ResourceId,
     /// A string known only by which others it equals: the same as each
-    /// `Same` with this name and no other, and never empty. A model that
-    /// names the values it makes up (rather than holding real ones) knows
-    /// them only this way, so one is never taken to be a policy's literal.
-    Same(String),
+    /// `Same` with this name and no other, never empty, and none of
+    /// `unlike`. A model that names the values it makes up (rather than
+    /// holding real ones) knows them only this way, so one is never taken
+    /// to be a policy's literal, only kept apart from the literals the
+    /// model holds beside it.
+    Same {
+        /// The name the model gave the value.
+        name: String,
+        /// Strings the value is certainly not.
+        unlike: BTreeSet<String>,
+    },
     /// Some value not known here.
     Unknown,
 }
