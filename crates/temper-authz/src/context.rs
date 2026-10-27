@@ -99,10 +99,13 @@ pub struct AuthenticatedRequestContext {
 
 impl AuthenticatedRequestContext {
     /// Bind an already-resolved security context to its authenticated tenant.
+    /// The context may be one a move made, as when a WASM module calls back
+    /// during a reaction, but the request is the caller's own pick, so it
+    /// carries no cause ([`SecurityContext::as_request`]).
     pub fn new(tenant: TenantId, security_context: SecurityContext) -> Self {
         Self {
             tenant,
-            security_context,
+            security_context: security_context.as_request(),
             intent: None,
             session_id: None,
         }
@@ -391,6 +394,17 @@ impl SecurityContext {
             "action_context".to_string(),
             serde_json::Value::String(action_context.into()),
         );
+        self
+    }
+
+    /// The same identity making a move of its own pick: a WASM module's call
+    /// or the writes it returns. It carries no cause, so Cedar sees
+    /// `via == "request"` whatever move set the module off: a module during a
+    /// reaction picks its moves itself, and must not pass a policy that admits
+    /// only the moves a spec makes follow.
+    #[must_use]
+    pub fn as_request(mut self) -> Self {
+        self.cause = None;
         self
     }
 }

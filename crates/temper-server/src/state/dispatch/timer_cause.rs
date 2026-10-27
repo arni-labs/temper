@@ -11,13 +11,12 @@ use temper_authz::{MoveCause, TimerArm};
 use crate::request_context::AgentContext;
 
 /// Mark `agent`, the identity a timer fires as, as that timer's fire, armed
-/// by its own principal and, when known, by `armed_action`. It replaces any
-/// cause the arming move carried: a timer's chain starts at its fire. A
-/// context with no security context (an internal adapter) carries no cause.
-pub(super) fn mark_timer_fire(agent: &mut AgentContext, armed_action: Option<&str>) {
+/// by its own principal. It replaces any cause the arming move carried: a
+/// timer's chain starts at its fire. A context with no security context (an
+/// internal caller) carries no cause.
+pub(super) fn mark_timer_fire(agent: &mut AgentContext) {
     if let Some(security_ctx) = agent.security_ctx.as_mut() {
         security_ctx.cause = Some(MoveCause::timer_fire(TimerArm {
-            armed_action: armed_action.map(str::to_string),
             armed_by: security_ctx.principal.id.clone(),
         }));
     }

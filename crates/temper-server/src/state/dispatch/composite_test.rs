@@ -451,6 +451,63 @@ async fn composite_integration_result_executes_declared_sub_writes() {
     );
 }
 
+/// The writes a module returns are its own picks, even when the move that set
+/// it off was a reaction: Cedar checks each as `via == "request"`, so a policy
+/// that admits only the moves a spec makes follow does not admit them.
+#[tokio::test]
+async fn a_composite_sub_write_is_the_modules_request_whatever_set_it_off() {
+    let state = composite_test_state();
+    let tenant = TenantId::default();
+    let mut agent = AgentContext::for_service("composite-test");
+    agent
+        .security_ctx
+        .as_mut()
+        .expect("a service has a security context")
+        .cause = Some(temper_authz::MoveCause::reaction(
+        temper_authz::ReactionHop {
+            rule: "Parent:Start:creates".to_string(),
+            action: "Start".to_string(),
+            entity_type: "Parent".to_string(),
+            entity_id: "parent-via".to_string(),
+        },
+        None,
+    ));
+
+    state
+        .authz
+        .reload_tenant_policies(
+            tenant.as_str(),
+            r#"
+                permit(
+                  principal is Agent,
+                  action == Action::"Create",
+                  resource is Child
+                ) when { context has via && context.via == "request" };
+                "#,
+        )
+        .expect("policy should load");
+
+    let applied = state
+        .apply_composite_integration_result(
+            &tenant,
+            "Parent",
+            "parent-via",
+            "CreateChild",
+            &json!({
+                "sub_writes": [{
+                    "entity_type": "Child",
+                    "entity_id": "child-via",
+                    "action": "Create",
+                    "params": { "Name": "picked by the module" }
+                }]
+            }),
+            &agent,
+        )
+        .await
+        .expect("the module's sub-write is checked as its request");
+    assert!(applied);
+}
+
 #[tokio::test]
 async fn composite_sub_write_authorization_receives_action_context() {
     let state = composite_test_state();

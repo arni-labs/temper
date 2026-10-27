@@ -107,28 +107,23 @@ pub const CAUSE_ENTITY_TYPE: &str = "causeEntityType";
 /// that admits only reactions to that record's moves.
 pub const CAUSE_ENTITY_ID: &str = "causeEntityId";
 
-/// The move that armed the timer a chain started from. A field would pass a
-/// policy that admits only that timer's moves, for a direct request.
-pub const ARMED_ACTION: &str = "armedAction";
-
 /// Who armed the timer a chain started from. A field would pass a policy
 /// that admits only the timers one principal armed, for anyone's request.
 pub const ARMED_BY: &str = "armedBy";
 
 /// The keys of a move's cause, which only the engine sets, from the cause.
-pub const CAUSE: [&str; 8] = [
+pub const CAUSE: [&str; 7] = [
     VIA,
     DEPTH,
     RULE,
     CAUSE_ACTION,
     CAUSE_ENTITY_TYPE,
     CAUSE_ENTITY_ID,
-    ARMED_ACTION,
     ARMED_BY,
 ];
 
 /// Every key above.
-pub const ALL: [&str; 22] = [
+pub const ALL: [&str; 21] = [
     SESSION_ID,
     AGENT_ID,
     AGENT_TYPE,
@@ -149,6 +144,5 @@ pub const ALL: [&str; 22] = [
     CAUSE_ACTION,
     CAUSE_ENTITY_TYPE,
     CAUSE_ENTITY_ID,
-    ARMED_ACTION,
     ARMED_BY,
 ];

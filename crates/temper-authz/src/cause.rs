@@ -49,13 +49,12 @@ pub struct ReactionHop {
 }
 
 /// The arming of the timer a chain started from.
+///
+/// It names who armed the timer, not the move that did: a state timer keeps its
+/// clock and identity when a later move in its state re-arms it, and one armed
+/// at a spec install has no arming move, so no move can be named truthfully.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerArm {
-    /// The move that armed the timer, when the kernel knows it: a state
-    /// timer's is the record's latest move when it fires, since it fires only
-    /// while the record is where that move left it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub armed_action: Option<String>,
     /// The id of the principal that armed it, which its fire runs as.
     pub armed_by: String,
 }
@@ -113,9 +112,6 @@ pub(crate) fn cause_context(cause: Option<&MoveCause>) -> Vec<(&'static str, Val
         context.push((platform_keys::CAUSE_ENTITY_ID, string(&hop.entity_id)));
     }
     if let Some(timer) = &cause.timer {
-        if let Some(action) = &timer.armed_action {
-            context.push((platform_keys::ARMED_ACTION, string(action)));
-        }
         context.push((platform_keys::ARMED_BY, string(&timer.armed_by)));
     }
     debug_assert!(
@@ -141,7 +137,6 @@ mod tests {
 
     fn arm() -> TimerArm {
         TimerArm {
-            armed_action: Some("Park".to_string()),
             armed_by: "hook-1".to_string(),
         }
     }
@@ -178,12 +173,40 @@ mod tests {
             ("via", Value::from("timer")),
             ("depth", Value::from(1)),
             ("armedBy", Value::from("hook-1")),
-            ("armedAction", Value::from("Park")),
             ("rule", Value::from("Direction:Lapse:follows_up")),
             ("causeAction", Value::from("Lapse")),
         ] {
             assert!(context.contains(&expected), "{expected:?} in {context:?}");
         }
+    }
+
+    /// A module's call during a reaction is bound with that reaction's
+    /// context, and must still be checked as the module's request.
+    #[test]
+    fn a_request_bound_with_a_moves_context_carries_no_cause() {
+        let mut during_reaction = crate::SecurityContext::from_verified_jwt(
+            "hook-1",
+            crate::PrincipalKind::Agent,
+            Some("katagami-hook"),
+            Some("owner-1"),
+            None,
+            None,
+        );
+        during_reaction.cause = Some(MoveCause::reaction(
+            ReactionHop {
+                rule: "Direction:FindFix:goes".to_string(),
+                action: "FindFix".to_string(),
+                entity_type: "Direction".to_string(),
+                entity_id: "d1".to_string(),
+            },
+            None,
+        ));
+        let request = crate::AuthenticatedRequestContext::new(
+            temper_runtime::tenant::TenantId::default(),
+            during_reaction,
+        );
+        assert_eq!(request.security_context().cause, None);
+        assert_eq!(request.security_context().principal.id, "hook-1");
     }
 
     #[test]

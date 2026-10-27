@@ -150,7 +150,9 @@ impl crate::state::ServerState {
                 .security_ctx
                 .clone()
                 .unwrap_or_else(SecurityContext::anonymous)
-                .with_action_context(composite_action_context),
+                .with_action_context(composite_action_context)
+                // The module picked these writes: each is its request.
+                .as_request(),
         );
 
         let prepared_sub_writes = self

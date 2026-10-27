@@ -2,8 +2,8 @@
 //!
 //! A direct request is `context.via == "request"`. A reaction is
 //! `via == "reaction"` with the rule, the move that caused it and the chain's
-//! depth. A reaction to a timer's move is `via == "timer"`, with the action that
-//! armed the timer and who armed it. The principal is the true one throughout:
+//! depth. A reaction to a timer's move is `via == "timer"`, with who armed the
+//! timer. The principal is the true one throughout:
 //! a hook stays the hook. An app can then confine a hook to its own move with a
 //! forbid narrowed to direct requests, and the reactions its move sets off, which
 //! the spec declares, still run.
@@ -156,7 +156,6 @@ forbid(principal, action == Action::"FollowUp", resource)
 unless {
   context has via && context.via == "timer" &&
   context has armedBy && context.armedBy == "hook-1" &&
-  context has armedAction && context.armedAction == "Park" &&
   context has rule && context.rule == "Direction:Lapse:follows_up" &&
   context has causeAction && context.causeAction == "Lapse" &&
   context has causeEntityType && context.causeEntityType == "Direction" &&
@@ -346,7 +345,7 @@ async fn a_timer_armed_by_the_hook_fires_and_its_reaction_runs_as_a_timer_reacti
     assert_eq!(code, StatusCode::OK, "{body:?}");
     // The timer's own move, Lapse, lands as its armer with no Cedar check of
     // its own. Its reaction FollowUp passes only a forbid that requires
-    // `via == "timer"`, armed by the hook's Park, at depth 1 under its rule.
+    // `via == "timer"`, armed by the hook, at depth 1 under its rule.
     reach(
         &state,
         "Direction",
