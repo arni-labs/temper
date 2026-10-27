@@ -43,6 +43,16 @@ pub(crate) fn synchronous() -> Option<&'static str> {
     })
 }
 
+/// Scratch measurement only: `TEMPER_TURSO_COMMIT_FULL=1` with
+/// `TEMPER_TURSO_SYNCHRONOUS=NORMAL` switches a connection to FULL just for
+/// its COMMIT. Under MVCC each sequence allocation in a `BEGIN CONCURRENT`
+/// transaction commits an inner transaction, and FULL fsyncs each one; the
+/// COMMIT's fsync covers those earlier log records too.
+pub(crate) fn commit_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TEMPER_TURSO_COMMIT_FULL").as_deref() == Ok("1"))
+}
+
 /// Driver failures retain the original engine or transport error.
 #[derive(Debug, Error)]
 pub(crate) enum DriverError {
@@ -258,6 +268,12 @@ impl Transaction<'_> {
     pub(crate) fn commit(self) -> impl Future<Output = Result<(), DriverError>> + Send {
         async move {
             match self {
+                Self::Local(tx, conn) if commit_full() => {
+                    conn.execute("PRAGMA synchronous = FULL", ()).await?;
+                    let committed = tx.into_inner().commit().await;
+                    conn.execute("PRAGMA synchronous = NORMAL", ()).await?;
+                    Ok(committed?)
+                }
                 Self::Local(tx, _) => Ok(tx.into_inner().commit().await?),
                 Self::Remote(tx) => Ok(tx.commit().await?),
             }
