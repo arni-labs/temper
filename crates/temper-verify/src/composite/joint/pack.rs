@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::slice::Iter;
 
-use super::state::{Call, Dispatch, JointState};
+use super::state::{Call, Dispatch, JointState, ReactionStep};
 use crate::model::{ModelString, ParamValue, TemperModelState};
 
 /// A packed joint state, shared by the walk's list and its index.
@@ -204,6 +204,21 @@ impl Pack for TemperModelState {
     }
 }
 
+impl Pack for ReactionStep {
+    fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
+        self.entity_type.put(packer, out);
+        self.action.put(packer, out);
+        self.generated_for.put(packer, out);
+    }
+    fn take(packer: &Packer, input: &mut Iter<'_, u32>) -> Self {
+        Self {
+            entity_type: Pack::take(packer, input),
+            action: Pack::take(packer, input),
+            generated_for: Pack::take(packer, input),
+        }
+    }
+}
+
 impl Pack for Dispatch {
     fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
         self.to.put(packer, out);
@@ -211,7 +226,7 @@ impl Pack for Dispatch {
         self.target_state.put(packer, out);
         self.params.put(packer, out);
         self.read.put(packer, out);
-        self.depth.put(packer, out);
+        self.chain.put(packer, out);
         self.via.put(packer, out);
         self.by.put(packer, out);
         self.inline.put(packer, out);
@@ -223,7 +238,7 @@ impl Pack for Dispatch {
             target_state: Pack::take(packer, input),
             params: Pack::take(packer, input),
             read: Pack::take(packer, input),
-            depth: Pack::take(packer, input),
+            chain: Pack::take(packer, input),
             via: Pack::take(packer, input),
             by: Pack::take(packer, input),
             inline: Pack::take(packer, input),

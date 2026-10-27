@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use temper_spec::predicate::{Truth, eval};
 
 use super::super::env::Blind;
+use super::super::state::ReactionStep;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
 use super::step::Certainty;
@@ -32,7 +33,7 @@ impl JointModel {
             target_state: None,
             params: BTreeMap::new(),
             read: !self.action_reads_related(entity, name),
-            depth: 0,
+            chain: Vec::new(),
             via: None,
             by,
             inline: false,
@@ -83,7 +84,7 @@ impl JointModel {
             state,
             &dispatch.to,
             &action,
-            dispatch.depth,
+            &dispatch.chain,
             dispatch.by,
             dispatch.inline,
         );
@@ -102,7 +103,7 @@ impl JointModel {
         state: JointState,
         entity: &str,
         action: &TemperModelAction,
-        depth: u32,
+        chain: &[ReactionStep],
         by: u32,
         inline: bool,
     ) -> Vec<(JointState, Certainty)> {
@@ -117,7 +118,7 @@ impl JointModel {
         };
         let mut next = state;
         self.place(&mut next, entity, moved, &action.name, by);
-        self.after_commit(next, entity, &action.name, depth, by, inline)
+        self.after_commit(next, entity, &action.name, chain, by, inline)
     }
 
     /// Put `entity`'s record, after it took `action` from `by`, into

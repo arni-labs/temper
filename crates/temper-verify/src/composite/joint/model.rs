@@ -36,9 +36,6 @@ pub(super) use walk::Explored;
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
 
-/// Reaction depth followed: the runtime's own bound.
-const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
-
 /// Dispatches and module calls in flight at once. The runtime has no such
 /// bound: each request, reaction and module call is its own task. The model
 /// needs one to stay finite; three lets a late dispatch land after two later
@@ -56,7 +53,7 @@ enum Delivery {
     /// Before the next move from outside: the dispatches a move sends all
     /// land, in any order, before anything else is asked. That is what the
     /// drop check claims (ADR-0150); with it, the dispatches in flight are
-    /// bounded by the reactions' fan-out and depth.
+    /// bounded by the reactions' fan-out and distinct steps.
     BeforeNextRequest,
 }
 
