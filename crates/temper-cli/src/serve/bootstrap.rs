@@ -691,7 +691,15 @@ pub(super) async fn bootstrap_installed_apps(
                     );
                 }
                 AppBootstrapSource::Cli => {
-                    print_install_warnings(&app_name, &result);
+                    if !result.warnings.is_empty() || !result.modules_reviewed.is_empty() {
+                        print_install_notes(
+                            &app_name,
+                            &serde_json::json!({
+                                "warnings": result.warnings,
+                                "modules_reviewed": result.modules_reviewed,
+                            }),
+                        );
+                    }
                     let all: Vec<String> = result
                         .added
                         .iter()
@@ -706,6 +714,9 @@ pub(super) async fn bootstrap_installed_apps(
                 }
             },
             Err(e) => {
+                if matches!(source, AppBootstrapSource::Cli) {
+                    print_install_notes(&app_name, &serde_json::json!({ "refused": e }));
+                }
                 eprintln!("  Warning: failed to install app '{app_name}' for '{tenant}': {e}");
             }
         }
@@ -714,16 +725,13 @@ pub(super) async fn bootstrap_installed_apps(
     Ok(())
 }
 
-/// An install's warnings and the modules Jev reviewed, as one line before the line that says it installed, so a reader
-/// of a start's output that sees "installed" already has that start's warnings (Katagami's start wrapper keeps both
-/// lines). One compact JSON object; nothing when there is neither.
-fn print_install_warnings(app_name: &str, result: &temper_platform::InstallResult) {
+/// Everything the install of an app given on the command line said, as one compact JSON object on one line before the
+/// line that says it installed or failed: its warnings and the modules Jev reviewed, or why it was refused, whole
+/// (`refused`). A reader of a start's output that sees the verdict already has it (Katagami's start wrapper keeps both
+/// lines and passes this one on as it is).
+fn print_install_notes(app_name: &str, line: &serde_json::Value) {
     use std::io::Write as _;
 
-    if result.warnings.is_empty() && result.modules_reviewed.is_empty() {
-        return;
-    }
-    let line = serde_json::json!({ "warnings": result.warnings, "modules_reviewed": result.modules_reviewed });
     let _ = writeln!(
         std::io::stdout(),
         "  App '{app_name}' install notes: {line}"
