@@ -13,6 +13,7 @@ pub mod genesis_install;
 pub mod genesis_install_verify;
 pub mod hooks;
 pub mod integration;
+pub mod module_review;
 mod operator_manage_policies;
 pub mod optimization;
 pub mod os_apps;
