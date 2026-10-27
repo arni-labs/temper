@@ -158,10 +158,9 @@ impl TursoEventStore {
     }
 
     async fn write_trajectory_rows(&self, rows: &[&TrajectoryRow]) -> Result<(), PersistenceError> {
-        let _write_permit = self
-            .acquire_write_permit("turso.persist_trajectory", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.persist_trajectory", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         for chunk in rows.chunks(ROWS_PER_INSERT) {
             let mut sql = String::from(
