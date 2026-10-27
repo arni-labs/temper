@@ -11,6 +11,8 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
+use super::field_index_rows::sync_field_index;
+use super::projection_rows::{ProjectionWrite, remove_projection, write_projection};
 use super::unchanged_projections::{
     ExistingProjection, apply_event_counters, drop_event_counters, projection_hash,
     store_event_counters,
@@ -22,7 +24,10 @@ use super::{TursoEventStore, TursoQueryProjectionRow};
 /// `entity_catalog.fields` but are not copied into the filter index.
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
 
-fn canonical_projection_status<'a>(fallback: &'a str, state: &'a serde_json::Value) -> &'a str {
+pub(super) fn canonical_projection_status<'a>(
+    fallback: &'a str,
+    state: &'a serde_json::Value,
+) -> &'a str {
     state
         .get("status")
         .and_then(|value| value.as_str())
@@ -121,127 +126,20 @@ impl TursoEventStore {
             .acquire_write_permit("turso.upsert_query_projection", WritePriority::Low)
             .await?;
         let conn = self.configured_connection().await?;
-        let fields_json = serde_json::to_string(fields)
-            .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
-        let new_projection_hash = projection_hash(status, &fields_json, state);
-        let updated_at = sim_now().to_rfc3339();
-        let sequence_nr = i64::try_from(sequence_nr).unwrap_or(i64::MAX);
-
-        // Deciding and writing under one write transaction keeps a concurrent
-        // projection of the same entity from landing between them.
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
-        let existing = {
-            let mut existing_rows = tx
-                .query(
-                    "SELECT c.sequence_nr, c.projection_hash, k.sequence_nr \
-                     FROM entity_catalog c LEFT JOIN entity_catalog_counters k \
-                       ON k.tenant = c.tenant AND k.entity_type = c.entity_type \
-                      AND k.entity_id = c.entity_id \
-                     WHERE c.tenant = ?1 AND c.entity_type = ?2 AND c.entity_id = ?3",
-                    params![tenant, entity_type, entity_id],
-                )
-                .await
-                .map_err(storage_error)?;
-            match existing_rows.next().await.map_err(storage_error)? {
-                Some(row) => Some(ExistingProjection::from_row(&row, 0)?),
-                None => None,
-            }
-        };
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing.sequence_nr() > sequence_nr)
-        {
-            tx.commit().await.map_err(storage_error)?;
-            return Ok(());
-        }
-        if let Some(existing) = existing
-            .as_ref()
-            .filter(|existing| existing.projection_hash == new_projection_hash)
-        {
-            if sequence_nr > existing.sequence_nr() {
-                store_event_counters(&tx, [tenant, entity_type, entity_id], sequence_nr, state)
-                    .await?;
-            }
-            tx.commit().await.map_err(storage_error)?;
-            return Ok(());
-        }
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing.counters_sequence_nr.is_some())
-        {
-            drop_event_counters(&tx, [tenant, entity_type, entity_id]).await?;
-        }
-
-        tx.execute(
-            "INSERT INTO entity_catalog \
-             (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2, ?9) \
-             ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
-                 status = excluded.status, \
-                 fields = excluded.fields, \
-                 state = excluded.state, \
-                 updated_at = excluded.updated_at, \
-                 sequence_nr = excluded.sequence_nr, \
-                 projection_version = excluded.projection_version, \
-                 projection_hash = excluded.projection_hash",
-            params![
+        write_projection(
+            &tx,
+            &ProjectionWrite {
                 tenant,
                 entity_type,
                 entity_id,
                 status,
-                fields_json.as_str(),
-                state_json.as_str(),
-                updated_at.as_str(),
+                fields,
+                state,
                 sequence_nr,
-                new_projection_hash.as_str(),
-            ],
+            },
         )
-        .await
-        .map_err(storage_error)?;
-
-        // Delete existing rows for this entity, then re-insert.
-        // This is simpler than tracking individual field changes and handles
-        // field removal correctly.
-        tx.execute(
-            "DELETE FROM entity_field_index WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-
-        let indexed_fields = indexed_projection_fields(status, fields);
-        if !indexed_fields.is_empty() {
-            let mut sql = String::from(
-                "INSERT INTO entity_field_index \
-                 (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
-            );
-            let mut values = Vec::with_capacity(indexed_fields.len() * 6);
-
-            for (index, (field_name, field_value)) in indexed_fields.iter().enumerate() {
-                if index > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str("(?, ?, ?, ?, ?, ?)");
-                values.push(Value::from(tenant.to_string()));
-                values.push(Value::from(entity_type.to_string()));
-                values.push(Value::from(entity_id.to_string()));
-                values.push(Value::from(field_name.clone()));
-                values.push(
-                    field_value
-                        .as_ref()
-                        .map(|value| Value::from(value.clone()))
-                        .unwrap_or(Value::Null),
-                );
-                values.push(Value::from(status.to_string()));
-            }
-
-            tx.execute(&sql, params_from_iter(values))
-                .await
-                .map_err(storage_error)?;
-        }
-
+        .await?;
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -417,31 +315,22 @@ impl TursoEventStore {
                 .map_err(storage_error)?;
         }
 
+        // An entity that may already have rows writes only the ones that
+        // changed. A known-new entity has none, so its rows go in one insert.
+        let (new_indexes, existing_indexes): (Vec<_>, Vec<_>) = changed_indexes
+            .into_iter()
+            .partition(|(_, _, _, _, known_new)| *known_new);
+        for (entity_type, entity_id, status, indexed_fields, _) in &existing_indexes {
+            sync_field_index(
+                &tx,
+                [tenant, entity_type.as_str(), entity_id.as_str()],
+                status,
+                indexed_fields,
+            )
+            .await?;
+        }
+        let changed_indexes = new_indexes;
         if !changed_indexes.is_empty() {
-            let delete_targets = changed_indexes
-                .iter()
-                .filter(|(_, _, _, _, known_new)| !known_new)
-                .collect::<Vec<_>>();
-            if !delete_targets.is_empty() {
-                let mut delete_sql =
-                    String::from("DELETE FROM entity_field_index WHERE tenant = ? AND (");
-                let mut delete_values = Vec::with_capacity(1 + delete_targets.len() * 2);
-                delete_values.push(Value::from(tenant.to_string()));
-                for (index, (entity_type, entity_id, _, _, _)) in delete_targets.iter().enumerate()
-                {
-                    if index > 0 {
-                        delete_sql.push_str(" OR ");
-                    }
-                    delete_sql.push_str("(entity_type = ? AND entity_id = ?)");
-                    delete_values.push(Value::from(entity_type.clone()));
-                    delete_values.push(Value::from(entity_id.clone()));
-                }
-                delete_sql.push(')');
-                tx.execute(&delete_sql, params_from_iter(delete_values))
-                    .await
-                    .map_err(storage_error)?;
-            }
-
             let indexed_field_count = changed_indexes
                 .iter()
                 .map(|(_, _, _, fields, _)| fields.len())
@@ -538,19 +427,7 @@ impl TursoEventStore {
             .await?;
         let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
-        tx.execute(
-            "DELETE FROM entity_catalog WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-        tx.execute(
-            "DELETE FROM entity_field_index WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .map_err(storage_error)?;
-        drop_event_counters(&tx, [tenant, entity_type, entity_id]).await?;
+        remove_projection(&tx, [tenant, entity_type, entity_id]).await?;
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -870,7 +747,7 @@ fn scalar_to_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn indexed_projection_fields(
+pub(super) fn indexed_projection_fields(
     status: &str,
     fields: &serde_json::Value,
 ) -> Vec<(String, Option<String>)> {

@@ -27,7 +27,7 @@ fn cedar_set_equality_denies_the_same_reaction_as_the_real_engine() {
         let decision = engine.authorize(&context, "Bring", "Place", &HashMap::new());
         assert_eq!(decision.is_allowed(), !denied, "{expression}: {decision:?}");
         assert_eq!(
-            analysis.may(&asker, "Bring", "Place"),
+            analysis.may(&asker, "Bring", "Place", &BTreeMap::new()),
             if denied { May::No } else { May::Yes },
             "{expression}"
         );
