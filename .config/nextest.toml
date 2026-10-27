@@ -1,3 +1,7 @@
+# Scratch only: run every test, so each mutant shows every test it fails.
+[profile.default]
+fail-fast = false
+
 # The tests over a 300,000-row change log keep four periods for draining it
 # with production trim code, and so do the three that trim on a simulated
 # slow drive (their fixture and their seconds of trimming). The pinned release tursodb
