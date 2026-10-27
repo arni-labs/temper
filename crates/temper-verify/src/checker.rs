@@ -5,10 +5,11 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use stateright::{Checker, Model};
+use stateright::{Checker, Expectation, Model};
+use temper_spec::predicate::Truth;
 
 use crate::model::ResolvedTransition;
-use crate::model::semantics::{guard_may_hold, successors};
+use crate::model::semantics::{guard_may_hold, successors, truth};
 use crate::model::{TemperModel, TemperModelAction, TemperModelState};
 
 /// A counterexample discovered during model checking.
@@ -16,7 +17,13 @@ use crate::model::{TemperModel, TemperModelAction, TemperModelState};
 pub struct Counterexample {
     /// The property name that was violated.
     pub property: String,
-    /// The sequence of (state, action) pairs leading to the violation.
+    /// What is false in the trace's last state: for `Invariants`, the names
+    /// of the invariants false there; for any other property, its name.
+    #[serde(default)]
+    pub violated: Vec<String>,
+    /// The sequence of (state, action) pairs leading to the violation: each
+    /// state and the action taken from it, the last state with none. For a
+    /// safety property it ends at the first state on the path that breaks it.
     pub trace: Vec<(TemperModelState, Option<TemperModelAction>)>,
 }
 
@@ -78,13 +85,19 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         if cut_by_time && property_name == crate::model::REACHES_TERMINAL {
             continue;
         }
-        let mut trace = Vec::new();
-        let steps: Vec<_> = path.into_vec();
-        for (state, action) in steps {
-            trace.push((state, action));
-        }
+        let trace = first_break(&walked, property_name, path.into_vec());
+        let violated = match trace.last() {
+            Some((state, _)) if property_name == "Invariants" => walked
+                .invariants
+                .iter()
+                .filter(|inv| truth(&inv.assert, &walked.var_kinds, state) == Truth::False)
+                .map(|inv| inv.name.clone())
+                .collect(),
+            _ => vec![property_name.to_string()],
+        };
         counterexamples.push(Counterexample {
             property: property_name.to_string(),
+            violated,
             trace,
         });
     }
@@ -108,6 +121,36 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         dead_transitions,
         is_complete,
     }
+}
+
+/// `steps` cut at the first state that breaks the safety property `name`.
+///
+/// Stateright keeps exploring after a safety property first fails (other
+/// properties still await theirs) and records each later state that fails
+/// it over the earlier one, so the path it returns ends at the last such
+/// state it visited, not the first: on a 23-move break it returned 38 moves.
+/// Cutting at the first failing state gives a path that ends where the
+/// property broke. A liveness (`eventually`) path is returned whole.
+fn first_break(
+    model: &TemperModel,
+    name: &str,
+    mut steps: Vec<(TemperModelState, Option<TemperModelAction>)>,
+) -> Vec<(TemperModelState, Option<TemperModelAction>)> {
+    let Some(property) = model
+        .properties()
+        .into_iter()
+        .find(|p| p.name == name && p.expectation == Expectation::Always)
+    else {
+        return steps;
+    };
+    if let Some(first) = steps
+        .iter()
+        .position(|(state, _)| !(property.condition)(model, state))
+    {
+        steps.truncate(first + 1);
+        steps[first].1 = None;
+    }
+    steps
 }
 
 /// The transitions no reachable state enables, or `None` when the model's
