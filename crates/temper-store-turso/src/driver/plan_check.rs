@@ -193,7 +193,7 @@ fn gives(sql: &str, name: &str, unqualified: bool, column: &str) -> bool {
         let start = from + found;
         let end = start + column.len();
         from = end;
-        let before = sql[..start].trim_end_matches(' ');
+        let before = &sql[..start];
         let qualified = before.ends_with('.')
             && before[..before.len() - 1].ends_with(name)
             && !before[..before.len() - 1 - name.len()]
