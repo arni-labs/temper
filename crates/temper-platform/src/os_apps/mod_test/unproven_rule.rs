@@ -1,6 +1,6 @@
-//! An install refuses a rule that is not proven, unless the tenant runs that
-//! rule now as it is: then the rule keeps running, and only a change to it is
-//! refused.
+//! An install refuses a rule that breaks, unless the tenant runs that rule
+//! now as it is: then the rule keeps running, the install says so among its
+//! unproved rules, and only a change to it is refused.
 
 use super::*;
 use std::path::PathBuf;
@@ -134,13 +134,13 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
-async fn a_new_type_whose_rule_is_not_proven_is_refused() {
+async fn a_new_type_whose_rule_breaks_is_refused() {
     let fixture = Fixture::new("new", BELOW_TWO);
     let error = fixture
         .install("unproven-new")
         .await
         .expect_err("a rule that breaks refuses the install of a type the tenant does not run");
-    assert!(error.contains("not proven"), "{error}");
+    assert!(error.contains("would break"), "{error}");
     assert!(error.contains("Counter.Small"), "{error}");
 }
 
@@ -149,14 +149,22 @@ async fn a_rule_the_tenant_runs_as_it_is_keeps_running() {
     let fixture = Fixture::new("running", BELOW_TWO);
     let tenant = "unproven-running";
     fixture.runs(tenant, BELOW_TWO, PERMIT);
-    fixture
+    let result = fixture
         .install(tenant)
         .await
         .expect("a rule the tenant already runs as it is does not take the app down");
+    assert!(
+        result
+            .unproved_rules
+            .iter()
+            .any(|rule| rule.contains("Counter.Small")),
+        "{:?}",
+        result.unproved_rules
+    );
 }
 
 #[tokio::test]
-async fn a_change_to_a_rule_that_is_not_proven_is_refused() {
+async fn a_change_to_a_rule_that_breaks_is_refused() {
     let fixture = Fixture::new("changed", BELOW_ONE);
     let tenant = "unproven-changed";
     fixture.runs(tenant, BELOW_TWO, PERMIT);
