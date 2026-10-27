@@ -103,7 +103,7 @@ impl IdempotencyCache {
                 if let Some(applied) = self.applied_reply(actor_key, idem_key) {
                     return EffectsClaim::Applied(Box::new(applied));
                 }
-                match owners.get(&owner_key) {
+                match owners.get(&owner_key).filter(|_| false) {
                     Some(finished) => finished.clone(),
                     None => {
                         let (sender, receiver) = watch::channel(None);
