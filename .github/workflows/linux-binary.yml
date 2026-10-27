@@ -70,41 +70,10 @@ jobs:
           kill "$pid"
           echo "temper serves /healthz"
 
-      - name: Publish the binary and its sha256
-        id: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="main-${GITHUB_SHA:0:12}"
-          mkdir -p out
-          cp target/release/temper out/temper-x86_64-linux
-          (cd out && sha256sum temper-x86_64-linux > temper-x86_64-linux.sha256)
-          sha="$(cut -d' ' -f1 out/temper-x86_64-linux.sha256)"
-          echo "sha256 $sha"
-          if gh release view "$tag" > /dev/null 2>&1; then
-            echo "$tag is already published"
-          else
-            gh release create "$tag" out/temper-x86_64-linux out/temper-x86_64-linux.sha256 \
-              --target "$GITHUB_SHA" --prerelease --title "temper $tag (Linux x86_64)" \
-              --notes "Built from $GITHUB_SHA on ubuntu-22.04 by linux-binary.yml. sha256 $sha"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
-          echo "### temper $tag" >> "$GITHUB_STEP_SUMMARY"
-          echo "sha256 \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Tell Katagami
-        env:
-          GH_TOKEN: ${{ secrets.KATAGAMI_DISPATCH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "$GH_TOKEN" ]; then
-            echo "KATAGAMI_DISPATCH_TOKEN is not set: Katagami is not told (its image workflow can be run by hand with this tag)"
-            exit 0
-          fi
-          gh api repos/arni-labs/katagami/dispatches -f event_type=temper-binary \
-            -f "client_payload[tag]=${{ steps.publish.outputs.tag }}" \
-            -f "client_payload[sha256]=${{ steps.publish.outputs.sha256 }}" \
-            -f "client_payload[commit]=$GITHUB_SHA"
-          echo "told arni-labs/katagami: temper-binary ${{ steps.publish.outputs.tag }}"
+      # Scratch build for a staging proof: an artifact only, no release, Katagami is not told.
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: temper-x86_64-linux
+          path: target/release/temper
+          retention-days: 3
