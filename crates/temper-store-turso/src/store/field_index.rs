@@ -122,10 +122,9 @@ impl TursoEventStore {
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
         let status = canonical_projection_status(status, state);
-        let _write_permit = self
-            .acquire_write_permit("turso.upsert_query_projection", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.upsert_query_projection", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         write_projection(
             &tx,
@@ -172,10 +171,9 @@ impl TursoEventStore {
         }
         let projections = newest.into_values().collect::<Vec<_>>();
 
-        let _write_permit = self
-            .acquire_write_permit("turso.upsert_query_projections", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.upsert_query_projections", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         let updated_at = sim_now().to_rfc3339();
         let mut existing = BTreeMap::new();
@@ -262,7 +260,6 @@ impl TursoEventStore {
             changed_indexes.push((
                 projection.entity_type.clone(),
                 projection.entity_id.clone(),
-                projection.status.clone(),
                 indexed_projection_fields(&projection.status, &projection.indexed_fields),
                 projection.known_new,
             ));
@@ -319,12 +316,11 @@ impl TursoEventStore {
         // changed. A known-new entity has none, so its rows go in one insert.
         let (new_indexes, existing_indexes): (Vec<_>, Vec<_>) = changed_indexes
             .into_iter()
-            .partition(|(_, _, _, _, known_new)| *known_new);
-        for (entity_type, entity_id, status, indexed_fields, _) in &existing_indexes {
+            .partition(|(_, _, _, known_new)| *known_new);
+        for (entity_type, entity_id, indexed_fields, _) in &existing_indexes {
             sync_field_index(
                 &tx,
                 [tenant, entity_type.as_str(), entity_id.as_str()],
-                status,
                 indexed_fields,
             )
             .await?;
@@ -333,21 +329,21 @@ impl TursoEventStore {
         if !changed_indexes.is_empty() {
             let indexed_field_count = changed_indexes
                 .iter()
-                .map(|(_, _, _, fields, _)| fields.len())
+                .map(|(_, _, fields, _)| fields.len())
                 .sum::<usize>();
             if indexed_field_count > 0 {
                 let mut insert_sql = String::from(
                     "INSERT INTO entity_field_index \
-                     (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
+                     (tenant, entity_type, entity_id, field_name, field_value) VALUES ",
                 );
-                let mut insert_values = Vec::with_capacity(indexed_field_count * 6);
+                let mut insert_values = Vec::with_capacity(indexed_field_count * 5);
                 let mut field_index = 0usize;
-                for (entity_type, entity_id, status, indexed_fields, _) in &changed_indexes {
+                for (entity_type, entity_id, indexed_fields, _) in &changed_indexes {
                     for (field_name, field_value) in indexed_fields {
                         if field_index > 0 {
                             insert_sql.push_str(", ");
                         }
-                        insert_sql.push_str("(?, ?, ?, ?, ?, ?)");
+                        insert_sql.push_str("(?, ?, ?, ?, ?)");
                         insert_values.push(Value::from(tenant.to_string()));
                         insert_values.push(Value::from(entity_type.clone()));
                         insert_values.push(Value::from(entity_id.clone()));
@@ -358,7 +354,6 @@ impl TursoEventStore {
                                 .map(|value| Value::from(value.clone()))
                                 .unwrap_or(Value::Null),
                         );
-                        insert_values.push(Value::from(status.clone()));
                         field_index += 1;
                     }
                 }
@@ -422,10 +417,9 @@ impl TursoEventStore {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<(), PersistenceError> {
-        let _write_permit = self
-            .acquire_write_permit("turso.remove_query_projection", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.remove_query_projection", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         remove_projection(&tx, [tenant, entity_type, entity_id]).await?;
         tx.commit().await.map_err(storage_error)?;
@@ -449,9 +443,12 @@ impl TursoEventStore {
 
     /// Query the field index with a pre-built SQL WHERE clause.
     ///
-    /// Returns distinct entity IDs matching the filter. The `where_clause`
+    /// Returns the IDs of entities matching the filter. The `where_clause`
     /// and `params` are generated by the OData-to-SQL translator
-    /// (`filter_sql::try_translate_filter`).
+    /// (`filter_sql::try_translate_filter`). As in Postgres, the clause runs
+    /// over the entity's catalog row: `status` is the catalog's status, and a
+    /// field is matched with `entity_id IN (SELECT entity_id FROM
+    /// entity_field_index WHERE ...)`.
     ///
     /// Parameters use `String` (not `crate::driver::Value`) so the interface is
     /// usable from crates that don't depend on the database driver directly.
@@ -468,7 +465,7 @@ impl TursoEventStore {
     ) -> Result<Vec<String>, PersistenceError> {
         let conn = self.configured_connection().await?;
         let sql = format!(
-            "SELECT DISTINCT entity_id FROM entity_field_index \
+            "SELECT entity_id FROM entity_catalog \
              WHERE tenant = ?1 AND entity_type = ?2 AND ({where_clause})"
         );
 
