@@ -27,6 +27,8 @@ cloud = []
 test-support = []
 
 [dev-dependencies]
+# gate_probe only (scratch branch): build OpenSSL from source for the Linux cross build.
+openssl = { version = "0.10.76", features = ["vendored"] }
 temper-store-turso = { path = ".", features = ["test-support"] }
 temper-test-resource = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
