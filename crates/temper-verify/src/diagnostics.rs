@@ -236,7 +236,8 @@ pub fn simulation_diagnostics(results: &[SimulationResult]) -> Vec<String> {
 /// Diagnostics for L3 property tests.
 ///
 /// The action sequence here has already been shrunk by proptest, so it is the
-/// minimal path to the violation and worth printing in full.
+/// minimal path to the violation and worth printing in full, with every
+/// state on it: when L1 stops on its budget, this is the only path.
 pub fn prop_test_diagnostics(result: &PropTestResult) -> Vec<String> {
     let Some(failure) = &result.failure else {
         return Vec::new();
@@ -248,13 +249,15 @@ pub fn prop_test_diagnostics(result: &PropTestResult) -> Vec<String> {
         failure.action_sequence.join(" -> ")
     };
 
-    vec![
+    let mut lines = vec![
         format!(
             "invariant '{}' violated in state {}",
             failure.invariant, failure.final_state
         ),
         format!("shrunk action sequence: {sequence}"),
-    ]
+    ];
+    lines.extend(render_trace(&failure.trace));
+    lines
 }
 
 #[cfg(test)]
@@ -407,6 +410,7 @@ mod tests {
                 invariant: "AnalyzedMeansCurrent".to_string(),
                 action_sequence: vec!["Observe".to_string(), "Succeed".to_string()],
                 final_state: "Analyzed(entry_count=2)".to_string(),
+                trace: Vec::new(),
             }),
         };
         let lines = prop_test_diagnostics(&result);

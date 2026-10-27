@@ -8,7 +8,9 @@
 
 use proptest::prelude::*;
 use temper_verify::model::build_model_from_ioa;
-use temper_verify::{CascadeLevel, VerificationCascade, check_model, verify_symbolic};
+use temper_verify::{
+    CascadeLevel, VerificationCascade, check_model, run_prop_tests_from_ioa, verify_symbolic,
+};
 
 const TRIP_REBOOKING: &str = include_str!("../../../test-fixtures/specs/trip_rebooking.ioa.toml");
 
@@ -88,6 +90,22 @@ fn a_counterexample_ends_where_the_rule_breaks() {
             .all(|(state, _)| state.counters["tickets_home"] <= 1),
         "every earlier state keeps the rule"
     );
+}
+
+/// L3's failure carries the same per-step trace as L1's, so an agent has a
+/// whole path even when L1 stops on its budget before finding one.
+#[test]
+fn a_property_test_failure_carries_every_state_on_its_path() {
+    // Mode 1 is deterministic: its walks are seeded by the case number.
+    let result = run_prop_tests_from_ioa(TRIP_REBOOKING, 500, 30);
+    let failure = result.failure.expect("a walk pays for two flights home");
+    assert_eq!(failure.invariant, "NeverPaysForTwoFlightsHome");
+    assert_eq!(failure.trace.len(), failure.action_sequence.len() + 1);
+    let (last, after) = failure.trace.last().expect("a path");
+    assert!(after.is_none());
+    assert_eq!(last.counters["tickets_home"], 2);
+    let (_, bought) = &failure.trace[failure.trace.len() - 2];
+    assert_eq!(bought.as_ref().map(|a| a.name.as_str()), Some("Bought"));
 }
 
 // ---------------------------------------------------------------------------
