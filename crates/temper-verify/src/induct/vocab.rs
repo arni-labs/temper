@@ -7,8 +7,7 @@ use std::sync::Mutex;
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::{
-    Action, ActionConstraint, ActionKind, ActionParam, ActionTrigger, Automaton, TriggerKind,
-    VarType,
+    Action, ActionParam, ActionTrigger, Automaton, TriggerKind, VarType, call_may_answer,
 };
 use temper_spec::predicate::{Arg, Effect, Literal};
 
@@ -106,10 +105,8 @@ impl Kind {
 }
 
 /// A kind of module call: the calls a record's triggers start on one
-/// module with the same declared answer and failure. As in the joint walk,
-/// a call keeps the fields its answers' parameters must equal, as the record
-/// held them when it started, and the record refuses an answer once they
-/// have moved on.
+/// module or adapter with the same kind, declared answer and failure.
+/// Returned parameters are chosen independently of call-time fields.
 #[derive(Debug, Clone)]
 pub(super) struct Call {
     /// Its name in the proof: the record's type and the module, numbered
@@ -119,8 +116,7 @@ pub(super) struct Call {
     pub(super) module: String,
     pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
-    /// The string fields it keeps.
-    pub(super) asked: Vec<String>,
+    pub(super) kind: TriggerKind,
 }
 
 /// What is in flight, by kind: a dispatch or a module call, and the values
@@ -308,12 +304,13 @@ impl<'a> Vocab<'a> {
         for to in &self.scope {
             for action in &self.automaton(to).actions {
                 for trigger in &action.triggers {
-                    let (TriggerKind::Wasm, Some(module)) = (&trigger.kind, &trigger.module) else {
+                    let Some(module) = trigger.callee() else {
                         continue;
                     };
                     let same = calls.iter().any(|c| {
                         &c.to == to
-                            && &c.module == module
+                            && c.module == module
+                            && c.kind == trigger.kind
                             && c.on_success == trigger.on_success
                             && c.on_failure == trigger.on_failure
                     });
@@ -322,33 +319,20 @@ impl<'a> Vocab<'a> {
                     }
                     let taken = calls
                         .iter()
-                        .filter(|c| &c.to == to && &c.module == module)
+                        .filter(|c| &c.to == to && c.module == module)
                         .count();
                     let name = match taken {
                         0 => format!("{to}@{module}"),
                         n => format!("{to}@{module}{}", n + 1),
                     };
-                    let mut call = Call {
+                    calls.push(Call {
                         name,
                         to: to.clone(),
-                        module: module.clone(),
+                        module: module.to_string(),
                         on_success: trigger.on_success.clone(),
                         on_failure: trigger.on_failure.clone(),
-                        asked: Vec::new(),
-                    };
-                    let mut asked = BTreeSet::new();
-                    for answer in self.answer_actions(&call) {
-                        for constraint in &answer.constraints {
-                            if let ActionConstraint::ParamEqualsField { param, field } = constraint
-                                && self.param(answer, param) == Some(Sort::Str)
-                                && self.var(to, field) == Some(Sort::Str)
-                            {
-                                asked.insert(field.clone());
-                            }
-                        }
-                    }
-                    call.asked = asked.into_iter().collect();
-                    calls.push(call);
+                        kind: trigger.kind,
+                    });
                 }
             }
         }
@@ -357,31 +341,23 @@ impl<'a> Vocab<'a> {
 
     /// The call kind `trigger` on one of `entity`'s actions starts.
     pub(super) fn call_of(&self, entity: &str, trigger: &ActionTrigger) -> Option<&Call> {
-        let module = trigger
-            .module
-            .as_ref()
-            .filter(|_| trigger.kind == TriggerKind::Wasm)?;
+        let module = trigger.callee()?;
         self.calls.iter().find(|c| {
             c.to == entity
-                && &c.module == module
+                && c.module == module
+                && c.kind == trigger.kind
                 && c.on_success == trigger.on_success
                 && c.on_failure == trigger.on_failure
         })
     }
 
-    /// The actions a call may be answered with: its declared answers, or
-    /// else any internal action of its record.
+    /// The actions the kernel takes as a call's answer: its declared
+    /// answer, or else any action of its record (`call_may_answer`).
     pub(super) fn answer_actions(&self, call: &Call) -> Vec<&'a Action> {
         self.automaton(&call.to)
             .actions
             .iter()
-            .filter(|a| {
-                if call.on_success.is_empty() {
-                    a.kind == ActionKind::Internal
-                } else {
-                    call.on_success.contains(&a.name)
-                }
-            })
+            .filter(|a| call_may_answer(&call.on_success, &a.name))
             .collect()
     }
 
@@ -393,7 +369,7 @@ impl<'a> Vocab<'a> {
         });
         let calls = self.calls.iter().map(|c| Flight {
             name: &c.name,
-            fields: c.asked.iter().map(|f| (f.clone(), Sort::Str)).collect(),
+            fields: Vec::new(),
         });
         dispatches.chain(calls).collect()
     }

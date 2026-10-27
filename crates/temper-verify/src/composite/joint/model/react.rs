@@ -3,11 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::TargetResolver;
+use temper_spec::automaton::{TargetResolver, call_may_answer};
 use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
-use super::super::senders::RUNTIME;
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::step::{Certainty, Move};
@@ -36,43 +35,28 @@ impl JointModel {
         let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
             return outcomes;
         };
-        let answering = if inline && by != RUNTIME && self.sender_matters.contains(source) {
-            vec![RUNTIME, by]
+        let answering = if inline
+            && self.sender_matters.contains(source)
+            && specs.iter().any(|spec| by != spec.background)
+        {
+            vec![false, true]
         } else {
-            vec![RUNTIME]
+            vec![false]
         };
-        let internal = self.kernel.internal.get(source);
-        let asked: Vec<BTreeSet<String>> = specs
-            .iter()
-            .map(|spec| {
-                self.unchecked.asked(source, |action| {
-                    if spec.on_success.is_empty() {
-                        internal.is_some_and(|names| names.contains(action))
-                    } else {
-                        spec.on_success.iter().any(|name| name == action)
-                    }
-                })
-            })
-            .collect();
         let mut started = Vec::new();
         for (outcome, known) in outcomes {
-            for &answer_as in &answering {
+            for &answer_inline in &answering {
                 if !self.expansion.take() {
                     return Vec::new();
                 }
                 let mut outcome = outcome.clone();
-                for (spec, asked) in specs.iter().zip(&asked) {
-                    let strings = &outcome.records[source].strings;
+                for spec in specs {
                     let call = Call {
                         to: source.to_string(),
                         module: spec.module.clone(),
                         on_success: spec.on_success.clone(),
                         on_failure: spec.on_failure.clone(),
-                        by: answer_as,
-                        asked: asked
-                            .iter()
-                            .filter_map(|field| Some((field.clone(), strings.get(field)?.clone())))
-                            .collect(),
+                        by: if answer_inline { by } else { spec.background },
                     };
                     let at = outcome.calls.partition_point(|c| c < &call);
                     outcome.calls.insert(at, call);
@@ -83,10 +67,10 @@ impl JointModel {
         started
     }
 
-    /// The answers a module may give the call `call`: its trigger's
-    /// `on_success`, or else any internal action of its record. The module
-    /// itself is not modelled: it may give each of these answers, and gives
-    /// each it keeps being able to give at some point.
+    /// The answers the kernel takes for the call `call`: its trigger's
+    /// `on_success`, or else any action of its record (`call_may_answer`).
+    /// The module itself is not modelled: it may give each of these
+    /// answers, and gives each it keeps being able to give at some point.
     pub(super) fn answers(
         &self,
         state: &JointState,
@@ -97,28 +81,14 @@ impl JointModel {
         let model = &self.models[&call.to];
         let local = &state.records[&call.to];
         for t in &model.transitions {
-            let answers = if call.on_success.is_empty() {
-                self.kernel
-                    .internal
-                    .get(&call.to)
-                    .is_some_and(|names| names.contains(&t.name))
-            } else {
-                call.on_success.contains(&t.name)
-            };
-            if !answers || !self.enabled(&call.to, t, state, Blind::Nothing) {
+            if !call_may_answer(&call.on_success, &t.name)
+                || !self.enabled(&call.to, t, state, Blind::Nothing)
+            {
                 continue;
             }
-            let mut seen = BTreeSet::new();
-            for (mut params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
-                // A parameter tied to a field carries it as the call found it.
-                for param in &t.string_params {
-                    if let Some(value) = param.equals.as_ref().and_then(|f| call.asked.get(f)) {
-                        params.insert(param.name.clone(), ParamValue::Str(value.clone()));
-                    }
-                }
-                if !seen.insert(params.clone()) {
-                    continue;
-                }
+            // Returned values are chosen by the callee. Constraints compare
+            // them with the record now, independently of call-time fields.
+            for (params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
                 let action = TemperModelAction {
                     name: t.name.clone(),
                     target_state: t.to_state.clone(),
@@ -127,20 +97,6 @@ impl JointModel {
                 out.push(Move::Answer(call.clone(), action));
             }
         }
-    }
-
-    /// Whether a field `action` ties a parameter to has changed since `call`
-    /// started, so its record refuses the module's answer.
-    pub(super) fn stale(&self, call: &Call, action: &str, state: &JointState) -> bool {
-        let strings = &state.records[&call.to].strings;
-        self.unchecked
-            .equals
-            .get(&(call.to.clone(), action.to_string()))
-            .is_some_and(|fields| {
-                fields
-                    .iter()
-                    .any(|field| call.asked.get(field) != strings.get(field))
-            })
     }
 
     /// Send the reactions of `source.action` between types in scope, in

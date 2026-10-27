@@ -24,7 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_authz::May;
 use temper_spec::predicate::Expr;
 
-use super::encode::{Enc, counted};
+use super::declare::counted;
+use super::encode::Enc;
 use super::moves::{Move, Moves, Step};
 use super::run::Ask;
 use super::vocab::Vocab;
@@ -240,9 +241,7 @@ fn helpful<'m>(
     let may = match (first.step, &first.timer) {
         (Step::Outside, _) => May::Yes,
         (Step::Timer, Some(state)) => v.timer_may(&first.entity, state, &first.action),
-        (Step::Answer | Step::Fail, _) if !first.action.is_empty() => {
-            v.runtime_may(&first.entity, &first.action)
-        }
+        // The kernel dispatches call answers and failures without Cedar.
         _ => May::Yes,
     };
     if may != May::Yes {

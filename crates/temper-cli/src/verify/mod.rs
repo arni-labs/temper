@@ -237,9 +237,8 @@ fn joint_bound(
 /// deciding each move as its sender. A broken invariant fails the command
 /// with its shortest path, a condition the system's own moves do not reach
 /// fails with how it comes to rest short of it, and a walk that could not
-/// finish fails too, since a partial walk proves nothing. So do a walk that
-/// never took an answer a module may give and a rule whose premise no walked
-/// state meets. Each rule is proved by induction first, for every run (an
+/// finish fails too, since a partial walk proves nothing. So does a rule
+/// whose premise no walked state meets. Each rule is proved by induction first, for every run (an
 /// invariant with its lemmas or the prover's guesses, an `eventually` rule
 /// with its measure), and walked only when the proof does not hold; a proved
 /// rule whose premise no run meets fails as well. A spec that does not parse

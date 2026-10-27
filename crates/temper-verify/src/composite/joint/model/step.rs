@@ -287,10 +287,6 @@ impl JointModel {
                 if self.action_reads_related(&call.to, &action.name) {
                     add(&mut next, sent(&call.to, action, call.by, inline));
                     outcomes.push((next, format!("{text} sent"), Sure));
-                } else if self.stale(call, &action.name, state) {
-                    // The module answers about the record as the call found
-                    // it, and the record has moved on from that.
-                    outcomes.push((next, format!("{text} refused by its record"), Sure));
                 } else {
                     // The record refuses an answer whose guard or constraints
                     // do not hold, and the call ends there

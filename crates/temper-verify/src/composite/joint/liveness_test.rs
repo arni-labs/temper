@@ -309,6 +309,7 @@ effect = ["brought = params.brought"]
 name = "place"
 kind = "wasm"
 module = "steps"
+on_success = "Placed"
 
 [[action]]
 name = "Again"

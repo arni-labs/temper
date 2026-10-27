@@ -642,7 +642,7 @@ params = [{ name = "rain", type = "int" }]
 guard = "params.rain >= 50"
 ```
 
-The kernel sends the first listed action the record takes with the module's values (its `from`, constraints and guard), or else the last, whose refusal is recorded. A guard reads only the parameters its action declares, and only an action's guard reads `params`. The record decides again when the answer commits. A module with nothing to report answers empty (`{"empty": true}`, `set_empty_result()` in the SDK), and nothing moves; `"action": ""` is not empty and still sends `on_success`. When `on_success` is named, an action the module's result names is ignored. Without `on_success`, the module's result may name any action of the entity, and the kernel dispatches it with no Cedar check: a module picking the move is being retired, so name `on_success`.
+The kernel sends the first listed action the record takes with the module's values (its `from`, constraints and guard), or else the last, whose refusal is recorded. A guard reads only the parameters its action declares, and only an action's guard reads `params`. The record decides again when the answer commits. A module with nothing to report answers empty (`{"empty": true}`, `set_empty_result()` in the SDK), and nothing moves; `"action": ""` is not empty and still sends `on_success`. When `on_success` is named, an action the module's result names is ignored. Without `on_success`, the module's result may name any action of the entity, and the kernel dispatches it with no Cedar check, so the checker takes every action the entity can take there as a possible answer: a module picking the move is being retired, so name `on_success`.
 
 ### Deployment-level webhooks
 

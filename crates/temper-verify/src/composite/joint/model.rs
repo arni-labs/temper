@@ -33,7 +33,7 @@ use read::{
     Kernel, Reaction, Unchecked, named_literals, outer_reactions, tracked, unchecked_constraints,
 };
 pub(super) use step::Move;
-pub(super) use walk::{Explored, unwalked_reason};
+pub(super) use walk::Explored;
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
@@ -126,11 +126,6 @@ pub(super) struct JointModel {
     /// Elsewhere who armed a timer or answers a call changes nothing, so the
     /// model does not tell them apart.
     sender_matters: BTreeSet<String>,
-    /// For each entity with a module call whose trigger names no
-    /// `on_success`, the actions nothing in the model sends. The kernel
-    /// takes whatever action such a module's result names, and the model
-    /// answers only with internal actions, so the walk never takes these.
-    unwalked_answers: BTreeMap<String, BTreeSet<String>>,
     /// The actions reactions from types outside the scope send. The model
     /// does not hold their sources, so each may come at any time, as a move
     /// from outside sent as its sender.
@@ -298,34 +293,6 @@ impl JointModel {
             .filter(|r| r.principal.is_none())
             .map(|r| r.from.clone())
             .collect();
-        let open: BTreeSet<&String> = kernel
-            .calls_on
-            .iter()
-            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_empty()))
-            .map(|((entity, _), _)| entity)
-            .collect();
-        let unwalked_answers = open
-            .into_iter()
-            .map(|entity| {
-                let actions: BTreeSet<String> = models[entity]
-                    .transitions
-                    .iter()
-                    .map(|t| &t.name)
-                    .filter(|action| {
-                        !chosen(entity, action)
-                            && !reactions
-                                .iter()
-                                .any(|r| &r.to == entity && &r.target_action == *action)
-                            && !outer
-                                .get(entity.as_str())
-                                .is_some_and(|sent| sent.contains_key(action.as_str()))
-                    })
-                    .cloned()
-                    .collect();
-                (entity.clone(), actions)
-            })
-            .filter(|(_, actions)| !actions.is_empty())
-            .collect();
         Self {
             expansion: Expansion::default(),
             id_literals,
@@ -341,7 +308,6 @@ impl JointModel {
             order,
             senders,
             sender_matters,
-            unwalked_answers,
             outer,
         }
     }
@@ -425,9 +391,6 @@ impl JointModel {
                     values.insert(text.clone());
                 }
             }
-        }
-        for call in &state.calls {
-            values.extend(call.asked.values().filter(|v| !v.is_empty()).cloned());
         }
         values
     }

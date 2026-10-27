@@ -20,21 +20,24 @@ fn a_number_reads_back_as_it_was_written_in_as_few_bytes_as_it_needs() {
 }
 
 #[test]
-fn packed_call_snapshots_keep_literals_distinct_from_symbols() {
+fn packed_dispatches_keep_literals_distinct_from_symbols() {
     let state = JointState {
         records: BTreeMap::new(),
-        inflight: Vec::new(),
-        calls: vec![Call {
+        inflight: vec![Dispatch {
             to: "T".into(),
-            module: "worker".into(),
-            on_success: Vec::new(),
-            on_failure: None,
-            by: 0,
-            asked: BTreeMap::from([
-                ("literal".into(), ModelString::from("#1")),
-                ("fresh".into(), ModelString::Symbol(1)),
+            action: "Go".into(),
+            target_state: None,
+            params: BTreeMap::from([
+                ("literal".into(), ParamValue::Str(ModelString::from("#1"))),
+                ("fresh".into(), ParamValue::Str(ModelString::Symbol(1))),
             ]),
+            read: false,
+            depth: 1,
+            via: None,
+            by: 0,
+            inline: false,
         }],
+        calls: Vec::new(),
         armed: BTreeMap::new(),
     };
     let mut packer = Packer::default();
@@ -43,7 +46,7 @@ fn packed_call_snapshots_keep_literals_distinct_from_symbols() {
     let restored = packer.unpack(&packed);
     assert_eq!(restored, state);
     assert_ne!(
-        restored.calls[0].asked["literal"],
-        restored.calls[0].asked["fresh"]
+        restored.inflight[0].params["literal"],
+        restored.inflight[0].params["fresh"]
     );
 }

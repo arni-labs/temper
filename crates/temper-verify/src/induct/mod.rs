@@ -18,6 +18,7 @@
 //! (`live.rs`).
 
 mod cedar;
+mod declare;
 mod effects;
 mod encode;
 mod guess;
@@ -40,7 +41,8 @@ use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name};
 
-use encode::{Enc, initial, prelude};
+use declare::{initial, prelude};
+use encode::Enc;
 use guess::Guess;
 pub use hints::{Hints, Lemma};
 pub use live::{Measure, Region};
@@ -492,3 +494,6 @@ fn solve(
     };
     run(rule, &session, asks, guessed)
 }
+
+#[cfg(test)]
+mod answers_test;

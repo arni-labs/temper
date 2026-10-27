@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use temper_spec::predicate::{Expr, Truth, eval};
 
-use super::model::{JointModel, unwalked_reason};
+use super::model::JointModel;
 use super::premise;
 use super::room::Bound;
 use crate::induct::RuleProof;
@@ -130,7 +130,6 @@ fn seek(
         met.iter().all(|met| *met)
     });
     let took = start.elapsed();
-    let unwalked = explored.unwalked();
     premises
         .iter()
         .zip(&met)
@@ -146,10 +145,6 @@ fn seek(
                     Some(reason) => Premise::Unknown {
                         premise,
                         reason: reason.clone(),
-                    },
-                    None if !unwalked.is_empty() => Premise::Unknown {
-                        premise,
-                        reason: unwalked_reason(&unwalked),
                     },
                     None => Premise::Never {
                         premise,

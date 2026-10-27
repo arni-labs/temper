@@ -1,13 +1,13 @@
 //! What the joint model reads once from the specs: each type's model with
 //! the strings it must track, the reactions between the types in scope and
 //! those into them from outside, the module calls their actions start, their
-//! internal actions and state timers, and the constraints it does not check.
+//! state timers, and the constraints it does not check.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::Asker;
 use temper_spec::automaton::{
-    ActionConstraint, ActionKind, Automaton, TargetResolver, TriggerKind,
+    ActionConstraint, Automaton, TargetResolver, TriggerKind, call_may_answer,
 };
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, VarKind};
 
@@ -136,10 +136,12 @@ pub(super) fn tracked(
     }
 }
 
-/// A module call an action's trigger starts.
+/// A call an action's trigger starts, to a WASM module or an adapter.
 #[derive(Debug, Clone)]
 pub(super) struct CallSpec {
     pub(super) module: String,
+    /// The service answering when this call runs in the background.
+    pub(super) background: u32,
     pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
 }
@@ -157,29 +159,22 @@ pub(in crate::composite::joint) struct Timeout {
 pub(super) struct Kernel {
     /// Each entity's state timers.
     pub(super) timers: BTreeMap<String, Vec<Timeout>>,
-    /// The module calls each (entity, action) starts.
+    /// The calls each (entity, action) starts.
     pub(super) calls_on: BTreeMap<(String, String), Vec<CallSpec>>,
-    /// Each entity's internal actions: what a module whose trigger declares
-    /// no `on_success` may answer with.
-    pub(super) internal: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Kernel {
     /// Whether the kernel sends `entity`'s `action` with parameters of its
-    /// own choosing or none: a module's answer or failure, or a timer.
+    /// own choosing or none: a call's answer or failure, or a timer.
     pub(super) fn chooses(&self, entity: &str, action: &str) -> bool {
-        let named = |name: &Option<String>| name.as_deref() == Some(action);
-        self.internal
+        self.timers
             .get(entity)
-            .is_some_and(|names| names.contains(action))
-            || self
-                .timers
-                .get(entity)
-                .is_some_and(|timers| timers.iter().any(|t| t.action == action))
+            .is_some_and(|timers| timers.iter().any(|t| t.action == action))
             || self.calls_on.iter().any(|((e, _), specs)| {
                 e == entity
                     && specs.iter().any(|spec| {
-                        spec.on_success.iter().any(|name| name == action) || named(&spec.on_failure)
+                        call_may_answer(&spec.on_success, action)
+                            || spec.on_failure.as_deref() == Some(action)
                     })
             })
     }
@@ -191,7 +186,7 @@ impl Kernel {
             let automaton = by_name[entity.as_str()];
             for action in &automaton.actions {
                 for trigger in &action.triggers {
-                    let (TriggerKind::Wasm, Some(module)) = (&trigger.kind, &trigger.module) else {
+                    let Some(module) = trigger.callee() else {
                         continue;
                     };
                     kernel
@@ -199,21 +194,16 @@ impl Kernel {
                         .entry((entity.clone(), action.name.clone()))
                         .or_default()
                         .push(CallSpec {
-                            module: module.clone(),
+                            module: module.to_string(),
+                            background: match trigger.kind {
+                                TriggerKind::Adapter => senders::PLATFORM_DISPATCH,
+                                _ => senders::RUNTIME,
+                            },
                             on_success: trigger.on_success.clone(),
                             on_failure: trigger.on_failure.clone(),
                         });
                 }
             }
-            kernel.internal.insert(
-                entity.clone(),
-                automaton
-                    .actions
-                    .iter()
-                    .filter(|a| a.kind == ActionKind::Internal)
-                    .map(|a| a.name.clone())
-                    .collect(),
-            );
             kernel.timers.insert(
                 entity.clone(),
                 automaton
@@ -306,8 +296,7 @@ fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) 
     reactions
 }
 
-/// The actions (entity, action) with a constraint the model cannot decide,
-/// and what a module call keeps to decide its answer's.
+/// The actions (entity, action) with a constraint the model cannot decide.
 #[derive(Debug, Default)]
 pub(super) struct Unchecked {
     /// Sent as a dispatch or a request: one on a counter the order does not
@@ -315,12 +304,9 @@ pub(super) struct Unchecked {
     pub(super) taken: BTreeSet<(String, String)>,
     /// Sent with parameters its sender chooses (a module's answer, or a
     /// request from outside): one that ties a parameter to a field the model
-    /// does not track. Any other constraint the sender can meet. A module
-    /// answers about the record as it was when the call started, so a call
-    /// keeps the tracked fields its answers are tied to (`asked`).
+    /// does not track. Any other constraint the sender can meet by choosing
+    /// a value against the record as it is when the answer arrives.
     pub(super) chosen: BTreeSet<(String, String)>,
-    /// Each (entity, action)'s tracked fields a parameter must equal.
-    pub(super) equals: BTreeMap<(String, String), BTreeSet<String>>,
     /// Each (entity, action)'s count parameters that must equal a counter
     /// the model holds as a value (not as a sequence number), with that
     /// counter. Decided when a dispatch carries the count, and only then.
@@ -362,16 +348,6 @@ impl Unchecked {
         self.nonempty
             .get(&(entity.to_string(), action.to_string()))
             .map_or(&[], Vec::as_slice)
-    }
-
-    /// The fields an `entity` record's module call keeps as it started:
-    /// those the actions it may answer with (`answers`) tie a parameter to.
-    pub(super) fn asked(&self, entity: &str, answers: impl Fn(&str) -> bool) -> BTreeSet<String> {
-        self.equals
-            .iter()
-            .filter(|((e, action), _)| e == entity && answers(action))
-            .flat_map(|(_, fields)| fields.iter().cloned())
-            .collect()
     }
 }
 
@@ -421,12 +397,7 @@ pub(super) fn unchecked_constraints(
                         .or_default()
                         .push((param.clone(), field.clone()));
                 }
-                if tracked(field) {
-                    out.equals
-                        .entry(key.clone())
-                        .or_default()
-                        .insert(field.clone());
-                } else {
+                if !tracked(field) {
                     out.chosen.insert(key.clone());
                 }
             }

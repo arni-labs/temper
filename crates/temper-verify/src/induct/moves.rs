@@ -8,10 +8,9 @@
 //!   any parameters: the child may be of another id than the scope's;
 //! - a dispatch in flight arriving, or a scheduled action firing: its
 //!   record takes it, sending what that sets off, or refuses it;
-//! - a module call in flight answered, with the trigger's declared answer
-//!   or else any internal action of its record, its parameters tied to a
-//!   field carrying the field as the call found it and the others any
-//!   value; or failing, which fires the trigger's `on_failure` with no
+//! - a call in flight answered, with the trigger's declared answer or else
+//!   any action of its record, as the kernel takes it, with independently
+//!   chosen parameters; or failing, which fires the trigger's `on_failure` with no
 //!   parameters; or ending unanswered (refused, or lost in a restart).
 //!
 //! A timer may fire whenever its state holds and a dispatch or call may
@@ -365,18 +364,10 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         for name in action.params.iter().map(param_name) {
             let sort = v.param(action, name).unwrap_or(Sort::Str);
             let fresh = || self.enc.fresh(&format!("p.{name}"), sort.smt());
-            let tied = action.constraints.iter().find_map(|c| match c {
-                ActionConstraint::ParamEqualsField { param, field } if param == name => Some(field),
-                _ => None,
-            });
             let (term, passed) = match source {
                 Source::Arrive(kind) if kind.fields.iter().any(|(f, _)| f == name) => {
                     (format!("({}/{name} w)", kind.name), "true".to_string())
                 }
-                Source::Answer(call) if tied.is_some_and(|f| call.asked.contains(f)) => (
-                    format!("({}/{} w)", call.name, tied.expect("tied")),
-                    "true".to_string(),
-                ),
                 Source::Timer(timeout) if timeout.args.contains_key(name) => (
                     self.arg(entity, &timeout.args[name], sort, "pre", &BTreeMap::new()),
                     "true".to_string(),
@@ -423,7 +414,14 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                 .collect();
             out.push(format!("(or {})", from.join(" ")));
         }
-        out.push(self.enc.expr(&action.guard, entity, "pre"));
+        let terms: BTreeMap<String, (String, Sort)> = params
+            .iter()
+            .map(|(name, p)| {
+                let sort = self.enc.v.param(action, name).unwrap_or(Sort::Str);
+                (name.clone(), (p.term.clone(), sort))
+            })
+            .collect();
+        out.push(self.enc.guard(&action.guard, entity, &terms));
         for constraint in &action.constraints {
             let (param, field, rel) = match constraint {
                 ActionConstraint::ParamNonempty { param } => (param, None, ""),

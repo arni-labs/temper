@@ -270,7 +270,6 @@ impl Pack for Call {
         self.on_success.put(packer, out);
         self.on_failure.put(packer, out);
         self.by.put(packer, out);
-        self.asked.put(packer, out);
     }
     fn take(packer: &Packer, input: &mut &[u8]) -> Self {
         Call {
@@ -279,7 +278,6 @@ impl Pack for Call {
             on_success: Pack::take(packer, input),
             on_failure: Pack::take(packer, input),
             by: Pack::take(packer, input),
-            asked: Pack::take(packer, input),
         }
     }
 }

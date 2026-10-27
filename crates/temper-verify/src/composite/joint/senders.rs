@@ -5,8 +5,9 @@
 //!   source in its context (`resolve_trigger_principal` in the trigger
 //!   dispatcher). Without one: whoever sent its source action, which for a
 //!   reaction from a type outside the model may be any sender.
-//! - A module's answer, or its `on_failure`: `service:wasm-runtime` when the
-//!   call ran in the background, and the caller when it ran inline
+//! - A call's answer, or its `on_failure`: `service:wasm-runtime` for WASM
+//!   and `service:platform-dispatch` for an adapter in the background,
+//!   and the caller when it ran inline
 //!   (`WasmDispatchMode` in `invocation_artifacts.rs`). Only an outside
 //!   caller can ask for inline (`?await_integration`); the kernel's own
 //!   dispatches never do.
@@ -45,6 +46,8 @@ use crate::model::ModelString;
 pub(super) const OUTSIDE: u32 = 0;
 /// The runtime, answering a module call that ran in the background.
 pub(super) const RUNTIME: u32 = 1;
+/// The platform dispatcher, answering an adapter call in the background.
+pub(super) const PLATFORM_DISPATCH: u32 = 2;
 
 /// The senders a model knows, by number, and what Cedar lets each send.
 pub(super) struct Senders {
@@ -97,7 +100,11 @@ impl Senders {
         also: impl IntoIterator<Item = Asker>,
         policies: Option<&SendAnalysis>,
     ) -> Self {
-        let mut askers = vec![Asker::Outside, service("wasm-runtime", BTreeMap::new())];
+        let mut askers = vec![
+            Asker::Outside,
+            service("wasm-runtime", BTreeMap::new()),
+            service("platform-dispatch", BTreeMap::new()),
+        ];
         let declared_in = entities.clone().into_iter().flat_map(|entity| {
             by_name[entity.as_str()]
                 .actions

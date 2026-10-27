@@ -1,9 +1,8 @@
 //! The breadth-first walk over joint states.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::super::JointOutcome;
-use super::super::env::Blind;
 use super::super::pack::Packer;
 use super::super::room::{Bound, Held, MB, bytes, grow};
 use super::super::state::render;
@@ -51,9 +50,6 @@ pub(in crate::composite::joint) struct Explored<'a> {
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
-    /// The answers a call open in a walked state may get that the walk
-    /// never takes, as (entity, action, the record's status).
-    unwalked: BTreeSet<(String, String, String)>,
     /// The memory its tables hold, given back when it is dropped.
     pub(in crate::composite::joint) held: Held<'a>,
 }
@@ -95,28 +91,6 @@ impl Explored<'_> {
         steps.reverse();
         steps
     }
-
-    /// The answers a module may give that the walk never took, each as
-    /// `Entity.Action (from Status, ...)`.
-    pub(in crate::composite::joint) fn unwalked(&self) -> Vec<String> {
-        let mut from: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-        for (entity, action, status) in &self.unwalked {
-            from.entry(format!("{entity}.{action}"))
-                .or_default()
-                .push(status);
-        }
-        from.into_iter()
-            .map(|(action, statuses)| format!("{action} (from {})", statuses.join(", ")))
-            .collect()
-    }
-}
-
-/// Why a walk that never took the answers `unwalked` proves nothing.
-pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
-    format!(
-        "the walk never takes {}: a module whose trigger names no on_success may answer with them, and nothing in the model sends them. Declare them internal if only the module sends them, or name the answer in the trigger's on_success",
-        unwalked.join(", ")
-    )
 }
 
 impl JointModel {
@@ -150,7 +124,6 @@ impl JointModel {
             edges: Vec::new(),
             stopped: None,
             held_back: false,
-            unwalked: BTreeSet::new(),
             held: Held::new(bound),
         };
         // Check the sliced models before either caller can expand a move.
@@ -192,7 +165,6 @@ impl JointModel {
         let mut index = 0;
         'walk: while index < explored.len() {
             let state = explored.state(index);
-            self.note_unwalked(&state, &mut explored.unwalked);
             if visit(index, &state) {
                 break;
             }
@@ -249,25 +221,6 @@ impl JointModel {
             explored.stopped = Some("the joint expansion exhausted its work or time budget".into());
         }
         explored
-    }
-
-    /// Note each answer a call open in `state` may get that the walk never
-    /// takes, as (entity, action, the record's status).
-    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<(String, String, String)>) {
-        for call in state.calls.iter().filter(|call| call.on_success.is_empty()) {
-            let Some(actions) = self.unwalked_answers.get(&call.to) else {
-                continue;
-            };
-            for t in &self.models[&call.to].transitions {
-                if actions.contains(&t.name) && self.enabled(&call.to, t, state, Blind::Nothing) {
-                    unwalked.insert((
-                        call.to.clone(),
-                        t.name.clone(),
-                        state.records[&call.to].status.clone(),
-                    ));
-                }
-            }
-        }
     }
 }
 
@@ -355,7 +308,6 @@ impl JointModel {
             }
             broken.iter().all(Option::is_some)
         });
-        let unwalked = explored.unwalked();
         let outcomes = broken
             .iter()
             .enumerate()
@@ -369,9 +321,6 @@ impl JointModel {
                 None => match &explored.stopped {
                     Some(reason) => JointOutcome::Incomplete {
                         reason: reason.clone(),
-                    },
-                    None if !unwalked.is_empty() => JointOutcome::Incomplete {
-                        reason: unwalked_reason(&unwalked),
                     },
                     None => match premises[i] {
                         Some(premise) if !met[i] => JointOutcome::Vacuous {
