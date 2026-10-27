@@ -951,21 +951,6 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        crate::dbm::postgres_query!(&self.schema,
-            "INSERT INTO {schema}snapshot_history (tenant, entity_type, entity_id, sequence_nr, state) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (tenant, entity_type, entity_id, sequence_nr) \
-             DO UPDATE SET state = $5, created_at = now()",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(entity_id)
-        .bind(sequence_nr as i64)
-        .bind(snapshot)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-
         segments::rotate_after_snapshot(
             &self.schema,
             &mut tx,

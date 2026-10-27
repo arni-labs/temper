@@ -122,8 +122,6 @@ struct SimEventStoreInner {
     journals: BTreeMap<String, Vec<PersistenceEnvelope>>,
     /// Snapshots: persistence_id → (sequence_nr, snapshot_bytes)
     snapshots: BTreeMap<String, (u64, Vec<u8>)>,
-    /// Immutable snapshot history: persistence_id → sequence_nr → snapshot bytes.
-    snapshot_history: BTreeMap<String, BTreeMap<u64, Vec<u8>>>,
     /// Event segment metadata: persistence_id → Vec<SimEventSegment>.
     event_segments: BTreeMap<String, Vec<SimEventSegment>>,
     /// Fault injection RNG.
@@ -222,7 +220,6 @@ impl SimEventStore {
             inner: Arc::new(Mutex::new(SimEventStoreInner {
                 journals: BTreeMap::new(),
                 snapshots: BTreeMap::new(),
-                snapshot_history: BTreeMap::new(),
                 event_segments: BTreeMap::new(),
                 rng: DeterministicRng::new(seed),
                 faults,
@@ -454,15 +451,6 @@ impl SimEventStore {
             .get(persistence_id)
             .cloned()
             .unwrap_or_default()
-    }
-
-    pub fn snapshot_history_len(&self, persistence_id: &str) -> usize {
-        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
-        inner
-            .snapshot_history
-            .get(persistence_id)
-            .map(BTreeMap::len)
-            .unwrap_or(0)
     }
 
     pub fn dump_segments(&self, persistence_id: &str) -> Vec<SimEventSegment> {
@@ -1254,11 +1242,6 @@ impl EventStore for SimEventStore {
         inner
             .snapshots
             .insert(persistence_id.to_string(), (sequence_nr, snapshot.to_vec()));
-        inner
-            .snapshot_history
-            .entry(persistence_id.to_string())
-            .or_default()
-            .insert(sequence_nr, snapshot.to_vec());
         let segments = inner
             .event_segments
             .entry(persistence_id.to_string())

@@ -126,6 +126,46 @@ pub fn translate_actions(automaton: &Automaton) -> Vec<ResolvedAction> {
         .collect()
 }
 
+/// Translate each `[[carry]]` into the move that applies it: from its `from`
+/// state to its target, under its guard, with `var = params.var` for each
+/// counter and flag it sets. The other values it sets reach the record as
+/// the move's params, as any move's params do.
+pub fn translate_carries(automaton: &Automaton) -> Vec<ResolvedAction> {
+    let kinds: BTreeMap<&str, VarKind> = automaton
+        .state
+        .iter()
+        .map(|s| (s.name.as_str(), s.var_type.kind()))
+        .collect();
+    automaton
+        .carry_moves()
+        .into_iter()
+        .map(|(name, carry)| ResolvedAction {
+            name,
+            from_states: vec![carry.from.clone()],
+            to_state: Some(carry.target().to_string()),
+            guard: carry.guard.clone(),
+            effects: carry
+                .set
+                .keys()
+                .filter_map(|var| {
+                    let value = Arg::Param(var.clone());
+                    match kinds.get(var.as_str()) {
+                        Some(VarKind::Counter) => Some(ResolvedEffect::SetCounter {
+                            var: var.clone(),
+                            value,
+                        }),
+                        Some(VarKind::Bool) => Some(ResolvedEffect::SetBool {
+                            var: var.clone(),
+                            value,
+                        }),
+                        _ => None,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Resolve one (already type-checked) effect statement.
 fn resolve_effect(effect: &Effect, kinds: &BTreeMap<&str, VarKind>) -> ResolvedEffect {
     match effect.clone() {
