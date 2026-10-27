@@ -6,10 +6,11 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use temper_runtime::scheduler::sim_now;
 
 use super::field_index::{canonical_projection_status, indexed_projection_fields};
+use super::field_index_rows::sync_field_index;
 use super::unchanged_projections::{
     ExistingProjection, drop_event_counters, projection_hash, store_event_counters,
 };
-use crate::driver::{Transaction, Value, params, params_from_iter};
+use crate::driver::{Transaction, params};
 
 /// One entity's projection, as its events at `sequence_nr` leave it.
 pub(super) struct ProjectionWrite<'a> {
@@ -112,42 +113,8 @@ pub(super) async fn write_projection(
     .await
     .map_err(storage_error)?;
 
-    tx.execute(
-        "DELETE FROM entity_field_index WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-        params![tenant, entity_type, entity_id],
-    )
-    .await
-    .map_err(storage_error)?;
     let indexed = indexed_projection_fields(status, fields);
-    if indexed.is_empty() {
-        return Ok(());
-    }
-    let mut sql = String::from(
-        "INSERT INTO entity_field_index \
-         (tenant, entity_type, entity_id, field_name, field_value, status) VALUES ",
-    );
-    let mut values = Vec::with_capacity(indexed.len() * 6);
-    for (index, (field_name, field_value)) in indexed.iter().enumerate() {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        sql.push_str("(?, ?, ?, ?, ?, ?)");
-        values.push(Value::from(tenant.to_string()));
-        values.push(Value::from(entity_type.to_string()));
-        values.push(Value::from(entity_id.to_string()));
-        values.push(Value::from(field_name.clone()));
-        values.push(
-            field_value
-                .as_ref()
-                .map(|value| Value::from(value.clone()))
-                .unwrap_or(Value::Null),
-        );
-        values.push(Value::from(status.to_string()));
-    }
-    tx.execute(&sql, params_from_iter(values))
-        .await
-        .map_err(storage_error)?;
-    Ok(())
+    sync_field_index(tx, [tenant, entity_type, entity_id], status, &indexed).await
 }
 
 /// Remove an entity's query-plane rows in `tx`.
