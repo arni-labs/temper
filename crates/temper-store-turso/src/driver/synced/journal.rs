@@ -75,3 +75,42 @@ pub(crate) async fn return_to_wal(path: &Path) -> Result<(), DriverError> {
     );
     Ok(())
 }
+
+/// Scratch measurement only: a new file is restored from its remote, then
+/// switched to MVCC on a plain connection before any table exists, so no
+/// sequence or change number has to carry over the switch. A file that
+/// already exists must already be in MVCC mode.
+pub(crate) async fn fresh_into_mvcc(
+    path: &Path,
+    remote_url: &str,
+    auth_token: &str,
+) -> Result<(), DriverError> {
+    if path.exists() {
+        return if is_mvcc(path)? {
+            Ok(())
+        } else {
+            Err(DriverError::SyncSetup(format!(
+                "{} exists in WAL mode; the MVCC measurement needs a new file",
+                path.display()
+            )))
+        };
+    }
+    drop(super::SyncCopy::build(path, remote_url, auth_token).await?);
+    let local = path.to_string_lossy();
+    let db = turso::Builder::new_local(&local).build().await?;
+    let conn = db.connect()?;
+    let mut rows = conn.query("PRAGMA journal_mode = 'mvcc'", ()).await?;
+    let mode = match rows.next().await? {
+        Some(row) => row.get::<String>(0)?,
+        None => String::new(),
+    };
+    drop(rows);
+    if !mode.eq_ignore_ascii_case("mvcc") {
+        return Err(DriverError::SyncSetup(format!(
+            "{} did not switch to MVCC (journal mode now {mode})",
+            path.display()
+        )));
+    }
+    tracing::warn!(path = %path.display(), "turso.sync a new file is in MVCC mode");
+    Ok(())
+}

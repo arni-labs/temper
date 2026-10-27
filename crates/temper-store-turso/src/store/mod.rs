@@ -239,10 +239,12 @@ impl TursoEventStore {
         // PRAGMAs are SQLite-specific and not supported on remote Turso Cloud.
         // Turso Cloud manages its own journal mode and concurrency.
         if !self.is_remote {
-            let _ = conn
-                .query("PRAGMA journal_mode=WAL", ())
-                .await
-                .map_err(storage_error)?;
+            if !crate::driver::concurrent_writes() {
+                let _ = conn
+                    .query("PRAGMA journal_mode=WAL", ())
+                    .await
+                    .map_err(storage_error)?;
+            }
             let _ = conn
                 .query("PRAGMA busy_timeout=30000", ())
                 .await

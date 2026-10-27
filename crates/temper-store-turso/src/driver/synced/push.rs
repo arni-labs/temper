@@ -24,9 +24,36 @@ impl SyncCopy {
     /// log, so an answer waits only for its own changes; the background loop
     /// trims (`TursoEventStore::trim_change_log`).
     pub async fn push_committed(&self) -> Result<(), PersistenceError> {
-        // Changes are numbered in commit order (one writer at a time), so
-        // everything this caller committed is at or below `wanted`.
-        let wanted = self.last_change().await?;
+        if !crate::driver::concurrent_writes() {
+            // Changes are numbered in commit order (one writer at a time), so
+            // everything this caller committed is at or below `wanted`.
+            let wanted = self.last_change().await?;
+            return self.push_once(wanted).await;
+        }
+        // Scratch measurement, MVCC: a transaction numbers its changes as it
+        // writes, so one still open can hold a number below this caller's.
+        // The engine sends only up to the lowest open one, and its record
+        // says how far it got: push until that record reaches this caller's
+        // newest row change (a commit record is never what it reports).
+        let wanted = self.last_row_change().await?;
+        let deadline = Instant::now() + PUSH_ATTEMPT_TIMEOUT;
+        loop {
+            self.push_once(wanted).await?;
+            if self.inner.pushed.load(Ordering::Acquire) >= wanted {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PersistenceError::Storage(format!(
+                    "turso.sync push reached {} of {wanted} in {} s",
+                    self.inner.pushed.load(Ordering::Acquire),
+                    PUSH_ATTEMPT_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn push_once(&self, wanted: i64) -> Result<(), PersistenceError> {
         let _pushing = self.inner.pushing.lock().await;
         self.require_copying()?;
         if self.inner.pushed.load(Ordering::Acquire) >= wanted {
@@ -83,8 +110,30 @@ impl SyncCopy {
             ));
             return self.require_copying();
         }
+        let covered = if crate::driver::concurrent_writes() {
+            remote_has
+        } else {
+            covered
+        };
         self.inner.pushed.fetch_max(covered, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Scratch measurement: the newest committed row change, not counting
+    /// the commit records between them.
+    async fn last_row_change(&self) -> Result<i64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query("SELECT MAX(change_id) FROM turso_cdc WHERE change_type <> 2", ())
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(0);
+        };
+        Ok(row
+            .get::<Option<i64>>(0)
+            .map_err(storage_error)?
+            .unwrap_or(0))
     }
 
     /// The remote's record of this file's last push before the next one.

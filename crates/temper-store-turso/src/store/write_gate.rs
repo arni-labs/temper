@@ -58,7 +58,11 @@ pub(super) struct WriteGate {
 impl WriteGate {
     pub(super) fn new() -> Self {
         Self {
-            permit: Arc::new(Semaphore::new(1)),
+            permit: Arc::new(Semaphore::new(if crate::driver::concurrent_writes() {
+                64
+            } else {
+                1
+            })),
             high_waiting: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
         }

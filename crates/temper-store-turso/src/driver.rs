@@ -22,6 +22,13 @@ use synced::ConnectionPool;
 pub(crate) use synced::TrimWriters;
 pub use synced::{CopyState, SyncCopy};
 
+/// Scratch measurement only: `TEMPER_TURSO_MVCC=1` opens a fresh synced file in
+/// MVCC mode and writes in `BEGIN CONCURRENT` transactions.
+pub(crate) fn concurrent_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TEMPER_TURSO_MVCC").as_deref() == Ok("1"))
+}
+
 /// Driver failures retain the original engine or transport error.
 #[derive(Debug, Error)]
 pub(crate) enum DriverError {
@@ -164,7 +171,11 @@ impl Connection {
                     DriverHandle::new(
                         turso::transaction::Transaction::new_unchecked(
                             conn,
-                            turso::transaction::TransactionBehavior::Immediate,
+                            if concurrent_writes() {
+                                turso::transaction::TransactionBehavior::Concurrent
+                            } else {
+                                turso::transaction::TransactionBehavior::Immediate
+                            },
                         )
                         .await?,
                     ),

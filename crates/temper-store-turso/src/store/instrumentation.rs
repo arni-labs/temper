@@ -87,7 +87,19 @@ impl WriteConnection {
         params: impl turso_serverless::params::IntoParams + Send,
     ) -> Result<u64, crate::driver::DriverError> {
         let start = Instant::now();
-        let result = self.conn.inner.execute(sql, params).await;
+        let result = if crate::driver::concurrent_writes() && writes_rows(sql) {
+            // In MVCC mode an autocommit write is an exclusive transaction:
+            // it waits for every open one. A concurrent one runs beside them.
+            async {
+                let tx = self.conn.inner.begin_immediate().await?;
+                let changed = tx.execute(sql, params).await?;
+                tx.commit().await?;
+                Ok(changed)
+            }
+            .await
+        } else {
+            self.conn.inner.execute(sql, params).await
+        };
         record_turso_query_duration(start.elapsed(), "execute", "connection", result.is_ok());
         result
     }
@@ -99,6 +111,13 @@ impl WriteConnection {
     > + Send {
         self.conn.inner.begin_immediate()
     }
+}
+
+fn writes_rows(sql: &str) -> bool {
+    let head = sql.trim_start().get(..7).unwrap_or("").to_ascii_uppercase();
+    ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+        .iter()
+        .any(|verb| head.starts_with(verb))
 }
 
 /// A connection that may write may also read.

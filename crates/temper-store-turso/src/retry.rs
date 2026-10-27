@@ -71,6 +71,9 @@ pub(crate) fn is_transient_write_error(err_msg: &str) -> bool {
         || lower.contains("connection reset")
         || lower.contains("broken pipe")
         || lower.contains("try again")
+        // Scratch measurement, MVCC: a concurrent transaction lost to another
+        // that wrote the same row first; the retry runs on fresh state.
+        || lower.contains("write-write conflict")
 }
 
 /// Extract the stringified cause from a `PersistenceError` for transient
