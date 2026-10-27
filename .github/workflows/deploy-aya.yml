@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false   # let an in-flight deploy+verify finish before the next
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     # A hung verify must not block every later release (cancel-in-progress is false).
     timeout-minutes: 30
     environment: production

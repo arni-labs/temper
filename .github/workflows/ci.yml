@@ -55,7 +55,7 @@ jobs:
   # ─────────────────────────────────────────────────────
   changes:
     name: Changed packages
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     outputs:
       lane: ${{ steps.affected.outputs.lane }}
       mode: ${{ steps.affected.outputs.mode }}
@@ -84,7 +84,7 @@ jobs:
   check:
     name: Compile & Lint
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -134,7 +134,7 @@ jobs:
   # ─────────────────────────────────────────────────────
   sdk-ts:
     name: TypeScript SDK
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     defaults:
       run:
         working-directory: packages/temper-sdk-ts
@@ -157,7 +157,7 @@ jobs:
   bench-build:
     name: Bench Build
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     if: needs.changes.outputs.lane == 'full'
     timeout-minutes: 45
     env:
@@ -198,7 +198,7 @@ jobs:
   # ─────────────────────────────────────────────────────
   integrity:
     name: Integrity & DST Patterns
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     steps:
       - uses: actions/checkout@v4
 
@@ -309,7 +309,7 @@ jobs:
     name: Tests (${{ matrix.name }})
     needs: changes
     if: needs.changes.outputs.lane == 'pr' && needs.changes.outputs.mode != 'none'
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -410,7 +410,7 @@ jobs:
     name: Tests
     needs: [changes, test-shards]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     timeout-minutes: 60
     # Tests that need a database run or fail in CI (crates/temper-test-resource), so
     # every machine that runs them has one. Each test isolates itself by a unique tenant
@@ -548,7 +548,7 @@ jobs:
     name: Postgres rollback migrations
     needs: changes
     if: needs.changes.outputs.packages != ''
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     timeout-minutes: 45
     services:
       postgres:
@@ -623,7 +623,7 @@ jobs:
   dst-matrix-setup:
     name: DST matrix setup
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
@@ -648,7 +648,7 @@ jobs:
   dst-platform-tests:
     name: DST/Platform Tests (${{ matrix.suite }}${{ matrix.shard_count && format(' {0}/{1}', matrix.shard_index, matrix.shard_count) || '' }})
     needs: [changes, dst-matrix-setup]
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -717,7 +717,7 @@ jobs:
   verify-specs:
     name: Spec Verification (L0-L3)
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     timeout-minutes: 30
     env:
       FULL_LANE: ${{ needs.changes.outputs.lane == 'full' }}
@@ -781,7 +781,7 @@ jobs:
   instrumentation-hygiene:
     name: Instrumentation Hygiene (ADR-0052)
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     env:
       RUST_CHANGED: ${{ needs.changes.outputs.rust }}
     steps:

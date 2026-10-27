@@ -9,7 +9,7 @@ on:
 jobs:
   badges:
     name: Update Badges
-    runs-on: ubuntu-latest
+    runs-on: arni-ubuntu-4core
     if: github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
