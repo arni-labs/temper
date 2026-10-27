@@ -37,6 +37,7 @@ pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> 
     let mut initial_counters = BTreeMap::new();
     let mut initial_booleans = BTreeMap::new();
     let mut initial_lists = BTreeMap::new();
+    let mut initial_strings = BTreeMap::new();
     let mut counter_bounds = BTreeMap::new();
 
     for sv in &automaton.state {
@@ -51,8 +52,10 @@ pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> 
             Initial::List(items) => {
                 initial_lists.insert(sv.name.clone(), items.clone());
             }
-            // Strings and ints are not modeled.
-            Initial::String(_) | Initial::Int(_) => {}
+            Initial::String(value) => {
+                initial_strings.insert(sv.name.clone(), value.clone());
+            }
+            Initial::Int(_) => {}
         }
     }
 
@@ -99,6 +102,7 @@ pub fn build_model_from_automaton(automaton: &Automaton, max_counter: usize) -> 
         initial_counters,
         initial_booleans,
         initial_lists,
+        initial_strings,
         counter_bounds,
         default_max_counter: max_counter,
         list_literals: list_literals(automaton),

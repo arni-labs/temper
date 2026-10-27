@@ -225,6 +225,9 @@ pub struct TemperModel {
     pub(crate) initial_booleans: BTreeMap<String, bool>,
     /// Initial list values from [[state]] declarations.
     pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
+    /// Declared string defaults used to resolve reaction target ids. IOA
+    /// effects cannot assign strings; guards still treat them as unknown.
+    pub(crate) initial_strings: BTreeMap<String, String>,
     /// Per-counter upper bounds for bounded exploration.
     pub(crate) counter_bounds: BTreeMap<String, usize>,
     /// Default upper bound for counters not in counter_bounds.

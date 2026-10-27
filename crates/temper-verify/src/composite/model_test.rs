@@ -203,11 +203,20 @@ fn a_long_cascade_of_distinct_steps_runs_to_its_end_on_a_small_thread() {
 
 #[test]
 fn a_created_child_runs_before_the_next_made_step_repeats() {
-    for (resolver, child_action, expected_runs) in [
-        ("same_id", "Sprout", 1),
-        ("create", "Sprout", 2),
-        ("create", "Grow", 2),
+    for (resolver, child_action, child_id, expected_runs) in [
+        ("same_id", "Sprout", "", 1),
+        ("create", "Sprout", "", 2),
+        ("create", "Grow", "", 2),
+        ("create_if_missing", "Sprout", "", 2),
+        ("create_if_missing", "Grow", "", 2),
+        ("create_if_missing", "Sprout", "original", 1),
+        ("create_if_missing", "Grow", "original", 1),
     ] {
+        let id_field = if resolver == "create_if_missing" {
+            r#", id_field = "child_id""#
+        } else {
+            ""
+        };
         let seed = parse_automaton(&format!(
             r#"
 [automaton]
@@ -215,6 +224,11 @@ name = "Seed"
 states = ["Sown"]
 initial = "Sown"
 allow_indefinite_states = ["Sown"]
+
+[[state]]
+name = "child_id"
+type = "string"
+initial = "{child_id}"
 
 [[state]]
 name = "sprouts"
@@ -232,7 +246,7 @@ name = "sprout_again"
 kind = "entity"
 target_entity = "Seed"
 target_action = "{child_action}"
-resolve_target = {{ kind = "{resolver}" }}
+resolve_target = {{ kind = "{resolver}"{id_field} }}
 
 [[action.triggers]]
 name = "record_sprout"
@@ -292,11 +306,11 @@ effect = ["records += 1"]
         // next made step. Both admitted actions must fire their reactions.
         assert_eq!(
             after.entities["Seed"].counters["sprouts"], expected_runs,
-            "{resolver} {child_action}: effects of admitted Sprout actions"
+            "{resolver} {child_action} with id {child_id:?}: effects of admitted Sprout actions"
         );
         assert_eq!(
             after.entities["Observer"].counters["records"], expected_runs,
-            "{resolver} {child_action}: downstream reactions of admitted Sprout actions"
+            "{resolver} {child_action} with id {child_id:?}: downstream reactions of admitted Sprout actions"
         );
         assert!(after.dropped.is_none());
     }
