@@ -22,17 +22,32 @@ const CASCADE_SEGMENT_BYTES: usize = 1024 * 1024;
 /// entity the chain found and one it made are distinct, as in the runtime's
 /// `InlineChain`. A create admits the first made step; another create of the
 /// same type and action repeats it even though production mints a new id.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(super) struct CascadeStep {
     pub(super) entity_type: String,
-    pub(super) entity: CascadeEntity,
+    pub(super) id_origin: CascadeIdOrigin,
     pub(super) action: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CascadeEntity {
-    Found,
-    Made,
+/// Where the current id came from. A cross-type `same_id` reference keeps
+/// this origin, but only the type the id was generated for is a made entity.
+#[derive(Clone)]
+pub(super) enum CascadeIdOrigin {
+    Read,
+    GeneratedFor(String),
+}
+
+impl CascadeStep {
+    fn repeats(&self, taken: &Self) -> bool {
+        self.entity_type == taken.entity_type
+            && self.action == taken.action
+            && self.is_made() == taken.is_made()
+    }
+
+    fn is_made(&self) -> bool {
+        matches!(&self.id_origin, CascadeIdOrigin::GeneratedFor(entity_type)
+            if entity_type == &self.entity_type)
+    }
 }
 
 impl CompositeTemperModel {
@@ -70,13 +85,13 @@ impl CompositeTemperModel {
             {
                 continue;
             }
-            let entity = self.target_identity(edge, chain);
+            let id_origin = self.target_id_origin(edge, chain);
             let step = CascadeStep {
                 entity_type: edge.to.clone(),
-                entity,
+                id_origin,
                 action: edge.target_action.clone(),
             };
-            if chain.contains(&step) {
+            if chain.iter().any(|taken| step.repeats(taken)) {
                 continue;
             }
             // Find target entity + model
@@ -151,29 +166,28 @@ impl CompositeTemperModel {
         }
     }
 
-    /// Resolve the identity production uses for the repeat check. A supplied
-    /// id addresses the found slice; only a generated id makes a new one.
-    /// `same_id` on the source type keeps the current source's identity.
-    fn target_identity(&self, edge: &TriggerEdge, chain: &[CascadeStep]) -> CascadeEntity {
+    /// Keep the id's origin through `same_id` hops, including other types:
+    /// Seed(g) -> Relay(g) -> Seed(g) must return to the same made Seed.
+    /// A supplied id addresses the found slice; generating an id starts a
+    /// new origin for the target type.
+    fn target_id_origin(&self, edge: &TriggerEdge, chain: &[CascadeStep]) -> CascadeIdOrigin {
         match &edge.resolve_target {
-            TargetResolver::Create => CascadeEntity::Made,
+            TargetResolver::Create => CascadeIdOrigin::GeneratedFor(edge.to.clone()),
             TargetResolver::CreateIfMissing { id_field } => {
                 let supplied = self.models[&edge.from]
                     .initial_strings
                     .get(id_field)
                     .is_some_and(|id| !id.is_empty());
                 if supplied {
-                    CascadeEntity::Found
+                    CascadeIdOrigin::Read
                 } else {
-                    CascadeEntity::Made
+                    CascadeIdOrigin::GeneratedFor(edge.to.clone())
                 }
             }
-            TargetResolver::SameId if edge.from == edge.to => chain
+            TargetResolver::SameId => chain
                 .last()
-                .map_or(CascadeEntity::Found, |step| step.entity),
-            TargetResolver::SameId
-            | TargetResolver::Field { .. }
-            | TargetResolver::Static { .. } => CascadeEntity::Found,
+                .map_or(CascadeIdOrigin::Read, |step| step.id_origin.clone()),
+            TargetResolver::Field { .. } | TargetResolver::Static { .. } => CascadeIdOrigin::Read,
         }
     }
 }

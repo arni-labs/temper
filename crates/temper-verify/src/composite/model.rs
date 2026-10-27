@@ -31,7 +31,7 @@ use temper_spec::predicate::{Env, Expr, Val, eval};
 use super::CompositeVerificationPlan;
 
 mod cascade;
-use cascade::{CascadeEntity, CascadeStep};
+use cascade::{CascadeIdOrigin, CascadeStep};
 
 /// A cross-entity reaction that was dropped because its target action was
 /// not enabled from the target entity's state at dispatch time (ADR-0150).
@@ -356,7 +356,7 @@ impl Model for CompositeTemperModel {
         // first dropped reaction (if any) into `next.dropped`.
         let mut chain = vec![CascadeStep {
             entity_type: action.entity.clone(),
-            entity: CascadeEntity::Found,
+            id_origin: CascadeIdOrigin::Read,
             action: action.action.name.clone(),
         }];
         self.cascade(

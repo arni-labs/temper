@@ -315,3 +315,149 @@ effect = ["records += 1"]
         assert!(after.dropped.is_none());
     }
 }
+
+#[test]
+fn a_made_step_returning_through_another_type_runs_once() {
+    let after = cross_type_same_id_cascade("");
+
+    // Seed(original).Start -> Seed(g).Grow -> Relay(g).Forward -> Seed(g).Grow.
+    // The returning Seed is still made: its second Grow and its reactions
+    // must be stopped, just as production's InlineChain stops them.
+    assert_eq!(after.entities["Seed"].counters["growths"], 1);
+    assert_eq!(after.entities["Observer"].counters["records"], 1);
+    assert_eq!(after.entities["Relay"].counters["forwards"], 1);
+    assert!(after.dropped.is_none());
+}
+
+#[test]
+fn a_new_create_after_cross_type_same_id_starts_its_own_id_origin() {
+    let after = cross_type_same_id_cascade(
+        r#"
+[[action.triggers]]
+name = "make_relay"
+kind = "entity"
+target_entity = "Relay"
+target_action = "Forward"
+resolve_target = { kind = "create" }
+"#,
+    );
+
+    // Relay(g) is found even though Seed(g) is made, so making Relay(h)
+    // admits a second Forward. Seed(h) is found too: the new id's origin
+    // must not inherit Seed(g)'s made identity and suppress its first Grow.
+    assert_eq!(after.entities["Relay"].counters["forwards"], 2);
+    assert_eq!(after.entities["Seed"].counters["growths"], 2);
+    assert_eq!(after.entities["Observer"].counters["records"], 2);
+    assert!(after.dropped.is_none());
+}
+
+fn cross_type_same_id_cascade(relay_trigger: &str) -> CompositeState {
+    let seed = parse_automaton(
+        r#"
+[automaton]
+name = "Seed"
+states = ["Sown"]
+initial = "Sown"
+allow_indefinite_states = ["Sown"]
+
+[[state]]
+name = "growths"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Start"
+from = ["Sown"]
+to = "Sown"
+
+[[action.triggers]]
+name = "make_seed"
+kind = "entity"
+target_entity = "Seed"
+target_action = "Grow"
+resolve_target = { kind = "create" }
+
+[[action]]
+name = "Grow"
+from = ["Sown"]
+to = "Sown"
+effect = ["growths += 1"]
+
+[[action.triggers]]
+name = "record_growth"
+kind = "entity"
+target_entity = "Observer"
+target_action = "Record"
+resolve_target = { kind = "same_id" }
+
+[[action.triggers]]
+name = "forward_growth"
+kind = "entity"
+target_entity = "Relay"
+target_action = "Forward"
+resolve_target = { kind = "same_id" }
+"#,
+    )
+    .unwrap();
+    let relay = parse_automaton(&format!(
+        r#"
+[automaton]
+name = "Relay"
+states = ["Ready"]
+initial = "Ready"
+allow_indefinite_states = ["Ready"]
+
+[[state]]
+name = "forwards"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Forward"
+from = ["Ready"]
+to = "Ready"
+effect = ["forwards += 1"]
+
+[[action.triggers]]
+name = "return_to_seed"
+kind = "entity"
+target_entity = "Seed"
+target_action = "Grow"
+resolve_target = {{ kind = "same_id" }}
+
+{relay_trigger}
+"#,
+    ))
+    .unwrap();
+    let observer = parse_automaton(
+        r#"
+[automaton]
+name = "Observer"
+states = ["Watching"]
+initial = "Watching"
+allow_indefinite_states = ["Watching"]
+
+[[state]]
+name = "records"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Record"
+from = ["Watching"]
+to = "Watching"
+effect = ["records += 1"]
+"#,
+    )
+    .unwrap();
+    let plan = CompositeVerificationPlan::new(&[&seed, &relay, &observer], "Seed").unwrap();
+    let model = CompositeTemperModel::from_plan(plan);
+    let init = &model.init_states()[0];
+    let mut actions = Vec::new();
+    model.actions(init, &mut actions);
+    let start = actions
+        .into_iter()
+        .find(|a| a.entity == "Seed" && a.action.name == "Start")
+        .unwrap();
+    model.next_state(init, start).unwrap()
+}
