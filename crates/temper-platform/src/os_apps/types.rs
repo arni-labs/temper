@@ -35,10 +35,43 @@ pub struct InstallResult {
     /// Seed data instances created.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub seed_instances: Vec<String>,
-    /// Rules over several entities the install check could not prove, with
-    /// why. A warning: only a rule found broken refuses an install.
+    /// What the install's checks found and did not refuse.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unproved_rules: Vec<String>,
+    pub warnings: Vec<InstallWarning>,
+}
+
+/// Something an install's checks found and did not refuse.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InstallWarning {
+    /// The check that found it, such as `spec_change`.
+    pub check: String,
+    /// What it found, in words.
+    pub message: String,
+    /// What it found as data, when the check gives any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl InstallWarning {
+    /// A warning from the spec change check (see temper-server's
+    /// `spec_change`).
+    pub fn spec_change(message: String) -> Self {
+        Self {
+            check: "spec_change".to_string(),
+            message,
+            detail: None,
+        }
+    }
+
+    /// A rule over several entities the install check could not prove,
+    /// with why: only a rule found broken refuses an install.
+    pub fn joint_invariants(message: String) -> Self {
+        Self {
+            check: "joint_invariants".to_string(),
+            message,
+            detail: None,
+        }
+    }
 }
 
 /// Component phases an OS-app install/reconcile should execute.

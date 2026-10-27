@@ -866,6 +866,16 @@ pub async fn handle_odata_post(
                 Err(resp) => return *resp,
             };
 
+            if temper_spec::automaton::is_carry_move(action.rsplit('.').next().unwrap_or(&action)) {
+                return odata_error(
+                    StatusCode::FORBIDDEN,
+                    "PlatformMove",
+                    "A [[carry]] move is made only by the platform, when it installs a new \
+                     version of the spec",
+                )
+                .into_response();
+            }
+
             if state.is_pg_actor_backed(&tenant, &entity_type) {
                 let Some(actor_sys) = &state.pg_actor_system else {
                     return odata_error(

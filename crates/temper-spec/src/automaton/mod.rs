@@ -33,7 +33,9 @@ pub use parser::{
     LivenessEnforcement, LivenessViolationReporter, parse_automaton, parse_automaton_with_liveness,
     set_liveness_violation_reporter, to_state_machine,
 };
-pub use translate::{ResolvedAction, ResolvedEffect, dispatch_effects, translate_actions};
+pub use translate::{
+    ResolvedAction, ResolvedEffect, dispatch_effects, translate_actions, translate_carries,
+};
 pub use trigger_graph::{TriggerEdge, TriggerGraph};
 pub use types::*;
 

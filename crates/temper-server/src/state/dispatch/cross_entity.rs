@@ -1,5 +1,5 @@
 use crate::request_context::AgentContext;
-use temper_jit::table::{Related, RelatedMap};
+use temper_jit::table::{Related, RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
@@ -20,17 +20,16 @@ impl crate::state::ServerState {
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        let mut result = RelatedMap::new();
         let table = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
-                return result;
+                return RelatedMap::new();
             };
             spec.table()
         };
         let refs = table.related_refs(action);
         if refs.is_empty() {
-            return result;
+            return RelatedMap::new();
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -39,12 +38,26 @@ impl crate::state::ServerState {
             .await
         {
             Ok(resp) => resp.state.fields,
-            Err(_) => return result,
+            Err(_) => return RelatedMap::new(),
         };
+        self.related_statuses_of(tenant, &table, refs, &current_fields)
+            .await
+    }
 
+    /// The statuses of the records `fields` refers to through each of
+    /// `refs`, `(related type, id field)`, under `table`'s declared defaults,
+    /// as [`Self::resolve_related_statuses`] resolves them.
+    pub(in crate::state) async fn related_statuses_of(
+        &self,
+        tenant: &TenantId,
+        table: &TransitionTable,
+        refs: Vec<(String, String)>,
+        fields: &serde_json::Value,
+    ) -> RelatedMap {
+        let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
             let ids = crate::entity_actor::related::reference_ids(
-                &current_fields,
+                fields,
                 &table.initial_values,
                 &id_field,
             );
