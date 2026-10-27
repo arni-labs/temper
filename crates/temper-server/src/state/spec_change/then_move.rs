@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use temper_authz::{AuthzDecision, AuthzEngine, CARRY_MOVE_CONTEXT};
+use temper_authz::{AuthzDecision, AuthzEngine, platform_keys};
 use temper_runtime::tenant::TenantId;
 
 use crate::request_context::AgentContext;
@@ -36,7 +36,7 @@ pub(super) fn then_maker(
         .as_mut()
         .expect("a service context carries its security context");
     security.context_attrs.insert(
-        CARRY_MOVE_CONTEXT.to_string(),
+        platform_keys::CARRY_MOVE.to_string(),
         Value::String(carry_move.to_string()),
     );
     if let Some(user) = user {
