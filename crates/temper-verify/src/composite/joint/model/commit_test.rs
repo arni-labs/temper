@@ -31,7 +31,7 @@ effect = ["total += params.amount"]
     .unwrap();
     let model = JointModel::new(
         &BTreeMap::from([("Total", &spec)]),
-        ["Total".to_string()].into(),
+        &std::collections::BTreeSet::from(["Total".to_string()]),
         "Total",
         &[],
         Sending::anyone(),

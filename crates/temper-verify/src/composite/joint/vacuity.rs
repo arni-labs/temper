@@ -5,21 +5,17 @@
 //! saying anything. The walk does not pass such a rule, and neither does a
 //! proof. The solver answers first ([`RuleProof::premise_excluded`]): when no
 //! state the proof covers meets the premise, no run does. Otherwise a state
-//! that meets it is looked for on the joint model, walked as the rule's own
+//! that meets it is looked for on the rule's own joint model, walked as its
 //! walk would walk it, stopping at the first; it costs the states up to it,
 //! never more than the rule's full walk.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use temper_authz::SendAnalysis;
-use temper_spec::automaton::{Automaton, Invariant, Liveness};
 use temper_spec::predicate::{Expr, Truth, eval};
 
-use super::liveness::liveness_model;
 use super::model::{JointModel, unwalked_reason};
-use super::{invariants_model, premise};
-use crate::Budget;
+use super::premise;
+use super::room::Bound;
 use crate::induct::RuleProof;
 
 /// Whether a run meets a rule's premise.
@@ -28,7 +24,7 @@ pub enum Premise {
     /// The rule has none.
     None,
     /// A walked state meets it: the joint states walked to find one, and
-    /// how long building and walking the model took.
+    /// how long the walk took.
     Met { states: usize, took: Duration },
     /// The proof shows no state meets it.
     Excluded { premise: String },
@@ -45,59 +41,45 @@ impl Premise {
     }
 }
 
-/// For each of `owner`'s proved invariants `rules`, whether a settled state
-/// of their walk meets its premise.
-pub(super) fn invariant_premises(
-    by_name: &BTreeMap<&str, &Automaton>,
+/// Whether a settled state of the walk of `owner`'s proved invariant `rule`
+/// meets its premise, `model` being that walk's model.
+pub(super) fn premise_met(
+    model: &Result<JointModel, String>,
     owner: &str,
-    rules: &[(&Invariant, &RuleProof)],
-    policies: Option<&SendAnalysis>,
-    budget: Budget,
-) -> Vec<Premise> {
-    let mut premises: Vec<Option<Premise>> = rules
-        .iter()
-        .map(|(rule, proof)| unwalked(&rule.assert, proof))
-        .collect();
-    let walked: Vec<&Expr> = rules
-        .iter()
-        .zip(&premises)
-        .filter(|(_, known)| known.is_none())
-        .map(|((rule, _), _)| &rule.assert)
-        .collect();
-    if !walked.is_empty() {
-        let start = Instant::now();
-        let mut found = match invariants_model(by_name, owner, &walked, policies) {
-            Ok(model) => seek(&model, owner, &walked, true, budget, start),
-            Err((_, missing)) => walked.iter().map(|r| undeclared(r, &missing)).collect(),
-        }
-        .into_iter();
-        for known in premises.iter_mut().filter(|known| known.is_none()) {
-            *known = found.next();
-        }
-    }
-    premises
-        .into_iter()
-        .map(|known| known.expect("each walked rule has an answer"))
-        .collect()
+    rule: &Expr,
+    proof: &RuleProof,
+    bound: Bound<'_>,
+) -> Premise {
+    seek_premise(model, owner, rule, proof, true, bound)
 }
 
-/// Whether a state of the walk of `owner`'s proved `live` rule, whose
-/// condition is `goal`, meets the condition's premise.
-pub(super) fn liveness_premise(
-    by_name: &BTreeMap<&str, &Automaton>,
+/// Whether a state of the walk of `owner`'s proved `eventually` rule, whose
+/// condition is `goal`, meets the condition's premise, `model` being that
+/// walk's model.
+pub(super) fn premise_reached(
+    model: &Result<JointModel, String>,
     owner: &str,
-    (live, goal): (&Liveness, &Expr),
+    goal: &Expr,
     proof: &RuleProof,
-    policies: Option<&SendAnalysis>,
-    budget: Budget,
+    bound: Bound<'_>,
 ) -> Premise {
-    if let Some(known) = unwalked(goal, proof) {
+    seek_premise(model, owner, goal, proof, false, bound)
+}
+
+fn seek_premise(
+    model: &Result<JointModel, String>,
+    owner: &str,
+    rule: &Expr,
+    proof: &RuleProof,
+    settled: bool,
+    bound: Bound<'_>,
+) -> Premise {
+    if let Some(known) = unwalked(rule, proof) {
         return known;
     }
-    let start = Instant::now();
-    match liveness_model(by_name, owner, live, goal, policies) {
-        Ok(model) => seek(&model, owner, &[goal], false, budget, start).remove(0),
-        Err((_, missing)) => undeclared(goal, &missing),
+    match model {
+        Ok(model) => seek(model, owner, &[rule], settled, bound).remove(0),
+        Err(reason) => undeclared(rule, reason),
     }
 }
 
@@ -114,33 +96,29 @@ fn unwalked(rule: &Expr, proof: &RuleProof) -> Option<Premise> {
 }
 
 /// A rule that reads types the app does not declare is not walked.
-fn undeclared(rule: &Expr, missing: &[String]) -> Premise {
+fn undeclared(rule: &Expr, reason: &str) -> Premise {
     match premise(rule) {
         Some(premise) => Premise::Unknown {
             premise: premise.to_string(),
-            reason: format!(
-                "it reads {}, which this app does not declare",
-                missing.join(", ")
-            ),
+            reason: reason.to_string(),
         },
         None => Premise::None,
     }
 }
 
 /// Walk `model` until a state meets each rule's premise, a settled one when
-/// `settled`, as the walks read invariants and liveness. `start` is when
-/// building the model began.
+/// `settled`, as the walks read invariants and liveness.
 fn seek(
     model: &JointModel,
     owner: &str,
     rules: &[&Expr],
     settled: bool,
-    budget: Budget,
-    start: Instant,
+    bound: Bound<'_>,
 ) -> Vec<Premise> {
+    let start = Instant::now();
     let premises: Vec<Option<&Expr>> = rules.iter().map(|rule| premise(rule)).collect();
     let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
-    let explored = model.walk_with(budget, false, |_, state| {
+    let explored = model.walk_with(bound, false, |_, state| {
         if !settled || state.settled() {
             let env = model.env(owner, state);
             for (met, premise) in met.iter_mut().zip(&premises) {

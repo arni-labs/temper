@@ -238,7 +238,7 @@ pub struct ResolvedLiveness {
 /// data needed to implement the `Model` trait efficiently. Invariant data is
 /// stored here (rather than captured in closures) because Stateright's
 /// `Property::always` requires a bare `fn` pointer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TemperModel {
     /// All valid status values from the specification.
     pub states: Vec<String>,

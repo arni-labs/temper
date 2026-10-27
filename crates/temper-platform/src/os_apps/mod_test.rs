@@ -900,6 +900,7 @@ mod directed_evolution;
 #[path = "mod_test/policy_joint.rs"]
 mod policy_joint;
 mod policy_reinstall;
+mod unproven_rule;
 #[test]
 fn test_get_app_project_management() {
     let bundle = get_os_app("project-management");

@@ -7,13 +7,12 @@
 //! Install reuses [`crate::bootstrap::bootstrap_tenant_specs`] so every app goes through the same verification cascade as system specs.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
 use temper_runtime::tenant::TenantId;
-use temper_server::state::WasmModuleSource;
 use temper_spec::automaton;
 use temper_spec::csdl::{emit_csdl_xml, merge_csdl, parse_csdl};
 
@@ -27,10 +26,12 @@ mod entity_aliases;
 mod install_checks;
 mod install_guard;
 mod policy_rows;
+mod proofs;
 mod reconcile;
 mod runtime_heal;
 mod system_files;
 mod types;
+mod wasm_replacement;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
     add_os_apps_dir, add_os_apps_dir_preferred, list_startup_os_apps, reload_os_apps,
@@ -55,6 +56,7 @@ pub(crate) use runtime_heal::{
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
 };
 pub use types::*;
+use wasm_replacement::{UploadedWasmReplacementContext, uploaded_wasm_replacement_context};
 
 fn read_app_manifest(app_dir: &Path) -> Option<AppManifest> {
     let path = app_dir.join("app.toml");
@@ -1107,6 +1109,27 @@ pub(super) async fn install_os_app_with_plan(
     app_name: &str,
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
+    // A proof that is still walking is waited for without the tenant's
+    // install lock; the install then starts again under it and finds the
+    // verdict, or a new walk when the tenant changed meanwhile.
+    let mut attempt = proofs::Attempt::default();
+    loop {
+        match install_once(state, tenant, app_name, plan, &mut attempt).await? {
+            ControlFlow::Break(result) => return Ok(result),
+            ControlFlow::Continue(proof) => proof.ended(&mut attempt).await?,
+        }
+    }
+}
+
+/// One try at an install: done, or the proof it must wait for. Everything
+/// before the proof only reads, so a try that waits leaves nothing behind.
+async fn install_once(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    plan: OsAppInstallPlan,
+    attempt: &mut proofs::Attempt,
+) -> Result<ControlFlow<InstallResult, proofs::Wait>, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
     let mut install = install_guard::tenant(&state.server, tenant).await;
     let app_dir = {
@@ -1228,8 +1251,20 @@ pub(super) async fn install_os_app_with_plan(
         combined_policy.as_deref(),
     )?;
     let policies = combined_policy.as_deref();
-    let unproved_rules =
-        install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies).await?;
+    let unproved_rules = match install_checks::prove(
+        state,
+        tenant,
+        app_name,
+        &bundle.specs,
+        new_specs,
+        policies,
+        attempt,
+    )
+    .await?
+    {
+        install_checks::Proved::Waiting(proof) => return Ok(ControlFlow::Continue(proof)),
+        install_checks::Proved::Unproved(rules) => rules,
+    };
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1622,7 +1657,7 @@ pub(super) async fn install_os_app_with_plan(
 
     reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle).await;
 
-    Ok(InstallResult {
+    Ok(ControlFlow::Break(InstallResult {
         added,
         updated,
         skipped,
@@ -1634,81 +1669,7 @@ pub(super) async fn install_os_app_with_plan(
         adrs_bootstrapped,
         seed_instances: seed_created,
         unproved_rules,
-    })
-}
-
-#[derive(Debug, Clone, Default)]
-struct UploadedWasmReplacementContext {
-    bundle_wasm_digest_changed: bool,
-    app_recorded_at: Option<DateTime<Utc>>,
-}
-
-impl UploadedWasmReplacementContext {
-    fn should_replace(&self, existing: &WasmModuleSource) -> bool {
-        if existing.source != "upload" {
-            return false;
-        }
-        if self.bundle_wasm_digest_changed {
-            return true;
-        }
-        let Some(app_recorded_at) = self.app_recorded_at else {
-            return false;
-        };
-        let Some(updated_at) = existing
-            .updated_at
-            .as_deref()
-            .and_then(parse_persisted_timestamp)
-        else {
-            return false;
-        };
-        updated_at < app_recorded_at
-    }
-}
-
-fn parse_persisted_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&Utc))
-        .or_else(|_| {
-            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").map(|dt| dt.and_utc())
-        })
-        .ok()
-}
-
-async fn uploaded_wasm_replacement_context(
-    state: &PlatformState,
-    tenant: &str,
-    app_name: &str,
-    bundle: &AppBundle,
-) -> UploadedWasmReplacementContext {
-    let Some(ps) = state
-        .server
-        .storage_stack
-        .as_ref()
-        .and_then(|stack| stack.platform.clone())
-    else {
-        return UploadedWasmReplacementContext::default();
-    };
-    let digest = reconcile::digest_app_bundle(app_name, bundle);
-    match ps.get_installed_app(tenant, app_name).await {
-        Ok(Some(record)) => UploadedWasmReplacementContext {
-            bundle_wasm_digest_changed: record.wasm_digest != digest.wasm_digest,
-            app_recorded_at: record
-                .last_reconciled_at
-                .as_deref()
-                .or(record.installed_at.as_deref())
-                .and_then(parse_persisted_timestamp),
-        },
-        Ok(None) => UploadedWasmReplacementContext::default(),
-        Err(error) => {
-            tracing::warn!(
-                tenant,
-                app = %app_name,
-                error = %error,
-                "Failed to read OS app metadata while deciding WASM hot-upload replacement"
-            );
-            UploadedWasmReplacementContext::default()
-        }
-    }
+    }))
 }
 
 // ── Bootstrap helpers (entity creation during install) ───────────────

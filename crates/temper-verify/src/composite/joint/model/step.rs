@@ -429,7 +429,7 @@ impl JointModel {
     }
 
     /// Whether someone outside may send `action` to an `entity` record.
-    fn sendable(&self, entity: &str, action: &str) -> bool {
+    pub(in crate::composite::joint) fn sendable(&self, entity: &str, action: &str) -> bool {
         self.outside_may(entity, action) != May::No
     }
 

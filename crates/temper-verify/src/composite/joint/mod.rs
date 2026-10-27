@@ -1,11 +1,12 @@
-//! Invariants over several entities.
+//! Invariants, over one entity or several.
 //!
 //! An `[[invariant]]` may read a related entity: its status
 //! (`Type[id].status`) or a field (`Type[id].field`). One entity's model
 //! cannot know those values, so the per-entity cascade reads them as unknown
 //! and never fails on them. They are checked here, on the joint state of the
-//! invariant's entity and every type it names, one record of each, run the
-//! way the runtime runs them:
+//! invariant's entity and every type it names, one record of each. An
+//! invariant that names no other type is checked here too, on its entity
+//! alone. Each model runs the way the runtime runs:
 //!
 //! - each move is made by whoever makes it in the runtime, and the app's
 //!   Cedar decides it as them: an action someone outside may send (with the
@@ -42,7 +43,8 @@
 //! Records disagree while a dispatch is on its way, so invariants are
 //! checked in settled states: those with nothing in flight. The walk is
 //! breadth first, so each broken invariant's path is a shortest one. A walk
-//! that runs out of its [`Budget`] says so and is never a pass.
+//! that does not fit in the memory its [`Room`] gives it says so and is
+//! never a pass.
 //!
 //! Nor is a walk that checked nothing. A module whose trigger names no
 //! `on_success` may answer with any action its result names, and the model
@@ -59,32 +61,39 @@
 
 mod check;
 mod env;
+mod lists;
 mod liveness;
 mod model;
 mod pack;
+mod proof;
+mod replay;
+mod room;
 mod senders;
 mod slice;
 mod state;
+mod store;
 mod vacuity;
 
-pub use check::{JointCheck, JointVerdict, check_joint};
-pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
+pub use check::{JointCheck, JointVerdict, PROOF_TIME, check_joint};
+pub use liveness::{
+    JointLivenessResult, LivenessOutcome, LivenessProof, StuckCase, verify_joint_liveness,
+};
+pub use proof::{JointProof, joint_proofs};
+pub use replay::{JointReplay, TraceMove, replay_joint_invariants};
+pub use room::{Bound, Bytes, Progress, Room};
 pub use vacuity::Premise;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use temper_authz::SendAnalysis;
-use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Expr, Truth, eval};
-
-use crate::Budget;
-use crate::model::{ModelString, ParamValue};
+use temper_spec::automaton::{ActionKind, Automaton, Invariant};
+use temper_spec::predicate::Expr;
 
 pub use model::DroppedReaction;
 pub(crate) use model::dropped_reactions;
-use model::{JointModel, Move, Sending};
-use state::render;
+use model::{JointModel, Sending};
+use proof::App;
 pub use state::{Call, Dispatch, JointState};
 
 /// What the joint check found for one invariant.
@@ -204,78 +213,144 @@ impl fmt::Display for JointInvariantResult {
     }
 }
 
-/// Check every `[[invariant]]` in `automatons` that reads a related entity,
-/// on the joint model of its entity and the types it names. `policies`
-/// decide each move as its sender, as for liveness; without them every
+/// The proof of one `[[invariant]]`, with all its walk reads: the invariant
+/// and the joint model of its entity and the types it names, cut to what it
+/// reads. Its [`JointProof::digest`] is of this value.
+#[derive(Debug)]
+pub struct InvariantProof {
+    entity: String,
+    invariant: Invariant,
+    scope: BTreeSet<String>,
+    /// The model, or why there is none: a type the invariant reads that the
+    /// app does not declare.
+    model: Result<JointModel, String>,
+    app: App,
+}
+
+impl InvariantProof {
+    /// Walk the model.
+    pub fn walk(&self, bound: Bound<'_>) -> JointInvariantResult {
+        let mut result = JointInvariantResult {
+            entity: self.entity.clone(),
+            invariant: self.invariant.name.clone(),
+            assert: self.invariant.assert.to_string(),
+            scope: self.scope.iter().cloned().collect(),
+            states: 0,
+            in_flight_bound: None,
+            outcome: JointOutcome::Holds,
+        };
+        match &self.model {
+            Ok(model) => {
+                let mut walk = model.walk(&self.entity, &[&self.invariant.assert], bound);
+                result.states = walk.states;
+                result.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
+                result.outcome = walk.outcomes.remove(0);
+            }
+            Err(reason) => {
+                result.outcome = JointOutcome::Incomplete {
+                    reason: reason.clone(),
+                }
+            }
+        }
+        result
+    }
+
+    /// The actions of the types in scope meant to come from outside (input
+    /// and composite) that Cedar lets nobody outside send, as `Type.Action`.
+    pub(super) fn unsent(&self) -> Vec<String> {
+        let Ok(model) = &self.model else {
+            return Vec::new();
+        };
+        let by_name = self.app.by_name();
+        self.scope
+            .iter()
+            .flat_map(|entity| {
+                by_name[entity.as_str()]
+                    .actions
+                    .iter()
+                    .filter(|action| {
+                        matches!(action.kind, ActionKind::Input | ActionKind::Composite)
+                    })
+                    .filter(|action| !model.sendable(entity, &action.name))
+                    .map(move |action| format!("{entity}.{}", action.name))
+            })
+            .collect()
+    }
+}
+
+/// The proofs of each `[[invariant]]` of `app` that `wanted` picks by its
+/// type and name: one per invariant, on the
+/// joint model of its entity and the types it names, with what a
+/// `[[liveness]]` there relies on sent from outside by whoever Cedar lets,
+/// since a rule must hold through those moves too. One that names no other
+/// type is proved on its entity alone, by the same proof and walk, with the
+/// kernel's moves and Cedar that the per-entity cascade does not read.
+fn invariant_proofs(app: &App, wanted: impl Fn(&str, &str) -> bool) -> Vec<InvariantProof> {
+    let by_name = app.by_name();
+    let mut proofs = Vec::new();
+    for (name, automaton) in &by_name {
+        for invariant in automaton
+            .invariants
+            .iter()
+            .filter(|invariant| wanted(name, &invariant.name))
+        {
+            let relies_on = |scope: &BTreeSet<String>| {
+                scope
+                    .iter()
+                    .flat_map(|entity| {
+                        by_name[entity.as_str()]
+                            .liveness
+                            .iter()
+                            .flat_map(move |live| {
+                                live.relies_on
+                                    .iter()
+                                    .map(move |action| (entity.clone(), action.clone()))
+                            })
+                    })
+                    .collect()
+            };
+            let (scope, model) = joint_model(app, name, &invariant.assert, relies_on);
+            proofs.push(InvariantProof {
+                entity: name.to_string(),
+                invariant: invariant.clone(),
+                scope,
+                model,
+                app: app.clone(),
+            });
+        }
+    }
+    proofs
+}
+
+/// Walk every `[[invariant]]` in `automatons` on the joint model of its
+/// entity and the types it names, with `policies`
+/// deciding each move as its sender, as for liveness; without them every
 /// sender may send everything.
 pub fn verify_joint_invariants(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    budget: Budget,
+    bound: Bound<'_>,
 ) -> Vec<JointInvariantResult> {
-    let by_name: BTreeMap<&str, &Automaton> = automatons
+    invariant_proofs(&App::new(automatons, policies), |_, _| true)
         .iter()
-        .map(|a| (a.automaton.name.as_str(), *a))
-        .collect();
-    let mut results = Vec::new();
-    for (name, automaton) in &by_name {
-        let joint: Vec<&temper_spec::automaton::Invariant> = automaton
-            .invariants
-            .iter()
-            .filter(|inv| !inv.assert.related_types().is_empty())
-            .collect();
-        if joint.is_empty() {
-            continue;
-        }
-        let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-        let result =
-            |inv: &temper_spec::automaton::Invariant, scope: &BTreeSet<String>, states, outcome| {
-                JointInvariantResult {
-                    entity: name.to_string(),
-                    invariant: inv.name.clone(),
-                    assert: inv.assert.to_string(),
-                    scope: scope.iter().cloned().collect(),
-                    states,
-                    in_flight_bound: None,
-                    outcome,
-                }
-            };
-        let model = match invariants_model(&by_name, name, &exprs, policies) {
-            Ok(model) => model,
-            Err((scope, missing)) => {
-                for inv in &joint {
-                    let reason = format!(
-                        "it reads {}, which this app does not declare",
-                        missing.join(", ")
-                    );
-                    results.push(result(inv, &scope, 0, JointOutcome::Incomplete { reason }));
-                }
-                continue;
-            }
-        };
-        let walk = model.walk(name, &exprs, budget);
-        for (inv, outcome) in joint.iter().zip(walk.outcomes) {
-            let mut found = result(inv, &model.scope, walk.states, outcome);
-            found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
-            results.push(found);
-        }
-    }
-    results
+        .map(|proof| proof.walk(bound))
+        .collect()
 }
 
-/// The joint model `owner`'s invariants `rules` are walked on: their type and
-/// the types they name, with what a `[[liveness]]` there relies on sent from
-/// outside by whoever Cedar lets, since a rule must hold through those moves
-/// too. `Err` gives the scope and the named types `by_name` does not hold.
-fn invariants_model(
-    by_name: &BTreeMap<&str, &Automaton>,
+/// The types `owner`'s `rule` is walked over, its own and the types it
+/// names, and their joint model, with the actions `relies_on` picks in that
+/// scope sent from outside; or why there is none: a type it names that the
+/// app does not declare.
+fn joint_model(
+    app: &App,
     owner: &str,
-    rules: &[&Expr],
-    policies: Option<&SendAnalysis>,
-) -> Result<JointModel, (BTreeSet<String>, Vec<String>)> {
-    let mut scope: BTreeSet<String> = BTreeSet::from([owner.to_string()]);
+    rule: &Expr,
+    relies_on: impl FnOnce(&BTreeSet<String>) -> BTreeSet<(String, String)>,
+) -> (BTreeSet<String>, Result<JointModel, String>) {
+    let by_name = app.by_name();
+    let mut scope = BTreeSet::from([owner.to_string()]);
     let mut missing = Vec::new();
-    for (entity_type, _) in rules.iter().flat_map(|rule| rule.related_types()) {
+    for (entity_type, _) in rule.related_types() {
         if by_name.contains_key(entity_type.as_str()) {
             scope.insert(entity_type);
         } else {
@@ -283,208 +358,19 @@ fn invariants_model(
         }
     }
     if !missing.is_empty() {
-        return Err((scope, missing));
+        let reason = format!(
+            "it reads {}, which this app does not declare",
+            missing.join(", ")
+        );
+        return (scope, Err(reason));
     }
-    let relies_on = scope
-        .iter()
-        .flat_map(|entity| {
-            by_name[entity.as_str()]
-                .liveness
-                .iter()
-                .flat_map(move |live| {
-                    live.relies_on
-                        .iter()
-                        .map(move |action| (entity.clone(), action.clone()))
-                })
-        })
-        .collect();
     let sending = Sending {
-        policies,
+        policies: app.policies(),
         kernel_moves: true,
-        relies_on,
+        relies_on: relies_on(&scope),
     };
-    Ok(JointModel::new(by_name, scope, owner, rules, sending, true))
-}
-
-/// One move of a trace: an entity's action with the string parameters it
-/// was sent. Values are names for this trace only: equal names are equal
-/// values, `''` is the empty string, and a name not seen before is a value
-/// nothing holds yet. A parameter the model does not track is not checked.
-#[derive(Debug, Clone)]
-pub struct TraceMove {
-    /// The entity type.
-    pub entity: String,
-    /// The action.
-    pub action: String,
-    /// String parameters by name; parameters left out may take any value.
-    pub params: BTreeMap<String, String>,
-}
-
-/// A trace walked through the joint model of `entity`'s cross-entity
-/// invariants.
-#[derive(Debug, Clone)]
-pub struct JointReplay {
-    /// The start and the state after each step.
-    pub steps: Vec<JointStep>,
-    /// The invariants false in the last state.
-    pub broken: Vec<String>,
-}
-
-/// Walk `trace` through the joint model of `entity`'s invariants that read
-/// related entities, as the check does: whether the spec allows each move,
-/// and which invariants the last state breaks. `ids` names each record's id
-/// in the trace's names (equal names, equal ids); a type left out gets an
-/// id of its own. A move the trace names takes a dispatch in flight to that
-/// action when there is one, and is otherwise sent from outside; when it is
-/// not allowed yet, dispatches in flight land first, oldest first. A
-/// reaction whose guard the model cannot decide is taken as not firing. Use
-/// it to ask whether what happened in production is a path of the spec.
-pub fn replay_joint_invariants(
-    automatons: &[&Automaton],
-    entity: &str,
-    ids: &BTreeMap<String, String>,
-    trace: &[TraceMove],
-) -> Result<JointReplay, String> {
-    let by_name: BTreeMap<&str, &Automaton> = automatons
-        .iter()
-        .map(|a| (a.automaton.name.as_str(), *a))
-        .collect();
-    let automaton = by_name
-        .get(entity)
-        .ok_or_else(|| format!("no entity type {entity}"))?;
-    let joint: Vec<&temper_spec::automaton::Invariant> = automaton
-        .invariants
-        .iter()
-        .filter(|inv| !inv.assert.related_types().is_empty())
-        .collect();
-    let mut scope = BTreeSet::from([entity.to_string()]);
-    for inv in &joint {
-        for (entity_type, _) in inv.assert.related_types() {
-            if !by_name.contains_key(entity_type.as_str()) {
-                return Err(format!(
-                    "{entity} reads {entity_type}, which is not declared"
-                ));
-            }
-            scope.insert(entity_type);
-        }
-    }
-    let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-    let model = JointModel::new(&by_name, scope, entity, &exprs, Sending::anyone(), true);
-    let (mut state, mut names) = model.init_with_ids(ids);
-    let mut steps = vec![JointStep {
-        action: None,
-        state: render(&state),
-    }];
-    for (i, wanted) in trace.iter().enumerate() {
-        loop {
-            let fits = |params: &BTreeMap<String, ParamValue>| {
-                let mut bindings = names.clone();
-                let mut used = model.values(&state);
-                wanted.params.iter().all(|(param, name)| {
-                    // A parameter the model does not track takes any value.
-                    let Some(ParamValue::Str(value)) = params.get(param) else {
-                        return true;
-                    };
-                    match bindings.get(name) {
-                        Some(bound) => value == bound,
-                        None if name.is_empty() => value.is_empty(),
-                        None if matches!(value, ModelString::Symbol(_))
-                            && !used.contains(value) =>
-                        {
-                            bindings.insert(name.clone(), value.clone());
-                            used.insert(value.clone());
-                            true
-                        }
-                        None => false,
-                    }
-                })
-            };
-            let wanted_dispatch = |d: &Dispatch| {
-                d.to == wanted.entity && d.action == wanted.action && fits(&d.params)
-            };
-            let moves = model.moves(&state);
-            let named = moves
-                .iter()
-                .find(|mv| match mv {
-                    Move::Read(d) | Move::Arrive(d) => wanted_dispatch(d),
-                    _ => false,
-                })
-                .or_else(|| {
-                    moves.iter().find(|mv| match mv {
-                        Move::Take(e, action) | Move::Send(e, action) => {
-                            e == &wanted.entity
-                                && action.name == wanted.action
-                                && fits(&action.params)
-                        }
-                        _ => false,
-                    })
-                });
-            let (mv, done) = match named {
-                Some(mv @ (Move::Take(..) | Move::Arrive(_))) => (mv.clone(), true),
-                Some(mv) => (mv.clone(), false),
-                None => match moves
-                    .iter()
-                    .find(|mv| matches!(mv, Move::Read(_) | Move::Arrive(_)))
-                {
-                    Some(mv) => (mv.clone(), false),
-                    None => {
-                        return Err(format!(
-                            "move {} ({}.{}) is not allowed in {}",
-                            i + 1,
-                            wanted.entity,
-                            wanted.action,
-                            render(&state)
-                        ));
-                    }
-                },
-            };
-            if let Move::Take(_, action) | Move::Send(_, action) = &mv {
-                for (param, name) in &wanted.params {
-                    if let Some(ParamValue::Str(value)) = action.params.get(param)
-                        && !name.is_empty()
-                    {
-                        names.entry(name.clone()).or_insert_with(|| value.clone());
-                    }
-                }
-            }
-            let next = model
-                .next(&state, &mv)
-                .0
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    format!(
-                        "move {} ({}.{}) cannot be taken",
-                        i + 1,
-                        wanted.entity,
-                        wanted.action
-                    )
-                })?;
-            names = names
-                .into_iter()
-                .filter_map(|(name, value)| match next.renamed.get(&value) {
-                    Some(new) => Some((name, new.clone())),
-                    None if matches!(value, ModelString::Literal(_)) => Some((name, value)),
-                    None => None,
-                })
-                .collect();
-            steps.push(JointStep {
-                action: Some(next.label),
-                state: render(&next.state),
-            });
-            state = next.state;
-            if done {
-                break;
-            }
-        }
-    }
-    let env = model.env(entity, &state);
-    let broken = joint
-        .iter()
-        .filter(|inv| eval(&inv.assert, &env) == Truth::False)
-        .map(|inv| inv.name.clone())
-        .collect();
-    Ok(JointReplay { steps, broken })
+    let model = JointModel::new(&by_name, &scope, owner, &[rule], sending, true);
+    (scope, Ok(model))
 }
 
 #[cfg(test)]

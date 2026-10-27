@@ -1,6 +1,6 @@
 //! The joint check an install and `temper verify` run.
 //!
-//! Each rule over several records is proved by induction first
+//! Each invariant, and each `eventually` rule, is proved by induction first
 //! ([`crate::induct`]), for every run rather than the runs a bounded walk
 //! reaches: with the lemmas written beside it, or with none, the rule at
 //! every state and then the prover's own guesses, which a verdict lists so
@@ -11,28 +11,36 @@
 //!
 //! A rule whose premise no run meets says nothing, proved or not
 //! ([`vacuity`](super::vacuity)): the solver rules that out first, and a
-//! walk to the first state that meets the premise is the fallback. The
-//! proofs get the budget's time between them, and each walk the budget it
-//! had before.
+//! walk to the first state that meets the premise is the fallback. An
+//! invariant whose premise no run meets only because Cedar lets nobody send
+//! a move is checked again with every sender allowed: when a run meets the
+//! premise there and the rule still holds, its premise waits on Cedar the
+//! app has yet to write, and the verdict names the moves Cedar refuses. Each
+//! rule is proved on its own ([`JointProof`]), so an install keeps each
+//! verdict by what that rule reads.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::Expr;
 
-use super::liveness::{JointLivenessResult, LivenessOutcome, verify_joint_liveness};
-use super::vacuity::{Premise, invariant_premises, liveness_premise};
-use super::{JointInvariantResult, JointOutcome, verify_joint_invariants};
-use crate::Budget;
-use crate::induct::{Hints, RuleProof, prove_some};
+use super::liveness::{JointLivenessResult, LivenessOutcome};
+use super::proof::{JointProof, joint_proofs};
+use super::room::Bound;
+use super::vacuity::{Premise, premise_met, premise_reached};
+use super::{JointInvariantResult, JointOutcome};
+use crate::induct::RuleProof;
+
+/// How long a rule's proof by induction runs before its walk decides it.
+/// Over quantified lemmas the solver may search without end, and a proof
+/// that has not finished says nothing of the rule.
+pub const PROOF_TIME: Duration = Duration::from_secs(120);
 
 /// What the joint check found, rule by rule.
 #[derive(Debug, Clone, Default)]
 pub struct JointCheck {
-    /// Each `[[invariant]]` that reads a related record.
+    /// Each `[[invariant]]`.
     pub invariants: Vec<JointVerdict>,
     /// Each `[[liveness]]` with `eventually`.
     pub liveness: Vec<JointVerdict>,
@@ -48,6 +56,10 @@ pub enum JointVerdict {
     Invariant(JointInvariantResult, Option<RuleProof>),
     /// Walked, with the proof that was tried and did not hold.
     Liveness(JointLivenessResult, Option<RuleProof>),
+    /// An invariant whose premise no run meets as Cedar stands, which holds
+    /// with every sender allowed and whose premise a run meets there: that
+    /// verdict, and the moves in scope Cedar lets nobody outside send.
+    WaitsOnCedar(Box<JointVerdict>, Vec<String>),
 }
 
 impl JointVerdict {
@@ -57,6 +69,7 @@ impl JointVerdict {
             JointVerdict::Proved(_, premise) => premise.met(),
             JointVerdict::Invariant(walked, _) => walked.holds(),
             JointVerdict::Liveness(walked, _) => walked.holds(),
+            JointVerdict::WaitsOnCedar(open, _) => open.holds(),
         }
     }
 
@@ -72,6 +85,7 @@ impl JointVerdict {
             JointVerdict::Liveness(walked, _) => {
                 matches!(walked.outcome, LivenessOutcome::Stuck { .. })
             }
+            JointVerdict::WaitsOnCedar(open, _) => open.broken(),
         }
     }
 
@@ -81,6 +95,7 @@ impl JointVerdict {
             JointVerdict::Proved(proof, _) => format!("{}.{}", proof.owner, proof.rule),
             JointVerdict::Invariant(walked, _) => format!("{}.{}", walked.entity, walked.invariant),
             JointVerdict::Liveness(walked, _) => format!("{}.{}", walked.entity, walked.name),
+            JointVerdict::WaitsOnCedar(open, _) => open.rule(),
         }
     }
 
@@ -102,6 +117,7 @@ impl JointVerdict {
                 LivenessOutcome::Vacuous { .. } => "VACUOUS",
                 LivenessOutcome::Incomplete { .. } => "INCOMPLETE",
             },
+            JointVerdict::WaitsOnCedar(open, _) => open.tag(),
         }
     }
 }
@@ -112,6 +128,17 @@ impl fmt::Display for JointVerdict {
             JointVerdict::Proved(proof, premise) => return proved(f, &self.rule(), proof, premise),
             JointVerdict::Invariant(walked, tried) => (walked.to_string(), tried),
             JointVerdict::Liveness(walked, tried) => (walked.to_string(), tried),
+            JointVerdict::WaitsOnCedar(open, unsent) => {
+                write!(
+                    f,
+                    "{open}\n  as the app's Cedar stands no run meets its premise; with every \
+                     sender allowed a run meets it and the rule still holds"
+                )?;
+                return match unsent.is_empty() {
+                    true => Ok(()),
+                    false => write!(f, ". Cedar lets nobody send {}", unsent.join(", ")),
+                };
+            }
         };
         f.write_str(walked.trim_end())?;
         match tried.as_ref().and_then(RuleProof::shortfall) {
@@ -163,146 +190,91 @@ fn proved(
     Ok(())
 }
 
-/// Check the rules over several records of `automatons`, as
-/// [`verify_joint_invariants`] and [`verify_joint_liveness`] pick them,
+impl JointProof {
+    /// Prove the rule by induction, for every run, and walk it when the
+    /// proof does not hold. A proof still running after `proof_time` is
+    /// left to the walk: over quantified lemmas the solver may search
+    /// without end. A rule that reads a type the app does not declare is
+    /// left to the walk, which says so, and so is an `eventually` rule
+    /// without a measure, which nothing guesses.
+    ///
+    /// An invariant whose premise no run meets as Cedar stands is checked
+    /// again with every sender allowed ([`JointVerdict::WaitsOnCedar`]).
+    /// One that breaks there holds only because Cedar refuses a move, and
+    /// one whose premise no run meets there is dead in its spec: both keep
+    /// the verdict as Cedar stands.
+    pub fn check(&self, bound: Bound<'_>, proof_time: Duration) -> JointVerdict {
+        let verdict = self.decide(bound, proof_time);
+        if verdict.tag() != "VACUOUS" {
+            return verdict;
+        }
+        let Some(open) = self.open() else {
+            return verdict;
+        };
+        let open = open.decide(bound, proof_time);
+        match (open.holds(), self) {
+            (true, JointProof::Invariant(rule)) => {
+                JointVerdict::WaitsOnCedar(Box::new(open), rule.unsent())
+            }
+            _ => verdict,
+        }
+    }
+
+    /// The verdict with the app's Cedar deciding each move.
+    fn decide(&self, bound: Bound<'_>, proof_time: Duration) -> JointVerdict {
+        let deadline = Instant::now().checked_add(proof_time);
+        match self {
+            JointProof::Invariant(rule) => {
+                let tried = match &rule.model {
+                    Ok(_) => rule.app.prove(&rule.entity, &rule.invariant.name, deadline),
+                    Err(_) => None,
+                };
+                match tried {
+                    Some(proof) if proof.proved() => {
+                        let assert = &rule.invariant.assert;
+                        let premise = premise_met(&rule.model, &rule.entity, assert, &proof, bound);
+                        JointVerdict::Proved(proof, premise)
+                    }
+                    tried => JointVerdict::Invariant(rule.walk(bound), tried),
+                }
+            }
+            JointProof::Liveness(rule) => {
+                let tried = match &rule.model {
+                    Ok(_) if rule.measured => rule.app.prove(&rule.entity, &rule.name, deadline),
+                    _ => None,
+                };
+                match tried {
+                    Some(proof) if proof.proved() => {
+                        let premise =
+                            premise_reached(&rule.model, &rule.entity, &rule.goal, &proof, bound);
+                        JointVerdict::Proved(proof, premise)
+                    }
+                    tried => JointVerdict::Liveness(rule.walk(bound), tried),
+                }
+            }
+        }
+    }
+}
+
+/// Check every invariant and `eventually` rule of `automatons`
+/// ([`joint_proofs`]),
 /// with `policies` deciding each move as its sender: by induction first, and
-/// by the walk where the proof does not hold.
+/// by the walk where the proof does not hold ([`JointProof::check`]).
 pub fn check_joint(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    budget: Budget,
+    bound: Bound<'_>,
+    proof_time: Duration,
 ) -> JointCheck {
-    let by_name: BTreeMap<&str, &Automaton> = automatons
-        .iter()
-        .map(|a| (a.automaton.name.as_str(), *a))
-        .collect();
-    // A rule that reads a type the app does not declare is reported by the
-    // walk, which says so.
-    let all_declared = |expr: &Expr| {
-        expr.related_types()
-            .iter()
-            .all(|(entity_type, _)| by_name.contains_key(entity_type.as_str()))
-    };
-    let mut invariants = BTreeSet::new();
-    let mut liveness = BTreeSet::new();
-    for automaton in automatons {
-        let owner = &automaton.automaton.name;
-        for invariant in &automaton.invariants {
-            if !invariant.assert.related_types().is_empty() && all_declared(&invariant.assert) {
-                invariants.insert((owner.clone(), invariant.name.clone()));
-            }
-        }
-        for live in &automaton.liveness {
-            if let Some(goal) = &live.eventually
-                && !live.measure.is_empty()
-                && all_declared(goal)
-            {
-                liveness.insert((owner.clone(), live.name.clone()));
-            }
-        }
-    }
-    let proofs = if invariants.is_empty() && liveness.is_empty() {
-        Vec::new()
-    } else {
-        prove_some(
-            automatons,
-            policies,
-            &Hints::default(),
-            |owner, rule| {
-                let key = (owner.to_string(), rule.to_string());
-                invariants.contains(&key) || liveness.contains(&key)
-            },
-            Some(Instant::now() + budget.time),
-        )
-    };
     let mut check = JointCheck::default();
-    let mut proved = BTreeSet::new();
-    let mut tried = BTreeMap::new();
-    // Proved invariants by their type, which walk together for premises.
-    let mut owned: BTreeMap<String, Vec<RuleProof>> = BTreeMap::new();
-    for proof in proofs {
-        let key = (proof.owner.clone(), proof.rule.clone());
-        if !proof.proved() {
-            tried.insert(key, proof);
-            continue;
+    for proof in joint_proofs(automatons, policies) {
+        let verdict = proof.check(bound, proof_time);
+        match proof {
+            JointProof::Invariant(_) => check.invariants.push(verdict),
+            JointProof::Liveness(_) => check.liveness.push(verdict),
         }
-        proved.insert(key.clone());
-        if invariants.contains(&key) {
-            owned.entry(proof.owner.clone()).or_default().push(proof);
-            continue;
-        }
-        let automaton = by_name[proof.owner.as_str()];
-        let premise = match automaton.liveness.iter().find(|l| l.name == proof.rule) {
-            Some(
-                live @ temper_spec::automaton::Liveness {
-                    eventually: Some(goal),
-                    ..
-                },
-            ) => liveness_premise(
-                &by_name,
-                &proof.owner,
-                (live, goal),
-                &proof,
-                policies,
-                budget,
-            ),
-            _ => Premise::None,
-        };
-        check.liveness.push(JointVerdict::Proved(proof, premise));
-    }
-    for (owner, proofs) in owned {
-        let automaton = by_name[owner.as_str()];
-        let rules: Vec<_> = proofs
-            .iter()
-            .filter_map(|p| {
-                let rule = automaton.invariants.iter().find(|i| i.name == p.rule)?;
-                Some((rule, p))
-            })
-            .collect();
-        let premises = invariant_premises(&by_name, &owner, &rules, policies, budget);
-        for (proof, premise) in proofs.into_iter().zip(premises) {
-            check.invariants.push(JointVerdict::Proved(proof, premise));
-        }
-    }
-    let unproved =
-        |owner: &str, rule: &str| !proved.contains(&(owner.to_string(), rule.to_string()));
-    // Each walk sees the rules left. A proved liveness rule stays for the
-    // invariants' walk: what it relies on is still sent from outside.
-    let for_invariants = edited(automatons, |a| {
-        let owner = a.automaton.name.clone();
-        a.invariants.retain(|i| unproved(&owner, &i.name));
-    });
-    let refs: Vec<&Automaton> = for_invariants.iter().collect();
-    for walked in verify_joint_invariants(&refs, policies, budget) {
-        let key = (walked.entity.clone(), walked.invariant.clone());
-        let proof = tried.remove(&key);
-        check
-            .invariants
-            .push(JointVerdict::Invariant(walked, proof));
-    }
-    let for_liveness = edited(automatons, |a| {
-        let owner = a.automaton.name.clone();
-        a.liveness.retain(|l| unproved(&owner, &l.name));
-    });
-    let refs: Vec<&Automaton> = for_liveness.iter().collect();
-    for walked in verify_joint_liveness(&refs, policies, budget) {
-        let key = (walked.entity.clone(), walked.name.clone());
-        let proof = tried.remove(&key);
-        check.liveness.push(JointVerdict::Liveness(walked, proof));
     }
     check
-}
-
-/// Copies of `automatons`, each changed by `edit`.
-fn edited(automatons: &[&Automaton], edit: impl Fn(&mut Automaton)) -> Vec<Automaton> {
-    automatons
-        .iter()
-        .map(|automaton| {
-            let mut automaton = (*automaton).clone();
-            edit(&mut automaton);
-            automaton
-        })
-        .collect()
 }
 
 #[cfg(test)]

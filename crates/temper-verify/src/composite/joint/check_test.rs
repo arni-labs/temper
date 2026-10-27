@@ -1,4 +1,4 @@
-//! Every rule over several records is proved by induction first: with the
+//! Every rule, over one record or several, is proved by induction first: with the
 //! lemmas its spec gives, or with the prover's guesses, which the verdict
 //! lists. A rule whose proof does not hold is walked as before and says why;
 //! a proved rule whose premise no run meets proves nothing, found by the
@@ -186,32 +186,28 @@ eventually = "status == 'Asked' => status == 'Done'"
     )
 }
 
-fn budget() -> Budget {
-    Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
-    }
-}
+/// How long each rule's proof may run.
+const TIME: Duration = Duration::from_secs(30);
 
-fn check(sources: &[&str], budget: Budget) -> JointCheck {
+fn check(sources: &[&str], time: Duration) -> JointCheck {
     let automatons: Vec<Automaton> = sources
         .iter()
         .map(|source| parse_automaton(source).expect("fixture parses"))
         .collect();
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    check_joint(&refs, None, budget)
+    check_joint(&refs, None, super::super::room::test_bound(), time)
 }
 
 /// The one invariant's verdict.
-fn invariant(sources: &[&str], budget: Budget) -> JointVerdict {
-    let mut invariants = check(sources, budget).invariants;
+fn invariant(sources: &[&str], time: Duration) -> JointVerdict {
+    let mut invariants = check(sources, time).invariants;
     assert_eq!(invariants.len(), 1, "{invariants:?}");
     invariants.remove(0)
 }
 
 #[test]
 fn a_rule_with_its_lemmas_is_proved_and_not_walked() {
-    let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN])], budget());
+    let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN])], TIME);
     let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
         panic!("proved, and a run meets its premise: {verdict}");
     };
@@ -226,7 +222,7 @@ fn a_rule_with_its_lemmas_is_proved_and_not_walked() {
 
 #[test]
 fn a_rule_whose_proof_fails_is_walked_and_says_why() {
-    let verdict = invariant(&[&parent(""), &child(&[LOCKED_WHEN_CLOSED])], budget());
+    let verdict = invariant(&[&parent(""), &child(&[LOCKED_WHEN_CLOSED])], TIME);
     let JointVerdict::Invariant(walked, Some(tried)) = &verdict else {
         panic!("walked with the failed proof: {verdict}");
     };
@@ -240,7 +236,7 @@ fn a_rule_whose_proof_fails_is_walked_and_says_why() {
 
 #[test]
 fn a_rule_without_hints_is_proved_with_the_provers_guesses() {
-    let verdict = invariant(&[&parent(""), &child(&[])], budget());
+    let verdict = invariant(&[&parent(""), &child(&[])], TIME);
     let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
         panic!("proved with the prover's guesses: {verdict}");
     };
@@ -260,7 +256,7 @@ fn a_rule_without_hints_is_proved_with_the_provers_guesses() {
     );
     // Written beside the rule, the guesses prove it with no more guessing.
     let pinned: Vec<&str> = proof.found.iter().map(|l| l.assert.as_str()).collect();
-    let verdict = invariant(&[&parent(""), &child(&pinned)], budget());
+    let verdict = invariant(&[&parent(""), &child(&pinned)], TIME);
     let JointVerdict::Proved(proof, Premise::Met { .. }) = &verdict else {
         panic!("proved with the pinned guesses: {verdict}");
     };
@@ -269,7 +265,7 @@ fn a_rule_without_hints_is_proved_with_the_provers_guesses() {
 
 #[test]
 fn a_rule_the_guesses_do_not_prove_is_walked_and_says_why() {
-    let verdict = invariant(&[TALLY, WATCHER], budget());
+    let verdict = invariant(&[TALLY, WATCHER], TIME);
     let JointVerdict::Invariant(walked, Some(tried)) = &verdict else {
         panic!("walked with the failed proof: {verdict}");
     };
@@ -283,7 +279,7 @@ fn a_rule_the_guesses_do_not_prove_is_walked_and_says_why() {
 #[test]
 fn a_proved_rule_whose_premise_no_run_meets_proves_nothing() {
     let never_closes = parent("").replace(CLOSE, "");
-    let verdict = invariant(&[&never_closes, &child(&[])], budget());
+    let verdict = invariant(&[&never_closes, &child(&[])], TIME);
     assert!(
         matches!(&verdict, JointVerdict::Proved(_, Premise::Never { .. })),
         "{verdict}"
@@ -300,7 +296,7 @@ fn a_proved_rule_whose_premise_no_run_meets_proves_nothing() {
 fn a_premise_the_proof_rules_out_needs_no_walk() {
     let never_closes = parent("").replace(CLOSE, "");
     let not_closed = "(not (= $Parent.status Parent/Closed))";
-    let verdict = invariant(&[&never_closes, &child(&[not_closed])], budget());
+    let verdict = invariant(&[&never_closes, &child(&[not_closed])], TIME);
     assert!(
         matches!(&verdict, JointVerdict::Proved(_, Premise::Excluded { .. })),
         "{verdict}"
@@ -321,7 +317,7 @@ fn a_rule_without_a_premise_has_none_to_meet() {
         "Parent[Id].status == 'Closed' => Parent[Id].locked == true",
         "Parent[Id].status != 'Closed' || Parent[Id].locked == true",
     );
-    let verdict = invariant(&[&parent(""), &rule], budget());
+    let verdict = invariant(&[&parent(""), &rule], TIME);
     assert!(
         matches!(&verdict, JointVerdict::Proved(_, Premise::None)),
         "{verdict}"
@@ -372,14 +368,14 @@ effect = ["spawn('Parent', '{first}')"]
 #[test]
 fn a_scheduled_action_fires_in_the_proof() {
     let closes_itself = parent(", \"schedule('Close', 60)\"");
-    let verdict = invariant(&[&closes_itself, &child(&[LOCKED_PAST_OPEN])], budget());
+    let verdict = invariant(&[&closes_itself, &child(&[LOCKED_PAST_OPEN])], TIME);
     assert!(matches!(&verdict, JointVerdict::Proved(..)), "{verdict}");
     // Closing schedules an unlock a minute later, which breaks the rule.
     let unlocks = format!(
         "{}effect = [\"schedule('Unlock', 60)\"]\n{UNLOCK}",
         parent("")
     );
-    let verdict = invariant(&[&unlocks, &child(&[LOCKED_PAST_OPEN])], budget());
+    let verdict = invariant(&[&unlocks, &child(&[LOCKED_PAST_OPEN])], TIME);
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("proved without the scheduled unlock: {verdict}");
     };
@@ -389,7 +385,7 @@ fn a_scheduled_action_fires_in_the_proof() {
     // arms it.
     let never_waits = "(not ($has.Parent.Unlock.scheduled mk/Parent.Unlock.scheduled))";
     let rule = child(&[LOCKED_PAST_OPEN, never_waits]);
-    let verdict = invariant(&[&unlocks, &rule], budget());
+    let verdict = invariant(&[&unlocks, &rule], TIME);
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("proved with a lemma that the unlock never waits: {verdict}");
     };
@@ -415,7 +411,7 @@ fn a_record_waiting_for_a_scheduled_action_is_settled() {
         "{}effect = [\"locked = false\", \"schedule('Lock', 60)\"]\n{LOCK}",
         parent("")
     );
-    let verdict = invariant(&[&locks_later, &child(&[])], budget());
+    let verdict = invariant(&[&locks_later, &child(&[])], TIME);
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("proved while the lock waits: {verdict}");
     };
@@ -427,9 +423,9 @@ fn a_record_waiting_for_a_scheduled_action_is_settled() {
 fn a_spawned_records_first_action_is_a_move_of_the_proof() {
     let rule = child(&[LOCKED_PAST_OPEN]);
     let parent = format!("{}{FORCE}", parent(""));
-    let verdict = invariant(&[&parent, &rule, &maker("Seal")], budget());
+    let verdict = invariant(&[&parent, &rule, &maker("Seal")], TIME);
     assert!(matches!(&verdict, JointVerdict::Proved(..)), "{verdict}");
-    let verdict = invariant(&[&parent, &rule, &maker("Force")], budget());
+    let verdict = invariant(&[&parent, &rule, &maker("Force")], TIME);
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("proved without the spawn's first action: {verdict}");
     };
@@ -442,11 +438,7 @@ fn a_spawned_records_first_action_is_a_move_of_the_proof() {
 
 #[test]
 fn proofs_stop_when_the_time_is_spent() {
-    let none = Budget {
-        time: Duration::ZERO,
-        states: 100_000,
-    };
-    let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN])], none);
+    let verdict = invariant(&[&parent(""), &child(&[LOCKED_PAST_OPEN])], Duration::ZERO);
     let JointVerdict::Invariant(_, Some(tried)) = &verdict else {
         panic!("walked with the proof that ran out of time: {verdict}");
     };
@@ -456,7 +448,7 @@ fn proofs_stop_when_the_time_is_spent() {
 
 #[test]
 fn an_eventually_rule_with_its_measure_is_proved() {
-    let mut hinted = check(&[&asker(true)], budget()).liveness;
+    let mut hinted = check(&[&asker(true)], TIME).liveness;
     assert_eq!(hinted.len(), 1);
     let verdict = hinted.remove(0);
     assert!(
@@ -464,9 +456,12 @@ fn an_eventually_rule_with_its_measure_is_proved() {
         "{verdict}"
     );
     // Nothing guesses a measure, so a rule without one is walked.
-    let verdict = check(&[&asker(false)], budget()).liveness.remove(0);
+    let verdict = check(&[&asker(false)], TIME).liveness.remove(0);
     assert!(
         matches!(&verdict, JointVerdict::Liveness(walked, None) if walked.holds()),
         "{verdict}"
     );
 }
+
+#[path = "check_test/one_type.rs"]
+mod one_type;

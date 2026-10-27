@@ -8,6 +8,14 @@ pub(crate) struct Expansion {
     until: std::cell::Cell<Option<std::time::Instant>>,
     pub(crate) exhausted: std::cell::Cell<bool>,
 }
+/// Work accounting, not part of what a model is: a joint proof's digest is
+/// of its model's `Debug` text, so this shows nothing that changes as a walk
+/// spends it.
+impl std::fmt::Debug for Expansion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Expansion")
+    }
+}
 impl Default for Expansion {
     fn default() -> Self {
         Self {

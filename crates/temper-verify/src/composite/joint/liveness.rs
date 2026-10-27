@@ -42,16 +42,18 @@
 //! names those answers, since one may be the way out. And a condition written
 //! `premise => conclusion` whose premise no walked state meets proves nothing.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use temper_authz::SendAnalysis;
-use temper_spec::automaton::{Automaton, Liveness};
+use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
-use super::JointStep;
-use super::model::{self, JointModel, Sending};
-use crate::Budget;
+use super::lists::Lists;
+use super::model::{self, JointModel};
+use super::proof::App;
+use super::room::{Bound, MB};
+use super::{JointStep, joint_model};
 
 /// What the joint check found for one `eventually` property.
 #[derive(Debug, Clone)]
@@ -205,121 +207,131 @@ impl fmt::Display for JointLivenessResult {
     }
 }
 
-/// Check every `[[liveness]]` with `eventually` in `automatons` on the joint
-/// model of its entity and the types its condition names. `policies` decide
-/// each move as its sender; without them every sender may send everything.
-pub fn verify_joint_liveness(
-    automatons: &[&Automaton],
-    policies: Option<&SendAnalysis>,
-    budget: Budget,
-) -> Vec<JointLivenessResult> {
-    let by_name: BTreeMap<&str, &Automaton> = automatons
-        .iter()
-        .map(|a| (a.automaton.name.as_str(), *a))
-        .collect();
-    let mut results = Vec::new();
-    for (name, automaton) in &by_name {
-        for live in &automaton.liveness {
-            let Some(goal) = &live.eventually else {
-                continue;
-            };
-            let model = liveness_model(&by_name, name, live, goal, policies);
-            let scope = match &model {
-                Ok(model) => model.scope.clone(),
-                Err((scope, _)) => scope.clone(),
-            };
-            let mut result = JointLivenessResult {
-                entity: name.to_string(),
-                name: live.name.clone(),
-                eventually: goal.to_string(),
-                relies_on: live.relies_on.clone(),
-                scope: scope.iter().cloned().collect(),
-                states: 0,
-                in_flight_bound: None,
-                outcome: LivenessOutcome::Holds,
-                unwalked: Vec::new(),
-            };
-            let model = match model {
-                Ok(model) => model,
-                Err((_, missing)) => {
-                    result.outcome = LivenessOutcome::Incomplete {
-                        reason: format!(
-                            "it reads {}, which this app does not declare",
-                            missing.join(", ")
-                        ),
-                    };
-                    results.push(result);
-                    continue;
-                }
-            };
-            let explored = model.walk_with(budget, true, |_, _| false);
-            result.states = explored.len();
-            result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
-            result.unwalked = explored.unwalked();
-            result.outcome = match &explored.stopped {
-                Some(reason) => LivenessOutcome::Incomplete {
+/// The proof of one `[[liveness]]` with `eventually`, with all its walk
+/// reads: the property and the joint model of its entity and the types its
+/// condition names, cut to what it reads. Its
+/// [`JointProof::digest`](super::JointProof::digest) is of this value.
+#[derive(Debug)]
+pub struct LivenessProof {
+    pub(super) entity: String,
+    pub(super) name: String,
+    pub(super) goal: Expr,
+    relies_on: Vec<String>,
+    /// Whether it carries a measure, without which induction does not try it.
+    pub(super) measured: bool,
+    scope: BTreeSet<String>,
+    /// The model, or why there is none: a type the condition reads that the
+    /// app does not declare.
+    pub(super) model: Result<JointModel, String>,
+    pub(super) app: App,
+}
+
+impl LivenessProof {
+    /// Walk the model and decide whether the records reach the condition.
+    pub fn walk(&self, bound: Bound<'_>) -> JointLivenessResult {
+        let mut result = JointLivenessResult {
+            entity: self.entity.clone(),
+            name: self.name.clone(),
+            eventually: self.goal.to_string(),
+            relies_on: self.relies_on.clone(),
+            scope: self.scope.iter().cloned().collect(),
+            states: 0,
+            in_flight_bound: None,
+            outcome: LivenessOutcome::Holds,
+            unwalked: Vec::new(),
+        };
+        let model = match &self.model {
+            Ok(model) => model,
+            Err(reason) => {
+                result.outcome = LivenessOutcome::Incomplete {
                     reason: reason.clone(),
-                },
-                None => match settle(&model, name, goal, &explored) {
+                };
+                return result;
+            }
+        };
+        let mut explored = model.walk_with(bound, true, |_, _| false);
+        result.states = explored.len();
+        result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
+        result.unwalked = explored.unwalked();
+        let settling = settle_bytes(&explored);
+        result.outcome = match &explored.stopped {
+            Some(reason) => LivenessOutcome::Incomplete {
+                reason: reason.clone(),
+            },
+            None => match explored.held.add(settling) {
+                Ok(()) => match settle(model, &self.entity, &self.goal, &explored) {
                     (LivenessOutcome::Holds, _) if !result.unwalked.is_empty() => {
                         LivenessOutcome::Incomplete {
                             reason: model::unwalked_reason(&result.unwalked),
                         }
                     }
                     (LivenessOutcome::Holds, false) => LivenessOutcome::Vacuous {
-                        premise: super::premise(goal)
+                        premise: super::premise(&self.goal)
                             .map(ToString::to_string)
                             .unwrap_or_default(),
                     },
                     (outcome, _) => outcome,
                 },
-            };
-            results.push(result);
-        }
+                Err(reason) => LivenessOutcome::Incomplete {
+                    reason: format!(
+                        "deciding the walk does not fit in the memory it may hold: {reason} \
+                         (it held {} MB at {} states and needs {} MB more)",
+                        explored.held.bytes / MB,
+                        explored.len(),
+                        settling / MB
+                    ),
+                },
+            },
+        };
+        result
     }
-    results
 }
 
-/// The joint model `owner`'s `live` rule, whose condition is `goal`, is
-/// walked on: its type and every type the condition names, with the actions
-/// it relies on sent from outside. `Err` gives the scope and the types the
-/// condition names that `by_name` does not hold.
-pub(super) fn liveness_model(
-    by_name: &BTreeMap<&str, &Automaton>,
-    owner: &str,
-    live: &Liveness,
-    goal: &Expr,
-    policies: Option<&SendAnalysis>,
-) -> Result<JointModel, (BTreeSet<String>, Vec<String>)> {
-    let mut scope = BTreeSet::from([owner.to_string()]);
-    let mut missing = Vec::new();
-    for (entity_type, _) in goal.related_types() {
-        if by_name.contains_key(entity_type.as_str()) {
-            scope.insert(entity_type);
-        } else {
-            missing.push(entity_type);
+/// The proofs of every `[[liveness]]` with `eventually` of `app`: one per
+/// property, on the joint model of its entity and the types its condition
+/// names, with the actions it relies on sent from outside.
+pub(super) fn liveness_proofs(app: &App) -> Vec<LivenessProof> {
+    let mut proofs = Vec::new();
+    for (name, automaton) in &app.by_name() {
+        for live in &automaton.liveness {
+            let Some(goal) = &live.eventually else {
+                continue;
+            };
+            let relies_on = |_: &BTreeSet<String>| {
+                live.relies_on
+                    .iter()
+                    .map(|action| (name.to_string(), action.clone()))
+                    .collect()
+            };
+            let (scope, model) = joint_model(app, name, goal, relies_on);
+            proofs.push(LivenessProof {
+                entity: name.to_string(),
+                name: live.name.clone(),
+                goal: goal.clone(),
+                relies_on: live.relies_on.clone(),
+                measured: !live.measure.is_empty(),
+                scope,
+                model,
+                app: app.clone(),
+            });
         }
     }
-    if !missing.is_empty() {
-        return Err((scope, missing));
-    }
-    let sending = Sending {
-        policies,
-        kernel_moves: true,
-        relies_on: live
-            .relies_on
-            .iter()
-            .map(|action| (owner.to_string(), action.clone()))
-            .collect(),
-    };
-    Ok(JointModel::new(
-        by_name,
-        scope,
-        owner,
-        &[goal],
-        sending,
-        true,
-    ))
+    proofs
+}
+
+/// Walk every `[[liveness]]` with `eventually` in `automatons` on the joint
+/// model of its entity and the types its condition names, with `policies`
+/// deciding each move as its sender; without them every sender may send
+/// everything.
+pub fn verify_joint_liveness(
+    automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
+    bound: Bound<'_>,
+) -> Vec<JointLivenessResult> {
+    liveness_proofs(&App::new(automatons, policies))
+        .iter()
+        .map(|proof| proof.walk(bound))
+        .collect()
 }
 
 /// Whether every walked state reaches `goal` through the system's moves,
@@ -362,35 +374,41 @@ fn settle(
         .iter()
         .map(|made| made.by_system || (made.relied && failing[made.from as usize]))
         .collect();
-    // For each state, the states with a sure move to it, and the covered
-    // moves that may end in it; for each covered move, how many of the
-    // states it may end in do not reach the goal yet.
-    let mut sure_from: Vec<Vec<u32>> = vec![Vec::new(); count];
-    let mut covering: Vec<Vec<u32>> = vec![Vec::new(); count];
+    // For each state, the states with a sure move to it.
+    let sure_from = Lists::build(count, |put| {
+        for edge in &explored.edges {
+            if edge.sure && usable[edge.made as usize] {
+                put(edge.to, explored.made[edge.made as usize].from);
+            }
+        }
+    });
+    // For each state, the covered moves that may end in it. A move's edges
+    // are walked one after another, so the states it ends in are told apart
+    // with a short list.
+    let covering = Lists::build(count, |put| {
+        let mut ends: (u32, Vec<u32>) = (u32::MAX, Vec::new());
+        for edge in &explored.edges {
+            if !usable[edge.made as usize] || !explored.made[edge.made as usize].covered {
+                continue;
+            }
+            if ends.0 != edge.made {
+                ends = (edge.made, Vec::new());
+            }
+            if !ends.1.contains(&edge.to) {
+                ends.1.push(edge.to);
+                put(edge.to, edge.made);
+            }
+        }
+    });
+    // For each covered move, how many of the states it may end in do not
+    // reach the goal yet.
     let mut open = vec![0u32; explored.made.len()];
-    // A move's edges are walked one after another, so the states it ends in
-    // are told apart with a short list.
-    let mut ends: (u32, Vec<u32>) = (u32::MAX, Vec::new());
-    for edge in &explored.edges {
-        let made = &explored.made[edge.made as usize];
-        if !usable[edge.made as usize] {
-            continue;
-        }
-        if edge.sure {
-            sure_from[edge.to as usize].push(made.from);
-        }
-        if ends.0 != edge.made {
-            ends = (edge.made, Vec::new());
-        }
-        if made.covered && !ends.1.contains(&edge.to) {
-            ends.1.push(edge.to);
-            covering[edge.to as usize].push(edge.made);
-            open[edge.made as usize] += 1;
-        }
+    for &made in &covering.items {
+        open[made as usize] += 1;
     }
     while let Some(index) = queue.pop_front() {
-        let mut reached: Vec<u32> = sure_from[index].clone();
-        for &made in &covering[index] {
+        let mut reached: Vec<u32> = sure_from.get(index).to_vec();
+        for &made in covering.get(index) {
             open[made as usize] -= 1;
             if open[made as usize] == 0 {
                 reached.push(explored.made[made as usize].from);
@@ -447,6 +465,18 @@ fn settle(
         },
         met,
     )
+}
+
+/// The bytes [`settle`] holds for `explored`: per state, its marks, its
+/// place in the queue and the stuck list, and where its two lists of moves
+/// in start; per move, its mark and count; per edge, its place in each of
+/// those lists.
+fn settle_bytes(explored: &model::Explored<'_>) -> usize {
+    let per_state = 2 * size_of::<bool>() + 4 * size_of::<usize>();
+    let per_move = size_of::<bool>() + size_of::<u32>();
+    explored.len() * per_state
+        + explored.made.len() * per_move
+        + explored.edges.len() * 2 * size_of::<u32>()
 }
 
 #[cfg(test)]

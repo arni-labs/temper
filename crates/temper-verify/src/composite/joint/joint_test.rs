@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
@@ -111,11 +110,12 @@ fn check_under(sources: &[&str], policies: Option<&str>) -> JointInvariantResult
     let automatons = parse(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
-    let budget = Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
     };
-    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), budget);
+    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), bound);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -257,15 +257,16 @@ fn an_invariant_naming_an_undeclared_type_is_not_checked_and_says_why() {
 }
 
 #[test]
-fn specs_without_cross_entity_invariants_have_nothing_to_check() {
+fn specs_without_invariants_have_nothing_to_check() {
     let parent = parent(false);
     let automatons = parse(&[&parent, CHILD]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let budget = Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
     };
-    assert!(verify_joint_invariants(&refs, None, budget).is_empty());
+    assert!(verify_joint_invariants(&refs, None, bound).is_empty());
 }
 
 #[test]
@@ -347,6 +348,68 @@ fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
             .filter_map(|s| s.action.as_deref())
             .any(|m| m.starts_with("Parent.Set") && m.contains("'secret'")),
         "{result}"
+    );
+}
+
+#[test]
+fn a_walk_its_room_cannot_hold_is_not_checked_and_gives_its_memory_back() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let automatons = parse(&[&parent, &child]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let (room, progress) = (Bytes::new(4 << 10), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    let results = verify_joint_invariants(&refs, None, bound);
+    assert_eq!(results.len(), 1);
+    let JointOutcome::Incomplete { reason } = &results[0].outcome else {
+        panic!("expected not checked, got {}", results[0]);
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+    assert_eq!(room.held(), 0, "the walk gives back what it took");
+}
+
+/// The digest of each joint proof of `sources`, with `policies` (Cedar)
+/// deciding each move as its sender.
+fn digests(sources: &[&str], policies: Option<&str>) -> Vec<String> {
+    let automatons = parse(sources);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
+    joint_proofs(&refs, analysis.as_ref())
+        .iter()
+        .map(JointProof::digest)
+        .collect()
+}
+
+#[test]
+fn a_proof_keeps_its_digest_through_a_change_its_cut_leaves_out() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let before = digests(&[&parent, &child], None);
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before,
+        digests(&[&parent, &child], None),
+        "the same specs, the same digest"
+    );
+    // A counter the rule never reads, counted by an action the cut keeps.
+    let counted = parent
+        .replace(
+            "[[action]]\nname = \"Close\"",
+            "[[state]]\nname = \"closings\"\ntype = \"counter\"\ninitial = 0\n\n[[action]]\nname = \"Close\"",
+        )
+        .replace("to = \"Closed\"\n", "to = \"Closed\"\neffect = [\"closings += 1\"]\n");
+    assert!(counted.contains("closings += 1"));
+    assert_eq!(before, digests(&[&counted, &child], None));
+    // Cedar about an action no type in scope has.
+    let more = format!(
+        "{ONLY_TELL_COPIES}\npermit(principal, action == Action::\"Elsewhere\", resource);\n"
+    );
+    assert_eq!(
+        digests(&[&parent, &child], Some(ONLY_TELL_COPIES)),
+        digests(&[&parent, &child], Some(&more))
     );
 }
 
@@ -470,7 +533,7 @@ fn a_literal_in_a_related_read_is_explored_by_the_parent_setter() {
 }
 
 #[test]
-fn initial_partitions_stop_within_a_tiny_budget() {
+fn initial_partitions_stop_within_a_tiny_room() {
     let sources: Vec<String> = (0..13)
         .map(|i| format!("[automaton]\nname = 'T{i}'\nstates = ['Ready']\ninitial = 'Ready'\n"))
         .collect();
@@ -483,20 +546,21 @@ fn initial_partitions_stop_within_a_tiny_budget() {
         "\n[[invariant]]\nname = 'rule'\nassert = \"{assertion}\"\n"
     ));
     let automatons = parse(&sources.iter().map(String::as_str).collect::<Vec<_>>());
+    let (room, progress) = (Bytes::new(64 << 10), Progress::default());
     let results = verify_joint_invariants(
         &automatons.iter().collect::<Vec<_>>(),
         None,
-        Budget {
-            states: 10,
-            time: Duration::from_secs(1),
+        Bound {
+            room: &room,
+            progress: &progress,
         },
     );
     assert_eq!(results.len(), 1);
-    assert!(matches!(
-        results[0].outcome,
-        JointOutcome::Incomplete { .. }
-    ));
-    assert!(results[0].states <= 10);
+    let JointOutcome::Incomplete { reason } = &results[0].outcome else {
+        panic!("expected not checked, got {}", results[0]);
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+    assert_eq!(room.held(), 0, "the walk gives back what it took");
 }
 
 #[test]
@@ -579,9 +643,59 @@ fn concrete_ids_in_assertions_are_explored_without_string_fields() {
 }
 
 #[test]
+fn a_proof_gets_a_new_digest_from_a_change_its_walk_reads() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let before = digests(&[&parent(false), &child], None);
+    assert_ne!(
+        before,
+        digests(&[&parent(true), &child], None),
+        "a parent that reopens"
+    );
+    let child = child_with("status == 'Done' => Parent[Id].value == value");
+    let parent = parent_told_once();
+    assert_ne!(
+        digests(&[&parent, &child], None),
+        digests(&[&parent, &child], Some(ONLY_TELL_COPIES)),
+        "Cedar that decides who may send Copy"
+    );
+}
+
+#[test]
 fn empty_references_never_find_a_record() {
     let parent = "[automaton]\nname = 'Parent'\nstates = ['Closed']\ninitial = 'Closed'\n";
     let child = "[automaton]\nname = 'Child'\nstates = ['Ready']\ninitial = 'Ready'\n[[state]]\nname = 'parent_id'\ntype = 'string'\ninitial = ''\n[[invariant]]\nname = 'rule'\nassert = \"Parent[parent_id].status != 'Closed'\"\n";
     let result = check(&[parent, child]);
     assert!(matches!(result.outcome, JointOutcome::Holds), "{result}");
+}
+
+#[test]
+fn initial_states_take_their_block_before_an_invariant_can_stop_the_walk() {
+    let child = child_with("Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let automatons = parse(&[&parent, &child]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    for limit in [4 << 10, 2 << 20] {
+        let room = Bytes::new(limit);
+        let progress = Progress::default();
+        let results = verify_joint_invariants(
+            &refs,
+            None,
+            Bound {
+                room: &room,
+                progress: &progress,
+            },
+        );
+        assert_eq!(results.len(), 1);
+        if limit < 1 << 20 {
+            assert!(matches!(
+                results[0].outcome,
+                JointOutcome::Incomplete { .. }
+            ));
+            assert_eq!(results[0].states, 0);
+        } else {
+            assert!(matches!(results[0].outcome, JointOutcome::Broken { .. }));
+            assert!(progress.bytes.load(std::sync::atomic::Ordering::Relaxed) >= 1 << 20);
+        }
+        assert_eq!(room.held(), 0);
+    }
 }

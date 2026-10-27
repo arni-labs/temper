@@ -28,6 +28,7 @@ use serde_json::Value as Json;
 
 use super::platform_policy::merge_system_platform_policy;
 use crate::error::AuthzError;
+use json::entity_parts;
 use request::{Request, TRUE};
 
 /// A kind of sender.
@@ -98,16 +99,39 @@ impl SendAnalysis {
             .parse::<PolicySet>()
             .map_err(|e| AuthzError::PolicyParse(e.to_string()))?;
         merge_system_platform_policy(&mut set);
-        let policies = set
+        let mut policies: Vec<(Effect, Json)> = set
             .policies()
             .map(|policy| {
                 // A template-linked policy has no JSON form of its own; an
                 // unknown condition makes it a policy that may apply.
-                let json = policy.to_json().unwrap_or(Json::Null);
+                let mut json = policy.to_json().unwrap_or(Json::Null);
+                // An annotation such as an install's `@source` label decides
+                // nothing.
+                if let Some(fields) = json.as_object_mut() {
+                    fields.remove("annotations");
+                }
                 (policy.effect(), json)
             })
             .collect();
+        // In one order whatever order the set holds them in, and each once,
+        // so the same rules print the same: a joint proof's digest reads
+        // them. `may` reads them in any order, and a copy changes no answer.
+        policies.sort_by_cached_key(|(effect, json)| format!("{effect:?} {json}"));
+        policies.dedup();
         Ok(Self { policies })
+    }
+
+    /// Only the policies that may apply to an action `sent` picks by its
+    /// name: [`Self::may`] answers the same for those actions, and the
+    /// policies about others are left out.
+    pub fn for_actions(&self, sent: impl Fn(&str) -> bool) -> Self {
+        let policies = self
+            .policies
+            .iter()
+            .filter(|(_, policy)| may_name(policy, &sent))
+            .cloned()
+            .collect();
+        Self { policies }
     }
 
     /// Whether `asker` may send `action` to a record of `resource_type`, of
@@ -148,5 +172,22 @@ impl SendAnalysis {
         } else {
             May::Maybe
         }
+    }
+}
+
+/// Whether `policy`'s action scope may hold for an action `sent` picks by
+/// its name, as `Request::applies` reads that scope.
+fn may_name(policy: &Json, sent: &dyn Fn(&str) -> bool) -> bool {
+    let scope = &policy["action"];
+    let named =
+        |entity: &Json| entity_parts(entity).is_some_and(|(kind, id)| kind == "Action" && sent(id));
+    match scope["op"].as_str() {
+        Some("==") => named(&scope["entity"]),
+        Some("in") => match (scope.get("entities"), scope.get("entity")) {
+            (Some(Json::Array(list)), _) => list.iter().any(named),
+            (_, Some(entity)) => named(entity),
+            _ => true,
+        },
+        _ => true,
     }
 }

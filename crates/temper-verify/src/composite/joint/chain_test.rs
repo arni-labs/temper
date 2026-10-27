@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::*;
 use temper_spec::automaton::parse_automaton;
 
@@ -76,7 +78,7 @@ permit(principal == Agent::"service:chain", action, resource) when {
     .unwrap();
     let model = JointModel::new(
         &by_name,
-        BTreeSet::from(["A".into(), "B".into(), "C".into()]),
+        &BTreeSet::from(["A".into(), "B".into(), "C".into()]),
         "A",
         &[],
         Sending {

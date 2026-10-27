@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::encode::Enc;
@@ -86,32 +87,42 @@ pub(super) fn run(
     let mut done = Vec::new();
     let mut errors = Vec::new();
     std::thread::scope(|scope| -> std::io::Result<()> {
-        let workers: Vec<_> = (0..solvers)
-            .map(|i| {
-                scope.spawn(move || -> std::io::Result<Checked> {
-                    let mut z3 = Z3::start(deadline)?;
-                    z3.send(prelude)?;
-                    z3.send(few)?;
-                    let mut checked = Vec::new();
-                    let late = || deadline.is_some_and(|d| Instant::now() >= d);
-                    while !stop.load(Ordering::Relaxed) && !late() {
-                        let at = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(ask) = asks.get(at) else {
-                            break;
-                        };
-                        let obligation = check(&mut z3, literals, ask)?;
-                        if ends(&obligation) {
-                            stop.store(true, Ordering::Relaxed);
-                        }
-                        checked.push((at, obligation));
+        let mut workers = Vec::new();
+        for i in 0..solvers.min(asks.len()) {
+            if stop.load(Ordering::Relaxed) || next.load(Ordering::Relaxed) >= asks.len() {
+                break;
+            }
+            // Reserve capacity before creating the thread: concurrent rules
+            // share the same worker budget as their live solver contexts.
+            let Some(seat) = Seat::take(deadline) else {
+                break;
+            };
+            #[cfg(test)]
+            tests::WORKERS_CREATED.fetch_add(1, Ordering::SeqCst);
+            workers.push(scope.spawn(move || -> std::io::Result<Checked> {
+                let _seat = seat;
+                let mut z3 = Z3::start(deadline)?;
+                z3.send(prelude)?;
+                z3.send(few)?;
+                let mut checked = Vec::new();
+                let late = || deadline.is_some_and(|d| Instant::now() >= d);
+                while !stop.load(Ordering::Relaxed) && !late() {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(ask) = asks.get(at) else {
+                        break;
+                    };
+                    let obligation = check(&mut z3, literals, ask)?;
+                    if ends(&obligation) {
+                        stop.store(true, Ordering::Relaxed);
                     }
-                    if let (Ok(path), Some(script)) = (std::env::var("INDUCT_SCRIPT"), &z3.script) {
-                        std::fs::write(format!("{path}.{rule}.{i}.smt2"), script)?;
-                    }
-                    Ok((checked, std::mem::take(&mut z3.errors)))
-                })
-            })
-            .collect();
+                    checked.push((at, obligation));
+                }
+                if let (Ok(path), Some(script)) = (std::env::var("INDUCT_SCRIPT"), &z3.script) {
+                    std::fs::write(format!("{path}.{rule}.{i}.smt2"), script)?;
+                }
+                Ok((checked, std::mem::take(&mut z3.errors)))
+            }));
+        }
         for worker in workers {
             let (checked, refused) = worker.join().expect("a solver thread panicked")?;
             done.extend(checked);
@@ -148,6 +159,53 @@ pub(super) fn run(
         });
     }
     Ok((out, errors))
+}
+
+/// One of the solvers this process runs at once: as many as it has cores.
+/// A solver keeps one core busy, so more only share them, and each holds
+/// memory the walks' room does not count. An install proves each rule on
+/// its own, all at once, so this is what bounds them.
+struct Seat;
+
+impl Seat {
+    fn seats() -> &'static (Mutex<usize>, Condvar) {
+        static SEATS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+        SEATS.get_or_init(|| {
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            (Mutex::new(cores), Condvar::new())
+        })
+    }
+
+    /// Wait for a seat, `None` once `deadline` has passed.
+    fn take(deadline: Option<Instant>) -> Option<Self> {
+        let (free, freed) = Self::seats();
+        let mut free = free.lock().unwrap_or_else(PoisonError::into_inner);
+        while *free == 0 {
+            free = match deadline {
+                None => freed.wait(free).unwrap_or_else(PoisonError::into_inner),
+                Some(deadline) => {
+                    let left = deadline.checked_duration_since(Instant::now())?;
+                    freed
+                        .wait_timeout(free, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
+        }
+        *free -= 1;
+        Some(Seat)
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        let (free, freed) = Self::seats();
+        *free.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        freed.notify_one();
+    }
 }
 
 /// Check that `ask`'s goal holds given what it assumes; on a failure, which
@@ -287,3 +345,6 @@ fn shown(v: &Vocab<'_>, before: &[(String, String)], after: &[(String, String)])
     }
     out
 }
+
+#[cfg(test)]
+mod tests;
