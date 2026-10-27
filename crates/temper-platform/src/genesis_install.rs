@@ -40,11 +40,12 @@ use cache_paths::{
 use object_lookup::load_genesis_object;
 pub(crate) use registry::configured_registry;
 use registry::{RegistryUrl, registry_client};
+use restore::rollback_to_prior;
 pub use restore::{restore_genesis_app_cache_roots, restore_genesis_registry_cache_roots};
 
 use crate::genesis_install_verify::{
     InstallVerifyDecision, classify_install_verify, mark_install_failed, platform_store,
-    restore_prior_install, verify_install_closure_runtime_ready,
+    restore_prior_install, verify_install_closure_runtime_ready, verify_install_runtime_ready,
 };
 use crate::os_apps::{
     AppManifest, DirApps, InstallResult, OsAppReconcileResult, add_os_apps_dir_preferred,
@@ -243,40 +244,6 @@ pub async fn list_genesis_follow_latest_updates(
     }
 
     updates
-}
-
-/// Roll a failed Genesis install back to the previously-installed pinned version.
-///
-/// Re-materializes the prior ref's closure if its cache was evicted, then delegates to
-/// [`restore_prior_install`] to re-reconcile the prior bundle and restore its provenance record.
-async fn rollback_to_prior(
-    platform: &PlatformState,
-    ps: &dyn temper_server::platform_store::PlatformStore,
-    tenant: &str,
-    prior: &InstalledAppRecord,
-    prior_records: &[InstalledAppRecord],
-) -> Result<(), String> {
-    restore::ensure_prior_bundle_available(platform, ps, prior, prior_records).await?;
-    restore_prior_install(platform, ps, tenant, prior).await?;
-    let app_names = prior_records
-        .iter()
-        .map(|record| record.app_name.clone())
-        .collect::<Vec<_>>();
-    if !verify_install_closure_runtime_ready(platform, ps, tenant, &app_names).await {
-        return Err("rollback dependency closure is not runtime-ready".to_string());
-    }
-    for record in prior_records {
-        if !record.bundle_digest.is_empty()
-            && tenant_os_app_bundle_digest(tenant, &record.app_name)
-                .is_none_or(|digest| digest.bundle_digest != record.bundle_digest)
-        {
-            return Err(format!(
-                "rollback bundle for {} does not match its prior digest",
-                record.app_name
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Install a pinned Genesis app ref into this Temper instance from a registry URL.
@@ -546,20 +513,6 @@ pub async fn install_genesis_app_from_registry(
                     request.app_ref, prior.app_ref
                 )
             })?;
-            // Restore dependency provenance only after the recorded bundles are ready.
-            for record in &prior_records {
-                if record.app_name == prior.app_name {
-                    continue;
-                }
-                ps.record_installed_app_metadata(record)
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "rollback could not restore dependency provenance for {}: {error}",
-                            record.app_name
-                        )
-                    })?;
-            }
             Err(format!(
                 "Genesis install of {} failed runtime verification; rolled back to previous pinned ref {}",
                 request.app_ref, prior.app_ref

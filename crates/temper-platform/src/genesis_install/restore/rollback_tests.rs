@@ -219,7 +219,8 @@ async fn rollback_checks_dependency_runtime_readiness() {
     let tenant = format!("{TENANT}-rollback-unready");
     let v1 = "1".repeat(40);
     let root = cache(&platform, &tenant, "notes", &v1);
-    write_app_needing(&root, "notes", "notes v1", &["tags"]);
+    write_app_needing(&root, "notes", "notes v1", &["tags", "labels"]);
+    write_app(&root, "labels", "labels v1");
     write_app(&root, "tags", "tags v1");
     std::fs::write(
         root.join("tags/app.toml"),
@@ -235,14 +236,187 @@ startup_loading = "lazy"
     std::fs::write(root.join("tags/wasm/broken/broken.wasm"), b"not wasm").expect("broken wasm");
     let notes = record(&root, &tenant, "notes", &v1);
     let tags = record(&root, &tenant, "tags", &v1);
+    let labels = record(&root, &tenant, "labels", &v1);
     let error = crate::genesis_install::rollback_to_prior(
         &platform,
         ps.as_ref(),
         &tenant,
         &notes,
-        &[notes.clone(), tags],
+        &[notes.clone(), tags.clone(), labels.clone()],
     )
     .await
     .expect_err("a ready root cannot hide an unready dependency");
     assert!(error.contains("runtime-ready"), "{error}");
+    let failed_tags = InstalledAppRecord {
+        status: "failed".to_string(),
+        ..tags
+    };
+    assert_eq!(
+        ps.get_installed_app(&tenant, "tags")
+            .await
+            .unwrap()
+            .unwrap(),
+        failed_tags,
+        "an unready dependency keeps recovery coordinates without claiming readiness"
+    );
+    assert_eq!(
+        ps.get_installed_app(&tenant, "labels")
+            .await
+            .unwrap()
+            .unwrap(),
+        labels,
+        "an unready sibling does not prevent a healthy dependency from recovering"
+    );
+}
+
+#[tokio::test]
+async fn partial_rollback_preserves_each_dependency_for_retry_and_boot_recovery() {
+    use base64::Engine as _;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    for seed in 0..4 {
+        let registry = MockServer::start().await;
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let ps = Arc::new(SimPlatformStore::new(seed, SimPlatformFaultConfig::none()));
+        let platform = server_on(data_dir.path(), &ps);
+        let tenant = format!("{TENANT}-partial-rollback-{seed}");
+        let (v1, v2) = ("1".repeat(40), "2".repeat(40));
+        let root = cache(&platform, &tenant, "notes", &v1);
+        write_app_needing(
+            &root,
+            "notes",
+            "notes v1",
+            &["missing", "cached", "bundled"],
+        );
+        write_app(&root, "bundled", "bundled v1");
+        let own = cache(&platform, &tenant, "cached", &v1);
+        write_app(&own, "cached", "cached v1");
+        let missing_files = tempfile::tempdir().expect("missing files");
+        write_app(missing_files.path(), "missing", "missing v1");
+        let notes = record(&root, &tenant, "notes", &v1);
+        let bundled = record(&root, &tenant, "bundled", &v1);
+        let cached = record(&own, &tenant, "cached", &v1);
+        let missing = InstalledAppRecord {
+            registry_url: registry.uri(),
+            ..record(missing_files.path(), &tenant, "missing", &v1)
+        };
+        // Exercise both dependency orderings and failure to recover the root itself.
+        if seed & 1 != 0 {
+            std::fs::remove_dir_all(root.join("notes")).expect("evict root");
+        }
+        let mut dependencies = vec![missing.clone(), cached.clone(), bundled.clone()];
+        if seed & 2 != 0 {
+            dependencies.reverse();
+        }
+        let mut prior_records = vec![notes.clone()];
+        prior_records.extend(dependencies.clone());
+        let broken = cache(&platform, &tenant, "notes", &v2);
+        for app in ["notes", "missing", "cached", "bundled"] {
+            write_app(&broken, app, "failed upgrade");
+            // Reconcile clears Genesis provenance before the upgrade fails verification.
+            let local = InstalledAppRecord {
+                tenant: tenant.clone(),
+                status: "installed".to_string(),
+                source_kind: "local".to_string(),
+                bundle_digest: recorded(&broken, app).bundle_digest,
+                app_name: app.to_string(),
+                ..Default::default()
+            };
+            ps.record_installed_app_metadata(&local)
+                .await
+                .expect("partial upgrade");
+        }
+        register_install_cache(&tenant, broken, DirApps::Every);
+        let error = crate::genesis_install::rollback_to_prior(
+            &platform,
+            ps.as_ref(),
+            &tenant,
+            &notes,
+            &prior_records,
+        )
+        .await
+        .expect_err("incomplete recovery still fails");
+        assert!(error.contains("rollback"), "seed {seed}: {error}");
+        for prior in &dependencies {
+            let stored = ps
+                .get_installed_app(&tenant, &prior.app_name)
+                .await
+                .expect("read dependency")
+                .expect("dependency record");
+            let mut expected = prior.clone();
+            if prior.app_name == "missing" {
+                expected.status = "failed".to_string();
+            }
+            assert_eq!(
+                stored, expected,
+                "seed {seed}: {} keeps its recovery coordinates",
+                prior.app_name
+            );
+        }
+        // The registry returns after rollback fails. Boot must fetch using the saved coordinates.
+        let files = ["app.toml", "APP.md"]
+            .into_iter()
+            .map(|name| GenesisRegistryBundleFile {
+                path: name.to_string(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(
+                    std::fs::read(missing_files.path().join("missing").join(name)).unwrap(),
+                ),
+            })
+            .collect();
+        let bundle = GenesisRegistryBundleResponse {
+            app_ref: missing.app_ref.clone(),
+            registry_tenant: "default".to_string(),
+            apps: vec![GenesisRegistryBundleApp {
+                owner: "acme".to_string(),
+                name: "missing".to_string(),
+                version_hash: v1.clone(),
+                files,
+            }],
+        };
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/genesis/apps/acme/missing/versions/{v1}/bundle"
+            )))
+            .and(header("X-Tenant-Id", "default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&bundle))
+            .expect(1)
+            .mount(&registry)
+            .await;
+        write_app_needing(
+            &root,
+            "notes",
+            "notes v1",
+            &["missing", "cached", "bundled"],
+        );
+        let rebooted = server_on(data_dir.path(), &ps);
+        assert_eq!(
+            restore_genesis_registry_cache_roots(&rebooted).await,
+            2,
+            "seed {seed}: boot restores the cached dependency and fetches the missing one"
+        );
+        crate::genesis_install::rollback_to_prior(
+            &rebooted,
+            ps.as_ref(),
+            &tenant,
+            &notes,
+            &prior_records,
+        )
+        .await
+        .expect("retry completes after missing files return");
+        registry.verify().await;
+        for prior in &prior_records {
+            assert_eq!(
+                ps.get_installed_app(&tenant, &prior.app_name)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *prior,
+                "seed {seed}: retry restores {}",
+                prior.app_name
+            );
+        }
+    }
 }

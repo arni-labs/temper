@@ -1,6 +1,132 @@
 //! Recover prior dependencies even when another install holds their files.
 
 use super::*;
+use crate::os_apps::{InstallOrigin, OsAppInstallPlan, install_os_app_with_plan};
+
+/// Roll back the prior closure without losing recovery coordinates on partial failure.
+pub(in crate::genesis_install) async fn rollback_to_prior(
+    platform: &PlatformState,
+    ps: &dyn PlatformStore,
+    tenant: &str,
+    prior: &InstalledAppRecord,
+    prior_records: &[InstalledAppRecord],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    // Preserve the desired versions before any fallible recovery. A failed record carries
+    // recovery coordinates without claiming that the currently selected bundle is healthy.
+    for record in prior_records
+        .iter()
+        .filter(|r| r.app_name != prior.app_name)
+    {
+        if let Err(error) = record_dependency_recovery(ps, record, false).await {
+            errors.push(error);
+        }
+    }
+    match ensure_prior_bundle_available(platform, ps, prior, prior_records).await {
+        Ok(()) => {
+            if let Err(error) = restore_prior_install(platform, ps, tenant, prior).await {
+                errors.push(error);
+            }
+        }
+        Err(error) => errors.push(error),
+    }
+    // Reconcile each recovered dependency even if the root or a sibling could not recover.
+    // Reconcile one app at a time so a missing sibling cannot prevent independent progress.
+    for record in prior_records
+        .iter()
+        .filter(|r| r.app_name != prior.app_name)
+    {
+        let matches = tenant_os_app_bundle_digest(tenant, &record.app_name).is_some_and(|digest| {
+            record.bundle_digest.is_empty() || digest.bundle_digest == record.bundle_digest
+        });
+        let ready = if matches {
+            // Pending records describe the desired version, so replay its phases rather
+            // than treating its saved digest as proof that the runtime is unchanged.
+            match install_os_app_with_plan(
+                platform,
+                tenant,
+                &record.app_name,
+                OsAppInstallPlan::all(),
+                InstallOrigin::Replay,
+            )
+            .await
+            {
+                Ok(_) => {
+                    verify_install_runtime_ready(platform, ps, tenant, &record.app_name).await
+                        && tenant_os_app_bundle_digest(tenant, &record.app_name).is_some_and(
+                            |digest| {
+                                record.bundle_digest.is_empty()
+                                    || digest.bundle_digest == record.bundle_digest
+                            },
+                        )
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "rollback reconcile of {} failed: {error}",
+                        record.app_name
+                    ));
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if !ready {
+            errors.push(format!(
+                "rollback dependency {} is not runtime-ready at its prior digest",
+                record.app_name
+            ));
+        }
+        // Keep the recovery record failed unless this dependency independently verified.
+        if let Err(error) = record_dependency_recovery(ps, record, ready).await {
+            errors.push(error);
+        }
+    }
+    let app_names = prior_records
+        .iter()
+        .map(|r| r.app_name.clone())
+        .collect::<Vec<_>>();
+    if errors.is_empty()
+        && !verify_install_closure_runtime_ready(platform, ps, tenant, &app_names).await
+    {
+        errors.push("rollback dependency closure is not runtime-ready".to_string());
+    }
+    for record in prior_records {
+        if !record.bundle_digest.is_empty()
+            && tenant_os_app_bundle_digest(tenant, &record.app_name)
+                .is_none_or(|digest| digest.bundle_digest != record.bundle_digest)
+        {
+            errors.push(format!(
+                "rollback bundle for {} does not match its prior digest",
+                record.app_name
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn record_dependency_recovery(
+    ps: &dyn PlatformStore,
+    prior: &InstalledAppRecord,
+    ready: bool,
+) -> Result<(), String> {
+    let mut record = prior.clone();
+    if !ready {
+        record.status = "failed".to_string();
+    }
+    ps.record_installed_app_metadata(&record)
+        .await
+        .map_err(|error| {
+            format!(
+                "rollback could not restore dependency provenance for {}: {error}",
+                prior.app_name
+            )
+        })
+}
 
 /// Restore every prior dependency the root cache no longer holds at its recorded digest.
 pub(super) async fn restore_prior_dependencies(
@@ -10,20 +136,23 @@ pub(super) async fn restore_prior_dependencies(
     prior_records: &[InstalledAppRecord],
     served: &BTreeSet<String>,
 ) -> Result<(), String> {
+    let mut errors = Vec::new();
     for record in prior_records {
         if record.app_name == prior.app_name || served.contains(&record.app_name) {
             continue;
         }
-        restore_dependency(platform, ps, record, prior_records)
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to restore prior dependency {} for rollback: {error}",
-                    record.app_ref
-                )
-            })?;
+        if let Err(error) = restore_dependency(platform, ps, record, prior_records).await {
+            errors.push(format!(
+                "failed to restore prior dependency {} for rollback: {error}",
+                record.app_ref
+            ));
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn restore_dependency(
