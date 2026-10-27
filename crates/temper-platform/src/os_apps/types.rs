@@ -38,6 +38,11 @@ pub struct InstallResult {
     /// What the install's checks found and did not refuse.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<InstallWarning>,
+    /// The modules Jev reviewed at this install (`module_review`), found
+    /// wanting or not: with no `module_review` warning about one, its review
+    /// found nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modules_reviewed: Vec<String>,
 }
 
 /// Something an install's checks found and did not refuse.
@@ -60,6 +65,16 @@ impl InstallWarning {
             check: "spec_change".to_string(),
             message,
             detail: None,
+        }
+    }
+
+    /// What Jev's review of a module found, or why a module was not
+    /// reviewed (`module_review`): advice, never a refusal.
+    pub fn module_review(message: String, detail: serde_json::Value) -> Self {
+        Self {
+            check: "module_review".to_string(),
+            message,
+            detail: Some(detail),
         }
     }
 
@@ -219,6 +234,10 @@ pub struct WasmModuleManifest {
     pub provenance: Option<String>,
     #[serde(default)]
     pub import_class: Option<String>,
+    /// The module's Rust source in the app, for Jev's review at install (`crate::module_review`). Relative to the
+    /// app's folder; `wasm/<name>/src/lib.rs` when not given.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl WasmModuleManifest {

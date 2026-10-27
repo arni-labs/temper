@@ -66,13 +66,6 @@ struct SnapshotRecord {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SnapshotHistoryRecord {
-    sequence_nr: u64,
-    snapshot: Vec<u8>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct SegmentRecord {
     segment_index: u64,
     start_sequence_nr: u64,
@@ -125,18 +118,6 @@ impl RedisEventStore {
     fn snapshot_key(tenant: &str, entity_type: &str, entity_id: &str) -> String {
         format!(
             "{}:snapshot:{tenant}:{entity_type}:{entity_id}",
-            crate::keys::PREFIX
-        )
-    }
-
-    fn snapshot_history_key(
-        tenant: &str,
-        entity_type: &str,
-        entity_id: &str,
-        sequence_nr: u64,
-    ) -> String {
-        format!(
-            "{}:snapshot_history:{tenant}:{entity_type}:{entity_id}:{sequence_nr}",
             crate::keys::PREFIX
         )
     }
@@ -378,20 +359,6 @@ impl EventStore for RedisEventStore {
         let _: () = self
             .client
             .set(&key, encoded, None, None, false)
-            .await
-            .map_err(storage_error)?;
-
-        let history_key = Self::snapshot_history_key(tenant, entity_type, entity_id, sequence_nr);
-        let history = SnapshotHistoryRecord {
-            sequence_nr,
-            snapshot: snapshot.to_vec(),
-            created_at: chrono::Utc::now(),
-        };
-        let encoded_history = serde_json::to_string(&history)
-            .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-        let _: () = self
-            .client
-            .set(&history_key, encoded_history, None, None, false)
             .await
             .map_err(storage_error)?;
 

@@ -26,6 +26,7 @@ mod closure_bootstrap;
 mod entity_aliases;
 mod install_checks;
 mod install_guard;
+mod module_review_step;
 mod policy_rows;
 mod reconcile;
 mod runtime_heal;
@@ -1136,6 +1137,8 @@ pub(super) async fn install_os_app_with_plan(
             missing.join(", ")
         ));
     }
+    // Jev reads the changed modules beside the rest of the install; joined before it answers.
+    let review = module_review_step::start(state, tenant, &app_dir, &bundle, plan.wasm).await;
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }
@@ -1618,6 +1621,8 @@ pub(super) async fn install_os_app_with_plan(
     };
 
     reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle).await;
+    let review = review.finish().await;
+    warnings.extend(review.warnings);
 
     Ok(InstallResult {
         added,
@@ -1631,6 +1636,7 @@ pub(super) async fn install_os_app_with_plan(
         adrs_bootstrapped,
         seed_instances: seed_created,
         warnings,
+        modules_reviewed: review.reviewed,
     })
 }
 
