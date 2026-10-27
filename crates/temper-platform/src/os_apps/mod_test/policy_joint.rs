@@ -108,7 +108,13 @@ async fn policy_checks_use_incoming_specs_over_active_versions() {
     )
     .await
     .expect("the incoming spec replaces the old property before checking");
-    assert!(unproved.is_empty(), "{unproved:?}");
+    // The new property names only Place, so App's reaction into Place is
+    // outside its scope. The walk does not send that reaction, so the
+    // property is not checked: a warning, not a refusal.
+    assert!(
+        unproved.len() == 1 && unproved[0].contains("a reaction from App may take Place.Bring"),
+        "{unproved:?}"
+    );
 }
 
 #[tokio::test]
