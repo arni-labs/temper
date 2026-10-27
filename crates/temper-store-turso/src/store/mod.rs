@@ -35,6 +35,7 @@ mod append_commit;
 mod append_config;
 mod authz;
 mod blobs;
+mod catalog_groups;
 mod commit_probe;
 mod constraints;
 mod entity_listing;
