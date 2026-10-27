@@ -287,9 +287,7 @@ impl AgentContext {
     /// the callback's own key: a retried parent's callback is then answered
     /// as its first, whichever identity sends it.
     pub fn for_service_answering(service_name: &str, callback: &AgentContext) -> Self {
-        let mut context = Self::for_service_inheriting(service_name, callback);
-        context.idempotency_key = callback.idempotency_key.clone();
-        context
+        Self::for_service_inheriting(service_name, callback)
     }
 
     /// Copy the execution budget and non-authority observability fields from a parent.
