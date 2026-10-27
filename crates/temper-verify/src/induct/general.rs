@@ -18,7 +18,6 @@ use temper_spec::automaton::Action;
 use super::moves::{Move, Moves, Param, Step};
 use super::run::Ask;
 use super::vocab::Sort;
-use super::{Obligation, Outcome};
 
 /// One obligation the proof checks first: a move as it is, or a general
 /// move standing for several.
@@ -143,59 +142,31 @@ impl Moves<'_, '_, '_> {
     }
 }
 
-impl Group {
-    /// The ask of its first obligation, from `ask`, which writes a move's.
-    pub(super) fn ask(&self, moves: &[Move], ask: &impl Fn(&Move) -> Ask) -> Ask {
-        match &self.general {
-            Some(general) => Ask {
-                general: true,
-                ..ask(general)
-            },
-            None => ask(&moves[self.members[0]]),
-        }
-    }
-}
-
-/// `checked`, the outcomes of `asked` in order, whose groups' asks start at
-/// `from`, with each general move that did not hold replaced by the
-/// outcomes of the moves it stands for, which `solve` checks; and what the
-/// solvers refused there.
-pub(super) fn fall_back(
-    (groups, moves): (&[Group], &[Move]),
-    (asked, from, checked): (&[Ask], usize, Vec<Obligation>),
+/// The asks of `groups`, in order, from `ask`, which writes a move's: a
+/// general move's is followed by those of the moves it stands for, which
+/// are checked only when it does not hold.
+pub(super) fn lay_out(
+    groups: &[Group],
+    moves: &[Move],
     ask: &impl Fn(&Move) -> Ask,
-    solve: impl FnOnce(&[Ask]) -> std::io::Result<(Vec<Obligation>, Vec<String>)>,
-) -> std::io::Result<(Vec<Obligation>, Vec<String>)> {
-    let unheld: Vec<Option<&Group>> = checked
-        .iter()
-        .enumerate()
-        .map(|(i, o)| {
-            let group = groups.get(i.checked_sub(from)?)?;
-            let general = group.general.as_ref()?;
-            let unheld = asked[i].name == general.label && !matches!(o.outcome, Outcome::Holds);
-            unheld.then_some(group)
-        })
-        .collect();
-    let asks: Vec<Ask> = unheld
-        .iter()
-        .flatten()
-        .flat_map(|group| group.members.iter().map(|&m| ask(&moves[m])))
-        .collect();
-    if asks.is_empty() {
-        return Ok((checked, Vec::new()));
-    }
-    let (specific, refused) = solve(&asks)?;
-    let mut specific = specific.into_iter();
-    let mut out = Vec::new();
-    for (o, unheld) in checked.into_iter().zip(unheld) {
-        match unheld {
-            Some(group) => out.extend(specific.by_ref().take(group.members.len())),
-            None => out.push(o),
+    out: &mut Vec<Ask>,
+) {
+    for group in groups {
+        let members = group.members.iter().map(|&m| ask(&moves[m]));
+        match &group.general {
+            Some(general) => {
+                let first = out.len() + 1;
+                let members: Vec<Ask> = members.collect();
+                let at = (first..first + members.len()).collect();
+                out.push(Ask {
+                    members: at,
+                    ..ask(general)
+                });
+                out.extend(members);
+            }
+            None => out.extend(members),
         }
     }
-    // What the solvers did not check by the deadline.
-    out.extend(specific);
-    Ok((out, refused))
 }
 
 #[cfg(test)]

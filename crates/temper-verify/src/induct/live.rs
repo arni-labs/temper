@@ -27,7 +27,7 @@ use temper_spec::predicate::Expr;
 use super::declare::counted;
 use super::encode::Enc;
 use super::moves::{Move, Moves, Step};
-use super::run::Ask;
+use super::run::{Ask, Goal, Reads};
 use super::vocab::Vocab;
 
 /// The measure of an `eventually` rule: terms over `$`-framed names,
@@ -88,15 +88,16 @@ pub(super) struct Live<'r> {
     pub(super) regions: Vec<&'r Region>,
 }
 
-/// The liveness obligations of `live`, after its lemmas `clauses` are
-/// proved inductive: the regions cover every state short of the target, the
+/// The liveness obligations of `live`, each assuming the lemmas the proof
+/// holds, whose clauses before a move are `before`, after those are proved
+/// inductive: the regions cover every state short of the target, the
 /// measure is not negative there, and each region's move can happen and
 /// reaches the target or lowers the measure, whichever way it goes.
 pub(super) fn asks(
     enc: &Enc<'_, '_>,
     moves: &[Move],
     live: &Live<'_>,
-    clauses: &dyn Fn(&str) -> Vec<(String, String)>,
+    before: &[(String, String)],
     out: &mut Vec<Ask>,
     errors: &mut Vec<String>,
 ) {
@@ -118,7 +119,6 @@ pub(super) fn asks(
     // target does not.
     let short = |extra: &[String], decls: &[String]| -> String {
         let not_there = format!("(not {})", target("pre"));
-        let held = clauses("pre");
         let mut text = format!("(push 1)\n{}", counted(v));
         let mut seen = BTreeSet::new();
         for d in enc.take_decls().iter().chain(decls) {
@@ -126,30 +126,40 @@ pub(super) fn asks(
                 text.push_str(&format!("{d}\n"));
             }
         }
-        for (_, c) in held {
-            text.push_str(&format!("(assert {c})\n"));
-        }
         text.push_str(&format!("(assert {not_there})\n"));
         for fact in extra {
             text.push_str(&format!("(assert {fact})\n"));
         }
         text
     };
-    let before = clauses("pre");
+    let ask = |name: &str, text, goal: Vec<(String, String)>| {
+        let reads = Reads::new(v, before, &goal);
+        Ask {
+            assumes: true,
+            ..Ask::new(
+                name,
+                text,
+                goal.into_iter()
+                    .map(|(name, text)| (Goal::Required(name), text))
+                    .collect(),
+                &reads,
+            )
+        }
+    };
     let any: Vec<String> = live.regions.iter().map(|r| r.read("pre")).collect();
     let covered = vec![(
         "some region".to_string(),
         format!("(or false {})", any.join(" ")),
     )];
     let text = short(&[], &[]);
-    out.push(Ask::new(v, "covers", text, covered, &before));
+    out.push(ask("covers", text, covered));
     let floor: Vec<String> = terms("pre").iter().map(|t| format!("(>= {t} 0)")).collect();
     let bounded = vec![(
         "measure not negative".to_string(),
         format!("(and true {})", floor.join(" ")),
     )];
     let text = short(&[], &[]);
-    out.push(Ask::new(v, "measure bounded", text, bounded, &before));
+    out.push(ask("measure bounded", text, bounded));
     let lower = lexically_less(&terms("post"), &terms("pre"));
     for region in &live.regions {
         // A region that pins no parameter takes its move as the induction
@@ -200,7 +210,7 @@ pub(super) fn asks(
         }
         let text = short(std::slice::from_ref(&at_w), &decls);
         let name = format!("region {}: {} can happen", region.name, region.step);
-        out.push(Ask::new(v, &name, text, happens, &before));
+        out.push(ask(&name, text, happens));
         for outcome in &outcomes {
             let reaches = vec![(
                 "target or lower measure".to_string(),
@@ -210,7 +220,7 @@ pub(super) fn asks(
             extra.extend(outcome.body().cloned());
             let text = short(&extra, &decls);
             let name = format!("region {}: {}", region.name, outcome.label);
-            out.push(Ask::new(v, &name, text, reaches, &before));
+            out.push(ask(&name, text, reaches));
         }
     }
 }
