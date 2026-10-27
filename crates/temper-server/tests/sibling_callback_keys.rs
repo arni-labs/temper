@@ -158,95 +158,170 @@ async fn two_integrations_answering_alike_both_apply_under_one_caller_key() {
     assert_eq!(answers().await, 2, "a retry applies neither callback again");
 }
 
-/// A callback that runs in the background, after the request has answered,
-/// keeps its key too: a retry of the request runs the integrations again, and
-/// their callbacks are answered by the ones that applied.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_retry_applies_no_background_callback_again() {
-    let outside = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/ask"))
-        .respond_with(answer("yes"))
-        .mount(&outside)
-        .await;
-    let tenant = TenantId::new("surveys");
-    let state = build_state("surveys", &SURVEY_IOA.replace("{url}", &outside.uri()));
-    let who = AgentContext {
-        idempotency_key: Some(IdempotencyKey::Request("ask-4".to_string())),
-        ..AgentContext::for_service(SERVICE)
-    };
-    let ask = || {
-        state.dispatch_tenant_action_ext(
-            &tenant,
-            "Survey",
-            "s1",
-            "Ask",
-            serde_json::json!({}),
-            DispatchExtOptions {
-                agent_ctx: &who,
-                await_integration: false,
-                await_reactions: true,
+/// [`SURVEY_IOA`] calling `/first` and `/second`. The second has no failure
+/// callback, so its failure fails the request; every `Unanswered` counts in
+/// `misses`, so one applied beside an `Answered` shows.
+const TWO_SERVICES_IOA: &str = r#"
+[automaton]
+name = "Survey"
+states = ["Idle", "Asking"]
+initial = "Idle"
+
+[[state]]
+name = "answers"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "misses"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Ask"
+kind = "input"
+from = ["Idle"]
+to = "Asking"
+
+[[action.triggers]]
+name = "ask_first"
+kind = "adapter"
+adapter = "http"
+on_success = "Answered"
+on_failure = "Unanswered"
+config = { method = "POST", url = "{url}/first" }
+
+[[action.triggers]]
+name = "ask_second"
+kind = "adapter"
+adapter = "http"
+on_success = "Answered"
+config = { method = "POST", url = "{url}/second" }
+
+[[action]]
+name = "Answered"
+kind = "input"
+from = ["Asking"]
+params = ["result"]
+effect = ["answers += 1"]
+
+[[action]]
+name = "Unanswered"
+kind = "input"
+from = ["Asking"]
+params = ["error_message"]
+effect = ["misses += 1"]
+"#;
+
+/// Survey `s1` as one caller sees it, asking under one `Idempotency-Key`.
+struct Survey {
+    state: ServerState,
+    tenant: TenantId,
+    who: AgentContext,
+}
+
+impl Survey {
+    /// A survey on [`TWO_SERVICES_IOA`] calling `outside`, asked under `key`.
+    fn new(outside: &MockServer, key: &str) -> Self {
+        Self {
+            state: build_state(
+                "surveys",
+                &TWO_SERVICES_IOA.replace("{url}", &outside.uri()),
+            ),
+            tenant: TenantId::new("surveys"),
+            who: AgentContext {
+                idempotency_key: Some(IdempotencyKey::Request(key.to_string())),
+                ..AgentContext::for_service(SERVICE)
             },
-        )
-    };
-    let seen = Seen {
-        state: &state,
-        tenant: &tenant,
-        outside: &outside,
-    };
+        }
+    }
 
-    let first = ask().await.expect("Ask dispatches");
-    assert!(first.success, "{:?}", first.error);
-    let applied = seen.until(Duration::from_secs(10), |_, answers| answers == 2);
-    assert!(applied.await.is_some(), "both background callbacks apply");
+    /// `Ask`, answered once its integrations and their callbacks have run.
+    async fn ask_inline(&self) -> (bool, Option<String>) {
+        self.ask(true).await
+    }
 
-    let retry = ask().await.expect("retried Ask dispatches");
-    assert!(retry.success, "{:?}", retry.error);
-    let rerun = seen.until(Duration::from_secs(10), |calls, _| calls == 4);
-    assert!(
-        rerun.await.is_some(),
-        "the retry runs both integrations again"
-    );
-    // Their callbacks follow the outside answers; give them time to land.
-    assert_eq!(
-        seen.until(Duration::from_secs(2), |_, answers| answers > 2)
-            .await,
-        None,
-        "a retry applied a background callback again"
-    );
-}
+    /// `Ask`, answered before its integrations run in the background.
+    async fn ask_in_background(&self) -> (bool, Option<String>) {
+        self.ask(false).await
+    }
 
-/// What a test can see of survey `s1`: the calls on `/ask` and its answers.
-struct Seen<'a> {
-    state: &'a ServerState,
-    tenant: &'a TenantId,
-    outside: &'a MockServer,
-}
+    async fn ask(&self, await_integration: bool) -> (bool, Option<String>) {
+        let response = self
+            .state
+            .dispatch_tenant_action_ext(
+                &self.tenant,
+                "Survey",
+                "s1",
+                "Ask",
+                serde_json::json!({}),
+                DispatchExtOptions {
+                    agent_ctx: &self.who,
+                    await_integration,
+                    await_reactions: true,
+                },
+            )
+            .await
+            .expect("Ask dispatches");
+        (response.success, response.error)
+    }
 
-impl Seen<'_> {
-    /// `(calls, answers)` once `done` holds, polling every 20 ms for at most
-    /// `limit`; `None` when it never did.
-    async fn until(
-        &self,
-        limit: Duration,
-        done: impl Fn(usize, usize) -> bool,
-    ) -> Option<(usize, usize)> {
+    /// The survey's counter `name`.
+    async fn count(&self, name: &str) -> usize {
+        let entity = self
+            .state
+            .get_tenant_entity_state(&self.tenant, "Survey", "s1")
+            .await
+            .expect("record");
+        entity.state.counters.get(name).copied().unwrap_or(0)
+    }
+
+    /// Whether `answers` reaches `target` within `limit`, polling every 20 ms.
+    async fn answers_reach(&self, target: usize, limit: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
         while tokio::time::Instant::now() < deadline {
-            let entity = self
-                .state
-                .get_tenant_entity_state(self.tenant, "Survey", "s1")
-                .await
-                .expect("record");
-            let answers = entity.state.counters.get("answers").copied().unwrap_or(0);
-            let seen = (calls(self.outside, "/ask").await, answers);
-            if done(seen.0, seen.1) {
-                return Some(seen);
+            if self.count("answers").await == target {
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        None
+        false
     }
+}
+
+/// An outside service where `/first` answers `yes` once and `then` after,
+/// and `/second` fails its first call and answers `yes` after. A request's
+/// first run commits `/first`'s callback and then fails on `/second`, which
+/// leaves its integrations to the retry.
+async fn failing_partway(then: ResponseTemplate) -> MockServer {
+    let outside = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first"))
+        .respond_with(answer("yes"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&outside)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/first"))
+        .respond_with(then)
+        .with_priority(2)
+        .mount(&outside)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/second"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&outside)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/second"))
+        .respond_with(answer("yes"))
+        .with_priority(2)
+        .mount(&outside)
+        .await;
+    outside
 }
 
 fn answer(result: &str) -> ResponseTemplate {
@@ -265,88 +340,60 @@ async fn calls(outside: &MockServer, route: &str) -> usize {
         .count()
 }
 
+/// A callback that runs in the background, after the request has answered,
+/// keeps its key too. The first request commits `/first`'s callback and fails
+/// on `/second`; its retry runs both again in the background, where `/first`
+/// now fails. That failure callback is answered by the committed success.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_retry_after_an_interrupted_request_does_not_apply_a_committed_callback_again() {
-    let outside = MockServer::start().await;
-    // The first service answers the retry differently from the first call.
-    Mock::given(method("POST"))
-        .and(path("/first"))
-        .respond_with(answer("yes"))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&outside)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/first"))
-        .respond_with(answer("changed"))
-        .with_priority(2)
-        .mount(&outside)
-        .await;
-    // The second service holds its first call, so the request stops there.
-    Mock::given(method("POST"))
-        .and(path("/second"))
-        .respond_with(answer("yes").set_delay(Duration::from_secs(60)))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&outside)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/second"))
-        .respond_with(answer("yes"))
-        .with_priority(2)
-        .mount(&outside)
-        .await;
-    let survey_ioa = SURVEY_IOA
-        .replacen("{url}/ask", "{url}/first", 1)
-        .replacen("{url}/ask", "{url}/second", 1)
-        .replace("{url}", &outside.uri());
-    let tenant = TenantId::new("surveys");
-    let state = build_state("surveys", &survey_ioa);
-    let who = AgentContext {
-        idempotency_key: Some(IdempotencyKey::Request("ask-2".to_string())),
-        ..AgentContext::for_service(SERVICE)
-    };
-    let ask = |state: ServerState, tenant: TenantId, who: AgentContext| async move {
-        state
-            .dispatch_tenant_action_ext(
-                &tenant,
-                "Survey",
-                "s1",
-                "Ask",
-                serde_json::json!({}),
-                DispatchExtOptions {
-                    agent_ctx: &who,
-                    await_integration: true,
-                    await_reactions: true,
-                },
-            )
-            .await
-            .map(|response| (response.success, response.error))
-    };
-    let answers = || async {
-        let entity = state
-            .get_tenant_entity_state(&tenant, "Survey", "s1")
-            .await
-            .expect("record");
-        entity.state.counters.get("answers").copied().unwrap_or(0)
-    };
+async fn a_retry_applies_no_background_callback_again() {
+    let outside = failing_partway(ResponseTemplate::new(500)).await;
+    let survey = Survey::new(&outside, "ask-4");
 
-    let interrupted = tokio::spawn(ask(state.clone(), tenant.clone(), who.clone()));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while calls(&outside, "/second").await == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the second outside call never started"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(answers().await, 1, "the first callback committed");
-    interrupted.abort();
-    assert!(interrupted.await.expect_err("aborted").is_cancelled());
+    let (success, _) = survey.ask_inline().await;
+    assert!(!success, "the second integration failed the request");
+    assert_eq!(
+        survey.count("answers").await,
+        1,
+        "the first callback committed"
+    );
 
-    let (success, error) = ask(state.clone(), tenant.clone(), who.clone())
-        .await
-        .expect("retried Ask dispatches");
+    let (success, error) = survey.ask_in_background().await;
+    assert!(success, "{error:?}");
+    // One task runs the integrations in order and waits for each callback, so
+    // `/first`'s callback has landed once `/second`'s has.
+    assert!(
+        survey.answers_reach(2, Duration::from_secs(10)).await,
+        "the retry's second callback applies"
+    );
+    assert_eq!(
+        calls(&outside, "/first").await,
+        2,
+        "the retry ran the first integration again"
+    );
+    assert_eq!(
+        survey.count("misses").await,
+        0,
+        "a retry applied a background callback beside the committed one"
+    );
+}
+
+/// A retry whose outside service answers it differently does not apply the
+/// committed callback again: the first request commits `/first`'s `yes` and
+/// fails on `/second`, and the retry's `/first` answers `changed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_after_a_request_that_failed_partway_does_not_apply_a_committed_callback_again() {
+    let outside = failing_partway(answer("changed")).await;
+    let survey = Survey::new(&outside, "ask-2");
+
+    let (success, _) = survey.ask_inline().await;
+    assert!(!success, "the second integration failed the request");
+    assert_eq!(
+        survey.count("answers").await,
+        1,
+        "the first callback committed"
+    );
+
+    let (success, error) = survey.ask_inline().await;
     assert!(success, "{error:?}");
     assert_eq!(
         calls(&outside, "/first").await,
@@ -354,9 +401,9 @@ async fn a_retry_after_an_interrupted_request_does_not_apply_a_committed_callbac
         "the retry ran the first integration again"
     );
     assert_eq!(
-        answers().await,
+        survey.count("answers").await,
         2,
-        "the committed callback is not applied again; the interrupted one applies once"
+        "the committed callback is not applied again; the second applies once"
     );
 }
 
@@ -365,83 +412,60 @@ async fn a_retry_after_an_interrupted_request_does_not_apply_a_committed_callbac
 /// callback is answered by the committed success, not applied beside it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retry_whose_integration_now_fails_keeps_its_committed_outcome() {
-    let outside = MockServer::start().await;
-    // The first service answers the first call, and fails every call after.
-    Mock::given(method("POST"))
-        .and(path("/first"))
-        .respond_with(answer("yes"))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&outside)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/first"))
-        .respond_with(ResponseTemplate::new(500))
-        .with_priority(2)
-        .mount(&outside)
-        .await;
-    // The second service holds its first call, so the request stops there.
-    Mock::given(method("POST"))
-        .and(path("/second"))
-        .respond_with(answer("yes").set_delay(Duration::from_secs(60)))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&outside)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/second"))
-        .respond_with(answer("yes"))
-        .with_priority(2)
-        .mount(&outside)
-        .await;
-    // Every `Unanswered` counts too, so one applied beside an `Answered` shows.
-    let survey_ioa = SURVEY_IOA
-        .replacen("{url}/ask", "{url}/first", 1)
-        .replacen("{url}/ask", "{url}/second", 1)
-        .replace("{url}", &outside.uri())
-        .replace(
-            "[[action]]\nname = \"Ask\"",
-            "[[state]]\nname = \"misses\"\ntype = \"counter\"\ninitial = 0\n\n[[action]]\nname = \"Ask\"",
-        )
-        .replace(
-            "params = [\"error_message\"]",
-            "params = [\"error_message\"]\neffect = [\"misses += 1\"]",
-        );
-    let tenant = TenantId::new("surveys");
-    let state = build_state("surveys", &survey_ioa);
-    let who = AgentContext {
-        idempotency_key: Some(IdempotencyKey::Request("ask-3".to_string())),
-        ..AgentContext::for_service(SERVICE)
-    };
-    let ask = |state: ServerState, tenant: TenantId, who: AgentContext| async move {
-        state
-            .dispatch_tenant_action_ext(
-                &tenant,
-                "Survey",
-                "s1",
-                "Ask",
-                serde_json::json!({}),
-                DispatchExtOptions {
-                    agent_ctx: &who,
-                    await_integration: true,
-                    await_reactions: true,
-                },
-            )
-            .await
-            .map(|response| (response.success, response.error))
-    };
-    let counter = |name: &'static str| {
-        let (state, tenant) = (state.clone(), tenant.clone());
-        async move {
-            let entity = state
-                .get_tenant_entity_state(&tenant, "Survey", "s1")
-                .await
-                .expect("record");
-            entity.state.counters.get(name).copied().unwrap_or(0)
-        }
-    };
+    let outside = failing_partway(ResponseTemplate::new(500)).await;
+    let survey = Survey::new(&outside, "ask-3");
 
-    let interrupted = tokio::spawn(ask(state.clone(), tenant.clone(), who.clone()));
+    let (success, _) = survey.ask_inline().await;
+    assert!(!success, "the second integration failed the request");
+    assert_eq!(
+        survey.count("answers").await,
+        1,
+        "the first callback committed"
+    );
+
+    let (success, error) = survey.ask_inline().await;
+    assert!(success, "{error:?}");
+    assert_eq!(
+        calls(&outside, "/first").await,
+        2,
+        "the retry ran the first integration again, and it failed"
+    );
+    assert_eq!(
+        survey.count("misses").await,
+        0,
+        "the failure callback was applied beside the committed success"
+    );
+    assert_eq!(
+        survey.count("answers").await,
+        2,
+        "the second integration answered once"
+    );
+}
+
+/// A caller that hangs up does not end its request's integrations: they run
+/// on. Its retry waits for them, as long as the outside service takes, and
+/// answers with their outcome; it runs none of them again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_after_a_hang_up_waits_for_the_integrations_still_running() {
+    let outside = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first"))
+        .respond_with(answer("yes"))
+        .mount(&outside)
+        .await;
+    // The second service takes 2 s to answer, so the caller hangs up first.
+    let hold = Duration::from_secs(2);
+    Mock::given(method("POST"))
+        .and(path("/second"))
+        .respond_with(answer("yes").set_delay(hold))
+        .mount(&outside)
+        .await;
+    let survey = std::sync::Arc::new(Survey::new(&outside, "ask-5"));
+
+    let hung_up = tokio::spawn({
+        let survey = survey.clone();
+        async move { survey.ask_inline().await }
+    });
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while calls(&outside, "/second").await == 0 {
         assert!(
@@ -450,27 +474,33 @@ async fn a_retry_whose_integration_now_fails_keeps_its_committed_outcome() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(counter("answers").await, 1, "the first callback committed");
-    interrupted.abort();
-    assert!(interrupted.await.expect_err("aborted").is_cancelled());
+    let held_from = tokio::time::Instant::now();
+    assert_eq!(
+        survey.count("answers").await,
+        1,
+        "the first callback committed"
+    );
+    hung_up.abort();
+    assert!(hung_up.await.expect_err("aborted").is_cancelled());
 
-    let (success, error) = ask(state.clone(), tenant.clone(), who.clone())
-        .await
-        .expect("retried Ask dispatches");
-    assert_eq!(
-        calls(&outside, "/first").await,
-        2,
-        "the retry ran the first integration again, and it failed"
-    );
-    assert_eq!(
-        counter("misses").await,
-        0,
-        "the failure callback was applied beside the committed success"
-    );
-    assert_eq!(
-        counter("answers").await,
-        2,
-        "the second integration answered once"
-    );
+    let (success, error) = survey.ask_inline().await;
     assert!(success, "{error:?}");
+    assert_eq!(
+        survey.count("answers").await,
+        2,
+        "the retry answered once the second callback had applied"
+    );
+    assert_eq!(
+        (
+            calls(&outside, "/first").await,
+            calls(&outside, "/second").await
+        ),
+        (1, 1),
+        "the retry ran no integration again"
+    );
+    assert!(
+        held_from.elapsed() < hold + Duration::from_secs(5),
+        "the retry waited for the held call, not a timeout: {:?}",
+        held_from.elapsed()
+    );
 }
