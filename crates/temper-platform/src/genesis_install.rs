@@ -20,6 +20,7 @@ mod blob_materialization;
 mod bundle_transport;
 mod bundles;
 mod cache_paths;
+mod dependency_versions;
 mod git_fallback;
 mod legacy_specs;
 mod object_lookup;
@@ -37,6 +38,11 @@ use bundles::{
 use bundles::{safe_bundle_relative_path, write_bundle_app};
 use cache_paths::{
     app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
+};
+pub use dependency_versions::KeptDependency;
+use dependency_versions::{
+    PinnedApp, RegistryAncestry, StoredAncestry, downgrade_field, drop_installed_elsewhere,
+    drop_kept_from_cache, parse_downgrade_dependencies, plan_dependency_moves,
 };
 use git_fallback::materialize_registry_app_closure;
 #[cfg(test)]
@@ -66,6 +72,10 @@ pub struct GenesisRegistryInstallRequest {
     pub registry_tenant: String,
     #[serde(default)]
     pub follow_policy: String,
+    /// Dependencies, as `owner/name`, the caller accepts moving to the version
+    /// this closure pins although the installed one is newer or unrelated.
+    #[serde(default)]
+    pub downgrade_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +103,10 @@ pub struct GenesisRegistryInstallResult {
     /// The modules Jev reviewed, of every app installed with the root.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub modules_reviewed: Vec<String>,
+    /// Dependencies left at their installed version because it descends from
+    /// the version this closure pins.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept_dependencies: Vec<KeptDependency>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,8 +342,17 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
             }
             Err(error) => Err(error),
         };
-        match materialized {
-            Ok(_) => {
+        // A closure restored for one record must not bring back another
+        // app at a version that app's own record does not name: the catalog
+        // is shared, and a kept dependency would otherwise return to its pin.
+        let pruned = match materialized {
+            Ok(refs) => {
+                drop_installed_elsewhere(ps.as_ref(), &tenant, &app_name, &refs, &cache_root).await
+            }
+            Err(error) => Err(error),
+        };
+        match pruned {
+            Ok(()) => {
                 legacy_specs::convert_legacy_bundle_specs(&cache_root);
                 add_os_apps_dir_preferred(cache_root);
                 restored += 1;
@@ -562,6 +585,7 @@ pub async fn install_genesis_app_from_registry(
         request.registry_tenant.trim().to_string()
     };
     let follow_policy = normalize_follow_policy(&request.follow_policy)?;
+    let downgrade = parse_downgrade_dependencies(&request.downgrade_dependencies)?;
     let root_ref = parse_registry_app_ref(&request.app_ref)?;
     let root_hash = root_ref
         .version_hash
@@ -659,13 +683,39 @@ pub async fn install_genesis_app_from_registry(
         .find(|record| record.app_name == root_ref.name)
         .cloned();
 
+    // Decide every dependency the closure would move before anything changes:
+    // a refusal here leaves the catalog, the records and the tenant as they were.
+    let pins: Vec<PinnedApp<'_>> = materialized_refs
+        .iter()
+        .filter_map(|app| {
+            Some(PinnedApp {
+                owner: &app.owner,
+                name: &app.name,
+                version: app.version_hash.as_deref()?,
+            })
+        })
+        .collect();
+    let ancestry = RegistryAncestry {
+        registry_url: &registry_url,
+        registry_tenant: &registry_tenant,
+    };
+    let kept = plan_dependency_moves(&ancestry, &root_ref.name, &pins, &prior_records, &downgrade)
+        .await
+        .map_err(|refusal| format!("Genesis install of {} {refusal}", request.app_ref))?;
+    drop_kept_from_cache(&cache_root, &kept)?;
+    let keep: BTreeSet<String> = kept.iter().map(|app| app.name.clone()).collect();
+
     add_os_apps_dir_preferred(cache_root.clone());
 
     let install_platform = platform.clone();
     let reconcile_started = Instant::now();
-    let reconcile_result =
-        reconcile_materialized_app_closure(&install_platform, &request.tenant, &root_ref.name)
-            .await;
+    let reconcile_result = reconcile_materialized_app_closure(
+        &install_platform,
+        &request.tenant,
+        &root_ref.name,
+        &keep,
+    )
+    .await;
 
     // Verify EVERY app in the reconciled closure reached runtime-ready — specs/policies/wasm
     // registered AND every app-required wasm module compiles. A reconcile error counts as
@@ -706,6 +756,9 @@ pub async fn install_genesis_app_from_registry(
                 let Some(version_hash) = materialized_ref.version_hash.as_deref() else {
                     continue;
                 };
+                if keep.contains(&materialized_ref.name) {
+                    continue;
+                }
                 let app_ref = format!(
                     "{}/{}@{}",
                     materialized_ref.owner,
@@ -782,6 +835,7 @@ pub async fn install_genesis_app_from_registry(
                 seed_instances: install.seed_instances,
                 warnings: install.warnings,
                 modules_reviewed: install.modules_reviewed,
+                kept_dependencies: kept,
             })
         }
         InstallVerifyDecision::RollBackToPrevious => {
@@ -843,16 +897,19 @@ pub async fn install_genesis_app_from_registry(
     }
 }
 
+/// Reconcile a materialized closure in install order, leaving the apps in
+/// `keep` exactly as they are installed.
 pub(crate) async fn reconcile_materialized_app_closure(
     platform: &PlatformState,
     tenant: &str,
     root_app_name: &str,
+    keep: &BTreeSet<String>,
 ) -> Result<InstallResult, String> {
     let order = resolve_os_app_install_order(&[root_app_name.to_string()])?;
     let mut root_result = InstallResult::default();
     let (mut warnings, mut reviewed) = (Vec::new(), Vec::new());
 
-    for app_name in order {
+    for app_name in order.into_iter().filter(|app| !keep.contains(app)) {
         let started = Instant::now();
         match reconcile_os_app(platform, tenant, &app_name).await? {
             OsAppReconcileResult::Skipped { bundle_digest, .. } => {
@@ -1098,8 +1155,10 @@ impl BoundActionHook for GenesisInstallHook {
         )?;
         let installation_id = installation_id(entity_id, &target_tenant, &version_hash);
 
+        let downgrade = parse_downgrade_dependencies(&downgrade_field(params))?;
+
         let cache_root = genesis_cache_root(state, &app_ref);
-        let materialized_apps = materialize_app_closure(
+        let materialized = materialize_app_closure(
             state,
             tenant,
             &cache_root,
@@ -1111,12 +1170,62 @@ impl BoundActionHook for GenesisInstallHook {
             },
         )
         .await?;
+        let materialized_apps: Vec<String> =
+            materialized.iter().map(|app| app.name.clone()).collect();
         let app_dir = app_cache_dir(&cache_root, &name)?;
-        add_os_apps_dir_preferred(cache_root);
 
         let mut platform = self.platform.clone();
         platform.server = state.clone();
-        match reconcile_materialized_app_closure(&platform, &target_tenant, &name).await {
+        // The same rule as a registry install, read from this Genesis's own
+        // commit rows, decided before anything changes.
+        let mut installed = Vec::new();
+        if let Some(ps) = platform_store(&platform) {
+            for app in &materialized {
+                let record = ps.get_installed_app(&target_tenant, &app.name).await;
+                installed.extend(record.map_err(|error| {
+                    format!(
+                        "App.Install could not read the install record of {}: {error}",
+                        app.name
+                    )
+                })?);
+            }
+        }
+        let pins: Vec<PinnedApp<'_>> = materialized
+            .iter()
+            .map(|app| PinnedApp {
+                owner: &app.owner,
+                name: &app.name,
+                version: &app.version_hash,
+            })
+            .collect();
+        let ancestry = StoredAncestry {
+            state,
+            registry_tenant: tenant.as_str(),
+        };
+        let kept =
+            match plan_dependency_moves(&ancestry, &name, &pins, &installed, &downgrade).await {
+                Ok(kept) => kept,
+                Err(refusal) => {
+                    let message = format!("Genesis App.Install of {app_ref} {refusal}");
+                    mark_installation(
+                        state,
+                        tenant,
+                        &installation_id,
+                        "MarkFailed",
+                        serde_json::json!({
+                            "Message": message,
+                            "InstalledAt": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await;
+                    return Err(message);
+                }
+            };
+        drop_kept_from_cache(&cache_root, &kept)?;
+        let keep: BTreeSet<String> = kept.iter().map(|app| app.name.clone()).collect();
+        add_os_apps_dir_preferred(cache_root);
+
+        match reconcile_materialized_app_closure(&platform, &target_tenant, &name, &keep).await {
             Ok(result) => {
                 let closure_id = format!(
                     "genesis:{}:{}",
@@ -1179,6 +1288,7 @@ impl BoundActionHook for GenesisInstallHook {
                     "agentSkills": result.skills,
                     "adrs": result.adrs_bootstrapped,
                     "seedInstances": result.seed_instances,
+                    "keptDependencies": kept,
                 })))
             }
             Err(error) => {
@@ -1619,7 +1729,7 @@ async fn materialize_app_closure(
     tenant: &TenantId,
     cache_root: &Path,
     root: GenesisAppBundle,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<GenesisAppBundle>, String> {
     let mut stack = vec![root];
     let mut admission = GenesisClosureAdmission::default();
     let mut materialized = Vec::new();
@@ -1640,7 +1750,7 @@ async fn materialize_app_closure(
             &mut materialization_budget,
         )
         .await?;
-        materialized.push(app.name.clone());
+        materialized.push(app.clone());
 
         for dependency in read_manifest_dependencies(&app_dir)?.into_iter().rev() {
             let dependency = resolve_genesis_dependency(state, tenant, &app.owner, &dependency)

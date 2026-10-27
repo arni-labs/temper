@@ -247,6 +247,12 @@ pub(crate) async fn install_genesis_app(
     }
     match crate::genesis_install::install_genesis_app_from_registry(&state, req).await {
         Ok(result) => (StatusCode::OK, Json(serde_json::json!(result))),
+        // A dependency the install would move backwards or sideways: the
+        // tenant is unchanged and the caller decides.
+        Err(error) if error.contains(" refused before any change: ") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error })),
+        ),
         Err(error) if error.contains("not found") => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": error })),
