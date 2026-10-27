@@ -208,6 +208,13 @@ impl crate::state::ServerState {
             await_reactions,
         } = cmd;
 
+        if temper_spec::automaton::is_carry_move(action) {
+            return Err(DispatchError::AuthzDenied(format!(
+                "'{action}' is a [[carry]] move, which only the platform makes when it installs \
+                 a new version of the spec"
+            )));
+        }
+
         if self
             .composite_metadata_for(tenant, entity_type, action)?
             .is_some()

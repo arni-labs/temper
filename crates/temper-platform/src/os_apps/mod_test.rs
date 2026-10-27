@@ -900,6 +900,7 @@ mod directed_evolution;
 #[path = "mod_test/policy_joint.rs"]
 mod policy_joint;
 mod policy_reinstall;
+mod spec_change;
 #[test]
 fn test_get_app_project_management() {
     let bundle = get_os_app("project-management");
@@ -2694,7 +2695,7 @@ field = "file_id"
 
     let bundle = load_app_bundle(&temp_dir);
     assert!(
-        bundle.is_none(),
+        bundle.is_err(),
         "legacy reactions.toml should be rejected after the ADR-0046 hard cut"
     );
 

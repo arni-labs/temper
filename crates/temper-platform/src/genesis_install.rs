@@ -42,7 +42,7 @@ use crate::genesis_install_verify::{
     restore_prior_install, verify_install_closure_runtime_ready,
 };
 use crate::os_apps::{
-    AppManifest, InstallResult, OsAppReconcileResult, add_os_apps_dir_preferred,
+    AppManifest, InstallResult, InstallWarning, OsAppReconcileResult, add_os_apps_dir_preferred,
     os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order,
 };
 use crate::state::PlatformState;
@@ -79,6 +79,10 @@ pub struct GenesisRegistryInstallResult {
     pub agent_skills: Vec<String>,
     pub adrs: Vec<String>,
     pub seed_instances: Vec<String>,
+    /// What the install's checks found and did not refuse, for every app
+    /// installed with the root.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<InstallWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +770,7 @@ pub async fn install_genesis_app_from_registry(
                 agent_skills: install.skills,
                 adrs: install.adrs_bootstrapped,
                 seed_instances: install.seed_instances,
+                warnings: install.warnings,
             })
         }
         InstallVerifyDecision::RollBackToPrevious => {
@@ -788,15 +793,21 @@ pub async fn install_genesis_app_from_registry(
                     );
                 }
             }
+            // The reconcile's own error says why, such as a refused spec
+            // change; only a reconcile that went through failed verification.
+            let failed = match &reconcile_result {
+                Err(error) => format!("failed: {error}"),
+                Ok(_) => "failed runtime verification".to_string(),
+            };
             // Surface a hard both-broken error only after best-effort dependency restore.
             rollback.map_err(|error| {
                 format!(
-                    "Genesis install of {} failed runtime verification and rollback to {} also failed: {error}",
+                    "Genesis install of {} {failed}\nRollback to {} also failed: {error}",
                     request.app_ref, prior.app_ref
                 )
             })?;
             Err(format!(
-                "Genesis install of {} failed runtime verification; rolled back to previous pinned ref {}",
+                "Genesis install of {} {failed}\nRolled back to previous pinned ref {}",
                 request.app_ref, prior.app_ref
             ))
         }
@@ -828,6 +839,7 @@ pub(crate) async fn reconcile_materialized_app_closure(
 ) -> Result<InstallResult, String> {
     let order = resolve_os_app_install_order(&[root_app_name.to_string()])?;
     let mut root_result = InstallResult::default();
+    let mut warnings = Vec::new();
 
     for app_name in order {
         let started = Instant::now();
@@ -853,10 +865,13 @@ pub(crate) async fn reconcile_materialized_app_closure(
                 );
                 if app_name == root_app_name {
                     root_result = *install;
+                } else {
+                    warnings.extend(install.warnings);
                 }
             }
         }
     }
+    root_result.warnings.splice(0..0, warnings);
 
     Ok(root_result)
 }
