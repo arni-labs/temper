@@ -161,6 +161,69 @@ assert = "status == 'C' => n == 0"
     );
 }
 
+/// The simulator chooses an action in one state and may deliver it in
+/// another. A late `Go` in `B` takes `B`'s rule whole, to `C` with `n = 5`;
+/// it used to take `B`'s effects with `A`'s target and report `B` with
+/// `n = 5`, which the runtime never reaches.
+#[test]
+fn a_late_action_takes_the_rule_of_the_state_it_arrives_in() {
+    let spec = r#"
+[automaton]
+name = "LateGo"
+states = ["A", "B", "C"]
+initial = "A"
+
+[[state]]
+name = "n"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Go"
+from = ["A"]
+to = "B"
+effect = ["n += 1"]
+
+[[action]]
+name = "Hop"
+from = ["A"]
+to = "B"
+
+[[action]]
+name = "Wait"
+from = ["A", "B"]
+
+[[action]]
+name = "Go"
+from = ["B"]
+to = "C"
+effect = ["n = 5"]
+
+[[action]]
+name = "Reset"
+from = ["C"]
+to = "A"
+effect = ["n = 0"]
+
+[[invariant]]
+name = "BKeepsNSmall"
+assert = "status == 'B' => n < 5"
+
+[[invariant]]
+name = "CHasFive"
+assert = "status == 'C' => n == 5"
+"#;
+    let result = VerificationCascade::from_ioa(spec)
+        .with_sim_seeds(5)
+        .with_prop_test_cases(20)
+        .run();
+    let l2 = result
+        .level_result(CascadeLevel::Simulation)
+        .expect("L2 ran");
+    assert!(l2.passed, "{}: {:?}", l2.summary, l2.diagnostics);
+    assert!(result.all_passed);
+}
+
 // ---------------------------------------------------------------------------
 // Generated specs
 // ---------------------------------------------------------------------------

@@ -7,8 +7,7 @@
 use stateright::{Model, Property};
 
 use super::semantics::{
-    apply_effects, apply_string_params, canonical_strings, evaluate_guard, guard_may_hold,
-    rule_for, successors, truth,
+    canonical_strings, evaluate_guard, guard_may_hold, rule_for, step, successors, truth,
 };
 use temper_spec::predicate::Truth;
 
@@ -180,13 +179,11 @@ impl Model for TemperModel {
     }
 
     fn next_state(&self, state: &Self::State, action: Self::Action) -> Option<Self::State> {
+        // The rule the runtime takes in this status gives both the effects
+        // and the target: an action chosen in one state and delivered in
+        // another (the simulator's late delivery) takes that state's rule.
         let resolved = rule_for(self, &action.name, &state.status)?;
-
-        let new_status = action.target_state.unwrap_or_else(|| state.status.clone());
-        let mut next = state.clone();
-        next.status = new_status;
-        apply_effects(&resolved.effects, &mut next, &action.name, &action.params);
-        apply_string_params(&resolved.string_params, &mut next, &action.params);
+        let mut next = step(resolved, state, &action.params);
         canonical_strings(&mut [&mut next.strings]);
         Some(next)
     }
