@@ -114,7 +114,7 @@ pub(super) async fn write_projection(
     .map_err(storage_error)?;
 
     let indexed = indexed_projection_fields(status, fields);
-    sync_field_index(tx, [tenant, entity_type, entity_id], status, &indexed).await
+    sync_field_index(tx, [tenant, entity_type, entity_id], &indexed).await
 }
 
 /// Remove an entity's query-plane rows in `tx`.
