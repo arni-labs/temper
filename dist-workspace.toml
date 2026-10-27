@@ -19,3 +19,10 @@ install-updater = false
 pr-run-mode = "skip"
 # Allow custom modifications to the generated CI workflow (e.g. npm publish step)
 allow-dirty = ["ci"]
+
+# Linux x86_64 builds and the global jobs (plan, host, announce) run on the organization's Ubuntu 22.04 larger runner:
+# the same glibc as GitHub's ubuntu-22.04, without the standard runners' wait. release.yml is kept by hand
+# (allow-dirty), so its literal runs-on lines name the same runner; `dist plan` reads this for the build matrix.
+[dist.github-custom-runners]
+global = "arni-ubuntu2204-4core"
+x86_64-unknown-linux-gnu = { runner = "arni-ubuntu2204-4core", host = "x86_64-unknown-linux-gnu" }

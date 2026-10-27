@@ -6,7 +6,8 @@ name: Linux binary
 # When KATAGAMI_DISPATCH_TOKEN is set, it then tells arni-labs/katagami (repository_dispatch `temper-binary`), whose
 # image workflow builds the sandbox image from it and publishes a KatagamiRelease.
 #
-# Built on ubuntu-22.04 so its glibc is no newer than the sandbox image's. Tagged releases stay with release.yml.
+# Built on Ubuntu 22.04 (the organization's larger runner arni-ubuntu2204-4core) so its glibc is no newer than the sandbox
+# image's. Tagged releases stay with release.yml.
 
 on:
   push:
@@ -27,7 +28,7 @@ env:
 jobs:
   build:
     name: Build and publish
-    runs-on: ubuntu-22.04
+    runs-on: arni-ubuntu2204-4core
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
