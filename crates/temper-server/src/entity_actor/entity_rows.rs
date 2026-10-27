@@ -46,7 +46,7 @@ pub(crate) enum Projection {
 /// The record's timer row.
 #[derive(Debug)]
 pub(crate) enum TimerRow {
-    Arm(StateTimerRecord),
+    Arm(Box<StateTimerRecord>),
     End,
 }
 

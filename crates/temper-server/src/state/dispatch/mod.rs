@@ -20,6 +20,7 @@ mod detached;
 mod effects;
 pub(crate) mod entity_rows;
 mod generated_callbacks;
+mod overdue_timer_rows;
 mod projection_barrier;
 pub(crate) mod retry;
 mod scheduled_actions;

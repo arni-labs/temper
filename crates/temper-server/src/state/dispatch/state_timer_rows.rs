@@ -18,7 +18,7 @@ use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 use tokio::sync::Semaphore;
 
-use super::state_timeouts::{ArmedTimer, remaining_budget};
+use super::state_timeouts::{ArmedTimer, remaining_budget, timer_due_at};
 use super::state_timer_follow::{BootCallers, BootTimers};
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::{decode_armed_by, encode_armed_by};
@@ -39,7 +39,10 @@ type DeclaredTimeouts = BTreeMap<(String, String), (u64, String)>;
 impl ServerState {
     /// Where `tenant`'s timer rows are kept: [`Self::state_timer_rows`] when
     /// set, else the tenant's metadata store. None: rows are not kept.
-    async fn timer_rows_for_tenant(&self, tenant: &str) -> Option<Arc<dyn StateTimerStore>> {
+    pub(super) async fn timer_rows_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Option<Arc<dyn StateTimerStore>> {
         if let Some(rows) = self.state_timer_rows.clone() {
             return Some(rows);
         }
@@ -152,6 +155,7 @@ impl ServerState {
         let mut counts = BootTimers::new();
         let mut armed = 0usize;
         let mut overdue = 0usize;
+        let mut undated = Vec::new();
         for (tenant, timeouts) in self.declared_state_timeouts() {
             let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
                 continue;
@@ -203,6 +207,12 @@ impl ServerState {
                         continue;
                     }
                 };
+                let due_at = timer_due_at(timer.started_at, timer.after_seconds);
+                if row.due_at != due_at
+                    && let Some(due_at) = due_at
+                {
+                    undated.push((store.clone(), row, due_at));
+                }
                 timer.boot_gate = Some(gate.clone());
                 let delay = remaining_budget(timer.started_at, timer.after_seconds, now);
                 let label = if delay.is_zero() {
@@ -228,9 +238,15 @@ impl ServerState {
         tracing::info!(
             armed,
             overdue,
+            undated = undated.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "re-armed state timers from the store"
         );
+        if !undated.is_empty() {
+            // determinism-ok: the due times of rows an older release wrote go
+            // in behind the boot, one low-priority write each.
+            tokio::spawn(date_timer_rows(undated));
+        }
         self.rearm_scheduled_actions(&gate, &mut counts).await;
         {
             // Serialize with install walks so none can consume startup changes
@@ -271,6 +287,28 @@ impl ServerState {
     }
 }
 
+/// Write the due time on each row an older release wrote without one (or
+/// under another budget), so the gauge of timers past due sees it. An update
+/// only: a row whose timer fired and removed it meanwhile stays removed.
+async fn date_timer_rows(rows: Vec<(Arc<dyn StateTimerStore>, StateTimerRecord, String)>) {
+    for (store, row, due_at) in rows {
+        if let Err(error) = store
+            .date_state_timer(
+                &row.tenant,
+                &row.entity_type,
+                &row.entity_id,
+                &row.arm_id,
+                &due_at,
+            )
+            .await
+        {
+            tracing::warn!(tenant = %row.tenant, entity_type = %row.entity_type,
+                entity_id = %row.entity_id, %error,
+                "state timer row's due time not written; the next boot writes it");
+        }
+    }
+}
+
 /// The identity a row's timer fires as, if the row keeps a readable one.
 pub(super) fn row_armed_by(row: &StateTimerRecord) -> Option<AgentContext> {
     decode_armed_by(&row.armed_by).ok()
@@ -285,6 +323,7 @@ fn timer_record(timer: &ArmedTimer) -> Result<StateTimerRecord, serde_json::Erro
         arm_id: timer.arm_id.clone(),
         sequence_nr: timer.sequence_nr,
         started_at: timer.started_at.to_rfc3339(),
+        due_at: timer_due_at(timer.started_at, timer.after_seconds),
         params: serde_json::to_string(&timer.params)?,
         armed_by: encode_armed_by(&timer.agent_ctx)?,
     })
