@@ -701,6 +701,7 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -739,6 +740,7 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -757,7 +759,13 @@ impl crate::state::ServerState {
                     // handle them twice. The projection and the state-timer
                     // arm ran above, before the integration.
                     self.dispatch_transition_deferred_effects(ctx, &response);
-                    return final_response;
+                    // The request's own action committed. If the store did not
+                    // take the answer, saying so (503) would ask the caller to
+                    // send the action again, and it would apply twice.
+                    return EntityResponse {
+                        store_unavailable: false,
+                        ..final_response
+                    };
                 }
             } else {
                 self.dispatch_wasm_integrations(

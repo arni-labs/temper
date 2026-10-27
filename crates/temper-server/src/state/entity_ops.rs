@@ -7,6 +7,7 @@ use std::time::Instant;
 use tracing::{Instrument, instrument};
 
 use temper_observe::wide_event;
+use temper_runtime::actor::ActorError;
 use temper_runtime::persistence::{
     CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError, ProjectionRow,
 };
@@ -26,6 +27,24 @@ use crate::storage::DataOnlyCreateRecord;
 /// Remainder stay registered for the next tick so snapshot writes cannot
 /// occupy the request pool for the whole idle set (ARN-462).
 pub const PASSIVATE_IDLE_ACTORS_PER_TICK: usize = 32;
+
+/// Why a create made no record.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateError {
+    /// The store did not take the record's first write: nothing was written,
+    /// and the same create can be sent again.
+    #[error("{0}")]
+    StoreUnavailable(String),
+    /// Any other reason.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<CreateError> for String {
+    fn from(error: CreateError) -> Self {
+        error.to_string()
+    }
+}
 
 fn actor_idle_timeout_secs() -> i64 {
     static ACTOR_IDLE_TIMEOUT: OnceLock<i64> = OnceLock::new();
@@ -315,6 +334,7 @@ impl ServerState {
                 spawn_requests: vec![],
                 spec_governed: true,
                 refused: false,
+                store_unavailable: false,
             }
         };
 
@@ -1093,6 +1113,30 @@ impl ServerState {
         runtime_metrics::record_server_state_metrics(self);
     }
 
+    /// Forget an entity whose first write its store did not take: it has no
+    /// journal, so it leaves the actor registry and the entity index, unless a
+    /// live actor has taken its key since. The registry lock is held
+    /// throughout, so a create that spawns the key again is never undone.
+    fn forget_uncreated_entity(&self, tenant: &TenantId, entity_type: &str, entity_id: &str) {
+        let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+        {
+            let mut registry = self.actor_registry.write().unwrap();
+            if registry
+                .get(&actor_key)
+                .is_some_and(|actor| !actor.is_closed())
+            {
+                return;
+            }
+            registry.remove(&actor_key);
+            self.last_accessed.write().unwrap().remove(&actor_key);
+            let mut index = self.entity_index.write().unwrap();
+            if let Some(ids) = index.get_mut(&format!("{tenant}:{entity_type}")) {
+                ids.remove(entity_id);
+            }
+        }
+        runtime_metrics::record_server_state_metrics(self);
+    }
+
     /// Stop and evict an entity actor plus its in-memory indexes.
     ///
     /// Used after an out-of-band durable append (for example, an atomic
@@ -1283,10 +1327,11 @@ impl ServerState {
     }
 
     /// Refuse a new entity whose first event, `Created` with its initial fields,
-    /// would be larger than the event size limit. Checked before its actor starts,
-    /// so a refused create answers with the refusal instead of a stopped actor and
-    /// an empty entity left in the index.
-    pub(crate) fn check_created_event_size(
+    /// cannot be written: the disk under the store is below the floor, or the
+    /// event would be larger than the event size limit. Checked before its actor
+    /// starts, so a refused create answers with the refusal instead of a stopped
+    /// actor and an empty entity left in the index.
+    pub(crate) fn check_created_event(
         &self,
         tenant: &TenantId,
         entity_type: &str,
@@ -1296,6 +1341,7 @@ impl ServerState {
         let Some((store, _)) = self.event_journal() else {
             return Ok(());
         };
+        store.check_room()?;
         // Without a limit (the kernel's default) a create pays nothing for this.
         if store.event_size_limits().max_bytes.is_none() {
             return Ok(());
@@ -1347,7 +1393,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
-    ) -> Result<EntityResponse, String> {
+    ) -> Result<EntityResponse, CreateError> {
         self.create_tenant_entity(tenant, entity_type, entity_id, initial_fields, None)
             .await
     }
@@ -1364,7 +1410,7 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
         created_by: &AgentContext,
-    ) -> Result<EntityResponse, String> {
+    ) -> Result<EntityResponse, CreateError> {
         self.create_tenant_entity(
             tenant,
             entity_type,
@@ -1383,26 +1429,42 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
         created_by: Option<&AgentContext>,
-    ) -> Result<EntityResponse, String> {
-        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
-            .map_err(|e| e.to_string())?;
-        let actor_ref = self.get_or_spawn_tenant_actor_created_by(
-            tenant,
-            entity_type,
-            entity_id,
-            initial_fields,
-            created_by,
-        )?;
+    ) -> Result<EntityResponse, CreateError> {
+        self.check_created_event(tenant, entity_type, entity_id, &initial_fields)
+            .map_err(|e| match e {
+                PersistenceError::StorageFull { .. } => {
+                    CreateError::StoreUnavailable(e.to_string())
+                }
+                e => CreateError::Failed(e.to_string()),
+            })?;
+        let actor_ref = self
+            .get_or_spawn_tenant_actor_created_by(
+                tenant,
+                entity_type,
+                entity_id,
+                initial_fields,
+                created_by,
+            )
+            .map_err(CreateError::Failed)?;
 
         let policy = self.dispatch_retry_policy();
-        let response = retry::ask_with_backoff::<_, EntityResponse, _>(
+        let response = match retry::ask_with_backoff::<_, EntityResponse, _>(
             &actor_ref,
             || EntityMsg::GetState,
             &policy,
         )
         .await
         .result
-        .map_err(|e| format!("Actor query failed: {e}"))?;
+        {
+            Ok(response) => response,
+            // The store did not take the record's first write (its size and the
+            // disk's room were checked above), so the record was not created.
+            Err(ActorError::InitFailed(reason)) => {
+                self.forget_uncreated_entity(tenant, entity_type, entity_id);
+                return Err(CreateError::StoreUnavailable(reason));
+            }
+            Err(e) => return Err(CreateError::Failed(format!("Actor query failed: {e}"))),
+        };
 
         // Broadcast entity creation event for SSE subscribers
         let seq = self.next_entity_event_sequence(tenant.as_str(), entity_type, entity_id);
@@ -1473,7 +1535,9 @@ impl ServerState {
                     entity_id = %entity_id,
                     "failed to update query projection during create"
                 );
-                return Err(format!("query projection write failed during create: {e}"));
+                return Err(CreateError::Failed(format!(
+                    "query projection write failed during create: {e}"
+                )));
             }
             record_projection_update_success(
                 tenant,
@@ -1770,6 +1834,7 @@ impl ServerState {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            store_unavailable: false,
         }))
     }
 

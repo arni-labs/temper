@@ -36,7 +36,9 @@ pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
     StateTimeoutTracker, TimerFollowHold,
 };
-pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
+pub use entity_ops::{
+    CreateError, FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError,
+};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
 pub use file_reads::{IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult};

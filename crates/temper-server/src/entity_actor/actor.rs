@@ -42,6 +42,7 @@ use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
 use super::entity_rows::{EntityRows, EntityRowsHook, RowsInput};
+use super::field_updates::NotUpdated;
 use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
@@ -71,11 +72,14 @@ impl ReplayPolicy {
     }
 }
 
-/// What the caller of a refused write is told. An oversized change is refused
-/// with its own words (what to keep elsewhere); anything else failed to persist.
-pub(super) fn persistence_failure(error: &PersistenceError) -> String {
+/// What the caller of a refused write is told. An oversized change and a full
+/// disk are told in their own words (what to do about it); anything else
+/// failed to persist.
+fn persistence_failure(error: &PersistenceError) -> String {
     match error {
-        PersistenceError::EventTooLarge { .. } => error.to_string(),
+        PersistenceError::EventTooLarge { .. } | PersistenceError::StorageFull { .. } => {
+            error.to_string()
+        }
         _ => format!("persistence failed: {error}"),
     }
 }
@@ -85,15 +89,18 @@ pub(super) fn persistence_failure(error: &PersistenceError) -> String {
 /// journal after any other failure: a write that landed is not answered
 /// here, a concurrency violation or a `not written` error did not land, and
 /// only an `outcome unknown` error may have. None of them is a refusal: the
-/// action itself was allowed, and a caller may try it again.
+/// action itself was allowed, and a caller may try it again. A store that
+/// failed or a disk under the floor makes the store unavailable (503).
 fn persistence_failure_reply(state: EntityState, error: &PersistenceError) -> EntityResponse {
     let said = persistence_failure(error);
     match error {
         PersistenceError::EventTooLarge { .. } => EntityResponse::refused(state, said),
-        PersistenceError::ConcurrencyViolation { .. }
-        | PersistenceError::Storage(_)
+        PersistenceError::Storage(_)
         | PersistenceError::OutcomeUnknown(_)
-        | PersistenceError::Serialization(_) => EntityResponse::write_failed(state, said),
+        | PersistenceError::StorageFull { .. } => EntityResponse::store_unavailable(state, said),
+        PersistenceError::ConcurrencyViolation { .. } | PersistenceError::Serialization(_) => {
+            EntityResponse::write_failed(state, said)
+        }
     }
 }
 
@@ -111,11 +118,14 @@ enum WriteOutcome {
 /// Why a concurrency retry (ADR-0046) gave up without writing the action.
 enum RetryGaveUp {
     /// The journal, read again, does not hold the action and it no longer
-    /// applies, or its event is too large: nothing was written.
+    /// applies: nothing was written.
     Refused(String),
-    /// Writing failed, the journal kept moving, or it already holds the
-    /// action: the action may have landed.
+    /// The journal kept moving, or it already holds the action: the action
+    /// may have landed.
     WriteFailed(String),
+    /// The store did not take a retry's event: answered as any write the
+    /// store did not take (`persistence_failure_reply`).
+    NotTaken(PersistenceError),
 }
 
 pub(super) fn event_budget_workspace_id(state: &EntityState) -> String {
@@ -608,9 +618,12 @@ impl EntityActor {
                 return Ok(new_seq);
             }
             // Refused before writing: nothing to learn. The event store logged
-            // a refusal for size once, with its words.
+            // a refusal for size once, with its words, and a full disk once
+            // when it began refusing.
             Err(
-                e @ (PersistenceError::EventTooLarge { .. } | PersistenceError::Serialization(_)),
+                e @ (PersistenceError::EventTooLarge { .. }
+                | PersistenceError::Serialization(_)
+                | PersistenceError::StorageFull { .. }),
             ) => {
                 return Err(e);
             }
@@ -1315,11 +1328,20 @@ impl Actor for EntityActor {
                     self.created_by.as_ref(),
                 )
                 .await
-                .map_err(|e| {
-                    ActorError::custom(format!(
+                .map_err(|e| match e {
+                    // The journal moved on, or the write may have landed: a
+                    // restart replays the journal and finds out.
+                    PersistenceError::ConcurrencyViolation { .. }
+                    | PersistenceError::OutcomeUnknown(_) => ActorError::custom(format!(
                         "failed to persist bootstrap Created event for {}:{}: {}",
                         self.entity_type, self.entity_id, e
-                    ))
+                    )),
+                    // Not written, so the record is not created. A restart would
+                    // only retry the write, which its creator can do once told.
+                    e => ActorError::InitFailed(format!(
+                        "{}:{} was not created: {e}",
+                        self.entity_type, self.entity_id
+                    )),
                 })?;
             }
             state.push_event_bounded(created);
@@ -1459,6 +1481,7 @@ impl EntityActor {
                         spawn_requests: vec![],
                         spec_governed: true,
                         refused: false,
+                        store_unavailable: false,
                     });
                     return Ok(());
                 }
@@ -1895,17 +1918,9 @@ impl EntityActor {
                                             break;
                                         }
                                         Err(e) => {
-                                            let gave_up = match &e {
-                                                PersistenceError::EventTooLarge { .. } => {
-                                                    RetryGaveUp::Refused(e.to_string())
-                                                }
-                                                _ => RetryGaveUp::WriteFailed(format!(
-                                                    "persistence failed during retry: {e}"
-                                                )),
-                                            };
                                             retry_final = Some((
                                                 crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                                Some(gave_up),
+                                                Some(RetryGaveUp::NotTaken(e)),
                                             ));
                                             break;
                                         }
@@ -1934,6 +1949,9 @@ impl EntityActor {
                                             }
                                             RetryGaveUp::WriteFailed(error) => {
                                                 EntityResponse::write_failed(state.clone(), error)
+                                            }
+                                            RetryGaveUp::NotTaken(error) => {
+                                                persistence_failure_reply(state.clone(), &error)
                                             }
                                         };
                                         ctx.reply(EntityResponse {
@@ -2041,6 +2059,7 @@ impl EntityActor {
                         spawn_requests: result.spawn_requests,
                         spec_governed: true,
                         refused: false,
+                        store_unavailable: false,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
@@ -2105,6 +2124,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    store_unavailable: false,
                 });
             }
             EntityMsg::GetField { field } => {
@@ -2131,16 +2151,25 @@ impl EntityActor {
                     expected_precondition,
                 )
                 .await;
-                ctx.reply(EntityResponse {
-                    success: outcome.is_ok(),
-                    refusal: None,
-                    state: state.clone(),
-                    error: outcome.err(),
-                    custom_effects: vec![],
-                    scheduled_actions: vec![],
-                    spawn_requests: vec![],
-                    spec_governed: true,
-                    refused: false,
+                ctx.reply(match outcome {
+                    Ok(()) => EntityResponse {
+                        success: true,
+                        refusal: None,
+                        state: state.clone(),
+                        error: None,
+                        custom_effects: vec![],
+                        scheduled_actions: vec![],
+                        spawn_requests: vec![],
+                        spec_governed: true,
+                        refused: false,
+                        store_unavailable: false,
+                    },
+                    Err(NotUpdated::Failed(reason)) => {
+                        EntityResponse::write_failed(state.clone(), reason)
+                    }
+                    Err(NotUpdated::Store(error)) => {
+                        persistence_failure_reply(state.clone(), &error)
+                    }
                 });
             }
 
@@ -2216,6 +2245,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    store_unavailable: false,
                 });
             }
         }
