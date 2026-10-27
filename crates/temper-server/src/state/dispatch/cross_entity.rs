@@ -103,14 +103,20 @@ impl crate::state::ServerState {
         action_params: &serde_json::Value,
         agent_ctx: &AgentContext,
     ) {
+        // Independent children can run concurrently, but one child's initializers
+        // must run in the same effect order used by the outside-write preview.
+        let mut by_child = std::collections::BTreeMap::<_, Vec<_>>::new();
         for req in spawn_requests {
+            by_child
+                .entry((req.entity_type.clone(), req.entity_id.clone()))
+                .or_default()
+                .push(req.clone());
+        }
+        for ((child_type, child_id), requests) in by_child {
             let state = self.clone();
             let t = tenant.clone();
             let parent_t = parent_type.to_string();
             let parent_i = parent_id.to_string();
-            let req = req.clone();
-            let child_type = req.entity_type.clone();
-            let child_id = req.entity_id.clone();
             let parent_params = action_params.clone();
             let agent = agent_ctx.clone();
             let workflow_root_entity_type = agent
@@ -139,79 +145,47 @@ impl crate::state::ServerState {
             tokio::spawn(
                 async move {
                     // determinism-ok: spawn dispatch is a background side-effect
-                    let plan = match state
-                        .spawn_plan(&t, &parent_t, &parent_i, &req, &parent_params)
-                        .await
-                    {
-                        Ok(plan) => plan,
-                        Err(refusal) => {
-                            state.record_generated_callback_refusal(
-                                super::WasmEntityRef {
-                                    tenant: &t,
-                                    entity_type: &parent_t,
-                                    entity_id: &parent_i,
-                                },
-                                &refusal.action,
-                                &refusal.error,
-                            );
-                            return;
-                        }
-                    };
-                    let super::spawn_plan::SpawnPlan {
-                        initial_fields,
-                        initializer,
-                        ..
-                    } = plan;
-
-                    match state
-                        .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
-                        .await
-                    {
-                        Ok(created) => {
-                            tracing::info!(
-                                parent_type = %parent_t,
-                                parent_id = %parent_i,
-                                child_type = %child_type,
-                                child_id = %child_id,
-                                "spawned child entity"
-                            );
-
-                            // A child with no initial action stays in its
-                            // first state: arm that state's timer here.
-                            if initializer.is_none() {
-                                state
-                                    .arm_state_timeouts_on_creation(
-                                        &t,
-                                        &child_type,
-                                        &child_id,
-                                        &created,
-                                        &agent,
-                                    )
-                                    .await;
+                    for req in requests {
+                        let plan = match state
+                            .spawn_plan(&t, &parent_t, &parent_i, &req, &parent_params)
+                            .await
+                        {
+                            Ok(plan) => plan,
+                            Err(refusal) => {
+                                state.record_generated_callback_refusal(
+                                    super::WasmEntityRef {
+                                        tenant: &t,
+                                        entity_type: &parent_t,
+                                        entity_id: &parent_i,
+                                    },
+                                    &refusal.action,
+                                    &refusal.error,
+                                );
+                                continue;
                             }
-                            if let Some((action, params)) = initializer {
-                                let result = state
-                                    .dispatch_tenant_action(
-                                        &t,
-                                        &child_type,
-                                        &child_id,
-                                        &action,
-                                        params,
-                                        &agent,
-                                    )
-                                    .await;
-                                let refusal = match result {
-                                    Err(error) => Some(error),
-                                    Ok(response) if !response.success => {
-                                        Some(response.error.unwrap_or_else(|| {
-                                            "child initializer refused".to_string()
-                                        }))
-                                    }
-                                    Ok(_) => None,
-                                };
-                                if let Some(error) = refusal {
-                                    // The child stays in its first state: arm
-                                    // that state's timer, as for no initializer.
+                        };
+                        let super::spawn_plan::SpawnPlan {
+                            initial_fields,
+                            initializer,
+                            ..
+                        } = plan;
+
+                        match state
+                            .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
+                            .await
+                        {
+                            Ok(created) => {
+                                tracing::info!(
+                                    parent_type = %parent_t,
+                                    parent_id = %parent_i,
+                                    child_type = %child_type,
+                                    child_id = %child_id,
+                                    "spawned child entity"
+                                );
+
+                                // A child with no initial action stays in its
+                                // first state: arm that state's timer here.
+                                if initializer.is_none() {
                                     state
                                         .arm_state_timeouts_on_creation(
                                             &t,
@@ -221,25 +195,59 @@ impl crate::state::ServerState {
                                             &agent,
                                         )
                                         .await;
-                                    state.record_generated_callback_refusal(
-                                        super::WasmEntityRef {
-                                            tenant: &t,
-                                            entity_type: &parent_t,
-                                            entity_id: &parent_i,
-                                        },
-                                        &action,
-                                        &error,
-                                    );
+                                }
+                                if let Some((action, params)) = initializer {
+                                    let result = state
+                                        .dispatch_tenant_action(
+                                            &t,
+                                            &child_type,
+                                            &child_id,
+                                            &action,
+                                            params,
+                                            &agent,
+                                        )
+                                        .await;
+                                    let refusal = match result {
+                                        Err(error) => Some(error),
+                                        Ok(response) if !response.success => {
+                                            Some(response.error.unwrap_or_else(|| {
+                                                "child initializer refused".to_string()
+                                            }))
+                                        }
+                                        Ok(_) => None,
+                                    };
+                                    if let Some(error) = refusal {
+                                        // The child stays in its first state: arm
+                                        // that state's timer, as for no initializer.
+                                        state
+                                            .arm_state_timeouts_on_creation(
+                                                &t,
+                                                &child_type,
+                                                &child_id,
+                                                &created,
+                                                &agent,
+                                            )
+                                            .await;
+                                        state.record_generated_callback_refusal(
+                                            super::WasmEntityRef {
+                                                tenant: &t,
+                                                entity_type: &parent_t,
+                                                entity_id: &parent_i,
+                                            },
+                                            &action,
+                                            &error,
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                child_type = %child_type,
-                                child_id = %child_id,
-                                error = %e,
-                                "failed to spawn child entity"
-                            );
+                            Err(e) => {
+                                tracing::error!(
+                                    child_type = %child_type,
+                                    child_id = %child_id,
+                                    error = %e,
+                                    "failed to spawn child entity"
+                                );
+                            }
                         }
                     }
                 }

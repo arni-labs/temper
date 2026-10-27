@@ -32,7 +32,8 @@ impl PendingRecords {
         );
     }
 
-    fn get(&self, entity_type: &str, entity_id: &str) -> Option<&EntityState> {
+    /// Read a child as the preceding spawn initializer leaves it.
+    pub(crate) fn get(&self, entity_type: &str, entity_id: &str) -> Option<&EntityState> {
         self.0
             .get(&(entity_type.to_string(), entity_id.to_string()))
     }

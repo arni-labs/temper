@@ -102,6 +102,30 @@ to = "Running"
 params = ["child_id"]
 effect = ["spawn('Child', 'Join', ChildRef, params.child_id)"]
 
+[[action]]
+name = "ArchiveThenInit"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = ["child_id"]
+effect = ["spawn('Child', 'Archive', ChildRef, params.child_id)", "spawn('Child', 'Init', ChildRef, params.child_id)"]
+
+[[action]]
+name = "InitThenArchive"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = ["child_id"]
+effect = ["spawn('Child', 'Init', ChildRef, params.child_id)", "spawn('Child', 'Archive', ChildRef, params.child_id)"]
+
+[[action]]
+name = "ArchiveThenInitAllowed"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = ["child_id"]
+effect = ["spawn('Child', 'Archive', ChildRef, params.child_id)", "spawn('Child', 'Init', ChildRef, params.child_id)"]
+
 [[field_invariant]]
 name = "RunningRunsHaveAChild"
 message = "a running run names its child"
@@ -110,6 +134,24 @@ assert = "status == 'Running' => ChildRef != null"
 
 const CROSS_INVARIANTS: &str = r#"
 version = 1
+
+[[invariant]]
+name = "RepeatedSpawnChildInitialized"
+kind = "hard"
+on = "Run.ArchiveThenInit"
+assert = 'related(Child, ChildRef).status in ["Initialized"]'
+
+[[invariant]]
+name = "RepeatedSpawnChildArchived"
+kind = "hard"
+on = "Run.InitThenArchive"
+assert = 'related(Child, ChildRef).status in ["Archived"]'
+
+[[invariant]]
+name = "RefusedInitializerLeavesArchivedChild"
+kind = "hard"
+on = "Run.ArchiveThenInitAllowed"
+assert = 'related(Child, ChildRef).status in ["Archived"]'
 
 [[invariant]]
 name = "StartedRunChildNotArchived"
@@ -364,3 +406,6 @@ async fn a_childs_initial_action_reads_the_parent_after_the_spawning_action() {
         ("Running".to_string(), json!("c1"))
     );
 }
+
+#[path = "stored_record_spawn/ordered.rs"]
+mod ordered;

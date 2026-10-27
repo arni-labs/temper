@@ -364,7 +364,8 @@ impl EntityActor {
         format!("{}:{}:{}", self.tenant, self.entity_type, self.entity_id)
     }
 
-    fn field_sync_mode_for_backend(
+    /// Storage transformation shared by execution and outside-write previews.
+    pub(crate) fn field_sync_mode_for_backend(
         backend: Option<BackendLabel>,
         blob_store: Option<&crate::blob_store::BlobStore>,
     ) -> FieldSyncMode {

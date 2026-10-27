@@ -204,8 +204,8 @@ pub enum FieldSyncMode {
     /// and replaced with a content-addressed reference object.
     BlobRefs { default_inline_max: usize },
     /// Every value stays in the record as it is, whatever its size. For a
-    /// preview that checks the record a write will store and stores nothing
-    /// itself, so the checks read values, never a storage reference.
+    /// blob-backed preview that stores nothing itself, so checks read domain
+    /// values rather than references to blobs that have not been stored yet.
     Inline,
 }
 

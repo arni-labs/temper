@@ -89,18 +89,26 @@ async fn fixture() -> Fixture {
     let store = TursoEventStore::new(&db_url, None)
         .await
         .expect("create Turso test store");
+    let mut state = batch_state(BATCH_IOA);
+    state.data_dir = temp.path().join("data");
+    state.set_storage_stack(StorageStack::from_turso(store));
+    Fixture { state, _temp: temp }
+}
+
+fn batch_state(ioa: &str) -> ServerState {
+    batch_state_with_schema(ioa, CSDL)
+}
+
+fn batch_state_with_schema(ioa: &str, csdl: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant_with_constraints(
         "default",
-        parse_csdl(CSDL).expect("CSDL parse"),
-        CSDL.to_string(),
-        &[("Batch", BATCH_IOA)],
+        parse_csdl(csdl).expect("CSDL parse"),
+        csdl.to_string(),
+        &[("Batch", ioa)],
         None,
     );
-    let mut state =
-        ServerState::from_registry(ActorSystem::new("stored-record-overflow"), registry);
-    state.data_dir = temp.path().join("data");
-    state.set_storage_stack(StorageStack::from_turso(store));
+    let state = ServerState::from_registry(ActorSystem::new("stored-record-overflow"), registry);
     state.registry.write().unwrap().set_verification_status(
         &TenantId::default(),
         "Batch",
@@ -119,7 +127,7 @@ async fn fixture() -> Fixture {
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")
         .expect("fixture policy should parse");
-    Fixture { state, _temp: temp }
+    state
 }
 
 /// A one-item list whose JSON is exactly `len` bytes.
@@ -277,4 +285,91 @@ async fn running_without_items_is_still_refused() {
     let (status, body) = act(state, "emptied", "Run", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(stored(state, "emptied").await.0, "Draft");
+}
+
+/// The memory actor stores a placeholder above the inline ceiling. The
+/// outside check must read that actual result, including its changed type.
+#[tokio::test]
+async fn a_truncating_backend_checks_the_value_it_will_actually_store() {
+    let ioa = BATCH_IOA.replace("len(Items) > 0", "len(Items) == 1");
+    let state = batch_state(&ioa);
+    for (id, len, expected) in [
+        ("at-limit", INLINE_LIMIT, StatusCode::OK),
+        ("over-limit", INLINE_LIMIT + 1, StatusCode::CONFLICT),
+    ] {
+        create_batch(&state, id).await;
+        let (status, body) = act(
+            &state,
+            id,
+            "Start",
+            json!({"Items": items_of_serialized_len(len)}),
+        )
+        .await;
+        assert_eq!(status, expected, "{id}: {body}");
+        let (status, fields) = stored(&state, id).await;
+        if expected == StatusCode::OK {
+            assert_eq!(status, "Running");
+            assert_eq!(fields["Items"].as_array().unwrap().len(), 1);
+        } else {
+            assert_eq!(status, "Draft");
+            assert!(fields.get("Items").is_none_or(Value::is_null));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unrelated_patch_checks_all_65_healthy_stored_values() {
+    use sha2::{Digest as _, Sha256};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = TursoEventStore::new(
+        &format!("file:{}", temp.path().join("many.db").display()),
+        None,
+    )
+    .await
+    .unwrap();
+    let bytes = serde_json::to_vec(&json!(["item"])).unwrap();
+    let key = format!("field-overflow/sha256/{:x}.json", Sha256::digest(&bytes));
+    store.put_blob(&key, &bytes).await.unwrap();
+    let mut ioa = BATCH_IOA.to_string();
+    let mut properties = String::new();
+    let mut fields = serde_json::Map::new();
+    for i in 0..65 {
+        let name = format!("Items{i:02}");
+        ioa.push_str(&format!(
+            "\n[[field_invariant]]\nname = 'Has{name}'\nassert = 'len({name}) == 1'\n"
+        ));
+        properties.push_str(&format!(
+            r#"<Property Name="{name}" Type="Collection(Edm.String)"/>"#
+        ));
+        fields.insert(
+            name,
+            json!({
+                "__temper_blob_ref": key,
+                "__temper_blob_size": bytes.len(),
+                "__temper_blob_encoding": "json",
+            }),
+        );
+    }
+    let csdl = CSDL.replace("</EntityType>", &format!("{properties}</EntityType>"));
+    let mut state = batch_state_with_schema(&ioa, &csdl);
+    state.data_dir = temp.path().join("data");
+    state.set_storage_stack(StorageStack::from_turso(store));
+    // A kernel create seeds the already stored record that the outside PATCH reads.
+    state
+        .get_or_create_tenant_entity(&TenantId::default(), "Batch", "many", Value::Object(fields))
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &state,
+        Method::PATCH,
+        "/tdata/Batches('many')",
+        json!({"Label": "checked"}),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "all required stored values are healthy: {status} {body}"
+    );
+    assert_eq!(stored(&state, "many").await.1["Label"], "checked");
 }

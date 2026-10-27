@@ -155,7 +155,7 @@ impl ServerState {
     /// value is read back from the tenant's blob store, so the checks read
     /// the domain value whatever its size. `None` when no field the checks
     /// read is stored that way. Values this write brings are already in the
-    /// record (an action's preview keeps every value inline).
+    /// record (a blob-backed action's preview keeps new values inline).
     async fn stored_values_checked(
         &self,
         write: RecordWrite<'_>,
@@ -326,7 +326,10 @@ impl ServerState {
             .await?;
         let mut pending = PendingRecords::default();
         for spawn in &spawns {
-            if let Some(child) = self.pending_child(tenant, &record, spawn, params).await {
+            if let Some(child) = self
+                .pending_child(tenant, &record, spawn, params, &pending)
+                .await
+            {
                 pending.insert(child);
             }
         }
@@ -345,18 +348,26 @@ impl ServerState {
         params: &Value,
         related: &RelatedMap,
     ) -> Option<(EntityState, Vec<SpawnRequest>)> {
-        // The preview repeats the interpreter's own log lines; only the real
-        // application of the action should appear in the logs. It keeps every
-        // value the action writes in the record, however large: the checks
-        // read values, and the preview stores nothing, so it has no use for
-        // the out-of-line references the actor stores large values behind.
+        let blob_store = self.blob_store_for_tenant(tenant).ok();
+        let mode = EntityActor::field_sync_mode_for_backend(
+            self.event_journal().map(|(_, backend)| backend),
+            blob_store.as_ref(),
+        );
+        // Blob-backed storage preserves domain values: keep the preview's new
+        // values inline because their blobs have not been stored yet. Truncating
+        // storage changes the value itself, so run exactly that transformation.
+        let mode = match mode {
+            FieldSyncMode::BlobRefs { .. } => FieldSyncMode::Inline,
+            mode => mode,
+        };
+        // Only the real application of the action should appear in the logs.
         let result = crate::entity_actor::action_input::process_action_with_blob_prestate(
             &mut state,
             table,
             action,
             params,
             related,
-            FieldSyncMode::Inline,
+            mode,
             crate::blobs::BlobReadSource::Tenant {
                 state: self,
                 tenant,
@@ -378,6 +389,7 @@ impl ServerState {
         parent: &EntityState,
         spawn: &SpawnRequest,
         params: &Value,
+        pending: &PendingRecords,
     ) -> Option<EntityState> {
         let plan = self
             .spawn_plan(
@@ -389,7 +401,11 @@ impl ServerState {
             )
             .await
             .ok()?;
-        let child = if self
+        // Dispatch serializes initializers for the same target in effect order.
+        // The next preview therefore starts at the preceding initializer's result.
+        let child = if let Some(child) = pending.get(&spawn.entity_type, &spawn.entity_id) {
+            child.clone()
+        } else if self
             .ensure_entity_loaded(tenant, &spawn.entity_type, &spawn.entity_id)
             .await
         {
@@ -421,7 +437,7 @@ impl ServerState {
                 &related,
             )
             .await;
-        // A refused initial action leaves the child in its first state.
+        // A refused initial action leaves the child in its preceding state.
         Some(initialized.map_or(child, |(initialized, _)| initialized))
     }
 }
