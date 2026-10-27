@@ -52,6 +52,10 @@ jobs:
   # What this run tests. Push, schedule and a plain dispatch: everything (lane "full").
   # A pull request or a merge group: only the packages its changes can reach (lane "pr"),
   # see scripts/ci/affected.py. A merge group's changes are those of every pull request in it.
+  # A push whose tree already passed in a merge group: nothing to test, like a docs-only change.
+  # Jobs with nothing to do are skipped here rather than started; a skipped job satisfies
+  # a required check. The DST cells always start, because a matrix job skipped before it
+  # expands reports none of the cell names the branch rules require.
   # ─────────────────────────────────────────────────────
   changes:
     name: Changed packages
@@ -62,15 +66,31 @@ jobs:
       packages: ${{ steps.affected.outputs.packages }}
       test_args: ${{ steps.affected.outputs.test_args }}
       rust: ${{ steps.affected.outputs.rust }}
+      sdk_ts: ${{ steps.affected.outputs.sdk_ts }}
       shards: ${{ steps.affected.outputs.shards }}
+      dst_matrix: ${{ steps.dst.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # The queue moves main to the commit its group tested, so the push that follows
+      # would test the same files again. Matched by tree, not commit: same files, same result.
+      - id: verified
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100" \
+            --jq ".workflow_runs[] | select(.head_commit.tree_id == \"$tree\") | .html_url" | head -n 1)
+          echo "tree $tree: ${run:-no merge group run passed it}"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
       - id: affected
         env:
           EVENT: ${{ github.event_name }}
+          VERIFIED_RUN: ${{ steps.verified.outputs.run }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           CHANGED_PATHS: ${{ inputs.changed }}
@@ -78,12 +98,33 @@ jobs:
           RUSTUP_TOOLCHAIN: stable
         run: python3 scripts/ci/affected.py
 
+      # core/boot/consistency always run. platform-random: one smoke cell on the pr lane,
+      # four full-mode seed shards on the full lane.
+      - id: dst
+        env:
+          LANE: ${{ steps.affected.outputs.lane }}
+        run: |
+          SUITES='[
+            {"suite":"core","filter":"test(dst_) and not binary(/^dst_platform_/)"},
+            {"suite":"platform-boot","filter":"test(dst_) and binary(=dst_platform_boot)"},
+            {"suite":"platform-consistency","filter":"test(dst_) and binary(/^dst_platform_/) and not binary(=dst_platform_boot) and not binary(=dst_platform_random)"}
+          ]'
+          RANDOM_FILTER="test(dst_) and binary(=dst_platform_random)"
+          if [ "$LANE" = "pr" ]; then
+            RANDOM_CELLS=$(jq -cn --arg f "$RANDOM_FILTER" '[{suite:"platform-random",filter:$f}]')
+          else
+            RANDOM_CELLS=$(jq -cn --arg f "$RANDOM_FILTER" '[range(0;4) | {suite:"platform-random",shard_index:(.|tostring),shard_count:"4",filter:$f}]')
+          fi
+          MATRIX=$(jq -cn --argjson s "$SUITES" --argjson r "$RANDOM_CELLS" '{include: ($s + $r)}')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
   # ─────────────────────────────────────────────────────
   # Gate 1: Fast checks (seconds)
   # ─────────────────────────────────────────────────────
   check:
     name: Compile & Lint
     needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -122,11 +163,9 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo check --workspace
-        if: needs.changes.outputs.rust == 'true'
         run: cargo check --workspace
 
       - name: cargo clippy --workspace --all-targets
-        if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ─────────────────────────────────────────────────────
@@ -134,6 +173,8 @@ jobs:
   # ─────────────────────────────────────────────────────
   sdk-ts:
     name: TypeScript SDK
+    needs: changes
+    if: needs.changes.outputs.sdk_ts == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -198,6 +239,8 @@ jobs:
   # ─────────────────────────────────────────────────────
   integrity:
     name: Integrity & DST Patterns
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -618,49 +661,24 @@ jobs:
   # seed-level splitting balances the work. The union of the 4 shards is the full
   # seed set, so coverage is unchanged. On PRs platform-random runs as ONE smoke
   # cell (no shards): sharding a ~3-min smoke suite would just be 4x runner spin-up.
-  # The matrix is built dynamically per event by dst-matrix-setup.
+  # The matrix is built per run by the changes job.
   # ─────────────────────────────────────────────────────
-  dst-matrix-setup:
-    name: DST matrix setup
-    needs: changes
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-    steps:
-      - id: gen
-        # core/boot/consistency always run. platform-random: one smoke cell on PRs,
-        # four full-mode seed shards on push/schedule/dispatch.
-        run: |
-          SUITES='[
-            {"suite":"core","filter":"test(dst_) and not binary(/^dst_platform_/)"},
-            {"suite":"platform-boot","filter":"test(dst_) and binary(=dst_platform_boot)"},
-            {"suite":"platform-consistency","filter":"test(dst_) and binary(/^dst_platform_/) and not binary(=dst_platform_boot) and not binary(=dst_platform_random)"}
-          ]'
-          RANDOM_FILTER="test(dst_) and binary(=dst_platform_random)"
-          if [ "${{ needs.changes.outputs.lane }}" = "pr" ]; then
-            RANDOM_CELLS=$(jq -cn --arg f "$RANDOM_FILTER" '[{suite:"platform-random",filter:$f}]')
-          else
-            RANDOM_CELLS=$(jq -cn --arg f "$RANDOM_FILTER" '[range(0;4) | {suite:"platform-random",shard_index:(.|tostring),shard_count:"4",filter:$f}]')
-          fi
-          MATRIX=$(jq -cn --argjson s "$SUITES" --argjson r "$RANDOM_CELLS" '{include: ($s + $r)}')
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-
   dst-platform-tests:
     name: DST/Platform Tests (${{ matrix.suite }}${{ matrix.shard_count && format(' {0}/{1}', matrix.shard_index, matrix.shard_count) || '' }})
-    needs: [changes, dst-matrix-setup]
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.dst-matrix-setup.outputs.matrix) }}
-    # The cells always run so each required check reports; on a pull request that
-    # reaches no package their steps are skipped.
+      matrix: ${{ fromJSON(needs.changes.outputs.dst_matrix) }}
+    # The cells always run so each required check reports; when no change reaches a
+    # package, or the tree already passed in its merge group, their steps are skipped.
     env:
       DST_NEEDED: ${{ needs.changes.outputs.test_args != '' }}
     steps:
       - name: Not affected
         if: env.DST_NEEDED != 'true'
-        run: echo "No change reaches a package; no dst_ tests run on this pull request."
+        run: echo "Nothing new to test; no dst_ tests run."
 
       - uses: actions/checkout@v4
         if: env.DST_NEEDED == 'true'
@@ -717,50 +735,38 @@ jobs:
   verify-specs:
     name: Spec Verification (L0-L3)
     needs: changes
+    # These are temper-cli's verify:: tests. On the pr lane the Tests shards run
+    # them whenever the change can reach temper-cli (every package except
+    # temper-agents, temper-macros, temper-wasm-sdk and the reference apps leads
+    # there), and any change outside a package tests everything.
+    if: needs.changes.outputs.lane == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      FULL_LANE: ${{ needs.changes.outputs.lane == 'full' }}
     steps:
-      # These are temper-cli's verify:: tests. On a pull request the Tests shards run
-      # them whenever the change can reach temper-cli (every package except
-      # temper-agents, temper-macros, temper-wasm-sdk and the reference apps leads
-      # there), and any change outside a package tests everything.
-      - name: Pull-request lane
-        if: env.FULL_LANE != 'true'
-        run: echo "On pull requests temper-cli's verify tests run in the Tests shards."
-
       - uses: actions/checkout@v4
-        if: env.FULL_LANE == 'true'
 
       - name: Install system dependencies
-        if: env.FULL_LANE == 'true'
         run: sudo apt-get update && sudo apt-get install -y libz3-dev
 
       - name: Install pinned Rust toolchain
-        if: env.FULL_LANE == 'true'
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Set up mold linker
-        if: env.FULL_LANE == 'true'
         uses: rui314/setup-mold@v1
 
       # rust-cache hashes every installed toolchain into its key. The runner image's own
       # stable Rust changes between image versions, which split one cache into several.
       - name: Keep only the pinned toolchain
-        if: env.FULL_LANE == 'true'
         run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache Rust build
-        if: env.FULL_LANE == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Build temper-cli
-        if: env.FULL_LANE == 'true'
         run: cargo build -p temper-cli
 
       # Source collections include partial fixtures and examples whose Rust
@@ -768,7 +774,6 @@ jobs:
       # collection's CSDL and IOA behavior; test the strict CLI on assembled
       # application fixtures, including missing-policy/module failure cases.
       - name: Verify repository sources and complete application fixtures
-        if: env.FULL_LANE == 'true'
         run: |
           cargo test --locked -p temper-cli verify::
 
@@ -781,39 +786,28 @@ jobs:
   instrumentation-hygiene:
     name: Instrumentation Hygiene (ADR-0052)
     needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    env:
-      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
     steps:
-      - name: Documentation only
-        if: env.RUST_CHANGED != 'true'
-        run: echo "Only documentation changed."
-
       - uses: actions/checkout@v4
-        if: env.RUST_CHANGED == 'true'
 
       - name: Install rust toolchain
-        if: env.RUST_CHANGED == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Set up mold linker
-        if: env.RUST_CHANGED == 'true'
         uses: rui314/setup-mold@v1
 
       # rust-cache hashes every installed toolchain into its key. The runner image's own
       # stable Rust changes between image versions, which split one cache into several.
       - name: Keep only the pinned toolchain
-        if: env.RUST_CHANGED == 'true'
         run: rustup toolchain list --quiet | grep -v "^${{ env.RUST_TOOLCHAIN }}" | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache Rust build
-        if: env.RUST_CHANGED == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Run check_instrumentation
-        if: env.RUST_CHANGED == 'true'
         run: cargo run -q -p temper-server --bin check_instrumentation
