@@ -6,7 +6,7 @@ Every condition in an IOA spec is one string in one grammar (ADR-0179):
 |---|---|---|
 | `[[action]]` | `guard` | the entity before the action |
 | `[[action.triggers]]` | `guard` | the entity after the action |
-| `[[invariant]]` | `assert` | every reachable state (proven by the verification cascade) |
+| `[[invariant]]` | `assert` | every reachable state (proven by the verification cascade), and the entity before and after every move ([checked on moves](#invariants-on-every-move)) |
 | `[[field_invariant]]` | `assert` | the entity's fields after a write (checked on writes) |
 
 An action's `effect` is a list of statements over the same literals and names ([Effects](#effects)), and trigger and state-timeout `args` are values in it ([Arguments](#arguments)).
@@ -114,7 +114,13 @@ terminal = ["Done", "Cancelled"]
 
 ## What the verifier can prove
 
-`[[invariant]]` asserts are proven over every reachable state, so they may only read what the model tracks: `status`, `counter`, `bool` and `list` state variables. An assertion over a string or number variable, an entity field, or a related entity fails to load; state it as a `[[field_invariant]]` instead, which is checked whenever the entity is written.
+`[[invariant]]` asserts are proven over every reachable state. They may read `status`, `counter`, `bool` and `string` state variables, the length and members of `list` variables, and a related entity's status or field. An assertion that reads a number that is not a counter, an undeclared field, or `null` fails to load; state it as a `[[field_invariant]]` instead, which is checked whenever the entity is written.
+
+## Invariants on every move
+
+The kernel also checks a type's `[[invariant]]`s on every move, whatever made it: a request, a timer, a reaction or a module's answer. A move that makes an invariant false when it held before the move is refused with `InvariantViolated`, which names the invariant (HTTP 409), and the entity is left as it was. An entity that already breaks an invariant, such as one written before the invariant was added, can still move, and the kernel logs a warning naming the invariant.
+
+A related entity's status (`Type[ref].status`) is read as the move resolved it, and a move that changes `ref` is not checked against that invariant. An invariant that reads a related entity's field (`Type[ref].field`) is not checked on moves; the kernel logs which ones when it loads the spec.
 
 Guards may also read values the model does not track (string variables, reference fields, related entities). The verifier treats those as unknown: an action gated on one may fire, but is not guaranteed to.
 

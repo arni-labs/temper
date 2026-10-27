@@ -32,10 +32,11 @@ use crate::state::ServerState;
 use crate::state::projection_backfill::transition_table_for;
 
 /// The wait before retrying a type after the store failed to list or read
-/// its records. It doubles up to [`FOLLOW_RETRY_MAX`], so a store that stays
-/// down is asked about once a minute, not in a tight loop.
-const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
-const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
+/// its records, or a record's timer row. It doubles up to
+/// [`FOLLOW_RETRY_MAX`], so a store that stays down is asked about once a
+/// minute, not in a tight loop.
+pub(super) const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
+pub(super) const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Who armed the timer of a record whose row the boot dropped (its state no
 /// longer declares a timeout), so the record's new timer fires as them.
