@@ -4,8 +4,10 @@
 //! running the effects of the same reply (webhooks, integrations, spawns,
 //! timers). The retry waits for that dispatcher instead of running them again.
 //! When it finishes, the retry answers with the reply it completed. When it
-//! ends without completing (an error or a dropped request), the next dispatcher
-//! in line runs them, so a retry after a dropped reply still gets its effects.
+//! ends without completing (an unsuccessful reply), the next dispatcher in line
+//! runs them. A caller that hangs up does not end it: the dispatch runs on its
+//! own task (`state::dispatch::detached`), so a retry after a hang-up waits for
+//! the effects that dispatch is still running, as long as they take.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
