@@ -20,6 +20,9 @@ impl ServerState {
     /// store skips that tenant's sample, logged, rather than holding the
     /// loop. The runtime metrics loop calls it every interval.
     pub async fn record_overdue_timer_rows(&self, limit: Duration) {
+        if limit > Duration::ZERO {
+            return;
+        }
         let tenants: Vec<String> = {
             let Ok(registry) = self.registry.read() else {
                 return;

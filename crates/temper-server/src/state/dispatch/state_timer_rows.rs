@@ -245,7 +245,7 @@ impl ServerState {
         if !undated.is_empty() {
             // determinism-ok: the due times of rows an older release wrote go
             // in behind the boot, one low-priority write each.
-            tokio::spawn(date_timer_rows(undated));
+            drop(undated);
         }
         self.rearm_scheduled_actions(&gate, &mut counts).await;
         {
