@@ -202,6 +202,9 @@ pub struct EntityActor {
     /// Says which query-plane and timer rows an event writes, for a store
     /// that keeps them in the journal's transaction.
     entity_rows: Option<EntityRowsHook>,
+    /// Who creates the record, when this actor writes its `Created` event:
+    /// the caller its first state's timer row is armed as, in that commit.
+    created_by: Option<AgentContext>,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -345,6 +348,7 @@ impl EntityActor {
             on_rehydrated: None,
             rebuild_from_journal: AtomicBool::new(false),
             entity_rows: None,
+            created_by: None,
         }
     }
 
@@ -373,6 +377,7 @@ impl EntityActor {
             on_rehydrated: None,
             rebuild_from_journal: AtomicBool::new(false),
             entity_rows: None,
+            created_by: None,
         }
     }
 
@@ -416,6 +421,12 @@ impl EntityActor {
     /// Attach what says which query-plane and timer rows an event writes.
     pub(crate) fn with_entity_rows(mut self, hook: Option<EntityRowsHook>) -> Self {
         self.entity_rows = hook;
+        self
+    }
+
+    /// The record's creator, for a `Created` event this actor writes.
+    pub(crate) fn with_creator(mut self, created_by: Option<AgentContext>) -> Self {
+        self.created_by = created_by;
         self
     }
 
@@ -1293,13 +1304,15 @@ impl Actor for EntityActor {
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
             {
+                // Its creator is its caller: a first state with a timer
+                // commits the timer's row with this event.
                 self.persist_event(
                     store,
                     backend,
                     &mut state,
                     &created,
                     &ScheduledRows::default(),
-                    None,
+                    self.created_by.as_ref(),
                 )
                 .await
                 .map_err(|e| {
