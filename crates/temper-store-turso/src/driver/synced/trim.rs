@@ -143,7 +143,13 @@ impl SyncCopy {
             };
             let turn = turn?;
             let plan = *self.inner.trim_plan.lock().unwrap();
-            let upper = through.min(oldest.saturating_add(plan.rows - 1));
+            // Scratch measurement, MVCC: writers run beside the trim, so
+            // nothing waits on a big batch, and each batch costs a commit.
+            let upper = if crate::driver::concurrent_writes() {
+                through
+            } else {
+                through.min(oldest.saturating_add(plan.rows - 1))
+            };
             let batch = self.delete_through(&conn, upper, plan, writers).await;
             drop(turn);
             let batch = batch.map_err(storage_error)?;
