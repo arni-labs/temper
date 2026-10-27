@@ -88,10 +88,10 @@ impl SyncCopy {
     ///
     /// The engine reads the log only above the remote's record of this
     /// file's last push: a push scans from that record plus one
-    /// (turso_sync_engine 0.7.2 `database_sync_operations.rs` 2853,
-    /// `database_tape.rs` 416-432), a pull replays only rows above it
-    /// (`database_sync_engine.rs` 864-887), and its stats count rows above
-    /// it (1405-1427). The record trimmed to is the one the engine saved
+    /// (turso_sync_engine 0.8.3 `database_sync_operations.rs` 2932,
+    /// `database_tape.rs` 416-433), a pull replays only rows above it
+    /// (`database_sync_engine.rs` 878-901), and its stats count rows above
+    /// it (1419-1441). The record trimmed to is the one the engine saved
     /// after the remote committed, so no row at or below it is read again.
     ///
     /// No push lock is held. A push reads only rows above the remote's
@@ -100,8 +100,8 @@ impl SyncCopy {
     /// land meanwhile touch none of the rows a batch deletes.
     ///
     /// The newest row stays because in WAL mode a change is numbered one
-    /// above the largest in the log (turso_core 0.7.2
-    /// `translate/emitter/mod.rs` 1223-1239, `vdbe/execute.rs` 10823-10841).
+    /// above the largest in the log (turso_core 0.8.3
+    /// `translate/emitter/mod.rs` 1340-1356, `vdbe/execute.rs` 13428-13446).
     /// An empty log would number the next change 1, at or below what the
     /// remote holds, and the next push would skip it. [`Self::last_change`],
     /// the start's check against the remote and the check after each push
@@ -233,8 +233,8 @@ impl SyncCopy {
                 tokio::time::sleep(work).await;
             }
             // Changes to the change log itself are not captured, so this adds
-            // no row of its own (turso_core 0.7.2 `translate/emitter/mod.rs`
-            // 1083-1091).
+            // no row of its own (turso_core 0.8.3 `translate/emitter/mod.rs`
+            // 1203-1211).
             tx.execute(
                 "DELETE FROM turso_cdc WHERE change_id <= ?1",
                 crate::driver::params![upper],
@@ -248,9 +248,9 @@ impl SyncCopy {
             }
         };
         // Dropping a DELETE mid-statement marks its transaction to roll back
-        // (turso_core 0.7.2 `vdbe/mod.rs` 2514-2534), and the ROLLBACK below
+        // (turso_core 0.8.3 `vdbe/mod.rs` 3390-3410), and the ROLLBACK below
         // ends it, releases the write lock and clears that mark
-        // (`connection.rs` 2654-2669, 4749-4786).
+        // (`connection.rs` 2847-2862, 5262-5301).
         let deleted = tokio::select! {
             biased;
             deleted = delete => Some(deleted),
@@ -317,8 +317,8 @@ pub(super) struct SimulatedTrim {
 
 /// The oldest and newest change numbers in the log, if it has any rows.
 async fn change_ids(conn: &Connection) -> Result<Option<(i64, i64)>, DriverError> {
-    // turso 0.7.2 reads one end of the log for a lone MIN or MAX, but scans every
-    // row for both in one query (turso_core `translate/optimizer/mod.rs` 662-718).
+    // turso 0.8.3 reads one end of the log for a lone MIN or MAX, but scans every
+    // row for both in one query (turso_core `translate/optimizer/mod.rs` 853-914).
     let oldest = one_id(conn, "SELECT MIN(change_id) FROM turso_cdc").await?;
     let newest = one_id(conn, "SELECT MAX(change_id) FROM turso_cdc").await?;
     Ok(oldest.zip(newest))

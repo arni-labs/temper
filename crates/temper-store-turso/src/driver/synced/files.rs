@@ -92,8 +92,8 @@ pub(super) fn sync_metadata(path: &Path) -> Result<serde_json::Value, DriverErro
 ///
 /// The engine rewrites `<db>-info` in place after every push, pull and
 /// checkpoint: `tokio::fs::write`, which truncates the file and then writes
-/// it (turso 0.7.2 `sync.rs` 912-930, turso_sync_engine 0.7.2
-/// `database_sync_engine.rs` 3177-3197). It does that on its own IO thread,
+/// it (turso 0.8.3 `sync.rs` 955-973, turso_sync_engine 0.8.3
+/// `database_sync_engine.rs` 3219-3239). It does that on its own IO thread,
 /// which finishes a write it has started even when the operation that asked
 /// for it was dropped by a timeout. So a reader can find the file empty or
 /// half written at any time, and the engine has no call that returns what
