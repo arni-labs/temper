@@ -241,6 +241,48 @@ async fn checkpoints_between_writes_fail_none_of_them() {
 }
 
 #[tokio::test]
+async fn a_checkpoint_waits_for_the_calls_in_flight_instead_of_skipping() {
+    // Skipping whenever a connection was in use let the log grow without
+    // bound under steady writes (1.21 GB in four minutes, staging, 27 Oct
+    // 2026), and the checkpoint that finally ran moved all of it while every
+    // call waited.
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_a_dir, a_path) = machine();
+    let a = std::sync::Arc::new(server.open(&a_path).await);
+    for i in 0..10 {
+        write(&a, "c1", i).await;
+    }
+    push(&a).await;
+    let copy = a.sync_copy().expect("copy").clone();
+    // A trim batch holds its connection until its commit returns.
+    copy.simulate_slow_trim(Duration::ZERO, Duration::from_millis(600));
+    let trimming = {
+        let a = a.clone();
+        tokio::spawn(async move { a.trim_change_log(Duration::from_secs(5)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !trimming.is_finished(),
+        "the trim still holds its connection"
+    );
+
+    assert!(
+        copy.checkpoint_if_wal_over(0).await.expect("checkpoint"),
+        "the checkpoint ran once the trim let go of its connection"
+    );
+    let trimmed = trimming.await.expect("trim task").expect("trim");
+    assert!(trimmed > 0, "the trim deleted the pushed changes");
+    write(&a, "c1", 10).await;
+    push(&a).await;
+
+    let (_b_dir, b_path) = machine();
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "c1").await, 11, "every write reached the remote");
+}
+
+#[tokio::test]
 async fn a_file_put_back_from_an_older_copy_is_restored_from_the_remote() {
     // A restart can bring back an old snapshot of the disk. The engine would
     // then reuse change numbers the remote already has and skip the new
