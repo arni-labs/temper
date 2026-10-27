@@ -12,8 +12,8 @@ mod policy_gen;
 pub mod statements;
 
 pub use context::{
-    AuthenticatedRequestContext, CARRY_MOVE_CONTEXT, Principal, PrincipalKind, SecurityContext,
-    is_cedar_authority_context_key,
+    AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
+    is_cedar_authority_context_key, platform_keys,
 };
 pub use engine::{
     Asker, Attr, AuthzDecision, AuthzEngine, ListReadUniformity, May, SendAnalysis,
