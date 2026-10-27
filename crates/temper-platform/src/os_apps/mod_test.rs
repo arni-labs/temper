@@ -897,6 +897,8 @@ fn test_intent_discovery_specs_verify() {
 
 mod bundle_refusal;
 mod directed_evolution;
+#[path = "mod_test/policy_joint.rs"]
+mod policy_joint;
 mod policy_reinstall;
 #[test]
 fn test_get_app_project_management() {
@@ -3664,3 +3666,6 @@ async fn test_concurrent_installs_into_one_tenant_keep_both_apps_cedar() {
         "{text}"
     );
 }
+
+#[path = "mod_test/timer_install.rs"]
+mod timer_install;

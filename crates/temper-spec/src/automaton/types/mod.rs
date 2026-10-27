@@ -183,6 +183,19 @@ pub struct Liveness {
     /// If true, asserts that actions are always available (no deadlock).
     #[serde(default)]
     pub has_actions: Option<bool>,
+    /// A condition the records reach by themselves: from every reachable
+    /// state, the moves the system makes (state timers, module answers,
+    /// reactions, and the actions in `relies_on`) can bring them to a state
+    /// with nothing in flight where it holds. It may read related records
+    /// (`Type[id].field`), and is checked on their joint model.
+    #[serde(default)]
+    pub eventually: Option<Expr>,
+    /// Actions of this entity that code outside the specs sends whenever
+    /// `eventually` does not hold, such as a site that nudges a record it
+    /// finds behind. The check counts them as moves the system makes while
+    /// the condition is false.
+    #[serde(default)]
+    pub relies_on: Vec<String>,
 }
 
 /// A dispatch record the runtime's WASM and adapter dispatchers look up by
@@ -201,9 +214,10 @@ pub struct Integration {
     /// WASM module name (required when `type = "wasm"`).
     #[serde(default)]
     pub module: Option<String>,
-    /// Action to dispatch on successful WASM execution (required when `type = "wasm"`).
-    #[serde(default)]
-    pub on_success: Option<String>,
+    /// The actions a successful call may take, in the order the kernel tries
+    /// them (see [`ActionTrigger::on_success`]).
+    #[serde(default, with = "trigger::one_or_many")]
+    pub on_success: Vec<String>,
     /// Action to dispatch on failed WASM execution (required when `type = "wasm"`).
     #[serde(default)]
     pub on_failure: Option<String>,

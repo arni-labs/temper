@@ -1338,23 +1338,30 @@ impl crate::state::ServerState {
                 )
                 .await;
 
-                // Determine callback action: prefer static on_success from spec,
-                // fall back to dynamic callback_action from WASM result. Composite
-                // integrations may return only a data envelope for the kernel to
-                // apply; the default SDK "callback" action should not become an
-                // implicit source-entity dispatch in that path.
-                let mut callback_action = integration
-                    .on_success
-                    .as_deref()
-                    .unwrap_or(&result.callback_action);
-                if composite_result_consumed
-                    && integration.on_success.is_none()
-                    && result.callback_action == "callback"
+                // The answer: one of the trigger's `on_success` actions, the
+                // first the record takes with the module's values (see
+                // `answers.rs`); none for an empty answer (`"empty": true`). A trigger without
+                // `on_success` still takes the action the result names.
+                // Composite integrations may return only a data envelope for
+                // the kernel to apply; the default SDK "callback" action
+                // should not become an implicit source-entity dispatch then.
+                let named = [result.callback_action.clone()];
+                let answers: &[String] = if result.empty_answer {
+                    &[]
+                } else if !integration.on_success.is_empty() {
+                    &integration.on_success
+                } else if result.callback_action.is_empty()
+                    || (composite_result_consumed && result.callback_action == "callback")
                 {
-                    callback_action = "";
-                }
+                    &[]
+                } else {
+                    &named
+                };
+                let callback_action = self
+                    .choose_answer(ctx.entity_ref, answers, &callback_params)
+                    .await;
 
-                if !callback_action.is_empty() {
+                if let Some(callback_action) = callback_action {
                     let callback_response = instrument_wasm_dispatch_phase_result(
                         phase_parent_span.clone(),
                         ctx,

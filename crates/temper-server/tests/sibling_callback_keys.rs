@@ -2,8 +2,9 @@
 //!
 //! Two integrations on one action can answer with the same callback action and
 //! the same parameters. Under a caller's `Idempotency-Key` both callbacks still
-//! apply, and a retry of the request applies neither again, even when the
-//! outside service answers the retry differently.
+//! apply, and a retry of the request applies neither again, whether they run
+//! inline or in the background, even when the outside service answers the
+//! retry differently.
 
 use std::time::Duration;
 
@@ -155,6 +156,97 @@ async fn two_integrations_answering_alike_both_apply_under_one_caller_key() {
     let retry = ask().await.expect("retried Ask dispatches");
     assert!(retry.success, "{:?}", retry.error);
     assert_eq!(answers().await, 2, "a retry applies neither callback again");
+}
+
+/// A callback that runs in the background, after the request has answered,
+/// keeps its key too: a retry of the request runs the integrations again, and
+/// their callbacks are answered by the ones that applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_applies_no_background_callback_again() {
+    let outside = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ask"))
+        .respond_with(answer("yes"))
+        .mount(&outside)
+        .await;
+    let tenant = TenantId::new("surveys");
+    let state = build_state("surveys", &SURVEY_IOA.replace("{url}", &outside.uri()));
+    let who = AgentContext {
+        idempotency_key: Some(IdempotencyKey::Request("ask-4".to_string())),
+        ..AgentContext::for_service(SERVICE)
+    };
+    let ask = || {
+        state.dispatch_tenant_action_ext(
+            &tenant,
+            "Survey",
+            "s1",
+            "Ask",
+            serde_json::json!({}),
+            DispatchExtOptions {
+                agent_ctx: &who,
+                await_integration: false,
+                await_reactions: true,
+            },
+        )
+    };
+    let seen = Seen {
+        state: &state,
+        tenant: &tenant,
+        outside: &outside,
+    };
+
+    let first = ask().await.expect("Ask dispatches");
+    assert!(first.success, "{:?}", first.error);
+    let applied = seen.until(Duration::from_secs(10), |_, answers| answers == 2);
+    assert!(applied.await.is_some(), "both background callbacks apply");
+
+    let retry = ask().await.expect("retried Ask dispatches");
+    assert!(retry.success, "{:?}", retry.error);
+    let rerun = seen.until(Duration::from_secs(10), |calls, _| calls == 4);
+    assert!(
+        rerun.await.is_some(),
+        "the retry runs both integrations again"
+    );
+    // Their callbacks follow the outside answers; give them time to land.
+    assert_eq!(
+        seen.until(Duration::from_secs(2), |_, answers| answers > 2)
+            .await,
+        None,
+        "a retry applied a background callback again"
+    );
+}
+
+/// What a test can see of survey `s1`: the calls on `/ask` and its answers.
+struct Seen<'a> {
+    state: &'a ServerState,
+    tenant: &'a TenantId,
+    outside: &'a MockServer,
+}
+
+impl Seen<'_> {
+    /// `(calls, answers)` once `done` holds, polling every 20 ms for at most
+    /// `limit`; `None` when it never did.
+    async fn until(
+        &self,
+        limit: Duration,
+        done: impl Fn(usize, usize) -> bool,
+    ) -> Option<(usize, usize)> {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            let entity = self
+                .state
+                .get_tenant_entity_state(self.tenant, "Survey", "s1")
+                .await
+                .expect("record");
+            let answers = entity.state.counters.get("answers").copied().unwrap_or(0);
+            let seen = (calls(self.outside, "/ask").await, answers);
+            if done(seen.0, seen.1) {
+                return Some(seen);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
 }
 
 fn answer(result: &str) -> ResponseTemplate {

@@ -41,6 +41,7 @@ mod namespace;
 pub use namespace::PostgresSchema;
 pub mod migration;
 pub mod platform;
+mod projection_freshness;
 mod query_page;
 pub mod schema;
 mod schema_event_history;

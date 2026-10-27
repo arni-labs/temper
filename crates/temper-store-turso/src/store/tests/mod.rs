@@ -9,8 +9,13 @@ use temper_runtime::persistence::{
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
+mod commit_outcome;
+mod commit_transport;
 mod evolution_tenant;
+mod field_index_writes;
 mod policy_approval;
+mod projection_writes;
+mod scheduled_actions;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
     PersistenceEnvelope {
@@ -199,36 +204,42 @@ async fn vector_index_write_behind_candidates_and_partitioning() {
     };
 
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-b",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![0.0, 1.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![0.0, 1.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     // A different model tag — must not appear in an m1 scan.
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-c",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m2", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m2", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -286,13 +297,15 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
 
     // Write-behind reconcile with a row, then a delete transition (empty rows).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            std::slice::from_ref(&row(vec![1.0, 0.0])),
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: std::slice::from_ref(&row(vec![1.0, 0.0])),
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -306,13 +319,14 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
     );
     // A Deleted transition emits no vector rows but still reconciles (purge).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             1,
             &[test_envelope("Delete", serde_json::json!({}))],
-            &[],
-            &[],
-            true,
+            temper_runtime::persistence::CommitRows {
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -419,33 +433,33 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
     assert_eq!(events[0].event_type, "OrderCreated");
 }
 
+/// Every append is a write transaction, so it waits its turn at the write
+/// gate like any writer (as the first in line: it is high priority).
 #[tokio::test]
-async fn single_event_append_bypasses_process_write_gate() {
-    let mut store = make_store("single-append-bypasses-gate").await;
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+async fn single_event_append_waits_for_the_write_gate() {
+    let mut store = make_store("single-append-waits-for-gate").await;
+    store.write_gate = std::sync::Arc::new(super::write_gate::WriteGate::new(1));
     let held_gate = store
         .write_gate
+        .permits
         .clone()
         .acquire_owned()
         .await
         .expect("hold gate");
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        store.append(
-            "tenant-a:Order:ord-bypass",
-            0,
-            &[test_envelope(
-                "OrderCreated",
-                serde_json::json!({ "id": "ord-bypass" }),
-            )],
-        ),
-    )
-    .await;
-    drop(held_gate);
+    let created = [test_envelope(
+        "OrderCreated",
+        serde_json::json!({ "id": "ord-gated" }),
+    )];
+    let append = store.append("tenant-a:Order:ord-gated", 0, &created);
+    tokio::pin!(append);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(300), append.as_mut()).await;
+    assert!(waited.is_err(), "an append went ahead of a held write gate");
 
-    let new_seq = result
-        .expect("single-event append should not wait for the process write gate")
+    drop(held_gate);
+    let new_seq = tokio::time::timeout(std::time::Duration::from_secs(5), append)
+        .await
+        .expect("the append goes once the gate frees")
         .expect("append should succeed");
     assert_eq!(new_seq, 1);
 }
@@ -1265,100 +1279,6 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
 }
 
 #[tokio::test]
-async fn unchanged_projection_updates_catalog_without_rebuilding_field_rows() {
-    let store = make_store("query-projection-stable-hash").await;
-    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
-    let entity_type = "Order";
-    let entity_id = "ord-stable-projection";
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            7,
-        )
-        .await
-        .expect("initial projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query initial title row");
-    let initial_row = rows
-        .next()
-        .await
-        .expect("read initial title row")
-        .expect("title row should exist");
-    let initial_rowid = initial_row.get::<i64>(0).expect("initial rowid");
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            8,
-        )
-        .await
-        .expect("second projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query updated title row");
-    let updated_row = rows
-        .next()
-        .await
-        .expect("read updated title row")
-        .expect("title row should still exist");
-    let updated_rowid = updated_row.get::<i64>(0).expect("updated rowid");
-
-    let mut catalog_rows = conn
-        .query(
-            "SELECT sequence_nr FROM entity_catalog \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .expect("query catalog row");
-    let catalog_row = catalog_rows
-        .next()
-        .await
-        .expect("read catalog row")
-        .expect("catalog row should exist");
-    let sequence_nr = catalog_row.get::<i64>(0).expect("catalog sequence_nr");
-
-    assert_eq!(
-        updated_rowid, initial_rowid,
-        "unchanged projections should keep existing field index rows"
-    );
-    assert_eq!(
-        sequence_nr, 8,
-        "entity catalog should still advance to the latest sequence number"
-    );
-}
-
-#[tokio::test]
 async fn stale_projection_upsert_does_not_overwrite_newer_catalog_row() {
     let store = make_store("query-projection-stale-sequence-skip").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
@@ -1860,9 +1780,10 @@ async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
         .await
         .expect("initial spec commit");
 
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    store.write_gate = std::sync::Arc::new(super::write_gate::WriteGate::new(1));
     let held_gate = store
         .write_gate
+        .permits
         .clone()
         .acquire_owned()
         .await
@@ -2429,4 +2350,93 @@ async fn deleted_probes_use_the_tombstone_index() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
+    let store = make_store("catalog-freshness").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let created = || test_envelope("Created", serde_json::json!({}));
+    let updated = || test_envelope("FieldsUpdated", serde_json::json!({}));
+    let top_level = serde_json::json!({ "OrderId": "ord-1" });
+    let wrapped = serde_json::json!({ "fields": { "OrderId": "ord-1" } });
+    let project = |id: &'static str, sequence_nr: u64, fields: serde_json::Value| {
+        let store = store.clone();
+        let tenant = tenant.clone();
+        async move {
+            store
+                .upsert_query_projection_with_state(
+                    &tenant,
+                    "Payment",
+                    id,
+                    "Pending",
+                    &fields,
+                    &serde_json::json!({}),
+                    sequence_nr,
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    // Projected at its newest event.
+    store
+        .append(&format!("{tenant}:Payment:pay-current"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-current", 1, top_level.clone()).await;
+    // A change committed after the projection, which never landed.
+    store
+        .append(&format!("{tenant}:Payment:pay-stale"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-stale", 1, top_level.clone()).await;
+    store
+        .append(&format!("{tenant}:Payment:pay-stale"), 1, &[updated()])
+        .await
+        .unwrap();
+    // Deleted, with its projection row left behind.
+    store
+        .append(&format!("{tenant}:Payment:pay-deleted"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-deleted", 1, top_level.clone()).await;
+    store
+        .append(
+            &format!("{tenant}:Payment:pay-deleted"),
+            1,
+            &[tombstone_envelope()],
+        )
+        .await
+        .unwrap();
+    // Journaled but never projected: not a catalog row at all.
+    store
+        .append(
+            &format!("{tenant}:Payment:pay-unprojected"),
+            0,
+            &[created()],
+        )
+        .await
+        .unwrap();
+    // Current, with its fields written under a `fields` object.
+    store
+        .append(&format!("{tenant}:Payment:pay-wrapped"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-wrapped", 1, wrapped.clone()).await;
+
+    let mut rows = store
+        .projection_catalog_freshness(&tenant, "Payment")
+        .await
+        .expect("read catalog freshness");
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        rows,
+        vec![
+            ("pay-current".to_string(), true, None),
+            ("pay-deleted".to_string(), false, None),
+            ("pay-stale".to_string(), false, None),
+            ("pay-wrapped".to_string(), true, Some(wrapped)),
+        ]
+    );
 }

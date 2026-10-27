@@ -44,6 +44,7 @@ fn make_response(status: &str) -> EntityResponse {
         scheduled_actions: vec![],
         spawn_requests: vec![],
         spec_governed: true,
+        refused: false,
     }
 }
 
@@ -61,6 +62,7 @@ fn busy_response(field_bytes: usize) -> EntityResponse {
             params: serde_json::json!({ "queue": "q".repeat(field_bytes) }),
             idempotency_key: Some(format!("dispatch:{index}")),
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         });
         response.state.processed_idempotency_keys.insert(
             format!("dispatch:{index}"),
@@ -380,6 +382,7 @@ fn estimate_counts_every_collection_a_reply_keeps() {
             .push(crate::entity_actor::ScheduledAction {
                 action: format!("Timer{index:03}"),
                 delay_seconds: 5,
+                arm_id: String::new(),
             });
     }
     let populated = estimated_entry_bytes("Feed:f", "k", &response);
@@ -397,6 +400,7 @@ fn keyed_events(state: &mut EntityState, keys: &[&str]) {
             params: serde_json::Value::Null,
             idempotency_key: Some((*key).to_string()),
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         });
         state.total_event_count += 1;
     }

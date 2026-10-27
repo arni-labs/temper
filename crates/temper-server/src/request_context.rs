@@ -14,6 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::idempotency::IdempotencyKey;
 
+pub(crate) mod armed_by;
 mod observation_metadata;
 
 /// Maximum callbacks along one server-owned internal context lineage.
@@ -86,6 +87,15 @@ pub struct AgentContext {
     /// `EntityMsg::Action` so the actor can dedupe duplicate asks produced by
     /// dispatch-layer retries.
     pub idempotency_key: Option<IdempotencyKey>,
+    /// Runtime-owned; never populated from request headers. The scheduled
+    /// action this dispatch fires: the actor removes its row in the commit of
+    /// the fire's event, and only for that record, so a child dispatch that
+    /// inherits this context removes nothing.
+    pub fires_scheduled_action: Option<ScheduledFire>,
+    /// Runtime-owned; never populated from request headers. The state timer
+    /// this dispatch fires: the actor applies its action only while the
+    /// record's journal is at the sequence the timer was armed at.
+    pub fires_state_timer: Option<StateTimerFire>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -94,7 +104,64 @@ pub struct AgentContext {
     pub observation_metadata: BTreeMap<String, String>,
 }
 
+/// A scheduled action's row, by its record and arm id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScheduledFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The row's arm id.
+    pub arm_id: String,
+}
+
+/// A state timer's fire: its record, its action, and the record's journal
+/// sequence when the timer was armed.
+///
+/// An arming is read from the journal at `armed_seq`, so every writer that
+/// holds it (an old and a new process during a deploy, or a fire sent again
+/// after a lost answer) fires at that sequence. The first to commit moves the
+/// journal past it; the store's sequence check picks that writer. Every other
+/// fire of the arming then finds the record moved and is dropped, so an
+/// arming commits its action at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTimerFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The timer's `on_timeout` action.
+    pub action: String,
+    /// The record's journal sequence when the timer was armed.
+    pub armed_seq: u64,
+}
+
 impl AgentContext {
+    /// The sequence this dispatch's state timer was armed at, when the
+    /// dispatch fires `action` on this record. A child dispatch that inherits
+    /// the context, on another record or with another action, is not the fire.
+    pub(crate) fn state_timer_armed_seq(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+    ) -> Option<u64> {
+        self.fires_state_timer
+            .as_ref()
+            .filter(|fire| {
+                fire.tenant == tenant
+                    && fire.entity_type == entity_type
+                    && fire.entity_id == entity_id
+                    && fire.action == action
+            })
+            .map(|fire| fire.armed_seq)
+    }
+
     /// Admit a callback only within both the inline and cumulative budgets.
     ///
     /// The callback is a new request, so it gets a follow-up key of its own,
@@ -154,6 +221,8 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -191,6 +260,8 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -210,6 +281,15 @@ impl AgentContext {
     /// agent, but they still belong to the same logical workflow trace.
     pub fn for_service_inheriting(service_name: &str, parent: &AgentContext) -> Self {
         Self::for_service(service_name).inherit_observability_from(parent)
+    }
+
+    /// The service identity a callback ([`Self::for_callback`]) runs as, with
+    /// the callback's own key: a retried parent's callback is then answered
+    /// as its first, whichever identity sends it.
+    pub fn for_service_answering(service_name: &str, callback: &AgentContext) -> Self {
+        let mut context = Self::for_service_inheriting(service_name, callback);
+        context.idempotency_key = callback.idempotency_key.clone();
+        context
     }
 
     /// Copy the execution budget and non-authority observability fields from a parent.
@@ -327,6 +407,8 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_root_entity_id,
         workflow_run_id,
         idempotency_key,
+        fires_scheduled_action: None,
+        fires_state_timer: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }
@@ -409,22 +491,6 @@ fn remote_parent_from_header(headers: &HeaderMap, name: &str) -> Option<opentele
         .and_then(|value| TraceState::from_str(value).ok())
         .unwrap_or_default();
     remote_parent(trace_id, span_id, flags, state)
-}
-
-pub(crate) fn remote_parent_context(agent_ctx: &AgentContext) -> Option<opentelemetry::Context> {
-    remote_parent_from_ids(
-        agent_ctx.trace_id.as_deref()?,
-        agent_ctx.parent_span_id.as_deref()?,
-    )
-}
-
-fn remote_parent_from_ids(trace_id: &str, span_id: &str) -> Option<opentelemetry::Context> {
-    remote_parent(
-        trace_id,
-        span_id,
-        TraceFlags::SAMPLED,
-        TraceState::default(),
-    )
 }
 
 fn remote_parent(

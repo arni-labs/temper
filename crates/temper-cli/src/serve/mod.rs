@@ -81,7 +81,7 @@ pub async fn run(
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
     // Phase 1: Storage backend
-    let (pg_pool, storage_stack, turso_sync_copy) =
+    let (pg_pool, storage_stack, turso_synced_store) =
         bootstrap::init_storage(storage.clone(), storage_explicit).await?;
 
     // Phase 2: Registry (restore + disk apps)
@@ -250,7 +250,7 @@ pub async fn run(
 
     // Phase 9: Bind, start background tasks, serve
     let router =
-        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_sync_copy);
+        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_synced_store);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
         .with_context(|| format!("Failed to bind to {bind}:{port}"))?;
@@ -268,7 +268,6 @@ pub async fn run(
     }
     spawn_optimization_loop(&state);
     spawn_actor_passivation_loop(&state);
-    state.server.spawn_runtime_metrics_loop();
     temper_server::profiling::spawn_continuous_profiler();
     let _pg_actor_runtime_cancel = pg_actor_runtime_cancel;
 
@@ -318,9 +317,9 @@ pub async fn run(
         }
     }
 
-    // ADR-0056: arm again the state timers the last process left waiting,
-    // before the first request can act on their records.
-    state.server.rearm_state_timers().await;
+    // The kernel runtime: state timers re-armed from their rows (ADR-0056)
+    // before the first request can act on their records, and runtime metrics.
+    let _boot_timers = state.server.start_runtime().await;
 
     println!("Listening on http://{bind}:{actual_port}");
     axum::serve(listener, router)

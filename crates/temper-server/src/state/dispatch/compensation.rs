@@ -65,7 +65,8 @@ impl crate::state::ServerState {
         let triggering_action = triggering_action.to_string();
         let error = error.to_string();
         let parent_ctx = parent_ctx.for_background_task();
-        let span = tracing::info_span!(
+        let span = crate::trace_context::runtime_work_span!(
+            crate::trace_context::cause(),
             "dispatch.integration_failure_compensation",
             tenant = %tenant,
             entity_type = %entity_type,
@@ -175,7 +176,7 @@ impl crate::state::ServerState {
                 return;
             }
         };
-        let agent_ctx = AgentContext::for_service_inheriting(COMPENSATION_SOURCE, &callback_ctx);
+        let agent_ctx = AgentContext::for_service_answering(COMPENSATION_SOURCE, &callback_ctx);
         match self
             .dispatch_tenant_action(tenant, entity_type, entity_id, &action, params, &agent_ctx)
             .await

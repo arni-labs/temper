@@ -181,6 +181,7 @@ impl crate::state::ServerState {
                     .await;
             }
         };
+        let values = callback_params.clone();
         match mode {
             WasmDispatchMode::Inline => {
                 // Preserve inline semantics through nested WASM callbacks.
@@ -204,16 +205,17 @@ impl crate::state::ServerState {
                 .await
                 .map_err(|e| e.to_string())?;
                 if !resp.success {
-                    self.record_generated_callback_refusal(
+                    self.record_answer_refusal(
                         entity_ref,
                         callback_action,
                         resp.error.as_deref().unwrap_or("callback rejected"),
+                        &values,
                     );
                 }
                 Ok(Some(resp))
             }
             WasmDispatchMode::Background => {
-                let callback_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx);
+                let callback_ctx = AgentContext::for_service_answering("wasm-runtime", agent_ctx);
                 let response = self
                     .dispatch_tenant_action(
                         entity_ref.tenant,
@@ -231,10 +233,11 @@ impl crate::state::ServerState {
                         msg
                     })?;
                 if !response.success {
-                    self.record_generated_callback_refusal(
+                    self.record_answer_refusal(
                         entity_ref,
                         callback_action,
                         response.error.as_deref().unwrap_or("callback rejected"),
+                        &values,
                     );
                 }
                 Ok(None)

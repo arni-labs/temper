@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use sqlx::{Acquire, PgPool};
 use temper_runtime::persistence::{
-    EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore, PersistenceAppend,
-    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, pack_f32_le, unpack_f32_le,
+    CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
+    PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
+    ScheduledActionRecord, pack_f32_le, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -79,19 +80,33 @@ impl EventStore for PostgresEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        self.append_with_index_rows(persistence_id, expected_sequence, events, &[], &[], false)
-            .await
+        self.append_with_rows(
+            persistence_id,
+            expected_sequence,
+            events,
+            CommitRows::default(),
+        )
+        .await
     }
 
-    async fn append_with_index_rows(
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
+        let CommitRows {
+            key_rows,
+            vector_rows,
+            reconcile_vectors,
+            scheduled_actions,
+            fired_scheduled_action,
+            // Postgres keeps its query-plane and timer rows after the commit
+            // (`commits_entity_rows` is false): the server writes them.
+            projection: _,
+            state_timer: _,
+        } = rows;
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
 
@@ -310,6 +325,15 @@ impl EventStore for PostgresEventStore {
             }
         }
 
+        // The scheduled actions the transition armed, and the one it fired, in
+        // THIS transaction: a row exists exactly while its action waits.
+        self.insert_scheduled_actions(&mut tx, scheduled_actions)
+            .await?;
+        if let Some(arm_id) = fired_scheduled_action {
+            self.delete_scheduled_action_row(&mut tx, tenant, entity_type, entity_id, arm_id)
+                .await?;
+        }
+
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
             record_postgres_transaction_commit_duration(
@@ -327,6 +351,24 @@ impl EventStore for PostgresEventStore {
         transaction_timer.set_outcome("ok");
 
         Ok(new_seq)
+    }
+
+    async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        self.scheduled_action_rows(tenant).await
+    }
+
+    async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        self.remove_scheduled_action(tenant, entity_type, entity_id, arm_id)
+            .await
     }
 
     async fn backfill_entity_keys(
@@ -1183,12 +1225,8 @@ mod tests {
 
     #[test]
     fn list_entity_ids_returns_distinct_pairs() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1404,12 +1442,8 @@ mod tests {
 
     #[test]
     fn load_query_projection_fields_many_returns_requested_fields() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1479,9 +1513,8 @@ mod tests {
 
     #[test]
     fn published_artifact_upsert_round_trips_and_updates_by_id() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => return,
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {

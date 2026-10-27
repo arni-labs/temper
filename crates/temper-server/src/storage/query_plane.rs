@@ -54,6 +54,23 @@ pub struct EntityCatalogRow {
     pub sequence_nr: u64,
 }
 
+/// One projection catalog row, and whether its field index entries are the
+/// entity's committed fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogRowFreshness {
+    pub entity_id: String,
+    /// The entity's journal holds no event newer than the one this row was
+    /// projected from. When false, the row may hold the fields from before a
+    /// committed change whose projection failed or is still queued, or belong
+    /// to an entity that has since been deleted.
+    pub current: bool,
+    /// The row's projected fields when they hold a `fields` object, the shape
+    /// a write that wraps its body under `fields` leaves. The field index does
+    /// not look inside that object, so a reference held there is read from
+    /// these fields. `None` for every other row.
+    pub wrapped_fields: Option<serde_json::Value>,
+}
+
 /// Backend-neutral durable projection upsert.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryProjectionUpsert {
@@ -178,4 +195,15 @@ pub trait QueryPlaneStore: Send + Sync {
     async fn projected_entity_counts_by_tenant(
         &self,
     ) -> Result<Option<Vec<(String, u64)>>, PersistenceError>;
+
+    /// Every projection catalog row of `entity_type`, compared with its
+    /// entity's journal in one read. Returns `None` if the backend cannot
+    /// compare them.
+    async fn projection_catalog_freshness(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        Ok(None)
+    }
 }

@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use temper_runtime::actor::Message;
 
+pub use super::effect_outcome::EffectOutcome;
+
 // Runtime resource budgets. Domain counter constraints belong to the spec.
 
 /// Maximum unsnapshotted events an actor may replay/hot-hold before refusing new transitions.
@@ -48,6 +50,10 @@ pub enum EntityMsg {
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
+        /// Who sent the action. A scheduled action the transition arms keeps
+        /// this identity in its row and fires as it. None: the action arms
+        /// with no identity (internal callers and tests).
+        caller: Option<std::sync::Arc<crate::request_context::AgentContext>>,
     },
     /// Get the current entity state.
     GetState,
@@ -270,6 +276,12 @@ pub struct EntityEvent {
     /// tombstone, whatever a spec names its actions.
     #[serde(default)]
     pub kind: temper_runtime::persistence::EventKind,
+    /// What the transition's effects wrote, recorded when it ran. Replay
+    /// restores it instead of running the effects again. `None` on events
+    /// that run no effects (creation, field updates, tombstones) and on
+    /// transitions journaled before outcomes were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<EffectOutcome>,
 }
 
 impl EntityEvent {
@@ -283,6 +295,7 @@ impl EntityEvent {
             params: serde_json::json!({}),
             idempotency_key: None,
             kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         }
     }
 }
@@ -320,6 +333,42 @@ pub struct EntityResponse {
     /// Whether the action was governed by a state-machine spec. Defaults to `true`.
     #[serde(default = "default_spec_governed", skip_serializing_if = "is_true")]
     pub spec_governed: bool,
+    /// Whether the action was refused before anything was written: its guard,
+    /// its state or its inputs did not allow it, the record had moved on and
+    /// its journal, read again, does not hold the action, or the event was too
+    /// large. A failed answer that is not a refusal (storage failed, a
+    /// concurrency violation that was not resolved by reading the journal, or
+    /// a step after the commit failed) may have landed. `refusal` says why a
+    /// guard, state or input refused it; it can be set when this is not, for a
+    /// replay refused after a concurrency violation that an earlier attempt of
+    /// the same action may have caused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+}
+
+impl EntityResponse {
+    /// The answer to an action refused before anything was written.
+    pub(crate) fn refused(state: EntityState, error: String) -> Self {
+        Self {
+            refused: true,
+            ..Self::write_failed(state, error)
+        }
+    }
+
+    /// The answer to an action whose write failed, so it may have landed.
+    pub(crate) fn write_failed(state: EntityState, error: String) -> Self {
+        Self {
+            success: false,
+            state,
+            error: Some(error),
+            refusal: None,
+            custom_effects: vec![],
+            scheduled_actions: vec![],
+            spawn_requests: vec![],
+            spec_governed: true,
+            refused: false,
+        }
+    }
 }
 
 #[cfg(test)]

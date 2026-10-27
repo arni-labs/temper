@@ -175,6 +175,7 @@ fn entity_response_spec_governed_skipped_when_true() {
         scheduled_actions: vec![],
         spawn_requests: vec![],
         spec_governed: true,
+        refused: false,
     };
     let serialized = serde_json::to_string(&resp).unwrap();
     assert!(!serialized.contains("spec_governed"));
