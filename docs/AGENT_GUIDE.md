@@ -309,6 +309,32 @@ set = { ready = true }    # optional: counters, flags, strings, numbers
 
 A carry stays in effect while the version holds it: every install into the tenant and every start makes it on the records it applies to then. So a start finishes the carries a stopped process left unmade, and a record carried once is not moved again. Remove the carry in a later version once its records have moved.
 
+When the records' next step is what an action does, name it with `then`. The platform makes that action on each record right after its carry, with no parameters, as an ordinary move with its effects, triggers and reactions. It must start from the state the carry ends in. The install's dry run makes it too, so its guard must pass and the record must keep the invariants after it, or nothing is installed.
+
+```toml
+# Runs left waiting for a login end through EndLeftover, whose trigger reports the failure.
+[[carry]]
+from = "WaitingForLogin"
+to = "Running"
+set = { carried_from = "WaitingForLogin" }
+then = "EndLeftover"
+```
+
+The `then` move goes through the version's Cedar like any move. Its principal is `Agent::"service:carry"` (role `service`, agent type `carry`), and `context.carryMove` names the carry's move, such as `"carry:WaitingForLogin:1"`. Only the platform sets `carryMove`: a record field of that name does not reach the context. To keep an action to the platform: `forbid(principal, action == Action::"EndLeftover", resource) unless { context has carryMove };`. The moves its triggers make run as the same principal unless a trigger declares its own, and the modules they call get the capability any move's modules get.
+
+When the move must be made for the user a record belongs to, name the string field that holds them with `as`. The carry service then acts for that user: Cedar sees `context.actingFor` set to the field's value and no role, and a parameter with `source = "authenticated_subject"` is bound to that user, as it is when an agent acts for them. A record whose field is empty is left where the carry puts it, and the install says how many. Since the platform acts for whoever the field names, `as` needs a field only a caller's own identity writes: the spec must set `strict_action_params = true` (otherwise a create body or a field update could write it), each action parameter of that name must have `source = "authenticated_subject"`, and no carry may `set` it. A version that breaks one of these is refused.
+
+```toml
+# Runs left waiting for a login end for the user who asked for them.
+[[carry]]
+from = "WaitingForLogin"
+to = "Running"
+then = "EndLeftover"
+as = "asked_by"
+```
+
+The install's dry run asks Cedar too, with the policies the tenant will have once the install serves, for the user each record names. A `then` move Cedar refuses refuses the install, naming its records. The dry run asks for one record of each group of records that hold the same values of what the check reads, the `as` field among them; a policy that reads another field is asked again for each record when its move is made. A move refused then is logged, and its record stays where the carry left it. So does a record whose process stopped between its carry and its `then` move: a later pass does not make the `then` move.
+
 Reported, not refused: records already without a way forward under the installed version, and moves that are no longer possible for records that keep another one. Not checked: moves whose guard reads a related record, and an install that removes a whole type.
 
 ### 3.3 Cedar (Access Control)

@@ -23,9 +23,11 @@ use temper_jit::swap::SwapController;
 use temper_jit::table::TransitionTable;
 use temper_runtime::tenant::TenantId;
 
-use super::{CarryMove, SpecChange, SpecChangePlan, SpecChangeRefused};
+use super::then_move::then_maker;
+use super::{CarryMove, Checked, SpecChange, SpecChangePlan, SpecChangeRefused};
+use crate::entity_actor::effects::entity_authorization_precondition;
 use crate::request_context::AgentContext;
-use crate::state::ServerState;
+use crate::state::{DispatchCommand, ServerState};
 
 /// The version a type is served from: the controller that swaps its table,
 /// and how many swaps it has made.
@@ -38,6 +40,9 @@ pub struct CarryReport {
     pub carried: usize,
     /// Why each carry that applies was not made.
     pub failed: Vec<String>,
+    /// Carried records whose `then` move is not made, since the field its
+    /// `as` names is empty.
+    pub left: Vec<String>,
 }
 
 impl ServerState {
@@ -69,13 +74,18 @@ impl ServerState {
         let mut refused = SpecChangeRefused::default();
         let mut planned: BTreeMap<&str, &Served> = BTreeMap::new();
         for (change, table, served) in &installed {
-            self.check_type(tenant, change, (table, table), &mut plan, &mut refused)
+            let checked = Checked {
+                tables: (table, table),
+                cedar: &self.authz,
+            };
+            self.check_type(tenant, change, checked, &mut plan, &mut refused)
                 .await;
             planned.insert(&change.entity_type, served);
         }
         let mut report = CarryReport {
             carried: 0,
             failed: refused.reasons,
+            left: Vec::new(),
         };
         for carry in &plan.carries {
             // A carry's values are its move's parameters, so it is made only
@@ -91,9 +101,26 @@ impl ServerState {
                     "a newer version was installed during the carry pass; its pass makes the rest");
                 break;
             }
-            match self.make_carry(tenant, carry).await {
-                Ok(()) => report.carried += 1,
-                Err(error) => report.failed.push(error),
+            if let Err(error) = self.make_carry(tenant, carry).await {
+                report.failed.push(error);
+                continue;
+            }
+            report.carried += 1;
+            let Some(then) = &carry.then else {
+                continue;
+            };
+            match self.make_then(tenant, carry, then).await {
+                Ok(true) => {}
+                Ok(false) => report.left.push(format!(
+                    "{} {}: carried; its then move {then} is not made, since its `{}` is empty",
+                    carry.entity_type,
+                    carry.entity_id,
+                    carry.acts_for.as_deref().unwrap_or_default()
+                )),
+                Err(error) => report.failed.push(format!(
+                    "{} {}: carried, but its then move {then} failed: {error}",
+                    carry.entity_type, carry.entity_id
+                )),
             }
         }
         if !plan.carries.is_empty() || !report.failed.is_empty() {
@@ -103,6 +130,9 @@ impl ServerState {
         }
         for failure in &report.failed {
             tracing::warn!(tenant = %tenant, %failure, "a carry was not made");
+        }
+        for left in &report.left {
+            tracing::info!(tenant = %tenant, %left, "a carried record has no one to act for");
         }
         report
     }
@@ -184,5 +214,62 @@ impl ServerState {
             "{} {}: {} failed: {error}",
             carry.entity_type, carry.entity_id, carry.action
         ))
+    }
+
+    /// Make a carry's `then` move on the record it carried, as any move is
+    /// made: decided by the version's Cedar on the record as it is now, with
+    /// its effects, triggers and reactions, by [`then_maker`]. A carry itself
+    /// is a system move, and a module gets no capability from a system move;
+    /// the modules this move's triggers call get the capability any move's
+    /// modules get. `false` when the record's `as` field is empty, so the
+    /// move is not made.
+    async fn make_then(
+        &self,
+        tenant: &TenantId,
+        carry: &CarryMove,
+        then: &str,
+    ) -> Result<bool, String> {
+        let snapshot = self
+            .load_authz_resource_snapshot(tenant, &carry.entity_type, &carry.entity_id)
+            .await?;
+        let Some(agent_ctx) = then_maker(
+            &carry.action,
+            carry.acts_for.as_deref(),
+            &snapshot.current_state.state.fields,
+        ) else {
+            return Ok(false);
+        };
+        let security_ctx = agent_ctx
+            .security_ctx
+            .as_ref()
+            .expect("a then move's maker carries its security context");
+        self.authorize_with_context(
+            security_ctx,
+            then,
+            &carry.entity_type,
+            &snapshot.resource_attrs,
+            tenant.as_str(),
+        )
+        .map_err(|denial| denial.to_string())?;
+        let response = self
+            .dispatch_tenant_action_ext_typed_if_current(
+                DispatchCommand {
+                    tenant,
+                    entity_type: &carry.entity_type,
+                    entity_id: &carry.entity_id,
+                    action: then,
+                    params: serde_json::json!({}),
+                    agent_ctx: &agent_ctx,
+                    await_integration: false,
+                    await_reactions: true,
+                },
+                entity_authorization_precondition(&snapshot.current_state.state),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        match response.success {
+            true => Ok(true),
+            false => Err(response.error.unwrap_or_default()),
+        }
     }
 }

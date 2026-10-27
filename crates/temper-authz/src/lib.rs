@@ -12,7 +12,7 @@ mod policy_gen;
 pub mod statements;
 
 pub use context::{
-    AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
+    AuthenticatedRequestContext, CARRY_MOVE_CONTEXT, Principal, PrincipalKind, SecurityContext,
     is_cedar_authority_context_key,
 };
 pub use engine::{

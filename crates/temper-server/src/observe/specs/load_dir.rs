@@ -400,7 +400,7 @@ pub(super) async fn load_specs_from_directory(
         .spec_changes(&tenant_id, &sources)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let spec_change = state
-        .check_spec_changes(&tenant_id, &changes)
+        .check_spec_changes(&tenant_id, &changes, None)
         .await
         .map_err(|refused| (StatusCode::CONFLICT, refused.to_string()))?;
 

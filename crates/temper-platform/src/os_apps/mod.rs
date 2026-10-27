@@ -1206,9 +1206,6 @@ pub(super) async fn install_os_app_with_plan(
     updated.sort();
     skipped.sort();
     let new_specs = plan.specs && !(added.is_empty() && updated.is_empty());
-    let mut warnings =
-        install_checks::check_spec_changes(state, &tenant_id, app_name, &bundle.specs, plan.specs)
-            .await?;
 
     // Build the full Cedar policy text for this tenant: the live text without
     // what this app's previous install wrote, plus the bundle's policies.
@@ -1231,6 +1228,16 @@ pub(super) async fn install_os_app_with_plan(
         combined_policy.as_deref(),
     )?;
     let policies = combined_policy.as_deref();
+    // A carry's then move is asked of the policies the install serves with.
+    let mut warnings = install_checks::check_spec_changes(
+        state,
+        &tenant_id,
+        app_name,
+        &bundle.specs,
+        plan.specs,
+        policies,
+    )
+    .await?;
     warnings.extend(
         install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies)
             .await?
