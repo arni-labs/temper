@@ -82,7 +82,8 @@ async fn wait_for_query_projection_ids(
             .query_field_index(
                 tenant,
                 entity_type,
-                "field_name = ?3 AND field_value = ?4",
+                "entity_id IN (SELECT entity_id FROM entity_field_index \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
                 vec![field_name.to_string(), field_value.to_string()],
             )
             .await
@@ -273,7 +274,8 @@ async fn startup_backfill_rebuilds_query_projection_without_hydrating_actors() {
         .query_field_index(
             tenant.as_str(),
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Rebuild Me".to_string()],
         )
         .await
@@ -346,7 +348,8 @@ async fn query_projection_excludes_fields_marked_not_query_indexed() {
         .query_field_index(
             tenant.as_str(),
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["progress_token".to_string(), "1".to_string()],
         )
         .await

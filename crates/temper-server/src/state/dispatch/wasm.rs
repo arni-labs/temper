@@ -11,7 +11,7 @@ use crate::entity_actor::{EntityResponse, EntityState};
 use crate::request_context::AgentContext;
 use crate::secrets::template::resolve_secret_templates;
 use crate::state::sim_now;
-use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
+use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext, platform_keys};
 use temper_runtime::tenant::TenantId;
 use temper_wasm::host_trait::clamp_redacted_metadata_value;
 use temper_wasm::{
@@ -87,12 +87,12 @@ pub(crate) fn internal_http_capability_issuer(
     match module {
         Some(module) => {
             security_context.context_attrs.insert(
-                "module".to_string(),
+                platform_keys::MODULE.to_string(),
                 serde_json::Value::String(module.to_string()),
             );
         }
         None => {
-            security_context.context_attrs.remove("module");
+            security_context.context_attrs.remove(platform_keys::MODULE);
         }
     }
     let authenticated = AuthenticatedRequestContext::new(tenant.clone(), security_context);
