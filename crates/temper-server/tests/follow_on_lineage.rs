@@ -150,6 +150,10 @@ effect = ["n += 1"]
 "#;
 
 fn build_state(integration_url: &str) -> ServerState {
+    build_state_with_bell(integration_url, BELL_SPEC)
+}
+
+fn build_state_with_bell(integration_url: &str, bell_spec: &str) -> ServerState {
     let cron_spec = CRON_SPEC.replace("{url}", integration_url);
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(CSDL_XML).expect("CSDL should parse");
@@ -160,7 +164,7 @@ fn build_state(integration_url: &str) -> ServerState {
         &[
             ("Cron", cron_spec.as_str()),
             ("Run", RUN_SPEC),
-            ("Bell", BELL_SPEC),
+            ("Bell", bell_spec),
             ("Reminder", REMINDER_SPEC),
         ],
     );
@@ -308,3 +312,95 @@ async fn one_action_scheduled_for_two_moments_fires_at_both() {
     tokio::time::sleep(Duration::from_millis(3_500)).await;
     assert_eq!(counter(&state, &tenant, "Reminder", "r1").await, 2);
 }
+
+/// The scheduled ring calls an HTTP adapter, so deduplicating its counter
+/// alone cannot hide replayed post-dispatch effects.
+async fn http_bell() -> (ServerState, MockServer) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ring"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "callback_params": {}
+        })))
+        .mount(&server)
+        .await;
+    let bell_spec = format!(
+        r#"{BELL_SPEC}
+[[action.triggers]]
+name = "ring_http"
+kind = "adapter"
+adapter = "http"
+on_success = "RingComplete"
+on_failure = "RingFailed"
+config = {{ method = "POST", url = "{}/ring" }}
+
+[[action]]
+name = "RingComplete"
+from = ["Ready"]
+
+[[action]]
+name = "RingFailed"
+from = ["Ready"]
+"#,
+        server.uri()
+    );
+    (build_state_with_bell(&server.uri(), &bell_spec), server)
+}
+
+async fn assert_one_http_ring(state: &ServerState, server: &MockServer) {
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(counter(state, &TenantId::default(), "Bell", "b1").await, 1);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "a cached scheduled reply must not launch its HTTP adapter again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_retried_while_its_ring_waits_calls_http_once() {
+    let (state, server) = http_bell().await;
+    let tenant = TenantId::default();
+    let agent = AgentContext {
+        idempotency_key: Some("press-once".into()),
+        ..AgentContext::default()
+    };
+    press(&state, &tenant, &agent).await;
+    press(&state, &tenant, &agent).await;
+    assert_one_http_ring(&state, &server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_retried_after_its_ring_calls_http_once() {
+    let (state, server) = http_bell().await;
+    let tenant = TenantId::default();
+    let agent = AgentContext {
+        idempotency_key: Some("press-once".into()),
+        ..AgentContext::default()
+    };
+    press(&state, &tenant, &agent).await;
+    assert_one_http_ring(&state, &server).await;
+
+    press(&state, &tenant, &agent).await;
+    assert_one_http_ring(&state, &server).await;
+
+    // Also exercise duplicate delivery of the scheduled child itself, even
+    // when the parent retry no longer starts a second timer.
+    let child = AgentContext {
+        idempotency_key: Some(temper_server::idempotency::derived_idempotency_key(
+            "press-once",
+            "scheduled:Ring",
+            "0",
+        )),
+        ..AgentContext::default()
+    };
+    let response = state
+        .dispatch_tenant_action(&tenant, "Bell", "b1", "Ring", serde_json::json!({}), &child)
+        .await
+        .expect("cached Ring should succeed");
+    assert!(response.success);
+    assert_one_http_ring(&state, &server).await;
+}
+
+#[path = "follow_on_lineage/dst.rs"]
+mod dst;

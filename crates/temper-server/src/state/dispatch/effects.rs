@@ -644,6 +644,22 @@ impl crate::state::ServerState {
             return response;
         }
 
+        // Internal callers (including scheduled deliveries) can receive a
+        // cached actor reply too. As at the HTTP boundary, only pending
+        // effects may replay: completed integrations, spawns and schedules
+        // must not launch again. A dropped actor reply leaves effects pending
+        // so its retry still reaches the pipeline below.
+        if let Some(key) = ctx.dispatch_idempotency_key {
+            let actor_key = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
+            if self
+                .idempotency_cache
+                .get_after_effects_applied(&actor_key, key)
+                .is_some()
+            {
+                return response;
+            }
+        }
+
         // Cancellation is bookkeeping for the committed transition, not a
         // dependent launch. An old reset timer must not fire during the wait.
         self.invalidate_state_timeouts_if_needed(ctx, &response);
