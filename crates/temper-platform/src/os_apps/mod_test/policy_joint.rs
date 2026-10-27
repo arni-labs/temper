@@ -108,6 +108,8 @@ async fn policy_checks_use_incoming_specs_over_active_versions() {
     )
     .await
     .expect("the incoming spec replaces the old property before checking");
+    // The new property names only Place. The walk sends App's reaction
+    // into Place as a move from outside, so the property is checked.
     assert!(unproved.is_empty(), "{unproved:?}");
 }
 
