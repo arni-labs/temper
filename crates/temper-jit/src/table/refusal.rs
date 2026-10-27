@@ -40,6 +40,17 @@ pub enum Refusal {
         /// The parameter's name.
         parameter: String,
     },
+    /// The move would make one of the type's `[[invariant]]`s false, and it
+    /// held before the move.
+    InvariantViolated {
+        /// The invariant's name, as the spec writes it.
+        invariant: String,
+        /// The failing part of its assertion, in canonical form.
+        assert: String,
+        /// One entry per comparison in `assert` that splits into a field, an
+        /// operator and a wanted value, with the value the move would leave.
+        conditions: Vec<GuardCondition>,
+    },
 }
 
 impl Refusal {
@@ -50,6 +61,7 @@ impl Refusal {
             Refusal::InvalidState { .. } => "InvalidState",
             Refusal::ParameterConstraint { .. } => "ParameterConstraint",
             Refusal::MissingParameter { .. } => "MissingParameter",
+            Refusal::InvariantViolated { .. } => "InvariantViolated",
         }
     }
 }

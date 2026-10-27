@@ -89,7 +89,9 @@ impl ServerState {
                     "state timer retained after failed fire; retrying");
                 delay = wait;
             }
-            state.forget_state_timer(&timer).await;
+            if !state.state_timer_row_moved_on(&timer, armed_seq) {
+                state.forget_state_timer(&timer).await;
+            }
             state.state_timeout_tracker.dec_pending(&timer.entity_type);
         });
     }
@@ -117,12 +119,16 @@ impl ServerState {
         };
         let belongs = current.status == timer.state && self.declares_state_timer(timer);
         if !belongs {
-            self.reconcile_state_timers(
+            let follow = super::state_timer_reconcile::Follow {
+                armed_by: Some(&timer.agent_ctx),
+                ..Default::default()
+            };
+            self.follow_owned_state_timer(
                 &timer.tenant,
                 &timer.entity_type,
                 &timer.entity_id,
                 &current,
-                Some(&timer.agent_ctx),
+                follow,
             )
             .await;
         } else if current.sequence_nr > timer.sequence_nr {

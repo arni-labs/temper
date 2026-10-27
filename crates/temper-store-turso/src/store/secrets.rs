@@ -8,6 +8,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use tracing::instrument;
 
 use super::TursoEventStore;
+use super::write_gate::WritePriority;
 
 /// A single encrypted secret row: `(key_name, ciphertext, nonce)`.
 pub type SecretRow = (String, Vec<u8>, Vec<u8>);
@@ -27,7 +28,9 @@ impl TursoEventStore {
         nonce: &[u8],
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.upsert_secret");
-        let conn = self.configured_connection().await?;
+        let conn = self
+            .write_connection("turso.upsert_secret", WritePriority::High)
+            .await?;
         conn.execute(
             "INSERT INTO tenant_secrets (tenant, key_name, ciphertext, nonce, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now')) \
@@ -52,7 +55,9 @@ impl TursoEventStore {
         key_name: &str,
     ) -> Result<bool, PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_secret");
-        let conn = self.configured_connection().await?;
+        let conn = self
+            .write_connection("turso.delete_secret", WritePriority::High)
+            .await?;
         let rows_affected = conn
             .execute(
                 "DELETE FROM tenant_secrets WHERE tenant = ?1 AND key_name = ?2",

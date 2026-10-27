@@ -102,6 +102,10 @@ impl EventStore for PostgresEventStore {
             reconcile_vectors,
             scheduled_actions,
             fired_scheduled_action,
+            // Postgres keeps its query-plane and timer rows after the commit
+            // (`commits_entity_rows` is false): the server writes them.
+            projection: _,
+            state_timer: _,
         } = rows;
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
@@ -1145,6 +1149,10 @@ impl EventStore for PostgresEventStore {
 #[cfg(test)]
 #[path = "store_projection_test.rs"]
 mod projection_tests;
+
+#[cfg(test)]
+#[path = "field_index_writes_test.rs"]
+mod field_index_writes_tests;
 
 #[cfg(test)]
 mod tests {

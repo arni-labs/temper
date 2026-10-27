@@ -34,12 +34,14 @@ use temper_runtime::persistence::{
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 pub(super) use tokio::time::sleep as sleep_persistence_retry; // determinism-ok: production persistence retry backoff
 
+use crate::request_context::AgentContext;
 use crate::storage::{BackendLabel, BoxedEventStore};
 
 use super::action_input::process_action_with_blob_prestate;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
+use super::entity_rows::{EntityRows, EntityRowsHook, RowsInput};
 use super::scheduled_rows::ScheduledRows;
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
@@ -139,13 +141,15 @@ fn duplicate_idempotency_custom_effects(
     table: &TransitionTable,
     state: &EntityState,
     action: &str,
+    params: &serde_json::Value,
     related: &temper_jit::table::RelatedMap,
 ) -> Vec<String> {
     if !table.composite_actions.contains_key(action) {
         return Vec::new();
     }
 
-    let ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    let mut ctx = build_eval_context_with_xref(state, related, table, Some(action));
+    super::effects::with_params(&mut ctx, params);
     table
         .evaluate_ctx(&state.status, &ctx, action)
         .filter(|result| result.success)
@@ -195,6 +199,9 @@ pub struct EntityActor {
     /// be the journal's. Once the message that wrote it is answered, the
     /// actor restarts and rebuilds from the journal before the next one.
     rebuild_from_journal: AtomicBool,
+    /// Says which query-plane and timer rows an event writes, for a store
+    /// that keeps them in the journal's transaction.
+    entity_rows: Option<EntityRowsHook>,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -337,6 +344,7 @@ impl EntityActor {
             legacy_blob_store: None,
             on_rehydrated: None,
             rebuild_from_journal: AtomicBool::new(false),
+            entity_rows: None,
         }
     }
 
@@ -364,6 +372,7 @@ impl EntityActor {
             legacy_blob_store: None,
             on_rehydrated: None,
             rebuild_from_journal: AtomicBool::new(false),
+            entity_rows: None,
         }
     }
 
@@ -401,6 +410,12 @@ impl EntityActor {
     /// Attach the hook run when this actor rehydrates from stored events.
     pub(crate) fn with_on_rehydrated(mut self, hook: Option<RehydrateHook>) -> Self {
         self.on_rehydrated = hook;
+        self
+    }
+
+    /// Attach what says which query-plane and timer rows an event writes.
+    pub(crate) fn with_entity_rows(mut self, hook: Option<EntityRowsHook>) -> Self {
+        self.entity_rows = hook;
         self
     }
 
@@ -442,13 +457,16 @@ impl EntityActor {
 
     /// Persist an event to the configured event store, with the rows of the
     /// scheduled actions it arms and the removal of the one it fires in the
-    /// same commit.
+    /// same commit, and, for a store that keeps them there, the record's
+    /// query-plane row and timer row as the event leaves it (`caller` is who
+    /// a timer it arms fires as). `state` is the record after the event, at
+    /// the sequence before it.
     ///
     /// The answer is what the write did. `Ok` is the event's sequence: it
     /// landed, also when the store answered an error and the journal, read
     /// again, holds the event. A concurrency violation or a `not written`
-    /// storage error: it did not land. An `outcome unknown` storage error:
-    /// the journal cannot yet establish whether the failed commit landed.
+    /// storage error: it did not land. An `outcome unknown` error: the
+    /// journal cannot yet establish whether the failed commit landed.
     pub(super) async fn persist_event(
         &self,
         store: &BoxedEventStore,
@@ -456,9 +474,29 @@ impl EntityActor {
         state: &mut EntityState,
         event: &EntityEvent,
         scheduled: &ScheduledRows,
+        caller: Option<&AgentContext>,
     ) -> Result<u64, PersistenceError> {
         let persistence_id = self.persistence_id();
         let event_id = sim_uuid();
+        let entity_rows = match &self.entity_rows {
+            Some(hook) if store.commits_entity_rows() => {
+                // The record as the event leaves it. A delete sets its status
+                // only once its tombstone is written, so the status is the
+                // event's.
+                let mut after = state.clone();
+                after.sequence_nr = state.sequence_nr + 1;
+                if !event.to_status.is_empty() {
+                    after.status = event.to_status.clone();
+                }
+                after.push_event_bounded(event.clone());
+                hook(&RowsInput {
+                    state: &after,
+                    event,
+                    caller,
+                })
+            }
+            _ => EntityRows::default(),
+        };
         let payload = super::bootstrap::event_payload(event, state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
         let envelope = PersistenceEnvelope {
@@ -536,13 +574,15 @@ impl EntityActor {
                 &persistence_id,
                 state.sequence_nr,
                 &[envelope],
-                CommitRows {
+                entity_rows.commit_rows(CommitRows {
                     key_rows: &key_rows,
                     vector_rows: &vector_rows,
                     reconcile_vectors,
                     scheduled_actions: &scheduled.armed,
                     fired_scheduled_action: scheduled.fired.as_deref(),
-                },
+                    projection: None,
+                    state_timer: None,
+                }),
             )
             .await;
         crate::runtime_metrics::record_event_store_append_wait(
@@ -1259,6 +1299,7 @@ impl Actor for EntityActor {
                     &mut state,
                     &created,
                     &ScheduledRows::default(),
+                    None,
                 )
                 .await
                 .map_err(|e| {
@@ -1388,8 +1429,9 @@ impl EntityActor {
                 if let Some(key) = idempotency_key.as_deref()
                     && state.has_processed_idempotency_key(key)
                 {
-                    let custom_effects =
-                        duplicate_idempotency_custom_effects(&table, state, &name, &related);
+                    let custom_effects = duplicate_idempotency_custom_effects(
+                        &table, state, &name, &params, &related,
+                    );
                     let mut response_state = state.clone();
                     if !custom_effects.is_empty() {
                         prune_transient_action_fields_from_state(&mut response_state);
@@ -1565,7 +1607,14 @@ impl EntityActor {
                         (self.event_journal.as_ref(), self.event_backend)
                     {
                         let first_persist = self
-                            .persist_event(store, backend, state, &event, &scheduled)
+                            .persist_event(
+                                store,
+                                backend,
+                                state,
+                                &event,
+                                &scheduled,
+                                caller.as_deref(),
+                            )
                             .await;
 
                         match first_persist {
@@ -1787,6 +1836,7 @@ impl EntityActor {
                                             state,
                                             &retry_event,
                                             &retry_scheduled,
+                                            caller.as_deref(),
                                         )
                                         .await
                                     {
@@ -2122,7 +2172,14 @@ impl EntityActor {
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
                     && let Err(e) = self
-                        .persist_event(store, backend, state, &deleted, &ScheduledRows::default())
+                        .persist_event(
+                            store,
+                            backend,
+                            state,
+                            &deleted,
+                            &ScheduledRows::default(),
+                            None,
+                        )
                         .await
                 {
                     ctx.reply(persistence_failure_reply(state.clone(), &e));
