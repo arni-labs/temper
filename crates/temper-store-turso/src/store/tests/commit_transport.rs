@@ -16,7 +16,7 @@ struct DelayedCommit {
     commits: Arc<AtomicUsize>,
     begins: Arc<AtomicUsize>,
     inserts: Arc<AtomicUsize>,
-    event: temper_runtime::persistence::PersistenceEnvelope,
+    events: [temper_runtime::persistence::PersistenceEnvelope; 2],
 }
 
 impl Respond for DelayedCommit {
@@ -36,11 +36,19 @@ impl Respond for DelayedCommit {
             ];
             if journal {
                 if self.published.load(Ordering::SeqCst) {
+                    let entity_id = body["batch"]["steps"][0]["stmt"]["args"][2]["value"]
+                        .as_str()
+                        .unwrap();
+                    let event = &self.events[match entity_id {
+                        "job-1" => 0,
+                        "job-2" => 1,
+                        other => panic!("unexpected journal {other}"),
+                    }];
                     lines.push(json!({"type":"row", "row":[
                         {"type":"integer","value":"1"},
-                        {"type":"text","value":self.event.event_type},
-                        {"type":"text","value":self.event.payload.to_string()},
-                        {"type":"text","value":serde_json::to_string(&self.event.metadata).unwrap()}
+                        {"type":"text","value":event.event_type},
+                        {"type":"text","value":event.payload.to_string()},
+                        {"type":"text","value":serde_json::to_string(&event.metadata).unwrap()}
                     ]}));
                 }
             } else {
@@ -84,7 +92,9 @@ impl Respond for DelayedCommit {
                             );
                         }
                         sql if sql.starts_with("INSERT INTO events") => {
-                            self.inserts.fetch_add(1, Ordering::SeqCst);
+                            // Batch inserts carry seven values per event row.
+                            let rows = request["stmt"]["args"].as_array().unwrap().len() / 7;
+                            self.inserts.fetch_add(rows, Ordering::SeqCst);
                         }
                         _ => {}
                     }
@@ -112,7 +122,10 @@ async fn a_transport_failure_before_remote_commit_finishes_stays_unknown_without
             commits: Arc::new(AtomicUsize::new(0)),
             begins: Arc::new(AtomicUsize::new(0)),
             inserts: Arc::new(AtomicUsize::new(0)),
-            event: test_envelope("Created", json!({})),
+            events: [
+                test_envelope("Created", json!({"job":1})),
+                test_envelope("Created", json!({"job":2})),
+            ],
         };
         Mock::given(method("POST"))
             .respond_with(fault.clone())
@@ -128,18 +141,28 @@ async fn a_transport_failure_before_remote_commit_finishes_stays_unknown_without
         );
         store.is_remote = true;
         let id = "tenant-a:Job:job-1";
+        let ids = if batch {
+            vec![id, "tenant-a:Job:job-2"]
+        } else {
+            vec![id]
+        };
         let result = if batch {
             store
-                .append_batch(&[PersistenceAppend {
-                    persistence_id: id.into(),
-                    expected_sequence: 0,
-                    events: vec![fault.event.clone()],
-                }])
+                .append_batch(
+                    &ids.iter()
+                        .enumerate()
+                        .map(|(index, id)| PersistenceAppend {
+                            persistence_id: (*id).into(),
+                            expected_sequence: 0,
+                            events: vec![fault.events[index].clone()],
+                        })
+                        .collect::<Vec<_>>(),
+                )
                 .await
                 .map(|_| ())
         } else {
             store
-                .append(id, 0, std::slice::from_ref(&fault.event))
+                .append(id, 0, std::slice::from_ref(&fault.events[0]))
                 .await
                 .map(|_| ())
         };
@@ -148,16 +171,24 @@ async fn a_transport_failure_before_remote_commit_finishes_stays_unknown_without
             "batch={batch}: {result:?}"
         );
         assert_eq!(fault.commits.load(Ordering::SeqCst), 1);
-        assert_eq!(fault.inserts.load(Ordering::SeqCst), 1);
+        assert_eq!(fault.inserts.load(Ordering::SeqCst), ids.len());
         assert_eq!(
             fault.begins.load(Ordering::SeqCst),
             1,
             "unknown outcomes must not retry"
         );
-        assert!(store.read_events(id, 0).await.unwrap().is_empty());
+        for id in &ids {
+            assert!(store.read_events(id, 0).await.unwrap().is_empty());
+        }
         fault.published.store(true, Ordering::SeqCst);
-        let landed = store.read_events(id, 0).await.unwrap();
-        assert_eq!(landed.len(), 1);
-        assert_eq!(landed[0].metadata.event_id, fault.event.metadata.event_id);
+        for (index, id) in ids.iter().enumerate() {
+            let landed = store.read_events(id, 0).await.unwrap();
+            assert_eq!(landed.len(), 1);
+            assert_eq!(
+                landed[0].metadata.event_id,
+                fault.events[index].metadata.event_id
+            );
+            assert_eq!(landed[0].payload, fault.events[index].payload);
+        }
     }
 }

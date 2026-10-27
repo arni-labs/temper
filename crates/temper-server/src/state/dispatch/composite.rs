@@ -297,8 +297,8 @@ impl crate::state::ServerState {
             .await?;
 
             let table = self.transition_table_for_dispatch(tenant, &write.entity_type)?;
-            let related = if table_has_cross_entity_guards_for_action(&table, &write.action) {
-                self.resolve_cross_entity_guards(
+            let related = if table_reads_related_records(&table, &write.action) {
+                self.resolve_related_statuses(
                     tenant,
                     &write.entity_type,
                     &write.entity_id,
@@ -865,8 +865,8 @@ impl crate::state::ServerState {
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
         }
-        let related = if table_has_cross_entity_guards_for_action(&table, &write.action) {
-            self.resolve_cross_entity_guards(
+        let related = if table_reads_related_records(&table, &write.action) {
+            self.resolve_related_statuses(
                 tenant,
                 &write.entity_type,
                 &write.entity_id,
@@ -973,7 +973,7 @@ impl crate::state::ServerState {
             .await
             .map_err(DispatchError::Internal)?;
         let related = self
-            .resolve_cross_entity_guards(tenant, entity_type, entity_id, action)
+            .resolve_related_statuses(tenant, entity_type, entity_id, action)
             .await;
         let eval_ctx = build_eval_context_with_xref(&current.state, &related, &table, Some(action));
 
