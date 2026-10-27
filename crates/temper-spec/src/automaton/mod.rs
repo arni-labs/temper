@@ -38,5 +38,8 @@ pub use trigger_graph::{TriggerEdge, TriggerGraph};
 pub use types::*;
 
 #[cfg(test)]
+#[path = "hints_test.rs"]
+mod hints_test;
+#[cfg(test)]
 #[path = "strict_test.rs"]
 mod strict_test;

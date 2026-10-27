@@ -46,8 +46,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use temper_authz::SendAnalysis;
-use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Truth, eval};
+use temper_spec::automaton::{Automaton, Liveness};
+use temper_spec::predicate::{Expr, Truth, eval};
 
 use super::JointStep;
 use super::model::{self, JointModel, Sending};
@@ -223,15 +223,11 @@ pub fn verify_joint_liveness(
             let Some(goal) = &live.eventually else {
                 continue;
             };
-            let mut scope = BTreeSet::from([name.to_string()]);
-            let mut missing = Vec::new();
-            for (entity_type, _) in goal.related_types() {
-                if by_name.contains_key(entity_type.as_str()) {
-                    scope.insert(entity_type);
-                } else {
-                    missing.push(entity_type);
-                }
-            }
+            let model = liveness_model(&by_name, name, live, goal, policies);
+            let scope = match &model {
+                Ok(model) => model.scope.clone(),
+                Err((scope, _)) => scope.clone(),
+            };
             let mut result = JointLivenessResult {
                 entity: name.to_string(),
                 name: live.name.clone(),
@@ -243,26 +239,19 @@ pub fn verify_joint_liveness(
                 outcome: LivenessOutcome::Holds,
                 unwalked: Vec::new(),
             };
-            if !missing.is_empty() {
-                result.outcome = LivenessOutcome::Incomplete {
-                    reason: format!(
-                        "it reads {}, which this app does not declare",
-                        missing.join(", ")
-                    ),
-                };
-                results.push(result);
-                continue;
-            }
-            let sending = Sending {
-                policies,
-                kernel_moves: true,
-                relies_on: live
-                    .relies_on
-                    .iter()
-                    .map(|action| (name.to_string(), action.clone()))
-                    .collect(),
+            let model = match model {
+                Ok(model) => model,
+                Err((_, missing)) => {
+                    result.outcome = LivenessOutcome::Incomplete {
+                        reason: format!(
+                            "it reads {}, which this app does not declare",
+                            missing.join(", ")
+                        ),
+                    };
+                    results.push(result);
+                    continue;
+                }
             };
-            let model = JointModel::new(&by_name, scope, name, &[goal], sending, true);
             let explored = model.walk_with(budget, true, |_, _| false);
             result.states = explored.len();
             result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
@@ -289,6 +278,48 @@ pub fn verify_joint_liveness(
         }
     }
     results
+}
+
+/// The joint model `owner`'s `live` rule, whose condition is `goal`, is
+/// walked on: its type and every type the condition names, with the actions
+/// it relies on sent from outside. `Err` gives the scope and the types the
+/// condition names that `by_name` does not hold.
+pub(super) fn liveness_model(
+    by_name: &BTreeMap<&str, &Automaton>,
+    owner: &str,
+    live: &Liveness,
+    goal: &Expr,
+    policies: Option<&SendAnalysis>,
+) -> Result<JointModel, (BTreeSet<String>, Vec<String>)> {
+    let mut scope = BTreeSet::from([owner.to_string()]);
+    let mut missing = Vec::new();
+    for (entity_type, _) in goal.related_types() {
+        if by_name.contains_key(entity_type.as_str()) {
+            scope.insert(entity_type);
+        } else {
+            missing.push(entity_type);
+        }
+    }
+    if !missing.is_empty() {
+        return Err((scope, missing));
+    }
+    let sending = Sending {
+        policies,
+        kernel_moves: true,
+        relies_on: live
+            .relies_on
+            .iter()
+            .map(|action| (owner.to_string(), action.clone()))
+            .collect(),
+    };
+    Ok(JointModel::new(
+        by_name,
+        scope,
+        owner,
+        &[goal],
+        sending,
+        true,
+    ))
 }
 
 /// Whether every walked state reaches `goal` through the system's moves,

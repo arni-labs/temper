@@ -236,8 +236,11 @@ const JOINT_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// fails with how it comes to rest short of it, and a walk that could not
 /// finish fails too, since a partial walk proves nothing. So do a walk that
 /// never took an answer a module may give and a rule whose premise no walked
-/// state meets. A spec that does
-/// not parse is reported by the IOA cascade, so it is skipped here.
+/// state meets. Each rule is proved by induction first, for every run (an
+/// invariant with its lemmas or the prover's guesses, an `eventually` rule
+/// with its measure), and walked only when the proof does not hold; a proved
+/// rule whose premise no run meets fails as well. A spec that does not parse is reported by the IOA cascade, so it is
+/// skipped here.
 fn verify_joint(
     ioa_sources: &std::collections::BTreeMap<String, String>,
     policy_text: &str,
@@ -251,38 +254,15 @@ fn verify_joint(
     }
     let analysis = temper_authz::SendAnalysis::new(policy_text).context("invalid Cedar policy")?;
     let refs: Vec<&temper_spec::automaton::Automaton> = parsed.iter().collect();
-    let invariants =
-        temper_verify::composite::verify_joint_invariants(&refs, Some(&analysis), JOINT_BUDGET);
-    let invariant_rows = invariants.iter().map(|result| {
-        let tag = match result.outcome {
-            temper_verify::composite::JointOutcome::Holds => "PASS",
-            temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
-            temper_verify::composite::JointOutcome::Vacuous { .. } => "VACUOUS",
-            temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
-        };
-        (
-            tag,
-            result.to_string(),
-            format!("{}.{}", result.entity, result.invariant),
-        )
-    });
-    let invariants = print_joint_report("Cross-entity invariants", invariant_rows.collect());
-    let live =
-        temper_verify::composite::verify_joint_liveness(&refs, Some(&analysis), JOINT_BUDGET);
-    let live_rows = live.iter().map(|result| {
-        let tag = match result.outcome {
-            temper_verify::composite::LivenessOutcome::Holds => "PASS",
-            temper_verify::composite::LivenessOutcome::Stuck { .. } => "FAIL",
-            temper_verify::composite::LivenessOutcome::Vacuous { .. } => "VACUOUS",
-            temper_verify::composite::LivenessOutcome::Incomplete { .. } => "INCOMPLETE",
-        };
-        (
-            tag,
-            result.to_string(),
-            format!("{}.{}", result.entity, result.name),
-        )
-    });
-    let liveness = print_joint_report("Liveness", live_rows.collect());
+    let check = temper_verify::composite::check_joint(&refs, Some(&analysis), JOINT_BUDGET);
+    let rows = |verdicts: &[temper_verify::composite::JointVerdict]| {
+        verdicts
+            .iter()
+            .map(|v| (v.holds(), v.tag(), v.to_string(), v.rule()))
+            .collect()
+    };
+    let invariants = print_joint_report("Cross-entity invariants", rows(&check.invariants));
+    let liveness = print_joint_report("Liveness", rows(&check.liveness));
     // Each reports on its own: one that fails does not hide the other.
     match (invariants, liveness) {
         (Err(invariants), Err(liveness)) => anyhow::bail!("{invariants}\n{liveness}"),
@@ -291,17 +271,18 @@ fn verify_joint(
     }
 }
 
-/// Print one joint check's results, each row its tag, the result in words
-/// and the property's name, and fail when a row did not pass.
-fn print_joint_report(check: &str, rows: Vec<(&str, String, String)>) -> Result<()> {
+/// Print one joint check's results, each row whether it holds, its tag, the
+/// result in words and the property's name, and fail when a row does not
+/// hold.
+fn print_joint_report(check: &str, rows: Vec<(bool, &str, String, String)>) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     let mut report = format!("\nRunning {} on the joint model...\n", check.to_lowercase());
     let mut failed = Vec::new();
-    for (tag, result, name) in &rows {
+    for (holds, tag, result, name) in &rows {
         report.push_str(&format!("    [{tag}] {result}\n"));
-        if *tag != "PASS" {
+        if !holds {
             failed.push(name.as_str());
         }
     }

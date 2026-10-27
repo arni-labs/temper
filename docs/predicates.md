@@ -126,6 +126,26 @@ Guards may also read values the model does not track (string variables, referenc
 
 Effects that read `params.p` are verified with `p` unknown: a counter takes every value in `0..=bound`, a bool both values, and a list element every string literal a guard or invariant compares that list against, plus one fresh value.
 
+## Proof hints
+
+A rule over several records (an `[[invariant]]` that reads `Type[...]`, or a `[[liveness]]` with `eventually`) is checked when an app is installed, and by `temper verify`. Each such rule is proved by induction first, for every run, and walked on the joint model of its types, which covers the runs a bounded walk reaches, only when the proof does not hold. An invariant with no lemmas is tried at every state, then with the prover's own guesses about the flags it reads. Hints written beside the rule give the proof what it cannot guess:
+
+```toml
+[[invariant]]
+name = "closed_parent_is_locked"
+assert = "Parent[Id].status == 'Closed' => Parent[Id].locked == true"
+
+[[invariant.lemma]]
+name = "locked_past_open"
+assert = "(=> (not (= $Parent.status Parent/Open)) $Parent.locked)"
+```
+
+- `[[invariant.lemma]]` and `[[liveness.lemma]]`: `name` and `assert`, a clause the proof holds alongside the rule, true at the start and kept by every move. It is SMT-LIB over `$`-framed names: `$Type.field`; `$Type.status`, compared with `Type/State`; `$n.Kind`, how many dispatches of a kind are in flight; and `($has.Kind m)` for a dispatch `m` of sort `Msg/Kind`. A reaction's kind is `Type.Action`, a module call's `Type@trigger`.
+- `measure`, on a `[[liveness]]` with `eventually`: integer terms over the same names, compared in order, that each helpful move lowers.
+- `[[liveness.region]]`: `name`; `region`, the states it covers; `step`, the move the system makes there, by its label (such as `Type.Action arrives` or `Type.Action (answer to Type@trigger)`); `witness`, the kind of the dispatch or call `w` names, when the step takes one; and `params` for the step's parameters. The regions cover every state short of the goal, and each step reaches the goal or lowers the measure.
+
+A rule proved with the prover's guesses lists them in its verdict, as lemmas that can be written beside it so the next check proves it without guessing. A `[[liveness]]` is tried only when it carries a `measure`, which nothing guesses. A rule whose proof does not hold is walked as before, and its verdict says why, such as the move after which a clause fails, so the lemma it lacked can be added. `cargo run -p temper-verify --example induct <spec dir>` prints each failing move with a counterexample (`CTI=<move>`). A proof does not count while its scope holds a move it does not make: a `schedule` or `schedule_at` effect, or a spawn of a type in scope. The proofs share the check's time budget. A proved rule whose premise no run meets proves nothing and fails like a vacuous walk. The solver decides that first: when no state the proof's clauses allow meets the premise, the verdict says so with no walk. Otherwise the joint model is walked to the first state that meets the premise, and the verdict gives that walk's states and time.
+
 ## Converting old specs
 
 Specs written before this grammar (guard tables and clauses such as `is_true x` or `min x 3`, `when` + `assert`, `no_further_transitions`, trigger-guard and field-predicate tables, table or verb-string effects such as `{ type = "increment", var = "items" }` or `"set ready true"`, `trigger`/`emit` effects and `[[integration]]` blocks) fail to load with a hint. Convert them in place:

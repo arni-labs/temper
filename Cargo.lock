@@ -7535,7 +7535,9 @@ dependencies = [
  "temper-authz",
  "temper-runtime",
  "temper-spec",
+ "toml",
  "z3",
+ "z3-sys",
 ]
 
 [[package]]

@@ -163,6 +163,39 @@ pub struct Invariant {
     pub name: String,
     /// Must hold in every reachable state.
     pub assert: Expr,
+    /// Lemmas its proof by induction holds alongside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lemma: Vec<ProofLemma>,
+}
+
+/// A clause a rule's proof by induction holds alongside the rule, written
+/// beside it by whoever writes the rule. SMT-LIB over `$`-framed names
+/// (`$Type.field`, `$Type.status`, `$pend.Kind`), read before and after
+/// each move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofLemma {
+    pub name: String,
+    pub assert: String,
+}
+
+/// Part of the states an `eventually` rule's proof covers, and the move
+/// the system makes there that reaches the goal or lowers the measure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofRegion {
+    pub name: String,
+    /// SMT-LIB over `$`-framed names, and `w` when it names a witness.
+    pub region: String,
+    /// The kind of dispatch or call `w` is, when the region names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<String>,
+    /// The helpful move, by its label.
+    pub step: String,
+    /// The helpful move's parameters, as SMT-LIB over `$`-framed names and
+    /// `w`; `passed.<p>` says whether a parameter is passed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
 }
 
 /// A liveness property.
@@ -196,6 +229,17 @@ pub struct Liveness {
     /// the condition is false.
     #[serde(default)]
     pub relies_on: Vec<String>,
+    /// Lemmas the proof by induction of `eventually` holds alongside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lemma: Vec<ProofLemma>,
+    /// The proof's measure: integer terms over `$`-framed names, compared
+    /// in order, that every helpful move lowers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measure: Vec<String>,
+    /// The regions that cover every state short of the goal, each with its
+    /// helpful move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region: Vec<ProofRegion>,
 }
 
 /// A dispatch record the runtime's WASM and adapter dispatchers look up by

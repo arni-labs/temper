@@ -4,7 +4,6 @@
 //! start to restore, so these refuse it before the first write.
 
 use temper_spec::cross_invariant;
-use temper_verify::composite::{JointOutcome, LivenessOutcome};
 
 use crate::state::PlatformState;
 
@@ -54,7 +53,10 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// Prove every `[[invariant]]` and `[[liveness]]` of `specs` (a bundle's
 /// types) that reads a related record, on the joint model of its type and
 /// the types it names, with `policies` (the tenant's Cedar as the install
-/// leaves it) deciding each move as its sender. Both run when the install
+/// leaves it) deciding each move as its sender. Each rule is proved by
+/// induction first, for every run (an invariant with its lemmas or the
+/// prover's guesses, an `eventually` rule with its measure), and walked only
+/// when the proof does not hold (`check_joint`). Both run when the install
 /// brings `new_specs` (added or changed types) or policies: who Cedar lets
 /// send each move decides whether a rule holds and whether a record gets
 /// where it should. A named type the bundle does not carry is taken from what
@@ -107,40 +109,20 @@ pub(super) async fn prove(
     );
     let policies = temper_authz::SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
-    let (invariants, liveness) = tokio::task::spawn_blocking(move || {
+    let check = tokio::task::spawn_blocking(move || {
         let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
-        (
-            temper_verify::composite::verify_joint_invariants(
-                &refs,
-                Some(&policies),
-                JOINT_INSTALL_BUDGET,
-            ),
-            temper_verify::composite::verify_joint_liveness(
-                &refs,
-                Some(&policies),
-                JOINT_INSTALL_BUDGET,
-            ),
-        )
+        temper_verify::composite::check_joint(&refs, Some(&policies), JOINT_INSTALL_BUDGET)
     })
     .await
     .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
     let (mut broken, mut unproved) = (Vec::new(), Vec::new());
-    for result in &invariants {
-        match result.outcome {
-            JointOutcome::Holds => tracing::info!(tenant, app = %app_name, "{result}"),
-            JointOutcome::Vacuous { .. } | JointOutcome::Incomplete { .. } => {
-                unproved.push(result.to_string())
-            }
-            JointOutcome::Broken { .. } => broken.push(result.to_string()),
-        }
-    }
-    for result in &liveness {
-        match result.outcome {
-            LivenessOutcome::Holds => tracing::info!(tenant, app = %app_name, "{result}"),
-            LivenessOutcome::Vacuous { .. } | LivenessOutcome::Incomplete { .. } => {
-                unproved.push(result.to_string())
-            }
-            LivenessOutcome::Stuck { .. } => broken.push(result.to_string()),
+    for verdict in check.invariants.iter().chain(&check.liveness) {
+        if verdict.holds() {
+            tracing::info!(tenant, app = %app_name, "{verdict}");
+        } else if verdict.broken() {
+            broken.push(verdict.to_string());
+        } else {
+            unproved.push(verdict.to_string());
         }
     }
     for text in &unproved {

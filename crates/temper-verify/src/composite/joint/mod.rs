@@ -57,6 +57,7 @@
 //! every reference finds, with a move's dispatches landing before the next
 //! move from outside, and names each reaction a target refuses.
 
+mod check;
 mod env;
 mod liveness;
 mod model;
@@ -64,8 +65,11 @@ mod pack;
 mod senders;
 mod slice;
 mod state;
+mod vacuity;
 
+pub use check::{JointCheck, JointVerdict, check_joint};
 pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
+pub use vacuity::Premise;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -137,7 +141,7 @@ pub enum JointOutcome {
 }
 
 /// The premise of a rule written `premise => conclusion`.
-fn premise(rule: &Expr) -> Option<&Expr> {
+pub(crate) fn premise(rule: &Expr) -> Option<&Expr> {
     match rule {
         Expr::Implies(premise, _) => Some(premise),
         _ => None,
@@ -223,17 +227,7 @@ pub fn verify_joint_invariants(
         if joint.is_empty() {
             continue;
         }
-        let mut scope: BTreeSet<String> = BTreeSet::from([name.to_string()]);
-        let mut missing = Vec::new();
-        for inv in &joint {
-            for (entity_type, _) in inv.assert.related_types() {
-                if by_name.contains_key(entity_type.as_str()) {
-                    scope.insert(entity_type);
-                } else {
-                    missing.push(entity_type);
-                }
-            }
-        }
+        let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
         let result =
             |inv: &temper_spec::automaton::Invariant, scope: &BTreeSet<String>, states, outcome| {
                 JointInvariantResult {
@@ -246,39 +240,19 @@ pub fn verify_joint_invariants(
                     outcome,
                 }
             };
-        if !missing.is_empty() {
-            for inv in &joint {
-                let reason = format!(
-                    "it reads {}, which this app does not declare",
-                    missing.join(", ")
-                );
-                results.push(result(inv, &scope, 0, JointOutcome::Incomplete { reason }));
+        let model = match invariants_model(&by_name, name, &exprs, policies) {
+            Ok(model) => model,
+            Err((scope, missing)) => {
+                for inv in &joint {
+                    let reason = format!(
+                        "it reads {}, which this app does not declare",
+                        missing.join(", ")
+                    );
+                    results.push(result(inv, &scope, 0, JointOutcome::Incomplete { reason }));
+                }
+                continue;
             }
-            continue;
-        }
-        let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
-        // Code outside the specs sends what a liveness property relies on,
-        // whoever Cedar lets send it; a rule that must always hold has to
-        // hold through those moves too.
-        let relies_on = scope
-            .iter()
-            .flat_map(|entity| {
-                by_name[entity.as_str()]
-                    .liveness
-                    .iter()
-                    .flat_map(move |live| {
-                        live.relies_on
-                            .iter()
-                            .map(move |action| (entity.clone(), action.clone()))
-                    })
-            })
-            .collect();
-        let sending = Sending {
-            policies,
-            kernel_moves: true,
-            relies_on,
         };
-        let model = JointModel::new(&by_name, scope, name, &exprs, sending, true);
         let walk = model.walk(name, &exprs, budget);
         for (inv, outcome) in joint.iter().zip(walk.outcomes) {
             let mut found = result(inv, &model.scope, walk.states, outcome);
@@ -287,6 +261,49 @@ pub fn verify_joint_invariants(
         }
     }
     results
+}
+
+/// The joint model `owner`'s invariants `rules` are walked on: their type and
+/// the types they name, with what a `[[liveness]]` there relies on sent from
+/// outside by whoever Cedar lets, since a rule must hold through those moves
+/// too. `Err` gives the scope and the named types `by_name` does not hold.
+fn invariants_model(
+    by_name: &BTreeMap<&str, &Automaton>,
+    owner: &str,
+    rules: &[&Expr],
+    policies: Option<&SendAnalysis>,
+) -> Result<JointModel, (BTreeSet<String>, Vec<String>)> {
+    let mut scope: BTreeSet<String> = BTreeSet::from([owner.to_string()]);
+    let mut missing = Vec::new();
+    for (entity_type, _) in rules.iter().flat_map(|rule| rule.related_types()) {
+        if by_name.contains_key(entity_type.as_str()) {
+            scope.insert(entity_type);
+        } else {
+            missing.push(entity_type);
+        }
+    }
+    if !missing.is_empty() {
+        return Err((scope, missing));
+    }
+    let relies_on = scope
+        .iter()
+        .flat_map(|entity| {
+            by_name[entity.as_str()]
+                .liveness
+                .iter()
+                .flat_map(move |live| {
+                    live.relies_on
+                        .iter()
+                        .map(move |action| (entity.clone(), action.clone()))
+                })
+        })
+        .collect();
+    let sending = Sending {
+        policies,
+        kernel_moves: true,
+        relies_on,
+    };
+    Ok(JointModel::new(by_name, scope, owner, rules, sending, true))
 }
 
 /// One move of a trace: an entity's action with the string parameters it
@@ -471,16 +488,13 @@ pub fn replay_joint_invariants(
 }
 
 #[cfg(test)]
-#[path = "joint_test.rs"]
-mod tests;
+mod joint_test;
 
 #[cfg(test)]
-#[path = "vacuous_test.rs"]
-mod vacuous_tests;
+mod vacuous_test;
 
 #[cfg(test)]
-#[path = "outside_test.rs"]
-mod outside_tests;
+mod outside_test;
 
 #[cfg(test)]
 mod chain_test;
