@@ -1151,6 +1151,10 @@ impl EventStore for PostgresEventStore {
 mod projection_tests;
 
 #[cfg(test)]
+#[path = "field_index_writes_test.rs"]
+mod field_index_writes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::migration::run_migrations;
