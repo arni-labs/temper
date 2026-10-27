@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use temper_jit::table::Refusal;
 use temper_runtime::ActorSystem;
 use temper_runtime::tenant::TenantId;
 use temper_server::ServerState;
@@ -269,12 +270,12 @@ async fn key_reuse_for_another_action_is_refused(state: ServerState, tenant: Ten
         !close.success,
         "Close sent with Note's key reported success while the ticket is a Draft"
     );
-    assert!(
-        close
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("different request")),
-        "{:?}",
+    assert_eq!(
+        close.refusal,
+        Some(Refusal::IdempotencyKeyReused {
+            action: "Note".to_string()
+        }),
+        "the refusal names the key's reuse and the action it recorded: {:?}",
         close.error
     );
     assert_eq!(

@@ -40,6 +40,12 @@ pub enum Refusal {
         /// The parameter's name.
         parameter: String,
     },
+    /// The request's Idempotency-Key was already used on this entity for a
+    /// different request.
+    IdempotencyKeyReused {
+        /// The action the key's request named.
+        action: String,
+    },
 }
 
 impl Refusal {
@@ -50,6 +56,7 @@ impl Refusal {
             Refusal::InvalidState { .. } => "InvalidState",
             Refusal::ParameterConstraint { .. } => "ParameterConstraint",
             Refusal::MissingParameter { .. } => "MissingParameter",
+            Refusal::IdempotencyKeyReused { .. } => "IdempotencyKeyReused",
         }
     }
 }

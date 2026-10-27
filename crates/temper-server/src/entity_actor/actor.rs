@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use temper_jit::table::{Effect, TransitionTable};
+use temper_jit::table::{Effect, Refusal, TransitionTable};
 use temper_observe::wide_event;
 use temper_runtime::actor::{Actor, ActorContext, ActorError};
 use temper_runtime::persistence::{
@@ -125,7 +125,9 @@ fn idempotency_key_reused(state: &EntityState, recorded: &str) -> EntityResponse
             "this Idempotency-Key was already used on this entity for a different request \
              (action `{recorded}`); send a new key for a new request"
         )),
-        refusal: None,
+        refusal: Some(Refusal::IdempotencyKeyReused {
+            action: recorded.to_string(),
+        }),
         custom_effects: vec![],
         scheduled_actions: vec![],
         spawn_requests: vec![],
