@@ -219,6 +219,24 @@ impl SimActorSystem {
         self.integration_responses = responses;
     }
 
+    /// Resolve against actual entity identities rather than scheduler ID conventions.
+    fn refresh_related_statuses(&mut self, actor_id: &str) {
+        let statuses = self
+            .actors
+            .values()
+            .filter_map(|handler| {
+                let (entity_type, entity_id) = handler.entity_identity()?;
+                Some((
+                    (entity_type.to_owned(), entity_id.to_owned()),
+                    handler.current_status(),
+                ))
+            })
+            .collect();
+        if let Some(handler) = self.actors.get_mut(actor_id) {
+            handler.refresh_related_statuses(&statuses);
+        }
+    }
+
     // ===================================================================
     // Scripted Mode
     // ===================================================================
@@ -232,6 +250,7 @@ impl SimActorSystem {
         action: &str,
         params: &str,
     ) -> Result<serde_json::Value, String> {
+        self.refresh_related_statuses(actor_id);
         let handler = self
             .actors
             .get_mut(actor_id)
@@ -376,6 +395,8 @@ impl SimActorSystem {
                 continue;
             }
 
+            self.refresh_related_statuses(&actor_id);
+
             // Get valid actions
             let valid = {
                 let handler = self.actors.get(&actor_id).unwrap(); // ci-ok: actor_id from self.actors.keys()
@@ -399,6 +420,7 @@ impl SimActorSystem {
 
             // Process delivered messages
             for msg in &delivered {
+                self.refresh_related_statuses(&msg.to);
                 if let Some(handler) = self.actors.get_mut(&msg.to) {
                     let status_before = handler.current_status();
 

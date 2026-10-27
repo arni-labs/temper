@@ -14,6 +14,7 @@ use temper_runtime::scheduler::{sim_now, sim_uuid};
 
 use crate::blobs::{FIELD_OVERFLOW_BLOB_PREFIX, OverflowBlobWrite, blob_ref_value};
 
+use super::move_invariants::InvariantsBefore;
 use super::types::{EffectOutcome, EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
 /// Journal event type for a PATCH-style field merge (ARN-189).
@@ -380,10 +381,15 @@ pub(crate) fn process_action_with_xref_and_field_mode(
             let sanitized_params = sanitize_action_params(effective_params.as_ref());
             let params = sanitized_params.as_ref();
 
+            let invariants = match InvariantsBefore::of(state, table, related, comparison_fields) {
+                Ok(before) => before,
+                Err(error) => return ProcessResult::refused(error),
+            };
+            let start = MoveStart::of(state);
             let (
                 (custom_effects, scheduled_actions, spawn_requests, schedule_at_requests),
                 outcome,
-            ) = record_effect_outcome(state, |state| {
+            ) = record_effect_outcome(state, &start, |state| {
                 apply_effects(
                     state,
                     &transition_result.effects,
@@ -398,6 +404,19 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 field_sync_mode,
                 Some(&table.state_var_metadata),
             );
+            if let Some(before) = invariants {
+                match before.refusal(state, table, related, action, &overflow_blobs) {
+                    Ok(Some((error, refusal))) => {
+                        start.restore(state);
+                        return ProcessResult::refused_with(error, Some(refusal));
+                    }
+                    Err(error) => {
+                        start.restore(state);
+                        return ProcessResult::refused(error);
+                    }
+                    Ok(None) => {}
+                }
+            }
 
             // Resolve deferred schedule_at requests now that fields are synced
             let mut all_scheduled = scheduled_actions;
@@ -841,44 +860,80 @@ fn set_counter(state: &mut EntityState, var: &str, value: usize) {
     }
 }
 
-/// Run `apply` (a transition's effects) on `state` and record what it wrote.
+/// Everything a move can change, as it was when the move started: its
+/// effects write status, counters (`item_count` among them), booleans, lists
+/// and fields, and the action's params are written into fields. The effects'
+/// outcome is the difference from it, and a refused move is put back to it.
+pub(crate) struct MoveStart {
+    status: String,
+    item_count: usize,
+    counters: std::collections::BTreeMap<String, usize>,
+    booleans: std::collections::BTreeMap<String, bool>,
+    lists: std::collections::BTreeMap<String, Vec<String>>,
+    fields: serde_json::Value,
+}
+
+impl MoveStart {
+    /// Copy what a move can change.
+    pub(crate) fn of(state: &EntityState) -> Self {
+        Self {
+            status: state.status.clone(),
+            item_count: state.item_count,
+            counters: state.counters.clone(),
+            booleans: state.booleans.clone(),
+            lists: state.lists.clone(),
+            fields: state.fields.clone(),
+        }
+    }
+
+    /// Put `state` back as it was when the move started.
+    pub(crate) fn restore(self, state: &mut EntityState) {
+        state.status = self.status;
+        state.item_count = self.item_count;
+        state.counters = self.counters;
+        state.booleans = self.booleans;
+        state.lists = self.lists;
+        state.fields = self.fields;
+    }
+}
+
+/// Run `apply` (a transition's effects) on `state`, which is as `start`
+/// copied it, and record what it wrote.
 ///
 /// The record is the difference between the state before and after, so it
 /// covers every effect, including one added later. The event carries it and
 /// replay restores it with [`EffectOutcome::restore`].
 pub(crate) fn record_effect_outcome<R>(
     state: &mut EntityState,
+    start: &MoveStart,
     apply: impl FnOnce(&mut EntityState) -> R,
 ) -> (R, EffectOutcome) {
-    let counters = state.counters.clone();
-    let item_count = state.item_count;
-    let booleans = state.booleans.clone();
-    let lists = state.lists.clone();
-    let fields = state.fields.as_object().cloned().unwrap_or_default();
-
     let applied = apply(state);
 
-    let mut changed_counters = changed_entries(&counters, &state.counters);
+    let mut changed_counters = changed_entries(&start.counters, &state.counters);
     // Setting an unchanged `items` counter can still synchronize item_count.
     // Record that write so restore calls set_counter for this case too.
-    if item_count != state.item_count {
+    if start.item_count != state.item_count {
         changed_counters.insert("items".to_string(), state.item_count);
     }
+    let fields = start.fields.as_object();
     let outcome = EffectOutcome {
         counters: changed_counters,
-        booleans: changed_entries(&booleans, &state.booleans),
-        lists: changed_entries(&lists, &state.lists),
+        booleans: changed_entries(&start.booleans, &state.booleans),
+        lists: changed_entries(&start.lists, &state.lists),
         fields: state
             .fields
             .as_object()
             .map(|after| {
                 debug_assert!(
-                    fields.keys().all(|key| after.contains_key(key)),
+                    fields.is_none_or(|before| before.keys().all(|key| after.contains_key(key))),
                     "an effect removed a field; the outcome records only set values"
                 );
                 after
                     .iter()
-                    .filter(|(key, value)| fields.get(*key) != Some(*value))
+                    .filter(|(key, value)| {
+                        fields.and_then(|before| before.get(*key)) != Some(*value)
+                    })
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect()
             })
