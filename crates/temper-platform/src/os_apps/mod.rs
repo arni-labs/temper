@@ -1138,11 +1138,7 @@ pub(super) async fn install_os_app_with_plan(
         ));
     }
     // Jev reads the changed modules beside the rest of the install; joined before it answers.
-    let review = if plan.wasm {
-        module_review_step::start(state, tenant, &app_dir, &bundle).await
-    } else {
-        module_review_step::PendingReview::default()
-    };
+    let review = module_review_step::start(state, tenant, &app_dir, &bundle, plan.wasm).await;
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }

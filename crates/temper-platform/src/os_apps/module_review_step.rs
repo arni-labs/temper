@@ -46,14 +46,16 @@ impl Drop for PendingReview {
     }
 }
 
-/// Start reviewing the modules of `bundle` whose code or running specs differ from what `tenant` has.
+/// Start reviewing the modules of `bundle` whose code or running specs differ from what `tenant` has, when the
+/// install puts modules (`wasm`).
 pub(super) async fn start(
     state: &PlatformState,
     tenant: &str,
     app_dir: &Path,
     bundle: &AppBundle,
+    wasm: bool,
 ) -> PendingReview {
-    if bundle.wasm_modules.is_empty() {
+    if !wasm || bundle.wasm_modules.is_empty() {
         return PendingReview::default();
     }
     let specs: Vec<SpecSource> = bundle
