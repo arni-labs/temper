@@ -200,3 +200,104 @@ fn a_long_cascade_of_distinct_steps_runs_to_its_end_on_a_small_thread() {
             .expect("the cascade ran to its end");
     });
 }
+
+#[test]
+fn a_created_child_runs_before_the_next_made_step_repeats() {
+    for (resolver, child_action, expected_runs) in [
+        ("same_id", "Sprout", 1),
+        ("create", "Sprout", 2),
+        ("create", "Grow", 2),
+    ] {
+        let seed = parse_automaton(&format!(
+            r#"
+[automaton]
+name = "Seed"
+states = ["Sown"]
+initial = "Sown"
+allow_indefinite_states = ["Sown"]
+
+[[state]]
+name = "sprouts"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Sprout"
+from = ["Sown"]
+to = "Sown"
+effect = ["sprouts += 1"]
+
+[[action.triggers]]
+name = "sprout_again"
+kind = "entity"
+target_entity = "Seed"
+target_action = "{child_action}"
+resolve_target = {{ kind = "{resolver}" }}
+
+[[action.triggers]]
+name = "record_sprout"
+kind = "entity"
+target_entity = "Observer"
+target_action = "Record"
+resolve_target = {{ kind = "same_id" }}
+
+[[action]]
+name = "Grow"
+from = ["Sown"]
+to = "Sown"
+
+[[action.triggers]]
+name = "sprout_on_child"
+kind = "entity"
+target_entity = "Seed"
+target_action = "Sprout"
+resolve_target = {{ kind = "same_id" }}
+"#
+        ))
+        .unwrap();
+        let observer = parse_automaton(
+            r#"
+[automaton]
+name = "Observer"
+states = ["Watching"]
+initial = "Watching"
+allow_indefinite_states = ["Watching"]
+
+[[state]]
+name = "records"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Record"
+from = ["Watching"]
+to = "Watching"
+effect = ["records += 1"]
+"#,
+        )
+        .unwrap();
+        let plan = CompositeVerificationPlan::new(&[&seed, &observer], "Seed").unwrap();
+        let model = CompositeTemperModel::from_plan(plan);
+        let init = &model.init_states()[0];
+        let mut actions = Vec::new();
+        model.actions(init, &mut actions);
+        let sprout = actions
+            .into_iter()
+            .find(|a| a.entity == "Seed" && a.action.name == "Sprout")
+            .unwrap();
+        let after = model.next_state(init, sprout).unwrap();
+
+        // The joint model accumulates effects in one slice per type. A found
+        // step runs once; a create admits one made step too, then stops the
+        // next made step. Both admitted actions must fire their reactions.
+        assert_eq!(
+            after.entities["Seed"].counters["sprouts"], expected_runs,
+            "{resolver} {child_action}: effects of admitted Sprout actions"
+        );
+        assert_eq!(
+            after.entities["Observer"].counters["records"], expected_runs,
+            "{resolver} {child_action}: downstream reactions of admitted Sprout actions"
+        );
+        assert!(after.dropped.is_none());
+    }
+}

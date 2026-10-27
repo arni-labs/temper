@@ -43,13 +43,22 @@ const CASCADE_RED_ZONE: usize = 128 * 1024;
 /// Size of each new segment.
 const CASCADE_SEGMENT_BYTES: usize = 1024 * 1024;
 
-/// A step of a cascade: an action on an entity. The joint state holds one
-/// entity per type, so a step is its type and action, and a target a
-/// `create` trigger makes is that type's entity too. The runtime stops a chain
-/// the first time it would repeat a step (`temper-server`'s `InlineChain`);
-/// a cascade here stops at the same place, so the verifier explores the
-/// chains production runs and every loop ends.
-type CascadeStep = (String, String);
+/// A step of a cascade. The joint state holds one entity per type, but an
+/// entity the chain found and one it made are distinct, as in the runtime's
+/// `InlineChain`. A create admits the first made step; another create of the
+/// same type and action repeats it even though production mints a new id.
+#[derive(Clone, PartialEq, Eq)]
+struct CascadeStep {
+    entity_type: String,
+    entity: CascadeEntity,
+    action: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CascadeEntity {
+    Found,
+    Made,
+}
 
 /// A cross-entity reaction that was dropped because its target action was
 /// not enabled from the target entity's state at dispatch time (ADR-0150).
@@ -206,7 +215,22 @@ impl CompositeTemperModel {
             {
                 continue;
             }
-            let step = (edge.to.clone(), edge.target_action.clone());
+            // A non-creating reaction addresses the type's current slice,
+            // retaining its identity if this path made it earlier.
+            let entity = if edge.creates_target {
+                CascadeEntity::Made
+            } else {
+                chain
+                    .iter()
+                    .rev()
+                    .find(|step| step.entity_type == edge.to)
+                    .map_or(CascadeEntity::Found, |step| step.entity)
+            };
+            let step = CascadeStep {
+                entity_type: edge.to.clone(),
+                entity,
+                action: edge.target_action.clone(),
+            };
             if chain.contains(&step) {
                 continue;
             }
@@ -479,7 +503,11 @@ impl Model for CompositeTemperModel {
         // Fire-and-forget cascade: apply triggered transitions
         // transitively, stopping at the first repeated step. Records the
         // first dropped reaction (if any) into `next.dropped`.
-        let mut chain = vec![(action.entity.clone(), action.action.name.clone())];
+        let mut chain = vec![CascadeStep {
+            entity_type: action.entity.clone(),
+            entity: CascadeEntity::Found,
+            action: action.action.name.clone(),
+        }];
         self.cascade(
             &mut next,
             &action.entity,
