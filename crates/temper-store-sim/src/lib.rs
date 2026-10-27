@@ -195,6 +195,8 @@ struct SimEventStoreInner {
     state_timers: BTreeMap<(String, String, String), StateTimerRecord>,
     /// How many commits wrote each persistence id's journal or rows.
     commits: BTreeMap<String, u64>,
+    /// Whether appends are written. See `stop_writes_after_next_append`.
+    writes: write_stops::Writes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +241,7 @@ impl SimEventStore {
                 projections: BTreeMap::new(),
                 state_timers: BTreeMap::new(),
                 commits: BTreeMap::new(),
+                writes: write_stops::Writes::default(),
             })),
         }
     }
@@ -568,6 +571,10 @@ impl EventStore for SimEventStore {
 
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
 
+        if let Some(error) = inner.refused_write() {
+            return Err(error);
+        }
+
         // Deterministic one-shot injection (see `inject_concurrency_violations`).
         // Consumes one counter per call; falls back to normal flow once drained.
         //
@@ -787,6 +794,7 @@ impl EventStore for SimEventStore {
 
         // The entity's query-plane and timer rows, in the same commit.
         inner.commit_entity_rows(persistence_id, new_seq, &rows);
+        inner.wrote(persistence_id);
 
         // The write landed; a lost answer reaches the caller as the retry's
         // concurrency violation (see `lose_next_append_answers`).
@@ -1068,6 +1076,9 @@ impl EventStore for SimEventStore {
                 )));
             }
         }
+        if let Some(error) = inner.refused_write() {
+            return Err(error);
+        }
 
         for append in appends {
             let pending_cv = inner
@@ -1154,6 +1165,9 @@ impl EventStore for SimEventStore {
                 persistence_id: append.persistence_id.clone(),
                 sequence_nr: new_seq,
             });
+        }
+        for append in appends {
+            inner.wrote(&append.persistence_id);
         }
 
         // The batch landed; a lost answer for any of its journals reaches the
@@ -1345,3 +1359,5 @@ mod tests;
 
 mod entity_rows;
 pub use entity_rows::SimProjection;
+
+mod write_stops;
