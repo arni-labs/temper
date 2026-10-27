@@ -1242,14 +1242,10 @@ pub(super) async fn install_os_app_with_plan(
         policies,
     )
     .await?;
+    let specs = &bundle.specs;
     warnings.extend(
-        install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies)
-            .await?
-            .into_iter()
-            .map(InstallWarning::joint_invariants),
+        install_checks::model_warnings(state, tenant, app_name, specs, new_specs, policies).await?,
     );
-    let strands = install_checks::timer_strands(state, tenant, &bundle.specs, new_specs, policies);
-    warnings.extend(strands);
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }

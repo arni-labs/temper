@@ -199,6 +199,26 @@ fn bundle_with_named(
     Ok(Some(automatons))
 }
 
+/// What the joint model says of `specs` under `policies` without refusing the
+/// install: the rules [`prove`] could not prove, and the timers whose lost
+/// fire nothing redoes ([`timer_strands`]).
+pub(super) async fn model_warnings(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    specs: &[(String, String)],
+    new_specs: bool,
+    policies: Option<&str>,
+) -> Result<Vec<InstallWarning>, String> {
+    let unproved = prove(state, tenant, app_name, specs, new_specs, policies).await?;
+    let mut warnings: Vec<InstallWarning> = unproved
+        .into_iter()
+        .map(InstallWarning::joint_invariants)
+        .collect();
+    warnings.extend(timer_strands(state, tenant, specs, new_specs, policies));
+    Ok(warnings)
+}
+
 /// Warn about each state timer of `specs` whose lost fire nothing redoes: no
 /// one outside Temper may make its `on_timeout` move, or any move in its
 /// `reset_on`, under `policies` (the tenant's Cedar as the install leaves
