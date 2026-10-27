@@ -47,7 +47,6 @@ effect = ["total += params.amount"]
         depth: 1,
         via: None,
         by: 0,
-        inline: false,
     };
     for expected in 1..=super::super::JOINT_MAX_COUNTER {
         let outcomes = model.deliver(state, &dispatch, "add");

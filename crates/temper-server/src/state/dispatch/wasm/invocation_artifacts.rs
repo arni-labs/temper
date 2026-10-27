@@ -213,7 +213,10 @@ impl crate::state::ServerState {
                 Ok(Some(resp))
             }
             WasmDispatchMode::Background => {
-                let callback_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx);
+                // The answer is the spec's own consequence of the move that
+                // called the module, so it is made as whoever made that move,
+                // as inline: its reactions are decided for them. The module's
+                // outside calls are still decided as the module.
                 let response = self
                     .dispatch_tenant_action(
                         entity_ref.tenant,
@@ -221,7 +224,7 @@ impl crate::state::ServerState {
                         entity_ref.entity_id,
                         callback_action,
                         callback_params,
-                        &callback_ctx,
+                        agent_ctx,
                     )
                     .await
                     .map_err(|e| {

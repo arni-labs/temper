@@ -168,10 +168,17 @@ impl crate::state::ServerState {
                 return;
             }
         };
-        let agent_ctx =
-            AgentContext::for_service_inheriting("integration-compensation", &callback_ctx);
+        // The compensating move is made as whoever made the move whose
+        // integration failed, as a declared on_failure answer is.
         match self
-            .dispatch_tenant_action(tenant, entity_type, entity_id, &action, params, &agent_ctx)
+            .dispatch_tenant_action(
+                tenant,
+                entity_type,
+                entity_id,
+                &action,
+                params,
+                &callback_ctx,
+            )
             .await
         {
             Ok(resp) if resp.success => {

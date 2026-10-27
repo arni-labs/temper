@@ -35,7 +35,6 @@ impl JointModel {
             depth: 0,
             via: None,
             by,
-            inline: false,
         };
         if !dispatch.read {
             let mut next = state;
@@ -79,14 +78,7 @@ impl JointModel {
         }
         let text = format!("{text} arrives -> {}", moved.status);
         self.place(&mut state, &dispatch.to, moved, &action, dispatch.by);
-        let after = self.after_commit(
-            state,
-            &dispatch.to,
-            &action,
-            dispatch.depth,
-            dispatch.by,
-            dispatch.inline,
-        );
+        let after = self.after_commit(state, &dispatch.to, &action, dispatch.depth, dispatch.by);
         outcomes.extend(
             after
                 .into_iter()
@@ -104,7 +96,6 @@ impl JointModel {
         action: &TemperModelAction,
         depth: u32,
         by: u32,
-        inline: bool,
     ) -> Vec<(JointState, Certainty)> {
         let Some(moved) = step(
             &self.models[entity],
@@ -117,7 +108,7 @@ impl JointModel {
         };
         let mut next = state;
         self.place(&mut next, entity, moved, &action.name, by);
-        self.after_commit(next, entity, &action.name, depth, by, inline)
+        self.after_commit(next, entity, &action.name, depth, by)
     }
 
     /// Put `entity`'s record, after it took `action` from `by`, into

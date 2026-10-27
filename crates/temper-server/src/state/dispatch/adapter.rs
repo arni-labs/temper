@@ -626,8 +626,8 @@ impl crate::state::ServerState {
                 Ok(Some(resp))
             }
             WasmDispatchMode::Background => {
-                let callback_ctx =
-                    AgentContext::for_service_inheriting("platform-dispatch", agent_ctx);
+                // Made as whoever made the move that called the adapter, as
+                // inline: the answer is that move's declared consequence.
                 let response = self
                     .dispatch_tenant_action(
                         entity_ref.tenant,
@@ -635,7 +635,7 @@ impl crate::state::ServerState {
                         entity_ref.entity_id,
                         callback_action,
                         callback_params,
-                        &callback_ctx,
+                        agent_ctx,
                     )
                     .await
                     .map_err(|e| {

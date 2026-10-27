@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::senders;
 use crate::model::semantics::canonical_strings;
 use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
 
@@ -45,8 +44,8 @@ pub struct Call {
     pub on_success: Vec<String>,
     /// The action sent when the call fails, if any.
     pub on_failure: Option<String>,
-    /// Who its answer runs as, by sender number: the runtime when the call
-    /// runs in the background, the caller when it runs inline.
+    /// Who its answer runs as, by sender number: whoever sent the move
+    /// that called the module.
     pub by: u32,
     /// The tracked fields its answers are tied to, as the record held them
     /// when the call started: the module answers about that record.
@@ -58,9 +57,6 @@ impl fmt::Display for Call {
         write!(f, "{} {} call", self.to, self.module)?;
         for (field, value) in &self.asked {
             write!(f, " for {field}='{value}'")?;
-        }
-        if self.by != senders::RUNTIME {
-            f.write_str(" (inline)")?;
         }
         Ok(())
     }
@@ -87,9 +83,6 @@ pub struct Dispatch {
     pub via: Option<usize>,
     /// Who sends it, by sender number; Cedar decides it as them.
     pub by: u32,
-    /// Its sender waits for the module calls it starts, so they run inline
-    /// and answer as the sender: an outside request may ask for that.
-    pub inline: bool,
 }
 
 impl fmt::Display for Dispatch {

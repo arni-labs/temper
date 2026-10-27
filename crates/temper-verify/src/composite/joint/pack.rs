@@ -214,7 +214,6 @@ impl Pack for Dispatch {
         self.depth.put(packer, out);
         self.via.put(packer, out);
         self.by.put(packer, out);
-        self.inline.put(packer, out);
     }
     fn take(packer: &Packer, input: &mut Iter<'_, u32>) -> Self {
         Dispatch {
@@ -226,7 +225,6 @@ impl Pack for Dispatch {
             depth: Pack::take(packer, input),
             via: Pack::take(packer, input),
             by: Pack::take(packer, input),
-            inline: Pack::take(packer, input),
         }
     }
 }

@@ -1,19 +1,21 @@
 //! Deterministic scheduling of the production callback context transitions.
 //!
-//! A seed chooses inline callbacks, detached successes and compensation
-//! identities. Identity provisioning is a deterministic fixture: the production
-//! service constructor generates an unrelated correlation UUID. The budget,
-//! task boundary and context inheritance methods run unmodified. Real WASM and
-//! compensation wiring is exercised separately by strict_native_callbacks.
+//! A seed chooses inline callbacks and detached answers. A detached answer (a
+//! module's, an adapter's, or a compensating move) keeps the context of the
+//! move that called it, so whoever made that move still makes the answer. The
+//! budget and task boundary methods run unmodified. Real WASM and compensation
+//! wiring is exercised separately by strict_native_callbacks and
+//! answers_act_for_the_asker.
 use super::*;
 use temper_runtime::scheduler::DeterministicRng;
 
 #[test]
 fn dst_detached_schedules_preserve_both_callback_bounds() {
-    let mut coverage = [0_u32; 4];
+    let mut coverage = [0_u32; 2];
     for seed in 1..=1024 {
         let mut rng = DeterministicRng::new(seed);
         let mut context = AgentContext {
+            agent_id: Some("ann".into()),
             session_id: Some("session".into()),
             workflow_run_id: Some("workflow".into()),
             intent: Some("bounded workflow".into()),
@@ -22,7 +24,7 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
         };
         // The oracle is the approved 512-hop contract, independent of the implementation constant.
         for admitted in 1..=512 {
-            let operation = rng.next_bound(4);
+            let operation = rng.next_bound(2);
             coverage[operation] += 1;
             if context.callback_depth == temper_runtime::reaction::MAX_REACTION_DEPTH {
                 assert_eq!(
@@ -37,20 +39,13 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
                 context = context.for_background_task();
                 assert_eq!(context.callback_depth, 0, "seed={seed}");
                 assert_eq!(context.callback_hops, previous_hops, "seed={seed}");
-                let service = match operation {
-                    1 => "wasm-runtime",
-                    2 => "platform-dispatch",
-                    3 => "integration-compensation",
-                    _ => unreachable!("bounded operation"),
-                };
-                context = service_identity(service).inherit_observability_from(&context);
-                assert_eq!(context.agent_type.as_deref(), Some(service), "seed={seed}");
             }
             let previous_depth = context.callback_depth;
             context = context.for_callback().unwrap_or_else(|error| {
                 panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
             });
             assert_eq!(context.callback_hops, admitted, "seed={seed}");
+            assert_eq!(context.agent_id.as_deref(), Some("ann"), "seed={seed}");
             assert_eq!(context.callback_depth, previous_depth + 1, "seed={seed}");
             assert_eq!(context.session_id.as_deref(), Some("session"));
             assert_eq!(context.workflow_run_id.as_deref(), Some("workflow"));
@@ -62,31 +57,14 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
     assert!(coverage.iter().all(|count| *count > 0), "{coverage:?}");
 }
 
-// Provisioning identity is outside the callback-budget state machine. The
-// production preservation method below is the one used by for_service_inheriting.
-fn service_identity(service: &str) -> AgentContext {
-    AgentContext {
-        agent_id: Some(format!("service:{service}")),
-        agent_type: Some(service.into()),
-        ..AgentContext::default()
-    }
-}
-
-fn assert_total_hops_exhausted(mut context: AgentContext, seed: u64) {
-    for service in [
-        "wasm-runtime",
-        "platform-dispatch",
-        "integration-compensation",
-    ] {
-        context = context.for_background_task();
-        context = service_identity(service).inherit_observability_from(&context);
-        assert_eq!(context.callback_hops, 512, "seed={seed}");
-        assert_eq!(
-            context.for_callback().unwrap_err(),
-            CallbackBudgetExceeded::TotalHops,
-            "seed={seed}, service={service}"
-        );
-    }
+fn assert_total_hops_exhausted(context: AgentContext, seed: u64) {
+    let context = context.for_background_task();
+    assert_eq!(context.callback_hops, 512, "seed={seed}");
+    assert_eq!(
+        context.for_callback().unwrap_err(),
+        CallbackBudgetExceeded::TotalHops,
+        "seed={seed}"
+    );
 }
 
 #[test]

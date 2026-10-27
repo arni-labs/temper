@@ -265,7 +265,6 @@ to = "Ready"
                 depth,
                 via: None,
                 by: super::super::super::senders::OUTSIDE,
-                inline: false,
             })
             .collect();
         model.expansion.reset(3, None);
