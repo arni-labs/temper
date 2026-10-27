@@ -83,6 +83,9 @@ pub struct GenesisRegistryInstallResult {
     /// installed with the root.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<InstallWarning>,
+    /// The modules Jev reviewed, of every app installed with the root.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modules_reviewed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -771,6 +774,7 @@ pub async fn install_genesis_app_from_registry(
                 adrs: install.adrs_bootstrapped,
                 seed_instances: install.seed_instances,
                 warnings: install.warnings,
+                modules_reviewed: install.modules_reviewed,
             })
         }
         InstallVerifyDecision::RollBackToPrevious => {
@@ -839,7 +843,7 @@ pub(crate) async fn reconcile_materialized_app_closure(
 ) -> Result<InstallResult, String> {
     let order = resolve_os_app_install_order(&[root_app_name.to_string()])?;
     let mut root_result = InstallResult::default();
-    let mut warnings = Vec::new();
+    let (mut warnings, mut reviewed) = (Vec::new(), Vec::new());
 
     for app_name in order {
         let started = Instant::now();
@@ -867,11 +871,13 @@ pub(crate) async fn reconcile_materialized_app_closure(
                     root_result = *install;
                 } else {
                     warnings.extend(install.warnings);
+                    reviewed.extend(install.modules_reviewed);
                 }
             }
         }
     }
     root_result.warnings.splice(0..0, warnings);
+    root_result.modules_reviewed.splice(0..0, reviewed);
 
     Ok(root_result)
 }
