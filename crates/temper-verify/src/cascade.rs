@@ -398,44 +398,44 @@ impl VerificationCascade {
             .filter(|(_, sat)| !sat)
             .map(|(name, _)| name.as_str())
             .collect();
-        let non_inductive: Vec<&str> = result
+        let proved = result
+            .inductive_invariants
+            .iter()
+            .filter(|(_, ind)| *ind)
+            .count();
+        let not_proved: Vec<String> = result
             .inductive_invariants
             .iter()
             .filter(|(_, ind)| !ind)
-            .map(|(name, _)| name.as_str())
+            .map(
+                |(name, _)| match result.not_proved.iter().find(|(n, _)| n == name) {
+                    Some((_, why)) => format!("{name} ({why})"),
+                    None => name.clone(),
+                },
+            )
             .collect();
 
-        let summary = if passed {
-            let mut base = format!(
-                "L0 Symbolic PASSED: {} guards satisfiable, {} invariants inductive, {} unreachable",
+        let mut summary = if passed {
+            format!(
+                "L0 Symbolic PASSED: {} guards satisfiable, {proved} of {} invariants proved inductive, {} unreachable",
                 result.guard_satisfiability.len(),
                 result.inductive_invariants.len(),
                 result.unreachable_states.len(),
-            );
-            if result.approximate {
-                base.push_str("; approximate model: ");
-                base.push_str(&result.approximation_notes.join(" | "));
-            }
-            base
+            )
         } else {
-            let mut issues = Vec::new();
-            if !dead_guards.is_empty() {
-                issues.push(format!("dead guards: {}", dead_guards.join(", ")));
-            }
-            if !non_inductive.is_empty() {
-                issues.push(format!(
-                    "non-inductive invariants: {}",
-                    non_inductive.join(", ")
-                ));
-            }
-            if result.approximate {
-                issues.push(format!(
-                    "approximate model: {}",
-                    result.approximation_notes.join(" | ")
-                ));
-            }
-            format!("L0 Symbolic WARNINGS: {}", issues.join("; "))
+            format!(
+                "L0 Symbolic FAILED: dead guards: {}",
+                dead_guards.join(", ")
+            )
         };
+        if !not_proved.is_empty() {
+            summary.push_str("; not proved, left to the model check: ");
+            summary.push_str(&not_proved.join(", "));
+        }
+        if result.approximate {
+            summary.push_str("; approximate model: ");
+            summary.push_str(&result.approximation_notes.join(" | "));
+        }
 
         LevelResult {
             level: CascadeLevel::SymbolicVerification,

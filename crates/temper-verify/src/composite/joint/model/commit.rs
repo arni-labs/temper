@@ -10,7 +10,7 @@ use super::super::state::ReactionStep;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
 use super::step::Certainty;
-use crate::model::semantics::{step, successors_budgeted, within_bounds};
+use crate::model::semantics::{rule_for, step, successors_budgeted, within_bounds};
 use crate::model::{
     ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
 };
@@ -107,15 +107,11 @@ impl JointModel {
         by: u32,
         inline: bool,
     ) -> Vec<(JointState, Certainty)> {
-        let Some(moved) = step(
-            &self.models[entity],
-            &action.name,
-            action.target_state.as_deref(),
-            &state.records[entity],
-            &action.params,
-        ) else {
+        let record = &state.records[entity];
+        let Some(t) = rule_for(&self.models[entity], &action.name, &record.status) else {
             return Vec::new();
         };
+        let moved = step(t, record, &action.params);
         let mut next = state;
         self.place(&mut next, entity, moved, &action.name, by);
         self.after_commit(next, entity, &action.name, chain, by, inline)
@@ -206,9 +202,7 @@ impl JointModel {
                 _ => carried = false,
             }
         }
-        let Some(moved) = step(model, &t.name, t.to_state.as_deref(), target, &params) else {
-            return Arrival::Refused;
-        };
+        let moved = step(t, target, &params);
         if !within_bounds(model, target, &moved) {
             return Arrival::BeyondBounds;
         }

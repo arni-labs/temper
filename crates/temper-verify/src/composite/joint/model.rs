@@ -22,7 +22,7 @@ use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
-use crate::model::semantics::{Expansion, string_values};
+use crate::model::semantics::{Expansion, rule_for, string_values};
 use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 pub use drops::DroppedReaction;
@@ -380,10 +380,11 @@ impl JointModel {
         state: &JointState,
         blind: Blind,
     ) -> bool {
-        let local = &state.records[entity];
-        let status_ok =
-            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
-        status_ok && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+        // The rule the runtime takes for this action in the record's status
+        // (`rule_for`); another with the same name never fires from there.
+        let taken = rule_for(&self.models[entity], &t.name, &state.records[entity].status)
+            .is_some_and(|rule| std::ptr::eq(rule, t));
+        taken && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
     }
 
     pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {
