@@ -256,11 +256,14 @@ async fn a_checkpoint_waits_for_the_calls_in_flight_instead_of_skipping() {
     }
     push(&a).await;
     let copy = a.sync_copy().expect("copy").clone();
-    // A trim batch holds its connection until its commit returns.
-    copy.simulate_slow_trim(Duration::ZERO, Duration::from_millis(600));
+    // A trim holds one connection through its batches until its budget runs
+    // out. Given 100 ms, it starts one batch and lets go when that batch's
+    // commit returns, about 400 ms in: a call in flight that ends within the
+    // checkpoint's turn.
+    copy.simulate_slow_trim(Duration::ZERO, Duration::from_millis(400));
     let trimming = {
         let a = a.clone();
-        tokio::spawn(async move { a.trim_change_log(Duration::from_secs(5)).await })
+        tokio::spawn(async move { a.trim_change_log(Duration::from_millis(100)).await })
     };
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
