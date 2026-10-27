@@ -671,6 +671,13 @@ impl crate::state::ServerState {
         }
 
         let response = match outcome.result {
+            // An earlier ask of this dispatch may have made the move and lost
+            // its reply, which the actor then repeats. The caller asked once,
+            // so that is this dispatch's own move, not a replay.
+            Ok(response) if outcome.retried_after_transient => EntityResponse {
+                replayed: false,
+                ..response
+            },
             Ok(response) => response,
             Err(e) => {
                 let entry = TrajectoryEntry {

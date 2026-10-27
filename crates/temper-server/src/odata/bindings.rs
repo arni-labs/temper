@@ -306,11 +306,13 @@ pub(super) async fn dispatch_bound_action(
         );
         action_span.set_attribute(OtelKeyValue::new("idempotency.hit", true));
         action_span.set_status(Status::Ok);
-        return ODataResponse {
+        let mut replay = ODataResponse {
             status: StatusCode::OK,
             body,
         }
         .into_response();
+        crate::idempotency::mark_replayed(&mut replay);
+        return replay;
     }
 
     let result = state
@@ -380,11 +382,15 @@ pub(super) async fn dispatch_bound_action(
                 hydrate_blob_refs_for_tenant(state, tenant, &mut state_json).await;
                 let body =
                     annotate_entity(state_json, format!("$metadata#{set_name}/$entity"), None);
-                ODataResponse {
+                let mut answer = ODataResponse {
                     status: StatusCode::OK,
                     body,
                 }
-                .into_response()
+                .into_response();
+                if response.replayed {
+                    crate::idempotency::mark_replayed(&mut answer);
+                }
+                answer
             } else {
                 action_span.set_status(Status::error(response.error.clone().unwrap_or_default()));
                 odata_refusal(

@@ -95,6 +95,10 @@ async fn retry_after_dropped_reply_replays_success_response_and_runs_effects_wit
         response.error
     );
     assert_eq!(response.state.status, "Running");
+    assert!(
+        !response.replayed,
+        "the caller sent Start once: the reply its own first ask lost is not a replay"
+    );
 
     assert_eq!(
         state.state_timeout_tracker.pending_snapshot(),
@@ -229,6 +233,10 @@ async fn retry_after_passivation_keeps_its_event_metadata() {
         .await
         .expect("the AddItem retry dispatches");
     assert!(retried.success);
+    assert!(
+        retried.replayed,
+        "a repeat after passivation says it is one"
+    );
     let last = retried
         .state
         .events
@@ -259,12 +267,14 @@ async fn immediate_retry_gets_the_live_state_in_full() {
         .await
         .expect("AddItem dispatches");
     assert!(first.success, "AddItem failed: {:?}", first.error);
+    assert!(!first.replayed, "a fresh move is not a replay");
 
     let retried = state
         .dispatch_tenant_action(&tenant, "Order", "o-3", "AddItem", add, &keyed("add-3"))
         .await
         .expect("the AddItem retry dispatches");
     assert!(retried.success);
+    assert!(retried.replayed, "a repeat of the same key says it is one");
     assert_eq!(
         retried.state.item_count, first.state.item_count,
         "not applied twice"

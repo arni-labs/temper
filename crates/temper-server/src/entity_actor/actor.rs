@@ -1404,7 +1404,8 @@ impl EntityActor {
                 // flight to this actor. Without this check, both asks would
                 // execute. Here we consult the shared cache keyed on the
                 // caller's `Idempotency-Key` before executing; on a hit, the
-                // previously-computed response is returned as the reply.
+                // previously-computed response is returned as the reply, marked
+                // replayed. So is the answer from the durable key set below.
                 let actor_key = self.persistence_id();
                 if let (Some(key), Some(cache)) =
                     (idempotency_key.as_ref(), self.idempotency_cache.as_ref())
@@ -1423,7 +1424,10 @@ impl EntityActor {
                     } else {
                         cached
                     };
-                    ctx.reply(reply);
+                    ctx.reply(EntityResponse {
+                        replayed: true,
+                        ..reply
+                    });
                     return Ok(());
                 }
                 if let Some(key) = idempotency_key.as_deref()
@@ -1446,6 +1450,7 @@ impl EntityActor {
                         spawn_requests: vec![],
                         spec_governed: true,
                         refused: false,
+                        replayed: true,
                     });
                     return Ok(());
                 }
@@ -2030,6 +2035,7 @@ impl EntityActor {
                         spawn_requests: result.spawn_requests,
                         spec_governed: true,
                         refused: false,
+                        replayed: false,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
@@ -2094,6 +2100,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    replayed: false,
                 });
             }
             EntityMsg::GetField { field } => {
@@ -2130,6 +2137,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    replayed: false,
                 });
             }
 
@@ -2205,6 +2213,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    replayed: false,
                 });
             }
         }

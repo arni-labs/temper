@@ -89,7 +89,11 @@ pub(super) async fn dispatch_action_bridge_result(
 
     match dispatch {
         Ok(response) if response.success => {
-            action_bridge_success_response(&bridge.response, &refs, sideband)
+            let mut answer = action_bridge_success_response(&bridge.response, &refs, sideband);
+            if response.replayed {
+                crate::idempotency::mark_replayed(&mut answer);
+            }
+            answer
         }
         Ok(response) => action_bridge_refusal_response(
             &bridge.response,
