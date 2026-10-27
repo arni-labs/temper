@@ -47,6 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_entity_catalog_status
 /// Mirrors top-level scalar fields from entity state so that `$filter`
 /// expressions can be translated to SQL WHERE clauses, avoiding full
 /// materialization of every actor in a collection query.
+///
+/// `status` is no longer written: rows store NULL, and filters read the status
+/// from `entity_catalog` (`store/field_index_rows.rs`). The column and
+/// `idx_efi_status` stay, so an existing database needs no schema change.
 pub const CREATE_ENTITY_FIELD_INDEX_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS entity_field_index (
     tenant       TEXT NOT NULL,
