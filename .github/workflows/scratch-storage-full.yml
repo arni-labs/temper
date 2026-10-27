@@ -1,0 +1,107 @@
+name: Scratch storage-full proof
+
+# Temporary, on a scratch branch only: builds the Linux temper binary for the staging proof, and runs the new tests on
+# the change and on six deliberate defects (each one main's behaviour for one part), which must fail.
+
+on:
+  push:
+    branches: [scratch/storage-full-*]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  binary:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libz3-dev
+      - id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-binary
+          save-if: false
+      - run: cargo build --release --locked -p temper-cli
+      - run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/release/temper out/temper
+          gzip -9 out/temper
+          sha256sum out/temper.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: temper-x86_64-linux
+          path: out/temper.gz
+          retention-days: 3
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [none, room, reply, healthz, start, cell, trajectory, masked, late, update, odata, inline]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libz3-dev
+      - id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: scratch-storage-full
+      - name: Apply the deliberate defect
+        run: |
+          set -euo pipefail
+          case "${{ matrix.mutant }}" in
+            none) ;;
+            # main has no floor: a disk under it refuses nothing.
+            room) perl -0pi -e 's/(    fn check\(&self\) -> Result<\(\), PersistenceError> \{\n)/$1        return Ok(());\n/' crates/temper-server/src/storage/write_room.rs ;;
+            # main answers a store failure as an ordinary failed action (409 ActionFailed).
+            reply) perl -0pi -e 's/=> EntityResponse::store_unavailable\(state, said\)/=> EntityResponse::write_failed(state, said)/' crates/temper-server/src/entity_actor/actor.rs ;;
+            # main's /healthz answers 200 whatever the store does.
+            healthz) perl -0pi -e 's/(pub async fn healthz\(State\(state\): State<ServerState>\) -> Response \{\n)/$1    if true {\n        return (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true }))).into_response();\n    }\n/' crates/temper-server/src/write_health.rs ;;
+            # main restarts an actor whose first write was not taken, then fails it for good (fb59, 22:30Z).
+            start) perl -0pi -e 's/e => ActorError::InitFailed\(format!\(/e => ActorError::custom(format!(/' crates/temper-server/src/entity_actor/actor.rs ;;
+            # main's cell restarts after any failed start and drops the asks waiting on it.
+            cell) perl -0pi -e 's/Err\(ActorError::InitFailed\(reason\)\) => \{/Err(ActorError::InitFailed(reason)) if false => {/' crates/temper-runtime/src/actor/cell.rs ;;
+            # main writes a refused move's trajectory row whatever room the disk has.
+            trajectory) perl -0pi -e 's/        self\.room\.check\(\)\.map_err\(\|error\| error\.to_string\(\)\)\?;\n//' crates/temper-server/src/storage/write_room.rs ;;
+            # a refusal for room replaces a store failure, so freeing the disk hides it.
+            masked) perl -0pi -e 's/            \(WriteHealth::Failing\(_\), WriteHealth::Refusing\(_\)\) => return,\n//' crates/temper-server/src/storage/write_room.rs ;;
+            # main's closed mailbox answers a late send SendFailed, not why the start was refused.
+            late) perl -0pi -e 's/        let _ = self\.not_started\.set\(reason\.to_owned\(\)\);\n//' crates/temper-runtime/src/mailbox/mod.rs ;;
+            # main answers a field update the store did not take as an ordinary failure (409).
+            update) perl -0pi -e 's/(Err\(NotUpdated::Store\(error\)\) => \{\n\s+)persistence_failure_reply\(state\.clone\(\), &error\)/$1EntityResponse::write_failed(state.clone(), error.to_string())/' crates/temper-server/src/entity_actor/actor.rs ;;
+            # main's PATCH, PUT and DELETE answer every failed write 409.
+            odata) perl -0pi -e 's/Ok\(response\) if response\.store_unavailable => \{/Ok(response) if false && response.store_unavailable => {/g' crates/temper-server/src/odata/write.rs ;;
+            # the inline answer's store failure becomes the committed request's 503.
+            inline) perl -0pi -e 's/return EntityResponse \{\n\s+store_unavailable: false,\n\s+\.\.final_response\n\s+\};/return final_response;/' crates/temper-server/src/state/dispatch/effects.rs ;;
+          esac
+          git diff --stat
+          git diff | head -40
+      - name: The new tests
+        run: |
+          set +e
+          cargo test -p temper-server --features sim --lib storage::write_room > unit.log 2>&1; unit=$?
+          cargo test -p temper-runtime --lib a_refused_start > cell.log 2>&1; cell=$?
+          cargo test -p temper-server --features sim --test dst_store_write_recovery > dst.log 2>&1; dst=$?
+          cargo test -p temper-server --features sim --test inline_integration_effects > inline.log 2>&1; inline=$?
+          tail -40 unit.log
+          tail -30 cell.log
+          tail -60 dst.log
+          tail -30 inline.log
+          echo "mutant=${{ matrix.mutant }} unit=$unit cell=$cell dst=$dst inline=$inline"
+          if [ "${{ matrix.mutant }}" = none ]; then
+            [ "$unit" = 0 ] && [ "$cell" = 0 ] && [ "$dst" = 0 ] && [ "$inline" = 0 ]
+          else
+            [ "$unit" != 0 ] || [ "$cell" != 0 ] || [ "$dst" != 0 ] || [ "$inline" != 0 ]
+          fi
