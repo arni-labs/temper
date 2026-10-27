@@ -3,10 +3,12 @@
 //! Contains the state, action, transition, invariant, liveness, and model struct
 //! definitions used by the Stateright model checker.
 
+pub use super::string::ModelString;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use std::collections::BTreeSet;
@@ -28,6 +30,14 @@ pub struct TemperModelState {
     pub booleans: BTreeMap<String, bool>,
     /// Named list variables (e.g. `tags`, `labels`).
     pub lists: BTreeMap<String, Vec<String>>,
+    /// The string variables an invariant reads, as symbols: `''`, a literal
+    /// the spec compares the variable with, or `#n`, a value that is equal
+    /// only to itself. The verifier tracks which strings are equal, not what
+    /// they say, so `#n` are renumbered in order of first use after every
+    /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
+    /// invariants read no string.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub strings: BTreeMap<String, ModelString>,
 }
 
 impl fmt::Display for TemperModelState {
@@ -60,6 +70,14 @@ impl fmt::Display for TemperModelState {
                 .collect();
             write!(f, "{{{}}}", pairs.join(","))?;
         }
+        if !self.strings.is_empty() {
+            let pairs: Vec<String> = self
+                .strings
+                .iter()
+                .map(|(k, v)| format!("{k}='{v}'"))
+                .collect();
+            write!(f, "<{}>", pairs.join(","))?;
+        }
         Ok(())
     }
 }
@@ -73,8 +91,8 @@ pub enum ParamValue {
     Count(usize),
     /// A boolean.
     Bool(bool),
-    /// A string some guard or invariant compares a list against.
-    Str(String),
+    /// A concrete string or a fresh equality symbol.
+    Str(ModelString),
     /// A string no guard or invariant mentions.
     Fresh,
 }
@@ -158,6 +176,23 @@ pub struct ResolvedTransition {
     pub effects: Vec<ModelEffect>,
     /// The action parameters the effects read, by kind.
     pub params: BTreeMap<String, ParamKind>,
+    /// The action parameters that write a tracked string variable of the
+    /// same name (the runtime writes every parameter into its field).
+    pub string_params: Vec<StringParam>,
+}
+
+/// An action parameter that writes the tracked string variable of its name,
+/// with what the action's constraints allow it to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StringParam {
+    /// The parameter, and the variable it writes.
+    pub name: String,
+    /// `param_nonempty`: never `''`.
+    pub nonempty: bool,
+    /// `param_equals_field`: the value of this variable.
+    pub equals: Option<String>,
+    /// `param_not_equals_field`: never the value of these variables.
+    pub not_equals: Vec<String>,
 }
 
 /// A safety invariant: `assert` must not be false in any reachable state.
@@ -225,9 +260,14 @@ pub struct TemperModel {
     pub(crate) initial_booleans: BTreeMap<String, bool>,
     /// Initial list values from [[state]] declarations.
     pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
-    /// Declared string defaults used to resolve reaction target ids. IOA
-    /// effects cannot assign strings; guards still treat them as unknown.
-    pub(crate) initial_strings: BTreeMap<String, String>,
+    /// Initial values of the tracked string variables.
+    pub(crate) initial_strings: BTreeMap<String, ModelString>,
+    /// The string variables the verifier tracks: those an invariant reads,
+    /// and those whose value reaches one through a constraint or a reaction.
+    pub tracked_strings: BTreeSet<String>,
+    /// String literals each tracked variable is compared with in a guard or
+    /// invariant: the values worth choosing for it besides `''` and others'.
+    pub(crate) string_literals: BTreeMap<String, BTreeSet<String>>,
     /// Per-counter upper bounds for bounded exploration.
     pub(crate) counter_bounds: BTreeMap<String, usize>,
     /// Default upper bound for counters not in counter_bounds.
@@ -252,6 +292,10 @@ pub(crate) struct ExploreLimit {
     /// Set once a walk is over, so the model offers its actions again:
     /// Stateright rebuilds a found path by stepping the model from the start.
     pub(crate) lifted: Arc<AtomicBool>,
+    /// Remaining expansion work shared by all callers in this walk.
+    pub(crate) work: Arc<AtomicUsize>,
+    /// Expansion stopped before all assignments were generated.
+    pub(crate) exhausted: Arc<AtomicBool>,
 }
 
 impl ExploreLimit {
@@ -260,6 +304,8 @@ impl ExploreLimit {
     pub(crate) fn for_one_walk(&self) -> Self {
         Self {
             lifted: Arc::new(AtomicBool::new(false)),
+            work: Arc::new(AtomicUsize::new(self.states)),
+            exhausted: Arc::new(AtomicBool::new(false)),
             ..self.clone()
         }
     }
@@ -270,10 +316,11 @@ impl ExploreLimit {
 }
 
 impl TemperModel {
-    /// Whether the time this model may be explored for is spent.
+    /// Whether the model has spent its time or expansion work allowance.
     pub fn out_of_time(&self) -> bool {
         self.limit.as_ref().is_some_and(|limit| {
-            !limit.lifted.load(Ordering::Relaxed) && Instant::now() >= limit.until
+            !limit.lifted.load(Ordering::Relaxed)
+                && (Instant::now() >= limit.until || limit.exhausted.load(Ordering::Relaxed))
         })
     }
 }
@@ -289,6 +336,7 @@ mod tests {
             counters: BTreeMap::new(),
             booleans: BTreeMap::new(),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         assert_eq!(s.to_string(), "Draft");
     }
@@ -300,6 +348,7 @@ mod tests {
             counters: BTreeMap::from([("items".into(), 3)]),
             booleans: BTreeMap::new(),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         assert_eq!(s.to_string(), "Active(items=3)");
     }
@@ -311,6 +360,7 @@ mod tests {
             counters: BTreeMap::new(),
             booleans: BTreeMap::from([("ready".into(), true), ("done".into(), false)]),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         assert_eq!(s.to_string(), "Active[ready]");
     }
@@ -322,6 +372,7 @@ mod tests {
             counters: BTreeMap::new(),
             booleans: BTreeMap::new(),
             lists: BTreeMap::from([("tags".into(), vec!["a".into(), "b".into()])]),
+            strings: BTreeMap::new(),
         };
         assert_eq!(s.to_string(), "Active{tags#2}");
     }
@@ -333,6 +384,7 @@ mod tests {
             counters: BTreeMap::from([("items".into(), 2)]),
             booleans: BTreeMap::from([("ready".into(), true)]),
             lists: BTreeMap::from([("tags".into(), vec!["x".into()])]),
+            strings: BTreeMap::new(),
         };
         assert_eq!(s.to_string(), "Active(items=2)[ready]{tags#1}");
     }
@@ -344,6 +396,7 @@ mod tests {
             counters: BTreeMap::new(),
             booleans: BTreeMap::from([("a".into(), false), ("b".into(), false)]),
             lists: BTreeMap::new(),
+            strings: BTreeMap::new(),
         };
         assert_eq!(s.to_string(), "X");
     }
@@ -380,6 +433,7 @@ mod tests {
             counters: BTreeMap::from([("items".into(), 5)]),
             booleans: BTreeMap::from([("ready".into(), true)]),
             lists: BTreeMap::from([("tags".into(), vec!["vip".into()])]),
+            strings: BTreeMap::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: TemperModelState = serde_json::from_str(&json).unwrap();

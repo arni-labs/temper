@@ -299,6 +299,14 @@ impl<'a> Parser<'a> {
         }
         match lhs {
             Operand::Var(name) => Ok(Expr::Var(name)),
+            // A bare `params.p` is a boolean test, like a bare name. It reads
+            // as `params.p == true`, which holds for `true` alone, as a bare
+            // name does.
+            Operand::Param(_) => Ok(Expr::Compare {
+                lhs,
+                op: CmpOp::Eq,
+                rhs: Operand::Lit(Literal::Bool(true)),
+            }),
             Operand::Lit(Literal::Bool(value)) => Ok(Expr::Const(value)),
             _ => Err(self.error("expected a comparison or 'in'")),
         }
@@ -342,6 +350,10 @@ impl<'a> Parser<'a> {
                     "false" => Ok(Operand::Lit(Literal::Bool(false))),
                     "null" => Ok(Operand::Lit(Literal::Null)),
                     "len" => Ok(Operand::Len(self.call_arg()?)),
+                    "params" => {
+                        self.expect(&Tok::Dot, "'.' after 'params'")?;
+                        Ok(Operand::Param(self.ident()?))
+                    }
                     _ if is_keyword(&name) => {
                         self.pos -= 1;
                         Err(self.error(&format!("unexpected keyword '{name}'")))
@@ -349,16 +361,19 @@ impl<'a> Parser<'a> {
                     _ if self.eat(&Tok::LBracket) => {
                         let id_field = self.ident()?;
                         self.expect(&Tok::RBracket, "']'")?;
-                        self.expect(&Tok::Dot, "'.status'")?;
-                        if !self.peek_keyword("status") {
-                            return Err(
-                                self.error("only '.status' can be read from a related entity")
-                            );
+                        self.expect(&Tok::Dot, "'.' and a field")?;
+                        if self.peek_keyword("status") {
+                            self.pos += 1;
+                            return Ok(Operand::CrossStatus {
+                                entity_type: name,
+                                id_field,
+                            });
                         }
-                        self.pos += 1;
-                        Ok(Operand::CrossStatus {
+                        let field = self.ident()?;
+                        Ok(Operand::CrossField {
                             entity_type: name,
                             id_field,
+                            field,
                         })
                     }
                     _ => Ok(Operand::Var(name)),

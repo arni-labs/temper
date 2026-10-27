@@ -329,10 +329,13 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
             timestamp: event.timestamp,
             params: serde_json::Value::Null,
             idempotency_key: event.idempotency_key.clone(),
+            kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         })
         .collect();
     EntityResponse {
         success: response.success,
+        refusal: response.refusal.clone(),
         state: EntityState {
             entity_type: state.entity_type.clone(),
             entity_id: state.entity_id.clone(),
@@ -355,6 +358,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
         scheduled_actions: response.scheduled_actions.clone(),
         spawn_requests: response.spawn_requests.clone(),
         spec_governed: response.spec_governed,
+        refused: response.refused,
     }
 }
 
@@ -399,7 +403,7 @@ fn estimated_entry_bytes(actor_key: &str, idem_key: &str, response: &EntityRespo
         + response
             .scheduled_actions
             .iter()
-            .map(|scheduled| named(&scheduled.action))
+            .map(|scheduled| named(&scheduled.action) + scheduled.arm_id.len())
             .sum::<usize>();
     ENTRY_OVERHEAD_BYTES
         + 2 * (actor_key.len() + idem_key.len())

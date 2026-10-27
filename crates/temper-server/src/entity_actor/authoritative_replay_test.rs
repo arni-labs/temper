@@ -103,6 +103,12 @@ fn envelope(
         timestamp: sim_now(),
         params: serde_json::json!({}),
         idempotency_key: None,
+        outcome: None,
+        kind: if action == "Deleted" {
+            temper_runtime::persistence::EventKind::Tombstone
+        } else {
+            temper_runtime::persistence::EventKind::Transition
+        },
     };
     PersistenceEnvelope {
         sequence_nr,
@@ -191,7 +197,6 @@ async fn authoritative_replay_ignores_ahead_stale_snapshot() {
         BackendLabel::Turso,
         &initial_fields,
         None,
-        false,
     )
     .await
     .expect("ordinary recovery accepts the snapshot");
@@ -347,6 +352,8 @@ async fn authoritative_replay_rejects_non_object_field_update_payloads() {
         timestamp: sim_now(),
         params: serde_json::json!([1, 2, 3]),
         idempotency_key: None,
+        kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     };
     let non_object = PersistenceEnvelope {
         sequence_nr: 1,

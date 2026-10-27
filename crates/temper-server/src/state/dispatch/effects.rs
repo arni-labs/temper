@@ -10,13 +10,17 @@ use std::time::Instant;
 use tokio::spawn as spawn_post_dispatch_effect; // determinism-ok: post-dispatch side effects are outside transition semantics
 use tracing::Instrument;
 
-use crate::entity_actor::{EntityResponse, effects::ScheduledAction};
+use crate::entity_actor::EntityResponse;
 use crate::events::EntityStateChange;
 use crate::request_context::AgentContext;
 use crate::state::ProjectionEnqueueOutcome;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
+
+/// The only tenant whose entities reach the platform custom effect handler:
+/// the system tenant, where the platform installs its own specs.
+const PLATFORM_HOOK_TENANT: &str = "temper-system";
 
 /// Collected context needed by post-dispatch effect handlers.
 pub(crate) struct PostDispatchContext<'a> {
@@ -92,7 +96,7 @@ impl crate::state::ServerState {
             query_projection_update_mode(),
             QueryProjectionUpdateMode::Queued
         );
-        let Some(query_plane) = self.query_plane_store() else {
+        let Some(query_plane) = self.query_plane_written_after_commit() else {
             return;
         };
 
@@ -367,7 +371,7 @@ impl crate::state::ServerState {
         self.persist_trajectory_entry_background(entry);
     }
 
-    /// Broadcast state change to SSE subscribers and update entity cache.
+    /// Broadcast state change to SSE subscribers.
     pub(crate) fn broadcast_state_change(
         &self,
         ctx: &PostDispatchContext<'_>,
@@ -437,8 +441,6 @@ impl crate::state::ServerState {
                 }),
             );
         }
-        let cache_key = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
-        self.cache_entity_status(cache_key, response.state.status.clone());
         let _ = self
             .observe_refresh_tx
             .send(crate::state::ObserveRefreshHint::Entities);
@@ -530,69 +532,12 @@ impl crate::state::ServerState {
         }
     }
 
-    /// Schedule delayed actions as fire-and-forget background timers.
-    ///
-    /// Propagates the originating `AgentContext` so that scheduled actions
-    /// retain identity attribution in trajectories and SSE events, as a
-    /// detached task (`AgentContext::for_background_task`).
-    pub(crate) fn dispatch_scheduled_actions(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        scheduled_actions: &[ScheduledAction],
-        agent_ctx: &AgentContext,
-    ) {
-        for sched in scheduled_actions {
-            let state = self.clone();
-            let t = tenant.clone();
-            let et = entity_type.to_string();
-            let eid = entity_id.to_string();
-            let action = sched.action.clone();
-            // A timer is paced by its delay, so the action it fires starts a
-            // new inline chain: an earlier lap is not a step it is inside of.
-            let ctx = agent_ctx.for_background_task();
-            let delay = std::time::Duration::from_secs(sched.delay_seconds);
-            let workflow_root_entity_type = ctx
-                .workflow_root_entity_type
-                .clone()
-                .unwrap_or_else(|| et.clone());
-            let workflow_root_entity_id = ctx
-                .workflow_root_entity_id
-                .clone()
-                .unwrap_or_else(|| eid.clone());
-            let workflow_run_id = ctx
-                .workflow_run_id
-                .clone()
-                .unwrap_or_else(|| format!("{et}:{eid}"));
-            let span = tracing::info_span!(
-                "dispatch.scheduled_actions",
-                workflow.root_entity_type = %workflow_root_entity_type,
-                workflow.root_entity_id = %workflow_root_entity_id,
-                workflow.run_id = %workflow_run_id,
-                temper.action = %action,
-                entity_type = %et,
-                entity_id = %eid,
-            );
-            spawn_post_dispatch_effect(
-                // determinism-ok: timer delivery is a background side-effect
-                async move {
-                    tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
-                    let _ = state
-                        .dispatch_tenant_action(&t, &et, &eid, &action, serde_json::json!({}), &ctx)
-                        .await;
-                }
-                .instrument(span),
-            );
-        }
-    }
-
-    /// Dispatch a transition's deferred child effects: spawn requests and
-    /// scheduled actions.
+    /// Dispatch a transition's deferred child effects: its spawn requests,
+    /// and arm its scheduled actions (their rows were written with its event).
     ///
     /// These belong to the ORIGINAL transition response and must run on every
     /// successful path — including when an inline integration produced a
-    /// callback response. Both are fire-and-forget (background tasks), so the
+    /// callback response. They are fire-and-forget (background tasks), so the
     /// caller is free to return the (possibly integration-updated) response
     /// afterwards.
     fn dispatch_transition_deferred_effects(
@@ -600,6 +545,7 @@ impl crate::state::ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
+        self.arm_scheduled_actions(ctx, response);
         // Spawn requests
         if !response.spawn_requests.is_empty() {
             self.dispatch_spawn_requests(
@@ -608,17 +554,6 @@ impl crate::state::ServerState {
                 ctx.entity_id,
                 &response.spawn_requests,
                 ctx.action_params,
-                ctx.agent_ctx,
-            );
-        }
-
-        // Scheduled actions (propagate agent context for identity attribution)
-        if !response.scheduled_actions.is_empty() {
-            self.dispatch_scheduled_actions(
-                ctx.tenant,
-                ctx.entity_type,
-                ctx.entity_id,
-                &response.scheduled_actions,
                 ctx.agent_ctx,
             );
         }
@@ -651,6 +586,16 @@ impl crate::state::ServerState {
         // dependent launch. An old reset timer must not fire during the wait.
         self.invalidate_state_timeouts_if_needed(ctx, &response);
 
+        // The status is committed, so guards decide on it from here on, even
+        // when the projection below fails and the action answers with an
+        // error. Simulation runs other requests between the commit and this
+        // write, as a slow writer would.
+        temper_runtime::buggify::buggify_yield(
+            crate::state::status_cache::STATUS_WRITE_YIELD_BUDGET,
+        )
+        .await;
+        self.cache_entity_status(ctx.tenant, &response.state);
+
         // Every committed transition is visible through the query plane before
         // the response returns: the caller, a reaction or an integration may
         // read it at once, and queue admission does not establish visibility.
@@ -661,6 +606,8 @@ impl crate::state::ServerState {
             // The journal is committed: hand the projection to the retrying
             // queue so reads catch up once the store recovers.
             self.apply_query_projection_update(ctx, &response).await;
+            // Its scheduled actions were committed with its event: arm them.
+            self.arm_scheduled_actions(ctx, &response);
             let mut response = response;
             response.success = false;
             response.error = Some(format!(
@@ -675,7 +622,7 @@ impl crate::state::ServerState {
             self.apply_query_projection_update(ctx, &response).await;
         }
 
-        // 3. Broadcast SSE + cache
+        // 3. Broadcast SSE
         self.broadcast_state_change(ctx, &response);
 
         // Arm the successor only after visibility, before an inline adapter
@@ -740,14 +687,18 @@ impl crate::state::ServerState {
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        // Committed with its event: its scheduled actions still fire.
+                        self.arm_scheduled_actions(ctx, &response);
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("WASM integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
                             scheduled_actions: Vec::new(),
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
+                            refused: false,
                         };
                     }
                 }
@@ -774,14 +725,18 @@ impl crate::state::ServerState {
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        // Committed with its event: its scheduled actions still fire.
+                        self.arm_scheduled_actions(ctx, &response);
                         return EntityResponse {
                             success: false,
+                            refusal: None,
                             state: response.state.clone(),
                             error: Some(format!("adapter integration failed: {err}")),
                             custom_effects: response.custom_effects.clone(),
                             scheduled_actions: Vec::new(),
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
+                            refused: false,
                         };
                     }
                 }
@@ -830,8 +785,13 @@ impl crate::state::ServerState {
         //
         // For system-tenant entities whose specs declare custom effects
         // but have no WASM/adapter integrations (e.g. GovernanceDecision),
-        // the handler routes effects to platform hooks (hooks.rs).
+        // the handler routes effects to platform hooks (hooks.rs). The
+        // platform installs those specs only in the system tenant, and the
+        // hooks act on whatever tenant and entity the record names, so only
+        // system-tenant entities reach them. A hook name in another tenant's
+        // spec is an ordinary custom effect for that tenant's integrations.
         if !response.custom_effects.is_empty()
+            && ctx.tenant.as_str() == PLATFORM_HOOK_TENANT
             && let Some(handler) = &self.custom_effect_handler
         {
             for effect_name in &response.custom_effects {

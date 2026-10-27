@@ -9,8 +9,14 @@ use temper_runtime::persistence::{
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
+mod commit_outcome;
+mod commit_transport;
 mod evolution_tenant;
+mod field_index_writes;
 mod policy_approval;
+mod projection_writes;
+mod scheduled_actions;
+mod write_queue;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
     PersistenceEnvelope {
@@ -25,6 +31,20 @@ fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnv
             actor_id: "store-test".to_string(),
         },
     }
+}
+
+/// The kernel's delete tombstone as it is journaled now.
+fn tombstone_envelope() -> PersistenceEnvelope {
+    test_envelope(
+        "Deleted",
+        serde_json::json!({
+            "action": "Deleted",
+            "from_status": "Draft",
+            "to_status": "Deleted",
+            "params": {},
+            "kind": "tombstone"
+        }),
+    )
 }
 
 fn sqlite_test_url(test_name: &str) -> String {
@@ -185,36 +205,42 @@ async fn vector_index_write_behind_candidates_and_partitioning() {
     };
 
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-b",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![0.0, 1.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![0.0, 1.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m1", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m1", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
     // A different model tag — must not appear in an m1 scan.
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-c",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            &[row("embed", "m2", vec![1.0, 0.0])],
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: &[row("embed", "m2", vec![1.0, 0.0])],
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -272,13 +298,15 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
 
     // Write-behind reconcile with a row, then a delete transition (empty rows).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             0,
             &[test_envelope("Create", serde_json::json!({}))],
-            &[],
-            std::slice::from_ref(&row(vec![1.0, 0.0])),
-            true,
+            temper_runtime::persistence::CommitRows {
+                vector_rows: std::slice::from_ref(&row(vec![1.0, 0.0])),
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -292,13 +320,14 @@ async fn vector_index_reconcile_purges_on_delete_and_empty_rows() {
     );
     // A Deleted transition emits no vector rows but still reconciles (purge).
     store
-        .append_with_index_rows(
+        .append_with_rows(
             "t:Item:item-a",
             1,
             &[test_envelope("Delete", serde_json::json!({}))],
-            &[],
-            &[],
-            true,
+            temper_runtime::persistence::CommitRows {
+                reconcile_vectors: true,
+                ..temper_runtime::persistence::CommitRows::default()
+            },
         )
         .await
         .unwrap();
@@ -405,33 +434,32 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
     assert_eq!(events[0].event_type, "OrderCreated");
 }
 
+/// Every append is a write transaction, so it waits its turn at the write
+/// gate like any writer (as the first in line: it is high priority).
 #[tokio::test]
-async fn single_event_append_bypasses_process_write_gate() {
-    let mut store = make_store("single-append-bypasses-gate").await;
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+async fn single_event_append_waits_for_the_write_gate() {
+    let store = make_store("single-append-waits-for-gate").await;
     let held_gate = store
         .write_gate
+        .permit
         .clone()
         .acquire_owned()
         .await
         .expect("hold gate");
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        store.append(
-            "tenant-a:Order:ord-bypass",
-            0,
-            &[test_envelope(
-                "OrderCreated",
-                serde_json::json!({ "id": "ord-bypass" }),
-            )],
-        ),
-    )
-    .await;
-    drop(held_gate);
+    let created = [test_envelope(
+        "OrderCreated",
+        serde_json::json!({ "id": "ord-gated" }),
+    )];
+    let append = store.append("tenant-a:Order:ord-gated", 0, &created);
+    tokio::pin!(append);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(300), append.as_mut()).await;
+    assert!(waited.is_err(), "an append went ahead of a held write gate");
 
-    let new_seq = result
-        .expect("single-event append should not wait for the process write gate")
+    drop(held_gate);
+    let new_seq = tokio::time::timeout(std::time::Duration::from_secs(5), append)
+        .await
+        .expect("the append goes once the gate frees")
         .expect("append should succeed");
     assert_eq!(new_seq, 1);
 }
@@ -603,7 +631,10 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
         .await
         .expect("upsert deleted projection");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "INSERT INTO entity_field_index \
          (tenant, entity_type, entity_id, field_name, field_value, status) \
@@ -619,6 +650,8 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
     )
     .await
     .expect("insert field-index-only row");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .append(
@@ -632,7 +665,7 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
         .append(
             &format!("{tenant}:AgentRoute:route-deleted"),
             0,
-            &[test_envelope("Deleted", serde_json::json!({}))],
+            &[tombstone_envelope()],
         )
         .await
         .expect("append deleted tombstone");
@@ -670,11 +703,7 @@ async fn list_entity_ids_by_type_includes_events_and_excludes_deleted() {
         .await
         .unwrap();
     store
-        .append(
-            &deleted_order,
-            1,
-            &[test_envelope("Deleted", serde_json::json!({}))],
-        )
+        .append(&deleted_order, 1, &[tombstone_envelope()])
         .await
         .unwrap();
     store
@@ -726,7 +755,8 @@ async fn list_entity_ids_excludes_entities_with_deleted_tombstones() {
                 serde_json::json!({
                     "action": "Deleted",
                     "from_status": "Draft",
-                    "to_status": "Deleted"
+                    "to_status": "Deleted",
+                    "params": {}
                 }),
             )],
         )
@@ -750,6 +780,70 @@ async fn list_entity_ids_excludes_entities_with_deleted_tombstones() {
     assert_eq!(
         entities,
         vec![("Order".to_string(), "ord-active".to_string())]
+    );
+}
+
+/// A spec action named `Deleted` is not the kernel's tombstone: every listing
+/// keeps its entity, whether it was journaled with a kind or before kinds.
+#[tokio::test]
+async fn listings_keep_entities_whose_spec_action_is_named_deleted() {
+    let store = make_store("entity-list-spec-deleted").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let spec_actions = [
+        (
+            "kept-marked",
+            serde_json::json!({
+                "action": "Deleted", "from_status": "Deleting", "to_status": "Deleted",
+                "params": {}, "kind": "transition"
+            }),
+        ),
+        (
+            "kept-legacy",
+            serde_json::json!({
+                "action": "Deleted", "from_status": "Deleting", "to_status": "Deleted",
+                "params": { "note": "gone", "deleted_at": "2026-11-22T00:00:00Z" }
+            }),
+        ),
+    ];
+    for (id, payload) in spec_actions {
+        let pid = format!("{tenant}:KeptData:{id}");
+        store
+            .append(&pid, 0, &[test_envelope("Created", serde_json::json!({}))])
+            .await
+            .unwrap();
+        store
+            .append(&pid, 1, &[test_envelope("Deleted", payload)])
+            .await
+            .unwrap();
+    }
+    let gone = format!("{tenant}:KeptData:gone");
+    store
+        .append(&gone, 0, &[test_envelope("Created", serde_json::json!({}))])
+        .await
+        .unwrap();
+    store
+        .append(&gone, 1, &[tombstone_envelope()])
+        .await
+        .unwrap();
+
+    let kept = vec!["kept-legacy".to_string(), "kept-marked".to_string()];
+    assert_eq!(
+        store
+            .list_entity_ids_by_type(&tenant, "KeptData")
+            .await
+            .unwrap(),
+        kept
+    );
+    let mut all = store.list_entity_ids(&tenant).await.unwrap();
+    all.sort();
+    assert_eq!(all.into_iter().map(|(_, id)| id).collect::<Vec<_>>(), kept);
+    let limited = store
+        .list_entity_ids_limited(&tenant, Some("KeptData"), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        limited.into_iter().map(|(_, id)| id).collect::<Vec<_>>(),
+        kept
     );
 }
 
@@ -876,7 +970,8 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Projection Test".to_string()],
         )
         .await
@@ -898,7 +993,8 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Projection Test".to_string()],
         )
         .await
@@ -1103,7 +1199,8 @@ async fn query_projection_batch_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             "Order",
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Owner".to_string(), "alice".to_string()],
         )
         .await
@@ -1175,7 +1272,8 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
         .query_field_index(
             &tenant,
             "Blob",
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec![
                 "CanonicalBytes".to_string(),
                 "full-canonical-payload".to_string(),
@@ -1186,100 +1284,6 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
     assert!(
         canonical_matches.is_empty(),
         "filtered fields should stay out of entity_field_index"
-    );
-}
-
-#[tokio::test]
-async fn unchanged_projection_updates_catalog_without_rebuilding_field_rows() {
-    let store = make_store("query-projection-stable-hash").await;
-    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
-    let entity_type = "Order";
-    let entity_id = "ord-stable-projection";
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            7,
-        )
-        .await
-        .expect("initial projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query initial title row");
-    let initial_row = rows
-        .next()
-        .await
-        .expect("read initial title row")
-        .expect("title row should exist");
-    let initial_rowid = initial_row.get::<i64>(0).expect("initial rowid");
-
-    store
-        .upsert_query_projection(
-            &tenant,
-            entity_type,
-            entity_id,
-            "Draft",
-            &serde_json::json!({
-                "Title": "Projection Test",
-                "Owner": "alice",
-            }),
-            8,
-        )
-        .await
-        .expect("second projection upsert");
-
-    let conn = store.connection().await.expect("connection");
-    let mut rows = conn
-        .query(
-            "SELECT rowid FROM entity_field_index \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND field_name = 'Title'",
-            params![tenant.clone(), entity_type, entity_id],
-        )
-        .await
-        .expect("query updated title row");
-    let updated_row = rows
-        .next()
-        .await
-        .expect("read updated title row")
-        .expect("title row should still exist");
-    let updated_rowid = updated_row.get::<i64>(0).expect("updated rowid");
-
-    let mut catalog_rows = conn
-        .query(
-            "SELECT sequence_nr FROM entity_catalog \
-             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
-            params![tenant, entity_type, entity_id],
-        )
-        .await
-        .expect("query catalog row");
-    let catalog_row = catalog_rows
-        .next()
-        .await
-        .expect("read catalog row")
-        .expect("catalog row should exist");
-    let sequence_nr = catalog_row.get::<i64>(0).expect("catalog sequence_nr");
-
-    assert_eq!(
-        updated_rowid, initial_rowid,
-        "unchanged projections should keep existing field index rows"
-    );
-    assert_eq!(
-        sequence_nr, 8,
-        "entity catalog should still advance to the latest sequence number"
     );
 }
 
@@ -1768,7 +1772,7 @@ async fn upsert_specs_and_commit_preserves_identical_spec_version() {
 
 #[tokio::test]
 async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
-    let mut store = make_store("spec-idempotent-bypasses-gate").await;
+    let store = make_store("spec-idempotent-bypasses-gate").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let ioa_source = "[automaton]\nname = \"Issue\"\n";
     let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
@@ -1785,9 +1789,9 @@ async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
         .await
         .expect("initial spec commit");
 
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let held_gate = store
         .write_gate
+        .permit
         .clone()
         .acquire_owned()
         .await
@@ -1840,19 +1844,25 @@ async fn persist_spec_verification_keeps_updated_at_for_identical_result() {
         .await
         .expect("persist verification");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .persist_spec_verification(&tenant, "Issue", update)
         .await
         .expect("persist identical verification");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -1907,13 +1917,18 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist first verification");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .persist_spec_verification(
@@ -1930,6 +1945,7 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist timestamp-only verification change");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at, verification_result FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -1973,19 +1989,25 @@ async fn commit_specs_keeps_updated_at_when_specs_are_already_committed() {
         .await
         .expect("initial spec commit");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .commit_specs(&tenant)
         .await
         .expect("commit already committed specs");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -2182,13 +2204,18 @@ async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
     assert_eq!(restorable(&store, &tenant).await, committed_view);
 
     // Once abandoned, recovery returns Issue to v1 and removes Task.
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = '2000-01-01 00:00:00' WHERE tenant = ?1 AND committed = 0",
         params![tenant.as_str()],
     )
     .await
     .expect("age the pending rows");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
     assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 2);
     assert_eq!(restorable(&store, &tenant).await, committed_view);
     assert!(
@@ -2354,4 +2381,93 @@ async fn deleted_probes_use_the_tombstone_index() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn projection_catalog_freshness_marks_rows_their_journal_has_passed() {
+    let store = make_store("catalog-freshness").await;
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+    let created = || test_envelope("Created", serde_json::json!({}));
+    let updated = || test_envelope("FieldsUpdated", serde_json::json!({}));
+    let top_level = serde_json::json!({ "OrderId": "ord-1" });
+    let wrapped = serde_json::json!({ "fields": { "OrderId": "ord-1" } });
+    let project = |id: &'static str, sequence_nr: u64, fields: serde_json::Value| {
+        let store = store.clone();
+        let tenant = tenant.clone();
+        async move {
+            store
+                .upsert_query_projection_with_state(
+                    &tenant,
+                    "Payment",
+                    id,
+                    "Pending",
+                    &fields,
+                    &serde_json::json!({}),
+                    sequence_nr,
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    // Projected at its newest event.
+    store
+        .append(&format!("{tenant}:Payment:pay-current"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-current", 1, top_level.clone()).await;
+    // A change committed after the projection, which never landed.
+    store
+        .append(&format!("{tenant}:Payment:pay-stale"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-stale", 1, top_level.clone()).await;
+    store
+        .append(&format!("{tenant}:Payment:pay-stale"), 1, &[updated()])
+        .await
+        .unwrap();
+    // Deleted, with its projection row left behind.
+    store
+        .append(&format!("{tenant}:Payment:pay-deleted"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-deleted", 1, top_level.clone()).await;
+    store
+        .append(
+            &format!("{tenant}:Payment:pay-deleted"),
+            1,
+            &[tombstone_envelope()],
+        )
+        .await
+        .unwrap();
+    // Journaled but never projected: not a catalog row at all.
+    store
+        .append(
+            &format!("{tenant}:Payment:pay-unprojected"),
+            0,
+            &[created()],
+        )
+        .await
+        .unwrap();
+    // Current, with its fields written under a `fields` object.
+    store
+        .append(&format!("{tenant}:Payment:pay-wrapped"), 0, &[created()])
+        .await
+        .unwrap();
+    project("pay-wrapped", 1, wrapped.clone()).await;
+
+    let mut rows = store
+        .projection_catalog_freshness(&tenant, "Payment")
+        .await
+        .expect("read catalog freshness");
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        rows,
+        vec![
+            ("pay-current".to_string(), true, None),
+            ("pay-deleted".to_string(), false, None),
+            ("pay-stale".to_string(), false, None),
+            ("pay-wrapped".to_string(), true, Some(wrapped)),
+        ]
+    );
 }

@@ -5,7 +5,7 @@ use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 
 struct TursoMetrics {
-    query_duration: Histogram<f64>,
+    operation_duration: Histogram<f64>,
     write_retries: Counter<u64>,
 }
 
@@ -14,9 +14,17 @@ fn metrics() -> &'static TursoMetrics {
     METRICS.get_or_init(|| {
         let meter = global::meter("temper.turso");
         TursoMetrics {
-            query_duration: meter
-                .f64_histogram("temper_turso_query_duration")
-                .with_description("Latency of Turso/libSQL query and execute operations.")
+            // Its own name: `temper_turso_query_duration` is the per-call
+            // histogram in `store::instrumentation`, and two instruments under
+            // one name mixed seconds with milliseconds in one series.
+            operation_duration: meter
+                .f64_histogram("temper_turso_operation_duration")
+                .with_unit("ms")
+                .with_description(
+                    "Duration of one Turso/libSQL store operation, start to finish: its \
+                     connection, every query and execute inside it, and reading the rows. \
+                     Tagged by operation.",
+                )
                 .build(),
             write_retries: meter
                 .u64_counter("temper_turso_write_retries_total")
@@ -34,9 +42,9 @@ pub fn init_metrics() {
     let _ = metrics();
 }
 
-pub(crate) fn record_turso_query_duration(duration: Duration, operation: &str) {
-    metrics().query_duration.record(
-        duration.as_secs_f64(),
+pub(crate) fn record_turso_operation_duration(duration: Duration, operation: &str) {
+    metrics().operation_duration.record(
+        duration.as_secs_f64() * 1_000.0,
         &[KeyValue::new("operation", operation.to_string())],
     );
 }
@@ -75,6 +83,6 @@ impl TursoQueryTimer {
 
 impl Drop for TursoQueryTimer {
     fn drop(&mut self) {
-        record_turso_query_duration(self.started.elapsed(), self.operation);
+        record_turso_operation_duration(self.started.elapsed(), self.operation);
     }
 }

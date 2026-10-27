@@ -17,7 +17,9 @@ use crate::metrics::{
 mod evolution;
 mod inputs;
 mod policy_approval;
+mod policy_replace;
 mod rows;
+mod scheduled_actions;
 mod specs;
 mod state_timers;
 pub use inputs::{PostgresEvolutionRecordInsert, PostgresPolicyApprovalCommit};
@@ -91,13 +93,20 @@ async fn update_query_projection_catalog_row(
     Ok(())
 }
 
+/// Bring the entity's `entity_field_index` rows to `new_index`. Only a field
+/// the entity no longer indexes is deleted, and only a row whose value changed
+/// is written, so a move that sets three fields writes three rows.
+///
+/// A row holds one field's value and nothing else about the entity. Its
+/// `status` column is left NULL: filters read the status from the catalog row,
+/// so a status change writes no index rows. A row written before rows stopped
+/// carrying the status gets it cleared when its value next changes.
 async fn reconcile_query_projection_field_index(
     schema: &crate::PostgresSchema,
     tx: &mut Transaction<'_, Postgres>,
     tenant: &str,
     entity_type: &str,
     entity_id: &str,
-    status: &str,
     new_index: &ScalarFieldIndex,
 ) -> Result<(), PersistenceError> {
     let mut field_names = Vec::with_capacity(new_index.len());
@@ -113,20 +122,12 @@ async fn reconcile_query_projection_field_index(
          WHERE e.tenant = $1 \
            AND e.entity_type = $2 \
            AND e.entity_id = $3 \
-           AND NOT EXISTS ( \
-               SELECT 1 \
-               FROM unnest($4::text[], $5::text[]) AS incoming(field_name, field_value) \
-               WHERE incoming.field_name = e.field_name \
-                 AND incoming.field_value IS NOT DISTINCT FROM e.field_value \
-                 AND $6 IS NOT DISTINCT FROM e.status \
-           )",
+           AND e.field_name <> ALL($4::text[])",
     )
     .bind(tenant)
     .bind(entity_type)
     .bind(entity_id)
     .bind(&field_names)
-    .bind(&field_values)
-    .bind(status)
     .execute(&mut **tx)
     .await
     .map_err(storage_error)?;
@@ -135,21 +136,19 @@ async fn reconcile_query_projection_field_index(
         crate::dbm::postgres_query!(
             schema,
             "INSERT INTO {schema}entity_field_index \
-             (tenant, entity_type, entity_id, field_name, field_value, status) \
-             SELECT $1, $2, $3, incoming.field_name, incoming.field_value, $6 \
+             (tenant, entity_type, entity_id, field_name, field_value) \
+             SELECT $1, $2, $3, incoming.field_name, incoming.field_value \
              FROM unnest($4::text[], $5::text[]) AS incoming(field_name, field_value) \
              ON CONFLICT (tenant, entity_type, entity_id, field_name) DO UPDATE SET \
                  field_value = EXCLUDED.field_value, \
-                 status = EXCLUDED.status \
-             WHERE entity_field_index.field_value IS DISTINCT FROM EXCLUDED.field_value \
-                OR entity_field_index.status IS DISTINCT FROM EXCLUDED.status",
+                 status = NULL \
+             WHERE entity_field_index.field_value IS DISTINCT FROM EXCLUDED.field_value",
         )
         .bind(tenant)
         .bind(entity_type)
         .bind(entity_id)
         .bind(&field_names)
         .bind(&field_values)
-        .bind(status)
         .execute(&mut **tx)
         .await
         .map_err(storage_error)?;
@@ -792,12 +791,11 @@ impl PostgresEventStore {
             }
         };
 
-        let should_reconcile_index =
-            previous_catalog
-                .as_ref()
-                .is_none_or(|(old_status, old_hash, _)| {
-                    old_status.as_str() != status || old_hash.as_str() != projection_hash.as_str()
-                });
+        // The index holds field values only, so a move that changes only the
+        // status leaves it alone.
+        let should_reconcile_index = previous_catalog
+            .as_ref()
+            .is_none_or(|(_, old_hash, _)| old_hash.as_str() != projection_hash.as_str());
         let reconciliation_path = if should_reconcile_index {
             if previous_catalog.is_some() {
                 "diff"
@@ -815,7 +813,6 @@ impl PostgresEventStore {
                 tenant,
                 entity_type,
                 entity_id,
-                status,
                 &new_index,
             )
             .await?;

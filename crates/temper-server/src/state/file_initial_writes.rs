@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use temper_runtime::persistence::{EventMetadata, PersistenceEnvelope, PersistenceError};
-use temper_runtime::scheduler::{sim_now, sim_uuid};
+use temper_runtime::scheduler::sim_uuid;
 use tracing::Instrument;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState, process_action_with_xref};
@@ -130,14 +130,7 @@ impl ServerState {
         let initial = state.clone();
         let mut events = Vec::with_capacity(3);
 
-        let created = EntityEvent {
-            action: "Created".to_string(),
-            from_status: String::new(),
-            to_status: state.status.clone(),
-            timestamp: sim_now(),
-            params: serde_json::json!({}),
-            idempotency_key: None,
-        };
+        let created = EntityEvent::bootstrap(state.status.clone());
         push_synthetic_event(&mut state, &mut events, created);
 
         let no_xref = std::collections::BTreeMap::new();
@@ -168,7 +161,7 @@ impl ServerState {
         });
         // The `File.StreamUpdated` spec guard reads the owning Workspace's
         // status. On the live dispatch path that status is resolved by
-        // `resolve_cross_entity_guards`; this atomic synthetic path bypasses
+        // `resolve_related_statuses`; this atomic synthetic path bypasses
         // that resolution, so supply it directly. We already confirmed the
         // workspace is Active (or absent) above.
         let mut stream_xref = temper_jit::table::RelatedMap::new();
@@ -243,12 +236,14 @@ impl ServerState {
 
         let response = EntityResponse {
             success: true,
+            refusal: None,
             state,
             error: None,
             custom_effects: vec![],
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         };
         self.broadcast_synthetic_file_stream_update(tenant, file_id, &response, agent_ctx);
         Ok(response)

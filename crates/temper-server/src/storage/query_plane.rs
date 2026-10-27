@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{CatalogGroupRow, PersistenceError};
 
 /// Backend-neutral projection row returned by [`QueryPlaneStore`].
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +52,58 @@ pub struct EntityCatalogRow {
     /// Full projected entity response state, with unbounded event history removed.
     pub state: Option<serde_json::Value>,
     pub sequence_nr: u64,
+}
+
+/// One projection catalog row, and whether its field index entries are the
+/// entity's committed fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogRowFreshness {
+    pub entity_id: String,
+    /// The entity's journal holds no event newer than the one this row was
+    /// projected from. When false, the row may hold the fields from before a
+    /// committed change whose projection failed or is still queued, or belong
+    /// to an entity that has since been deleted.
+    pub current: bool,
+    /// The row's projected fields when they hold a `fields` object, the shape
+    /// a write that wraps its body under `fields` leaves. The field index does
+    /// not look inside that object, so a reference held there is read from
+    /// these fields. `None` for every other row.
+    pub wrapped_fields: Option<serde_json::Value>,
+}
+
+/// Catalog rows of one entity type that hold the same status and the same
+/// value of each field asked for, from [`QueryPlaneStore::catalog_groups`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogGroup {
+    pub status: String,
+    /// The fields asked for that the rows hold, with their values.
+    pub values: BTreeMap<String, serde_json::Value>,
+    /// Their entity ids, in order.
+    pub ids: Vec<String>,
+}
+
+impl CatalogGroup {
+    /// A group from a store's row, whose values are those of `fields` in
+    /// order.
+    pub fn from_row(row: CatalogGroupRow, fields: &[String]) -> Self {
+        debug_assert_eq!(fields.len(), row.values.len());
+        Self {
+            status: row.status,
+            values: fields
+                .iter()
+                .zip(row.values)
+                .filter_map(|(field, value)| Some((field.clone(), value?)))
+                .collect(),
+            ids: row.ids,
+        }
+    }
+
+    /// Groups from a store's rows.
+    pub fn from_rows(rows: Vec<CatalogGroupRow>, fields: &[String]) -> Vec<Self> {
+        rows.into_iter()
+            .map(|row| Self::from_row(row, fields))
+            .collect()
+    }
 }
 
 /// Backend-neutral durable projection upsert.
@@ -178,4 +230,29 @@ pub trait QueryPlaneStore: Send + Sync {
     async fn projected_entity_counts_by_tenant(
         &self,
     ) -> Result<Option<Vec<(String, u64)>>, PersistenceError>;
+
+    /// Every projection catalog row of `entity_type`, compared with its
+    /// entity's journal in one read. Returns `None` if the backend cannot
+    /// compare them.
+    async fn projection_catalog_freshness(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+    ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        Ok(None)
+    }
+
+    /// The catalog rows of `entity_type` in one of `statuses` that
+    /// [`Self::projection_catalog_freshness`] reads as current and unwrapped,
+    /// grouped by status and by the value of each of `fields`, with their
+    /// ids, in one read. Returns `None` if the backend cannot group them.
+    async fn catalog_groups(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _fields: &[String],
+        _statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
+        Ok(None)
+    }
 }

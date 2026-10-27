@@ -7,6 +7,7 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use temper_authz::AuthenticatedRequestContext;
+use temper_runtime::tenant::TenantId;
 use temper_spec::automaton::LintSeverity;
 use temper_spec::cross_invariant::{
     CrossInvariantLintSeverity, lint_cross_invariants, parse_cross_invariants,
@@ -388,6 +389,21 @@ pub(super) async fn load_specs_from_directory(
         return build_ndjson_response(StatusCode::BAD_REQUEST, lines);
     }
 
+    // Stored records must keep a way forward under each new version, or be
+    // carried; checked before anything is written (see `state::spec_change`).
+    let tenant_id = TenantId::new(&body.tenant);
+    let sources: Vec<(&str, &str)> = ioa_sources
+        .iter()
+        .map(|(entity_type, source)| (entity_type.as_str(), source.as_str()))
+        .collect();
+    let changes = state
+        .spec_changes(&tenant_id, &sources)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let spec_change = state
+        .check_spec_changes(&tenant_id, &changes, None)
+        .await
+        .map_err(|refused| (StatusCode::CONFLICT, refused.to_string()))?;
+
     // Persist loaded specs first when Postgres is configured.
     let csdl_xml_for_db = csdl_xml.clone();
     for (entity_type, ioa_source) in &ioa_sources {
@@ -447,6 +463,10 @@ pub(super) async fn load_specs_from_directory(
             })?;
     }
     state.rebuild_reaction_dispatcher();
+    state.spawn_follow_spec_changes();
+    // The records the check carries wait in their old states until this pass
+    // has made their carries, after the answer.
+    state.spawn_carry_stranded(vec![tenant_id]);
 
     if !state.data_dir.as_os_str().is_empty() {
         let registry_path = state.data_dir.join("specs-registry.json");
@@ -475,11 +495,22 @@ pub(super) async fn load_specs_from_directory(
 
     // Stream NDJSON response: verification runs inline and results are streamed per-entity.
     // Any agent calling this endpoint gets verification results without polling.
-    let lint_warning_lines: Vec<serde_json::Value> = lint_findings
+    let mut lint_warning_lines: Vec<serde_json::Value> = lint_findings
         .into_iter()
         .filter(|f| matches!(f.severity, LintSeverity::Warning))
         .map(|f| lint_ndjson_line(&f))
         .collect();
+    if !spec_change.carries.is_empty() {
+        lint_warning_lines.push(serde_json::json!({
+            "type": "carrying",
+            "records": spec_change.carries.len(),
+        }));
+    }
+    lint_warning_lines.extend(
+        spec_change.warnings.iter().map(
+            |message| serde_json::json!({ "type": "spec_change_warning", "message": message }),
+        ),
+    );
     let cross_lint_warning_lines: Vec<serde_json::Value> = cross_lint_findings
         .into_iter()
         .filter(|f| matches!(f.severity, CrossInvariantLintSeverity::Warning))

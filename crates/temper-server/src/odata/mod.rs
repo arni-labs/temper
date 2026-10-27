@@ -19,6 +19,7 @@ mod response;
 mod storage_guardrails;
 mod stream_fast_path;
 mod stream_put;
+mod unavailable_tenant;
 mod write;
 
 pub(crate) use common::resolve_entity_type;
@@ -27,6 +28,8 @@ pub use read::handle_hints;
 pub use read::handle_metadata;
 pub use read::handle_odata_get;
 pub use read::handle_service_document;
+pub(crate) use unavailable_tenant::refuse_unavailable_tenant;
+pub use unavailable_tenant::unavailable_tenant_response;
 pub use write::handle_odata_delete;
 pub use write::handle_odata_patch;
 pub use write::handle_odata_post;

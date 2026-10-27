@@ -7,7 +7,9 @@ use std::time::Instant;
 use tracing::{Instrument, instrument};
 
 use temper_observe::wide_event;
-use temper_runtime::persistence::{EventMetadata, PersistenceEnvelope, PersistenceError};
+use temper_runtime::persistence::{
+    CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError, ProjectionRow,
+};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
@@ -16,6 +18,7 @@ use super::{ServerState, projection_backfill};
 use crate::entity_actor::{EntityActor, EntityEvent, EntityMsg, EntityResponse};
 use crate::events::EntityStateChange;
 use crate::registry::{VerificationDetail, VerificationStatus};
+use crate::request_context::AgentContext;
 use crate::runtime_metrics;
 use crate::storage::DataOnlyCreateRecord;
 
@@ -33,17 +36,6 @@ fn actor_idle_timeout_secs() -> i64 {
             .filter(|v| *v > 0)
             .unwrap_or(300)
     })
-}
-
-fn is_deleted_envelope(event: &PersistenceEnvelope) -> bool {
-    if event.event_type == "Deleted" {
-        return true;
-    }
-    event
-        .payload
-        .get("action")
-        .and_then(serde_json::Value::as_str)
-        == Some("Deleted")
 }
 
 fn record_projection_update_started(
@@ -310,6 +302,7 @@ impl ServerState {
             .ok_or_else(|| format!("No transition table for {tenant}/{entity_type}"))?;
             EntityResponse {
                 success: true,
+                refusal: None,
                 state: EntityActor::build_initial_state(
                     entity_type,
                     entity_id,
@@ -321,6 +314,7 @@ impl ServerState {
                 scheduled_actions: vec![],
                 spawn_requests: vec![],
                 spec_governed: true,
+                refused: false,
             }
         };
 
@@ -942,13 +936,34 @@ impl ServerState {
     }
 
     /// Get or spawn an entity actor with initial fields for a specific tenant.
-    #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
     pub fn get_or_spawn_tenant_actor_with_fields(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
+    ) -> Result<ActorRef<EntityMsg>, String> {
+        self.get_or_spawn_tenant_actor_created_by(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+            None,
+        )
+    }
+
+    /// [`Self::get_or_spawn_tenant_actor_with_fields`], for a record that
+    /// `created_by` creates: a new actor writes its `Created` event as that
+    /// caller's, so a first state with a timer commits the timer's row with
+    /// it.
+    #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
+    fn get_or_spawn_tenant_actor_created_by(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: Option<&AgentContext>,
     ) -> Result<ActorRef<EntityMsg>, String> {
         if !initial_fields
             .as_object()
@@ -1019,7 +1034,10 @@ impl ServerState {
                 .with_idempotency_cache(self.idempotency_cache.clone())
                 .with_blob_store(tenant_blob_store),
         }
-        .with_legacy_blob_store(legacy_blob_store);
+        .with_legacy_blob_store(legacy_blob_store)
+        .with_on_rehydrated(self.state_timer_rehydrate_hook(tenant, entity_type, entity_id))
+        .with_entity_rows(self.entity_rows_hook(tenant, entity_type))
+        .with_creator(created_by.cloned());
 
         // Slow-path: atomically re-check and spawn under write lock.
         // This prevents duplicate actors when concurrent requests race to create
@@ -1264,6 +1282,8 @@ impl ServerState {
             timestamp: sim_now(),
             params: fields,
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
@@ -1277,7 +1297,6 @@ impl ServerState {
     }
 
     /// Create a new entity with initial fields and return its state.
-    #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_or_create_tenant_entity(
         &self,
         tenant: &TenantId,
@@ -1285,13 +1304,50 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<EntityResponse, String> {
-        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
-            .map_err(|e| e.to_string())?;
-        let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
+        self.create_tenant_entity(tenant, entity_type, entity_id, initial_fields, None)
+            .await
+    }
+
+    /// [`Self::get_or_create_tenant_entity`] for a record `created_by`
+    /// creates. A first state with a timer commits the timer's row, armed as
+    /// `created_by`, with the record's `Created` event: a process that stops
+    /// before [`Self::arm_state_timeouts_on_creation`] leaves the timer to
+    /// the next one.
+    pub async fn get_or_create_tenant_entity_by(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: &AgentContext,
+    ) -> Result<EntityResponse, String> {
+        self.create_tenant_entity(
             tenant,
             entity_type,
             entity_id,
             initial_fields,
+            Some(created_by),
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
+    async fn create_tenant_entity(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: Option<&AgentContext>,
+    ) -> Result<EntityResponse, String> {
+        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
+            .map_err(|e| e.to_string())?;
+        let actor_ref = self.get_or_spawn_tenant_actor_created_by(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+            created_by,
         )?;
 
         let policy = self.dispatch_retry_policy();
@@ -1328,7 +1384,7 @@ impl ServerState {
         );
         let _ = self.event_tx.send(change);
 
-        if let Some(query_plane) = self.query_plane_store() {
+        if let Some(query_plane) = self.query_plane_written_after_commit() {
             let status = response.state.status.clone();
             let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
             let projected_state = self.query_projection_state(&response.state);
@@ -1449,6 +1505,8 @@ impl ServerState {
             timestamp: sim_now(),
             params: initial_fields,
             idempotency_key: None,
+            kind: temper_runtime::persistence::EventKind::Transition,
+            outcome: None,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;
@@ -1543,8 +1601,22 @@ impl ServerState {
             }
         } else {
             let append_started_at = Instant::now(); // determinism-ok: production-only append wait metric
+            let rows_follow = self.entity_rows_follow_commits();
+            let projection = rows_follow.then_some(ProjectionRow::Upsert {
+                status: &state.status,
+                fields: &projection_fields,
+                state: &projection_state,
+            });
             let append_result = store
-                .append(&persistence_id, state.sequence_nr, &[envelope])
+                .append_with_rows(
+                    &persistence_id,
+                    state.sequence_nr,
+                    &[envelope],
+                    CommitRows {
+                        projection,
+                        ..CommitRows::default()
+                    },
+                )
                 .await;
             runtime_metrics::record_event_store_append_wait(
                 backend.as_str(),
@@ -1569,17 +1641,18 @@ impl ServerState {
             let source = "data_only_create_fast_path";
             record_projection_update_started(tenant, entity_type, operation, source);
             let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
-            if let Err(e) = query_plane
-                .upsert_projection(
-                    tenant.as_str(),
-                    entity_type,
-                    entity_id,
-                    &state.status,
-                    &projection_fields,
-                    &projection_state,
-                    state.sequence_nr,
-                )
-                .await
+            if !rows_follow
+                && let Err(e) = query_plane
+                    .upsert_projection(
+                        tenant.as_str(),
+                        entity_type,
+                        entity_id,
+                        &state.status,
+                        &projection_fields,
+                        &projection_state,
+                        state.sequence_nr,
+                    )
+                    .await
             {
                 record_projection_update_error(
                     tenant,
@@ -1645,12 +1718,14 @@ impl ServerState {
 
         Ok(Some(EntityResponse {
             success: true,
+            refusal: None,
             state,
             error: None,
             custom_effects: vec![],
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
         }))
     }
 
@@ -1748,7 +1823,7 @@ impl ServerState {
         .map_err(|e| format!("Actor update failed: {e}"))?;
 
         if response.success
-            && let Some(query_plane) = self.query_plane_store()
+            && let Some(query_plane) = self.query_plane_written_after_commit()
         {
             let status = response.state.status.clone();
             let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
@@ -1870,7 +1945,7 @@ impl ServerState {
         .map_err(|e| format!("Actor delete failed: {e}"))?;
 
         if response.success {
-            if let Some(query_plane) = self.query_plane_store() {
+            if let Some(query_plane) = self.query_plane_written_after_commit() {
                 let operation = "remove";
                 let source = "delete";
                 record_projection_update_started(tenant, entity_type, operation, source);
@@ -1910,10 +1985,24 @@ impl ServerState {
                 }
             }
 
+            // With a journal the tombstone is the record's last event, so its
+            // status replaces the cached one: a guard no longer finds the
+            // record in its last live status, and an older write still in
+            // flight cannot bring that status back. Without one nothing keeps
+            // the tombstone, and a record created later under the same id
+            // starts its count again, so the entry goes with the record.
+            if self.event_journal().is_some() {
+                self.cache_entity_status(tenant, &response.state);
+            } else if let Ok(mut cache) = self.entity_state_cache.lock() {
+                cache.pop(&format!("{tenant}:{entity_type}:{entity_id}"));
+            }
+
             // Tombstone persisted successfully; now it is safe to remove actor
-            // and in-memory index entries.
+            // and in-memory index entries. A deleted record keeps no timer.
             let _ = actor_ref.stop();
             self.remove_entity(tenant, entity_type, entity_id);
+            self.reconcile_state_timers(tenant, entity_type, entity_id, &response.state, None)
+                .await;
         }
 
         Ok(response)
@@ -1950,7 +2039,7 @@ impl ServerState {
                 _ => return true,
             };
 
-            if events.last().is_some_and(is_deleted_envelope) {
+            if temper_runtime::persistence::journal_is_deleted(&events) {
                 self.remove_entity(tenant, entity_type, entity_id);
                 return false;
             }
@@ -1988,7 +2077,7 @@ impl ServerState {
             return Ok(false);
         }
 
-        if events.last().is_some_and(is_deleted_envelope) {
+        if temper_runtime::persistence::journal_is_deleted(&events) {
             self.remove_entity(tenant, entity_type, entity_id);
             return Ok(false);
         }
@@ -2187,8 +2276,14 @@ impl ServerState {
                 if let Ok(mut last_accessed) = self.last_accessed.write() {
                     last_accessed.remove(&actor_key);
                 }
-                // Evict the state cache entry so stale status doesn't linger.
-                if let Ok(mut cache) = self.entity_state_cache.lock() {
+                // With a journal the record's cached status stays: it is still
+                // its newest, and the next actor continues the journal's
+                // sequence, so a write of this actor that lands late is older
+                // and cannot replace it. Without one the record's state ends
+                // with its actor, and its status goes with it.
+                if journal.is_none()
+                    && let Ok(mut cache) = self.entity_state_cache.lock()
+                {
                     cache.pop(&actor_key);
                 }
                 // The replay buffer is for clients following a live entity;
@@ -2308,40 +2403,6 @@ impl ServerState {
                     })
                 }
             }
-        }
-    }
-}
-
-/// Resolve the current status of an entity.
-///
-/// Fast path: check the `entity_state_cache` (populated on every successful dispatch).
-/// Slow path: fall back to `get_tenant_entity_state()` (async actor ask) and backfill cache.
-impl ServerState {
-    #[instrument(skip_all, fields(otel.name = "entity.resolve_entity_status", tenant = %tenant, entity_type, entity_id))]
-    pub async fn resolve_entity_status(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Option<String> {
-        // Fast path: check cache (LruCache::get requires &mut, so use Mutex).
-        let cache_key = format!("{tenant}:{entity_type}:{entity_id}");
-        if let Ok(mut cache) = self.entity_state_cache.lock()
-            && let Some((status, _timestamp)) = cache.get(&cache_key)
-        {
-            return Some(status.clone());
-        }
-
-        // Slow path: actor ask + backfill
-        if let Ok(response) = self
-            .get_tenant_entity_state(tenant, entity_type, entity_id)
-            .await
-        {
-            let status = response.state.status.clone();
-            self.cache_entity_status(cache_key, status.clone());
-            Some(status)
-        } else {
-            None
         }
     }
 }

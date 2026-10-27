@@ -3,7 +3,6 @@
 //!
 //! Exported for use by all `store` sub-modules via `super::instrumentation`.
 
-use std::ops::Deref;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -38,7 +37,9 @@ pub(super) fn record_turso_query_duration(
     );
 }
 
-/// Connection wrapper that records Turso query/execute latency metrics.
+/// A connection for reading, recording each query's latency. It cannot
+/// write: a write needs a [`WriteConnection`], which holds the write gate's
+/// permit.
 pub(crate) struct InstrumentedConnection {
     inner: crate::driver::Connection,
 }
@@ -58,6 +59,27 @@ impl InstrumentedConnection {
         record_turso_query_duration(start.elapsed(), "query", "connection", result.is_ok());
         result
     }
+}
+
+/// A connection that may write. It holds the write gate's permit until it is
+/// dropped, so writes to the database take turns at the gate and never wait
+/// for one another at the database's write lock (`super::write_gate`).
+pub(crate) struct WriteConnection {
+    // Declared before the permit, so it is closed before the permit is free.
+    conn: InstrumentedConnection,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl WriteConnection {
+    pub(super) fn new(
+        conn: InstrumentedConnection,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            conn,
+            _permit: permit,
+        }
+    }
 
     pub(crate) async fn execute(
         &self,
@@ -65,16 +87,25 @@ impl InstrumentedConnection {
         params: impl turso_serverless::params::IntoParams + Send,
     ) -> Result<u64, crate::driver::DriverError> {
         let start = Instant::now();
-        let result = self.inner.execute(sql, params).await;
+        let result = self.conn.inner.execute(sql, params).await;
         record_turso_query_duration(start.elapsed(), "execute", "connection", result.is_ok());
         result
     }
+
+    pub(crate) fn begin_immediate(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<crate::driver::Transaction<'_>, crate::driver::DriverError>,
+    > + Send {
+        self.conn.inner.begin_immediate()
+    }
 }
 
-impl Deref for InstrumentedConnection {
-    type Target = crate::driver::Connection;
+/// A connection that may write may also read.
+impl std::ops::Deref for WriteConnection {
+    type Target = InstrumentedConnection;
 
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        &self.conn
     }
 }

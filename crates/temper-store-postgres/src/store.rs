@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use sqlx::{Acquire, PgPool};
 use temper_runtime::persistence::{
-    EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore, PersistenceAppend,
-    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, pack_f32_le, unpack_f32_le,
+    CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
+    PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
+    ScheduledActionRecord, pack_f32_le, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -17,6 +18,7 @@ use crate::metrics::{
     PostgresTransactionTimer, record_postgres_pool_acquire_duration,
     record_postgres_transaction_begin_duration, record_postgres_transaction_commit_duration,
 };
+use crate::schema::tombstone_sql;
 use crate::segments;
 
 const EVENT_APPEND_OPERATION: &str = "event_append";
@@ -78,19 +80,33 @@ impl EventStore for PostgresEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        self.append_with_index_rows(persistence_id, expected_sequence, events, &[], &[], false)
-            .await
+        self.append_with_rows(
+            persistence_id,
+            expected_sequence,
+            events,
+            CommitRows::default(),
+        )
+        .await
     }
 
-    async fn append_with_index_rows(
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
+        let CommitRows {
+            key_rows,
+            vector_rows,
+            reconcile_vectors,
+            scheduled_actions,
+            fired_scheduled_action,
+            // Postgres keeps its query-plane and timer rows after the commit
+            // (`commits_entity_rows` is false): the server writes them.
+            projection: _,
+            state_timer: _,
+        } = rows;
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
 
@@ -309,6 +325,15 @@ impl EventStore for PostgresEventStore {
             }
         }
 
+        // The scheduled actions the transition armed, and the one it fired, in
+        // THIS transaction: a row exists exactly while its action waits.
+        self.insert_scheduled_actions(&mut tx, scheduled_actions)
+            .await?;
+        if let Some(arm_id) = fired_scheduled_action {
+            self.delete_scheduled_action_row(&mut tx, tenant, entity_type, entity_id, arm_id)
+                .await?;
+        }
+
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
             record_postgres_transaction_commit_duration(
@@ -326,6 +351,24 @@ impl EventStore for PostgresEventStore {
         transaction_timer.set_outcome("ok");
 
         Ok(new_seq)
+    }
+
+    async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        self.scheduled_action_rows(tenant).await
+    }
+
+    async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        self.remove_scheduled_action(tenant, entity_type, entity_id, arm_id)
+            .await
     }
 
     async fn backfill_entity_keys(
@@ -908,21 +951,6 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        crate::dbm::postgres_query!(&self.schema,
-            "INSERT INTO {schema}snapshot_history (tenant, entity_type, entity_id, sequence_nr, state) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (tenant, entity_type, entity_id, sequence_nr) \
-             DO UPDATE SET state = $5, created_at = now()",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(entity_id)
-        .bind(sequence_nr as i64)
-        .bind(snapshot)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-
         segments::rotate_after_snapshot(
             &self.schema,
             &mut tx,
@@ -993,7 +1021,8 @@ impl EventStore for PostgresEventStore {
     ) -> Result<Vec<String>, PersistenceError> {
         let rows: Vec<String> = crate::dbm::postgres_query_scalar!(
             &self.schema,
-            "SELECT entity_id \
+            concat!(
+                "SELECT entity_id \
              FROM ( \
                SELECT c.entity_id \
                FROM {schema}entity_catalog c \
@@ -1005,7 +1034,9 @@ impl EventStore for PostgresEventStore {
                    WHERE d.tenant = c.tenant \
                      AND d.entity_type = c.entity_type \
                      AND d.entity_id = c.entity_id \
-                     AND d.event_type = 'Deleted' \
+                     AND ",
+                tombstone_sql!(),
+                "
                  ) \
                UNION \
                SELECT f.entity_id \
@@ -1018,7 +1049,9 @@ impl EventStore for PostgresEventStore {
                    WHERE d.tenant = f.tenant \
                      AND d.entity_type = f.entity_type \
                      AND d.entity_id = f.entity_id \
-                     AND d.event_type = 'Deleted' \
+                     AND ",
+                tombstone_sql!(),
+                "
                  ) \
                UNION \
                SELECT DISTINCT e.entity_id \
@@ -1031,10 +1064,13 @@ impl EventStore for PostgresEventStore {
                    WHERE d.tenant = e.tenant \
                      AND d.entity_type = e.entity_type \
                      AND d.entity_id = e.entity_id \
-                     AND d.event_type = 'Deleted' \
+                     AND ",
+                tombstone_sql!(),
+                "
                  ) \
              ) ids \
-             ORDER BY entity_id",
+             ORDER BY entity_id"
+            ),
         )
         .bind(tenant)
         .bind(entity_type)
@@ -1098,6 +1134,10 @@ impl EventStore for PostgresEventStore {
 #[cfg(test)]
 #[path = "store_projection_test.rs"]
 mod projection_tests;
+
+#[cfg(test)]
+#[path = "field_index_writes_test.rs"]
+mod field_index_writes_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1174,12 +1214,8 @@ mod tests {
 
     #[test]
     fn list_entity_ids_returns_distinct_pairs() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1395,12 +1431,8 @@ mod tests {
 
     #[test]
     fn load_query_projection_fields_many_returns_requested_fields() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1470,9 +1502,8 @@ mod tests {
 
     #[test]
     fn published_artifact_upsert_round_trips_and_updates_by_id() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => return,
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {

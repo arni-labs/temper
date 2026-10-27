@@ -4564,6 +4564,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost 0.13.5",
  "reqwest 0.12.28",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -4574,9 +4575,12 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f8870d3024727e99212eb3bb1762ec16e255e3e6f58eeb3dc8db1aa226746d"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost 0.13.5",
+ "serde",
  "tonic",
 ]
 
@@ -7101,8 +7105,10 @@ dependencies = [
  "temper-store-postgres",
  "temper-store-redis",
  "temper-store-turso",
+ "temper-test-resource",
  "temper-transport",
  "temper-verify",
+ "temper-wasm",
  "tempfile",
  "termimad",
  "tikv-jemallocator",
@@ -7362,6 +7368,8 @@ dependencies = [
  "libc",
  "lru",
  "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
  "opentelemetry_sdk",
  "p256",
  "percent-encoding",
@@ -7389,6 +7397,7 @@ dependencies = [
  "temper-store-redis",
  "temper-store-sim",
  "temper-store-turso",
+ "temper-test-resource",
  "temper-verify",
  "temper-wasm",
  "tempfile",
@@ -7434,6 +7443,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "temper-runtime",
+ "temper-test-resource",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7451,6 +7461,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temper-runtime",
+ "temper-test-resource",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -7481,6 +7492,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "temper-runtime",
+ "temper-store-turso",
+ "temper-test-resource",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -7491,6 +7504,10 @@ dependencies = [
  "uuid",
  "wiremock",
 ]
+
+[[package]]
+name = "temper-test-resource"
+version = "0.1.0"
 
 [[package]]
 name = "temper-transport"
@@ -7514,8 +7531,8 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "stacker",
  "stateright",
+ "temper-authz",
  "temper-runtime",
  "temper-spec",
  "z3",

@@ -24,7 +24,9 @@ mod agent_bootstrap;
 mod app_catalog;
 mod closure_bootstrap;
 mod entity_aliases;
+mod install_checks;
 mod install_guard;
+mod module_review_step;
 mod policy_rows;
 mod reconcile;
 mod runtime_heal;
@@ -913,7 +915,7 @@ pub fn list_os_apps() -> Vec<AppEntry> {
 pub fn get_os_app(name: &str) -> Option<AppBundle> {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
     let app_dir = cat.paths.get(name)?;
-    load_app_bundle(app_dir)
+    load_app_bundle(app_dir).ok()
 }
 
 /// Get the full app guide markdown for an app by name.
@@ -925,9 +927,9 @@ pub fn get_app_guide(name: &str) -> Option<String> {
         .and_then(|e| e.app_guide.clone())
 }
 
-/// Load a complete app bundle from a directory on disk.
-fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
-    let manifest = read_app_manifest(app_dir)?;
+/// Load a complete app bundle from a directory on disk, or say why not.
+fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
+    let manifest = read_app_manifest(app_dir).ok_or("its app.toml is missing or invalid")?;
     let deployment_mode = effective_app_deployment_mode(&manifest);
     let legacy_reaction_paths = [
         app_dir.join("reactions").join("reactions.toml"),
@@ -938,15 +940,16 @@ fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
             path = %path.display(),
             "legacy reactions.toml is no longer supported; migrate this app to inline [[action.triggers]]"
         );
-        return None;
+        return Err("legacy reactions.toml is no longer supported".to_string());
     }
     let ioa_files = find_ioa_files(app_dir);
 
     // Read IOA specs, extracting entity type from the parsed automaton name.
     let mut specs = Vec::new();
     for (_hint, path) in &ioa_files {
-        let source = std::fs::read_to_string(path).ok()?;
-        let parsed = automaton::parse_automaton(&source).ok()?;
+        let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let parsed = automaton::parse_automaton(&source)
+            .map_err(|error| format!("{} is refused: {error}", app_relative_path(app_dir, path)))?;
         specs.push((parsed.automaton.name, source));
     }
 
@@ -1010,10 +1013,10 @@ fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
         && csdl.is_none()
         && cross_invariants_toml.is_none()
     {
-        return None;
+        return Err("it holds nothing to install".to_string());
     }
 
-    Some(AppBundle {
+    Ok(AppBundle {
         deployment_mode,
         specs,
         csdl,
@@ -1106,7 +1109,8 @@ pub(super) async fn install_os_app_with_plan(
     app_name: &str,
     plan: OsAppInstallPlan,
 ) -> Result<InstallResult, String> {
-    let _serialized = install_guard::tenant(tenant).await;
+    install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
+    let mut install = install_guard::tenant(&state.server, tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
         cat.paths.get(app_name).cloned().ok_or_else(|| {
@@ -1114,9 +1118,9 @@ pub(super) async fn install_os_app_with_plan(
             format!("OS app '{app_name}' not found in catalog (known path keys: {known:?})")
         })?
     };
-    let bundle = load_app_bundle(&app_dir).ok_or_else(|| {
+    let bundle = load_app_bundle(&app_dir).map_err(|why| {
         format!(
-            "OS app '{app_name}' is registered at '{}' but its bundle failed to load",
+            "OS app '{app_name}' is registered at '{}' but its bundle failed to load: {why}",
             app_dir.display()
         )
     })?;
@@ -1133,6 +1137,8 @@ pub(super) async fn install_os_app_with_plan(
             missing.join(", ")
         ));
     }
+    // Jev reads the changed modules beside the rest of the install; joined before it answers.
+    let review = module_review_step::start(state, tenant, &app_dir, &bundle, plan.wasm).await;
     if bundle.deployment_mode == AppDeploymentMode::Commons {
         state.server.enable_commons_guardrails(tenant);
     }
@@ -1178,11 +1184,13 @@ pub(super) async fn install_os_app_with_plan(
                 }
             }
         }
+        // Parsed before any write, with the CSDL below (see `install_checks`).
+        install_checks::parse_cross_invariants(bundle.cross_invariants_toml.as_deref(), app_name)?;
         // App installs must preserve existing tenant types.
         let merged_csdl = if let Some(ref csdl) = bundle.csdl {
+            let incoming = parse_csdl(csdl)
+                .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
             if let Some(existing) = registry.get_tenant(&tenant_id) {
-                let incoming = parse_csdl(csdl)
-                    .map_err(|e| format!("Failed to parse CSDL for os-app '{app_name}': {e}"))?;
                 Some(emit_csdl_xml(&merge_csdl(&existing.csdl, &incoming)))
             } else {
                 Some(csdl.clone())
@@ -1201,6 +1209,7 @@ pub(super) async fn install_os_app_with_plan(
     added.sort();
     updated.sort();
     skipped.sort();
+    let new_specs = plan.specs && !(added.is_empty() && updated.is_empty());
 
     // Build the full Cedar policy text for this tenant: the live text without
     // what this app's previous install wrote, plus the bundle's policies.
@@ -1222,6 +1231,23 @@ pub(super) async fn install_os_app_with_plan(
         tenant,
         combined_policy.as_deref(),
     )?;
+    let policies = combined_policy.as_deref();
+    // A carry's then move is asked of the policies the install serves with.
+    let mut warnings = install_checks::check_spec_changes(
+        state,
+        &tenant_id,
+        app_name,
+        &bundle.specs,
+        plan.specs,
+        policies,
+    )
+    .await?;
+    warnings.extend(
+        install_checks::prove(state, tenant, app_name, &bundle.specs, new_specs, policies)
+            .await?
+            .into_iter()
+            .map(InstallWarning::joint_invariants),
+    );
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
@@ -1330,7 +1356,8 @@ pub(super) async fn install_os_app_with_plan(
     }
 
     if plan.policies {
-        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle).await?;
+        policy_rows::persist_bundle_policy_rows(state, tenant, app_name, &bundle, &superseded)
+            .await?;
         policy_rows::delete_dropped_rows(state, tenant, &superseded).await?;
     }
 
@@ -1343,27 +1370,7 @@ pub(super) async fn install_os_app_with_plan(
             .iter()
             .map(|(et, src)| (et.as_str(), src.as_str()))
             .collect();
-        let verified_cache = if let Some(turso) = state
-            .server
-            .storage_stack
-            .as_ref()
-            .and_then(|stack| stack.turso.as_ref())
-            .and_then(|provider| provider.platform_store())
-        {
-            turso
-                .load_verification_cache(tenant)
-                .await
-                .unwrap_or_default()
-        } else if let Some(ps) = state
-            .server
-            .storage_stack
-            .as_ref()
-            .and_then(|stack| stack.platform.clone())
-        {
-            ps.load_verification_cache(tenant).await.unwrap_or_default()
-        } else {
-            std::collections::BTreeMap::new()
-        };
+        let verified_cache = bootstrap::load_verification_cache(state, tenant).await;
 
         if let Some(ref merged) = merged_csdl {
             // Even when every spec is byte-for-byte unchanged, we still need to
@@ -1383,7 +1390,7 @@ pub(super) async fn install_os_app_with_plan(
                     cross_invariants_source: bundle.cross_invariants_toml.as_deref(),
                     verification_mode: bootstrap::BootstrapSpecVerificationMode::TrustBundle,
                 },
-            );
+            )?;
 
             if let Some(ps) = state
                 .server
@@ -1402,15 +1409,9 @@ pub(super) async fn install_os_app_with_plan(
                 .await;
             }
         }
-        // App installs can introduce or update inline entity triggers.
-        // Refresh the live dispatcher after the registry mutation so the
-        // newly bootstrapped trigger graph is active for subsequent traffic.
-        state.server.rebuild_reaction_dispatcher();
     }
 
-    // App installs can add or change cross-entity reactions. Refresh the live
-    // dispatcher immediately so the newly registered tenant config takes effect
-    // without requiring a process restart or a separate specs reload.
+    // Installed specs can change triggers and cross-entity reactions: refresh the dispatcher.
     if plan.specs {
         state.server.rebuild_reaction_dispatcher();
     }
@@ -1568,6 +1569,9 @@ pub(super) async fn install_os_app_with_plan(
         }
     }
 
+    // Overdue timers may fire at once: reconcile only now that policies and modules are in.
+    install.installed(&state.server, plan.specs);
+
     tracing::info!(
         "Installed os-app '{app_name}' for tenant '{tenant}': added={added:?} updated={updated:?} skipped={skipped:?} wasm={wasm_registered:?}"
     );
@@ -1615,6 +1619,8 @@ pub(super) async fn install_os_app_with_plan(
     };
 
     reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle).await;
+    let review = review.finish().await;
+    warnings.extend(review.warnings);
 
     Ok(InstallResult {
         added,
@@ -1627,6 +1633,8 @@ pub(super) async fn install_os_app_with_plan(
         skills: skills_bootstrapped,
         adrs_bootstrapped,
         seed_instances: seed_created,
+        warnings,
+        modules_reviewed: review.reviewed,
     })
 }
 

@@ -15,7 +15,7 @@ use serde_json::Value;
 use temper_runtime::persistence::PersistenceError;
 use temper_runtime::scheduler::sim_now;
 
-use super::actor::{EntityActor, ReplayPolicy};
+use super::actor::{EntityActor, ReplayLogging, ReplayPolicy};
 use super::effects;
 use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 
@@ -103,7 +103,14 @@ pub(super) async fn commit_field_update(
     let mut attempt: u32 = 0;
     loop {
         match actor
-            .persist_event(store, backend, &actor.persistence_id(), state, &event)
+            .persist_event(
+                store,
+                backend,
+                state,
+                &event,
+                &super::scheduled_rows::ScheduledRows::default(),
+                None,
+            )
             .await
         {
             Ok(_) => break,
@@ -183,6 +190,8 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         timestamp: sim_now(),
         params: fields.clone(),
         idempotency_key: None,
+        kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     }
 }
 
@@ -268,7 +277,7 @@ async fn catch_up(
         &mut caught_up,
         &actor.tenant,
         actor.blob_store.as_ref(),
-        ReplayPolicy::LenientSnapshot,
+        (ReplayPolicy::StrictSnapshot, ReplayLogging::Actor),
     )
     .await
     .map_err(|e| format!("conflict recovery replay failed: {e}"))?;

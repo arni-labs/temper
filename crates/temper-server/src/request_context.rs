@@ -12,6 +12,8 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+pub(crate) mod armed_by;
+mod execution;
 mod inline_chain;
 mod observation_metadata;
 
@@ -89,6 +91,15 @@ pub struct AgentContext {
     /// `Idempotency-Key` header. Threaded into `EntityMsg::Action` so the
     /// actor can dedupe duplicate asks produced by dispatch-layer retries.
     pub idempotency_key: Option<String>,
+    /// Runtime-owned; never populated from request headers. The scheduled
+    /// action this dispatch fires: the actor removes its row in the commit of
+    /// the fire's event, and only for that record, so a child dispatch that
+    /// inherits this context removes nothing.
+    pub fires_scheduled_action: Option<ScheduledFire>,
+    /// Runtime-owned; never populated from request headers. The state timer
+    /// this dispatch fires: the actor applies its action only while the
+    /// record's journal is at the sequence the timer was armed at.
+    pub fires_state_timer: Option<StateTimerFire>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -97,58 +108,62 @@ pub struct AgentContext {
     pub observation_metadata: BTreeMap<String, String>,
 }
 
+/// A scheduled action's row, by its record and arm id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScheduledFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The row's arm id.
+    pub arm_id: String,
+}
+
+/// A state timer's fire: its record, its action, and the record's journal
+/// sequence when the timer was armed.
+///
+/// An arming is read from the journal at `armed_seq`, so every writer that
+/// holds it (an old and a new process during a deploy, or a fire sent again
+/// after a lost answer) fires at that sequence. The first to commit moves the
+/// journal past it; the store's sequence check picks that writer. Every other
+/// fire of the arming then finds the record moved and is dropped, so an
+/// arming commits its action at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTimerFire {
+    /// The record's tenant.
+    pub tenant: String,
+    /// The record's entity type.
+    pub entity_type: String,
+    /// The record's id.
+    pub entity_id: String,
+    /// The timer's `on_timeout` action.
+    pub action: String,
+    /// The record's journal sequence when the timer was armed.
+    pub armed_seq: u64,
+}
+
 impl AgentContext {
-    /// Admit a callback running `action` on an entity, unless its inline
-    /// chain has already taken that step or the lineage has used its hops.
-    pub(crate) fn for_callback(
+    /// The sequence this dispatch's state timer was armed at, when the
+    /// dispatch fires `action` on this record. A child dispatch that inherits
+    /// the context, on another record or with another action, is not the fire.
+    pub(crate) fn state_timer_armed_seq(
         &self,
+        tenant: &str,
         entity_type: &str,
         entity_id: &str,
         action: &str,
-    ) -> Result<Self, CallbackBudgetExceeded> {
-        let step = self.inline_chain.step(entity_type, entity_id, action);
-        let inline_chain = self
-            .inline_chain
-            .then(step)
-            .map_err(CallbackBudgetExceeded::RepeatedStep)?;
-        if self.callback_hops >= MAX_CALLBACK_HOPS {
-            return Err(CallbackBudgetExceeded::TotalHops);
-        }
-        let mut next = self.clone();
-        next.inline_chain = inline_chain;
-        next.callback_hops += 1;
-        Ok(next)
-    }
-
-    /// This context inside `action` on an entity: the step of its inline
-    /// chain that the action's own inline work continues.
-    pub(crate) fn entering(&self, entity_type: &str, entity_id: &str, action: &str) -> Self {
-        let mut next = self.clone();
-        let step = self.inline_chain.step(entity_type, entity_id, action);
-        next.inline_chain = self.inline_chain.entering(step);
-        next
-    }
-
-    /// This context after its step made these entities (`(type, id)`), so its
-    /// chain knows them as made rather than found.
-    pub(crate) fn having_made<'a>(
-        mut self,
-        made: impl IntoIterator<Item = (&'a str, &'a str)>,
-    ) -> Self {
-        for (entity_type, entity_id) in made {
-            self.inline_chain = self.inline_chain.making(entity_type, entity_id);
-        }
-        self
-    }
-
-    /// Begin a detached task without replenishing its causal callback budget.
-    ///
-    /// Call only at a runtime-owned spawn boundary: the parent inline chain
-    /// ends there, but its callback lineage continues in the detached task.
-    pub(crate) fn for_background_task(&self) -> Self {
-        let mut next = self.clone();
-        next.inline_chain = InlineChain::default();
-        next
+    ) -> Option<u64> {
+        self.fires_state_timer
+            .as_ref()
+            .filter(|fire| {
+                fire.tenant == tenant
+                    && fire.entity_type == entity_type
+                    && fire.entity_id == entity_id
+                    && fire.action == action
+            })
+            .map(|fire| fire.armed_seq)
     }
 
     /// Create a system-level agent context for internal operations.
@@ -171,6 +186,8 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -208,6 +225,8 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -344,6 +363,8 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_root_entity_id,
         workflow_run_id,
         idempotency_key,
+        fires_scheduled_action: None,
+        fires_state_timer: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }
@@ -426,22 +447,6 @@ fn remote_parent_from_header(headers: &HeaderMap, name: &str) -> Option<opentele
         .and_then(|value| TraceState::from_str(value).ok())
         .unwrap_or_default();
     remote_parent(trace_id, span_id, flags, state)
-}
-
-pub(crate) fn remote_parent_context(agent_ctx: &AgentContext) -> Option<opentelemetry::Context> {
-    remote_parent_from_ids(
-        agent_ctx.trace_id.as_deref()?,
-        agent_ctx.parent_span_id.as_deref()?,
-    )
-}
-
-fn remote_parent_from_ids(trace_id: &str, span_id: &str) -> Option<opentelemetry::Context> {
-    remote_parent(
-        trace_id,
-        span_id,
-        TraceFlags::SAMPLED,
-        TraceState::default(),
-    )
 }
 
 fn remote_parent(

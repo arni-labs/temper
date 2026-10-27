@@ -1,6 +1,6 @@
 //! Who a reaction runs as, and the idempotency key it carries.
 
-use temper_authz::SecurityContext;
+use temper_authz::{SecurityContext, platform_keys};
 
 use crate::request_context::AgentContext;
 
@@ -32,23 +32,23 @@ pub(super) fn resolve_trigger_principal(
             let mut ctx = AgentContext::for_service_inheriting(service_name, invoking_ctx);
             if let Some(security_ctx) = ctx.security_ctx.as_mut() {
                 security_ctx.context_attrs.insert(
-                    "triggerRule".to_string(),
+                    platform_keys::TRIGGER_RULE.to_string(),
                     serde_json::Value::String(rule_name.to_string()),
                 );
                 security_ctx.context_attrs.insert(
-                    "triggerSourceEntityType".to_string(),
+                    platform_keys::TRIGGER_SOURCE_ENTITY_TYPE.to_string(),
                     serde_json::Value::String(source_entity_type.to_string()),
                 );
                 security_ctx.context_attrs.insert(
-                    "triggerSourceEntityId".to_string(),
+                    platform_keys::TRIGGER_SOURCE_ENTITY_ID.to_string(),
                     serde_json::Value::String(source_entity_id.to_string()),
                 );
                 security_ctx.context_attrs.insert(
-                    "triggerSourceAction".to_string(),
+                    platform_keys::TRIGGER_SOURCE_ACTION.to_string(),
                     serde_json::Value::String(source_action.to_string()),
                 );
                 security_ctx.context_attrs.insert(
-                    "triggerDeclaredPrincipal".to_string(),
+                    platform_keys::TRIGGER_DECLARED_PRINCIPAL.to_string(),
                     serde_json::Value::Bool(true),
                 );
             }
@@ -109,7 +109,7 @@ pub(super) fn effective_trigger_security_context(agent_ctx: &AgentContext) -> Se
         agent_ctx.agent_type.as_deref(),
     );
     security_ctx.context_attrs.insert(
-        "triggerInheritedContextApproximate".to_string(),
+        platform_keys::TRIGGER_INHERITED_CONTEXT_APPROXIMATE.to_string(),
         serde_json::Value::Bool(true),
     );
     security_ctx
