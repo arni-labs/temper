@@ -606,8 +606,10 @@ impl crate::state::ServerState {
             // The journal is committed: hand the projection to the retrying
             // queue so reads catch up once the store recovers.
             self.apply_query_projection_update(ctx, &response).await;
-            // Its scheduled actions were committed with its event: arm them.
+            // Its scheduled actions and its state's timer were committed with
+            // its event: arm them, or they wait for the next boot.
             self.arm_scheduled_actions(ctx, &response);
+            Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
             let mut response = response;
             response.success = false;
             response.error = Some(format!(
