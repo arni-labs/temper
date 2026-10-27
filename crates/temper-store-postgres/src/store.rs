@@ -902,18 +902,44 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        rows.into_iter()
-            .map(|(seq, event_type, payload, meta_json)| {
-                let metadata: EventMetadata = serde_json::from_value(meta_json)
-                    .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-                Ok(PersistenceEnvelope {
-                    sequence_nr: seq as u64,
-                    event_type,
-                    payload,
-                    metadata,
-                })
-            })
-            .collect()
+        rows.into_iter().map(envelope_from_row).collect()
+    }
+
+    /// Read at most `limit` events after `after_sequence`, bounded by the
+    /// query's `LIMIT` and returned in ascending `sequence_nr` order.
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+
+        // Stored sequences are signed BIGINTs; a larger cursor is past the tail.
+        let Ok(after_sequence) = i64::try_from(after_sequence) else {
+            return Ok(Vec::new());
+        };
+
+        let rows: Vec<(i64, String, serde_json::Value, serde_json::Value)> =
+            crate::dbm::postgres_query_as!(
+                &self.schema,
+                "SELECT sequence_nr, event_type, payload, metadata \
+             FROM {schema}events \
+             WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 AND sequence_nr > $4 \
+             ORDER BY sequence_nr ASC \
+             LIMIT $5",
+            )
+            .bind(tenant)
+            .bind(entity_type)
+            .bind(entity_id)
+            .bind(after_sequence)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| PersistenceError::Storage(e.to_string()))?;
+
+        rows.into_iter().map(envelope_from_row).collect()
     }
 
     /// Save (upsert) a snapshot for the given entity.
@@ -1127,6 +1153,20 @@ impl EventStore for PostgresEventStore {
     }
 }
 
+/// Decode one `(sequence_nr, event_type, payload, metadata)` journal row.
+fn envelope_from_row(
+    (seq, event_type, payload, meta_json): (i64, String, serde_json::Value, serde_json::Value),
+) -> Result<PersistenceEnvelope, PersistenceError> {
+    let metadata: EventMetadata = serde_json::from_value(meta_json)
+        .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+    Ok(PersistenceEnvelope {
+        sequence_nr: seq as u64,
+        event_type,
+        payload,
+        metadata,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1161,6 +1201,25 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 actor_id: "store-test".to_string(),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn history_page_beyond_signed_sequence_range_is_empty() {
+        // A closed pool ensures these cursors never reach SQL as negative values.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let store = PostgresEventStore::new(pool);
+        for after in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(
+                store
+                    .read_events_page("default:Order:o-1", after, 2)
+                    .await
+                    .expect("cursor past the stored range")
+                    .is_empty()
+            );
         }
     }
 

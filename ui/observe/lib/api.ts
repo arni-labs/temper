@@ -108,16 +108,26 @@ export async function fetchEntityHistory(
   if (tenant) {
     headers["X-Tenant-Id"] = tenant;
   }
-  const res = await fetchWithRetry(
-    `${API_BASE}/observe/entities/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/history`,
-    { cache: "no-store", headers },
-  );
-  if (!res.ok)
-    throw new ApiError(
-      `Failed to fetch history for ${entityType}/${entityId}: ${res.status}`,
-      res.status,
-    );
-  return res.json();
+  const base = `${API_BASE}/observe/entities/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/history`;
+  // The route answers one page at a time from the durable journal; follow
+  // `next` (a stored sequence) until the last page.
+  const fetchPage = async (url: string): Promise<EntityHistory> => {
+    const res = await fetchWithRetry(url, { cache: "no-store", headers });
+    if (!res.ok)
+      throw new ApiError(
+        `Failed to fetch history for ${entityType}/${entityId}: ${res.status}`,
+        res.status,
+      );
+    return res.json();
+  };
+  const history = await fetchPage(base);
+  let after = history.next;
+  while (after != null) {
+    const page = await fetchPage(`${base}?after=${after}`);
+    history.events = [...history.events, ...page.events];
+    after = page.next;
+  }
+  return history;
 }
 
 /** Fetch all entity verification statuses */

@@ -182,6 +182,29 @@ impl RedisEventStore {
             .map_err(storage_error)?;
         Ok(entries)
     }
+
+    /// Decode the journal entries in the inclusive LRANGE index range.
+    async fn read_event_range(
+        &self,
+        events_key: &str,
+        start_index: i64,
+        stop_index: i64,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let encoded_events: Vec<String> = self
+            .client
+            .lrange(events_key, start_index, stop_index)
+            .await
+            .map_err(storage_error)?;
+
+        let mut out = Vec::with_capacity(encoded_events.len());
+        for encoded in encoded_events {
+            let env: PersistenceEnvelope = serde_json::from_str(&encoded)
+                .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+            out.push(env);
+        }
+        out.sort_by_key(|e| e.sequence_nr);
+        Ok(out)
+    }
 }
 
 impl EventStore for RedisEventStore {
@@ -325,20 +348,28 @@ impl EventStore for RedisEventStore {
         // Event at index i has sequence_nr = i + 1.
         // To read events with sequence_nr > from_sequence, start at index from_sequence.
         let start_index = from_sequence as i64;
-        let encoded_events: Vec<String> = self
-            .client
-            .lrange(&events_key, start_index, -1)
-            .await
-            .map_err(storage_error)?;
+        self.read_event_range(&events_key, start_index, -1).await
+    }
 
-        let mut out = Vec::with_capacity(encoded_events.len());
-        for encoded in encoded_events {
-            let env: PersistenceEnvelope = serde_json::from_str(&encoded)
-                .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-            out.push(env);
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-        out.sort_by_key(|e| e.sequence_nr);
-        Ok(out)
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let events_key = Self::events_key(tenant, entity_type, entity_id);
+        // Index i holds sequence i + 1 (see `read_events`), so the page is the
+        // inclusive index range [after, after + limit - 1], bounded by LRANGE.
+        let start_index = after_sequence as i64;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let stop_index = start_index.saturating_add(limit - 1);
+        self.read_event_range(&events_key, start_index, stop_index)
+            .await
     }
 
     async fn save_snapshot(

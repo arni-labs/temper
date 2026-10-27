@@ -542,6 +542,26 @@ pub trait EventStore: Send + Sync + 'static {
         from_sequence: u64,
     ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send;
 
+    /// Read at most `limit` events stored after `after_sequence`, in ascending
+    /// sequence order: one page of a journal for a paged history read.
+    ///
+    /// Storage backends should override this to apply the bound inside the
+    /// backing query. The default reads the tail and truncates it, which suits
+    /// small in-memory/test stores only.
+    fn read_events_page(
+        &self,
+        persistence_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send
+    {
+        async move {
+            let mut events = self.read_events(persistence_id, after_sequence).await?;
+            events.truncate(limit);
+            Ok(events)
+        }
+    }
+
     /// Save a state snapshot.
     fn save_snapshot(
         &self,
