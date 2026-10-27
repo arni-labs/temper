@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use temper_runtime::tenant::TenantId;
 use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 
+mod rollback;
+
 use super::registry::recorded_registry;
 use super::*;
 use crate::os_apps::{DirApps, os_app_dir_bundle_digests};
@@ -268,8 +270,10 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
 /// Prefers the prior install's on-disk cache, whether a registry install or an `App.Install`
 /// made it; if it was evicted, re-materializes the closure from the prior record's registry
 /// coordinates. `prior_records` are the closure's records from before the failed install, which
-/// has since overwritten the stored ones. Best-effort when the prior ref is unpinned or carries no
-/// registry URL — rollback then relies on whatever bundle the catalog already resolves for the app.
+/// has since overwritten the stored ones. Dependencies must be recovered at their recorded digests,
+/// including from other install closures or their recorded registries. Best-effort for the root
+/// when the prior ref is unpinned or carries no registry URL — rollback then relies on whatever
+/// bundle the catalog already resolves for the app.
 pub(super) async fn ensure_prior_bundle_available(
     platform: &PlatformState,
     ps: &dyn PlatformStore,
@@ -278,7 +282,14 @@ pub(super) async fn ensure_prior_bundle_available(
 ) -> Result<(), String> {
     let prior_ref = parse_registry_app_ref(&prior.app_ref)?;
     let Some(prior_hash) = prior_ref.version_hash.clone() else {
-        return Ok(());
+        return rollback::restore_prior_dependencies(
+            platform,
+            ps,
+            prior,
+            prior_records,
+            &BTreeSet::new(),
+        )
+        .await;
     };
     let cache_key = format!(
         "{}/{}@{}",
@@ -296,7 +307,7 @@ pub(super) async fn ensure_prior_bundle_available(
     if let Some((stored, apps)) =
         first_matching_install(ps, &candidates, prior, prior_records).await
     {
-        restore_prior_dependencies(platform, ps, prior, prior_records, &apps).await;
+        rollback::restore_prior_dependencies(platform, ps, prior, prior_records, &apps).await?;
         register_install_cache(&prior.tenant, stored, DirApps::Only(apps));
         return Ok(());
     }
@@ -309,7 +320,14 @@ pub(super) async fn ensure_prior_bundle_available(
         );
     }
     if prior.registry_url.trim().is_empty() {
-        return Ok(());
+        return rollback::restore_prior_dependencies(
+            platform,
+            ps,
+            prior,
+            prior_records,
+            &BTreeSet::new(),
+        )
+        .await;
     }
     let registry = recorded_registry(&prior.registry_url)?;
     std::fs::create_dir_all(&cache_root).map_err(|error| {
@@ -339,43 +357,9 @@ pub(super) async fn ensure_prior_bundle_available(
                 prior.app_ref
             )
         })?;
-    restore_prior_dependencies(platform, ps, prior, prior_records, &apps).await;
+    rollback::restore_prior_dependencies(platform, ps, prior, prior_records, &apps).await?;
     register_install_cache(&prior.tenant, cache_root, DirApps::Only(apps));
     Ok(())
-}
-
-/// Bring back, from its own install's cache, every prior dependency the prior
-/// root's directory does not hold at its recorded version: one installed again
-/// separately since that root was installed.
-async fn restore_prior_dependencies(
-    platform: &PlatformState,
-    ps: &dyn PlatformStore,
-    prior: &InstalledAppRecord,
-    prior_records: &[InstalledAppRecord],
-    served: &BTreeSet<String>,
-) {
-    for record in prior_records {
-        if record.app_name == prior.app_name || served.contains(&record.app_name) {
-            continue;
-        }
-        let registry_tenant = if record.registry_tenant.trim().is_empty() {
-            "default"
-        } else {
-            record.registry_tenant.trim()
-        };
-        let candidates =
-            install_cache_candidates(platform, &record.tenant, registry_tenant, &record.app_ref);
-        match first_matching_install(ps, &candidates, record, prior_records).await {
-            Some((stored, apps)) => {
-                register_install_cache(&record.tenant, stored, DirApps::Only(apps));
-            }
-            None => tracing::warn!(
-                app = %record.app_name,
-                app_ref = %record.app_ref,
-                "Prior dependency's files are not on disk at its recorded version for rollback"
-            ),
-        }
-    }
 }
 
 /// The cache directories an install of `cache_key` into `tenant` may have, the registry's first.

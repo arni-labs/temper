@@ -257,7 +257,26 @@ async fn rollback_to_prior(
     prior_records: &[InstalledAppRecord],
 ) -> Result<(), String> {
     restore::ensure_prior_bundle_available(platform, ps, prior, prior_records).await?;
-    restore_prior_install(platform, ps, tenant, prior).await
+    restore_prior_install(platform, ps, tenant, prior).await?;
+    let app_names = prior_records
+        .iter()
+        .map(|record| record.app_name.clone())
+        .collect::<Vec<_>>();
+    if !verify_install_closure_runtime_ready(platform, ps, tenant, &app_names).await {
+        return Err("rollback dependency closure is not runtime-ready".to_string());
+    }
+    for record in prior_records {
+        if !record.bundle_digest.is_empty()
+            && tenant_os_app_bundle_digest(tenant, &record.app_name)
+                .is_none_or(|digest| digest.bundle_digest != record.bundle_digest)
+        {
+            return Err(format!(
+                "rollback bundle for {} does not match its prior digest",
+                record.app_name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Install a pinned Genesis app ref into this Temper instance from a registry URL.
@@ -513,35 +532,34 @@ pub async fn install_genesis_app_from_registry(
             let prior =
                 prior_root_record.expect("RollBackToPrevious implies a prior installed record");
             let ps = ps.expect("RollBackToPrevious implies a platform store");
-            let rollback = rollback_to_prior(
+            rollback_to_prior(
                 &install_platform,
                 ps.as_ref(),
                 &request.tenant,
                 &prior,
                 &prior_records,
             )
-            .await;
-            // Reconcile overwrote every dependency app's record with a local-provenance row too;
-            // restore each captured prior record so dependency provenance survives the rollback.
-            for record in &prior_records {
-                if record.app_name == prior.app_name {
-                    continue;
-                }
-                if let Err(error) = ps.record_installed_app_metadata(record).await {
-                    tracing::warn!(
-                        app = %record.app_name,
-                        error = %error,
-                        "Failed to restore dependency provenance record during rollback"
-                    );
-                }
-            }
-            // Surface a hard both-broken error only after best-effort dependency restore.
-            rollback.map_err(|error| {
+            .await
+            .map_err(|error| {
                 format!(
                     "Genesis install of {} failed runtime verification and rollback to {} also failed: {error}",
                     request.app_ref, prior.app_ref
                 )
             })?;
+            // Restore dependency provenance only after the recorded bundles are ready.
+            for record in &prior_records {
+                if record.app_name == prior.app_name {
+                    continue;
+                }
+                ps.record_installed_app_metadata(record)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "rollback could not restore dependency provenance for {}: {error}",
+                            record.app_name
+                        )
+                    })?;
+            }
             Err(format!(
                 "Genesis install of {} failed runtime verification; rolled back to previous pinned ref {}",
                 request.app_ref, prior.app_ref

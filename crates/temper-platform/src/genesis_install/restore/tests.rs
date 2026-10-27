@@ -337,3 +337,6 @@ async fn an_app_comes_back_beside_a_dependency_upgraded_on_its_own() {
         assert_eq!(stored.bundle_digest, record.bundle_digest);
     }
 }
+
+#[path = "rollback_tests.rs"]
+mod rollback_tests;
