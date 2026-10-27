@@ -970,7 +970,8 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Projection Test".to_string()],
         )
         .await
@@ -992,7 +993,8 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Projection Test".to_string()],
         )
         .await
@@ -1197,7 +1199,8 @@ async fn query_projection_batch_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             "Order",
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Owner".to_string(), "alice".to_string()],
         )
         .await
@@ -1269,7 +1272,8 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
         .query_field_index(
             &tenant,
             "Blob",
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec![
                 "CanonicalBytes".to_string(),
                 "full-canonical-payload".to_string(),

@@ -655,18 +655,10 @@ fn upsert_query_projection_diffs_field_index_rows() {
                 (
                     "content_hash".to_string(),
                     Some("sha256:new".to_string()),
-                    Some("Ready".to_string())
+                    None
                 ),
-                (
-                    "owner".to_string(),
-                    Some("alice".to_string()),
-                    Some("Ready".to_string())
-                ),
-                (
-                    "size_bytes".to_string(),
-                    Some("128".to_string()),
-                    Some("Ready".to_string())
-                ),
+                ("owner".to_string(), Some("alice".to_string()), None),
+                ("size_bytes".to_string(), Some("128".to_string()), None),
             ]
         );
 
@@ -897,8 +889,10 @@ fn upsert_query_projection_advances_sequence_without_rewriting_unchanged_index()
     });
 }
 
+/// The index holds field values only; the status lives in the catalog row, so
+/// a move that changes only the status leaves the index rows alone.
 #[test]
-fn upsert_query_projection_updates_index_status_when_fields_are_unchanged() {
+fn upsert_query_projection_leaves_index_rows_alone_when_only_status_changes() {
     let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
         return;
     };
@@ -939,9 +933,9 @@ fn upsert_query_projection_updates_index_status_when_fields_are_unchanged() {
         assert_eq!(
             field_rows,
             vec![
-                ("message_count".to_string(), Some("Complete".to_string())),
-                ("owner".to_string(), Some("Complete".to_string())),
-                ("title".to_string(), Some("Complete".to_string())),
+                ("message_count".to_string(), None),
+                ("owner".to_string(), None),
+                ("title".to_string(), None),
             ]
         );
 
