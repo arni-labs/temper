@@ -1,5 +1,6 @@
 //! Regression cases for inherited senders and distinct dispatch identities.
 
+use super::declare::prelude;
 use super::*;
 use temper_spec::automaton::parse_automaton;
 

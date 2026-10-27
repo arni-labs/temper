@@ -3,6 +3,9 @@
 # model check reaches has 2^4 * 3^5 = 3888 successors to compute, and the
 # unbudgeted cascade runs for minutes.
 #
+# Its rule holds within the model's bounds, but no induction proves it, so
+# the model check walks for it.
+#
 # Not named *.ioa.toml on purpose: repository-wide spec discovery would verify
 # it with no budget.
 state = [
@@ -26,3 +29,7 @@ action = [
 name = "HeavyFeed"
 states = ["Resting", "Running"]
 initial = "Resting"
+
+[[invariant]]
+name = "FewSteps"
+assert = "next <= 1000"

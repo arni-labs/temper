@@ -380,10 +380,11 @@ temper verify --specs-dir specs
 - **Advantage**: Works on unbounded state spaces without enumerating states
 
 ### Level 1: Stateright Model Checking
-- **What**: Exhaustively explores every reachable state of the multi-variable state machine
-- **Checks**: Safety invariants (always), liveness properties (eventually/no-deadlock)
+- **What**: Proves each invariant that reads no other type by induction first, over every action but an output taken at any time; then exhaustively explores every reachable state of the multi-variable state machine for the invariants and liveness rules left
+- **Checks**: Safety invariants (always), liveness properties (eventually/no-deadlock), and actions no reachable state enables
 - **State**: Tracks status + named counters (BTreeMap) + named booleans (BTreeMap)
 - **Guarantee**: If it passes, the invariant holds in ALL reachable states
+- **Cost**: A spec whose rules are all proved is not walked. The search for actions that never fire stops once every action has fired, heading first for the statuses where an unfired one starts
 
 ### Level 2: Deterministic Simulation
 - **What**: Runs multi-actor scenarios with fault injection (message delay, drop, actor crash)

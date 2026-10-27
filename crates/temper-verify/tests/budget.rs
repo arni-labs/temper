@@ -56,7 +56,8 @@ fn a_spec_too_large_to_check_stops_at_its_budget_and_names_itself() {
 }
 
 /// Six counters each stepped by its own move: a million states at bound 9,
-/// each cheap to step from.
+/// each cheap to step from, and a rule no induction proves, so the model
+/// check walks them.
 const WIDE: &str = r#"
 state = [
   { name = "a", type = "counter", initial = 0 },
@@ -79,6 +80,10 @@ action = [
 name = "Wide"
 states = ["On"]
 initial = "On"
+
+[[invariant]]
+name = "FewA"
+assert = "a <= 1000"
 "#;
 
 #[test]

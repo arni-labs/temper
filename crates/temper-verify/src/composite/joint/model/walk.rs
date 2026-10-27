@@ -1,6 +1,7 @@
-//! The breadth-first walk over joint states.
+//! The walk over joint states: breadth first, or toward a status.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap};
 
 use super::super::JointOutcome;
 use super::super::pack::Packer;
@@ -111,6 +112,44 @@ impl JointModel {
         &self,
         bound: Bound<'a>,
         edges: bool,
+        visit: impl FnMut(usize, &JointState) -> bool,
+    ) -> Explored<'a> {
+        self.walk_in(bound, edges, InOrder::default(), |_| 0, visit)
+    }
+
+    /// Walk every reachable joint state as [`Self::walk_with`] does, with no
+    /// edges kept, taking next a state whose `owner` record is nearest a
+    /// status `target` picks, the latest found among the nearest. A search
+    /// for a state that may stand there finds one sooner, by a path that may
+    /// not be the shortest. When `target` picks every status, it walks
+    /// breadth first.
+    pub(in crate::composite::joint) fn walk_toward<'a>(
+        &self,
+        bound: Bound<'a>,
+        (owner, target): (&str, impl Fn(&str) -> bool),
+        visit: impl FnMut(usize, &JointState) -> bool,
+    ) -> Explored<'a> {
+        let model = self.models.get(owner);
+        let Some(model) = model.filter(|m| !m.states.iter().all(|s| target(s))) else {
+            return self.walk_with(bound, false, visit);
+        };
+        let near = model.distances(target);
+        let distance = |state: &JointState| {
+            let status = state.records.get(owner).map(|r| r.status.as_str());
+            status
+                .and_then(|s| near.get(s))
+                .copied()
+                .unwrap_or(usize::MAX)
+        };
+        self.walk_in(bound, false, BinaryHeap::new(), distance, visit)
+    }
+
+    fn walk_in<'a>(
+        &self,
+        bound: Bound<'a>,
+        edges: bool,
+        mut queue: impl Frontier,
+        distance: impl Fn(&JointState) -> usize,
         mut visit: impl FnMut(usize, &JointState) -> bool,
     ) -> Explored<'a> {
         // The room bounds what the walk holds; a model's expansion work has
@@ -149,8 +188,8 @@ impl JointModel {
                 break;
             }
             explored.packer.pack(&init, &mut packed);
-            let new = match explored.states.add(&packed, &mut explored.held) {
-                Ok((_, new)) => new,
+            let (at, new) = match explored.states.add(&packed, &mut explored.held) {
+                Ok(added) => added,
                 Err(reason) => {
                     explored.stop_for_room(reason);
                     return explored;
@@ -158,18 +197,16 @@ impl JointModel {
             };
             if new {
                 explored.firsts.push(None);
+                queue.add(at as usize, distance(&init));
             }
         }
-        // States are walked in the order they were first reached, which is
-        // breadth first.
-        let mut index = 0;
-        'walk: while index < explored.len() {
+        'walk: while let Some(index) = queue.take(explored.len()) {
             let state = explored.state(index);
             if visit(index, &state) {
                 break;
             }
             explored.held.walked(explored.len());
-            if let Err(reason) = tables.make_room(&mut explored, edges) {
+            if let Err(reason) = tables.make_room(&mut explored, &mut queue, edges) {
                 explored.stop_for_room(reason);
                 break;
             }
@@ -203,6 +240,7 @@ impl JointModel {
                     if new {
                         let label = explored.packer.id(&next.label);
                         explored.firsts.push(Some((index as u32, label)));
+                        queue.add(at as usize, distance(&next.state));
                     }
                     if edges {
                         explored.edges.push(Edge {
@@ -215,7 +253,6 @@ impl JointModel {
             }
             let after = [explored.len(), explored.made.len(), explored.edges.len()];
             tables.saw([0, 1, 2].map(|i| after[i] - before[i]));
-            index += 1;
         }
         if self.expansion.exhausted.get() {
             explored.stopped = Some("the joint expansion exhausted its work or time budget".into());
@@ -357,10 +394,16 @@ impl Tables {
         }
     }
 
-    fn make_room(&mut self, explored: &mut Explored<'_>, edges: bool) -> Result<(), String> {
+    fn make_room(
+        &mut self,
+        explored: &mut Explored<'_>,
+        queue: &mut impl Frontier,
+        edges: bool,
+    ) -> Result<(), String> {
         let [states, made, ends] = self.most.map(|most| most.max(1));
         let held = &mut explored.held;
         explored.states.reserve(states, held)?;
+        queue.grow(states, held)?;
         grow(&mut explored.firsts, states, held)?;
         if edges {
             grow(&mut explored.made, made, held)?;
@@ -370,7 +413,65 @@ impl Tables {
             + explored.packer.bytes()
             + bytes(&explored.firsts)
             + bytes(&explored.made)
-            + bytes(&explored.edges);
+            + bytes(&explored.edges)
+            + queue.bytes();
         explored.held.set(total)
+    }
+}
+
+/// The states found and not yet walked, by their index.
+trait Frontier {
+    /// The state found `index`th, `distance` moves from where the walk heads.
+    fn add(&mut self, index: usize, distance: usize);
+    /// The state to walk next, of the `found` so far.
+    fn take(&mut self, found: usize) -> Option<usize>;
+    /// Make room for `spare` more, taking its memory from `held` first.
+    fn grow(&mut self, spare: usize, held: &mut Held<'_>) -> Result<(), String>;
+    /// Bytes it holds.
+    fn bytes(&self) -> usize;
+}
+
+/// The first found first: states are kept in the order they were found, so
+/// the next is the one after the last walked.
+#[derive(Default)]
+struct InOrder(usize);
+
+impl Frontier for InOrder {
+    fn add(&mut self, _: usize, _: usize) {}
+    fn take(&mut self, found: usize) -> Option<usize> {
+        let next = (self.0 < found).then_some(self.0)?;
+        self.0 += 1;
+        Some(next)
+    }
+    fn grow(&mut self, _: usize, _: &mut Held<'_>) -> Result<(), String> {
+        Ok(())
+    }
+    fn bytes(&self) -> usize {
+        0
+    }
+}
+
+/// The nearest first, and the latest found among the nearest.
+impl Frontier for BinaryHeap<(Reverse<usize>, usize)> {
+    fn add(&mut self, index: usize, distance: usize) {
+        self.push((Reverse(distance), index));
+    }
+    fn take(&mut self, _: usize) -> Option<usize> {
+        self.pop().map(|(_, index)| index)
+    }
+    fn grow(&mut self, spare: usize, held: &mut Held<'_>) -> Result<(), String> {
+        let len = self.len();
+        if self.capacity() - len >= spare {
+            return Ok(());
+        }
+        let wanted = (len + spare).max(self.capacity() * 2);
+        let entry = size_of::<(Reverse<usize>, usize)>();
+        held.add(wanted * entry)?;
+        self.reserve_exact(wanted - len);
+        held.sub(wanted * entry);
+        Ok(())
+    }
+    fn bytes(&self) -> usize {
+        self.capacity() * size_of::<(Reverse<usize>, usize)>()
     }
 }

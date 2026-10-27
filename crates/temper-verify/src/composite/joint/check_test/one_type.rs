@@ -129,3 +129,103 @@ fn a_premise_dead_in_the_spec_proves_nothing() {
     let text = verdict.to_string();
     assert!(!text.contains("every sender allowed"), "{text}");
 }
+
+/// Four counters stepped in Start by a move each, and a chain of statuses
+/// down to End, which Finish reaches with `done` set. Go comes first, so a
+/// search that takes the latest state found first goes down the counters.
+const DEEP: &str = r#"
+[automaton]
+name = "Deep"
+states = ["Start", "One", "Two", "Three", "End"]
+initial = "Start"
+
+[[state]]
+name = "done"
+type = "bool"
+initial = false
+
+[[state]]
+name = "a"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "b"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "c"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "d"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Start"]
+to = "One"
+
+[[action]]
+name = "A"
+kind = "input"
+from = ["Start"]
+effect = ["a += 1"]
+
+[[action]]
+name = "B"
+kind = "input"
+from = ["Start"]
+effect = ["b += 1"]
+
+[[action]]
+name = "C"
+kind = "input"
+from = ["Start"]
+effect = ["c += 1"]
+
+[[action]]
+name = "D"
+kind = "input"
+from = ["Start"]
+effect = ["d += 1"]
+
+[[action]]
+name = "OnToTwo"
+kind = "input"
+from = ["One"]
+to = "Two"
+
+[[action]]
+name = "OnToThree"
+kind = "input"
+from = ["Two"]
+to = "Three"
+
+[[action]]
+name = "Finish"
+kind = "input"
+from = ["Three"]
+to = "End"
+effect = ["done = true"]
+
+[[invariant]]
+name = "EndIsDone"
+assert = "status == 'End' => done == true && a >= 0 && b >= 0 && c >= 0 && d >= 0"
+"#;
+
+#[test]
+fn the_walk_for_a_premise_heads_for_the_statuses_where_it_may_hold() {
+    let verdict = invariant(&[DEEP], TIME);
+    let JointVerdict::Proved(_, Premise::Met { states, .. }) = &verdict else {
+        panic!("proved, and a run meets its premise: {verdict}");
+    };
+    // The rule reads Start's counters, so the walk keeps them, and they
+    // alone make over a hundred states; the walk takes Start, then each
+    // status down the chain.
+    assert!(*states <= 12, "{verdict}");
+}

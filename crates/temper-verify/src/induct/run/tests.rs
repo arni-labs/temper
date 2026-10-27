@@ -16,11 +16,14 @@ fn saturated_solver_capacity_creates_no_waiting_workers() {
             text: String::new(),
             goal: vec![],
             show: vec![],
+            general: false,
+            quantified: false,
         })
         .collect();
     let session = Session {
         prelude: "",
         few: "",
+        clauses: "",
         literals: &[],
         solvers: 64,
         deadline: Some(Instant::now() + Duration::from_millis(50)),

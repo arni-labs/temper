@@ -5,7 +5,7 @@
 
 pub use super::string::ModelString;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -322,6 +322,39 @@ impl TemperModel {
             !limit.lifted.load(Ordering::Relaxed)
                 && (Instant::now() >= limit.until || limit.exhausted.load(Ordering::Relaxed))
         })
+    }
+
+    /// How many transitions each status is from one `target` picks, by the
+    /// statuses its transitions name. A status left out leads to none.
+    pub(crate) fn distances(&self, target: impl Fn(&str) -> bool) -> HashMap<&str, usize> {
+        let mut near: HashMap<&str, usize> = self
+            .states
+            .iter()
+            .filter(|status| target(status))
+            .map(|status| (status.as_str(), 0))
+            .collect();
+        let mut queue: VecDeque<&str> = near.keys().copied().collect();
+        while let Some(status) = queue.pop_front() {
+            let further = near[status] + 1;
+            let into = self
+                .transitions
+                .iter()
+                .filter(|t| t.to_state.as_deref() == Some(status));
+            for transition in into {
+                // A transition that names no status starts anywhere.
+                let from = match transition.from_states.is_empty() {
+                    true => &self.states,
+                    false => &transition.from_states,
+                };
+                for from in from {
+                    if !near.contains_key(from.as_str()) {
+                        near.insert(from, further);
+                        queue.push_back(from);
+                    }
+                }
+            }
+        }
+        near
     }
 }
 
