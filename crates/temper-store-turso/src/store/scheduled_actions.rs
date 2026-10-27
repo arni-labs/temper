@@ -20,10 +20,9 @@ impl TursoEventStore {
         arm_id: &str,
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_scheduled_action");
-        let _write_permit = self
-            .acquire_write_permit("turso.delete_scheduled_action", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.delete_scheduled_action", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         conn.execute(
             "DELETE FROM scheduled_actions \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND arm_id = ?4",

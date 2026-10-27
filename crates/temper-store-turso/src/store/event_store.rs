@@ -182,10 +182,9 @@ impl EventStore for TursoEventStore {
         // Reconcile: DELETE all of the entity's rows, then insert the current ones.
         // Empty `vector_rows` purges the entity (deleted / un-embedded). Always runs
         // the delete so a purge is honored.
-        let _write_permit = self
-            .acquire_write_permit("turso.backfill_entity_vectors", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.backfill_entity_vectors", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         tx.execute(
             "DELETE FROM entity_vector_index \
@@ -250,10 +249,9 @@ impl EventStore for TursoEventStore {
         entity_type: &str,
         vector_set: &str,
     ) -> Result<(), PersistenceError> {
-        let _write_permit = self
-            .acquire_write_permit("turso.mark_vector_index_backfilled", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.mark_vector_index_backfilled", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let completed_at = temper_runtime::scheduler::sim_now().to_rfc3339();
         conn.execute(
             "INSERT INTO vector_index_backfill_watermark (tenant, entity_type, vector_set, completed_at) \
@@ -396,10 +394,9 @@ impl EventStore for TursoEventStore {
     ) -> Result<(), PersistenceError> {
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
-        let _write_permit = self
-            .acquire_write_permit("turso.save_snapshot", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.save_snapshot", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
 
         tx.execute(
