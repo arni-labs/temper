@@ -3,7 +3,8 @@
 //! A synced database's change log gains one row for every row a write inserts,
 //! updates or deletes. The triggers below record those same row writes, so each
 //! test reads what a move adds to that log from the field index. A move that
-//! sets one field of a record writes one index row, whatever else it indexes.
+//! sets one field of a record writes one index row, whatever else it indexes,
+//! and a status change writes only the `Status` row.
 
 use std::collections::BTreeMap;
 
@@ -155,15 +156,15 @@ fn total(writes: &BTreeMap<String, i64>) -> i64 {
     writes.values().sum()
 }
 
-/// The record's index rows as `field_name -> (field_value, status)`.
+/// The record's index rows as `field_name -> field_value`.
 async fn index_rows(
     store: &TursoEventStore,
     [tenant, entity_id]: [&str; 2],
-) -> BTreeMap<String, (Option<String>, Option<String>)> {
+) -> BTreeMap<String, Option<String>> {
     let conn = store.connection().await.expect("connection");
     let mut rows = conn
         .query(
-            "SELECT field_name, field_value, status FROM entity_field_index \
+            "SELECT field_name, field_value FROM entity_field_index \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, ENTITY_TYPE, entity_id],
         )
@@ -173,33 +174,41 @@ async fn index_rows(
     while let Some(row) = rows.next().await.expect("read index row") {
         stored.insert(
             row.get::<String>(0).expect("field_name"),
-            (
-                row.get::<Option<String>>(1).expect("field_value"),
-                row.get::<Option<String>>(2).expect("status"),
-            ),
+            row.get::<Option<String>>(1).expect("field_value"),
         );
     }
     stored
 }
 
-/// The index rows a record with `fields` and `status` should have.
-fn expected_rows(
-    fields: &Value,
-    status: &str,
-) -> BTreeMap<String, (Option<String>, Option<String>)> {
+/// How many of the record's index rows carry a status.
+async fn rows_with_status(store: &TursoEventStore, [tenant, entity_id]: [&str; 2]) -> i64 {
+    let conn = store.connection().await.expect("connection");
+    let mut rows = conn
+        .query(
+            "SELECT count(*) FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND status IS NOT NULL",
+            params![tenant, ENTITY_TYPE, entity_id],
+        )
+        .await
+        .expect("count rows with a status");
+    rows.next()
+        .await
+        .expect("read count")
+        .expect("count row")
+        .get::<i64>(0)
+        .expect("count")
+}
+
+/// The index rows a record with `fields` and `status` should have: one value
+/// per field, and the status as the `Status` pseudo-field.
+fn expected_rows(fields: &Value, status: &str) -> BTreeMap<String, Option<String>> {
     let mut expected = fields
         .as_object()
         .expect("fields object")
         .iter()
-        .map(|(name, value)| {
-            let text = value.as_str().map(str::to_string);
-            (name.clone(), (text, Some(status.to_string())))
-        })
+        .map(|(name, value)| (name.clone(), value.as_str().map(str::to_string)))
         .collect::<BTreeMap<_, _>>();
-    expected.insert(
-        "Status".to_string(),
-        (Some(status.to_string()), Some(status.to_string())),
-    );
+    expected.insert("Status".to_string(), Some(status.to_string()));
     expected
 }
 
@@ -224,56 +233,41 @@ async fn a_move_writes_only_the_index_rows_it_changes(write: Write, name: &str) 
         expected_rows(&created, "Open")
     );
 
-    // (what the move does, its fields, its status, the index rows it writes)
+    // (what the move does, the fields it sets, the status it leaves, the index
+    // rows it writes). Each move keeps what the moves before it set.
     let moves = [
         (
             "sets one field",
-            record_fields(&[("Field07", json!("edited"))]),
+            vec![("Field07", json!("edited"))],
             "Open",
             1,
         ),
         (
             "sets three fields",
-            record_fields(&[
-                ("Field07", json!("edited")),
+            vec![
                 ("Field01", json!("one")),
                 ("Field02", json!("two")),
                 ("Field03", json!("three")),
-            ]),
+            ],
             "Open",
             3,
         ),
+        ("adds a field", vec![("Assignee", json!("ana"))], "Open", 1),
+        ("removes a field", vec![("Field19", Value::Null)], "Open", 1),
+        ("changes status", vec![], "Closed", 1),
+        // The Factory's usual move: a new status and a field or two.
         (
-            "adds a field",
-            record_fields(&[
-                ("Field07", json!("edited")),
-                ("Field01", json!("one")),
-                ("Field02", json!("two")),
-                ("Field03", json!("three")),
-                ("Assignee", json!("ana")),
-            ]),
-            "Open",
-            1,
-        ),
-        (
-            "removes a field",
-            record_fields(&[
-                ("Field07", json!("edited")),
-                ("Field01", json!("one")),
-                ("Field02", json!("two")),
-                ("Field03", json!("three")),
-                ("Assignee", json!("ana")),
-                ("Field19", Value::Null),
-            ]),
-            "Open",
-            1,
+            "changes status and sets two fields",
+            vec![("Field04", json!("four")), ("Field05", json!("five"))],
+            "Review",
+            3,
         ),
     ];
-    let mut seq = 1;
-    let mut fields = created;
-    for (what, next, status, expected) in moves {
-        seq += 1;
-        project(&store, write, ticket, status, &next, seq).await;
+    let mut changes = Vec::new();
+    for (seq, (what, sets, status, expected)) in (2..).zip(moves) {
+        changes.extend(sets);
+        let fields = record_fields(&changes);
+        project(&store, write, ticket, status, &fields, seq).await;
         let writes = take_writes(&store).await;
         assert_eq!(
             total(&writes),
@@ -282,24 +276,42 @@ async fn a_move_writes_only_the_index_rows_it_changes(write: Write, name: &str) 
         );
         assert_eq!(
             index_rows(&store, ticket).await,
-            expected_rows(&next, status),
+            expected_rows(&fields, status),
             "index rows after a move that {what}"
         );
-        fields = next;
     }
 
-    // Every row carries the record's status, so a status change rewrites each
-    // row once, and only once.
-    seq += 1;
-    project(&store, write, ticket, "Closed", &fields, seq).await;
-    let writes = take_writes(&store).await;
-    let rows = expected_rows(&fields, "Closed");
-    assert_eq!(
-        total(&writes),
-        rows.len() as i64,
-        "field-index rows written by a status change: {writes:?}"
-    );
-    assert_eq!(index_rows(&store, ticket).await, rows);
+    // No row copies the status, so a status change has only the `Status` row
+    // to write. A filter finds the record by the status in its catalog row,
+    // and by a field through the index.
+    assert_eq!(rows_with_status(&store, ticket).await, 0);
+    for (status, found) in [("Review", true), ("Open", false)] {
+        let ids = store
+            .query_field_index(
+                ticket[0],
+                ENTITY_TYPE,
+                "status = ?3",
+                vec![status.to_string()],
+            )
+            .await
+            .expect("query by status");
+        assert_eq!(
+            ids.contains(&ticket[1].to_string()),
+            found,
+            "status {status}: {ids:?}"
+        );
+    }
+    let ids = store
+        .query_field_index(
+            ticket[0],
+            ENTITY_TYPE,
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
+            vec!["Field04".to_string(), "four".to_string()],
+        )
+        .await
+        .expect("query by field");
+    assert_eq!(ids, vec![ticket[1].to_string()]);
 }
 
 #[tokio::test]
