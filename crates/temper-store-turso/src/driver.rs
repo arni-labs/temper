@@ -19,6 +19,7 @@ mod handle;
 use handle::DriverHandle;
 mod synced;
 use synced::ConnectionPool;
+pub(crate) use synced::TrimWriters;
 pub use synced::{CopyState, SyncCopy};
 
 /// Driver failures retain the original engine or transport error.
