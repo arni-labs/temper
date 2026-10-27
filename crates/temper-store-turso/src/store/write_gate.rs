@@ -41,7 +41,7 @@ const GIVE_WAY_RECHECK: Duration = Duration::from_millis(25);
 /// or remote, let one transaction write at a time. A second permit would not
 /// let a second write run; it would move that write's wait from here, a
 /// first-come queue with no deadline of its own, to the database's busy
-/// handler, which retries every 1 to 100 ms (turso_core 0.7.2 `busy.rs`
+/// handler, which retries every 1 to 100 ms (turso_core 0.8.3 `busy.rs`
 /// 62-90), lets a newcomer in ahead of one that has waited longer, and
 /// refuses a move whose wait passes its lock wait.
 #[derive(Debug)]

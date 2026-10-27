@@ -2,12 +2,13 @@
 //! machine restores them from it.
 //!
 //! Runs against Turso's local sync server: set `TEMPER_TEST_TURSODB` to a
-//! `tursodb` binary of the version the `turso` crate pins (0.7.2). Without it
+//! `tursodb` binary of the version the `turso` crate pins (0.8.3). Without it
 //! the tests are skipped locally and fail in CI.
 
 mod answers;
 mod change_log;
 mod projection;
+mod rollback;
 mod startup;
 mod support;
 

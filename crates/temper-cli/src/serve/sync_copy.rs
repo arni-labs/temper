@@ -72,6 +72,14 @@ async fn push_before_answering(
         return refusal;
     }
     let started = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let tenant = request
+        .headers()
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let response = next.run(request).await;
     let budget = ANSWER_BUDGET
         .saturating_sub(started.elapsed())
@@ -81,7 +89,14 @@ async fn push_before_answering(
         // The request ran, so whatever the copy's state now, the change may
         // have been saved here: never answer as if nothing happened.
         Err(error) => {
-            tracing::error!(%error, "turso.sync: change not copied off this server; not confirming it");
+            tracing::error!(
+                %error,
+                %method,
+                path,
+                tenant,
+                record = record_named(&path).unwrap_or(""),
+                "turso.sync: change not copied off this server; not confirming it"
+            );
             unavailable(
                 "NotConfirmed",
                 "Not confirmed: the change could not be copied to this app's database copy. \
@@ -119,6 +134,15 @@ fn unavailable(code: &str, message: &str) -> Response {
         axum::Json(serde_json::json!({ "error": { "code": code, "message": message } })),
     )
         .into_response()
+}
+
+/// The record an OData path names: its entity set and key, as in
+/// `Notes('a')` for `/tdata/Notes('a')/Ns.Write`, or the entity set alone
+/// for a create. None for any other route.
+fn record_named(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/tdata/")?;
+    let record = rest.split('/').next().unwrap_or("");
+    (!record.is_empty()).then_some(record)
 }
 
 /// Requests that cannot change anything: reads of Temper's own routes. A
@@ -201,6 +225,18 @@ mod tests {
         assert!(!reads_only(&Method::GET, "/static/app-page"));
         assert!(!reads_only(&Method::GET, "/observer"));
         assert!(!reads_only(&Method::GET, "/genesisx"));
+    }
+
+    #[test]
+    fn a_not_confirmed_change_names_its_record() {
+        assert_eq!(
+            record_named("/tdata/Notes('a')/Ns.Write"),
+            Some("Notes('a')")
+        );
+        assert_eq!(record_named("/tdata/Notes('a')"), Some("Notes('a')"));
+        assert_eq!(record_named("/tdata/Notes"), Some("Notes"));
+        assert_eq!(record_named("/tdata/"), None);
+        assert_eq!(record_named("/webhooks/default/callback"), None);
     }
 
     #[test]
