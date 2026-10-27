@@ -15,6 +15,7 @@ use std::time::Duration;
 use temper_runtime::persistence::{
     CommitRows, EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend,
     PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
+    StateTimerRecord,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -190,6 +191,12 @@ struct SimEventStoreInner {
     /// completed type mapped to the sorted comma-joined declared vector-path names the
     /// backfill covered. Mirrors `key_index_watermark`.
     vector_index_watermark: BTreeMap<(String, String), String>,
+    /// Query-plane rows written with their entity's events, by persistence id.
+    projections: BTreeMap<String, entity_rows::SimProjection>,
+    /// One state-timer row per entity: `(tenant, entity_type, entity_id)`.
+    state_timers: BTreeMap<(String, String, String), StateTimerRecord>,
+    /// How many commits wrote each persistence id's journal or rows.
+    commits: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +210,12 @@ pub struct SimEventSegment {
 }
 
 impl SimEventStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SimEventStoreInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Create a new SimEventStore with the given seed and fault config.
     pub fn new(seed: u64, faults: SimFaultConfig) -> Self {
         Self {
@@ -226,6 +239,9 @@ impl SimEventStore {
                 scheduled_deletes_held: false,
                 pending_scheduled_list_failures: BTreeMap::new(),
                 vector_index_watermark: BTreeMap::new(),
+                projections: BTreeMap::new(),
+                state_timers: BTreeMap::new(),
+                commits: BTreeMap::new(),
             })),
         }
     }
@@ -536,6 +552,7 @@ impl EventStore for SimEventStore {
             reconcile_vectors,
             scheduled_actions,
             fired_scheduled_action,
+            ..
         } = rows;
         let append_delay = {
             let mut inner = self
@@ -780,6 +797,9 @@ impl EventStore for SimEventStore {
             ));
         }
 
+        // The entity's query-plane and timer rows, in the same commit.
+        inner.commit_entity_rows(persistence_id, new_seq, &rows);
+
         // The write landed; a lost answer reaches the caller as the retry's
         // concurrency violation (see `lose_next_append_answers`).
         if inner.take_lost_append_answer(persistence_id) {
@@ -793,6 +813,10 @@ impl EventStore for SimEventStore {
         }
 
         Ok(new_seq)
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        true
     }
 
     async fn list_scheduled_actions(
@@ -1134,6 +1158,10 @@ impl EventStore for SimEventStore {
                 stored.sequence_nr = new_seq;
                 journal.push(stored);
             }
+            *inner
+                .commits
+                .entry(append.persistence_id.clone())
+                .or_default() += 1;
             results.push(PersistenceAppendResult {
                 persistence_id: append.persistence_id.clone(),
                 sequence_nr: new_seq,
@@ -1331,3 +1359,6 @@ impl EventStore for SimEventStore {
 
 #[cfg(test)]
 mod tests;
+
+mod entity_rows;
+pub use entity_rows::SimProjection;

@@ -1,20 +1,17 @@
 //! [`EventStore`] trait implementation for Turso.
 
 use crate::driver::{Value, params};
-use std::time::Duration;
 use temper_runtime::persistence::{
     CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
     PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
     ScheduledActionRecord, pack_f32_le, storage_error, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
-use tracing::{error, instrument};
+use tracing::instrument;
 
 use super::TursoEventStore;
 use super::append_commit::OwnedAppend;
-use super::append_config::append_max_attempts;
 use super::write_gate::WritePriority;
-use crate::retry::{is_transient_write_error, retry_delay_ms};
 
 /// Every live `(entity_type, entity_id)` of a tenant. The `NOT EXISTS` probe is
 /// served by `idx_events_deleted`; see `schema::CREATE_EVENTS_DELETED_INDEX`.
@@ -151,12 +148,10 @@ impl EventStore for TursoEventStore {
     // DST. Giving Turso the keyed oracle requires first implementing live co-commit
     // (completing ADR-0153 phase 2 for Turso) — tracked separately.
 
-    // ADR-0155: Turso maintains `entity_vector_index` **write-behind** — the event is
-    // appended first (with retries), then the derived vector rows follow in a separate,
-    // also-retried write. This is safe for vectors (unlike keys) because a vector row
-    // carries no uniqueness constraint and a lagging index write only makes a ranking
-    // temporarily incomplete; it can never corrupt a keyed absence. So Turso implements
-    // the full vector surface below.
+    // One transaction per move: the event, its scheduled actions, and the
+    // entity's query-plane, timer and vector rows (ADR-0155) commit together,
+    // so an event never lands without them and a move pays one write lock.
+    // Keys are not maintained on Turso, per the note above.
     async fn append_with_rows(
         &self,
         persistence_id: &str,
@@ -164,70 +159,17 @@ impl EventStore for TursoEventStore {
         events: &[PersistenceEnvelope],
         rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
-        let CommitRows {
-            vector_rows,
-            reconcile_vectors,
-            scheduled_actions,
-            fired_scheduled_action,
-            ..
-        } = rows;
-        // The journal append is the durable event, with the scheduled actions
-        // it armed and fired (keys are not maintained on Turso, per the note
-        // above).
-        let scheduled = CommitRows {
-            scheduled_actions,
-            fired_scheduled_action,
-            ..CommitRows::default()
-        };
-        let new_seq = self
-            .append_owned(OwnedAppend::new(
-                persistence_id,
-                expected_sequence,
-                events,
-                scheduled,
-            ))
-            .await?;
-        // Write-behind vector maintenance: reconcile the entity's rows (delete stale,
-        // insert current — an empty `vector_rows` purges a deleted/cleared entity),
-        // RETRIED like the event append rather than a warn-once one-shot, so a
-        // transient failure does not silently drop the write. On final exhaustion the
-        // error is logged loudly; the partition then lags until the next backfill
-        // reconcile runs. Only runs when the type declares vector paths.
-        if reconcile_vectors
-            && let Ok((tenant, entity_type, entity_id)) = parse_persistence_id_parts(persistence_id)
-        {
-            let total_attempts = append_max_attempts();
-            let mut last_err: Option<PersistenceError> = None;
-            for attempt in 0..total_attempts {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms(attempt - 1))).await;
-                }
-                match self
-                    .backfill_entity_vectors(tenant, entity_type, entity_id, vector_rows)
-                    .await
-                {
-                    Ok(()) => {
-                        last_err = None;
-                        break;
-                    }
-                    Err(err) => {
-                        let transient = matches!(&err, PersistenceError::Storage(msg) if is_transient_write_error(msg));
-                        last_err = Some(err);
-                        if !transient {
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some(error) = last_err {
-                error!(
-                    persistence_id,
-                    error = %error,
-                    "turso vector-index write-behind failed after retries; partition lags until the next backfill reconcile"
-                );
-            }
-        }
-        Ok(new_seq)
+        self.append_owned(OwnedAppend::new(
+            persistence_id,
+            expected_sequence,
+            events,
+            rows,
+        ))
+        .await
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        true
     }
 
     async fn backfill_entity_vectors(

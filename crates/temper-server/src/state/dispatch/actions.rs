@@ -191,7 +191,8 @@ impl crate::state::ServerState {
         self.dispatch_typed_checked(cmd, None).await
     }
 
-    async fn dispatch_typed_checked(
+    /// The dispatch, on the task [`Self::dispatch_typed_checked`] gives it.
+    pub(super) async fn dispatch_typed_attached(
         &self,
         cmd: DispatchCommand<'_>,
         expected_authorization_precondition: Option<String>,

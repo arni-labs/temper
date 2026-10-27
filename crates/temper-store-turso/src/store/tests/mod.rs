@@ -438,9 +438,10 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
 #[tokio::test]
 async fn single_event_append_waits_for_the_write_gate() {
     let mut store = make_store("single-append-waits-for-gate").await;
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    store.write_gate = std::sync::Arc::new(super::write_gate::WriteGate::new(1));
     let held_gate = store
         .write_gate
+        .permits
         .clone()
         .acquire_owned()
         .await
@@ -1783,9 +1784,10 @@ async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
         .await
         .expect("initial spec commit");
 
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    store.write_gate = std::sync::Arc::new(super::write_gate::WriteGate::new(1));
     let held_gate = store
         .write_gate
+        .permits
         .clone()
         .acquire_owned()
         .await
