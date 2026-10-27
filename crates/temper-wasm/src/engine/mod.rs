@@ -11,6 +11,8 @@ mod compilation_tests;
 mod guest_read_bounds_test;
 mod guest_spans;
 mod host_functions;
+#[cfg(test)]
+mod outbound_failure_log_test;
 mod telemetry;
 #[cfg(test)]
 mod tests;
