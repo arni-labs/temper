@@ -122,10 +122,9 @@ impl TursoEventStore {
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
         let status = canonical_projection_status(status, state);
-        let _write_permit = self
-            .acquire_write_permit("turso.upsert_query_projection", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.upsert_query_projection", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         write_projection(
             &tx,
@@ -172,10 +171,9 @@ impl TursoEventStore {
         }
         let projections = newest.into_values().collect::<Vec<_>>();
 
-        let _write_permit = self
-            .acquire_write_permit("turso.upsert_query_projections", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.upsert_query_projections", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         let updated_at = sim_now().to_rfc3339();
         let mut existing = BTreeMap::new();
@@ -419,10 +417,9 @@ impl TursoEventStore {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<(), PersistenceError> {
-        let _write_permit = self
-            .acquire_write_permit("turso.remove_query_projection", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.remove_query_projection", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         remove_projection(&tx, [tenant, entity_type, entity_id]).await?;
         tx.commit().await.map_err(storage_error)?;

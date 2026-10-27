@@ -102,7 +102,10 @@ async fn project(
 
 /// Record every row `entity_field_index` gains, changes or loses.
 async fn log_field_index_writes(store: &TursoEventStore) {
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute("CREATE TABLE field_index_writes (op TEXT NOT NULL)", ())
         .await
         .expect("create write log");
@@ -139,6 +142,10 @@ async fn take_writes(store: &TursoEventStore) -> BTreeMap<String, i64> {
         );
     }
     drop(rows);
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute("DELETE FROM field_index_writes", ())
         .await
         .expect("clear write log");
