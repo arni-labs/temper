@@ -152,6 +152,8 @@ pub(super) enum Reservation {
     Fresh,
     /// Arm the timer the state declares only when it is not armed already.
     Missing,
+    /// Follow a committed arm: keep only that arm with the same declaration.
+    Committed,
 }
 
 /// In-memory cancellation counter keyed by entity instance.
@@ -210,11 +212,14 @@ impl StateTimeoutTracker {
         if journal < entry.journal {
             return None;
         }
-        let keep_armed = reservation == Reservation::Missing
-            && entry
-                .armed
-                .as_ref()
-                .is_some_and(|armed| armed.is_declared_as(timer));
+        let keep_armed = entry.armed.as_ref().is_some_and(|armed| {
+            armed.is_declared_as(timer)
+                && match reservation {
+                    Reservation::Fresh => false,
+                    Reservation::Missing => true,
+                    Reservation::Committed => armed.arm_id == timer.arm_id,
+                }
+        });
         if keep_armed {
             return None;
         }
@@ -409,17 +414,31 @@ impl crate::state::ServerState {
                 ctx.action,
             );
         }
+        // The clock starts at the event that entered or reset the state, as
+        // its committed row says (`committed_timer_row`), not when the commit
+        // returned: a slow commit must not move the deadline, and a restart
+        // arms from the row.
         let now = sim_now();
-        let timer = declared_timer(
+        let started_at = response
+            .state
+            .events
+            .back()
+            .map_or(now, |event| event.timestamp);
+        let mut timer = declared_timer(
             ctx.tenant,
             ctx.entity_type,
             ctx.entity_id,
             &st,
             &response.state,
             ctx.agent_ctx,
-            now,
+            started_at,
         );
-        let delay = Duration::from_secs(st.after_seconds);
+        if self.entity_rows_follow_commits() {
+            // The event that entered or reset the state committed this
+            // timer's row under this id (`committed_timer_row`).
+            timer.arm_id = super::entity_rows::timer_arm_id(&st.state, response.state.sequence_nr);
+        }
+        let delay = remaining_budget(started_at, st.after_seconds, now);
         self.start_armed_timer(timer, delay, Reservation::Fresh)
             .await;
     }
@@ -522,6 +541,18 @@ impl crate::state::ServerState {
             .has_armed(&EntityKey::new(tenant, entity_type, entity_id))
     }
 
+    /// The tracker's cancellation value for `entity` now: it changes with
+    /// every arm and cancellation of its timer in this process.
+    pub(super) fn state_timer_turn(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> u64 {
+        self.state_timeout_tracker
+            .current(&EntityKey::new(tenant, entity_type, entity_id))
+    }
+
     /// The timer `entity` has armed now, if any.
     pub(super) fn armed_state_timer(
         &self,
@@ -602,7 +633,7 @@ impl crate::state::ServerState {
             gate: timer.boot_gate.clone(),
             ..Default::default()
         };
-        self.follow_state_timer(
+        self.follow_owned_state_timer(
             &timer.tenant,
             &timer.entity_type,
             &timer.entity_id,
@@ -726,13 +757,17 @@ impl crate::state::ServerState {
                     let belongs =
                         current.state.status == timer.state && state.declares_state_timer(&timer);
                     if !belongs {
+                        let follow = super::state_timer_reconcile::Follow {
+                            armed_by: Some(&timer.agent_ctx),
+                            ..Default::default()
+                        };
                         state
-                            .reconcile_state_timers(
+                            .follow_owned_state_timer(
                                 &timer.tenant,
                                 &timer.entity_type,
                                 &timer.entity_id,
                                 &current.state,
-                                Some(&timer.agent_ctx),
+                                follow,
                             )
                             .await;
                     } else if current.state.sequence_nr > timer.sequence_nr {
@@ -768,7 +803,17 @@ impl crate::state::ServerState {
                         }
                     }
                 }
-                state.forget_state_timer(&timer).await;
+                // A newer arm can hold this timer's row under the same id:
+                // a dispatch's arm that replaced a reconcile's for the same
+                // event. That row is the newer timer's to end.
+                let row_moved_on = state.state_timeout_tracker.current(&key) != armed_seq
+                    && state
+                        .state_timeout_tracker
+                        .armed(&key)
+                        .is_some_and(|armed| armed.arm_id == timer.arm_id);
+                if !row_moved_on {
+                    state.forget_state_timer(&timer).await;
+                }
                 state.state_timeout_tracker.dec_pending(&timer.entity_type);
             }
             .instrument(span)
@@ -832,7 +877,7 @@ impl ArmedTimer {
 /// the entity has already recorded that key, so the fire would be answered as
 /// a duplicate and never run. Nor does it keep the mark of a timer fire that
 /// armed it: each fire is marked with its own arming (`ArmedTimer::fire_context`).
-fn timer_agent(armed_by: &AgentContext) -> AgentContext {
+pub(super) fn timer_agent(armed_by: &AgentContext) -> AgentContext {
     let mut agent = armed_by.for_background_task();
     agent.idempotency_key = None;
     agent.fires_state_timer = None;

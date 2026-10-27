@@ -31,6 +31,19 @@ pub struct Carry {
     /// field, each a state variable this version declares.
     #[serde(default)]
     pub set: BTreeMap<String, serde_json::Value>,
+    /// An action of this version the platform makes on each carried record
+    /// right after its carry, with no parameters, as an ordinary move with
+    /// its effects, triggers and reactions, decided by the version's Cedar.
+    /// A record whose next step is what that action does gets there. It must
+    /// start from the carry's target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then: Option<String>,
+    /// The string field naming the user the `then` move is made for: the
+    /// platform's carry service acts for them, so the version's Cedar sees
+    /// them as `context.actingFor`. A record whose field is empty is left
+    /// where the carry put it.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub acts_for: Option<String>,
 }
 
 impl Carry {

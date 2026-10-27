@@ -35,12 +35,16 @@ pub struct Principal {
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
+/// The Cedar context key naming the `[[carry]]` move whose `then` move the
+/// platform is making. Only the platform sets it.
+pub const CARRY_MOVE_CONTEXT: &str = "carryMove";
+
 /// Cedar context keys that only a resolved `SecurityContext` may populate.
 pub fn is_cedar_authority_context_key(name: &str) -> bool {
     matches!(
         name,
         "sessionId" | "agentId" | "agentType" | "agentTypeVerified" | "role" | "actingFor"
-    )
+    ) || name == CARRY_MOVE_CONTEXT
 }
 
 /// Security context carried with every actor message dispatch.
@@ -595,6 +599,7 @@ mod tests {
         assert!(is_cedar_authority_context_key("sessionId"));
         assert!(is_cedar_authority_context_key("agentTypeVerified"));
         assert!(is_cedar_authority_context_key("role"));
+        assert!(is_cedar_authority_context_key("carryMove"));
         assert!(!is_cedar_authority_context_key("status"));
         assert!(!is_cedar_authority_context_key("Customer"));
     }

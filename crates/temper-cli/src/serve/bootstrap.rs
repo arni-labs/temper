@@ -20,7 +20,7 @@ use temper_server::registry_bootstrap::{
 use temper_server::storage::StorageStack;
 use temper_server::webhooks::WebhookDispatcher;
 use temper_store_redis::RedisEventStore;
-use temper_store_turso::{SyncCopy, TenantStoreRouter, TursoEventStore};
+use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
 use crate::StorageBackend;
 
@@ -32,14 +32,18 @@ use super::storage::{
 
 /// Phase 1: Initialize the storage backend (Postgres, Turso, Redis, or memory).
 ///
-/// Also returns the Turso Cloud copy of a local Turso database when
-/// `TURSO_SYNC_URL` is set; the server answers changes only once they reach it.
+/// Also returns the local Turso database when `TURSO_SYNC_URL` gives it a
+/// Turso Cloud copy; the server answers changes only once they reach it.
 pub(super) async fn init_storage(
     storage: StorageBackend,
     storage_explicit: bool,
-) -> Result<(Option<sqlx::PgPool>, Option<StorageStack>, Option<SyncCopy>)> {
+) -> Result<(
+    Option<sqlx::PgPool>,
+    Option<StorageStack>,
+    Option<TursoEventStore>,
+)> {
     let mut pg_pool: Option<sqlx::PgPool> = None;
-    let mut sync_copy: Option<SyncCopy> = None;
+    let mut synced_store: Option<TursoEventStore> = None;
     if !matches!(storage, StorageBackend::Turso) && std::env::var_os("TURSO_SYNC_URL").is_some() {
         anyhow::bail!("TURSO_SYNC_URL needs --storage turso");
     }
@@ -130,7 +134,7 @@ pub(super) async fn init_storage(
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to open synced Turso database: {e}")
                         })?;
-                    sync_copy = store.sync_copy().cloned();
+                    synced_store = Some(store.clone());
                     let copied =
                         format!(", each change copied to {sync_url} before it is answered");
                     (store, copied)
@@ -155,7 +159,7 @@ pub(super) async fn init_storage(
             Some(StorageStack::from_redis(store))
         }
     };
-    Ok((pg_pool, storage_stack, sync_copy))
+    Ok((pg_pool, storage_stack, synced_store))
 }
 
 /// Phase 2: Build the spec registry from persistent storage and disk apps.

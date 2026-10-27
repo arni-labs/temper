@@ -12,8 +12,9 @@ use crate::store::instrumentation::record_turso_query_duration;
 const APPEND_BATCH_INSERT_CHUNK_ROWS: usize = 400;
 
 /// Write `append`'s rows in `tx`: its events after a sequence check, its
-/// segment's end, and the scheduled actions it arms and fires. A row exists
-/// exactly while its action waits; a repeated arm keeps its row.
+/// segment's end, the scheduled actions it arms and fires (a row exists
+/// exactly while its action waits; a repeated arm keeps its row), and the
+/// entity's query-plane, timer and vector rows as its events leave it.
 pub(super) async fn write_append(
     tx: &Transaction<'_>,
     append: &OwnedAppend,
@@ -148,6 +149,10 @@ pub(super) async fn write_append(
         .await
         .map_err(storage_error)?;
     }
+    append
+        .entity_rows
+        .write(tx, [tenant, entity_type, entity_id], new_seq)
+        .await?;
     Ok(new_seq)
 }
 

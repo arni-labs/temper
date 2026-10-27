@@ -275,8 +275,8 @@ fn note(message: String, detail: serde_json::Value) -> InstallWarning {
 fn finding_note(module: &str, finding: &Finding) -> InstallWarning {
     note(
         format!(
-            "{} in module {} ({}): {}",
-            finding.title, module, finding.location, finding.why
+            "{} in module {} ({}): {} {}",
+            finding.title, module, finding.location, finding.why, finding.instead
         ),
         json!({
             "module": module,

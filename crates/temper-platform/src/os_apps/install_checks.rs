@@ -204,12 +204,15 @@ fn bundle_with_named(
 /// leaves records with no way forward that no `[[carry]]` moves. Returns what
 /// the check reports, and how many records each carry moves once the install
 /// has answered (the server's carry pass makes them in the background).
+/// `policies` is the tenant's Cedar text once the install serves, when the
+/// install changes it.
 pub(super) async fn check_spec_changes(
     state: &PlatformState,
     tenant: &TenantId,
     app_name: &str,
     specs: &[(String, String)],
     writes_specs: bool,
+    policies: Option<&str>,
 ) -> Result<Vec<InstallWarning>, String> {
     if !writes_specs {
         return Ok(Vec::new());
@@ -224,7 +227,7 @@ pub(super) async fn check_spec_changes(
         .map_err(|error| format!("os-app '{app_name}': {error}"))?;
     let plan = state
         .server
-        .check_spec_changes(tenant, &changes)
+        .check_spec_changes(tenant, &changes, policies)
         .await
         .map_err(|refused| format!("os-app '{app_name}' was not installed. {refused}"))?;
     let mut carrying: BTreeMap<(&str, &str), usize> = BTreeMap::new();

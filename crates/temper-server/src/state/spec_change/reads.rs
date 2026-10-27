@@ -63,11 +63,12 @@ pub(super) fn affected_states(
 
 /// The names the check reads from a record, which group the stored records:
 /// what the moves of either version and the installed version's carries
-/// read, and under the new version what each carry's guard and effects
-/// read, what its invariants read, and the fields naming the related records
-/// its moves and invariants read. Records in one state that agree on all of
-/// them end the same way in a carry's dry run, so the dry run reads one
-/// record per group.
+/// read, and under the new version what each carry's guard and effects and
+/// its `then` move's effects read, the field its `as` names, which the then
+/// move's Cedar sees as `context.actingFor`, what its invariants read, and
+/// the fields naming the related records its moves and invariants read.
+/// Records in one state that agree on all of them end the same way in a
+/// carry's dry run, so the dry run reads one record per group.
 pub(super) fn read_names(
     old: &TransitionTable,
     new: &TransitionTable,
@@ -89,16 +90,22 @@ pub(super) fn read_names(
     };
     for (_, carry) in carries {
         carry.guard.for_each_name(&mut read);
+        if let Some(field) = &carry.acts_for {
+            read(Name::Var(field));
+        }
     }
     for invariant in &new.invariants {
         invariant.assert.for_each_name(&mut read);
     }
-    for (action, _) in carries {
+    let made = carries
+        .iter()
+        .flat_map(|(action, carry)| std::iter::once(action.as_str()).chain(carry.then.as_deref()));
+    for action in made {
         names.extend(new.move_reads(action));
         let effects = new
             .rules
             .iter()
-            .filter(|rule| rule.name == *action)
+            .filter(|rule| rule.name == action)
             .flat_map(|rule| &rule.effects);
         for effect in effects {
             let (var, value) = match effect {

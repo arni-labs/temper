@@ -10,9 +10,11 @@
 //! At boot, after the rows are re-armed, a walk makes each record that had a
 //! row follow the state it replays into: a row armed under an older spec, on
 //! a record whose state now declares another timer, gets the new timer at
-//! once, not when the stale one fires. A record in a timed state with no row is not armed: it waits for
-//! its next action ([`Arming::FromRow`]). The walk counts those records, and
-//! ends with one log line of counts per tenant and type.
+//! once, not when the stale one fires. A record in a timed state with no row
+//! (its process stopped between the event and the row) is armed too, from
+//! when it entered its state, through the boot's fire gate; only one whose
+//! timeout binds a caller nobody saved waits for its next action. The walk
+//! counts those, and ends with one log line of counts per tenant and type.
 //!
 //! A record in memory is reconciled with its actor's state. One that is not is
 //! replayed from the store without starting an actor, so a walk over many
@@ -32,10 +34,11 @@ use crate::state::ServerState;
 use crate::state::projection_backfill::transition_table_for;
 
 /// The wait before retrying a type after the store failed to list or read
-/// its records. It doubles up to [`FOLLOW_RETRY_MAX`], so a store that stays
-/// down is asked about once a minute, not in a tight loop.
-const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
-const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
+/// its records, or a record's timer row. It doubles up to
+/// [`FOLLOW_RETRY_MAX`], so a store that stays down is asked about once a
+/// minute, not in a tight loop.
+pub(super) const FOLLOW_RETRY_FIRST: Duration = Duration::from_secs(1);
+pub(super) const FOLLOW_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Who armed the timer of a record whose row the boot dropped (its state no
 /// longer declares a timeout), so the record's new timer fires as them.
@@ -48,8 +51,8 @@ pub struct BootTimerCounts {
     pub rearmed: usize,
     /// Rows removed: their state no longer declares a timeout.
     pub dropped: usize,
-    /// Records in a timed state with no row: not armed, they wait for their
-    /// next action.
+    /// Records in a timed state whose timeout binds a caller, with no row
+    /// to say who: not armed, they wait for their next action.
     pub waiting: usize,
     /// Scheduled actions (`schedule`, `schedule_at`) armed again from their
     /// rows.
@@ -125,8 +128,9 @@ impl ServerState {
     }
 
     /// At boot, after the rows are re-armed: make every record of every type
-    /// that declares a timeout and had a row follow its state, and count the
-    /// records in a timed state with no row into `counts`, which it logs.
+    /// that declares a timeout follow its state, arming a record left in a
+    /// timed state with no row, and count the records that wait for a caller
+    /// into `counts`, which it logs.
     pub(super) async fn follow_timed_types(
         &self,
         callers: BootCallers,
@@ -153,7 +157,7 @@ impl ServerState {
             Err(_) => return counts,
         };
         let waiting = self
-            .follow_types(types, &callers, Some(gate), Arming::FromRow)
+            .follow_types(types, &callers, Some(gate), Arming::Any)
             .await;
         for (key, waiting) in waiting {
             counts.entry(key).or_default().waiting = waiting;
