@@ -236,7 +236,13 @@ impl crate::state::ServerState {
                     }
 
                     match state
-                        .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
+                        .get_or_create_tenant_entity_by(
+                            &t,
+                            &child_type,
+                            &child_id,
+                            initial_fields,
+                            &agent,
+                        )
                         .await
                     {
                         Ok(created) => {

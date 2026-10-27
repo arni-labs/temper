@@ -12,6 +12,8 @@
 //! `gamma`'s records may have no row at all.
 //!
 //! Invariants:
+//! - the boot arms every record it finds in a timed state with no row, and
+//!   leaves none waiting;
 //! - after a record rehydrates, it has exactly one armed timer row, for its
 //!   current state, when that state declares a timeout, and none otherwise
 //!   (none for a deleted record);
@@ -187,7 +189,8 @@ struct Run {
     trace: Vec<String>,
     deleted: BTreeSet<(String, String)>,
     /// Records in a timed state that nothing armed: no dispatch since their
-    /// type gained its timeouts, and no install walk. They wait, with no row.
+    /// type gained its timeouts, and no install walk. They have no row until
+    /// their next action or the next boot arms them.
     unarmed: BTreeSet<(String, String)>,
 }
 
@@ -352,7 +355,8 @@ fn run_seed(seed: u64) -> Result<(), String> {
             // The process stops before the install's walk reaches gamma.
             install(state, "gamma", JOB_V1);
             state.registry.write().unwrap().take_changed_types();
-            // Nothing armed gamma's records: they wait until their next action.
+            // Nothing armed gamma's records: they have no row until their next
+            // action or the next boot.
             for job in &jobs {
                 if job.tenant.as_str() == "gamma" && !run.is_deleted(job) {
                     run.unarmed.insert((job.tenant.to_string(), job.id.clone()));
@@ -402,12 +406,13 @@ fn run_seed(seed: u64) -> Result<(), String> {
     first.kill(&world, downtime);
 
     let second = Process::start(&world, &v2, JOB_V1, &format!("follow-{seed}-b"));
+    // The boot arms the records the install's walk never reached.
+    run.unarmed.clear();
     second.runtime.block_on(async {
         let state = &second.state;
-        check_boot_counts(&second.booted, &jobs, &run)?;
+        check_boot_counts(&second.booted, &run)?;
         check_rows_follow_state(state, &world, &jobs, &run, "after the restart").await?;
-        // A read rehydrates a record: one with a row follows its state, one
-        // without stays unarmed.
+        // A read rehydrates a record, which follows its state.
         let looked: Vec<Job> = jobs.iter().filter(|_| rng.chance(0.4)).cloned().collect();
         run.note(format!(
             "rehydrated {:?}",
