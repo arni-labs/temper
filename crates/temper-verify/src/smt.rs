@@ -197,9 +197,11 @@ type NotProvedInvariants = Vec<(String, NotProved)>;
 ///
 /// Every transition is checked, those that stay in their state and those
 /// whose guards read related entities (the unknown parts of a guard are free,
-/// so the guard may hold). Counters are only non-negative, so a proof holds
-/// at every count, not just up to L1's bound. An invariant over values L0
-/// does not model is not proved. `TypeInvariant` and `Terminal(..)` are
+/// so the guard may hold). Counters are only non-negative, so a proof about
+/// counters holds at every count, not just up to L1's bound; lists are as
+/// long as L1 explores them, so a proof about a list's length holds up to that
+/// bound, as L1's check does. An invariant over values L0 does not model is
+/// not proved. `TypeInvariant` and `Terminal(..)` are
 /// structural: every target is a declared state, and no transition leaves a
 /// terminal state.
 fn check_invariant_induction(
@@ -294,14 +296,19 @@ fn broken_by(
 
     let mut pre_counters = BTreeMap::new();
     for name in model.initial_counters.keys() {
-        let pre = Int::new_const(format!("pre:{name}"));
+        let pre = Int::new_const(var_name("pre:", "counter", name));
         solver.assert(pre.ge(&zero));
         pre_counters.insert(name.clone(), pre);
     }
     let pre_bools: BTreeMap<String, Bool> = model
         .initial_booleans
         .keys()
-        .map(|name| (name.clone(), Bool::new_const(format!("pre:{name}"))))
+        .map(|name| {
+            (
+                name.clone(),
+                Bool::new_const(var_name("pre:", "bool", name)),
+            )
+        })
         .collect();
     let pre_lists = make_list_vars(model, &solver, list_bound, "pre:");
     let pre_status = make_status_var(model, &solver);
@@ -317,7 +324,7 @@ fn broken_by(
             Arg::Lit(Literal::Int(n)) => Int::from_i64(*n),
             Arg::Var(name) => counters.get(name).cloned().unwrap_or_else(|| zero.clone()),
             Arg::Param(name) => {
-                let param = Int::new_const(format!("param:{name}"));
+                let param = Int::new_const(var_name("", "param", name));
                 solver.assert(param.ge(&zero));
                 param
             }
@@ -351,7 +358,7 @@ fn broken_by(
                         .get(name)
                         .cloned()
                         .unwrap_or_else(|| Bool::from_bool(false)),
-                    Arg::Param(name) => Bool::new_const(format!("param:{name}")),
+                    Arg::Param(name) => Bool::new_const(var_name("", "param", name)),
                     Arg::Lit(_) => Bool::from_bool(false),
                 };
                 post_bools.insert(var.clone(), value);
@@ -430,7 +437,7 @@ fn make_counter_vars(
         .initial_counters
         .keys()
         .map(|name| {
-            let var = Int::new_const(name.as_str());
+            let var = Int::new_const(var_name("", "counter", name));
             solver.assert(var.ge(&zero));
             solver.assert(var.le(&max_val));
             (name.clone(), var)
@@ -444,7 +451,7 @@ fn make_bool_vars(model: &TemperModel) -> Vec<(String, Bool)> {
         .initial_booleans
         .keys()
         .map(|name| {
-            let var = Bool::new_const(name.as_str());
+            let var = Bool::new_const(var_name("", "bool", name));
             (name.clone(), var)
         })
         .collect()
@@ -458,8 +465,8 @@ struct ListSymbolicVars {
 }
 
 /// Create exact bounded symbolic list variables, named after `prefix`:
-/// - `len` in `[0, bound]`
-/// - `elem_0..elem_{bound-1}` for position values
+/// - its length, in `[0, bound]`
+/// - one element per position below `bound`
 ///
 /// Every string a guard or invariant tests for membership, and every initial
 /// element, gets its own atom, so `'v' in list` is never decided by default.
@@ -475,13 +482,13 @@ fn make_list_vars(
     let mut elem_vars = BTreeMap::new();
 
     for name in model.initial_lists.keys() {
-        let len_var = Int::new_const(format!("{prefix}{name}_len"));
+        let len_var = Int::new_const(var_name(prefix, "len", name));
         solver.assert(len_var.ge(&zero));
         solver.assert(len_var.le(&max_val));
         len_vars.insert(name.clone(), len_var);
 
         let elements = (0..bound)
-            .map(|idx| Int::new_const(format!("{prefix}{name}_elem_{idx}")))
+            .map(|idx| Int::new_const(var_name(prefix, &format!("elem{idx}"), name)))
             .collect::<Vec<_>>();
         elem_vars.insert(name.clone(), elements);
     }
@@ -518,9 +525,17 @@ fn make_list_vars(
     }
 }
 
+/// A Z3 constant's name: the state it belongs to (`prefix`), the kind of
+/// value, and the spec's own name last, so constants of different kinds never
+/// share a name (a counter `tags_len` and list `tags`'s length are two
+/// constants).
+fn var_name(prefix: &str, kind: &str, name: &str) -> String {
+    format!("{prefix}{kind}|{name}")
+}
+
 /// Create a symbolic status variable over `model.states` indices.
 fn make_status_var(model: &TemperModel, solver: &Solver) -> Int {
-    let var = Int::new_const("status_idx");
+    let var = Int::new_const("status");
     let zero = Int::from_i64(0);
     if model.states.is_empty() {
         solver.assert(var.eq(&zero));
@@ -585,15 +600,17 @@ struct Symbols<'a> {
     bools: BTreeMap<String, Bool>,
     lists: &'a ListSymbolicVars,
     status: Int,
-    /// Distinguishes free atoms of different states (pre/post).
+    /// Names this state's free atoms (pre/post) in a solver dump.
     prefix: &'static str,
 }
 
-/// Encode an expression as a Z3 formula. Parts over values the model does
-/// not track (related-entity statuses, strings, fields) become free boolean
-/// atoms, named by their source text so repeated occurrences agree.
+/// Encode an expression as a Z3 formula. Each part over values the model
+/// does not track (related-entity statuses, strings, fields, parameters) is a
+/// fresh free atom, even where the same text appears twice: L1 reads every
+/// such part as unknown, so `X && !X` may hold there, and L0 must not rule
+/// out what L1 explores.
 fn encode(expr: &Expr, sym: &Symbols<'_>, model: &TemperModel) -> Bool {
-    let free = || Bool::new_const(format!("{}atom:{expr}", sym.prefix));
+    let free = || Bool::fresh_const(&format!("{}unknown", sym.prefix));
     match expr {
         Expr::Const(value) => Bool::from_bool(*value),
         Expr::Not(inner) => encode(inner, sym, model).not(),

@@ -8,7 +8,7 @@ use stateright::{Model, Property};
 
 use super::semantics::{
     apply_effects, apply_string_params, canonical_strings, evaluate_guard, guard_may_hold,
-    successors, truth,
+    rule_for, successors, truth,
 };
 use temper_spec::predicate::Truth;
 
@@ -103,28 +103,30 @@ fn check_reaches_state(model: &TemperModel, state: &TemperModelState) -> bool {
 // -- Model trait implementation ----------------------------------------------
 
 impl TemperModel {
-    /// Whether `transition` is enabled in `state`: status precondition, then guard.
+    /// Whether `transition` is enabled in `state`: it is the transition the
+    /// runtime takes for its action in this status ([`rule_for`]), and its
+    /// guard may hold.
     ///
     /// The single definition of "this edge may fire here", so that the action
-    /// generator and any caller that applies an action out of band cannot drift
-    /// apart on what the spec permits.
-    fn transition_enabled(
+    /// generator, the dead-transition walk and any caller that applies an
+    /// action out of band cannot drift apart on what the spec permits.
+    pub(crate) fn transition_enabled(
         &self,
         transition: &ResolvedTransition,
         state: &TemperModelState,
     ) -> bool {
-        let status_ok = transition.from_states.is_empty()
-            || transition.from_states.iter().any(|s| s == &state.status);
+        let taken = rule_for(self, &transition.name, &state.status)
+            .is_some_and(|rule| std::ptr::eq(rule, transition));
         // Guard checked for *fireability*: a cross-entity guard is a free
         // boolean, so `guard_may_hold` admits the gated edge rather than
         // pruning it. See `actions` for why that is the right direction.
-        status_ok && guard_may_hold(&transition.guard, &self.var_kinds, state)
+        taken && guard_may_hold(&transition.guard, &self.var_kinds, state)
     }
 
     /// Whether `action` may fire in `state`.
     ///
-    /// [`Model::next_state`] cannot answer this: it resolves a transition by
-    /// name and applies it unconditionally, which is sound under Stateright
+    /// [`Model::next_state`] cannot answer this: it resolves the transition
+    /// for the action's name and applies it unconditionally, which is sound under Stateright
     /// (every action it applies came from `actions` for that same state) but
     /// not for a caller that holds an action across a state change. The
     /// simulator does exactly that -- it chooses an action while an actor is in
@@ -133,9 +135,7 @@ impl TemperModel {
     ///
     /// An unknown action name is not enabled; there is no transition to fire.
     pub fn action_enabled(&self, state: &TemperModelState, action: &TemperModelAction) -> bool {
-        self.transitions
-            .iter()
-            .find(|t| t.name == action.name)
+        rule_for(self, &action.name, &state.status)
             .is_some_and(|t| self.transition_enabled(t, state))
     }
 }
@@ -180,7 +180,7 @@ impl Model for TemperModel {
     }
 
     fn next_state(&self, state: &Self::State, action: Self::Action) -> Option<Self::State> {
-        let resolved = self.transitions.iter().find(|t| t.name == action.name)?;
+        let resolved = rule_for(self, &action.name, &state.status)?;
 
         let new_status = action.target_state.unwrap_or_else(|| state.status.clone());
         let mut next = state.clone();

@@ -172,7 +172,7 @@ assert = "status in ['B'] => count > 0"
 /// for two flights home.
 #[test]
 fn a_rule_any_move_can_break_is_not_called_inductive() {
-    let spec = include_str!("../../../test-fixtures/specs/trip_getaway.ioa.toml");
+    let spec = include_str!("../../../test-fixtures/refused/trip_getaway.ioa.toml");
     let result = verify_symbolic(spec, 2);
     assert_eq!(
         not_proved(&result, "NeverPaysForTwoFlightsHome"),
@@ -236,6 +236,82 @@ assert = "'x' not in tags"
     assert_eq!(
         not_proved(&result, "NeverX"),
         Some(NotProved::BrokenBy("Tag".to_string()))
+    );
+}
+
+#[test]
+fn a_counter_named_like_a_list_length_is_its_own_value() {
+    // The counter `tags_len` and list `tags`'s length were one solver
+    // constant, so the counter was capped at the list bound and `Inc` could
+    // never reach 4.
+    let spec = r#"
+[automaton]
+name = "Collide"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "tags"
+type = "list"
+initial = []
+
+[[state]]
+name = "tags_len"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Inc"
+from = ["Open"]
+effect = ["tags_len += 1"]
+
+[[invariant]]
+name = "NeverFour"
+assert = "tags_len != 4"
+"#;
+    let result = verify_symbolic(spec, 2);
+    assert_eq!(
+        not_proved(&result, "NeverFour"),
+        Some(NotProved::BrokenBy("Inc".to_string()))
+    );
+}
+
+#[test]
+fn a_guard_part_written_twice_is_two_unknowns() {
+    // L1 reads `params.urgent == true` as unknown wherever it appears, so it
+    // fires `Proceed`; L0 used to read both copies as one value, find the
+    // guard false while `n == 0`, and prove `NeverReady`.
+    let spec = r#"
+[automaton]
+name = "UnknownTwice"
+states = ["Waiting", "Ready"]
+initial = "Waiting"
+
+[[state]]
+name = "n"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Proceed"
+from = ["Waiting"]
+to = "Ready"
+params = ["urgent"]
+guard = "params.urgent == true && (!(params.urgent == true) || n > 0)"
+
+[[invariant]]
+name = "NIsZero"
+assert = "n == 0"
+
+[[invariant]]
+name = "NeverReady"
+assert = "status != 'Ready'"
+"#;
+    let result = verify_symbolic(spec, 2);
+    assert_eq!(not_proved(&result, "NIsZero"), None);
+    assert_eq!(
+        not_proved(&result, "NeverReady"),
+        Some(NotProved::BrokenBy("Proceed".to_string()))
     );
 }
 

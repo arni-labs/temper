@@ -9,7 +9,7 @@ use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
 
 use crate::model::ResolvedTransition;
-use crate::model::semantics::{guard_may_hold, successors, truth};
+use crate::model::semantics::{successors, truth};
 use crate::model::{TemperModel, TemperModelAction, TemperModelState};
 
 /// A counterexample discovered during model checking.
@@ -209,15 +209,10 @@ fn step(
     transition: &ResolvedTransition,
     state: &TemperModelState,
 ) -> Vec<TemperModelState> {
-    let status_ok = transition.from_states.is_empty()
-        || transition
-            .from_states
-            .iter()
-            .any(|from| from == &state.status);
-    // Use `guard_may_hold` (not `evaluate_guard`) so cross-entity gated edges
-    // are walked during reachability BFS: a cross-entity guard is a free
-    // boolean, so the gated target state is genuinely reachable in the model.
-    if !status_ok || !guard_may_hold(&transition.guard, &model.var_kinds, state) {
+    // `transition_enabled` admits a cross-entity gated edge (its guard is a
+    // free boolean), so the gated target state is walked, as it is reachable
+    // in the model; a transition another with its name shadows is not.
+    if !model.transition_enabled(transition, state) {
         return Vec::new();
     }
     successors(model, transition, state)

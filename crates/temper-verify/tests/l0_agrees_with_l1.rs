@@ -12,7 +12,7 @@ use temper_verify::{
     CascadeLevel, VerificationCascade, check_model, run_prop_tests_from_ioa, verify_symbolic,
 };
 
-const TRIP_REBOOKING: &str = include_str!("../../../test-fixtures/specs/trip_rebooking.ioa.toml");
+const TRIP_REBOOKING: &str = include_str!("../../../test-fixtures/refused/trip_rebooking.ioa.toml");
 
 /// The film's failure, through the cascade: L0 does not call the rule
 /// inductive, and L1 names it and shows the whole path to the move that
@@ -108,19 +108,76 @@ fn a_property_test_failure_carries_every_state_on_its_path() {
     assert_eq!(bought.as_ref().map(|a| a.name.as_str()), Some("Bought"));
 }
 
+/// Two rules for one action: the runtime takes the first whose source states
+/// hold (temper-jit `evaluate_ctx`), and so does L1. It used to apply the
+/// first rule's effects from every state, reaching `C` with `n = 2`.
+#[test]
+fn two_rules_for_one_action_step_as_the_runtime_takes_them() {
+    let spec = r#"
+[automaton]
+name = "Dup"
+states = ["A", "B", "C"]
+initial = "A"
+
+[[state]]
+name = "n"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Go"
+from = ["A"]
+to = "B"
+effect = ["n += 1"]
+
+[[action]]
+name = "Go"
+from = ["B"]
+to = "C"
+effect = ["n = 0"]
+
+[[invariant]]
+name = "CleanInC"
+assert = "status == 'C' => n == 0"
+"#;
+    let model = build_model_from_ioa(spec, 2).expect("spec builds");
+    let checked = check_model(&model);
+    assert!(checked.is_complete);
+    assert!(
+        checked.counterexamples.is_empty(),
+        "{:?}",
+        checked.counterexamples
+    );
+    assert!(
+        checked.dead_transitions.is_empty(),
+        "{:?}",
+        checked.dead_transitions
+    );
+    let symbolic = verify_symbolic(spec, 2);
+    assert!(
+        symbolic
+            .inductive_invariants
+            .contains(&("CleanInC".to_string(), true))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Generated specs
 // ---------------------------------------------------------------------------
 
 const STATES: [&str; 3] = ["S0", "S1", "S2"];
 
+/// The counters: the second is named like the list's length, which L0 must
+/// keep apart from it.
+const COUNTERS: [&str; 2] = ["c0", "l0_len"];
+
 fn counter_atom() -> impl Strategy<Value = String> {
     (
-        0..2usize,
+        prop::sample::select(COUNTERS.to_vec()),
         prop::sample::select(vec!["==", "!=", "<", "<=", ">", ">="]),
         0..=3i64,
     )
-        .prop_map(|(c, op, n)| format!("c{c} {op} {n}"))
+        .prop_map(|(c, op, n)| format!("{c} {op} {n}"))
 }
 
 fn bool_atom() -> impl Strategy<Value = String> {
@@ -133,6 +190,16 @@ fn bool_atom() -> impl Strategy<Value = String> {
     })
 }
 
+fn list_atom() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "len(l0) <= 1",
+        "len(l0) == 0",
+        "'x' in l0",
+        "'x' not in l0",
+    ])
+    .prop_map(str::to_string)
+}
+
 fn status_atom() -> impl Strategy<Value = String> {
     prop::sample::subsequence(STATES.to_vec(), 1..=2).prop_map(|states| {
         let quoted: Vec<String> = states.iter().map(|s| format!("'{s}'")).collect();
@@ -141,15 +208,27 @@ fn status_atom() -> impl Strategy<Value = String> {
 }
 
 fn local_atom() -> impl Strategy<Value = String> {
-    prop_oneof![counter_atom(), bool_atom()]
+    prop_oneof![counter_atom(), bool_atom(), list_atom()]
 }
 
-/// A guard: a condition on counters and flags, or none.
+/// A guard atom: a condition on the record, or on a parameter L0 and L1
+/// cannot read (the same text may appear twice in one guard).
+fn guard_atom() -> impl Strategy<Value = String> {
+    prop_oneof![
+        3 => local_atom(),
+        1 => prop::sample::select(vec!["params.p == true", "!(params.p == true)"])
+            .prop_map(str::to_string),
+    ]
+}
+
+/// A guard: a condition on counters, flags, the list and a parameter, or none.
 fn guard() -> impl Strategy<Value = Option<String>> {
     prop::option::of(prop_oneof![
-        local_atom(),
-        (local_atom(), local_atom()).prop_map(|(a, b)| format!("{a} && {b}")),
-        (local_atom(), local_atom()).prop_map(|(a, b)| format!("{a} || {b}")),
+        guard_atom(),
+        (guard_atom(), guard_atom()).prop_map(|(a, b)| format!("{a} && {b}")),
+        (guard_atom(), guard_atom()).prop_map(|(a, b)| format!("{a} || {b}")),
+        (guard_atom(), guard_atom(), guard_atom())
+            .prop_map(|(a, b, c)| format!("{a} && ({b} || {c})")),
     ])
 }
 
@@ -169,12 +248,14 @@ fn invariant() -> impl Strategy<Value = String> {
 
 /// One effect statement, as `(variable written, statement)`.
 fn effect() -> impl Strategy<Value = (String, String)> {
+    let counter = || prop::sample::select(COUNTERS.to_vec());
     prop_oneof![
-        (0..2usize).prop_map(|c| (format!("c{c}"), format!("c{c} += 1"))),
-        (0..2usize).prop_map(|c| (format!("c{c}"), format!("c{c} -= 1"))),
-        (0..2usize, 0..=2i64).prop_map(|(c, n)| (format!("c{c}"), format!("c{c} = {n}"))),
+        counter().prop_map(|c| (c.to_string(), format!("{c} += 1"))),
+        counter().prop_map(|c| (c.to_string(), format!("{c} -= 1"))),
+        (counter(), 0..=2i64).prop_map(|(c, n)| (c.to_string(), format!("{c} = {n}"))),
         (0..2usize, any::<bool>()).prop_map(|(b, v)| (format!("b{b}"), format!("b{b} = {v}"))),
         (0..2usize).prop_map(|b| (format!("b{b}"), format!("b{b} = b{}", 1 - b))),
+        Just(("l0".to_string(), "append(l0, params.tag)".to_string())),
     ]
 }
 
@@ -214,6 +295,8 @@ fn quoted(items: &[&str]) -> String {
     format!("[{}]", items.join(", "))
 }
 
+/// A spec of up to five actions over three action names, so some names have
+/// two rules (the runtime takes the first whose source states hold).
 fn spec() -> impl Strategy<Value = String> {
     (
         prop::collection::vec(0..=1usize, 2),
@@ -226,9 +309,9 @@ fn spec() -> impl Strategy<Value = String> {
                 "[automaton]\nname = \"Gen\"\nstates = {states}\ninitial = \"S0\"\nallow_indefinite_states = {states}\n",
                 states = quoted(&STATES)
             );
-            for (i, initial) in counters.iter().enumerate() {
+            for (name, initial) in COUNTERS.iter().zip(&counters) {
                 toml.push_str(&format!(
-                    "\n[[state]]\nname = \"c{i}\"\ntype = \"counter\"\ninitial = {initial}\n"
+                    "\n[[state]]\nname = \"{name}\"\ntype = \"counter\"\ninitial = {initial}\n"
                 ));
             }
             for (i, initial) in bools.iter().enumerate() {
@@ -236,10 +319,25 @@ fn spec() -> impl Strategy<Value = String> {
                     "\n[[state]]\nname = \"b{i}\"\ntype = \"bool\"\ninitial = {initial}\n"
                 ));
             }
+            toml.push_str("\n[[state]]\nname = \"l0\"\ntype = \"list\"\ninitial = []\n");
             for (i, (from, to, guard, effects)) in actions.iter().enumerate() {
-                toml.push_str(&format!("\n[[action]]\nname = \"A{i}\"\nfrom = {}\n", quoted(from)));
+                toml.push_str(&format!(
+                    "\n[[action]]\nname = \"A{}\"\nfrom = {}\n",
+                    i % 3,
+                    quoted(from)
+                ));
                 if let Some(to) = to {
                     toml.push_str(&format!("to = \"{to}\"\n"));
+                }
+                let mut params = Vec::new();
+                if guard.as_ref().is_some_and(|g| g.contains("params.p")) {
+                    params.push("p");
+                }
+                if effects.iter().any(|e| e.contains("params.tag")) {
+                    params.push("tag");
+                }
+                if !params.is_empty() {
+                    toml.push_str(&format!("params = {}\n", quoted(&params)));
                 }
                 if let Some(guard) = guard {
                     toml.push_str(&format!("guard = \"{guard}\"\n"));
