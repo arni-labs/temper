@@ -3,8 +3,9 @@
 //! A collection read otherwise evaluates Cedar once per row and emits a span
 //! per evaluation. When every policy that can match this principal, action,
 //! and entity type ignores per-row state, one evaluation is the whole answer.
-//! A policy that names an entity id, a parent, or a resource attribute stays
-//! on the per-row path so a denied row is still removed.
+//! A policy that names an entity id, a parent, a resource attribute, or a
+//! context key a row's field fills stays on the per-row path so a denied row
+//! is still removed.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -14,7 +15,7 @@ use cedar_policy::{
     ResourceConstraint,
 };
 
-use crate::context::{PrincipalKind, SecurityContext};
+use crate::context::{PrincipalKind, SecurityContext, is_cedar_authority_context_key};
 
 /// How a list read may share one Cedar decision across rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +25,9 @@ pub enum ListReadUniformity {
     /// Rows can differ.
     ///
     /// `attribute_keys` lists the resource attributes the applicable policies
-    /// read, excluding `has_spec` (constant for the type) and the entity id.
+    /// read, as `resource.<key>` or as a `context.<key>` the request does
+    /// not fill, excluding `has_spec` (constant for the type) and the entity
+    /// id.
     /// `None` means the policy shape was not recognized; the caller must
     /// evaluate each full resource.
     PerEntity {
@@ -50,6 +53,11 @@ pub(super) fn classify(
         return per_entity_unknown();
     };
 
+    // Keys a row's fields cannot fill: authority keys, and those the request
+    // sets itself, which the engine puts in the context before the row's.
+    let request_fills = |key: &str| {
+        is_cedar_authority_context_key(key) || security_ctx.context_attrs.contains_key(key)
+    };
     let mut varies = false;
     let mut keys = Some(BTreeSet::new());
     for policy in policies.policies() {
@@ -59,7 +67,7 @@ pub(super) fn classify(
         if !policy.is_static() {
             return per_entity_unknown();
         }
-        match row_variance(policy, &resource_type_name) {
+        match row_variance(policy, &resource_type_name, &request_fills) {
             RowVariance::Uniform => {}
             RowVariance::Varies(policy_keys) => {
                 varies = true;
@@ -97,7 +105,12 @@ enum RowVariance {
     Unknown,
 }
 
-fn row_variance(policy: &Policy, resource_type: &EntityTypeName) -> RowVariance {
+/// `request_fills(key)`: whether the request itself fills `context.<key>`.
+fn row_variance(
+    policy: &Policy,
+    resource_type: &EntityTypeName,
+    request_fills: &dyn Fn(&str) -> bool,
+) -> RowVariance {
     let scope_varies = match policy.resource_constraint() {
         ResourceConstraint::Any => false,
         ResourceConstraint::Is(expected) => {
@@ -135,9 +148,24 @@ fn row_variance(policy: &Policy, resource_type: &EntityTypeName) -> RowVariance 
         return RowVariance::Unknown;
     }
 
-    if scan.unknown {
+    if scan.unknown
+        || scan
+            .nested_context_keys
+            .iter()
+            .any(|key| !request_fills(key))
+    {
         return RowVariance::Unknown;
     }
+    // The engine puts each resource attribute, the row's fields among them,
+    // into the context under its own name unless the request fills that key.
+    // So `context.owner` is the row's `owner` field: a page decided once on a
+    // probe without fields would skip a `forbid ... when { context.owner !=
+    // principal.id }` and show one user everyone's rows.
+    scan.keys.extend(
+        scan.context_keys
+            .into_iter()
+            .filter(|key| !request_fills(key)),
+    );
     if scope_varies || scan.identity || !scan.keys.is_empty() {
         RowVariance::Varies(Some(scan.keys))
     } else {
@@ -148,6 +176,10 @@ fn row_variance(policy: &Policy, resource_type: &EntityTypeName) -> RowVariance 
 #[derive(Default)]
 struct AttrScan {
     keys: BTreeSet<String>,
+    /// Keys the condition reads as `context.<key>`.
+    context_keys: BTreeSet<String>,
+    /// Keys the condition reads inside, as `context.<key>.<attr>`.
+    nested_context_keys: BTreeSet<String>,
     /// The condition names the row's id (`resource.id`, `resource.Id`, or `resource.entity_id`).
     identity: bool,
     /// The condition reads the resource in a shape this walk does not project.
@@ -157,6 +189,8 @@ struct AttrScan {
 impl AttrScan {
     fn merge(&mut self, other: Self) {
         self.keys.extend(other.keys);
+        self.context_keys.extend(other.context_keys);
+        self.nested_context_keys.extend(other.nested_context_keys);
         self.identity |= other.identity;
         self.unknown |= other.unknown;
     }
@@ -176,9 +210,10 @@ fn collect_resource_attrs_into(value: &serde_json::Value, scan: &mut AttrScan) {
             }
         }
         serde_json::Value::Object(map) => {
-            if json_var_is(value, "resource") {
+            if json_var_is(value, "resource") || json_var_is(value, "context") {
                 // A bare `resource` (entity equality, a function argument, …)
-                // can depend on more than the id. Keep the full document.
+                // can depend on more than the id, and a bare `context` holds
+                // the row's fields. Keep the full document.
                 scan.unknown = true;
             }
             if let Some(node) = map.get(".").or_else(|| map.get("has")) {
@@ -238,8 +273,14 @@ fn classify_getattr(attr: &str, target: Option<&serde_json::Value>, scan: &mut A
         return;
     }
     if json_var_is(target, "context") {
-        // Request context does not change between rows. Authority keys and
-        // other context attributes are both decided by the single probe.
+        // Kept apart: only `row_variance` knows which keys the request fills.
+        scan.context_keys.insert(attr.to_string());
+        return;
+    }
+    if let Some(key) = context_root(target) {
+        // `context.owner.name`: like a nested resource read when a row
+        // fills `owner`.
+        scan.nested_context_keys.insert(key.to_string());
         return;
     }
     if json_contains_var(target, "resource") {
@@ -247,6 +288,17 @@ fn classify_getattr(attr: &str, target: Option<&serde_json::Value>, scan: &mut A
         // this walker can project safely.
         scan.unknown = true;
     }
+}
+
+/// The context key a chain of attribute reads starts from: `owner` for
+/// `context.owner.name`.
+fn context_root(value: &serde_json::Value) -> Option<&str> {
+    let node = value.get(".")?;
+    let left = node.get("left").or_else(|| node.get("expr"))?;
+    if json_var_is(left, "context") {
+        return node.get("attr")?.as_str();
+    }
+    context_root(left)
 }
 
 fn json_var_is(value: &serde_json::Value, name: &str) -> bool {
@@ -318,144 +370,5 @@ fn principal_uid(security_ctx: &SecurityContext) -> Option<EntityUid> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-    use crate::context::{Principal, SecurityContext};
-    use crate::engine::AuthzEngine;
-
-    fn customer() -> SecurityContext {
-        SecurityContext {
-            principal: Principal {
-                id: "reader".to_string(),
-                kind: PrincipalKind::Customer,
-                role: None,
-                acting_for: None,
-                agent_type: None,
-                attributes: HashMap::new(),
-            },
-            context_attrs: HashMap::new(),
-            correlation_id: "list-uniformity".to_string(),
-        }
-    }
-
-    fn classify_for(policy: &str, resource_type: &str) -> ListReadUniformity {
-        let engine = AuthzEngine::empty();
-        engine
-            .reload_tenant_policies("tenant", policy)
-            .expect("policy should parse");
-        engine.list_read_uniformity("tenant", &customer(), "read", resource_type)
-    }
-
-    #[test]
-    fn type_level_read_permit_is_uniform() {
-        let decision = classify_for(
-            r#"permit(principal, action == Action::"read", resource is DesignLanguage);"#,
-            "DesignLanguage",
-        );
-        assert_eq!(decision, ListReadUniformity::Uniform);
-    }
-
-    #[test]
-    fn has_spec_condition_stays_uniform() {
-        let decision = classify_for(
-            r#"
-            permit(principal, action == Action::"read", resource is Order)
-            when { resource.has_spec == true };
-            "#,
-            "Order",
-        );
-        assert_eq!(decision, ListReadUniformity::Uniform);
-    }
-
-    #[test]
-    fn status_condition_is_per_entity() {
-        let decision = classify_for(
-            r#"
-            permit(principal, action == Action::"read", resource is DesignLanguage)
-            when { resource.status == "published" };
-            "#,
-            "DesignLanguage",
-        );
-        match decision {
-            ListReadUniformity::PerEntity {
-                attribute_keys: Some(keys),
-            } => {
-                assert!(keys.contains("status"), "keys={keys:?}");
-                assert!(!keys.contains("has_spec"));
-            }
-            other => panic!("expected per-entity status, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resource_id_condition_is_per_entity_without_json_fields() {
-        let decision = classify_for(
-            r#"
-            permit(principal, action == Action::"read", resource is Order)
-            when { resource.id == "ord-01" };
-            "#,
-            "Order",
-        );
-        match decision {
-            ListReadUniformity::PerEntity {
-                attribute_keys: Some(keys),
-            } => assert!(
-                keys.is_empty(),
-                "resource.id is the row id, not a catalog JSON field: {keys:?}"
-            ),
-            other => panic!("expected per-entity id condition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn nested_resource_attribute_is_not_projected() {
-        let decision = classify_for(
-            r#"
-            permit(principal, action == Action::"read", resource is Order)
-            when { resource.owner.name == "ada" };
-            "#,
-            "Order",
-        );
-        assert_eq!(
-            decision,
-            ListReadUniformity::PerEntity {
-                attribute_keys: None
-            }
-        );
-    }
-
-    #[test]
-    fn entity_id_forbid_is_per_entity_without_loading_json_fields() {
-        let decision = classify_for(
-            r#"
-            permit(principal, action == Action::"read", resource is Order);
-            forbid(principal, action == Action::"read", resource == Order::"ord-01");
-            "#,
-            "Order",
-        );
-        match decision {
-            ListReadUniformity::PerEntity {
-                attribute_keys: Some(keys),
-            } => assert!(
-                keys.is_empty(),
-                "an id forbid needs the entity id, not catalog JSON: {keys:?}"
-            ),
-            other => panic!("expected per-entity id forbid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unrelated_type_and_action_do_not_force_per_row_reads() {
-        let decision = classify_for(
-            r#"
-            permit(principal, action == Action::"read", resource is Order);
-            forbid(principal, action == Action::"read", resource is TrustedIssuer);
-            forbid(principal, action == Action::"delete", resource == Order::"ord-01");
-            "#,
-            "Order",
-        );
-        assert_eq!(decision, ListReadUniformity::Uniform);
-    }
-}
+#[path = "list_uniformity_test.rs"]
+mod tests;
