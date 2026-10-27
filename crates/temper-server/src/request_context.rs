@@ -12,6 +12,7 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+mod answer;
 pub(crate) mod armed_by;
 mod observation_metadata;
 

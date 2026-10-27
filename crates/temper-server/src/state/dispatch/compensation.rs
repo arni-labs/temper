@@ -177,7 +177,7 @@ impl crate::state::ServerState {
                 entity_id,
                 &action,
                 params,
-                &callback_ctx,
+                &callback_ctx.for_answer(),
             )
             .await
         {

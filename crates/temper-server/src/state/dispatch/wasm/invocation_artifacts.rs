@@ -224,7 +224,7 @@ impl crate::state::ServerState {
                         entity_ref.entity_id,
                         callback_action,
                         callback_params,
-                        agent_ctx,
+                        &agent_ctx.for_answer(),
                     )
                     .await
                     .map_err(|e| {
