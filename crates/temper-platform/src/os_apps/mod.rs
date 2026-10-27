@@ -1245,6 +1245,8 @@ pub(super) async fn install_os_app_with_plan(
             .into_iter()
             .map(InstallWarning::joint_invariants),
     );
+    let strands = install_checks::timer_strands(state, tenant, &bundle.specs, new_specs, policies);
+    warnings.extend(strands);
     if plan.policies {
         policy_rows::rewrite_primary_snapshot(state, tenant, &superseded).await?;
     }
