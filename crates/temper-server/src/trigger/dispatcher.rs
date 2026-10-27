@@ -7,8 +7,10 @@
 
 use std::sync::Arc;
 
+use super::reaction_principal::{
+    effective_trigger_security_context, reaction_cause, resolve_trigger_principal,
+};
 use crate::request_context::AgentContext;
-use temper_authz::{SecurityContext, platform_keys};
 use temper_runtime::tenant::TenantId;
 use tracing;
 use tracing::instrument;
@@ -162,6 +164,12 @@ impl ReactionDispatcher {
             let effective_params =
                 super::params::build_effective_params(&rule.then, entity_id, fields, &rule.name);
 
+            // How this move comes about: this rule, set off by the invoking
+            // move. Cedar sees it as `context.via` and the rest, so an app can
+            // tell a move the spec makes follow another from a principal's own
+            // pick. The principal itself stays the true one.
+            let cause = reaction_cause(&rule.name, entity_type, entity_id, action, invoking_ctx);
+
             // ADR-0046: resolve the dispatch principal. If the rule declares
             // an explicit `principal`, build a synthetic service identity;
             // otherwise inherit the invoking principal's exact
@@ -173,6 +181,7 @@ impl ReactionDispatcher {
                 entity_type,
                 entity_id,
                 action,
+                &cause,
             );
 
             let authz_snapshot = match state
@@ -199,7 +208,7 @@ impl ReactionDispatcher {
                 }
             };
 
-            let security_ctx = effective_trigger_security_context(&dispatch_ctx);
+            let security_ctx = effective_trigger_security_context(&dispatch_ctx, &cause);
             if let Err(denial) = state.authorize_with_context(
                 &security_ctx,
                 &rule.then.action,
@@ -216,6 +225,8 @@ impl ReactionDispatcher {
                     target_action = %rule.then.action,
                     principal_id = %security_ctx.principal.id,
                     principal_kind = ?security_ctx.principal.kind,
+                    via = cause.via(),
+                    depth = cause.depth,
                     "Reaction authorization denied: {reason}"
                 );
                 results.push(ReactionResult {
@@ -396,90 +407,6 @@ impl CascadeStop<'_> {
 }
 
 // Target resolver logic consolidated in super::resolver::resolve_target_id.
-
-/// ADR-0046: resolve the dispatch context for a reaction.
-///
-/// - When the rule declares a principal (`Some(service_name)`), build a
-///   synthetic `AgentContext` identifying the named service. Cedar policies
-///   can match on `principal.role`, `principal.agent_type`, or
-///   `principal.id == Service::"<name>"` — whichever style the tenant
-///   prefers. The `agent_type` slot carries the name so the Cedar request
-///   sees it via `principal.agent_type == "<name>"`.
-/// - When the rule has no principal (`None`), inherit the invoking context
-///   directly — the trigger runs as whoever called the source action.
-///
-/// Either way the reaction carries its own idempotency key, derived from the
-/// caller's and the rule's name ([`reaction_idempotency_key`]).
-fn resolve_trigger_principal(
-    declared_principal: Option<&str>,
-    invoking_ctx: &AgentContext,
-    rule_name: &str,
-    source_entity_type: &str,
-    source_entity_id: &str,
-    source_action: &str,
-) -> AgentContext {
-    let mut ctx = match declared_principal {
-        Some(service_name) if !service_name.is_empty() => {
-            let mut ctx = AgentContext::for_service_inheriting(service_name, invoking_ctx);
-            if let Some(security_ctx) = ctx.security_ctx.as_mut() {
-                security_ctx.context_attrs.insert(
-                    platform_keys::TRIGGER_RULE.to_string(),
-                    serde_json::Value::String(rule_name.to_string()),
-                );
-                security_ctx.context_attrs.insert(
-                    platform_keys::TRIGGER_SOURCE_ENTITY_TYPE.to_string(),
-                    serde_json::Value::String(source_entity_type.to_string()),
-                );
-                security_ctx.context_attrs.insert(
-                    platform_keys::TRIGGER_SOURCE_ENTITY_ID.to_string(),
-                    serde_json::Value::String(source_entity_id.to_string()),
-                );
-                security_ctx.context_attrs.insert(
-                    platform_keys::TRIGGER_SOURCE_ACTION.to_string(),
-                    serde_json::Value::String(source_action.to_string()),
-                );
-                security_ctx.context_attrs.insert(
-                    platform_keys::TRIGGER_DECLARED_PRINCIPAL.to_string(),
-                    serde_json::Value::Bool(true),
-                );
-            }
-            ctx
-        }
-        _ => invoking_ctx.clone(),
-    };
-    ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name);
-    ctx
-}
-
-/// A reaction's idempotency key: the caller's, made the rule's own (ADR-0048).
-/// A retry of the source action carries the same caller key, so its reactions
-/// are deduplicated too. The caller's key itself would make a reaction on the
-/// source's own record (`same_id`) a duplicate of the source action, which
-/// that record has just recorded under the key, and the reaction would be
-/// answered as done without running.
-fn reaction_idempotency_key(invoking_ctx: &AgentContext, rule_name: &str) -> Option<String> {
-    invoking_ctx
-        .idempotency_key
-        .as_ref()
-        .map(|key| format!("{key}:reaction:{rule_name}"))
-}
-
-fn effective_trigger_security_context(agent_ctx: &AgentContext) -> SecurityContext {
-    if let Some(security_ctx) = &agent_ctx.security_ctx {
-        return security_ctx.clone();
-    }
-
-    let mut security_ctx = SecurityContext::anonymous().with_agent_context(
-        agent_ctx.agent_id.as_deref(),
-        agent_ctx.session_id.as_deref(),
-        agent_ctx.agent_type.as_deref(),
-    );
-    security_ctx.context_attrs.insert(
-        platform_keys::TRIGGER_INHERITED_CONTEXT_APPROXIMATE.to_string(),
-        serde_json::Value::Bool(true),
-    );
-    security_ctx
-}
 
 #[cfg(test)]
 #[path = "dispatcher_test.rs"]

@@ -31,6 +31,7 @@ mod state_timer_rows;
 #[cfg(test)]
 #[path = "strict_support_test.rs"]
 mod strict_test_support;
+mod timer_cause;
 mod wasm;
 pub(crate) use wasm::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]

@@ -790,7 +790,7 @@ impl crate::state::ServerState {
                                 &timer.entity_id,
                                 &timer.action,
                                 timer.params.clone(),
-                                &timer.fire_context(),
+                                &timer.fire_context(&current.state),
                             )
                             .await;
                         if let Ok(answer) = answer
@@ -858,9 +858,15 @@ impl ArmedTimer {
 
     /// What its fire is dispatched as: its identity, marked as the fire of
     /// the arming at its journal sequence, which the record's actor applies
-    /// only while the record is still at that sequence.
-    fn fire_context(&self) -> AgentContext {
+    /// only while the record is still at that sequence. So the record's
+    /// latest move in `current`, which it fires on, is the move that armed
+    /// it, and its fire's cause names that move.
+    fn fire_context(&self, current: &EntityState) -> AgentContext {
         let mut agent = self.agent_ctx.clone();
+        super::timer_cause::mark_timer_fire(
+            &mut agent,
+            current.events.back().map(|event| event.action.as_str()),
+        );
         agent.fires_state_timer = Some(StateTimerFire {
             tenant: self.tenant.to_string(),
             entity_type: self.entity_type.clone(),

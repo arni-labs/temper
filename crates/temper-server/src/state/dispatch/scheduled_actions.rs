@@ -317,6 +317,9 @@ impl ServerState {
         let mut agent = timer.agent_ctx.clone();
         agent.idempotency_key = Some(key.clone());
         agent.fires_scheduled_action = Some(timer.row());
+        // Its row does not keep the move that scheduled it, so the fire's
+        // cause names only who armed it.
+        super::timer_cause::mark_timer_fire(&mut agent, None);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
         loop {

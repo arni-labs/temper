@@ -11,6 +11,7 @@
 pub mod dispatcher;
 pub(crate) mod guard;
 pub(crate) mod params;
+mod reaction_principal;
 pub mod registry;
 pub(crate) mod resolver;
 pub mod sim_dispatcher;

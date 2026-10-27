@@ -55,6 +55,12 @@ pub struct SecurityContext {
     pub context_attrs: HashMap<String, serde_json::Value>,
     /// Correlation ID for tracing.
     pub correlation_id: String,
+    /// How the move this context carries came about, when the kernel's
+    /// reaction or timer path made it; None for a direct request. Cedar sees
+    /// it as `context.via` and the rest ([`crate::cause`]); only the kernel
+    /// sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::MoveCause>,
 }
 
 /// Credential-authenticated authority bound to one tenant.
@@ -154,6 +160,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -183,6 +190,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id,
+            cause: None,
         }
     }
 
@@ -202,6 +210,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -253,6 +262,7 @@ impl SecurityContext {
             },
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -318,6 +328,7 @@ impl SecurityContext {
             },
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
