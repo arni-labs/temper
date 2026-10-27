@@ -29,6 +29,20 @@ pub(crate) fn concurrent_writes() -> bool {
     *ON.get_or_init(|| std::env::var("TEMPER_TURSO_MVCC").as_deref() == Ok("1"))
 }
 
+/// Scratch measurement only: `TEMPER_TURSO_SYNCHRONOUS=NORMAL` (or FULL, OFF)
+/// sets `PRAGMA synchronous` on every synced connection.
+pub(crate) fn synchronous() -> Option<&'static str> {
+    static MODE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("TEMPER_TURSO_SYNCHRONOUS").as_deref() {
+            Ok("NORMAL") => Some("NORMAL"),
+            Ok("FULL") => Some("FULL"),
+            Ok("OFF") => Some("OFF"),
+            _ => None,
+        }
+    })
+}
+
 /// Driver failures retain the original engine or transport error.
 #[derive(Debug, Error)]
 pub(crate) enum DriverError {

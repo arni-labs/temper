@@ -344,6 +344,10 @@ impl SyncCopy {
             match opened {
                 Ok(conn) => {
                     conn.busy_timeout(Duration::from_secs(5))?;
+                    if let Some(mode) = crate::driver::synchronous() {
+                        conn.execute(&format!("PRAGMA synchronous = {mode}"), ())
+                            .await?;
+                    }
                     let conn = Lease::new(Arc::new(DriverHandle::new(conn)), in_use);
                     return Ok(Connection::Local { conn, pool });
                 }
