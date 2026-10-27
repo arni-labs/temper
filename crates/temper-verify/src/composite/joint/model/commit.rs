@@ -9,7 +9,7 @@ use super::super::env::Blind;
 use super::super::{Dispatch, JointState};
 use super::JointModel;
 use super::step::Certainty;
-use crate::model::semantics::{step, successors_budgeted};
+use crate::model::semantics::{step, successors_budgeted, within_bounds};
 use crate::model::{
     ParamValue, ResolvedTransition, StringParam, TemperModelAction, TemperModelState,
 };
@@ -54,13 +54,23 @@ impl JointModel {
         text: &str,
     ) -> Vec<(JointState, String, Certainty)> {
         let refused = format!("{text} refused by its record");
-        let Arrival::Took {
-            moved,
-            action,
-            certainty,
-        } = self.arrive(&state, dispatch)
-        else {
-            return vec![(state, refused, Certainty::Sure)];
+        let (moved, action, certainty) = match self.arrive(&state, dispatch) {
+            Arrival::Refused => return vec![(state, refused, Certainty::Sure)],
+            Arrival::BeyondBounds => {
+                // The runtime can take this move, but its result is outside
+                // the bounded walk. Do not count it as a definite refusal
+                // or as a covered move in the liveness graph.
+                return vec![(
+                    state,
+                    format!("{text}: outcome beyond exploration bounds"),
+                    Certainty::Unsure,
+                )];
+            }
+            Arrival::Took {
+                moved,
+                action,
+                certainty,
+            } => (moved, action, certainty),
         };
         // A take the model cannot decide may be a refusal instead.
         let mut outcomes = Vec::new();
@@ -175,14 +185,38 @@ impl JointModel {
         if !constraints_hold(&t.string_params, target, &params) || newer == Truth::False {
             return Arrival::Refused;
         }
+        // A count that must equal one of the record's counters, and a
+        // string the record does not track that must not be empty: decided
+        // when the dispatch carries it.
+        let mut carried = true;
+        for (param, field) in self.unchecked.counts(&dispatch.to, &t.name) {
+            match (dispatch.params.get(param), target.counters.get(field)) {
+                (Some(ParamValue::Count(sent)), Some(held)) if sent != held => {
+                    return Arrival::Refused;
+                }
+                (Some(ParamValue::Count(_)), Some(_)) => {}
+                _ => carried = false,
+            }
+        }
+        for param in self.unchecked.nonempty(&dispatch.to, &t.name) {
+            match dispatch.params.get(param) {
+                Some(ParamValue::Str(sent)) if sent.is_empty() => return Arrival::Refused,
+                Some(ParamValue::Str(_)) => {}
+                _ => carried = false,
+            }
+        }
         let Some(moved) = step(model, &t.name, t.to_state.as_deref(), target, &params) else {
             return Arrival::Refused;
         };
+        if !within_bounds(model, target, &moved) {
+            return Arrival::BeyondBounds;
+        }
         // Taken or refused, and nothing else, unless another transition
         // might be the one taken, the model chose a value it was not sent, or
         // a count behind its family's newest moves up by an unknown amount.
         let decided = eval(&t.guard, &self.env(&dispatch.to, state)) == Truth::True
             && self.unchecked.decides(&dispatch.to, &t.name)
+            && carried
             && newer == Truth::True;
         let certainty =
             if enabled.len() > 1 || chose || !self.order.exact(&dispatch.to, &t.effects, state) {
@@ -217,6 +251,8 @@ impl JointModel {
 
 /// What a record's actor does with a dispatch.
 pub(super) enum Arrival {
+    /// Its result lies outside the bounded exploration, not a refusal.
+    BeyondBounds,
     /// It refuses it: no transition from its state allows it.
     Refused,
     /// It takes a transition.
@@ -263,3 +299,7 @@ fn constraints_hold(
                 .all(|v| v != value)
     })
 }
+
+#[cfg(test)]
+#[path = "commit_test.rs"]
+mod tests;

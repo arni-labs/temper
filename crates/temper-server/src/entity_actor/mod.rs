@@ -9,6 +9,7 @@ mod actor;
 pub(crate) mod bootstrap;
 mod effect_outcome;
 pub mod effects;
+pub(crate) mod entity_rows;
 mod field_updates;
 mod move_invariants;
 pub(crate) mod related;

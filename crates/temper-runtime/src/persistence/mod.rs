@@ -219,6 +219,36 @@ pub struct CommitRows<'a> {
     /// transition fired: its row is removed in the same commit, so a row
     /// never outlives its fire's event and a restart cannot fire it again.
     pub fired_scheduled_action: Option<&'a str>,
+    /// The entity's query-plane row as the appended events leave it. A store
+    /// whose [`EventStore::commits_entity_rows`] is true writes it in the
+    /// journal's transaction, at the last appended sequence.
+    pub projection: Option<ProjectionRow<'a>>,
+    /// The entity's state-timer row as the appended events leave it, for a
+    /// store whose [`EventStore::commits_entity_rows`] is true. None leaves
+    /// the row as it is.
+    pub state_timer: Option<StateTimerRow<'a>>,
+}
+
+/// An entity's query-plane row, written with the events that change it.
+#[derive(Debug, Clone, Copy)]
+pub enum ProjectionRow<'a> {
+    /// The entity's status, its projected fields and its projected state.
+    Upsert {
+        status: &'a str,
+        fields: &'a serde_json::Value,
+        state: &'a serde_json::Value,
+    },
+    /// The entity was deleted: its row and its field-index rows go.
+    Remove,
+}
+
+/// An entity's state-timer row, written with the events that change it.
+#[derive(Debug, Clone, Copy)]
+pub enum StateTimerRow<'a> {
+    /// The events armed (or reset) a timer: this is its row.
+    Arm(&'a StateTimerRecord),
+    /// The entity is no longer where a timer waits: its row goes.
+    End,
 }
 
 impl CommitRows<'_> {
@@ -290,6 +320,15 @@ pub trait EventStore: Send + Sync + 'static {
             );
         }
         self.append(persistence_id, expected_sequence, events)
+    }
+
+    /// Whether [`EventStore::append_with_rows`] writes
+    /// [`CommitRows::projection`] and [`CommitRows::state_timer`] in the
+    /// journal's transaction: the entity's query-plane row and timer row are
+    /// then the journal's, and nothing writes them again after the commit.
+    /// The default writes neither.
+    fn commits_entity_rows(&self) -> bool {
+        false
     }
 
     /// Every pending scheduled action of `tenant`: what a restart arms again.
