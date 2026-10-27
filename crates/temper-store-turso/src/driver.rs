@@ -33,14 +33,14 @@ pub(crate) fn concurrent_writes() -> bool {
 /// sets `PRAGMA synchronous` on every synced connection.
 pub(crate) fn synchronous() -> Option<&'static str> {
     static MODE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("TEMPER_TURSO_SYNCHRONOUS").as_deref() {
+    *MODE.get_or_init(
+        || match std::env::var("TEMPER_TURSO_SYNCHRONOUS").as_deref() {
             Ok("NORMAL") => Some("NORMAL"),
             Ok("FULL") => Some("FULL"),
             Ok("OFF") => Some("OFF"),
             _ => None,
-        }
-    })
+        },
+    )
 }
 
 /// Scratch measurement only: `TEMPER_TURSO_COMMIT_FULL=1` with

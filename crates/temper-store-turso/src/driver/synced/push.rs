@@ -124,7 +124,10 @@ impl SyncCopy {
     async fn last_row_change(&self) -> Result<i64, PersistenceError> {
         let conn = self.connect().await.map_err(storage_error)?;
         let mut rows = conn
-            .query("SELECT MAX(change_id) FROM turso_cdc WHERE change_type <> 2", ())
+            .query(
+                "SELECT MAX(change_id) FROM turso_cdc WHERE change_type <> 2",
+                (),
+            )
             .await
             .map_err(storage_error)?;
         let Some(row) = rows.next().await.map_err(storage_error)? else {
