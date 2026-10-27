@@ -240,6 +240,7 @@ impl JointModel {
                     if new {
                         let label = explored.packer.id(&next.label);
                         explored.firsts.push(Some((index as u32, label)));
+                        queue.add(at as usize, distance(&next.state));
                     }
                     if edges {
                         explored.edges.push(Edge {
