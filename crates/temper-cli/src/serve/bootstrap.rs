@@ -20,7 +20,7 @@ use temper_server::registry_bootstrap::{
 use temper_server::storage::StorageStack;
 use temper_server::webhooks::WebhookDispatcher;
 use temper_store_redis::RedisEventStore;
-use temper_store_turso::{SyncCopy, TenantStoreRouter, TursoEventStore};
+use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
 use crate::StorageBackend;
 
@@ -32,14 +32,18 @@ use super::storage::{
 
 /// Phase 1: Initialize the storage backend (Postgres, Turso, Redis, or memory).
 ///
-/// Also returns the Turso Cloud copy of a local Turso database when
-/// `TURSO_SYNC_URL` is set; the server answers changes only once they reach it.
+/// Also returns the local Turso database when `TURSO_SYNC_URL` gives it a
+/// Turso Cloud copy; the server answers changes only once they reach it.
 pub(super) async fn init_storage(
     storage: StorageBackend,
     storage_explicit: bool,
-) -> Result<(Option<sqlx::PgPool>, Option<StorageStack>, Option<SyncCopy>)> {
+) -> Result<(
+    Option<sqlx::PgPool>,
+    Option<StorageStack>,
+    Option<TursoEventStore>,
+)> {
     let mut pg_pool: Option<sqlx::PgPool> = None;
-    let mut sync_copy: Option<SyncCopy> = None;
+    let mut synced_store: Option<TursoEventStore> = None;
     if !matches!(storage, StorageBackend::Turso) && std::env::var_os("TURSO_SYNC_URL").is_some() {
         anyhow::bail!("TURSO_SYNC_URL needs --storage turso");
     }
@@ -130,7 +134,7 @@ pub(super) async fn init_storage(
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to open synced Turso database: {e}")
                         })?;
-                    sync_copy = store.sync_copy().cloned();
+                    synced_store = Some(store.clone());
                     let copied =
                         format!(", each change copied to {sync_url} before it is answered");
                     (store, copied)
@@ -155,7 +159,7 @@ pub(super) async fn init_storage(
             Some(StorageStack::from_redis(store))
         }
     };
-    Ok((pg_pool, storage_stack, sync_copy))
+    Ok((pg_pool, storage_stack, synced_store))
 }
 
 /// Phase 2: Build the spec registry from persistent storage and disk apps.
@@ -721,6 +725,15 @@ pub(super) async fn bootstrap_installed_apps(
                     );
                 }
                 AppBootstrapSource::Cli => {
+                    if !result.warnings.is_empty() || !result.modules_reviewed.is_empty() {
+                        print_install_notes(
+                            &app_name,
+                            &serde_json::json!({
+                                "warnings": result.warnings,
+                                "modules_reviewed": result.modules_reviewed,
+                            }),
+                        );
+                    }
                     let all: Vec<String> = result
                         .added
                         .iter()
@@ -735,6 +748,9 @@ pub(super) async fn bootstrap_installed_apps(
                 }
             },
             Err(e) => {
+                if matches!(source, AppBootstrapSource::Cli) {
+                    print_install_notes(&app_name, &serde_json::json!({ "refused": e }));
+                }
                 // A stored install that does not come back is an outage of that
                 // app, so it is logged as an error; a `--app` request only warns.
                 let message = match source {
@@ -757,6 +773,19 @@ pub(super) async fn bootstrap_installed_apps(
     }
 
     Ok(())
+}
+
+/// Everything the install of an app given on the command line said, as one compact JSON object on one line before the
+/// line that says it installed or failed: its warnings and the modules Jev reviewed, or why it was refused, whole
+/// (`refused`). A reader of a start's output that sees the verdict already has it (Katagami's start wrapper keeps both
+/// lines and passes this one on as it is).
+fn print_install_notes(app_name: &str, line: &serde_json::Value) {
+    use std::io::Write as _;
+
+    let _ = writeln!(
+        std::io::stdout(),
+        "  App '{app_name}' install notes: {line}"
+    );
 }
 
 #[cfg(test)]

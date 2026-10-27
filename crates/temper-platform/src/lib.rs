@@ -13,6 +13,7 @@ pub mod genesis_install;
 pub mod genesis_install_verify;
 pub mod hooks;
 pub mod integration;
+pub mod module_review;
 mod operator_manage_policies;
 pub mod optimization;
 pub mod os_apps;
@@ -32,7 +33,8 @@ pub use bootstrap::{
     persist_system_verification, retire_other_operator_credentials,
 };
 pub use os_apps::{
-    AppBundle, AppEntry, AppManifest, InstallResult, install_os_app, list_os_apps, restore_os_app,
+    AppBundle, AppEntry, AppManifest, InstallResult, InstallWarning, install_os_app, list_os_apps,
+    restore_os_app,
 };
 pub use protocol::{PlatformEvent, VerifyStepStatus};
 pub use state::PlatformState;

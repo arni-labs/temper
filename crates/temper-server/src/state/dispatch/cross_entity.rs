@@ -1,34 +1,35 @@
 use crate::request_context::AgentContext;
-use temper_jit::table::{Related, RelatedMap};
+use temper_jit::table::{Related, RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
 impl crate::state::ServerState {
-    /// Resolve the related entities an action's guards read.
+    /// Resolve the related entities a move of `action` reads: its guards, and
+    /// the type's invariants, which every move is checked against.
     ///
-    /// For each `Type[id_field].status` in the guards of `action`, reads the
-    /// id (or list of ids) from the entity's current fields and resolves each
+    /// For each `Type[id_field].status` they read, reads the
+    /// id (or list of ids) from stored fields or declared defaults and resolves each
     /// related entity's status. An unset reference resolves to no statuses;
     /// an entity that is not found resolves to `None`. Every id is resolved:
     /// the number of lookups is the number of ids the entity's own fields
     /// hold, so a guard over all of a list's entities sees all of them.
-    pub(super) async fn resolve_cross_entity_guards(
+    pub(super) async fn resolve_related_statuses(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        let mut result = RelatedMap::new();
-        let refs: Vec<(String, String)> = {
+        let table = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
-                return result;
+                return RelatedMap::new();
             };
-            spec.table().guard_related_refs(action)
+            spec.table()
         };
+        let refs = table.related_refs(action);
         if refs.is_empty() {
-            return result;
+            return RelatedMap::new();
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -37,19 +38,29 @@ impl crate::state::ServerState {
             .await
         {
             Ok(resp) => resp.state.fields,
-            Err(_) => return result,
+            Err(_) => return RelatedMap::new(),
         };
+        self.related_statuses_of(tenant, &table, refs, &current_fields)
+            .await
+    }
 
+    /// The statuses of the records `fields` refers to through each of
+    /// `refs`, `(related type, id field)`, under `table`'s declared defaults,
+    /// as [`Self::resolve_related_statuses`] resolves them.
+    pub(in crate::state) async fn related_statuses_of(
+        &self,
+        tenant: &TenantId,
+        table: &TransitionTable,
+        refs: Vec<(String, String)>,
+        fields: &serde_json::Value,
+    ) -> RelatedMap {
+        let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
-            let ids: Vec<&str> = match current_fields.get(&id_field) {
-                Some(serde_json::Value::Array(items)) => items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .filter(|id| !id.is_empty())
-                    .collect(),
-                Some(serde_json::Value::String(id)) if !id.is_empty() => vec![id.as_str()],
-                _ => Vec::new(),
-            };
+            let ids = crate::entity_actor::related::reference_ids(
+                fields,
+                &table.initial_values,
+                &id_field,
+            );
             let mut statuses = Vec::with_capacity(ids.len());
             for id in ids {
                 statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
@@ -61,7 +72,7 @@ impl crate::state::ServerState {
 
     /// Dispatch entity spawn requests post-transition.
     ///
-    /// This is a **sync** method (like `dispatch_scheduled_actions`) so that
+    /// This is a **sync** method (like `arm_scheduled_actions`) so that
     /// `tokio::spawn` inside it does not cause async recursion.
     /// Creates child entities and optionally dispatches initial actions.
     ///
@@ -99,7 +110,8 @@ impl crate::state::ServerState {
                 .workflow_run_id
                 .clone()
                 .unwrap_or_else(|| format!("{parent_t}:{parent_i}"));
-            let span = tracing::info_span!(
+            let span = crate::trace_context::runtime_work_span!(
+                crate::trace_context::cause(),
                 "dispatch.background_spawn_entity",
                 workflow.root_entity_type = %workflow_root_entity_type,
                 workflow.root_entity_id = %workflow_root_entity_id,
@@ -212,13 +224,15 @@ impl crate::state::ServerState {
                                         table,
                                         &initial_fields,
                                     );
-                                table.validate_action_params(
-                                    action,
-                                    params,
-                                    &prestate.fields,
-                                    &prestate.counters,
-                                    &prestate.booleans,
-                                )
+                                table
+                                    .validate_action_params(
+                                        action,
+                                        params,
+                                        &prestate.fields,
+                                        &prestate.counters,
+                                        &prestate.booleans,
+                                    )
+                                    .map_err(String::from)
                             });
                         if let Err(error) = validation {
                             state.record_generated_callback_refusal(
@@ -235,7 +249,13 @@ impl crate::state::ServerState {
                     }
 
                     match state
-                        .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
+                        .get_or_create_tenant_entity_by(
+                            &t,
+                            &child_type,
+                            &child_id,
+                            initial_fields,
+                            &agent,
+                        )
                         .await
                     {
                         Ok(created) => {

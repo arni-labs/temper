@@ -65,4 +65,6 @@ npm-package = "temper-mcp"
 pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{ archive-suffix }"
 
 [dev-dependencies]
+temper-test-resource = { workspace = true }
 tempfile = "3"
+temper-wasm = { workspace = true }

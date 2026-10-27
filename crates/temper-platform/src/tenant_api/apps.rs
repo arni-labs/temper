@@ -3,6 +3,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use temper_authz::AuthenticatedRequestContext;
+use temper_server::platform_store::InstalledAppRecord;
 
 use super::auth::{
     PlatformResourceAuthorization, require_authenticated, require_requested_resource_authorization,
@@ -77,18 +78,50 @@ pub(crate) async fn get_os_app_guide(
     }
 }
 
-/// Return follow-latest state only for the credential-bound tenant.
-pub(crate) async fn list_genesis_follow_updates(
-    State(state): State<PlatformState>,
-    authenticated: Option<Extension<AuthenticatedRequestContext>>,
-) -> impl IntoResponse {
-    let authenticated = match require_authenticated(authenticated.as_deref()) {
-        Ok(authenticated) => authenticated,
-        Err(status) => return authorization_error(status),
-    };
+/// One installed app and the version it runs, as `GET /genesis/apps/installs`
+/// reports it.
+#[derive(Debug, serde::Serialize)]
+struct InstalledAppView {
+    app_name: String,
+    source_kind: String,
+    app_ref: String,
+    version_hash: String,
+    pinned_version_hash: String,
+    current_version_hash: String,
+    follow_policy: String,
+    status: String,
+    installed_at: Option<String>,
+    last_reconciled_at: Option<String>,
+}
+
+impl From<InstalledAppRecord> for InstalledAppView {
+    fn from(record: InstalledAppRecord) -> Self {
+        Self {
+            app_name: record.app_name,
+            source_kind: record.source_kind,
+            app_ref: record.app_ref,
+            version_hash: record.version_hash,
+            pinned_version_hash: record.pinned_version_hash,
+            current_version_hash: record.current_version_hash,
+            follow_policy: record.follow_policy,
+            status: record.status,
+            installed_at: record.installed_at,
+            last_reconciled_at: record.last_reconciled_at,
+        }
+    }
+}
+
+/// Authorize a read of the credential tenant's app installs and return that
+/// tenant. The tenant comes from the credential alone: the install read routes
+/// take no request input that could name another tenant.
+fn authorize_app_install_read<'a>(
+    state: &PlatformState,
+    authenticated: Option<&'a AuthenticatedRequestContext>,
+) -> Result<&'a str, StatusCode> {
+    let authenticated = require_authenticated(authenticated)?;
     let tenant = authenticated.tenant().as_str();
-    if let Err(status) = require_resource_authorization(
-        &state,
+    require_resource_authorization(
+        state,
         authenticated,
         PlatformResourceAuthorization {
             action: "read_app_installs",
@@ -96,9 +129,75 @@ pub(crate) async fn list_genesis_follow_updates(
             resource_id: tenant,
             attrs: std::collections::BTreeMap::new(),
         },
-    ) {
-        return authorization_error(status);
+    )?;
+    Ok(tenant)
+}
+
+/// List every app installed in the credential's tenant with the version each
+/// one runs, sorted by app name.
+///
+/// A release check uses this to prove production runs a merged app change: it
+/// reads the installed version hashes instead of trusting that a deployed
+/// image carried the commit. It is a plain read of the platform store and
+/// makes no registry or network calls. A storage stack without a platform
+/// store has nothing installed to report and returns an empty list.
+pub(crate) async fn list_app_installs(
+    State(state): State<PlatformState>,
+    authenticated: Option<Extension<AuthenticatedRequestContext>>,
+) -> impl IntoResponse {
+    let tenant = match authorize_app_install_read(&state, authenticated.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(status) => return authorization_error(status),
+    };
+    match installed_apps_in_tenant(&state, tenant).await {
+        Ok(apps) => (StatusCode::OK, Json(serde_json::json!({ "value": apps }))),
+        Err(error) => {
+            tracing::warn!(tenant, error = %error, "failed to read installed apps");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to read installed apps" })),
+            )
+        }
     }
+}
+
+/// Read one tenant's installed-app rows. A store failure is an error rather
+/// than an empty list, so a caller never mistakes it for "nothing installed".
+async fn installed_apps_in_tenant(
+    state: &PlatformState,
+    tenant: &str,
+) -> Result<Vec<InstalledAppView>, String> {
+    let Some(platform_store) = state
+        .server
+        .storage_stack
+        .as_ref()
+        .and_then(|stack| stack.platform.clone())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut apps = Vec::new();
+    for (row_tenant, app_name) in platform_store.list_all_installed_apps().await? {
+        if row_tenant != tenant {
+            continue;
+        }
+        // None: the row has no metadata, e.g. it was removed between the reads.
+        if let Some(record) = platform_store.get_installed_app(tenant, &app_name).await? {
+            apps.push(InstalledAppView::from(record));
+        }
+    }
+    apps.sort_by(|left, right| left.app_name.cmp(&right.app_name));
+    Ok(apps)
+}
+
+/// Return follow-latest state only for the credential-bound tenant.
+pub(crate) async fn list_genesis_follow_updates(
+    State(state): State<PlatformState>,
+    authenticated: Option<Extension<AuthenticatedRequestContext>>,
+) -> impl IntoResponse {
+    let tenant = match authorize_app_install_read(&state, authenticated.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(status) => return authorization_error(status),
+    };
     let updates = crate::genesis_install::list_genesis_follow_latest_updates(&state)
         .await
         .into_iter()

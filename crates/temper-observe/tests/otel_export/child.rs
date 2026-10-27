@@ -100,11 +100,21 @@ impl Run {
             .collect()
     }
 
+    /// The bodies sent to `path`, each checked to be OTLP protobuf, the only
+    /// encoding [`wire`] reads.
     fn bodies<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a [u8]> {
         self.received
             .iter()
             .filter(move |request| request.path == path)
-            .map(|request| request.body.as_slice())
+            .map(|request| {
+                assert_eq!(
+                    request.header("content-type"),
+                    "application/x-protobuf",
+                    "export to {} is not OTLP protobuf",
+                    request.path
+                );
+                request.body.as_slice()
+            })
     }
 }
 

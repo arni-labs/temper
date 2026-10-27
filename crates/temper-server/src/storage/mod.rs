@@ -38,6 +38,7 @@ use crate::platform_store::PlatformStore;
 use crate::platform_store::SimPlatformStore;
 use crate::state::trajectory::TrajectoryEntry;
 
+mod commit_writes;
 mod event_size;
 mod metadata_impls;
 mod observe_read;
@@ -46,6 +47,7 @@ mod policy_router_impls;
 mod published_artifacts;
 mod query_plane_impls;
 mod query_plane_read;
+mod query_plane_router_impls;
 mod redaction;
 mod state_timers;
 mod trajectory_row;
@@ -53,11 +55,12 @@ pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
-pub use state_timers::StateTimerStore;
+pub use state_timers::{MetadataTimerRows, StateTimerStore};
 mod query_plane;
 pub use query_plane::{
-    EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection, QueryFieldIndexPage,
-    QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    QueryProjectionUpsert,
 };
 pub(crate) use query_plane_read::{
     CatalogRowsLoad, load_catalog_rows_by_id, load_selected_catalog_rows_by_id,
@@ -93,15 +96,31 @@ pub trait DynEventStore: Send + Sync {
         key_rows: &'a [temper_runtime::persistence::EntityKeyRow],
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
 
-    fn append_with_index_rows<'a>(
+    fn append_with_rows<'a>(
         &'a self,
         persistence_id: &'a str,
         expected_sequence: u64,
         events: &'a [PersistenceEnvelope],
-        key_rows: &'a [temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &'a [temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'a>,
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
+
+    fn commits_entity_rows(&self) -> bool;
+
+    fn list_scheduled_actions<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError>,
+    >;
+
+    fn delete_scheduled_action<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        arm_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<(), PersistenceError>>;
 
     fn backfill_entity_vectors<'a>(
         &'a self,
@@ -255,23 +274,49 @@ where
         ))
     }
 
-    fn append_with_index_rows<'a>(
+    fn append_with_rows<'a>(
         &'a self,
         persistence_id: &'a str,
         expected_sequence: u64,
         events: &'a [PersistenceEnvelope],
-        key_rows: &'a [temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &'a [temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'a>,
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>> {
-        Box::pin(EventStore::append_with_index_rows(
+        Box::pin(EventStore::append_with_rows(
             self,
             persistence_id,
             expected_sequence,
             events,
-            key_rows,
-            vector_rows,
-            reconcile_vectors,
+            rows,
+        ))
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        EventStore::commits_entity_rows(self)
+    }
+
+    fn list_scheduled_actions<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<
+        'a,
+        Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError>,
+    > {
+        Box::pin(EventStore::list_scheduled_actions(self, tenant))
+    }
+
+    fn delete_scheduled_action<'a>(
+        &'a self,
+        tenant: &'a str,
+        entity_type: &'a str,
+        entity_id: &'a str,
+        arm_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<(), PersistenceError>> {
+        Box::pin(EventStore::delete_scheduled_action(
+            self,
+            tenant,
+            entity_type,
+            entity_id,
+            arm_id,
         ))
     }
 
@@ -543,25 +588,43 @@ impl BoxedEventStore {
             .await
     }
 
-    pub async fn append_with_index_rows(
+    pub async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[temper_runtime::persistence::EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: temper_runtime::persistence::CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
         self.store
-            .append_with_index_rows(
-                persistence_id,
-                expected_sequence,
-                events,
-                key_rows,
-                vector_rows,
-                reconcile_vectors,
-            )
+            .append_with_rows(persistence_id, expected_sequence, events, rows)
+            .await
+    }
+
+    /// Whether an append writes the entity's query-plane row and timer row
+    /// in its own transaction (`EventStore::commits_entity_rows`).
+    pub fn commits_entity_rows(&self) -> bool {
+        self.store.commits_entity_rows()
+    }
+
+    /// Every pending scheduled action of `tenant`, kept with its journal.
+    pub async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ScheduledActionRecord>, PersistenceError> {
+        self.store.list_scheduled_actions(tenant).await
+    }
+
+    /// Remove one scheduled action's row once it has fired.
+    pub async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        self.store
+            .delete_scheduled_action(tenant, entity_type, entity_id, arm_id)
             .await
     }
 
@@ -1318,6 +1381,9 @@ pub struct StorageStack {
     pub data_only_create: Option<Arc<dyn DataOnlyCreateStore>>,
     pub trajectory: Option<Arc<dyn TrajectorySink>>,
     pub metadata: Option<Arc<dyn MetadataStoreProvider>>,
+    /// Which of this stack's rows the event store's commit writes
+    /// ([`StorageStack::entity_rows_in_commit`]).
+    commit_writes: commit_writes::CommitWrites,
 }
 
 impl StorageStack {
@@ -1345,6 +1411,7 @@ impl StorageStack {
             data_only_create,
             trajectory,
             metadata,
+            commit_writes: commit_writes::CommitWrites::Nothing,
         }
     }
 
@@ -1392,6 +1459,7 @@ impl StorageStack {
             Some(store.clone() as Arc<dyn TrajectorySink>),
             Some(Arc::new(SingleMetadataStoreProvider::new(store))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_tenant_router(router: TenantStoreRouter) -> Self {
@@ -1413,6 +1481,7 @@ impl StorageStack {
                 router.as_ref().clone(),
             ))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_redis(store: temper_store_redis::RedisEventStore) -> Self {

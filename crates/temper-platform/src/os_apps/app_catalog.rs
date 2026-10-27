@@ -111,13 +111,13 @@ pub fn list_tenant_os_apps(tenant: &str) -> Vec<AppEntry> {
 /// Reads IOA, CSDL, and Cedar files from disk on each call so changes
 /// are picked up without a rebuild.
 pub fn get_os_app(name: &str) -> Option<AppBundle> {
-    load_app_bundle(read_catalog().app_dir(None, name)?)
+    load_app_bundle(read_catalog().app_dir(None, name)?).ok()
 }
 
 /// Get the full spec bundle `tenant` resolves for `name`: its own install
 /// when it has one, otherwise the shared catalog's.
 pub fn tenant_os_app(tenant: &str, name: &str) -> Option<AppBundle> {
-    load_app_bundle(read_catalog().app_dir(Some(tenant), name)?)
+    load_app_bundle(read_catalog().app_dir(Some(tenant), name)?).ok()
 }
 
 /// Get the full app guide markdown `tenant` resolves for `name`.

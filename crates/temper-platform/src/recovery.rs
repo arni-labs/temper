@@ -392,14 +392,17 @@ permit(
             "id".to_string(),
             serde_json::json!("__trigger__:Submit:build_session_message"),
         );
-        resource_attrs.insert(
-            "module".to_string(),
+        // The WASM gate sets the calling module on the context.
+        let mut module_ctx =
+            SecurityContext::from_resolved_identity("wasm-module", "wasm_module", None);
+        module_ctx.context_attrs.insert(
+            temper_authz::platform_keys::MODULE.to_string(),
             serde_json::json!("build_session_message"),
         );
 
         let decision = state.server.authz.authorize_for_tenant(
             "default",
-            &SecurityContext::from_resolved_identity("wasm-module", "wasm_module", None),
+            &module_ctx,
             "http_call",
             "HttpEndpoint",
             &resource_attrs,

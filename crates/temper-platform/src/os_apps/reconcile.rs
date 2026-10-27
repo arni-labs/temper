@@ -118,7 +118,7 @@ pub fn os_app_dir_bundle_digest(dir: &Path, app_name: &str) -> Option<OsAppBundl
         return None;
     }
     let installed = AppCatalog::from_dir(dir.to_path_buf());
-    let bundle = load_app_bundle(installed.app_dir(None, app_name)?)?;
+    let bundle = load_app_bundle(installed.app_dir(None, app_name)?).ok()?;
     Some(digest_entry_bundle(
         app_name,
         installed.app_entry(None, app_name),
@@ -138,7 +138,7 @@ pub fn os_app_dir_bundle_digests(dir: &Path) -> Option<Vec<OsAppBundleDigest>> {
         .app_entries(None)
         .iter()
         .filter_map(|entry| {
-            let bundle = load_app_bundle(installed.app_dir(None, &entry.name)?)?;
+            let bundle = load_app_bundle(installed.app_dir(None, &entry.name)?).ok()?;
             Some(digest_entry_bundle(&entry.name, Some(entry), &bundle))
         })
         .collect();
