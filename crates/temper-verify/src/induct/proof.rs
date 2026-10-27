@@ -38,9 +38,6 @@ pub struct RuleProof {
     pub obligations: Vec<Obligation>,
     /// What the encoding could not express; each only weakens the proof.
     pub limits: Vec<String>,
-    /// Effects that make moves the proof does not, such as a scheduled
-    /// action; a proof with any is not a proof.
-    pub unmodelled: Vec<String>,
     /// What the rule itself reads that the proof does not hold, each read
     /// as an unknown.
     pub unheld: BTreeSet<String>,
@@ -65,9 +62,6 @@ impl RuleProof {
     pub fn shortfall(&self) -> Option<String> {
         if let Some(error) = self.errors.first() {
             return Some(format!("the solver refused it: {error}"));
-        }
-        if let Some(effect) = self.unmodelled.first() {
-            return Some(format!("{effect} makes a move the proof does not"));
         }
         self.obligations.iter().find_map(|o| match &o.outcome {
             Outcome::Holds => None,

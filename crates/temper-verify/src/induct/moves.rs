@@ -4,8 +4,10 @@
 //! - a state timer's action, with its arguments, while its state holds;
 //! - a reaction from a type outside the scope, carrying values the proof
 //!   does not know, as the sender Cedar decides it for;
-//! - a dispatch in flight arriving: its record takes it, sending what that
-//!   sets off, or refuses it;
+//! - a spawn's first action on a record of the scope, by any record, with
+//!   any parameters: the child may be of another id than the scope's;
+//! - a dispatch in flight arriving, or a scheduled action firing: its
+//!   record takes it, sending what that sets off, or refuses it;
 //! - a module call in flight answered, with the trigger's declared answer
 //!   or else any internal action of its record, its parameters tied to a
 //!   field carrying the field as the call found it and the others any
@@ -21,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::May;
 use temper_spec::automaton::{Action, ActionConstraint, ActionKind, StateTimeout, TriggerKind};
+use temper_spec::predicate::Effect;
 
 use super::encode::Enc;
 use super::vocab::{Call, Kind, Sort};
@@ -78,6 +81,8 @@ enum Source<'t> {
     Timer(&'t StateTimeout),
     /// A reaction from outside the scope, carrying these parameters.
     Outer(BTreeSet<String>),
+    /// A spawn's first action, passed any of the parent's parameters.
+    Spawn,
     /// A dispatch of this kind arriving, as the constant `w`.
     Arrive(&'t Kind),
     /// A call of this kind answered, as the constant `w`.
@@ -98,8 +103,6 @@ pub(super) struct Moves<'e, 'v, 'a> {
     pub(super) enc: &'e Enc<'v, 'a>,
     /// What the encoding could not express, in words.
     pub(super) limits: RefCell<BTreeSet<String>>,
-    /// Effects of the scope's records that make moves the proof does not.
-    pub(super) unmodelled: RefCell<BTreeSet<String>>,
     /// Parameters a liveness proof chooses for a helpful move, by name, as
     /// terms over `pre` and `w`; `passed.<name>` says whether it is passed.
     pins: BTreeMap<String, String>,
@@ -114,7 +117,6 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         Self {
             enc,
             limits: RefCell::default(),
-            unmodelled: RefCell::default(),
             pins,
         }
     }
@@ -166,10 +168,37 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                 }
             }
         }
+        if v.spawn_may() != May::No {
+            for (source, automaton) in &v.by_name {
+                for action in &automaton.actions {
+                    for effect in &action.effect {
+                        let Effect::Spawn {
+                            entity_type,
+                            initial_action,
+                            ..
+                        } = effect
+                        else {
+                            continue;
+                        };
+                        let Some(first) = v
+                            .scope
+                            .contains(entity_type)
+                            .then(|| v.action(entity_type, initial_action))
+                            .flatten()
+                        else {
+                            continue;
+                        };
+                        let label = format!("a spawn from {source}.{}", action.name);
+                        out.push(self.take(entity_type, first, &Source::Spawn, &label));
+                    }
+                }
+            }
+        }
         for kind in &v.kinds {
             if let Some(action) = v.action(&kind.to, &kind.action) {
+                let how = if kind.scheduled { "fires" } else { "arrives" };
                 if kind.may != May::No {
-                    out.push(self.take(&kind.to, action, &Source::Arrive(kind), "arrives"));
+                    out.push(self.take(&kind.to, action, &Source::Arrive(kind), how));
                 }
                 out.push(self.refuse(kind, action));
             }
@@ -228,7 +257,7 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
         let step = match source {
             Source::Outside => Step::Outside,
             Source::Timer(_) => Step::Timer,
-            Source::Outer(_) => Step::Outer,
+            Source::Outer(_) | Source::Spawn => Step::Outer,
             Source::Arrive(_) => Step::Arrive,
             Source::Answer(_) => Step::Answer,
             Source::Fail(_) => Step::Fail,
@@ -360,7 +389,7 @@ impl<'e, 'v, 'a> Moves<'e, 'v, 'a> {
                         .cloned()
                         .unwrap_or_else(|| "true".to_string()),
                 ),
-                Source::Outside | Source::Answer(_) => {
+                Source::Outside | Source::Answer(_) | Source::Spawn => {
                     (fresh(), self.enc.fresh(&format!("passed.{name}"), "Bool"))
                 }
                 _ => (fresh(), "false".to_string()),

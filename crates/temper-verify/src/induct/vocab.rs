@@ -10,13 +10,13 @@ use temper_spec::automaton::{
     Action, ActionConstraint, ActionKind, ActionParam, ActionTrigger, Automaton, TriggerKind,
     VarType,
 };
-use temper_spec::predicate::{Arg, Literal};
+use temper_spec::predicate::{Arg, Effect, Literal};
 
-/// A value's sort in the proof.
 /// A reaction's target in the scope, its action, and the parameters it
 /// carries with their sorts.
 type Carried = (String, String, Vec<(String, Sort)>);
 
+/// A value's sort in the proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Sort {
     /// A string, known only by which others and which literals it equals.
@@ -49,7 +49,9 @@ impl Sort {
 }
 
 /// A kind of dispatch: reactions to one action that carry the same
-/// parameters, run as the same sender and that Cedar answers the same.
+/// parameters, run as the same sender and that Cedar answers the same. A
+/// scheduled action waiting to fire is one too, of its own, carrying no
+/// parameters.
 #[derive(Debug, Clone)]
 pub(super) struct Kind {
     /// Its name in the proof: the target and action, numbered when several
@@ -62,6 +64,45 @@ pub(super) struct Kind {
     pub(super) fields: Vec<(String, Sort)>,
     /// What Cedar answers when it arrives.
     pub(super) may: May,
+    /// Whether it is a scheduled action. Like a state timer it may wait as
+    /// long as it likes, so a record waiting for one is settled.
+    pub(super) scheduled: bool,
+}
+
+impl Kind {
+    /// A kind, named when it is added to the vocabulary.
+    fn new(
+        to: String,
+        action: String,
+        principal: Option<String>,
+        fields: Vec<(String, Sort)>,
+        may: May,
+        scheduled: bool,
+    ) -> Self {
+        Self {
+            name: String::new(),
+            to,
+            action,
+            principal,
+            fields,
+            may,
+            scheduled,
+        }
+    }
+
+    /// Whether `other` is the same kind, whatever their names.
+    fn same(&self, other: &Kind) -> bool {
+        self.to == other.to
+            && self.action == other.action
+            && self.principal == other.principal
+            && self.may == other.may
+            && self.scheduled == other.scheduled
+            && self
+                .fields
+                .iter()
+                .map(|(f, _)| f)
+                .eq(other.fields.iter().map(|(f, _)| f))
+    }
 }
 
 /// A kind of module call: the calls a record's triggers start on one
@@ -171,17 +212,29 @@ impl<'a> Vocab<'a> {
     ) -> Option<&Kind> {
         let (to, target_action, fields) = self.carried(source, trigger)?;
         let may = self.reaction_may(source, &action.name, trigger, &to, &target_action);
-        self.kinds.iter().find(|kind| {
-            kind.to == to
-                && kind.action == target_action
-                && kind.principal == trigger.principal
-                && kind.may == may
-                && kind
-                    .fields
-                    .iter()
-                    .map(|(f, _)| f)
-                    .eq(fields.iter().map(|(f, _)| f))
-        })
+        let probe = Kind::new(
+            to,
+            target_action,
+            trigger.principal.clone(),
+            fields,
+            may,
+            false,
+        );
+        self.kinds.iter().find(|kind| kind.same(&probe))
+    }
+
+    /// The kind `entity`'s action `arming` arms when it schedules `action`.
+    pub(super) fn scheduled_kind(&self, entity: &str, arming: &str, action: &str) -> Option<&Kind> {
+        let may = self.scheduled_may(entity, arming, action);
+        let probe = Kind::new(
+            entity.to_string(),
+            action.to_string(),
+            None,
+            Vec::new(),
+            may,
+            true,
+        );
+        self.kinds.iter().find(|kind| kind.same(&probe))
     }
 
     /// A reaction's target in the scope, its action, and the parameters it
@@ -217,7 +270,8 @@ impl<'a> Vocab<'a> {
         Some((to.clone(), action.clone(), fields))
     }
 
-    /// The kinds of dispatch the scope's records send each other.
+    /// The kinds of dispatch the scope's records send each other, and the
+    /// scheduled actions they arm.
     fn read_kinds(&self) -> Vec<Kind> {
         let mut kinds: Vec<Kind> = Vec::new();
         for source in &self.scope {
@@ -227,36 +281,21 @@ impl<'a> Vocab<'a> {
                         continue;
                     };
                     let may = self.reaction_may(source, &action.name, trigger, &to, &target_action);
-                    let same = kinds.iter().any(|kind| {
-                        kind.to == to
-                            && kind.action == target_action
-                            && kind.principal == trigger.principal
-                            && kind.may == may
-                            && kind
-                                .fields
-                                .iter()
-                                .map(|(f, _)| f)
-                                .eq(fields.iter().map(|(f, _)| f))
-                    });
-                    if same {
-                        continue;
+                    let principal = trigger.principal.clone();
+                    push_kind(
+                        &mut kinds,
+                        Kind::new(to, target_action, principal, fields, may, false),
+                    );
+                }
+                for scheduled in action.effect.iter().filter_map(scheduled) {
+                    if self.action(source, scheduled).is_some() {
+                        let may = self.scheduled_may(source, &action.name, scheduled);
+                        let (to, target) = (source.clone(), scheduled.to_string());
+                        push_kind(
+                            &mut kinds,
+                            Kind::new(to, target, None, Vec::new(), may, true),
+                        );
                     }
-                    let taken = kinds
-                        .iter()
-                        .filter(|k| k.to == to && k.action == target_action)
-                        .count();
-                    let name = match taken {
-                        0 => format!("{to}.{target_action}"),
-                        n => format!("{to}.{target_action}{}", n + 1),
-                    };
-                    kinds.push(Kind {
-                        name,
-                        to,
-                        action: target_action,
-                        principal: trigger.principal.clone(),
-                        fields,
-                        may,
-                    });
                 }
             }
         }
@@ -358,4 +397,31 @@ impl<'a> Vocab<'a> {
         });
         dispatches.chain(calls).collect()
     }
+}
+
+/// The action an effect schedules on its own record, if it schedules one.
+pub(super) fn scheduled(effect: &Effect) -> Option<&str> {
+    match effect {
+        Effect::Schedule { action, .. } | Effect::ScheduleAt { action, .. } => Some(action),
+        _ => None,
+    }
+}
+
+/// Add `kind` unless `kinds` has it, named by its target and action (a
+/// scheduled one `.scheduled` after), avoiding names of every existing kind.
+fn push_kind(kinds: &mut Vec<Kind>, mut kind: Kind) {
+    if kinds.iter().any(|k| k.same(&kind)) {
+        return;
+    }
+    let base = match kind.scheduled {
+        true => format!("{}.{}.scheduled", kind.to, kind.action),
+        false => format!("{}.{}", kind.to, kind.action),
+    };
+    kind.name = base.clone();
+    let mut suffix = 2;
+    while kinds.iter().any(|k| k.name == kind.name) {
+        kind.name = format!("{base}{suffix}");
+        suffix += 1;
+    }
+    kinds.push(kind);
 }
