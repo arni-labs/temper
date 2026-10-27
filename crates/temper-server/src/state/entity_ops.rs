@@ -1154,12 +1154,56 @@ impl ServerState {
         resource_attrs: &BTreeMap<String, serde_json::Value>,
         tenant: &str,
     ) -> Result<(), AuthzDenial> {
+        self.decide_and_report(
+            AuthzEngine::authorize_for_tenant_or_bypass,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            tenant,
+        )
+    }
+
+    /// The same decision as [`Self::authorize_with_context`], for a page
+    /// asking which moves to show before any is sent (`POST /api/authorize`).
+    /// It is counted as `check:offer`, not as a refusal; a move that is sent
+    /// is checked again at the gate.
+    #[instrument(skip_all, fields(otel.name = "entity.authorize_offer_with_context", action, resource_type))]
+    pub fn authorize_offer_with_context(
+        &self,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &BTreeMap<String, serde_json::Value>,
+        tenant: &str,
+    ) -> Result<(), AuthzDenial> {
+        self.decide_and_report(
+            AuthzEngine::authorize_offer_for_tenant,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            tenant,
+        )
+    }
+
+    /// Ask Cedar through `decide` and emit the authz wide event for the answer.
+    fn decide_and_report(
+        &self,
+        decide: AuthzCheck,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &BTreeMap<String, serde_json::Value>,
+        tenant: &str,
+    ) -> Result<(), AuthzDenial> {
         let attrs: std::collections::HashMap<_, _> = resource_attrs // determinism-ok: Cedar API requires HashMap
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(); // determinism-ok
         let authz_start = sim_now();
-        let decision = self.authz.authorize_for_tenant_or_bypass(
+        let decision = decide(
+            &self.authz,
             tenant,
             security_ctx,
             action,
@@ -2407,5 +2451,16 @@ impl ServerState {
     }
 }
 
-use temper_authz::{AuthzDecision, AuthzDenial, SecurityContext};
+use temper_authz::{AuthzDecision, AuthzDenial, AuthzEngine, SecurityContext};
 use temper_runtime::actor::ActorRef;
+
+/// One of [`AuthzEngine`]'s tenant checks; they differ only in the `check`
+/// their Cedar metric is counted under.
+type AuthzCheck = fn(
+    &AuthzEngine,
+    &str,
+    &SecurityContext,
+    &str,
+    &str,
+    &std::collections::HashMap<String, serde_json::Value>, // determinism-ok: Cedar API requires HashMap
+) -> AuthzDecision;
