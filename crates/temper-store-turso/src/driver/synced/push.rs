@@ -22,7 +22,7 @@ impl SyncCopy {
     /// change log and the next successful push sends them. Nothing is pushed
     /// unless the copy is [`CopyState::Copying`]. It never trims the change
     /// log, so an answer waits only for its own changes; the background loop
-    /// trims ([`Self::trim_pushed`]).
+    /// trims (`TursoEventStore::trim_change_log`).
     pub async fn push_committed(&self) -> Result<(), PersistenceError> {
         // Changes are numbered in commit order (one writer at a time), so
         // everything this caller committed is at or below `wanted`.

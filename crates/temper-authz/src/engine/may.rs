@@ -12,14 +12,16 @@
 //!
 //! The answer is [`May::Yes`] only when some permit applies whatever the
 //! unknowns are and no forbid can, [`May::No`] when no permit can apply or a
-//! forbid always does, and [`May::Maybe`] otherwise.
+//! forbid always does, and [`May::Maybe`] otherwise. A caller that knows some
+//! of the record's attributes passes them, and those are unknown no longer.
 
+mod json;
 mod request;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cedar_policy::{Effect, PolicySet};
 use serde_json::Value as Json;
@@ -54,6 +56,18 @@ pub enum Attr {
     Value(Json),
     /// The id of the record the request acts on, as `resource.id` holds it.
     ResourceId,
+    /// A string known only by which others it equals: the same as each
+    /// `Same` with this name and no other, never empty, and none of
+    /// `unlike`. A model that names the values it makes up (rather than
+    /// holding real ones) knows them only this way, so one is never taken
+    /// to be a policy's literal, only kept apart from the literals the
+    /// model holds beside it.
+    Same {
+        /// The name the model gave the value.
+        name: String,
+        /// Strings the value is certainly not.
+        unlike: BTreeSet<String>,
+    },
     /// Some value not known here.
     Unknown,
 }
@@ -96,12 +110,20 @@ impl SendAnalysis {
         Ok(Self { policies })
     }
 
-    /// Whether `asker` may send `action` to a record of `resource_type`.
-    pub fn may(&self, asker: &Asker, action: &str, resource_type: &str) -> May {
+    /// Whether `asker` may send `action` to a record of `resource_type`, of
+    /// which the caller knows the attributes in `record` (`id` its id).
+    pub fn may(
+        &self,
+        asker: &Asker,
+        action: &str,
+        resource_type: &str,
+        record: &BTreeMap<String, Attr>,
+    ) -> May {
         let request = Request {
             asker,
             action,
             resource_type,
+            record,
         };
         let (mut permit_can, mut permit_always) = (false, false);
         let (mut forbid_can, mut forbid_always) = (false, false);

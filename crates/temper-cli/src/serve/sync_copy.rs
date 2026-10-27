@@ -9,10 +9,6 @@
 //! be confirmed, requests that can change data are refused before they run
 //! and reads are served as usual.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -20,7 +16,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use temper_store_turso::{CopyState, SyncCopy};
+use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 /// How long a request that can change data may take, its push included,
 /// before its change is reported as not confirmed.
@@ -32,9 +28,9 @@ const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The 1 s ceiling lets the background push run once each tick. With a
-/// request in flight the trim stops after its 250 ms floor and current batch;
-/// idle ticks use the whole second to drain the backlog.
+/// The 1 s ceiling lets the background push and the checkpoint run once each
+/// tick. Requests need no share of it: a write that waits goes before the
+/// trim's next batch (`TursoEventStore::trim_change_log`).
 const TRIM_BUDGET: Duration = Duration::from_secs(1);
 
 /// Checkpoint the local log once it passes this size. Turso Sync turns the
@@ -47,15 +43,17 @@ const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 /// restart starts a fresh one, and the start checks the file again.
 const TIMEOUTS_BEFORE_RESTART: u32 = 6;
 
-/// With a copy, answer changes only after they reach it and keep it current.
-pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Router {
-    let Some(copy) = copy else {
+/// With a store whose database has a copy, answer changes only after they
+/// reach it and keep it current.
+pub(super) fn answer_after_copy(router: Router, store: Option<TursoEventStore>) -> Router {
+    let Some((store, copy)) =
+        store.and_then(|store| store.sync_copy().cloned().map(|copy| (store, copy)))
+    else {
         return router;
     };
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    spawn_upkeep(copy.clone(), in_flight.clone());
+    spawn_upkeep(store, copy.clone());
     router.layer(axum::middleware::from_fn_with_state(
-        (copy, in_flight),
+        copy,
         push_before_answering,
     ))
 }
@@ -63,16 +61,13 @@ pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Route
 /// Refuse a request that can change data while writes cannot be confirmed;
 /// otherwise run it and push what it committed before answering.
 async fn push_before_answering(
-    State((copy, in_flight)): State<(SyncCopy, Arc<AtomicUsize>)>,
+    State(copy): State<SyncCopy>,
     request: Request,
     next: Next,
 ) -> Response {
     if reads_only(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
-    // Count through the answer's push, including cancellation and refusals.
-    in_flight.fetch_add(1, Ordering::AcqRel);
-    let _request = InFlight(in_flight);
     if let Some(refusal) = refusal(&copy.state()) {
         return refusal;
     }
@@ -93,15 +88,6 @@ async fn push_before_answering(
                  It may still have been saved here; read it back before trying again.",
             )
         }
-    }
-}
-
-/// Drop also handles a cancelled request, so upkeep never sees a stale count.
-struct InFlight(Arc<AtomicUsize>);
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -153,8 +139,9 @@ fn reads_only(method: &Method, path: &str) -> bool {
 }
 
 /// Push changes no request waited for, check a file the start could not
-/// check, checkpoint the local log, and restart when only a restart helps.
-fn spawn_upkeep(copy: SyncCopy, in_flight: Arc<AtomicUsize>) {
+/// check, trim the change log, checkpoint the local log, and restart when
+/// only a restart helps.
+fn spawn_upkeep(store: TursoEventStore, copy: SyncCopy) {
     let interval = std::env::var("TEMPER_TURSO_SYNC_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -188,10 +175,7 @@ fn spawn_upkeep(copy: SyncCopy, in_flight: Arc<AtomicUsize>) {
                 );
                 std::process::exit(75);
             }
-            if let Err(error) = copy
-                .trim_pushed(TRIM_BUDGET, || in_flight.load(Ordering::Acquire) > 0)
-                .await
-            {
+            if let Err(error) = store.trim_change_log(TRIM_BUDGET).await {
                 tracing::warn!(%error, "turso.sync could not trim the change log; the next tick will");
             }
             if let Err(error) = copy.checkpoint_if_wal_over(MAX_WAL_BYTES).await {

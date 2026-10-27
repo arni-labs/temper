@@ -191,7 +191,8 @@ impl crate::state::ServerState {
         self.dispatch_typed_checked(cmd, None).await
     }
 
-    async fn dispatch_typed_checked(
+    /// The dispatch, on the task [`Self::dispatch_typed_checked`] gives it.
+    pub(super) async fn dispatch_typed_attached(
         &self,
         cmd: DispatchCommand<'_>,
         expected_authorization_precondition: Option<String>,
@@ -503,7 +504,7 @@ impl crate::state::ServerState {
 
         // Pre-resolve cross-entity state gates (Gap 1: Agent OS).
         let related = self
-            .resolve_cross_entity_guards(tenant, entity_type, entity_id, action)
+            .resolve_related_statuses(tenant, entity_type, entity_id, action)
             .await;
 
         let action_params = params.clone();
