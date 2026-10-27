@@ -649,6 +649,8 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
     )
     .await
     .expect("insert field-index-only row");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .append(
@@ -1847,12 +1849,15 @@ async fn persist_spec_verification_keeps_updated_at_for_identical_result() {
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .persist_spec_verification(&tenant, "Issue", update)
         .await
         .expect("persist identical verification");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -1917,6 +1922,8 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .persist_spec_verification(
@@ -1933,6 +1940,7 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist timestamp-only verification change");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at, verification_result FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -1986,12 +1994,15 @@ async fn commit_specs_keeps_updated_at_when_specs_are_already_committed() {
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .commit_specs(&tenant)
         .await
         .expect("commit already committed specs");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -2198,6 +2209,8 @@ async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
     )
     .await
     .expect("age the pending rows");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
     assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 2);
     assert_eq!(restorable(&store, &tenant).await, committed_view);
     assert!(
