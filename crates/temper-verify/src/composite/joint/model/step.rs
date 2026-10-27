@@ -284,7 +284,7 @@ impl JointModel {
                 // dispatch was decided at its entry point, or is the kernel's.
                 let may = if dispatch.depth > 0 {
                     self.senders
-                        .may(dispatch.by, &dispatch.to, &dispatch.action)
+                        .may_in(dispatch.by, &dispatch.to, &dispatch.action, state)
                 } else {
                     May::Yes
                 };

@@ -17,10 +17,9 @@ impl TursoEventStore {
         timer: &StateTimerRecord,
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.upsert_state_timer");
-        let _write_permit = self
-            .acquire_write_permit("turso.upsert_state_timer", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.upsert_state_timer", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         conn.execute(
             "INSERT INTO state_timers \
                  (tenant, entity_type, entity_id, state, arm_id, sequence_nr, started_at, params, armed_by) \
@@ -60,10 +59,9 @@ impl TursoEventStore {
         arm_id: &str,
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_state_timer");
-        let _write_permit = self
-            .acquire_write_permit("turso.delete_state_timer", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.delete_state_timer", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         conn.execute(
             "DELETE FROM state_timers \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND arm_id = ?4",

@@ -193,8 +193,11 @@ async fn a_caller_that_stops_waiting_leaves_all_or_nothing_and_no_lock() {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            // No connection holds the write lock.
-            let conn = store.connection().await.expect("connection");
+            // Neither the gate nor the database's write lock is still held.
+            let conn = store
+                .write_connection("test", super::super::WritePriority::High)
+                .await
+                .expect("connection");
             let lock = tokio::time::timeout(Duration::from_secs(3), async {
                 let tx = conn.begin_immediate().await?;
                 tx.execute("CREATE TABLE IF NOT EXISTS lock_probe (x INTEGER)", ())

@@ -26,12 +26,14 @@ impl CommitPoint {
     pub(crate) const ALL: [Self; 3] = [Self::Began, Self::Wrote, Self::Committed];
 }
 
-/// Pause the first append that reaches `at` for `pause`.
+/// Pause the first append that reaches `at` for `pause`, or every one.
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct CommitProbe {
     at: CommitPoint,
     pause: Duration,
+    /// Pause only the first append to get there.
+    once: bool,
     /// How long one append attempt may take before it is retried.
     attempt_timeout: Duration,
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -43,8 +45,17 @@ impl CommitProbe {
         Self {
             at,
             pause,
+            once: true,
             attempt_timeout,
             fired: Default::default(),
+        }
+    }
+
+    /// Pause every append that reaches `at`, as a slow drive would.
+    pub(crate) fn every(at: CommitPoint, pause: Duration, attempt_timeout: Duration) -> Self {
+        Self {
+            once: false,
+            ..Self::new(at, pause, attempt_timeout)
         }
     }
 
@@ -70,7 +81,7 @@ impl TursoEventStore {
         #[cfg(test)]
         if let Some(probe) = &self.commit_probe
             && point == probe.at
-            && !probe.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && (!probe.fired.swap(true, std::sync::atomic::Ordering::SeqCst) || !probe.once)
         {
             tokio::time::sleep(probe.pause).await;
         }
