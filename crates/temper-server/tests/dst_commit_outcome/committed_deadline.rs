@@ -43,6 +43,17 @@ async fn advance_to(at: tokio::time::Instant) {
     settle().await;
 }
 
+/// How many times the record's timer fired: its `Expire` events.
+async fn expires(store: &SimEventStore, id: &str) -> usize {
+    store
+        .read_events(&journal_of(id), 0)
+        .await
+        .expect("the journal reads")
+        .iter()
+        .filter(|event| event.event_type == "Expire")
+        .count()
+}
+
 fn timer_row(store: &SimEventStore, id: &str) -> Option<StateTimerRecord> {
     store
         .list_state_timers(TENANT)
@@ -317,22 +328,18 @@ fn a_create_commits_its_timer_and_a_restart_fires_it() {
                 .to_std()
                 .expect("the deadline is after the restart");
 
+            // `journal` reads a record as `Open` until a `Hold`, and this one
+            // was created `Busy`: count the timer's own events instead.
             advance_to(tokio::time::Instant::now() + until_deadline - Duration::from_secs(1)).await;
             assert_eq!(
-                journal(&store, "made").await.0.status,
-                "Busy",
+                expires(&store, "made").await,
+                0,
                 "seed {seed}: the timer fired before a day after the create"
             );
             advance_to(tokio::time::Instant::now() + Duration::from_secs(2)).await;
-            let expired = store
-                .read_events(&journal_of("made"), 0)
-                .await
-                .unwrap()
-                .iter()
-                .filter(|event| event.event_type == "Expire")
-                .count();
             assert_eq!(
-                expired, 1,
+                expires(&store, "made").await,
+                1,
                 "seed {seed}: the restarted process fires the created record's timer once"
             );
         });
