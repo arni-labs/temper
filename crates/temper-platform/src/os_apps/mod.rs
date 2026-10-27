@@ -914,7 +914,7 @@ pub fn list_os_apps() -> Vec<AppEntry> {
 pub fn get_os_app(name: &str) -> Option<AppBundle> {
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
     let app_dir = cat.paths.get(name)?;
-    load_app_bundle(app_dir)
+    load_app_bundle(app_dir).ok()
 }
 
 /// Get the full app guide markdown for an app by name.
@@ -926,9 +926,9 @@ pub fn get_app_guide(name: &str) -> Option<String> {
         .and_then(|e| e.app_guide.clone())
 }
 
-/// Load a complete app bundle from a directory on disk.
-fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
-    let manifest = read_app_manifest(app_dir)?;
+/// Load a complete app bundle from a directory on disk, or say why not.
+fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
+    let manifest = read_app_manifest(app_dir).ok_or("its app.toml is missing or invalid")?;
     let deployment_mode = effective_app_deployment_mode(&manifest);
     let legacy_reaction_paths = [
         app_dir.join("reactions").join("reactions.toml"),
@@ -939,15 +939,16 @@ fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
             path = %path.display(),
             "legacy reactions.toml is no longer supported; migrate this app to inline [[action.triggers]]"
         );
-        return None;
+        return Err("legacy reactions.toml is no longer supported".to_string());
     }
     let ioa_files = find_ioa_files(app_dir);
 
     // Read IOA specs, extracting entity type from the parsed automaton name.
     let mut specs = Vec::new();
     for (_hint, path) in &ioa_files {
-        let source = std::fs::read_to_string(path).ok()?;
-        let parsed = automaton::parse_automaton(&source).ok()?;
+        let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let parsed = automaton::parse_automaton(&source)
+            .map_err(|error| format!("{} is refused: {error}", app_relative_path(app_dir, path)))?;
         specs.push((parsed.automaton.name, source));
     }
 
@@ -1011,10 +1012,10 @@ fn load_app_bundle(app_dir: &Path) -> Option<AppBundle> {
         && csdl.is_none()
         && cross_invariants_toml.is_none()
     {
-        return None;
+        return Err("it holds nothing to install".to_string());
     }
 
-    Some(AppBundle {
+    Ok(AppBundle {
         deployment_mode,
         specs,
         csdl,
@@ -1116,9 +1117,9 @@ pub(super) async fn install_os_app_with_plan(
             format!("OS app '{app_name}' not found in catalog (known path keys: {known:?})")
         })?
     };
-    let bundle = load_app_bundle(&app_dir).ok_or_else(|| {
+    let bundle = load_app_bundle(&app_dir).map_err(|why| {
         format!(
-            "OS app '{app_name}' is registered at '{}' but its bundle failed to load",
+            "OS app '{app_name}' is registered at '{}' but its bundle failed to load: {why}",
             app_dir.display()
         )
     })?;

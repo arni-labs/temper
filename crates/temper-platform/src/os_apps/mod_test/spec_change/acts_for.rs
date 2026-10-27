@@ -196,8 +196,16 @@ async fn as_names_a_field_only_a_caller_identity_writes() {
     let places = Fixture::new("then-as-trust").await;
     places.asked_places().await;
     let cases = [
+        // A spec that is not strict holds no bound param, so no move binds
+        // the field there: only a create body or a field update writes it.
         (
-            settles_for(LEAVE_AS_ASKER).replace("strict_action_params = true\n", ""),
+            settles_for(LEAVE_AS_ASKER)
+                .replace("strict_action_params = true\n", "")
+                .replace(
+                    "params = [{ name = \"asked_by\", type = \"string\", source = \"authenticated_subject\" }]",
+                    "params = []",
+                )
+                .replace(", source = \"authenticated_subject\" }", " }"),
             "needs `strict_action_params = true`",
         ),
         (
