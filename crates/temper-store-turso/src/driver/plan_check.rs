@@ -185,7 +185,9 @@ fn table_names(sql: &str) -> BTreeMap<&str, String> {
 }
 
 /// Whether `sql` gives `column` of `name` with `= ?`: as `name.column`, or
-/// bare when the statement reads one table.
+/// bare when the statement reads one table. A term joined to the rest by `OR`
+/// (`(?2 IS NULL OR tenant = ?2)`) does not hold for every row, so it does not
+/// count.
 fn gives(sql: &str, name: &str, unqualified: bool, column: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut from = 0;
@@ -208,15 +210,43 @@ fn gives(sql: &str, name: &str, unqualified: bool, column: &str) -> bool {
         let word_ends = !bytes
             .get(end)
             .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
-        let param = sql[end..]
+        let Some(after) = sql[end..]
             .trim_start()
             .strip_prefix('=')
-            .is_some_and(|after| after.trim_start().starts_with('?'));
-        if (qualified || bare) && word_ends && param {
+            .and_then(|after| after.trim_start().strip_prefix('?'))
+        else {
+            continue;
+        };
+        let lead = if qualified {
+            &before[..before.len() - 1 - name.len()]
+        } else {
+            before
+        };
+        let after = after.trim_start_matches(|c: char| c.is_ascii_digit());
+        if (qualified || bare) && word_ends && !joined_by_or(lead, after) {
             return true;
         }
     }
     false
+}
+
+/// Whether the text before a term (`lead`) or after it (`rest`) joins it with
+/// `OR`.
+fn joined_by_or(lead: &str, rest: &str) -> bool {
+    let is_word = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    let lead = lead.trim_end().trim_end_matches('(').trim_end().as_bytes();
+    let or_before = lead.len() >= 2
+        && lead[lead.len() - 2..].eq_ignore_ascii_case(b"OR")
+        && !lead[..lead.len() - 2].last().is_some_and(is_word);
+    let rest = rest
+        .trim_start()
+        .trim_start_matches(')')
+        .trim_start()
+        .as_bytes();
+    let or_after = rest.len() >= 2
+        && rest[..2].eq_ignore_ascii_case(b"OR")
+        && !rest.get(2).is_some_and(is_word);
+    or_before || or_after
 }
 
 #[cfg(test)]
@@ -262,5 +292,19 @@ mod tests {
         let bare = "DELETE FROM t WHERE tenant = ? AND xentity_id = ?";
         assert!(gives(bare, "t", true, "tenant"));
         assert!(!gives(bare, "t", true, "entity_id"));
+    }
+
+    #[test]
+    fn a_term_joined_by_or_is_not_given() {
+        let sql = "SELECT 1 FROM t WHERE session_id = ?1 AND (?2 IS NULL OR tenant = ?2) \
+                   AND (entity_type = ?3 OR ?3 IS NULL) AND action = ?4 ORDER BY id";
+        assert!(gives(sql, "t", true, "session_id"));
+        assert!(!gives(sql, "t", true, "tenant"));
+        assert!(!gives(sql, "t", true, "entity_type"));
+        assert!(gives(sql, "t", true, "action"));
+        let ordered = "SELECT 1 FROM t WHERE tenant = ?1 AND origin = ?2";
+        assert!(gives(ordered, "t", true, "origin"));
+        let grouped = "SELECT 1 FROM t WHERE (tenant = ?1) OR x = 1";
+        assert!(!gives(grouped, "t", true, "tenant"));
     }
 }
