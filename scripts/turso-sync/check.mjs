@@ -7,7 +7,7 @@
 //
 // Env:
 //   TEMPER_BIN        temper binary (default: target/release/temper, then target/debug/temper)
-//   TURSODB_BIN       tursodb 0.7.2, used as the remote when SYNC_URL is not set (`tursodb --sync-server`)
+//   TURSODB_BIN       tursodb 0.8.3, used as the remote when SYNC_URL is not set (`tursodb --sync-server`)
 //   SYNC_URL          a real remote (libsql://... on Turso Cloud) instead of the local sync server
 //   SYNC_TOKEN_FILE   file holding that remote's token (read, never printed)
 //   SECONDS_BEFORE_KILL  how long writers run before the kill (default 6)

@@ -26,6 +26,7 @@ use temper_runtime::persistence::{PersistenceError, storage_error};
 use super::{Connection, DriverError, DriverHandle, Lease};
 
 mod files;
+mod journal;
 mod pool;
 mod push;
 mod remote;
@@ -132,6 +133,7 @@ impl SyncCopy {
     ) -> Result<Self, DriverError> {
         let path = Path::new(path);
         check_local_files(path)?;
+        journal::return_to_wal(path).await?;
         let copy = Self::build(path, remote_url, auth_token).await?;
         match copy.recheck_inner().await {
             Ok(CopyState::Behind) => {}

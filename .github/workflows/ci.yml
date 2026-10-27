@@ -378,8 +378,8 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSfL -o /tmp/tursodb.tar.xz \
-            https://github.com/tursodatabase/turso/releases/download/v0.7.2/turso_cli-x86_64-unknown-linux-gnu.tar.xz
-          echo "321e401e44f7ee8ea656caff0f85304025f7e905acafe7bedf6a9304f1af1783  /tmp/tursodb.tar.xz" | sha256sum -c -
+            https://github.com/tursodatabase/turso/releases/download/v0.8.3/turso_cli-x86_64-unknown-linux-gnu.tar.xz
+          echo "4475c4df29f744fb3b2fdeef622d9297bbb80698039eec57d1b3ba7e048b5e31  /tmp/tursodb.tar.xz" | sha256sum -c -
           tar -xJf /tmp/tursodb.tar.xz -C /tmp
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
@@ -493,8 +493,8 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSfL -o /tmp/tursodb.tar.xz \
-            https://github.com/tursodatabase/turso/releases/download/v0.7.2/turso_cli-x86_64-unknown-linux-gnu.tar.xz
-          echo "321e401e44f7ee8ea656caff0f85304025f7e905acafe7bedf6a9304f1af1783  /tmp/tursodb.tar.xz" | sha256sum -c -
+            https://github.com/tursodatabase/turso/releases/download/v0.8.3/turso_cli-x86_64-unknown-linux-gnu.tar.xz
+          echo "4475c4df29f744fb3b2fdeef622d9297bbb80698039eec57d1b3ba7e048b5e31  /tmp/tursodb.tar.xz" | sha256sum -c -
           tar -xJf /tmp/tursodb.tar.xz -C /tmp
           echo "TEMPER_TEST_TURSODB=/tmp/turso_cli-x86_64-unknown-linux-gnu/tursodb" >> "$GITHUB_ENV"
 
