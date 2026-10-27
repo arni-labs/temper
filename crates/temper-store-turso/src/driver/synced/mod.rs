@@ -133,7 +133,7 @@ impl SyncCopy {
     ) -> Result<Self, DriverError> {
         let path = Path::new(path);
         check_local_files(path)?;
-        journal::return_to_wal(path).await?;
+        let _ = journal::return_to_wal;
         let copy = Self::build(path, remote_url, auth_token).await?;
         match copy.recheck_inner().await {
             Ok(CopyState::Behind) => {}
