@@ -234,3 +234,64 @@ fn answered_retry_removes_retained_row() {
         process.kill(&world, Duration::ZERO);
     }
 }
+
+/// B replaces A but reports failure; C fails before saving. An answer from C
+/// must remove B as well as A, so a restart cannot resurrect an ended timer.
+#[test]
+fn answered_retry_removes_a_row_saved_despite_an_error() {
+    for seed in [103, 104, 105] {
+        for refused in [true, false] {
+            let clock = Arc::new(ProcessClock::new());
+            let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+            let spec = if refused {
+                expire_refused()
+                    + "\n[admission]\nmax_concurrent_actions = { \"Expire\" = 1 }\nqueue_timeout_seconds = 0\n"
+            } else {
+                expire_admits_one()
+            };
+            let (world, process, job) = started(seed, clock, &spec, "ambiguous-retry-write");
+            process.runtime.block_on(async {
+                let first = world.rows.row("gamma", &job.id).unwrap();
+                let in_flight = hold_expire_permit(&process.state, &job.tenant).await;
+                world.rows.fail_after_next_writes(1);
+                advance(PAST_THE_BUDGET).await;
+                let saved_retry = world.rows.row("gamma", &job.id).unwrap();
+                assert_ne!(saved_retry.arm_id, first.arm_id, "B landed despite its error");
+
+                world.rows.fail_next_writes(1);
+                advance(PAST_THE_BUDGET).await;
+                assert_eq!(
+                    world.rows.row("gamma", &job.id).unwrap().arm_id,
+                    saved_retry.arm_id,
+                    "C failed before saving, so B is still durable"
+                );
+                drop(in_flight);
+                advance(PAST_THE_BUDGET).await;
+                assert_eq!(
+                    status(&process.state, &job).await,
+                    if refused { "Waiting" } else { "Done" }
+                );
+                assert!(
+                    world.rows.row("gamma", &job.id).is_none(),
+                    "an answer must end even a timer whose save reported an error: seed={seed}, refused={refused}"
+                );
+            });
+            process.kill(&world, Duration::ZERO);
+            let restarted = Process::start(&world, JOB_V1, &spec, "ended-after-ambiguous-write");
+            assert_eq!(
+                restarted.booted[&(job.tenant.clone(), "Job".to_string())].rearmed,
+                0,
+                "boot must not re-arm an answered timer"
+            );
+            restarted.runtime.block_on(async {
+                advance(PAST_THE_BUDGET).await;
+                assert_eq!(
+                    status(&restarted.state, &job).await,
+                    if refused { "Waiting" } else { "Done" }
+                );
+                assert!(world.rows.row("gamma", &job.id).is_none());
+            });
+            restarted.kill(&world, Duration::ZERO);
+        }
+    }
+}

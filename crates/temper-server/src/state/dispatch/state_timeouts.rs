@@ -471,7 +471,7 @@ impl crate::state::ServerState {
             return false;
         };
         if self.persist_state_timer(&timer).await {
-            timer.previous_arm_id = None;
+            timer.previous_arm_ids.clear();
         }
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         if self.state_timeout_tracker.current(&key) != armed_seq {
@@ -668,7 +668,7 @@ impl crate::state::ServerState {
 
             async move {
                 // A retry takes responsibility for the durable row, including
-                // its predecessor when saving the replacement fails.
+                // all possible predecessors when saving the replacement fails.
                 let rearmed = if let Err(error) = state.fire_state_timer(&timer, armed_seq).await {
                     state
                         .rearm_unanswered_state_timer(&timer, armed_seq, &error)
@@ -773,13 +773,12 @@ impl crate::state::ServerState {
         {
             return false;
         }
+        // A failed save may have landed. Retain every candidate row until
+        // a confirmed replacement, so an answer can remove whichever landed.
+        let mut previous_arm_ids = timer.previous_arm_ids.clone();
+        previous_arm_ids.push(timer.arm_id.clone());
         let again = ArmedTimer {
-            previous_arm_id: Some(
-                timer
-                    .previous_arm_id
-                    .clone()
-                    .unwrap_or_else(|| timer.arm_id.clone()),
-            ),
+            previous_arm_ids,
             arm_id: sim_uuid().to_string(),
             ..timer.clone()
         };
@@ -822,8 +821,8 @@ pub(super) struct ArmedTimer {
     pub(super) agent_ctx: AgentContext,
     /// Names this arming's durable row.
     pub(super) arm_id: String,
-    /// Durable predecessor retained until a replacement write succeeds.
-    pub(super) previous_arm_id: Option<String>,
+    /// Every possibly saved predecessor, until a replacement write succeeds.
+    pub(super) previous_arm_ids: Vec<String>,
     /// The entity's journal sequence when the timer was armed.
     pub(super) sequence_nr: u64,
     pub(super) started_at: DateTime<Utc>,
@@ -893,7 +892,7 @@ pub(super) fn declared_timer(
         );
     }
     ArmedTimer {
-        previous_arm_id: None,
+        previous_arm_ids: Vec::new(),
         boot_gate: None,
         tenant: tenant.clone(),
         entity_type: entity_type.to_string(),
@@ -1097,7 +1096,7 @@ mod tests {
     /// A timer on `E/e-1` in `state`, armed by the transition at `journal`.
     fn timer(state: &str, journal: u64) -> ArmedTimer {
         ArmedTimer {
-            previous_arm_id: None,
+            previous_arm_ids: Vec::new(),
             boot_gate: None,
             tenant: TenantId::from("t".to_string()),
             entity_type: "E".to_string(),

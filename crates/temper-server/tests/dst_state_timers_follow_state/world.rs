@@ -19,6 +19,7 @@ pub(crate) struct SimTimerRows {
     rows: Mutex<BTreeMap<(String, String, String), StateTimerRecord>>,
     rng: Mutex<DeterministicRng>,
     failed_writes: Mutex<usize>,
+    saved_but_failed_writes: Mutex<usize>,
     /// A write takes fewer scheduler turns than this to land.
     round_trip_turns: usize,
 }
@@ -35,6 +36,7 @@ impl SimTimerRows {
         Self {
             rows: Mutex::new(BTreeMap::new()),
             failed_writes: Mutex::new(0),
+            saved_but_failed_writes: Mutex::new(0),
             rng: Mutex::new(DeterministicRng::new(seed ^ 0x7177_e125)),
             round_trip_turns: turns,
         }
@@ -42,6 +44,12 @@ impl SimTimerRows {
 
     pub(crate) fn fail_next_writes(&self, count: usize) {
         *self.failed_writes.lock().unwrap() = count;
+    }
+
+    /// Save the next `count` writes, but report failure as if the connection
+    /// dropped after the write committed and before its acknowledgment.
+    pub(crate) fn fail_after_next_writes(&self, count: usize) {
+        *self.saved_but_failed_writes.lock().unwrap() = count;
     }
 
     /// The record's row now.
@@ -84,6 +92,13 @@ impl StateTimerStore for SimTimerRows {
             .is_none_or(|row| timer.sequence_nr >= row.sequence_nr)
         {
             rows.insert(key, timer.clone());
+        }
+        let mut failures = self.saved_but_failed_writes.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(PersistenceError::Storage(
+                "injected timer write acknowledgment failure".into(),
+            ));
         }
         Ok(())
     }

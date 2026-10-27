@@ -105,7 +105,7 @@ impl ServerState {
     }
 
     /// Write a newly armed timer's row; whether persistence succeeded. A
-    /// failed retry write retains its predecessor row for recovery at boot.
+    /// failed retry write retains all possible predecessors for recovery at boot.
     pub(super) async fn persist_state_timer(&self, timer: &ArmedTimer) -> bool {
         let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return false;
@@ -132,7 +132,7 @@ impl ServerState {
         let Some(store) = self.timer_rows_for_tenant(timer.tenant.as_str()).await else {
             return;
         };
-        for arm_id in std::iter::once(&timer.arm_id).chain(timer.previous_arm_id.iter()) {
+        for arm_id in std::iter::once(&timer.arm_id).chain(timer.previous_arm_ids.iter()) {
             if let Err(error) = store
                 .delete_state_timer(
                     timer.tenant.as_str(),
@@ -319,7 +319,7 @@ fn armed_timer(
     let armed_by: ArmedBy =
         serde_json::from_str(&row.armed_by).map_err(|error| format!("armed_by: {error}"))?;
     Ok(ArmedTimer {
-        previous_arm_id: None,
+        previous_arm_ids: Vec::new(),
         boot_gate: None,
         tenant: tenant.clone(),
         entity_type: row.entity_type.clone(),
