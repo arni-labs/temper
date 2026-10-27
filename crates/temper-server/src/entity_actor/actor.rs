@@ -1482,8 +1482,19 @@ impl EntityActor {
                 if let Some(key) = idempotency_key.as_deref()
                     && state.has_processed_idempotency_key(key)
                 {
+                    // A follow-up's retry that names another action is
+                    // answered by the one its key recorded.
+                    let answered_action = state
+                        .processed_idempotency_keys
+                        .get(key)
+                        .and_then(|recorded| recorded.action.clone())
+                        .filter(|recorded| *recorded != name);
                     let custom_effects = duplicate_idempotency_custom_effects(
-                        &table, state, &name, &params, &related,
+                        &table,
+                        state,
+                        answered_action.as_deref().unwrap_or(&name),
+                        &params,
+                        &related,
                     );
                     let mut response_state = state.clone();
                     if !custom_effects.is_empty() {
@@ -1499,6 +1510,7 @@ impl EntityActor {
                         spawn_requests: vec![],
                         spec_governed: true,
                         refused: false,
+                        answered_action,
                     });
                     return Ok(());
                 }
@@ -2083,6 +2095,7 @@ impl EntityActor {
                         spawn_requests: result.spawn_requests,
                         spec_governed: true,
                         refused: false,
+                        answered_action: None,
                     };
                     // ADR-0048 sub-decision 5: cache the successful response
                     // so a racing retry that lands after this reply returns
@@ -2149,6 +2162,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    answered_action: None,
                 });
             }
             EntityMsg::GetField { field } => {
@@ -2185,6 +2199,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    answered_action: None,
                 });
             }
 
@@ -2260,6 +2275,7 @@ impl EntityActor {
                     spawn_requests: vec![],
                     spec_governed: true,
                     refused: false,
+                    answered_action: None,
                 });
             }
         }

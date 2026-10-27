@@ -272,7 +272,7 @@ impl ReactionDispatcher {
                             tenant,
                             &rule.then.entity_type,
                             &target_entity_id,
-                            &rule.then.action,
+                            response.action(&rule.then.action),
                             &target_status,
                             &serde_json::to_value(&response.state.fields).unwrap_or_default(),
                             depth + 1,

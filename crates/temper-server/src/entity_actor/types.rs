@@ -344,9 +344,21 @@ pub struct EntityResponse {
     /// the same action may have caused.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// The action this answer is for, when it is not the one requested: a
+    /// follow-up's retry that named another action is answered by the
+    /// outcome its key recorded (`IdempotencyKey::FollowUp`), and the
+    /// effects and reactions that follow belong to that recorded action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_action: Option<String>,
 }
 
 impl EntityResponse {
+    /// The action this answer is for: `requested`, unless a follow-up's key
+    /// recorded another ([`Self::answered_action`]).
+    pub fn action<'a>(&'a self, requested: &'a str) -> &'a str {
+        self.answered_action.as_deref().unwrap_or(requested)
+    }
+
     /// The answer to an action refused before anything was written.
     pub(crate) fn refused(state: EntityState, error: String) -> Self {
         Self {
@@ -367,6 +379,7 @@ impl EntityResponse {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            answered_action: None,
         }
     }
 }

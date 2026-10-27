@@ -103,6 +103,7 @@ fn build_state(tenant: &str, survey_ioa: &str) -> ServerState {
             r#"permit(principal == Agent::"service:sibling-callback-test", action, resource);"#,
         )
         .expect("policy should load");
+    state.rebuild_reaction_dispatcher();
     state
 }
 
@@ -160,7 +161,9 @@ async fn two_integrations_answering_alike_both_apply_under_one_caller_key() {
 
 /// [`SURVEY_IOA`] calling `/first` and `/second`. The second has no failure
 /// callback, so its failure fails the request; every `Unanswered` counts in
-/// `misses`, so one applied beside an `Answered` shows.
+/// `misses`, so one applied beside an `Answered` shows. Each callback reacts
+/// on the same survey (`Tally` and `Flag`), so a reaction started for a
+/// callback that did not commit shows too.
 const TWO_SERVICES_IOA: &str = r#"
 [automaton]
 name = "Survey"
@@ -174,6 +177,16 @@ initial = 0
 
 [[state]]
 name = "misses"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "tallies"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "flags"
 type = "counter"
 initial = 0
 
@@ -205,12 +218,38 @@ from = ["Asking"]
 params = ["result"]
 effect = ["answers += 1"]
 
+[[action.triggers]]
+name = "answer_tallies"
+kind = "entity"
+target_entity = "Survey"
+target_action = "Tally"
+resolve_target = { kind = "same_id" }
+
 [[action]]
 name = "Unanswered"
 kind = "input"
 from = ["Asking"]
 params = ["error_message"]
 effect = ["misses += 1"]
+
+[[action.triggers]]
+name = "miss_flags"
+kind = "entity"
+target_entity = "Survey"
+target_action = "Flag"
+resolve_target = { kind = "same_id" }
+
+[[action]]
+name = "Tally"
+kind = "internal"
+from = ["Asking"]
+effect = ["tallies += 1"]
+
+[[action]]
+name = "Flag"
+kind = "internal"
+from = ["Asking"]
+effect = ["flags += 1"]
 "#;
 
 /// Survey `s1` as one caller sees it, asking under one `Idempotency-Key`.
@@ -409,7 +448,8 @@ async fn a_retry_after_a_request_that_failed_partway_does_not_apply_a_committed_
 
 /// An integration whose success callback committed, and which fails when a
 /// retry of its request runs it again, keeps the outcome it had: its failure
-/// callback is answered by the committed success, not applied beside it.
+/// callback is answered by the committed success, not applied beside it, and
+/// the failure callback's reactions do not start.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retry_whose_integration_now_fails_keeps_its_committed_outcome() {
     let outside = failing_partway(ResponseTemplate::new(500)).await;
@@ -439,6 +479,16 @@ async fn a_retry_whose_integration_now_fails_keeps_its_committed_outcome() {
         survey.count("answers").await,
         2,
         "the second integration answered once"
+    );
+    assert_eq!(
+        survey.count("flags").await,
+        0,
+        "the reaction of a failure callback that never committed started"
+    );
+    assert_eq!(
+        survey.count("tallies").await,
+        2,
+        "each committed success reacted once"
     );
 }
 

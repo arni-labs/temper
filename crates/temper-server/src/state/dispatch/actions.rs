@@ -238,6 +238,7 @@ impl crate::state::ServerState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(dispatcher) = dispatcher {
+                let action = response.action(action);
                 let to_state = response.state.status.clone();
                 let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
                 if await_reactions {
@@ -749,6 +750,11 @@ impl crate::state::ServerState {
                 return Err(DispatchError::from_actor_error(e, outcome.attempts));
             }
         };
+        // A follow-up's retry answered by the outcome its key recorded is that
+        // outcome from here on: its effects and reactions, not those of the
+        // action this retry named.
+        let answered_action = response.answered_action.clone();
+        let action = answered_action.as_deref().unwrap_or(action);
 
         // Run all post-dispatch effects through the dedicated pipeline.
         let ctx = PostDispatchContext {
@@ -768,7 +774,7 @@ impl crate::state::ServerState {
         // retry after they ran does not run them again. Either way the retry
         // answers at the state that dispatcher completed, never with the
         // actor's copy from before the effects ran.
-        let response = match idempotency_key.as_ref() {
+        let mut response = match idempotency_key.as_ref() {
             Some(idem_key) if response.success => {
                 let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
                 match self
@@ -790,6 +796,8 @@ impl crate::state::ServerState {
             }
             _ => self.run_post_dispatch_effects(&ctx, response).await,
         };
+        // The reply the effects claim hands back may be another dispatcher's.
+        response.answered_action = answered_action;
         if response.success {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }

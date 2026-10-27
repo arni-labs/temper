@@ -314,6 +314,7 @@ impl ServerState {
                 spawn_requests: vec![],
                 spec_governed: true,
                 refused: false,
+                answered_action: None,
             }
         };
 
@@ -1667,6 +1668,7 @@ impl ServerState {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            answered_action: None,
         }))
     }
 

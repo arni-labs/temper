@@ -61,6 +61,19 @@ struct IdempotencyEntry {
     seq: u64,
 }
 
+impl IdempotencyEntry {
+    /// The cached reply as the answer to `request`, a retry of the request it
+    /// answered. A follow-up's retry may name another action; the reply then
+    /// says which one it is for.
+    fn reply_to(&self, request: &RequestFingerprint) -> EntityResponse {
+        let mut reply = self.response.clone();
+        if self.request.action() != request.action() {
+            reply.answered_action = Some(self.request.action().to_string());
+        }
+        reply
+    }
+}
+
 /// Insertion order, oldest first: seq → (actor_key, idempotency_key).
 type Order = BTreeMap<u64, (String, String)>;
 
@@ -194,7 +207,7 @@ impl IdempotencyCache {
     ) -> CachedReply {
         self.with_entry(actor_key, idem_key, |entry| {
             if entry.request == *request {
-                CachedReply::Replay(Box::new(entry.response.clone()))
+                CachedReply::Replay(Box::new(entry.reply_to(request)))
             } else {
                 CachedReply::OtherRequest(entry.request.action().to_string())
             }
@@ -216,7 +229,7 @@ impl IdempotencyCache {
         request: &RequestFingerprint,
     ) -> Option<EntityResponse> {
         self.with_entry(actor_key, idem_key, |entry| {
-            (entry.effects_applied && entry.request == *request).then(|| entry.response.clone())
+            (entry.effects_applied && entry.request == *request).then(|| entry.reply_to(request))
         })
         .flatten()
     }
@@ -400,6 +413,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
         spawn_requests: response.spawn_requests.clone(),
         spec_governed: response.spec_governed,
         refused: response.refused,
+        answered_action: None,
     }
 }
 
