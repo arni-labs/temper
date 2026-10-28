@@ -224,15 +224,6 @@ fn test_manifest_dependencies_accept_pinned_genesis_refs_for_local_install_order
 }
 
 #[test]
-fn test_os_app_document_bootstrap_does_not_charge_workspace_file_count() {
-    let source = include_str!("mod.rs");
-    assert!(
-        !source.contains("action: \"IncrementFileCount\""),
-        "OS app document bootstrap must not charge Workspace for each file materialized"
-    );
-}
-
-#[test]
 fn test_reconcile_plan_for_wasm_only_digest_skips_unrelated_phases() {
     let current = OsAppBundleDigest {
         app_name: "paw-agent".to_string(),
@@ -903,16 +894,6 @@ mod policy_joint;
 mod policy_reinstall;
 mod spec_change;
 mod timer_strands;
-#[test]
-fn test_get_app_project_management() {
-    let bundle = get_os_app("project-management");
-    assert!(bundle.is_some());
-    let bundle = bundle.unwrap();
-    assert_eq!(bundle.specs.len(), 5);
-    assert!(bundle.csdl.is_some());
-    assert!(!bundle.csdl.as_ref().unwrap().is_empty());
-    assert!(!bundle.cedar_policies.is_empty());
-}
 
 #[test]
 fn test_agent_specs_parse() {

@@ -7277,7 +7277,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "temper-authz",
- "temper-codegen",
  "temper-jit",
  "temper-observe",
  "temper-optimize",
