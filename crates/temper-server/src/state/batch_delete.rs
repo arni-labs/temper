@@ -131,12 +131,13 @@ impl ServerState {
                 // actors may still hold exactly the states this batch read.
                 // The store does not name the conflicting member: reload them
                 // all before the route plans and authorizes the delete again.
+                // Actor refresh does not delete entities. Keep every id
+                // discoverable throughout recovery, including if a reload
+                // fails or another request lists a fully hydrated type.
                 for member in &deleted {
-                    self.stop_and_remove_entity(tenant, &member.entity_type, &member.entity_id);
+                    self.stop_entity_actor(tenant, &member.entity_type, &member.entity_id);
                 }
                 for member in &deleted {
-                    // Reload now also restores the live ids evicted above;
-                    // an already-hydrated type must still find its dependents.
                     let current = self
                         .get_tenant_entity_state(tenant, &member.entity_type, &member.entity_id)
                         .await

@@ -175,3 +175,81 @@ async fn a_batch_conflict_reauthorizes_the_root_on_another_servers_state() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_conflict_reload_keeps_every_child_discoverable_for_retry() {
+    // Regression seed 0: the first child fails replay; later children must
+    // remain discoverable both during recovery and after it returns an error.
+    for seed in 0..16 {
+        let _sim = install_deterministic_context(seed);
+        let store = SimEventStore::no_faults(seed);
+        let state = server("cascade-failed-reload", &store);
+        let tracks = ["a-first", "b-middle", "c-last"];
+        album_with_tracks(&state, "owner", &tracks).await;
+        let tenant = TenantId::default();
+        assert_eq!(state.list_entity_ids_lazy(&tenant, "Track").await, tracks);
+
+        // Planning reads resident actors. Reject the batch, then fail the
+        // first child's replay and its three supervised restarts while
+        // subsequent children are still evicted.
+        let other = server("cascade-failed-reload-other", &store);
+        other
+            .update_tenant_entity_fields(
+                &tenant,
+                "Album",
+                "owner",
+                json!({ "latest_track_id": "a-first" }),
+                false,
+            )
+            .await
+            .expect("another server changes the root after its actor was loaded");
+        store.fail_next_reads("default:Track:a-first", 4);
+        let observe_recovery = async {
+            loop {
+                let last_is_resident = state
+                    .actor_registry
+                    .read()
+                    .expect("actor registry")
+                    .contains_key("default:Track:c-last");
+                if !last_is_resident {
+                    return state.list_entity_ids_lazy(&tenant, "Track").await;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let ((status, body), during_recovery) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(delete(&state, "Albums", "owner"), observe_recovery)
+            })
+            .await
+            .expect("recovery must report the read failure");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "seed {seed}: {body}"
+        );
+        assert!(body.to_string().contains("delete conflict recovery failed"));
+        for id in tracks {
+            assert_eq!(tombstones(&store, "Track", id), 0, "seed {seed}: {id}");
+        }
+        assert_eq!(tombstones(&store, "Album", "owner"), 0);
+
+        let after_recovery = state.list_entity_ids_lazy(&tenant, "Track").await;
+
+        // Restore storage and retry through OData, without reading children
+        // individually (which could repopulate an incomplete index).
+        store.fail_next_reads("default:Track:a-first", 0);
+        let (status, body) = delete(&state, "Albums", "owner").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "seed {seed}: {body}");
+        assert_eq!(tombstones(&store, "Album", "owner"), 1);
+        for id in tracks {
+            assert_eq!(tombstones(&store, "Track", id), 1, "seed {seed}: {id}");
+            assert_eq!(get(&state, "Tracks", id).await, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(during_recovery, tracks, "seed {seed}: concurrent discovery");
+        assert_eq!(
+            after_recovery, tracks,
+            "seed {seed}: discovery after failure"
+        );
+    }
+}
