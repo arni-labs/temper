@@ -220,16 +220,37 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
                 format!("{owner}/{name}@{}", version_hash.trim_start_matches('@'))
             });
             let cache_root = genesis_cache_root(&platform.server, &app_ref);
+            let target_tenant = string_field(&installation.state.fields, "TargetTenant")
+                .unwrap_or_else(|| source_tenant.clone());
             let root = GenesisAppBundle {
                 owner,
-                name,
+                name: name.clone(),
                 repository_id,
                 version_hash,
             };
-            match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
-                Ok(_) => {
+            let materialized =
+                materialize_app_closure(&platform.server, &tenant, &cache_root, root).await;
+            // As on registry recovery: the closure joins the catalog without
+            // the dependencies the target tenant runs at another version.
+            let elsewhere = match (materialized, platform_store(platform)) {
+                (Ok(apps), Some(ps)) => {
+                    let pins: Vec<PinnedApp<'_>> = apps
+                        .iter()
+                        .map(|app| PinnedApp {
+                            owner: &app.owner,
+                            name: &app.name,
+                            version: &app.version_hash,
+                        })
+                        .collect();
+                    installed_elsewhere(ps.as_ref(), &target_tenant, &name, &pins).await
+                }
+                (Ok(_), None) => Ok(BTreeSet::new()),
+                (Err(error), _) => Err(error),
+            };
+            match elsewhere {
+                Ok(elsewhere) => {
                     legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                    add_os_apps_dir_preferred(cache_root, &BTreeSet::new());
+                    add_os_apps_dir_preferred(cache_root, &elsewhere);
                     restored += 1;
                 }
                 Err(error) => {
@@ -346,7 +367,19 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         // app at a version that app's own record does not name: the catalog
         // is shared, and a kept dependency would otherwise return to its pin.
         let elsewhere = match materialized {
-            Ok(refs) => installed_elsewhere(ps.as_ref(), &tenant, &app_name, &refs).await,
+            Ok(refs) => {
+                let pins: Vec<PinnedApp<'_>> = refs
+                    .iter()
+                    .filter_map(|app| {
+                        Some(PinnedApp {
+                            owner: &app.owner,
+                            name: &app.name,
+                            version: app.version_hash.as_deref()?,
+                        })
+                    })
+                    .collect();
+                installed_elsewhere(ps.as_ref(), &tenant, &app_name, &pins).await
+            }
             Err(error) => Err(error),
         };
         match elsewhere {

@@ -23,11 +23,11 @@ use serde_json::Value;
 use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 use temper_server::state::ServerState;
 
+use super::BundleAudience;
 use super::cache_paths::validate_identity_component;
 use super::version_compare::{
     GenesisVersionCompareResponse, VersionComparison, compare_genesis_app_versions,
 };
-use super::{BundleAudience, RegistryAppRef};
 
 /// How long the installer waits for a registry's compare answer.
 ///
@@ -281,16 +281,13 @@ pub(super) async fn installed_elsewhere(
     ps: &dyn PlatformStore,
     tenant: &str,
     root_name: &str,
-    closure: &[RegistryAppRef],
+    closure: &[PinnedApp<'_>],
 ) -> Result<BTreeSet<String>, String> {
     let mut elsewhere = BTreeSet::new();
     for app in closure.iter().filter(|app| app.name != root_name) {
-        let Some(pinned) = app.version_hash.as_deref() else {
-            continue;
-        };
-        let record = ps.get_installed_app(tenant, &app.name).await?;
-        if version_to_compare(record.as_ref(), pinned, false).is_some() {
-            elsewhere.insert(app.name.clone());
+        let record = ps.get_installed_app(tenant, app.name).await?;
+        if version_to_compare(record.as_ref(), app.version, false).is_some() {
+            elsewhere.insert(app.name.to_string());
         }
     }
     Ok(elsewhere)
