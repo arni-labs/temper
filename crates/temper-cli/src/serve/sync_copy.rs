@@ -49,7 +49,7 @@ const TIMEOUTS_BEFORE_RESTART: u32 = 6;
 /// around all of it. The span goes on last, so a request's push, and the
 /// answer it ends in, are part of that request's trace.
 pub(super) fn serve_router(routes: Router, store: Option<TursoEventStore>) -> Router {
-    temper_server::with_request_span(answer_after_copy(routes, store))
+    answer_after_copy(temper_server::with_request_span(routes), store)
 }
 
 /// With a store whose database has a copy, answer changes only after they
