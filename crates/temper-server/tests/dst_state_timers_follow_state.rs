@@ -35,6 +35,8 @@
 
 #[path = "dst_state_timers_follow_state/boot_burst.rs"]
 mod boot_burst;
+#[path = "dst_state_timers_follow_state/boot_listing_retry.rs"]
+mod boot_listing_retry;
 #[path = "dst_state_timers_follow_state/boot_logging.rs"]
 mod boot_logging;
 #[path = "dst_state_timers_follow_state/delete_race.rs"]
@@ -313,7 +315,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
             state
                 .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
                 .await
-                .map_err(|error| run.fail("records are created", error))?;
+                .map_err(|error| run.fail("records are created", error.to_string()))?;
             if !act(state, job, "Start").await {
                 return Err(run.fail("records start", format!("{}/{}", job.tenant, job.id)));
             }

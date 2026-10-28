@@ -10,6 +10,7 @@ mod identity;
 mod listener;
 mod render;
 mod sampling;
+mod shutdown;
 mod signals;
 mod wire;
 

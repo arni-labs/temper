@@ -11,7 +11,7 @@ use crate::entity_actor::{EntityResponse, EntityState};
 use crate::request_context::AgentContext;
 use crate::secrets::template::resolve_secret_templates;
 use crate::state::sim_now;
-use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
+use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext, platform_keys};
 use temper_runtime::tenant::TenantId;
 use temper_wasm::host_trait::clamp_redacted_metadata_value;
 use temper_wasm::{
@@ -55,6 +55,7 @@ fn wasm_module_security_context(module_name: &str) -> SecurityContext {
         },
         context_attrs: std::collections::HashMap::new(), // determinism-ok: SecurityContext uses HashMap
         correlation_id: temper_runtime::scheduler::sim_uuid().to_string(),
+        cause: None,
     }
 }
 
@@ -87,12 +88,12 @@ pub(crate) fn internal_http_capability_issuer(
     match module {
         Some(module) => {
             security_context.context_attrs.insert(
-                "module".to_string(),
+                platform_keys::MODULE.to_string(),
                 serde_json::Value::String(module.to_string()),
             );
         }
         None => {
-            security_context.context_attrs.remove("module");
+            security_context.context_attrs.remove(platform_keys::MODULE);
         }
     }
     let authenticated = AuthenticatedRequestContext::new(tenant.clone(), security_context);
@@ -246,7 +247,9 @@ fn agent_ctx_for_composite_wasm_result(
     if composite_agent_ctx.idempotency_key.is_none()
         && let Some(idempotency_key) = dispatch_idempotency_key
     {
-        composite_agent_ctx.idempotency_key = Some(idempotency_key.to_string());
+        composite_agent_ctx.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+            idempotency_key.to_string(),
+        ));
     }
     composite_agent_ctx
 }
@@ -1069,7 +1072,14 @@ impl crate::state::ServerState {
                 "integration": integration.name.clone(),
             });
             return self
-                .dispatch_wasm_callback(ctx.entity_ref, cb, params, ctx.agent_ctx, ctx.mode)
+                .dispatch_wasm_callback(
+                    ctx.entity_ref,
+                    &integration.name,
+                    cb,
+                    params,
+                    ctx.agent_ctx,
+                    ctx.mode,
+                )
                 .await;
         }
         Ok(None)
@@ -1360,6 +1370,7 @@ impl crate::state::ServerState {
                         WASM_DISPATCH_PHASE_DISPATCH_CALLBACK,
                         self.dispatch_wasm_callback(
                             ctx.entity_ref,
+                            &integration.name,
                             callback_action,
                             callback_params,
                             ctx.agent_ctx,

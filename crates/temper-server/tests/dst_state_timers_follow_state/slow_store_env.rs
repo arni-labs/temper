@@ -115,6 +115,16 @@ impl EventStore for SlowStore {
     ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
         self.journal.read_events(id, seq).await
     }
+    async fn read_events_page(
+        &self,
+        id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        self.journal
+            .read_events_page(id, before_sequence, limit)
+            .await
+    }
     async fn save_snapshot(
         &self,
         id: &str,

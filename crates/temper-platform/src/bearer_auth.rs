@@ -135,6 +135,7 @@ pub async fn bearer_auth_check(
                 identity.role.as_deref(),
                 verified_session,
             )
+            .with_principal_records(&identity.principal_records)
         } else {
             temper_authz::SecurityContext::from_resolved_identity(
                 &identity.agent_instance_id,

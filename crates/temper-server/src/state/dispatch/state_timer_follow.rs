@@ -83,7 +83,7 @@ impl ServerState {
     /// changed follow the state the record is in now, including a type that
     /// had no timeout before. Failed listings and reads remain pending until
     /// the store recovers. Startup installs defer to `start_runtime`'s
-    /// rows-only boot walk, preserving saved callers and its shared fire gate.
+    /// boot walk, preserving saved callers and its shared fire gate.
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
             Ok(mut registry) => {
@@ -217,6 +217,7 @@ impl ServerState {
                         armed_by: callers.get(&key),
                         gate: gate.clone(),
                         arming,
+                        woke_for: None,
                     };
                     let followed = self
                         .reconcile_stored_record(&tenant, &entity_type, entity_id, follow)
@@ -274,7 +275,7 @@ impl ServerState {
     }
 
     /// The record's state now, without starting its actor when it has none.
-    async fn current_record_state(
+    pub(in crate::state) async fn current_record_state(
         &self,
         tenant: &TenantId,
         entity_type: &str,

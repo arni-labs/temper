@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod action;
+mod carry;
 mod state;
 mod trigger;
 mod webhook;
 
 pub use action::*;
+pub use carry::*;
 pub use state::*;
 pub use trigger::*;
 pub use webhook::*;
@@ -85,6 +87,10 @@ pub struct Automaton {
     /// Empty when the spec declared no `[[vector]]`.
     #[serde(default, rename = "vector")]
     pub vectors: Vec<VectorDecl>,
+    /// Where this version moves stored records it would otherwise leave with
+    /// no way forward (see [`Carry`]).
+    #[serde(default, rename = "carry")]
+    pub carries: Vec<Carry>,
     /// Admission control caps (ADR-0051). When present, the dispatch layer
     /// gates concurrent calls per `(tenant, entity_type, action)` before
     /// reaching the actor.
@@ -153,6 +159,12 @@ pub struct AutomatonMeta {
     /// them in `from`.
     #[serde(default)]
     pub terminal: Vec<String>,
+    /// A record of this type whose id is a user's `sub` describes that user:
+    /// Cedar sees its status on the principal, as `principal.<Type>` when the
+    /// user calls in person and `principal.actingFor<Type>` when an agent
+    /// calls for them, read from the record's actor on every request.
+    #[serde(default)]
+    pub principal_record: bool,
 }
 
 /// A safety invariant, proven by the verification cascade.
@@ -295,6 +307,10 @@ pub struct StateTimeout {
     /// Typically includes an `error_message` for observability.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub args: BTreeMap<String, Arg>,
+    /// Words for people reading the app: what the timer does ("check CI
+    /// again"). Display only: the kernel never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub says: Option<String>,
 }
 
 /// Admission control declaration (ADR-0051).

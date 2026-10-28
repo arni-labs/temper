@@ -79,7 +79,9 @@ impl ServerState {
         input: &RowsInput<'_>,
     ) -> EntityRows {
         let after = input.state;
-        let projection = if after.status == "Deleted" {
+        // Only the kernel's tombstone removes the row; a spec action into a
+        // state named Deleted is projected like any other.
+        let projection = if input.event.kind == temper_runtime::persistence::EventKind::Tombstone {
             Projection::Remove
         } else {
             Projection::Upsert {

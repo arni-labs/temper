@@ -722,3 +722,50 @@ async fn too_many_tables_is_rejected() {
         "a module declaring more than MAX_TABLES tables must fail instantiation: {result:?}"
     );
 }
+
+// Counts down from ten million, then returns: it runs long enough in real time
+// for a runtime with nothing else to do to go idle while it runs.
+const WAT_COUNTDOWN: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "run") (param i32 i32) (result i32)
+        (local $n i32)
+        i32.const 10000000
+        local.set $n
+        (loop $L
+          local.get $n
+          i32.const 1
+          i32.sub
+          local.tee $n
+          br_if $L)
+        i32.const 0
+      )
+    )
+"#;
+
+/// A simulation's paused clock stands still while a module runs on its own
+/// thread, so no timer fires in the middle of a module call and its answer
+/// arrives at the simulated time it was asked.
+#[tokio::test(start_paused = true)]
+async fn a_paused_clock_stands_still_while_a_module_runs() {
+    let engine = WasmEngine::new().unwrap();
+    let hash = engine.compile_and_cache(WAT_COUNTDOWN.as_bytes()).unwrap();
+    // The timer an idle runtime's paused clock would jump to.
+    let _timer = tokio::spawn(tokio::time::sleep(Duration::from_secs(3_600)));
+    let asked_at = tokio::time::Instant::now();
+    // The module sets no result; only the clock matters here.
+    let _ = engine
+        .invoke(
+            &hash,
+            &make_context(),
+            make_host(),
+            &WasmResourceLimits::default(),
+            make_streams(),
+        )
+        .await;
+    assert_eq!(
+        asked_at.elapsed(),
+        Duration::ZERO,
+        "the clock moved while the module ran"
+    );
+}

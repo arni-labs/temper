@@ -20,8 +20,10 @@
 //! other is cancelled.
 //!
 //! State exits and reset signals invalidate the old timer before waiting
-//! for query visibility. Successor timers are armed after that wait, so an
-//! old deadline cannot fire while a committed reset is being projected.
+//! for query visibility, so an old deadline cannot fire while a committed
+//! reset is being projected. Successor timers are armed before that wait
+//! too: a timer fires through the record's actor, not the query plane, and a
+//! projection that lags or fails must not leave a committed record untimed.
 //!
 //! Durability (ADR-0056): every armed timer keeps a durable row with its
 //! clock start, parameters and the identity it fires as, and removes it when
@@ -54,6 +56,7 @@ use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
+use crate::idempotency::IdempotencyKey;
 use crate::request_context::{AgentContext, StateTimerFire};
 
 use super::effects::PostDispatchContext;
@@ -627,7 +630,9 @@ impl crate::state::ServerState {
     /// sequence for the rest of its budget (none for a timer that fires once
     /// and already did), as `timer`'s identity and through its boot gate. A
     /// newer arm in this process since `timer` (`armed_seq` is no longer
-    /// current) already follows the record, so nothing changes.
+    /// current) already follows the record, so nothing changes. `timer`'s
+    /// task woke for its deadline, so a timer armed here at that deadline
+    /// fires on time, not overdue.
     pub(super) async fn follow_moved_record(
         &self,
         timer: &ArmedTimer,
@@ -649,6 +654,7 @@ impl crate::state::ServerState {
         let follow = super::state_timer_reconcile::Follow {
             armed_by: Some(&timer.agent_ctx),
             gate: timer.boot_gate.clone(),
+            woke_for: Some(deadline(timer.started_at, timer.after_seconds)),
             ..Default::default()
         };
         self.follow_owned_state_timer(
@@ -742,11 +748,24 @@ impl ArmedTimer {
             && self.after_seconds == other.after_seconds
     }
 
-    /// What its fire is dispatched as: its identity, marked as the fire of
-    /// the arming at its journal sequence, which the record's actor applies
-    /// only while the record is still at that sequence.
-    pub(super) fn fire_context(&self) -> AgentContext {
+    /// A key for the fires of one task of this arming: a fire tried again
+    /// after its write landed unseen is answered as that write. It is the
+    /// task's own, not the arming's: in a deploy overlap two processes fire
+    /// the same arming, and the one whose fire did not commit then meets the
+    /// other's key, not its own, so it is refused as past the arming rather
+    /// than answered as a duplicate whose effects it would run a second time.
+    pub(super) fn new_fire_key(&self) -> IdempotencyKey {
+        IdempotencyKey::Request(format!("state-timer:{}:{}", self.arm_id, sim_uuid()))
+    }
+
+    /// What its fire is dispatched as: its identity under `fire_key`,
+    /// marked as the fire of the arming at its journal sequence, which the
+    /// record's actor applies only while the record is still at that
+    /// sequence, and with its cause.
+    pub(super) fn fire_context(&self, fire_key: &IdempotencyKey) -> AgentContext {
         let mut agent = self.agent_ctx.clone();
+        agent.idempotency_key = Some(fire_key.clone());
+        super::timer_cause::mark_timer_fire(&mut agent);
         agent.fires_state_timer = Some(StateTimerFire {
             tenant: self.tenant.to_string(),
             entity_type: self.entity_type.clone(),
@@ -838,6 +857,16 @@ pub(super) fn remaining_budget(
         .to_std()
         .unwrap_or(Duration::ZERO);
     Duration::from_secs(after_seconds).saturating_sub(elapsed)
+}
+
+/// When a timer whose clock started at `started_at` falls due. A budget past
+/// the end of the calendar never falls due.
+pub(super) fn deadline(started_at: DateTime<Utc>, after_seconds: u64) -> DateTime<Utc> {
+    i64::try_from(after_seconds)
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|budget| started_at.checked_add_signed(budget))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 #[cfg(test)]

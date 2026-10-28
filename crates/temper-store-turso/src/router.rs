@@ -710,6 +710,21 @@ impl EventStore for TenantStoreRouter {
         store.read_events(persistence_id, from_sequence).await
     }
 
+    #[instrument(skip_all, fields(persistence_id, otel.name = "router.read_events_page"))]
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let (tenant, _, _) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let store = self.store_for_tenant(tenant).await?;
+        store
+            .read_events_page(persistence_id, before_sequence, limit)
+            .await
+    }
+
     #[instrument(skip_all, fields(persistence_id, otel.name = "router.save_snapshot"))]
     async fn save_snapshot(
         &self,
@@ -734,6 +749,26 @@ impl EventStore for TenantStoreRouter {
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
         let store = self.store_for_tenant(tenant).await?;
         store.load_snapshot(persistence_id).await
+    }
+
+    async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        let (tenant, _, _) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        self.store_for_tenant(tenant)
+            .await?
+            .latest_sequence_nr(persistence_id)
+            .await
+    }
+
+    #[instrument(skip_all, fields(tenant, otel.name = "router.journal_heads"))]
+    async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        self.store_for_tenant(tenant)
+            .await?
+            .journal_heads(tenant)
+            .await
     }
 
     #[instrument(skip_all, fields(tenant, otel.name = "router.list_entity_ids"))]

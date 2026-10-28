@@ -9,11 +9,14 @@ use temper_runtime::persistence::{
 use super::{PublishedArtifactUpsert, QueryProjectionUpsert, TursoEventStore};
 use crate::TursoSpecVerificationUpdate;
 
+mod catalog_row_writes;
 mod commit_outcome;
 mod commit_transport;
+mod event_pages;
 mod evolution_tenant;
 mod field_index_writes;
 mod policy_approval;
+mod projection_repair;
 mod projection_writes;
 mod scheduled_actions;
 mod write_queue;
@@ -1329,6 +1332,7 @@ async fn stale_projection_upsert_does_not_overwrite_newer_catalog_row() {
     let mut rows = conn
         .query(
             "SELECT sequence_nr, fields FROM entity_catalog \
+             INDEXED BY sqlite_autoindex_entity_catalog_1 \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, entity_type, entity_id],
         )

@@ -6,7 +6,9 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use super::DispatchError;
-use super::state_timeouts::ArmedTimer;
+use super::owed_writes::{OwedKind, OwedWrite};
+use super::state_timeouts::{ArmedTimer, deadline};
+use crate::idempotency::IdempotencyKey;
 use crate::state::ServerState;
 
 impl ServerState {
@@ -20,6 +22,7 @@ impl ServerState {
         gate: Option<Arc<Semaphore>>,
         armed_seq: u64,
     ) {
+        let fire_key = timer.new_fire_key();
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
             .agent_ctx
@@ -53,6 +56,7 @@ impl ServerState {
         let state = self.clone();
         let armed_by = crate::trace_context::cause();
         tokio::spawn(async move {
+            let mut kept = false;
             // determinism-ok: timer work on the runtime's scheduler
             loop {
                 tokio::time::sleep(delay).await; // determinism-ok: simulated runtime clock
@@ -73,7 +77,7 @@ impl ServerState {
                     workflow.run_id = %workflow_run_id,
                 );
                 let retry = state
-                    .fire_state_timer(&timer, armed_seq)
+                    .fire_state_timer(&timer, armed_seq, &fire_key)
                     .instrument(span)
                     .await;
                 // The dispatch awaited the store answer and ran the normal
@@ -83,11 +87,26 @@ impl ServerState {
                 if !state.state_timer_is_current(&timer, armed_seq) {
                     break;
                 }
+                if !kept {
+                    kept = state.track_owed_write(
+                        fire_key.as_str(),
+                        OwedWrite {
+                            tenant: timer.tenant.clone(),
+                            entity_type: timer.entity_type.clone(),
+                            entity_id: timer.entity_id.clone(),
+                            kind: OwedKind::Timer,
+                            key: Some(fire_key.clone()),
+                        },
+                    );
+                }
                 tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                     entity_id = %timer.entity_id, arm_id = %timer.arm_id,
                     %reason, retry_in_ms = wait.as_millis() as u64,
                     "state timer retained after failed fire; retrying");
                 delay = wait;
+            }
+            if kept {
+                state.untrack_owed_write(fire_key.as_str());
             }
             if !state.state_timer_row_moved_on(&timer, armed_seq) {
                 state.forget_state_timer(&timer).await;
@@ -101,6 +120,7 @@ impl ServerState {
         &self,
         timer: &ArmedTimer,
         armed_seq: u64,
+        fire_key: &IdempotencyKey,
     ) -> Option<(Duration, String)> {
         if !self.state_timer_is_current(timer, armed_seq) {
             return None;
@@ -121,6 +141,7 @@ impl ServerState {
         if !belongs {
             let follow = super::state_timer_reconcile::Follow {
                 armed_by: Some(&timer.agent_ctx),
+                woke_for: Some(deadline(timer.started_at, timer.after_seconds)),
                 ..Default::default()
             };
             self.follow_owned_state_timer(
@@ -140,7 +161,7 @@ impl ServerState {
                 &timer.state,
                 &timer.action,
             );
-            let agent_ctx = timer.fire_context();
+            let agent_ctx = timer.fire_context(fire_key);
             let answer = self
                 .dispatch_tenant_action_ext_typed(
                     &timer.tenant,

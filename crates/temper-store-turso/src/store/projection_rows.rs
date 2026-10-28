@@ -2,7 +2,7 @@
 //! holds: the journal append's, so a move's projection commits with its
 //! event, or the projection writer's own.
 
-use temper_runtime::persistence::{PersistenceError, storage_error};
+use temper_runtime::persistence::{PersistenceError, catalog_state_for_storage, storage_error};
 use temper_runtime::scheduler::sim_now;
 
 use super::field_index::{canonical_projection_status, indexed_projection_fields};
@@ -23,6 +23,31 @@ pub(super) struct ProjectionWrite<'a> {
     pub(super) sequence_nr: u64,
 }
 
+/// The entity's catalog row in `tx`, if it has one.
+pub(super) async fn existing_projection(
+    tx: &Transaction<'_>,
+    [tenant, entity_type, entity_id]: [&str; 3],
+) -> Result<Option<ExistingProjection>, PersistenceError> {
+    let mut rows = tx
+        .query(
+            // The key's index: without it the planner may read every row of
+            // the type (driver/plan_check.rs).
+            "SELECT c.sequence_nr, c.projection_hash, k.sequence_nr \
+             FROM entity_catalog c INDEXED BY sqlite_autoindex_entity_catalog_1 \
+             LEFT JOIN entity_catalog_counters k \
+               ON k.tenant = c.tenant AND k.entity_type = c.entity_type \
+              AND k.entity_id = c.entity_id \
+             WHERE c.tenant = ?1 AND c.entity_type = ?2 AND c.entity_id = ?3",
+            params![tenant, entity_type, entity_id],
+        )
+        .await
+        .map_err(storage_error)?;
+    match rows.next().await.map_err(storage_error)? {
+        Some(found) => Ok(Some(ExistingProjection::from_row(&found, 0)?)),
+        None => Ok(None),
+    }
+}
+
 /// Write `row` in `tx`: its catalog row, and its field-index rows when its
 /// indexed values changed. A row already at a later sequence is kept.
 pub(super) async fn write_projection(
@@ -40,29 +65,15 @@ pub(super) async fn write_projection(
     let status = canonical_projection_status(row.status, state);
     let fields_json = serde_json::to_string(fields)
         .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
-    let new_hash = projection_hash(status, &fields_json, state);
-    let state_json = serde_json::to_string(state)
+    // The row holds each field once: in `fields`, not again in `state`.
+    let stored_state = catalog_state_for_storage(fields, state);
+    let new_hash = projection_hash(status, &fields_json, &stored_state);
+    let state_json = serde_json::to_string(&stored_state)
         .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
     let updated_at = sim_now().to_rfc3339();
     let sequence_nr = i64::try_from(row.sequence_nr).unwrap_or(i64::MAX);
 
-    let existing = {
-        let mut rows = tx
-            .query(
-                "SELECT c.sequence_nr, c.projection_hash, k.sequence_nr \
-                 FROM entity_catalog c LEFT JOIN entity_catalog_counters k \
-                   ON k.tenant = c.tenant AND k.entity_type = c.entity_type \
-                  AND k.entity_id = c.entity_id \
-                 WHERE c.tenant = ?1 AND c.entity_type = ?2 AND c.entity_id = ?3",
-                params![tenant, entity_type, entity_id],
-            )
-            .await
-            .map_err(storage_error)?;
-        match rows.next().await.map_err(storage_error)? {
-            Some(found) => Some(ExistingProjection::from_row(&found, 0)?),
-            None => None,
-        }
-    };
+    let existing = existing_projection(tx, [tenant, entity_type, entity_id]).await?;
     if existing
         .as_ref()
         .is_some_and(|existing| existing.sequence_nr() > sequence_nr)

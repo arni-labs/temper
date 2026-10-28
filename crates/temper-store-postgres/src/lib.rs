@@ -39,9 +39,13 @@ pub mod dbm;
 mod metrics;
 mod namespace;
 pub use namespace::PostgresSchema;
+mod catalog_groups;
 pub mod migration;
 pub mod platform;
 mod projection_freshness;
+mod projection_repair;
+#[cfg(test)]
+mod projection_repair_test;
 mod query_page;
 pub mod schema;
 mod schema_event_history;

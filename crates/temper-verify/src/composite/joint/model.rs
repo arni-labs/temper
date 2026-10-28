@@ -22,22 +22,21 @@ use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
-use crate::model::semantics::{Expansion, string_values};
+use crate::model::semantics::{Expansion, rule_for, string_values};
 use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
-use read::{Kernel, Reaction, Unchecked, named_literals, tracked, unchecked_constraints};
+use read::{
+    Kernel, Reaction, Unchecked, named_literals, reactions_into, tracked, unchecked_constraints,
+};
 pub(super) use step::Move;
-pub(super) use walk::Explored;
+pub(super) use walk::{Explored, Unwalked, unwalked_reason};
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
-
-/// Reaction depth followed: the runtime's own bound.
-const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 
 /// Dispatches and module calls in flight at once. The runtime has no such
 /// bound: each request, reaction and module call is its own task. The model
@@ -56,7 +55,7 @@ enum Delivery {
     /// Before the next move from outside: the dispatches a move sends all
     /// land, in any order, before anything else is asked. That is what the
     /// drop check claims (ADR-0150); with it, the dispatches in flight are
-    /// bounded by the reactions' fan-out and depth.
+    /// bounded by the reactions' fan-out and distinct steps.
     BeforeNextRequest,
 }
 
@@ -126,6 +125,36 @@ pub(super) struct JointModel {
     /// Elsewhere who armed a timer or answers a call changes nothing, so the
     /// model does not tell them apart.
     sender_matters: BTreeSet<String>,
+    /// Each entity's transitions (by index) that nothing in the model sends
+    /// and something in the runtime does, with who.
+    unsent: BTreeMap<String, Vec<(usize, Unsent)>>,
+}
+
+/// Who in the runtime sends an action nothing in the model sends.
+#[derive(Debug, Clone)]
+enum Unsent {
+    /// A module whose trigger names no `on_success`, while its call is open:
+    /// the kernel takes whatever action the module's result names, and the
+    /// model answers only with internal actions. Only for an action nothing
+    /// else sends.
+    Answer,
+    /// Reactions from these types, outside the scope.
+    Reactions(BTreeSet<String>),
+}
+
+impl Unsent {
+    fn sender(&self) -> String {
+        match self {
+            Unsent::Answer => "a module whose trigger names no on_success".to_string(),
+            Unsent::Reactions(from) => format!(
+                "a reaction from {}",
+                from.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+        }
+    }
 }
 
 impl JointModel {
@@ -254,6 +283,34 @@ impl JointModel {
             .filter(|r| r.principal.is_none())
             .map(|r| r.from.clone())
             .collect();
+        let into = reactions_into(by_name, &scope);
+        let open: BTreeSet<&String> = kernel
+            .calls_on
+            .iter()
+            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_empty()))
+            .map(|((entity, _), _)| entity)
+            .collect();
+        let unsent = models
+            .iter()
+            .filter_map(|(entity, model)| {
+                let ways: Vec<(usize, Unsent)> = model
+                    .transitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        !chosen(entity, &t.name)
+                            && !reactions
+                                .iter()
+                                .any(|r| &r.to == entity && r.target_action == t.name)
+                    })
+                    .filter_map(|(i, t)| match into.get(&(entity.clone(), t.name.clone())) {
+                        Some(from) => Some((i, Unsent::Reactions(from.clone()))),
+                        None => open.contains(entity).then_some((i, Unsent::Answer)),
+                    })
+                    .collect();
+                (!ways.is_empty()).then(|| (entity.clone(), ways))
+            })
+            .collect();
         Self {
             expansion: Expansion::default(),
             id_literals,
@@ -270,6 +327,30 @@ impl JointModel {
             order,
             senders,
             sender_matters,
+            unsent,
+        }
+    }
+
+    /// Note each move the runtime could make in `state` that the walk never
+    /// takes.
+    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<Unwalked>) {
+        for (entity, ways) in &self.unsent {
+            let open = state
+                .calls
+                .iter()
+                .any(|call| &call.to == entity && call.on_success.is_empty());
+            for (index, sender) in ways {
+                let t = &self.models[entity].transitions[*index];
+                if (open || !matches!(sender, Unsent::Answer))
+                    && self.enabled(entity, t, state, Blind::Nothing)
+                {
+                    unwalked.insert(Unwalked {
+                        action: format!("{entity}.{}", t.name),
+                        sender: sender.sender(),
+                        from: state.records[entity].status.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -383,10 +464,11 @@ impl JointModel {
         state: &JointState,
         blind: Blind,
     ) -> bool {
-        let local = &state.records[entity];
-        let status_ok =
-            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
-        status_ok && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+        // The rule the runtime takes for this action in the record's status
+        // (`rule_for`); another with the same name never fires from there.
+        let taken = rule_for(&self.models[entity], &t.name, &state.records[entity].status)
+            .is_some_and(|rule| std::ptr::eq(rule, t));
+        taken && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
     }
 
     pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {

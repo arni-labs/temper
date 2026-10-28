@@ -1,6 +1,7 @@
 //! Checks a parsed spec must pass before it is installed: declared states,
 //! predicates and effects, state timeouts, triggers, webhooks and vectors.
 
+mod carries;
 mod triggers;
 mod webhooks;
 
@@ -17,6 +18,19 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
         return Err(AutomatonParseError::Validation(format!(
             "initial state '{}' is not in states list",
             automaton.automaton.initial
+        )));
+    }
+
+    // A principal record's status reaches Cedar as `principal.<name>`. Every
+    // attribute the kernel puts on a principal starts lowercase (`id`, `role`,
+    // `agentTypeVerified`, `actingFor<Type>`), so a name that starts uppercase
+    // can never stand in for one of them.
+    let name = &automaton.automaton.name;
+    if automaton.automaton.principal_record && !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return Err(AutomatonParseError::Validation(format!(
+            "principal_record type '{name}' must start with an uppercase letter: Cedar reads it \
+             as principal.{name}, and every attribute the kernel sets on a principal starts \
+             lowercase, so only such a name cannot stand in for one"
         )));
     }
 
@@ -140,6 +154,7 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     //    - `metric` must be one of cosine | dot | l2.
     //    - names must be unique (each identifies one index partition + `decl=`).
     validate_vector_decls(automaton)?;
+    carries::validate_carries(automaton)?;
 
     Ok(())
 }
