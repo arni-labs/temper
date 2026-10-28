@@ -17,6 +17,12 @@ pub(super) fn is_creation(event: &EntityEvent) -> bool {
 }
 
 impl EntityActor {
+    /// Whether the record is not written yet: it has a journal, with no
+    /// event in it.
+    pub(super) fn is_unwritten(&self, state: &EntityState) -> bool {
+        self.event_journal.is_some() && state.sequence_nr == 0
+    }
+
     /// The `Created` event of a record not written yet, and the record it
     /// creates (the event's payload carries its initial values). None once
     /// its journal holds an event, or with no journal.
@@ -24,7 +30,7 @@ impl EntityActor {
         &self,
         state: &EntityState,
     ) -> Option<(EntityEvent, EntityState)> {
-        if self.event_journal.is_none() || state.sequence_nr != 0 {
+        if !self.is_unwritten(state) {
             return None;
         }
         let table = self.table.read().expect("table lock poisoned").clone();

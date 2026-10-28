@@ -2010,11 +2010,14 @@ impl EntityActor {
                         state.status,
                         name
                     );
+                    // A record's first write also commits its `Created` event.
+                    let created = usize::from(self.is_unwritten(&state_before));
                     debug_assert!(
-                        state.total_event_count == event_count_before + 1,
-                        "POSTCONDITION: event count must grow by exactly 1 (was {}, now {})",
+                        state.total_event_count == event_count_before + 1 + created,
+                        "POSTCONDITION: event count must grow by the events the commit wrote (was {}, now {}, created {})",
                         event_count_before,
-                        state.total_event_count
+                        state.total_event_count,
+                        created
                     );
                     debug_assert!(
                         state
