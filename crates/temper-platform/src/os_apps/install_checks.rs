@@ -4,15 +4,21 @@
 //! start to restore, so these refuse it before the first write.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use temper_authz::{Asker, May, SendAnalysis};
 use temper_runtime::tenant::TenantId;
+use temper_spec::automaton::Automaton;
 use temper_spec::cross_invariant;
-use temper_verify::composite::{JointOutcome, LivenessOutcome};
+use temper_verify::composite::{Bound, JointOutcome, LivenessOutcome};
 
 use super::InstallWarning;
+use super::proofs::{self, Attempt, Proof, Verdict, Wait, Walked};
 
 use crate::state::PlatformState;
+
+/// Types by name, each with its spec source and parsed.
+type Sourced = BTreeMap<String, (String, Automaton)>;
 
 /// Refuse an install into a tenant whose stored specs did not load at startup.
 ///
@@ -43,20 +49,6 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
         .map_err(|e| format!("Failed to parse cross-invariants for os-app '{app_name}': {e}"))
 }
 
-/// Time and states the joint check of one install may spend. Anyone who may
-/// install an app can send specs whose joint model never ends: unbounded,
-/// one install would hold a core and gigabytes for hours. These are
-/// validate-ioa's caps for the same attack (its `MAX_BUDGET_MS` and
-/// `BUDGET_STATES`). The time cap comes first: a liveness walk of the
-/// Katagami control specs reached 2.2M states in 120 s and held 1.5 GB on a
-/// Mac. A check that runs out leaves its rule unproved, which is a warning:
-/// the install goes ahead. Intermediate expansion work also spends the state
-/// allowance.
-const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
-    time: std::time::Duration::from_secs(120),
-    states: 10_000_000,
-};
-
 /// Prove every `[[invariant]]` and `[[liveness]]` of `specs` (a bundle's
 /// types) that reads a related record, on the joint model of its type and
 /// the types it names, with `policies` (the tenant's Cedar as the install
@@ -69,13 +61,15 @@ const JOINT_INSTALL_BUDGET: temper_verify::Budget = temper_verify::Budget {
 ///
 /// Only a rule the check finds broken refuses the install: an invariant with
 /// a path of moves that breaks it, or a liveness rule with a path to a state
-/// from which no move reaches its condition. A rule it could not prove (out
-/// of budget, reading a type nobody declares, a module answer not walked, or
-/// a premise no state meets) is a warning and the install goes ahead; those
-/// rules are returned for the install's answer. It runs before the install
-/// writes or swaps anything, so a refused bundle leaves the tenant as it was
-/// and reads keep serving the old specs meanwhile, and on a blocking thread,
-/// since a large joint model takes seconds.
+/// from which no move reaches its condition. A rule it could not prove (the
+/// walk did not fit in its memory, it reads a type nobody declares, a module
+/// answer not walked, or a premise no state meets) is a warning and the
+/// install goes ahead; those rules are returned for the install's answer. It
+/// runs before the install writes or swaps anything, so a refused bundle
+/// leaves the tenant as it was and reads keep serving the old specs
+/// meanwhile. The walk runs as its own job (see [`proofs`]): a proof still
+/// walking comes back as the walk to wait for, and the install waits for it
+/// without its lock and starts again, finding the verdict in `attempt`.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -83,9 +77,10 @@ pub(super) async fn prove(
     specs: &[(String, String)],
     new_specs: bool,
     policies: Option<&str>,
-) -> Result<Vec<String>, String> {
+    attempt: &Attempt,
+) -> Result<ControlFlow<Vec<String>, Wait>, String> {
     if !new_specs && policies.is_none() {
-        return Ok(Vec::new());
+        return Ok(ControlFlow::Break(Vec::new()));
     }
     // A liveness property's own type counts as named, so one that reads no
     // other type is still checked.
@@ -105,7 +100,7 @@ pub(super) async fn prove(
         invariants.chain(liveness).collect()
     })?
     else {
-        return Ok(Vec::new());
+        return Ok(ControlFlow::Break(Vec::new()));
     };
     let policy_text = policies.map_or_else(
         || super::cached_or_active_tenant_policy_text(state, tenant),
@@ -113,73 +108,132 @@ pub(super) async fn prove(
     );
     let policies = SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
-    let (invariants, liveness) = tokio::task::spawn_blocking(move || {
-        let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
-        (
-            temper_verify::composite::verify_joint_invariants(
-                &refs,
-                Some(&policies),
-                JOINT_INSTALL_BUDGET,
-            ),
-            temper_verify::composite::verify_joint_liveness(
-                &refs,
-                Some(&policies),
-                JOINT_INSTALL_BUDGET,
-            ),
-        )
-    })
-    .await
-    .map_err(|e| format!("os-app '{app_name}': the joint check stopped: {e}"))?;
-    let (mut broken, mut unproved) = (Vec::new(), Vec::new());
-    for result in &invariants {
-        match result.outcome {
-            JointOutcome::Holds => tracing::info!(tenant, app = %app_name, "{result}"),
-            JointOutcome::Vacuous { .. } | JointOutcome::Incomplete { .. } => {
-                unproved.push(result.to_string())
+    const PROOF: &str = "rules over several records";
+    let digest = proofs::digest(PROOF, &sources(&automatons), Some(&policy_text));
+    let app = app_name.to_string();
+    let walk = move |bound: Bound<'_>| {
+        let refs: Vec<&Automaton> = automatons.values().map(|(_, a)| a).collect();
+        let invariants =
+            temper_verify::composite::verify_joint_invariants(&refs, Some(&policies), bound);
+        let liveness =
+            temper_verify::composite::verify_joint_liveness(&refs, Some(&policies), bound);
+        let (mut held, mut broken, mut unproved) = (Vec::new(), Vec::new(), Vec::new());
+        // A walk that did not finish says nothing of the specs: it may fit
+        // when the host has more room, so its verdict is not kept. A rule
+        // that checks nothing as written is a verdict on the specs.
+        let mut fit = true;
+        for result in &invariants {
+            match result.outcome {
+                JointOutcome::Holds => held.push(result.to_string()),
+                JointOutcome::Vacuous { .. } => unproved.push(result.to_string()),
+                JointOutcome::Incomplete { .. } => {
+                    fit = false;
+                    unproved.push(result.to_string());
+                }
+                JointOutcome::Broken { .. } => broken.push(result.to_string()),
             }
-            JointOutcome::Broken { .. } => broken.push(result.to_string()),
         }
-    }
-    for result in &liveness {
-        match result.outcome {
-            LivenessOutcome::Holds => tracing::info!(tenant, app = %app_name, "{result}"),
-            LivenessOutcome::Vacuous { .. } | LivenessOutcome::Incomplete { .. } => {
-                unproved.push(result.to_string())
+        for result in &liveness {
+            match result.outcome {
+                LivenessOutcome::Holds => held.push(result.to_string()),
+                LivenessOutcome::Vacuous { .. } => unproved.push(result.to_string()),
+                LivenessOutcome::Incomplete { .. } => {
+                    fit = false;
+                    unproved.push(result.to_string());
+                }
+                LivenessOutcome::Stuck { .. } => broken.push(result.to_string()),
             }
-            LivenessOutcome::Stuck { .. } => broken.push(result.to_string()),
         }
+        let refused = (!broken.is_empty()).then(|| {
+            format!(
+                "os-app '{app}' would break tenant rules over several records:\n{}",
+                broken.join("\n")
+            )
+        });
+        Walked {
+            verdict: Verdict {
+                held,
+                unproved,
+                refused,
+            },
+            fit,
+        }
+    };
+    let proof = proofs::proof(state, tenant, app_name, PROOF, digest, attempt, walk).await;
+    decided(tenant, app_name, proof)
+}
+
+/// The install goes on with the rules left unproved, is refused, or waits
+/// for the walk.
+fn decided(
+    tenant: &str,
+    app_name: &str,
+    proof: Proof,
+) -> Result<ControlFlow<Vec<String>, Wait>, String> {
+    let verdict = match proof {
+        Proof::Running(wait) => return Ok(ControlFlow::Continue(wait)),
+        Proof::Done(verdict) => verdict,
+    };
+    if let Some(refused) = verdict.refused {
+        return Err(refused);
     }
-    for text in &unproved {
-        tracing::warn!(tenant, app = %app_name, "{text}");
+    for line in &verdict.held {
+        tracing::info!(tenant, app = %app_name, "{line}");
     }
-    if broken.is_empty() {
-        Ok(unproved)
-    } else {
-        Err(format!(
-            "os-app '{app_name}' would break tenant rules over several records:\n{}",
-            broken.join("\n")
-        ))
+    for line in &verdict.unproved {
+        tracing::warn!(tenant, app = %app_name, "{line}");
+    }
+    Ok(ControlFlow::Break(verdict.unproved))
+}
+
+/// [`prove`] as an install drives it: wait for the walk while it runs, then
+/// ask again, until it answers.
+#[cfg(test)]
+pub(super) async fn prove_to_the_end(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    specs: &[(String, String)],
+    new_specs: bool,
+    policies: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut attempt = Attempt::default();
+    loop {
+        let proved = prove(
+            state, tenant, app_name, specs, new_specs, policies, &attempt,
+        );
+        match proved.await? {
+            ControlFlow::Continue(wait) => wait.ended(&mut attempt).await?,
+            ControlFlow::Break(unproved) => return Ok(unproved),
+        }
     }
 }
 
-/// The bundle's types parsed, with each type `names` returns for them taken
-/// from what the tenant already runs when the bundle does not carry it.
-/// Include active tenant types before finding properties;
-/// incoming types take precedence. `None` when no checked type names one.
+/// Each type's spec source, which a verdict is kept by.
+fn sources(automatons: &Sourced) -> BTreeMap<String, String> {
+    automatons
+        .iter()
+        .map(|(entity_type, (source, _))| (entity_type.clone(), source.clone()))
+        .collect()
+}
+
+/// The bundle's types, each with its source and parsed, with every type the
+/// tenant already runs that the bundle does not carry: incoming types take
+/// precedence. `None` when no type `names` returns one.
 fn bundle_with_named(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     specs: &[(String, String)],
-    names: impl Fn(&temper_spec::automaton::Automaton) -> Vec<(String, String)>,
-) -> Result<Option<std::collections::BTreeMap<String, temper_spec::automaton::Automaton>>, String> {
-    let mut automatons = std::collections::BTreeMap::new();
+    names: impl Fn(&Automaton) -> Vec<(String, String)>,
+) -> Result<Option<Sourced>, String> {
+    let mut automatons = BTreeMap::new();
     for (entity_type, ioa_source) in specs {
         let automaton = temper_spec::automaton::parse_automaton(ioa_source)
             .map_err(|e| format!("os-app '{app_name}' spec {entity_type} failed to parse: {e}"))?;
-        automatons.insert(entity_type.clone(), automaton);
+        automatons.insert(entity_type.clone(), (ioa_source.clone(), automaton));
     }
-    let tenant_id = temper_runtime::tenant::TenantId::new(tenant);
+    let tenant_id = TenantId::new(tenant);
     let registry = state
         .registry
         .read()
@@ -189,12 +243,12 @@ fn bundle_with_named(
         if let Some(spec) = registry.get_spec(&tenant_id, entity_type) {
             automatons
                 .entry(entity_type.to_string())
-                .or_insert_with(|| spec.automaton.clone());
+                .or_insert_with(|| (spec.ioa_source.clone(), spec.automaton.clone()));
         }
     }
     let named: std::collections::BTreeSet<String> = automatons
         .values()
-        .flat_map(&names)
+        .flat_map(|(_, a)| names(a))
         .map(|(entity_type, _)| entity_type)
         .collect();
     if named.is_empty() {
@@ -205,7 +259,8 @@ fn bundle_with_named(
 
 /// What the joint model says of `specs` under `policies` without refusing the
 /// install: the rules [`prove`] could not prove, and the timers whose lost
-/// fire nothing redoes ([`timer_strands`]).
+/// fire nothing redoes ([`timer_strands`]). Or the proof's walk to wait for,
+/// as [`prove`] gives it.
 pub(super) async fn model_warnings(
     state: &PlatformState,
     tenant: &str,
@@ -213,14 +268,19 @@ pub(super) async fn model_warnings(
     specs: &[(String, String)],
     new_specs: bool,
     policies: Option<&str>,
-) -> Result<Vec<InstallWarning>, String> {
-    let unproved = prove(state, tenant, app_name, specs, new_specs, policies).await?;
+    attempt: &Attempt,
+) -> Result<ControlFlow<Vec<InstallWarning>, Wait>, String> {
+    let proved = prove(state, tenant, app_name, specs, new_specs, policies, attempt);
+    let unproved = match proved.await? {
+        ControlFlow::Continue(wait) => return Ok(ControlFlow::Continue(wait)),
+        ControlFlow::Break(unproved) => unproved,
+    };
     let mut warnings: Vec<InstallWarning> = unproved
         .into_iter()
         .map(InstallWarning::joint_invariants)
         .collect();
     warnings.extend(timer_strands(state, tenant, specs, new_specs, policies));
-    Ok(warnings)
+    Ok(ControlFlow::Break(warnings))
 }
 
 /// Warn about each state timer of `specs` whose lost fire nothing redoes: no

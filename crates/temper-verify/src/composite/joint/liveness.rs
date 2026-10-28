@@ -50,7 +50,7 @@ use temper_spec::predicate::{Truth, eval};
 
 use super::JointStep;
 use super::model::{self, JointModel, Sending};
-use crate::Budget;
+use super::room::{Bound, MB};
 
 /// What the joint check found for one `eventually` property.
 #[derive(Debug, Clone)]
@@ -210,7 +210,7 @@ impl fmt::Display for JointLivenessResult {
 pub fn verify_joint_liveness(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    budget: Budget,
+    bound: Bound<'_>,
 ) -> Vec<JointLivenessResult> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
@@ -262,26 +262,38 @@ pub fn verify_joint_liveness(
                     .collect(),
             };
             let model = JointModel::new(&by_name, scope, name, &[goal], sending, true);
-            let explored = model.walk_with(budget, true, |_, _| false);
+            let mut explored = model.walk_with(bound, true, |_, _| false);
             result.states = explored.len();
             result.in_flight_bound = explored.held_back.then_some(model::MAX_IN_FLIGHT);
             result.unwalked = explored.unwalked();
+            let settling = settle_bytes(&explored);
             result.outcome = match &explored.stopped {
                 Some(reason) => LivenessOutcome::Incomplete {
                     reason: reason.clone(),
                 },
-                None => match settle(&model, name, goal, &explored) {
-                    (LivenessOutcome::Holds, _) if !result.unwalked.is_empty() => {
-                        LivenessOutcome::Incomplete {
-                            reason: model::unwalked_reason(&result.unwalked),
+                None => match explored.held.add(settling) {
+                    Ok(()) => match settle(&model, name, goal, &explored) {
+                        (LivenessOutcome::Holds, _) if !result.unwalked.is_empty() => {
+                            LivenessOutcome::Incomplete {
+                                reason: model::unwalked_reason(&result.unwalked),
+                            }
                         }
-                    }
-                    (LivenessOutcome::Holds, false) => LivenessOutcome::Vacuous {
-                        premise: super::premise(goal)
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
+                        (LivenessOutcome::Holds, false) => LivenessOutcome::Vacuous {
+                            premise: super::premise(goal)
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                        },
+                        (outcome, _) => outcome,
                     },
-                    (outcome, _) => outcome,
+                    Err(reason) => LivenessOutcome::Incomplete {
+                        reason: format!(
+                            "deciding the walk does not fit in the memory it may hold: {reason} \
+                             (it held {} MB at {} states and needs {} MB more)",
+                            explored.held.bytes / MB,
+                            explored.len(),
+                            settling / MB
+                        ),
+                    },
                 },
             };
             results.push(result);
@@ -415,6 +427,19 @@ fn settle(
         },
         met,
     )
+}
+
+/// The bytes [`settle`] holds for `explored`: per state, its marks, its
+/// place in the queue and the stuck list, and its two lists of moves in; per
+/// move, its mark and count; per edge, its place in one of those lists.
+fn settle_bytes(explored: &model::Explored<'_>) -> usize {
+    let per_state = 2 * size_of::<bool>()
+        + 2 * size_of::<usize>()
+        + 2 * (size_of::<Vec<u32>>() + super::room::block(4 * size_of::<u32>()));
+    let per_move = size_of::<bool>() + size_of::<u32>();
+    explored.len() * per_state
+        + explored.made.len() * per_move
+        + explored.edges.len() * 2 * size_of::<u32>()
 }
 
 #[cfg(test)]
