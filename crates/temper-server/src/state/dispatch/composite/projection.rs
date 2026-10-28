@@ -112,6 +112,10 @@ impl ServerState {
                     format!("timed out after {} ms", budget.as_millis())
                 }
             };
+            if tries > 0 {
+                report_unprojected(tenant, &upserts, tries, &error);
+                return; // DEFECT: give up after the first refused try
+            }
             // Wait, then drop the records deleted since, until a try may run.
             loop {
                 if spent.saturating_add(wait) >= PROJECTION_BARRIER_BUDGET {
