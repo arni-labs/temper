@@ -87,6 +87,50 @@ fn a_turn_with_no_token_signals_validates() {
 }
 
 #[test]
+fn deserialization_rejects_a_misaligned_turn() {
+    let json = serde_json::json!({
+        "turn_id": 1,
+        "span_id": "span-1",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "completion_token_ids": [4, 5],
+        "logprobs": [-0.1, -0.2, -0.3],
+    });
+    let error = serde_json::from_value::<OTSTurn>(json)
+        .expect_err("a turn with three logprobs over two tokens is not valid RL data");
+    assert!(error.to_string().contains("logprobs"), "{error}");
+}
+
+#[test]
+fn deserialization_rejects_a_signal_with_nothing_to_align_against() {
+    let json = serde_json::json!({
+        "turn_id": 1,
+        "span_id": "span-1",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "response_mask": [1, 0],
+    });
+    let error = serde_json::from_value::<OTSTurn>(json)
+        .expect_err("a mask with no completion tokens indexes into nothing");
+    assert!(
+        error.to_string().contains("no completion_token_ids"),
+        "{error}"
+    );
+}
+
+#[test]
+fn deserialization_rejects_a_mask_outside_the_zero_one_domain() {
+    let json = serde_json::json!({
+        "turn_id": 1,
+        "span_id": "span-1",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "completion_token_ids": [4, 5],
+        "response_mask": [1, 7],
+    });
+    let error = serde_json::from_value::<OTSTurn>(json)
+        .expect_err("a mask entry of 7 is not a loss switch");
+    assert!(error.to_string().contains("0 or 1"), "{error}");
+}
+
+#[test]
 fn test_turn_with_parent_span() {
     let timestamp = sim_now();
     let turn = OTSTurn::new(1, timestamp).with_parent_span_id("parent-span-123");
