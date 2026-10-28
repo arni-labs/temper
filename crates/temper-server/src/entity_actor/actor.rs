@@ -1351,6 +1351,8 @@ impl Actor for EntityActor {
                 self.blob_store.as_ref(),
             )
             .await?;
+            // MUTANT: a restarted record forgets its keys.
+            state.processed_idempotency_keys.clear();
             if state.sequence_nr > 0
                 && let Some(hook) = self.on_rehydrated.as_ref()
             {
