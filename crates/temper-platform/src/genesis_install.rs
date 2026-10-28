@@ -22,6 +22,8 @@ mod bundles;
 mod cache_paths;
 mod legacy_specs;
 mod object_lookup;
+pub mod version_compare;
+mod visibility;
 use blob_materialization::{
     MAX_GENESIS_TREE_CANONICAL_BYTES, blob_content_len, canonical_field_len, git_object_body,
     materialize_blob_content_field, read_canonical_field_bounded,
@@ -36,6 +38,7 @@ use cache_paths::{
     app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
 };
 use object_lookup::load_genesis_object;
+use visibility::refuse_unless_repository_is_public;
 
 use crate::genesis_install_verify::{
     InstallVerifyDecision, classify_install_verify, mark_install_failed, platform_store,
@@ -1561,59 +1564,6 @@ pub async fn export_genesis_registry_bundle(
         BundleAudience::Authenticated,
     )
     .await
-}
-
-/// Refuse unless this repository is public.
-///
-/// Called for each app as the closure is walked, BEFORE its tree is
-/// materialized. An app's bundle is its whole dependency closure, so "is this
-/// public?" is a question about every repository in it — and the check has to
-/// happen before the content is read, not after: resolving the closure
-/// materializes each tree in order to read its manifest, so a check that ran
-/// afterwards would already have written a private repository to disk.
-async fn refuse_unless_repository_is_public(
-    state: &ServerState,
-    tenant: &TenantId,
-    app: &GenesisAppBundle,
-) -> Result<(), String> {
-    if !state
-        .ensure_entity_loaded(tenant, "Repository", &app.repository_id)
-        .await
-    {
-        return Err(format!(
-            "Genesis bundle refused: repository {} for {}/{} could not be read",
-            app.repository_id, app.owner, app.name
-        ));
-    }
-    let repository = state
-        .get_tenant_entity_state(tenant, "Repository", &app.repository_id)
-        .await
-        .map_err(|error| {
-            format!(
-                "Genesis bundle refused: repository {} could not be read: {error}",
-                app.repository_id
-            )
-        })?;
-    let visibility = repository
-        .state
-        .fields
-        .get("Visibility")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if visibility != "public" {
-        tracing::warn!(
-            tenant = %tenant,
-            repository_id = %app.repository_id,
-            app = %app.name,
-            visibility,
-            "anonymous Genesis bundle refused: a repository in the closure is not public"
-        );
-        return Err(format!(
-            "Genesis bundle refused: {}/{} is not public",
-            app.owner, app.name
-        ));
-    }
-    Ok(())
 }
 
 /// Export a pinned app bundle, bounded by who is asking.
