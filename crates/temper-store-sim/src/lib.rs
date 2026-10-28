@@ -144,6 +144,10 @@ struct SimEventStoreInner {
     /// Each entry makes the next N appends that write that id (alone or in a
     /// batch) fail with a storage error, writing nothing. See `fail_next_appends`.
     pending_append_failures: BTreeMap<String, usize>,
+    /// Each entry lets that many more appends that write that id (alone or in
+    /// a batch) through, then fails every later one, writing nothing, until it
+    /// is cleared. See `stop_appends_after`.
+    appends_before_stop: BTreeMap<String, usize>,
     /// Each entry makes the next N single-journal appends to that id write their
     /// events and then answer with a concurrency violation, as a store does when
     /// it retries a write whose first answer was lost. See `lose_next_append_answers`.
@@ -226,6 +230,7 @@ impl SimEventStore {
                 pending_concurrency_violations: BTreeMap::new(),
                 pending_read_failures: BTreeMap::new(),
                 pending_append_failures: BTreeMap::new(),
+                appends_before_stop: BTreeMap::new(),
                 pending_lost_append_answers: BTreeMap::new(),
                 pending_landed_failures: BTreeMap::new(),
                 pending_append_delays: BTreeMap::new(),
@@ -314,6 +319,24 @@ impl SimEventStore {
             inner
                 .pending_append_failures
                 .insert(persistence_id.to_string(), count);
+        }
+    }
+
+    /// Let the next `landed` appends that write `persistence_id`, alone or in
+    /// a batch, through, then fail every later one with a storage error,
+    /// writing nothing: a process stopped after `landed` commits. `None`
+    /// clears it.
+    pub fn stop_appends_after(&self, persistence_id: &str, landed: Option<usize>) {
+        let mut inner = self.lock();
+        match landed {
+            Some(landed) => {
+                inner
+                    .appends_before_stop
+                    .insert(persistence_id.to_string(), landed);
+            }
+            None => {
+                inner.appends_before_stop.remove(persistence_id);
+            }
         }
     }
 
@@ -464,8 +487,17 @@ impl SimEventStore {
 }
 
 impl SimEventStoreInner {
-    /// Consume one injected append failure for `persistence_id`, if one is set.
+    /// The failure an append that writes `persistence_id` meets, if any: a
+    /// stopped process (see `stop_appends_after`), or one injected failure.
     fn take_append_failure(&mut self, persistence_id: &str) -> Option<PersistenceError> {
+        if let Some(left) = self.appends_before_stop.get_mut(persistence_id) {
+            if *left == 0 {
+                return Some(PersistenceError::Storage(format!(
+                    "SimEventStore: the process stopped before this append to '{persistence_id}'"
+                )));
+            }
+            *left -= 1;
+        }
         take_one(&mut self.pending_append_failures, persistence_id).then(|| {
             PersistenceError::Storage(format!(
                 "SimEventStore: injected append failure for '{persistence_id}'"

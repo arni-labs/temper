@@ -35,12 +35,17 @@
 //!   count, except one whose outcome could not be learned (its caller was
 //!   answered "outcome unknown", so nothing ran after it; see `unknown`).
 //!
+//! A move on a record that does not exist yet commits the record's creation
+//! with it (`first_move`).
+//!
 //! The server runs in one single-threaded, paused-clock Tokio runtime.
 
 #[path = "dst_commit_outcome/committed_deadline.rs"]
 mod committed_deadline;
 #[path = "dst_commit_outcome/faults.rs"]
 mod faults;
+#[path = "dst_commit_outcome/first_move.rs"]
+mod first_move;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
 #[path = "dst_commit_outcome/reset_recovery.rs"]
