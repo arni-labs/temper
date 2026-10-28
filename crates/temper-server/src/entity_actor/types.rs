@@ -55,8 +55,12 @@ pub enum EntityMsg {
         /// with no identity (internal callers and tests).
         caller: Option<std::sync::Arc<crate::request_context::AgentContext>>,
     },
-    /// Get the current entity state.
+    /// Get the current entity state. A record not written yet is written.
     GetState,
+    /// Get the current entity state without writing a record not written
+    /// yet: the read before a write, which commits the record's `Created`
+    /// event with it.
+    Peek,
     /// Get a specific field value.
     GetField { field: String },
     /// Update entity fields (PATCH: merge, PUT: replace).

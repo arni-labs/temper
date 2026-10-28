@@ -55,6 +55,16 @@ pub(crate) enum TimerRow {
 pub(crate) type EntityRowsHook = Arc<dyn Fn(&RowsInput<'_>) -> EntityRows + Send + Sync>;
 
 impl EntityRows {
+    /// The rows of an event committed after `earlier`'s, in its commit: each
+    /// row as this event leaves it, or as `earlier`'s does where this one
+    /// leaves it be.
+    pub(super) fn after(self, earlier: EntityRows) -> EntityRows {
+        EntityRows {
+            projection: self.projection.or(earlier.projection),
+            state_timer: self.state_timer.or(earlier.state_timer),
+        }
+    }
+
     /// The rows as [`CommitRows`] borrows them.
     pub(super) fn commit_rows<'a>(&'a self, rows: CommitRows<'a>) -> CommitRows<'a> {
         CommitRows {

@@ -346,8 +346,9 @@ impl ServerState {
         if snapshot.exists {
             return Ok(snapshot);
         }
+        // The write that follows creates the record, in its own commit.
         let current_state = self
-            .get_tenant_entity_state(tenant, entity_type, entity_id)
+            .peek_tenant_entity_state(tenant, entity_type, entity_id)
             .await
             .map_err(super::DispatchError::Internal)?;
         let resource_attrs = self
@@ -1259,13 +1260,39 @@ impl ServerState {
             .await
     }
 
-    /// Get the current state of an entity actor for a specific tenant.
+    /// Get the current state of an entity actor for a specific tenant. A
+    /// record not written yet is written.
     #[instrument(skip_all, fields(otel.name = "entity.get_tenant_entity_state", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_tenant_entity_state(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
+    ) -> Result<EntityResponse, String> {
+        self.ask_tenant_entity_state(tenant, entity_type, entity_id, || EntityMsg::GetState)
+            .await
+    }
+
+    /// [`Self::get_tenant_entity_state`] without writing a record not
+    /// written yet: the read before a write to it, which commits the
+    /// record's `Created` event with that write.
+    #[instrument(skip_all, fields(otel.name = "entity.peek_tenant_entity_state", tenant = %tenant, entity_type, entity_id))]
+    pub(crate) async fn peek_tenant_entity_state(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<EntityResponse, String> {
+        self.ask_tenant_entity_state(tenant, entity_type, entity_id, || EntityMsg::Peek)
+            .await
+    }
+
+    async fn ask_tenant_entity_state(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        msg: fn() -> EntityMsg,
     ) -> Result<EntityResponse, String> {
         let actor_ref = self
             .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
@@ -1276,7 +1303,7 @@ impl ServerState {
         // ADR-0048: retry transient ask failures (AskTimeout, MailboxFull)
         // so a single slow actor reply does not surface as HTTP 500.
         let policy = self.dispatch_retry_policy();
-        retry::ask_with_backoff::<_, EntityResponse, _>(&actor_ref, || EntityMsg::GetState, &policy)
+        retry::ask_with_backoff::<_, EntityResponse, _>(&actor_ref, msg, &policy)
             .await
             .result
             .map_err(|e| format!("Actor query failed: {e}"))

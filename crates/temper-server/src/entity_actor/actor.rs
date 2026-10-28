@@ -38,6 +38,7 @@ use crate::request_context::AgentContext;
 use crate::storage::{BackendLabel, BoxedEventStore};
 
 use super::action_input::process_action_with_blob_prestate;
+use super::creation::is_creation;
 use super::effects::{
     FieldSyncMode, build_eval_context_with_xref, prune_transient_action_fields_from_state,
 };
@@ -172,7 +173,7 @@ fn duplicate_idempotency_custom_effects(
 pub struct EntityActor {
     pub(super) tenant: String,
     pub(super) entity_type: String,
-    entity_id: String,
+    pub(super) entity_id: String,
     /// Live reference to the transition table. Reads through `RwLock` so that
     /// hot-swapped tables are visible on the next action dispatch without
     /// restarting the actor.
@@ -204,7 +205,7 @@ pub struct EntityActor {
     entity_rows: Option<EntityRowsHook>,
     /// Who creates the record, when this actor writes its `Created` event:
     /// the caller its first state's timer row is armed as, in that commit.
-    created_by: Option<AgentContext>,
+    pub(super) created_by: Option<AgentContext>,
 }
 
 /// What an entity actor runs when it starts from stored events, with the
@@ -471,7 +472,8 @@ impl EntityActor {
     /// same commit, and, for a store that keeps them there, the record's
     /// query-plane row and timer row as the event leaves it (`caller` is who
     /// a timer it arms fires as). `state` is the record after the event, at
-    /// the sequence before it.
+    /// the sequence before it. A record not written yet commits its `Created`
+    /// event first, in the same commit, and holds it once that lands.
     ///
     /// The answer is what the write did. `Ok` is the event's sequence: it
     /// landed, also when the store answered an error and the journal, read
@@ -489,39 +491,71 @@ impl EntityActor {
     ) -> Result<u64, PersistenceError> {
         let persistence_id = self.persistence_id();
         let event_id = sim_uuid();
+        // A record not written yet commits its creation with its first event,
+        // so no stop between two commits can leave it created without it.
+        let creation = if is_creation(event) {
+            None
+        } else {
+            self.unwritten_creation(state)
+        };
+        let first_sequence = state.sequence_nr + 1;
+        let sequence_nr = first_sequence + u64::from(creation.is_some());
         let entity_rows = match &self.entity_rows {
             Some(hook) if store.commits_entity_rows() => {
                 // The record as the event leaves it. A delete sets its status
                 // only once its tombstone is written, so the status is the
                 // event's.
                 let mut after = state.clone();
-                after.sequence_nr = state.sequence_nr + 1;
+                if let Some((created, _)) = &creation {
+                    after.push_event_bounded(created.clone());
+                }
+                after.sequence_nr = sequence_nr;
                 if !event.to_status.is_empty() {
                     after.status = event.to_status.clone();
                 }
                 after.push_event_bounded(event.clone());
-                hook(&RowsInput {
+                let rows = hook(&RowsInput {
                     state: &after,
                     event,
                     caller,
-                })
+                });
+                match &creation {
+                    Some((created, initial)) => {
+                        let mut created_after = initial.clone();
+                        created_after.sequence_nr = first_sequence;
+                        created_after.push_event_bounded(created.clone());
+                        rows.after(hook(&RowsInput {
+                            state: &created_after,
+                            event: created,
+                            caller: self.created_by.as_ref(),
+                        }))
+                    }
+                    None => rows,
+                }
             }
             _ => EntityRows::default(),
         };
-        let payload = super::bootstrap::event_payload(event, state)
-            .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
-        let envelope = PersistenceEnvelope {
-            sequence_nr: state.sequence_nr + 1,
-            event_type: event.action.clone(),
-            payload,
-            metadata: EventMetadata {
-                event_id,
-                causation_id: sim_uuid(),
-                correlation_id: sim_uuid(),
-                timestamp: event.timestamp,
-                actor_id: persistence_id.clone(),
-            },
+        let envelope = |event: &EntityEvent, initial: &EntityState, sequence_nr, event_id| {
+            let payload = super::bootstrap::event_payload(event, initial)
+                .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+            Ok::<_, PersistenceError>(PersistenceEnvelope {
+                sequence_nr,
+                event_type: event.action.clone(),
+                payload,
+                metadata: EventMetadata {
+                    event_id,
+                    causation_id: sim_uuid(),
+                    correlation_id: sim_uuid(),
+                    timestamp: event.timestamp,
+                    actor_id: persistence_id.clone(),
+                },
+            })
         };
+        let mut envelopes = Vec::with_capacity(2);
+        if let Some((created, initial)) = &creation {
+            envelopes.push(envelope(created, initial, first_sequence, sim_uuid())?);
+        }
+        envelopes.push(envelope(event, state, sequence_nr, event_id)?);
 
         // W2 / temper#146: measure append wait — the hypothesis is that
         // writer-lock / fsync serialization is a cold-start bottleneck.
@@ -584,7 +618,7 @@ impl EntityActor {
             .append_with_rows(
                 &persistence_id,
                 state.sequence_nr,
-                &[envelope],
+                &envelopes,
                 entity_rows.commit_rows(CommitRows {
                     key_rows: &key_rows,
                     vector_rows: &vector_rows,
@@ -604,6 +638,9 @@ impl EntityActor {
         let error = match result {
             Ok(new_seq) => {
                 state.sequence_nr = new_seq;
+                if let Some((created, _)) = creation {
+                    state.push_event_bounded(created);
+                }
                 tracing::debug!(entity = %state.entity_id, seq = new_seq, "event persisted");
                 return Ok(new_seq);
             }
@@ -627,6 +664,9 @@ impl EntityActor {
         match outcome {
             WriteOutcome::Landed { sequence_nr } => {
                 state.sequence_nr = sequence_nr;
+                if let Some((created, _)) = creation {
+                    state.push_event_bounded(created);
+                }
                 Ok(sequence_nr)
             }
             WriteOutcome::NotWritten => match error {
@@ -1286,44 +1326,9 @@ impl Actor for EntityActor {
             }
         }
 
-        // Persist a bootstrap Created event for first-time entities so initial
-        // fields are durable and replayable.
-        if self.event_journal.is_some() && state.sequence_nr == 0 && state.total_event_count == 0 {
-            let initial_params =
-                super::effects::sanitize_action_params(&self.initial_fields).into_owned();
-            let created = EntityEvent {
-                action: "Created".to_string(),
-                from_status: String::new(),
-                to_status: state.status.clone(),
-                timestamp: sim_now(),
-                params: initial_params,
-                idempotency_key: None,
-                kind: temper_runtime::persistence::EventKind::Transition,
-                outcome: None,
-            };
-
-            if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
-            {
-                // Its creator is its caller: a first state with a timer
-                // commits the timer's row with this event.
-                self.persist_event(
-                    store,
-                    backend,
-                    &mut state,
-                    &created,
-                    &ScheduledRows::default(),
-                    self.created_by.as_ref(),
-                )
-                .await
-                .map_err(|e| {
-                    ActorError::custom(format!(
-                        "failed to persist bootstrap Created event for {}:{}: {}",
-                        self.entity_type, self.entity_id, e
-                    ))
-                })?;
-            }
-            state.push_event_bounded(created);
-        }
+        // A record whose journal is empty is not written yet: its `Created`
+        // event commits with its first write (`persist_event`), or alone when
+        // it is first read (`write_creation`).
 
         Ok(state)
     }
@@ -2095,6 +2100,20 @@ impl EntityActor {
                 );
             }
             EntityMsg::GetState => {
+                self.write_creation(state).await?;
+                ctx.reply(EntityResponse {
+                    success: true,
+                    refusal: None,
+                    state: state.clone(),
+                    error: None,
+                    custom_effects: vec![],
+                    scheduled_actions: vec![],
+                    spawn_requests: vec![],
+                    spec_governed: true,
+                    refused: false,
+                });
+            }
+            EntityMsg::Peek => {
                 ctx.reply(EntityResponse {
                     success: true,
                     refusal: None,
@@ -2108,6 +2127,7 @@ impl EntityActor {
                 });
             }
             EntityMsg::GetField { field } => {
+                self.write_creation(state).await?;
                 let value = state
                     .fields
                     .get(&field)
