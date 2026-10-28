@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use temper_server::odata::IDEMPOTENCY_KEY;
 use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 /// How long a request that can change data may take, its push included,
@@ -82,13 +83,33 @@ async fn push_before_answering(
         // have been saved here: never answer as if nothing happened.
         Err(error) => {
             tracing::error!(%error, "turso.sync: change not copied off this server; not confirming it");
-            unavailable(
-                "NotConfirmed",
-                "Not confirmed: the change could not be copied to this app's database copy. \
-                 It may still have been saved here; read it back before trying again.",
-            )
+            not_confirmed(response.headers().get(IDEMPOTENCY_KEY))
         }
     }
+}
+
+/// The answer to a request that ran but whose change could not be copied
+/// off this server. It names the key the request ran with, when it has one,
+/// so the caller can send it again as the same write.
+fn not_confirmed(key: Option<&HeaderValue>) -> Response {
+    let key = key.and_then(|value| Some((value, value.to_str().ok()?)));
+    let mut error = serde_json::json!({
+        "code": "NotConfirmed",
+        "message": "Not confirmed: the change could not be copied to this app's database copy. \
+                    It may still have been saved here; read it back before trying again.",
+    });
+    if let Some((_, text)) = key {
+        error["idempotencyKey"] = text.into();
+    }
+    let mut answer = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({ "error": error })),
+    )
+        .into_response();
+    if let Some((value, _)) = key {
+        answer.headers_mut().insert(IDEMPOTENCY_KEY, value.clone());
+    }
+    answer
 }
 
 /// The answer to a request that can change data in `state`, if it is refused.
@@ -201,6 +222,25 @@ mod tests {
         assert!(!reads_only(&Method::GET, "/static/app-page"));
         assert!(!reads_only(&Method::GET, "/observer"));
         assert!(!reads_only(&Method::GET, "/genesisx"));
+    }
+
+    #[tokio::test]
+    async fn a_not_confirmed_answer_names_the_key_its_write_ran_with() {
+        let key = HeaderValue::from_static("write-key-1");
+        let answer = not_confirmed(Some(&key));
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(answer.headers().get(IDEMPOTENCY_KEY), Some(&key));
+        let body = axum::body::to_bytes(answer.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["error"]["code"], "NotConfirmed");
+        assert_eq!(body["error"]["idempotencyKey"], "write-key-1");
+
+        // A request that came without one (an app's own route) still gets
+        // the answer, without a key.
+        let unkeyed = not_confirmed(None);
+        assert!(unkeyed.headers().get(IDEMPOTENCY_KEY).is_none());
     }
 
     #[test]
