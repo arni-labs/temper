@@ -145,6 +145,11 @@ fn unavailable(code: &str, message: &str) -> Response {
 /// Requests that cannot change anything: reads of Temper's own routes. A
 /// read of an app's HTTP endpoint or webhook can run actions, so it waits too.
 fn reads_only(method: &Method, path: &str) -> bool {
+    // A question to Cedar is a read sent as a POST: it decides on the snapshot
+    // its caller sends and writes nothing (temper-server's api/authorize.rs).
+    if *method == Method::POST && path == "/api/authorize" {
+        return true;
+    }
     let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     let own_route = ["/tdata", "/observe", "/api", "/genesis"]
         .iter()
@@ -241,6 +246,18 @@ mod tests {
         // the answer, without a key.
         let unkeyed = not_confirmed(None);
         assert!(unkeyed.headers().get(IDEMPOTENCY_KEY).is_none());
+    }
+
+    #[test]
+    fn a_question_to_cedar_skips_the_push() {
+        // A page's offers after a move waited 34-39 ms here for a push they
+        // never needed (production trace 01a1835002c87215af29a4fd2486757b:
+        // 0.56 ms of Cedar inside a 39 ms answer).
+        assert!(reads_only(&Method::POST, "/api/authorize"));
+        // The audit endpoint writes a trajectory row, so it still waits.
+        assert!(!reads_only(&Method::POST, "/api/audit"));
+        assert!(!reads_only(&Method::POST, "/api/authorize/x"));
+        assert!(!reads_only(&Method::PUT, "/api/authorize"));
     }
 
     #[test]
