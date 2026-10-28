@@ -35,4 +35,15 @@ impl EntityState {
         }
         self.push_event_bounded(tombstone);
     }
+
+    /// Whether the kernel's delete removed this record: its last event is the
+    /// kernel's tombstone, which is terminal. Only that removes a record's
+    /// catalog row and its id from the entity index. A spec action into a
+    /// state named `Deleted` is an ordinary transition, and its record stays
+    /// listed and readable like any other.
+    pub(crate) fn is_tombstoned(&self) -> bool {
+        self.events
+            .back()
+            .is_some_and(|event| event.kind == temper_runtime::persistence::EventKind::Tombstone)
+    }
 }
