@@ -473,14 +473,43 @@ jobs:
         run: cargo test --locked --doc ${{ matrix.doc }}
 
   # ─────────────────────────────────────────────────────
+  # Every Cargo workspace other than the root one: the os-app, GEPA and reference-app
+  # modules and the test fixtures, each a workspace of its own that no -p from the root
+  # reaches. scripts/ci/workspaces.py asks cargo which workspace each Cargo.toml on disk
+  # belongs to and runs cargo test in every other one, --locked where it has a lock file,
+  # so a new module is covered without a list here. Tests requires it. (Until 28 Oct 2026
+  # nothing built them, and 21 of their lock files were stale from 24 Apr.)
+  # ─────────────────────────────────────────────────────
+  workspaces:
+    name: Other workspaces
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.mode != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: cargo test, every other workspace
+        run: python3 scripts/ci/workspaces.py
+
+  # ─────────────────────────────────────────────────────
   # Gate 3: Full test suite (minutes)
   # The required "Tests" check. Full lane (push, schedule, plain dispatch): the
   # whole workspace on one machine, exactly as before. Pull-request lane: passes
-  # when every test shard above passed, or nothing needed testing.
+  # when every test shard above passed, or nothing needed testing. Either lane also
+  # needs Other workspaces to have passed, or to have had nothing to test.
   # ─────────────────────────────────────────────────────
   test:
     name: Tests
-    needs: [changes, test-shards]
+    needs: [changes, test-shards, workspaces]
     if: ${{ !cancelled() && inputs.tests == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -613,6 +642,13 @@ jobs:
       - name: cargo test --doc --workspace
         if: needs.changes.outputs.lane == 'full'
         run: cargo test --locked --doc --workspace
+
+      - name: Other workspaces result
+        env:
+          WORKSPACES: ${{ needs.workspaces.result }}
+        run: |
+          echo "Other workspaces: $WORKSPACES"
+          case "$WORKSPACES" in success|skipped) ;; *) exit 1 ;; esac
 
   # ─────────────────────────────────────────────────────
   # Tests that need a disposable PostgreSQL of their own: each is #[ignore]d with a
