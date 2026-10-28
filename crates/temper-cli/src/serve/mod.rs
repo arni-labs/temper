@@ -81,7 +81,7 @@ pub async fn run(
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
     // Phase 1: Storage backend
-    let (pg_pool, storage_stack, turso_sync_copy) =
+    let (pg_pool, storage_stack, turso_synced_store) =
         bootstrap::init_storage(storage.clone(), storage_explicit).await?;
 
     // Phase 2: Registry (restore + disk apps)
@@ -104,6 +104,15 @@ pub async fn run(
     state.api_token = std::env::var("TEMPER_API_KEY").ok();
     if state.api_token.is_some() {
         println!("  API key: configured (Bearer token required)");
+    }
+    // Jev reads an app's changed modules at install when this server has a key or pass for it; never printed.
+    if std::env::var(temper_platform::module_review::JEV_KEY_ENV)
+        .is_ok_and(|key| !key.trim().is_empty())
+    {
+        let judge = std::sync::Arc::new(temper_platform::module_review::JevJudge::from_env());
+        state.set_module_reviewer(std::sync::Arc::new(
+            temper_platform::module_review::ModuleReviewer::new(judge),
+        ));
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let data_dir = Path::new(&home).join(".local/share/temper");
@@ -250,7 +259,7 @@ pub async fn run(
 
     // Phase 9: Bind, start background tasks, serve
     let router =
-        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_sync_copy);
+        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_synced_store);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
         .with_context(|| format!("Failed to bind to {bind}:{port}"))?;

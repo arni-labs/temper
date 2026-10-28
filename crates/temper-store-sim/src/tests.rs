@@ -168,7 +168,7 @@ async fn snapshot_save_and_load() {
 }
 
 #[tokio::test]
-async fn snapshot_save_records_history_and_rotates_segments() {
+async fn snapshot_save_rotates_segments() {
     let store = SimEventStore::no_faults(42);
     let pid = "default:Order:segmented";
 
@@ -186,7 +186,6 @@ async fn snapshot_save_records_history_and_rotates_segments() {
         .await
         .unwrap();
 
-    assert_eq!(store.snapshot_history_len(pid), 1);
     let segments = store.dump_segments(pid);
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);

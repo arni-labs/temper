@@ -140,14 +140,21 @@ impl ServerState {
             self.cache_entity_status(tenant, member);
             self.stop_and_remove_entity(tenant, &member.entity_type, &member.entity_id);
         }
+        // The batch commits only the tombstones, so their query-plane rows go
+        // after it, also on a store that keeps them in a single delete's
+        // commit, as a composite batch's do.
+        let query_plane = self.query_plane_store();
         for member in &deleted {
-            self.remove_deleted_entity_projection(
-                tenant,
-                &member.entity_type,
-                &member.entity_id,
-                member.sequence_nr,
-            )
-            .await;
+            if let Some(query_plane) = &query_plane {
+                self.remove_deleted_entity_projection(
+                    query_plane.as_ref(),
+                    tenant,
+                    &member.entity_type,
+                    &member.entity_id,
+                    member.sequence_nr,
+                )
+                .await;
+            }
             // A deleted record keeps no timer, as a single delete does.
             self.reconcile_state_timers(
                 tenant,

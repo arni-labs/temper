@@ -14,15 +14,19 @@ use cedar_policy::{
     Request, Response as CedarResponse,
 };
 
-use crate::context::{PrincipalKind, SecurityContext, is_cedar_authority_context_key};
+use crate::context::{
+    PrincipalKind, SecurityContext, is_cedar_authority_context_key, platform_keys,
+};
 use crate::error::{AuthzDenial, AuthzError};
 use crate::metrics::{CedarCheck, CedarDecisionMetric, CedarPhaseOutcome};
 
 mod candidates;
 mod list_uniformity;
+mod may;
 mod platform_policy;
 
 pub use list_uniformity::ListReadUniformity;
+pub use may::{Asker, Attr, May, SendAnalysis};
 pub use platform_policy::VERIFIED_OPERATOR_WHEN;
 use platform_policy::{
     compiled_system_platform_policies, count_user_policies, merge_system_platform_policy,
@@ -503,13 +507,13 @@ impl AuthzEngine {
         // Add principal attributes to context
         if let Some(ref role) = security_ctx.principal.role {
             ctx_map.insert(
-                "role".to_string(),
+                platform_keys::ROLE.to_string(),
                 cedar_policy::RestrictedExpression::new_string(role.clone()),
             );
         }
         if let Some(ref acting_for) = security_ctx.principal.acting_for {
             ctx_map.insert(
-                "actingFor".to_string(),
+                platform_keys::ACTING_FOR.to_string(),
                 cedar_policy::RestrictedExpression::new_string(acting_for.clone()),
             );
         }
@@ -520,7 +524,7 @@ impl AuthzEngine {
         }
 
         // Resource fields may appear as context.key for domain policies.
-        // Authority keys (sessionId, agentType, role, …) stay on SecurityContext.
+        // A key only the platform sets (`platform_keys`) never comes from one.
         for (key, value) in resource_attrs {
             if is_cedar_authority_context_key(key) || ctx_map.contains_key(key) {
                 continue;

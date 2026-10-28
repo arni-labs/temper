@@ -27,6 +27,7 @@ async fn act(
     let response: EntityResponse = actor
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: name.into(),
                 params,
                 related: BTreeMap::new(),

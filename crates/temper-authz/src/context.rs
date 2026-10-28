@@ -35,12 +35,12 @@ pub struct Principal {
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
-/// Cedar context keys that only a resolved `SecurityContext` may populate.
+pub mod platform_keys;
+
+/// Whether `name` is a Cedar context key only the platform sets
+/// ([`platform_keys`]), which a record's field never fills.
 pub fn is_cedar_authority_context_key(name: &str) -> bool {
-    matches!(
-        name,
-        "sessionId" | "agentId" | "agentType" | "agentTypeVerified" | "role" | "actingFor"
-    )
+    platform_keys::ALL.contains(&name)
 }
 
 /// Security context carried with every actor message dispatch.
@@ -224,20 +224,20 @@ impl SecurityContext {
 
         let mut context_attrs = HashMap::new();
         context_attrs.insert(
-            "agentId".to_string(),
+            platform_keys::AGENT_ID.to_string(),
             serde_json::Value::String(agent_instance_id.to_string()),
         );
         context_attrs.insert(
-            "agentType".to_string(),
+            platform_keys::AGENT_TYPE.to_string(),
             serde_json::Value::String(agent_type_name.to_string()),
         );
         context_attrs.insert(
-            "agentTypeVerified".to_string(),
+            platform_keys::AGENT_TYPE_VERIFIED.to_string(),
             serde_json::Value::Bool(true),
         );
         if let Some(sid) = session_id {
             context_attrs.insert(
-                "sessionId".to_string(),
+                platform_keys::SESSION_ID.to_string(),
                 serde_json::Value::String(sid.to_string()),
             );
         }
@@ -281,28 +281,28 @@ impl SecurityContext {
 
         let mut context_attrs = HashMap::new();
         context_attrs.insert(
-            "agentId".to_string(),
+            platform_keys::AGENT_ID.to_string(),
             serde_json::Value::String(principal_id.to_string()),
         );
         if let Some(at) = agent_type {
             context_attrs.insert(
-                "agentType".to_string(),
+                platform_keys::AGENT_TYPE.to_string(),
                 serde_json::Value::String(at.to_string()),
             );
         }
         context_attrs.insert(
-            "agentTypeVerified".to_string(),
+            platform_keys::AGENT_TYPE_VERIFIED.to_string(),
             serde_json::Value::Bool(true),
         );
         if let Some(af) = acting_for {
             context_attrs.insert(
-                "actingFor".to_string(),
+                platform_keys::ACTING_FOR.to_string(),
                 serde_json::Value::String(af.to_string()),
             );
         }
         if let Some(sid) = session_id {
             context_attrs.insert(
-                "sessionId".to_string(),
+                platform_keys::SESSION_ID.to_string(),
                 serde_json::Value::String(sid.to_string()),
             );
         }
@@ -334,7 +334,7 @@ impl SecurityContext {
     ) -> Self {
         if let Some(aid) = agent_id {
             self.context_attrs.insert(
-                "agentId".to_string(),
+                platform_keys::AGENT_ID.to_string(),
                 serde_json::Value::String(aid.to_string()),
             );
             // Promote anonymous principals to Agent kind
@@ -348,13 +348,13 @@ impl SecurityContext {
         }
         if let Some(sid) = session_id {
             self.context_attrs.insert(
-                "sessionId".to_string(),
+                platform_keys::SESSION_ID.to_string(),
                 serde_json::Value::String(sid.to_string()),
             );
         }
         if let Some(at) = agent_type {
             self.context_attrs.insert(
-                "agentType".to_string(),
+                platform_keys::AGENT_TYPE.to_string(),
                 serde_json::Value::String(at.to_string()),
             );
             self.principal.agent_type = Some(at.to_string());
@@ -365,7 +365,7 @@ impl SecurityContext {
             serde_json::Value::Bool(false),
         );
         self.context_attrs.insert(
-            "agentTypeVerified".to_string(),
+            platform_keys::AGENT_TYPE_VERIFIED.to_string(),
             serde_json::Value::Bool(false),
         );
         self
@@ -595,6 +595,10 @@ mod tests {
         assert!(is_cedar_authority_context_key("sessionId"));
         assert!(is_cedar_authority_context_key("agentTypeVerified"));
         assert!(is_cedar_authority_context_key("role"));
+        assert!(is_cedar_authority_context_key("carryMove"));
+        assert!(is_cedar_authority_context_key("module"));
+        assert!(is_cedar_authority_context_key("triggerDeclaredPrincipal"));
+        assert!(!is_cedar_authority_context_key("url"));
         assert!(!is_cedar_authority_context_key("status"));
         assert!(!is_cedar_authority_context_key("Customer"));
     }

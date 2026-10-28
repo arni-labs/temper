@@ -22,6 +22,7 @@ mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
+mod spec_change;
 mod start_runtime;
 pub mod status_cache;
 pub(crate) mod storage_caps;
@@ -54,6 +55,9 @@ pub(crate) use published_artifacts::{
     PUBLISH_ARTIFACT_STALE_AUTHORIZATION, PublishArtifactAuthorization,
 };
 pub(crate) use query_projection_queue::{ProjectionEnqueueOutcome, QueryProjectionWriteQueue};
+pub use spec_change::{
+    CarryMove, CarryReport, SpecChange, SpecChangePlan, SpecChangeRefused, StuckRecords,
+};
 pub use trajectory::{TrajectoryEntry, TrajectorySource};
 pub use wasm_invocation_log::WasmInvocationEntry;
 
@@ -525,10 +529,19 @@ pub struct ServerState {
     /// Where armed timer rows are kept when the storage stack has no metadata
     /// store to keep them, as under simulation. None: the metadata store.
     pub state_timer_rows: Option<Arc<dyn crate::storage::StateTimerStore>>,
+    /// The scheduled actions armed in this process: how many live timers
+    /// each row has. A row is armed only while it has none, however many
+    /// replies hand it back (a cached reply to a retried fire carries the
+    /// schedules it armed), and leaves the map when its fire ends.
+    pub(crate) scheduled_armed:
+        Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
     pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Held by each carry pass, so a pass derives its carries only after
+    /// the one before it has made its own (see `spec_change::carry_pass`).
+    pub(crate) carry_pass: Arc<tokio::sync::Mutex<()>>,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -626,8 +639,6 @@ pub struct ServerState {
     /// receive a clone of this Arc via `with_shared_streams` so
     /// FFI calls from the guest resolve to the same handle IDs.
     pub http_stream_registry: Arc<temper_wasm::http_stream::HttpStreamRegistry>,
-    /// Long-lived workflow root spans keyed by workflow.run_id.
-    pub(crate) workflow_spans: Arc<crate::workflow_tracing::WorkflowSpanRegistry>,
     /// Public hostnames owned by this process that may use in-process TData
     /// dispatch from WASM guests instead of leaving through the public edge.
     pub(crate) local_tdata_hosts: Arc<BTreeSet<String>>,
@@ -829,8 +840,10 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
+            carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -862,7 +875,6 @@ impl ServerState {
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
-            workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
@@ -1109,8 +1121,10 @@ impl ServerState {
             admission: Arc::new(AdmissionController::new()),
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
+            scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
+            carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1142,7 +1156,6 @@ impl ServerState {
             http_endpoint_tables: Arc::new(crate::http_endpoint::HttpEndpointTables::new()),
             http_transports: Arc::new(Default::default()),
             http_stream_registry: Arc::new(temper_wasm::http_stream::HttpStreamRegistry::new()),
-            workflow_spans: Arc::new(crate::workflow_tracing::WorkflowSpanRegistry::default()),
             local_tdata_hosts: Arc::new(env_local_tdata_hosts()),
             llm_content_export_tenants: Arc::new(env_llm_content_export_tenants()),
         };
@@ -1234,6 +1247,11 @@ impl ServerState {
             // The status clock is the actor's, for its timers; a query never
             // reads it, and rows written before it was kept stay comparable.
             obj.remove("status_clock");
+            // The idempotency keys are the actor's, to drop a repeated
+            // request; a query never reads them. Every dispatch records one
+            // (up to 1,000 per entity), so keeping them would make every
+            // action, a poll that changes nothing included, change the row.
+            obj.remove("processed_idempotency_keys");
         }
         projected
     }

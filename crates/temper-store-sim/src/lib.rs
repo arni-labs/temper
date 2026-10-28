@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use temper_runtime::persistence::{
-    EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend, PersistenceAppendResult,
-    PersistenceEnvelope, PersistenceError,
+    CommitRows, EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend,
+    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
+    StateTimerRecord,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -121,8 +122,6 @@ struct SimEventStoreInner {
     journals: BTreeMap<String, Vec<PersistenceEnvelope>>,
     /// Snapshots: persistence_id → (sequence_nr, snapshot_bytes)
     snapshots: BTreeMap<String, (u64, Vec<u8>)>,
-    /// Immutable snapshot history: persistence_id → sequence_nr → snapshot bytes.
-    snapshot_history: BTreeMap<String, BTreeMap<u64, Vec<u8>>>,
     /// Event segment metadata: persistence_id → Vec<SimEventSegment>.
     event_segments: BTreeMap<String, Vec<SimEventSegment>>,
     /// Fault injection RNG.
@@ -149,6 +148,11 @@ struct SimEventStoreInner {
     /// events and then answer with a concurrency violation, as a store does when
     /// it retries a write whose first answer was lost. See `lose_next_append_answers`.
     pending_lost_append_answers: BTreeMap<String, usize>,
+    /// Each entry makes the next N appends that write that id (alone or in a
+    /// batch) write their events and rows and then answer with a storage
+    /// error, as a store does when a commit lands but its answer is lost. See
+    /// `land_next_appends_then_fail`.
+    pending_landed_failures: BTreeMap<String, usize>,
     /// One-shot append delays per `persistence_id`.
     ///
     /// Used by dispatch retry tests to deterministically model "the actor
@@ -172,10 +176,25 @@ struct SimEventStoreInner {
     /// exact-scan kNN access path. Unlike the key index this has no uniqueness
     /// constraint; it is derived, rebuildable ranking state.
     vector_index: BTreeMap<(String, String, String, String, String), Vec<f32>>,
+    /// Pending scheduled actions, committed with the event that armed them
+    /// under the same lock. `(tenant, entity_type, entity_id, arm_id) -> row`.
+    scheduled_actions: BTreeMap<(String, String, String, String), ScheduledActionRecord>,
+    /// While set, `delete_scheduled_action` never completes, as when the
+    /// process stops before it. See `hold_scheduled_action_deletes`.
+    scheduled_deletes_held: bool,
+    /// Each entry makes `list_scheduled_actions` for that tenant fail with a
+    /// storage error on the next N calls. See `fail_next_scheduled_lists`.
+    pending_scheduled_list_failures: BTreeMap<String, usize>,
     /// ADR-0155 backfill watermark: `(tenant, entity_type) -> vector_set` — each
     /// completed type mapped to the sorted comma-joined declared vector-path names the
     /// backfill covered. Mirrors `key_index_watermark`.
     vector_index_watermark: BTreeMap<(String, String), String>,
+    /// Query-plane rows written with their entity's events, by persistence id.
+    projections: BTreeMap<String, entity_rows::SimProjection>,
+    /// One state-timer row per entity: `(tenant, entity_type, entity_id)`.
+    state_timers: BTreeMap<(String, String, String), StateTimerRecord>,
+    /// How many commits wrote each persistence id's journal or rows.
+    commits: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,13 +208,18 @@ pub struct SimEventSegment {
 }
 
 impl SimEventStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SimEventStoreInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Create a new SimEventStore with the given seed and fault config.
     pub fn new(seed: u64, faults: SimFaultConfig) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SimEventStoreInner {
                 journals: BTreeMap::new(),
                 snapshots: BTreeMap::new(),
-                snapshot_history: BTreeMap::new(),
                 event_segments: BTreeMap::new(),
                 rng: DeterministicRng::new(seed),
                 faults,
@@ -203,11 +227,18 @@ impl SimEventStore {
                 pending_read_failures: BTreeMap::new(),
                 pending_append_failures: BTreeMap::new(),
                 pending_lost_append_answers: BTreeMap::new(),
+                pending_landed_failures: BTreeMap::new(),
                 pending_append_delays: BTreeMap::new(),
                 key_index: BTreeMap::new(),
                 key_index_watermark: BTreeMap::new(),
                 vector_index: BTreeMap::new(),
+                scheduled_actions: BTreeMap::new(),
+                scheduled_deletes_held: false,
+                pending_scheduled_list_failures: BTreeMap::new(),
                 vector_index_watermark: BTreeMap::new(),
+                projections: BTreeMap::new(),
+                state_timers: BTreeMap::new(),
+                commits: BTreeMap::new(),
             })),
         }
     }
@@ -229,6 +260,29 @@ impl SimEventStore {
             inner
                 .pending_concurrency_violations
                 .insert(persistence_id.to_string(), count);
+        }
+    }
+
+    /// While `held`, every `delete_scheduled_action` call waits forever and
+    /// removes nothing, as when the process stops right after a fire, before
+    /// any removal that is not part of the fire's commit. A test sets it, lets
+    /// a fire run, stops the process, and clears it before the next boot.
+    pub fn hold_scheduled_action_deletes(&self, held: bool) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner.scheduled_deletes_held = held;
+    }
+
+    /// Make the next `count` `list_scheduled_actions` calls for `tenant` fail
+    /// with a storage error, then behave normally, as when the store is
+    /// briefly unreachable at boot. `count == 0` clears the injection.
+    pub fn fail_next_scheduled_lists(&self, tenant: &str, count: usize) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if count == 0 {
+            inner.pending_scheduled_list_failures.remove(tenant);
+        } else {
+            inner
+                .pending_scheduled_list_failures
+                .insert(tenant.to_string(), count);
         }
     }
 
@@ -288,6 +342,23 @@ impl SimEventStore {
         } else {
             inner
                 .pending_lost_append_answers
+                .insert(persistence_id.to_string(), count);
+        }
+    }
+
+    /// Make the next `count` appends that write `persistence_id`, alone or in a
+    /// batch, write their events and every row they carry and then answer with
+    /// a storage error, then behave normally. This is a commit that landed
+    /// while its caller was told it failed: a connection lost after the
+    /// commit, or a commit abandoned by a timeout after it was published.
+    /// `count == 0` clears the injection.
+    pub fn land_next_appends_then_fail(&self, persistence_id: &str, count: usize) {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if count == 0 {
+            inner.pending_landed_failures.remove(persistence_id);
+        } else {
+            inner
+                .pending_landed_failures
                 .insert(persistence_id.to_string(), count);
         }
     }
@@ -382,15 +453,6 @@ impl SimEventStore {
             .unwrap_or_default()
     }
 
-    pub fn snapshot_history_len(&self, persistence_id: &str) -> usize {
-        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
-        inner
-            .snapshot_history
-            .get(persistence_id)
-            .map(BTreeMap::len)
-            .unwrap_or(0)
-    }
-
     pub fn dump_segments(&self, persistence_id: &str) -> Vec<SimEventSegment> {
         let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
         inner
@@ -414,6 +476,15 @@ impl SimEventStoreInner {
     /// Consume one lost append answer for `persistence_id`, if one is set.
     fn take_lost_append_answer(&mut self, persistence_id: &str) -> bool {
         take_one(&mut self.pending_lost_append_answers, persistence_id)
+    }
+
+    /// Consume one landed-then-failed append for `persistence_id`, if one is set.
+    fn take_landed_failure(&mut self, persistence_id: &str) -> Option<PersistenceError> {
+        take_one(&mut self.pending_landed_failures, persistence_id).then(|| {
+            PersistenceError::Storage(format!(
+                "SimEventStore: the append to '{persistence_id}' landed and its answer was lost"
+            ))
+        })
     }
 }
 
@@ -447,19 +518,30 @@ impl EventStore for SimEventStore {
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
-        self.append_with_index_rows(persistence_id, expected_sequence, events, &[], &[], false)
-            .await
+        self.append_with_rows(
+            persistence_id,
+            expected_sequence,
+            events,
+            CommitRows::default(),
+        )
+        .await
     }
 
-    async fn append_with_index_rows(
+    async fn append_with_rows(
         &self,
         persistence_id: &str,
         expected_sequence: u64,
         events: &[PersistenceEnvelope],
-        key_rows: &[temper_runtime::persistence::EntityKeyRow],
-        vector_rows: &[EntityVectorRow],
-        reconcile_vectors: bool,
+        rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
+        let CommitRows {
+            key_rows,
+            vector_rows,
+            reconcile_vectors,
+            scheduled_actions,
+            fired_scheduled_action,
+            ..
+        } = rows;
         let append_delay = {
             let mut inner = self
                 .inner
@@ -678,6 +760,34 @@ impl EventStore for SimEventStore {
             }
         }
 
+        // The scheduled actions the transition armed, under the SAME lock: they
+        // exist exactly when the event does. A repeated arm keeps its row.
+        for action in scheduled_actions {
+            inner
+                .scheduled_actions
+                .entry((
+                    action.tenant.clone(),
+                    action.entity_type.clone(),
+                    action.entity_id.clone(),
+                    action.arm_id.clone(),
+                ))
+                .or_insert_with(|| action.clone());
+        }
+        // The scheduled action the transition fired goes in the same commit.
+        if let Some(arm_id) = fired_scheduled_action
+            && let Ok((tenant, entity_type, entity_id)) = parse_persistence_id_parts(persistence_id)
+        {
+            inner.scheduled_actions.remove(&(
+                tenant.to_string(),
+                entity_type.to_string(),
+                entity_id.to_string(),
+                arm_id.to_string(),
+            ));
+        }
+
+        // The entity's query-plane and timer rows, in the same commit.
+        inner.commit_entity_rows(persistence_id, new_seq, &rows);
+
         // The write landed; a lost answer reaches the caller as the retry's
         // concurrency violation (see `lose_next_append_answers`).
         if inner.take_lost_append_answer(persistence_id) {
@@ -686,8 +796,62 @@ impl EventStore for SimEventStore {
                 actual: new_seq,
             });
         }
+        if let Some(error) = inner.take_landed_failure(persistence_id) {
+            return Err(error);
+        }
 
         Ok(new_seq)
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        true
+    }
+
+    async fn list_scheduled_actions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<ScheduledActionRecord>, PersistenceError> {
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        if let Some(left) = inner.pending_scheduled_list_failures.get_mut(tenant) {
+            *left -= 1;
+            if *left == 0 {
+                inner.pending_scheduled_list_failures.remove(tenant);
+            }
+            return Err(PersistenceError::Storage(
+                "simulated scheduled-action list failure".to_string(),
+            ));
+        }
+        Ok(inner
+            .scheduled_actions
+            .values()
+            .filter(|action| action.tenant == tenant)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_scheduled_action(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        arm_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let held = self
+            .inner
+            .lock()
+            .expect("SimEventStore lock poisoned") // ci-ok: infallible lock
+            .scheduled_deletes_held;
+        if held {
+            std::future::pending::<()>().await;
+        }
+        let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        inner.scheduled_actions.remove(&(
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+            arm_id.to_string(),
+        ));
+        Ok(())
     }
 
     async fn backfill_entity_keys(
@@ -982,6 +1146,10 @@ impl EventStore for SimEventStore {
                 stored.sequence_nr = new_seq;
                 journal.push(stored);
             }
+            *inner
+                .commits
+                .entry(append.persistence_id.clone())
+                .or_default() += 1;
             results.push(PersistenceAppendResult {
                 persistence_id: append.persistence_id.clone(),
                 sequence_nr: new_seq,
@@ -1001,6 +1169,14 @@ impl EventStore for SimEventStore {
             }
         }
         if let Some(error) = lost {
+            return Err(error);
+        }
+        let mut landed_failure = None;
+        for append in appends {
+            let failed = inner.take_landed_failure(&append.persistence_id);
+            landed_failure = landed_failure.or(failed);
+        }
+        if let Some(error) = landed_failure {
             return Err(error);
         }
 
@@ -1066,11 +1242,6 @@ impl EventStore for SimEventStore {
         inner
             .snapshots
             .insert(persistence_id.to_string(), (sequence_nr, snapshot.to_vec()));
-        inner
-            .snapshot_history
-            .entry(persistence_id.to_string())
-            .or_default()
-            .insert(sequence_nr, snapshot.to_vec());
         let segments = inner
             .event_segments
             .entry(persistence_id.to_string())
@@ -1171,3 +1342,6 @@ impl EventStore for SimEventStore {
 
 #[cfg(test)]
 mod tests;
+
+mod entity_rows;
+pub use entity_rows::SimProjection;

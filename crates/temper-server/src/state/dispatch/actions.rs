@@ -2,10 +2,9 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Semaphore;
 use tracing::{Instrument, instrument};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::entity_actor::{EntityMsg, EntityResponse};
-use crate::request_context::{AgentContext, remote_parent_context};
+use crate::request_context::AgentContext;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
@@ -192,7 +191,8 @@ impl crate::state::ServerState {
         self.dispatch_typed_checked(cmd, None).await
     }
 
-    async fn dispatch_typed_checked(
+    /// The dispatch, on the task [`Self::dispatch_typed_checked`] gives it.
+    pub(super) async fn dispatch_typed_attached(
         &self,
         cmd: DispatchCommand<'_>,
         expected_authorization_precondition: Option<String>,
@@ -207,6 +207,13 @@ impl crate::state::ServerState {
             await_integration,
             await_reactions,
         } = cmd;
+
+        if temper_spec::automaton::is_carry_move(action) {
+            return Err(DispatchError::AuthzDenied(format!(
+                "'{action}' is a [[carry]] move, which only the platform makes when it installs \
+                 a new version of the spec"
+            )));
+        }
 
         if self
             .composite_metadata_for(tenant, entity_type, action)?
@@ -318,7 +325,8 @@ impl crate::state::ServerState {
             fields,
             agent_ctx,
         } = dispatch;
-        let span = tracing::info_span!(
+        let span = crate::trace_context::runtime_work_span!(
+            crate::trace_context::cause(),
             "reaction.dispatch.background",
             tenant = %tenant,
             entity_type = %entity_type,
@@ -389,125 +397,10 @@ impl crate::state::ServerState {
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
 
-        let explicit_workflow_context = agent_ctx.workflow_run_id.is_some()
-            || agent_ctx.workflow_root_entity_type.is_some()
-            || agent_ctx.workflow_root_entity_id.is_some();
-        let use_workflow_root = crate::workflow_tracing::should_use_workflow_root_span(
-            explicit_workflow_context,
-            entity_type,
-        );
+        // The dispatch runs in the span it was called in: the request's, or the
+        // root span of the runtime work that started it. Ids carried in the agent
+        // context never re-parent or re-link it (see `trace_context`).
         let enriched_agent_ctx = agent_ctx.for_dispatch_root(entity_type, entity_id);
-        let dispatch_span = tracing::Span::current();
-        if use_workflow_root {
-            let root_entity_type = enriched_agent_ctx
-                .workflow_root_entity_type
-                .as_deref()
-                .unwrap_or(entity_type);
-            let root_entity_id = enriched_agent_ctx
-                .workflow_root_entity_id
-                .as_deref()
-                .unwrap_or(entity_id);
-            let workflow_run_id = enriched_agent_ctx
-                .workflow_run_id
-                .as_deref()
-                .unwrap_or(root_entity_id);
-            match self.workflow_spans.parent_context(
-                tenant.as_str(),
-                root_entity_type,
-                root_entity_id,
-                workflow_run_id,
-                enriched_agent_ctx.session_id.as_deref(),
-            ) {
-                crate::workflow_tracing::WorkflowParent::Open(workflow) => {
-                    // The workflow's work is one step span in the workflow's own trace,
-                    // linked both ways to this dispatch span, which stays in the
-                    // request's trace. Each span is in exactly one trace.
-                    record_workflow_span_attrs(
-                        &enriched_agent_ctx,
-                        entity_type,
-                        entity_id,
-                        Some(action),
-                    );
-                    let step = tracing::info_span!(
-                        parent: None,
-                        "dispatch.workflow_step",
-                        otel.name = %format_args!("{entity_type}.{action}"),
-                        tenant = %tenant,
-                        entity_type,
-                        entity_id,
-                        action_name = action,
-                        workflow.root_entity_type = tracing::field::Empty,
-                        workflow.root_entity_id = tracing::field::Empty,
-                        workflow.run_id = tracing::field::Empty,
-                        temper.action = tracing::field::Empty,
-                        session.id = tracing::field::Empty,
-                        session_id = tracing::field::Empty,
-                        intent = tracing::field::Empty,
-                        observation_metadata = tracing::field::Empty,
-                        success = tracing::field::Empty,
-                        error_msg = tracing::field::Empty,
-                    );
-                    crate::trace_context::continue_in(&step, &workflow);
-                    crate::trace_context::link_both(&dispatch_span, &step);
-                    return self
-                        .dispatch_tenant_action_steps(DispatchSteps {
-                            tenant,
-                            entity_type,
-                            entity_id,
-                            action,
-                            params,
-                            agent_ctx: enriched_agent_ctx,
-                            await_integration,
-                            expected_authorization_precondition,
-                            workflow_root_active: true,
-                        })
-                        .instrument(step)
-                        .await;
-                }
-                crate::workflow_tracing::WorkflowParent::Finished(workflow) => {
-                    // Late work for a finished workflow stays in the request that
-                    // brought it, linked to the workflow: never a second workflow trace.
-                    dispatch_span.add_link(workflow);
-                }
-                crate::workflow_tracing::WorkflowParent::None => {}
-            }
-        } else if let Some(remote) = remote_parent_context(agent_ctx) {
-            // Context handed over in the agent context, not by this span's parent:
-            // a link, never a re-parent, so this span stays in its own trace.
-            crate::trace_context::link_if_other_trace(&dispatch_span, &remote);
-        }
-        self.dispatch_tenant_action_steps(DispatchSteps {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            agent_ctx: enriched_agent_ctx,
-            await_integration,
-            expected_authorization_precondition,
-            workflow_root_active: false,
-        })
-        .await
-    }
-
-    /// The work of one dispatch, in the current span: the dispatch span, or the
-    /// step span of a workflow's own trace.
-    async fn dispatch_tenant_action_steps(
-        &self,
-        steps: DispatchSteps<'_>,
-    ) -> Result<EntityResponse, DispatchError> {
-        let DispatchSteps {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            agent_ctx: enriched_agent_ctx,
-            await_integration,
-            expected_authorization_precondition,
-            workflow_root_active,
-        } = steps;
-        let enriched_agent_ctx = enriched_agent_ctx.with_current_span_trace_context();
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();
@@ -618,7 +511,7 @@ impl crate::state::ServerState {
 
         // Pre-resolve cross-entity state gates (Gap 1: Agent OS).
         let related = self
-            .resolve_cross_entity_guards(tenant, entity_type, entity_id, action)
+            .resolve_related_statuses(tenant, entity_type, entity_id, action)
             .await;
 
         let action_params = params.clone();
@@ -691,6 +584,9 @@ impl crate::state::ServerState {
         let params_for_retry = params;
         let cross_for_retry = related;
         let authorization_precondition_for_retry = expected_authorization_precondition;
+        // The actor keeps the caller's identity on any scheduled action the
+        // transition arms, so the action fires as them after a restart too.
+        let caller = Arc::new(agent_ctx.clone());
         let idempotency_key = Some(agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
             format!(
                 "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
@@ -710,6 +606,7 @@ impl crate::state::ServerState {
             retry::ask_with_backoff::<_, EntityResponse, _>(
                 &actor_ref,
                 || EntityMsg::Action {
+                    caller: Some(caller.clone()),
                     name: action_name.clone(),
                     params: params_for_retry.clone(),
                     related: cross_for_retry.clone(),
@@ -884,32 +781,9 @@ impl crate::state::ServerState {
         if let Some(ref err) = response.error {
             tracing::Span::current().record("error_msg", err.as_str());
         }
-        if workflow_root_active && let Some(workflow_run_id) = agent_ctx.workflow_run_id.clone() {
-            self.workflow_spans.finish_if_terminal_after_drain(
-                tenant.to_string(),
-                workflow_run_id,
-                entity_type.to_string(),
-                entity_id.to_string(),
-                response.state.status.clone(),
-            );
-        }
 
         Ok(response)
     }
-}
-
-/// One dispatch's inputs, handed to the span its work runs in.
-struct DispatchSteps<'a> {
-    tenant: &'a TenantId,
-    entity_type: &'a str,
-    entity_id: &'a str,
-    action: &'a str,
-    params: serde_json::Value,
-    agent_ctx: AgentContext,
-    await_integration: bool,
-    expected_authorization_precondition: Option<String>,
-    /// The work runs in a workflow's step span.
-    workflow_root_active: bool,
 }
 
 #[cfg(test)]

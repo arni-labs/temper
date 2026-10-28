@@ -13,6 +13,7 @@ impl EntityEvent {
             timestamp: temper_runtime::scheduler::sim_now(),
             params: serde_json::json!({}),
             idempotency_key: None,
+            outcome: None,
             kind: temper_runtime::persistence::EventKind::Tombstone,
         }
     }
