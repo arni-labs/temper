@@ -34,6 +34,20 @@ states = ["Pending"]
 initial = "Pending"
 "#;
 
+/// The same `Payment` before a spec change that starts indexing `OrderId`.
+const PAYMENT_IOA_ORDER_ID_UNINDEXED: &str = r#"
+[automaton]
+name = "Payment"
+states = ["Pending"]
+initial = "Pending"
+
+[[state]]
+name = "OrderId"
+type = "string"
+initial = ""
+query_indexed = false
+"#;
+
 /// Enough referencing rows that reading them shows up plainly in the actor count.
 const REFERENCING_PAYMENTS: usize = 40;
 
@@ -69,12 +83,16 @@ impl Drop for Store {
 }
 
 fn server(name: &str, stack: StorageStack) -> ServerState {
+    server_with(name, stack, PAYMENT_IOA)
+}
+
+fn server_with(name: &str, stack: StorageStack, payment_ioa: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
         parse_csdl(CSDL_XML).expect("CSDL parse"),
         CSDL_XML.to_string(),
-        &[("Order", ORDER_IOA), ("Payment", PAYMENT_IOA)],
+        &[("Order", ORDER_IOA), ("Payment", payment_ioa)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
     state.set_storage_stack(stack);
@@ -410,4 +428,40 @@ async fn restrict_delete_sees_a_reference_written_under_a_fields_object() {
          read from its projection, not its actor"
     );
     assert_eq!(get_order(&state, "ord-wrapped").await, StatusCode::OK);
+}
+
+/// A spec change that starts indexing a field leaves the rows projected
+/// before it with no index entry for that field, while their catalog entries
+/// stay current. The restrict delete must still see such a row's reference,
+/// and a `$filter` on the field must still find the row.
+#[tokio::test]
+async fn restrict_delete_sees_a_reference_projected_before_its_field_was_indexed() {
+    let store = Store::new("newly-indexed");
+    let writer = server_with(
+        "delete-reference-newly-indexed-writer",
+        StorageStack::from_turso(store.open().await),
+        PAYMENT_IOA_ORDER_ID_UNINDEXED,
+    );
+    create(&writer, "Order", "ord-early", serde_json::json!({})).await;
+    let early = serde_json::json!({ "OrderId": "ord-early" });
+    create(&writer, "Payment", "pay-early", early).await;
+
+    // The next spec indexes OrderId, and nothing has projected pay-early again.
+    let state = restarted_server("delete-reference-newly-indexed-restarted", &store).await;
+    let get_payment = Request::get("/tdata/Payments('pay-early')");
+    let (status, payment) = send(&state, get_payment.body(Body::empty()).unwrap()).await;
+    assert_eq!(
+        (status, payment["OrderId"].as_str()),
+        (StatusCode::OK, Some("ord-early")),
+        "pay-early holds the reference: {payment}"
+    );
+
+    let (deleted, body) = delete_order(&state, "ord-early").await;
+    let filter = Request::get("/tdata/Payments?$filter=OrderId%20eq%20'ord-early'");
+    let (_, listed) = send(&state, filter.body(Body::empty()).unwrap()).await;
+    assert_eq!(
+        (deleted, listed.to_string().contains("pay-early")),
+        (StatusCode::CONFLICT, true),
+        "the delete is refused for pay-early ({body}) and the filter finds it ({listed})"
+    );
 }
