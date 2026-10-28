@@ -5,8 +5,8 @@
 //! The route narrows a filter to candidate rows in SQL where it can (string
 //! and boolean equality, `Status` ranges, and `and`/`or` of those) and decides
 //! the rest on the records themselves, so every case here passes through
-//! one path or the other. A filter that is exactly a declared key reads the
-//! key index instead. The reads start once the store's projection has
+//! one path or the other. A filter on a declared key may read the key index
+//! instead. The reads start once the store's projection has
 //! caught up with every write, so the SQL rows are what the route reads.
 //! An exact match still finds a record whose projection fell behind its
 //! journal. A filter that does not parse is refused with where it went wrong.
@@ -180,14 +180,15 @@ const CASES: &[(&str, &[&str])] = &[
         "not (Color eq 'red' and Size eq 3)",
         &["p2", "p3", "p4", "p5", "p6"],
     ),
-    // A filter that is exactly the declared key reads the key index; a
-    // missing value is null there too. An `or` of its parts is not the key.
+    // Filters on the declared key (`Name`, `Color`), where a missing value
+    // is null, and `or`s of the key's parts, which are not the key.
     ("Name eq 'bolt' and Color eq 'red'", &["p1"]),
     ("Color eq 'Red' and Name eq 'red bolt'", &["p6"]),
     ("Name eq 'spring' and Color eq null", &["p5"]),
     ("Name eq 'O''Brien''s washer' and Color eq null", &["p3"]),
     ("Name eq 'bolt' and Color eq 'blue'", &[]),
     ("Name eq 'bolt' or Color eq 'red'", &["p1", "p4"]),
+    ("Name eq 'spring' or Color eq null", &["p3", "p5"]),
     // Mixes of what SQL can narrow and what it cannot.
     ("Status ne 'Draft' and Color eq 'red'", &["p4"]),
     ("Color eq 'red' or Size eq 10", &["p1", "p2", "p4", "p5"]),
@@ -450,6 +451,62 @@ async fn an_exact_match_finds_a_record_whose_projection_fell_behind() {
             .unwrap_or_default();
         assert_eq!(returned, ["p5"], "{filter}: {body}");
     }
+}
+
+#[tokio::test]
+async fn a_record_whose_projection_was_never_written_is_still_found() {
+    let dir = tempfile::tempdir().expect("a database of its own");
+    let url = format!("file:{}", dir.path().join("unprojected.db").display());
+    let store = TursoEventStore::new(&url, None)
+        .await
+        .expect("open the Turso file");
+    let (stack, failing) = ProjectionWritesFail::stack(store);
+    let (app, projection) = server(stack, "default");
+    seed(&app, "default").await;
+    wait_for_projection(projection.as_ref(), "default").await;
+
+    // p7 is created while the projection takes no writes, so it has no SQL
+    // row at all. It has no Color, so its key is ("clip", null).
+    failing.store(true, Ordering::SeqCst);
+    post(
+        &app,
+        "default",
+        "/tdata/Parts",
+        &json!({ "id": "p7", "Name": "clip", "Size": 1 }),
+    )
+    .await;
+    let request = Request::get("/tdata/Parts('p7')")
+        .body(Body::empty())
+        .unwrap();
+    let (status, record) = send(&app, "default", request).await;
+    assert_eq!(status, StatusCode::OK, "p7 was created: {record}");
+
+    let mut wrong = Vec::new();
+    for (filter, expected) in [
+        ("Name eq 'clip'", &["p7"][..]),
+        ("Color eq null", &["p3", "p5", "p7"]),
+        ("Size lt 3", &["p4", "p7"]),
+        // Read as the key ("clip", null), this would find p7 alone.
+        ("Name eq 'clip' or Color eq null", &["p3", "p5", "p7"]),
+    ] {
+        let (status, body) = read(&app, "default", filter).await;
+        let returned: BTreeSet<&str> = body["value"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value["entity_id"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expected: BTreeSet<&str> = expected.iter().copied().collect();
+        if status != StatusCode::OK || returned != expected {
+            wrong.push(format!(
+                "{filter}: wanted {expected:?}, got {status} {returned:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "wrong records:\n{}", wrong.join("\n"));
 }
 
 #[tokio::test]
