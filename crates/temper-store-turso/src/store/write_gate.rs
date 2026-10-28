@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::PersistenceError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::TursoEventStore;
 use super::instrumentation::WriteConnection;
+use crate::metrics::{record_turso_write_gate_hold, record_turso_write_gate_wait};
 
 /// Which writes go first when several wait for the gate's permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,32 @@ impl WriteGate {
     }
 }
 
+/// The gate's permit, held by one writer. Dropping it frees the gate and
+/// records how long the writer held it, which is how long every write that
+/// arrived meanwhile waited for it.
+#[derive(Debug)]
+pub(crate) struct GatePermit {
+    _permit: OwnedSemaphorePermit,
+    operation: &'static str,
+    acquired: Instant,
+}
+
+impl GatePermit {
+    fn new(permit: OwnedSemaphorePermit, operation: &'static str) -> Self {
+        Self {
+            _permit: permit,
+            operation,
+            acquired: Instant::now(),
+        }
+    }
+}
+
+impl Drop for GatePermit {
+    fn drop(&mut self) {
+        record_turso_write_gate_hold(self.acquired.elapsed(), self.operation);
+    }
+}
+
 impl TursoEventStore {
     /// A connection that may write, once the gate's permit is this writer's.
     /// Every write to the database goes through one.
@@ -80,7 +107,7 @@ impl TursoEventStore {
     /// A connection that may write on a permit already taken.
     pub(super) async fn write_connection_on(
         &self,
-        permit: OwnedSemaphorePermit,
+        permit: GatePermit,
     ) -> Result<WriteConnection, PersistenceError> {
         Ok(WriteConnection::new(
             self.configured_connection().await?,
@@ -100,8 +127,24 @@ impl TursoEventStore {
         &self,
         operation: &'static str,
         priority: WritePriority,
+    ) -> Result<GatePermit, PersistenceError> {
+        let started = Instant::now();
+        let permit = self.wait_for_permit(operation, priority, started).await;
+        let outcome = if permit.is_ok() {
+            "acquired"
+        } else {
+            "timed_out"
+        };
+        record_turso_write_gate_wait(started.elapsed(), operation, priority.as_str(), outcome);
+        Ok(GatePermit::new(permit?, operation))
+    }
+
+    async fn wait_for_permit(
+        &self,
+        operation: &'static str,
+        priority: WritePriority,
+        started: Instant,
     ) -> Result<OwnedSemaphorePermit, PersistenceError> {
-        let started = std::time::Instant::now();
         let timeout = write_gate_wait_timeout();
         let waiting = Waiting::new(&self.write_gate, priority);
 
@@ -148,12 +191,12 @@ impl TursoEventStore {
     /// A batch must never keep a writer waiting, so it starts only when no
     /// writer waits at the gate, and it never queues there: a queued request
     /// would hold back writers that arrive behind it.
-    async fn trim_turn(&self) -> Result<OwnedSemaphorePermit, PersistenceError> {
+    async fn trim_turn(&self) -> Result<GatePermit, PersistenceError> {
         let gate = &self.write_gate;
         loop {
             if gate.waiting.load(Ordering::Acquire) == 0 {
                 match gate.permit.clone().try_acquire_owned() {
-                    Ok(turn) => return Ok(turn),
+                    Ok(turn) => return Ok(GatePermit::new(turn, "turso.trim_change_log")),
                     Err(tokio::sync::TryAcquireError::Closed) => return Err(write_gate_closed()),
                     Err(tokio::sync::TryAcquireError::NoPermits) => {}
                 }
@@ -165,7 +208,7 @@ impl TursoEventStore {
     async fn wait_for_high_priority_writers(
         &self,
         operation: &'static str,
-        started: std::time::Instant,
+        started: Instant,
         timeout: Duration,
     ) -> Result<(), PersistenceError> {
         while self.write_gate.high_waiting.load(Ordering::Acquire) > 0 {
@@ -187,7 +230,7 @@ impl TursoEventStore {
 pub(super) struct TrimTurns<'a>(pub(super) &'a TursoEventStore);
 
 impl crate::driver::TrimWriters for TrimTurns<'_> {
-    type Turn = OwnedSemaphorePermit;
+    type Turn = GatePermit;
 
     fn turn(
         &self,

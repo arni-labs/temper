@@ -13,6 +13,7 @@ use opentelemetry::{KeyValue, global};
 
 pub(crate) mod blob_transport;
 mod handler_deadlines;
+pub(crate) mod owed_writes;
 mod snapshot_writes;
 pub use handler_deadlines::*;
 pub use snapshot_writes::*;
@@ -525,6 +526,9 @@ pub enum ConcurrencyRetryOutcome {
     /// The action is a state timer's fire, and replay found the record past
     /// the sequence its timer was armed at: dropped, not evaluated again.
     TimerSuperseded,
+    /// The action was decided on the record as its caller read it, and replay
+    /// found the record changed: refused, so the caller decides it again.
+    RecordChanged,
 }
 
 impl ConcurrencyRetryOutcome {
@@ -536,6 +540,7 @@ impl ConcurrencyRetryOutcome {
             ConcurrencyRetryOutcome::ActionIllegal => "action_illegal",
             ConcurrencyRetryOutcome::AlreadyWritten => "already_written",
             ConcurrencyRetryOutcome::TimerSuperseded => "timer_superseded",
+            ConcurrencyRetryOutcome::RecordChanged => "record_changed",
         }
     }
 }

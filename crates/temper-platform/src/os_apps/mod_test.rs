@@ -28,6 +28,7 @@ fn test_admin_security_context(principal_id: &str) -> SecurityContext {
         },
         context_attrs: HashMap::new(),
         correlation_id: "test-admin-context".to_string(),
+        cause: None,
     }
 }
 
@@ -901,6 +902,7 @@ mod directed_evolution;
 mod policy_joint;
 mod policy_reinstall;
 mod spec_change;
+mod timer_strands;
 #[test]
 fn test_get_app_project_management() {
     let bundle = get_os_app("project-management");

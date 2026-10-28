@@ -3,6 +3,7 @@
 pub(crate) mod account_verification;
 pub mod admission;
 pub(crate) mod app_uniqueness;
+pub(crate) mod batch_delete;
 pub mod custom_effects;
 mod dispatch;
 mod entity_ops;
@@ -20,6 +21,7 @@ mod projection_backfill;
 mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
+pub(crate) mod redecide;
 mod runtime_metrics;
 mod spec_change;
 mod start_runtime;
@@ -32,11 +34,14 @@ pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
+pub(crate) use dispatch::owed_writes;
 pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
     StateTimeoutTracker, TimerFollowHold,
 };
-pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
+pub use entity_ops::{
+    CreateError, FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError,
+};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
 pub use file_reads::{IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult};
@@ -534,6 +539,10 @@ pub struct ServerState {
     /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
+    /// The writes committed moves owe that the store has not taken yet, by
+    /// idempotency key, each tried again until it lands or fails otherwise
+    /// (`dispatch::owed_writes`). In memory only: a restart loses them.
+    pub(crate) owed_writes: Arc<Mutex<BTreeMap<String, dispatch::owed_writes::OwedWrite>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
@@ -840,6 +849,7 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             carry_pass: Arc::default(),
@@ -1121,6 +1131,7 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             carry_pass: Arc::default(),
@@ -1294,6 +1305,21 @@ impl ServerState {
             || self
                 .actor_backed_types
                 .contains(&format!("{}:{entity_type}", tenant.as_str()))
+    }
+
+    /// Whether `entity_type` takes only the actions its spec declares: its
+    /// entities are never changed or deleted by a generic write.
+    pub(crate) fn has_strict_action_params(&self, tenant: &TenantId, entity_type: &str) -> bool {
+        let registry = self.registry.read().expect("registry lock poisoned");
+        registry
+            .get_table(tenant, entity_type)
+            .map(|table| table.strict_action_params)
+            .or_else(|| {
+                self.transition_tables
+                    .get(entity_type)
+                    .map(|table| table.strict_action_params)
+            })
+            .unwrap_or(false)
     }
 
     /// Attach an encrypted secrets vault.

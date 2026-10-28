@@ -21,6 +21,7 @@ mod detached;
 mod effects;
 pub(crate) mod entity_rows;
 mod generated_callbacks;
+pub(crate) mod owed_writes;
 mod projection_barrier;
 pub(crate) mod retry;
 mod scheduled_actions;
@@ -31,6 +32,7 @@ mod state_timer_rows;
 #[cfg(test)]
 #[path = "strict_support_test.rs"]
 mod strict_test_support;
+mod timer_cause;
 mod wasm;
 pub(crate) use wasm::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
@@ -133,6 +135,11 @@ pub enum DispatchError {
     /// The entity type has no registered spec — all actions are denied by default.
     #[error("entity type '{0}' is not governed by any registered spec")]
     Ungoverned(String),
+
+    /// The store could not take the write: it failed, or its disk is under
+    /// the floor. Answered 503, so the caller tries again.
+    #[error("{0}")]
+    StoreUnavailable(String),
 
     /// An internal error (serialization, persistence, unexpected state).
     #[error("{0}")]

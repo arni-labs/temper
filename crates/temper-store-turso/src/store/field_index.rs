@@ -12,10 +12,11 @@ use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
 use super::field_index_rows::sync_field_index;
-use super::projection_rows::{ProjectionWrite, remove_projection, write_projection};
+use super::projection_rows::{
+    ProjectionWrite, existing_projection, remove_projection, write_projection,
+};
 use super::unchanged_projections::{
-    ExistingProjection, apply_event_counters, drop_event_counters, projection_hash,
-    store_event_counters,
+    apply_event_counters, drop_event_counters, projection_hash, store_event_counters,
 };
 use super::write_gate::WritePriority;
 use super::{TursoEventStore, TursoQueryProjectionRow};
@@ -176,44 +177,24 @@ impl TursoEventStore {
             .await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         let updated_at = sim_now().to_rfc3339();
+        // One lookup by key per entity: a statement that ORs the keys
+        // together can only search by tenant, reading its whole catalog.
         let mut existing = BTreeMap::new();
-        let existing_candidates = projections
+        for projection in projections
             .iter()
             .filter(|projection| !projection.known_new)
-            .collect::<Vec<_>>();
-        if !existing_candidates.is_empty() {
-            let mut existing_sql = String::from(
-                "SELECT c.entity_type, c.entity_id, c.sequence_nr, c.projection_hash, k.sequence_nr \
-                 FROM entity_catalog c LEFT JOIN entity_catalog_counters k \
-                   ON k.tenant = c.tenant AND k.entity_type = c.entity_type \
-                  AND k.entity_id = c.entity_id \
-                 WHERE c.tenant = ? AND (",
-            );
-            let mut existing_values = Vec::with_capacity(1 + existing_candidates.len() * 2);
-            existing_values.push(Value::from(tenant.to_string()));
-            for (index, projection) in existing_candidates.iter().enumerate() {
-                if index > 0 {
-                    existing_sql.push_str(" OR ");
-                }
-                existing_sql.push_str("(c.entity_type = ? AND c.entity_id = ?)");
-                existing_values.push(Value::from(projection.entity_type.clone()));
-                existing_values.push(Value::from(projection.entity_id.clone()));
-            }
-            existing_sql.push(')');
-
-            let mut existing_rows = tx
-                .query(&existing_sql, params_from_iter(existing_values))
-                .await
-                .map_err(storage_error)?;
-            while let Some(row) = existing_rows.next().await.map_err(storage_error)? {
-                let entity_type: String = row.get(0).map_err(storage_error)?;
-                let entity_id: String = row.get(1).map_err(storage_error)?;
+        {
+            let key = [
+                tenant,
+                projection.entity_type.as_str(),
+                projection.entity_id.as_str(),
+            ];
+            if let Some(found) = existing_projection(&tx, key).await? {
                 existing.insert(
-                    (entity_type, entity_id),
-                    ExistingProjection::from_row(&row, 2)?,
+                    (projection.entity_type.clone(), projection.entity_id.clone()),
+                    found,
                 );
             }
-            drop(existing_rows);
         }
 
         struct PreparedProjection {
@@ -464,8 +445,9 @@ impl TursoEventStore {
         params: Vec<String>,
     ) -> Result<Vec<String>, PersistenceError> {
         let conn = self.configured_connection().await?;
+        let index = catalog_filter_index(where_clause);
         let sql = format!(
-            "SELECT entity_id FROM entity_catalog \
+            "SELECT entity_id FROM entity_catalog {index}\
              WHERE tenant = ?1 AND entity_type = ?2 AND ({where_clause})"
         );
 
@@ -774,6 +756,19 @@ pub(super) fn indexed_projection_fields(
     // Also index the status as a pseudo-field so `$filter=Status eq 'Active'` works.
     indexed_fields.push(("Status".to_string(), Some(status.to_string())));
     indexed_fields
+}
+
+/// What a `$filter` over the catalog reads it by. Every one fixes the tenant
+/// and type; one that also fixes the status (`status = ?`) reads
+/// `idx_entity_catalog_status` by all three, which turso_core's planner does
+/// not choose by itself (see `driver/plan_check.rs`). Without one, the
+/// planner's walk of the primary key also keeps a page in `entity_id` order.
+pub(super) fn catalog_filter_index(where_clause: &str) -> &'static str {
+    if crate::sql_terms::gives(where_clause, "entity_catalog", true, "status") {
+        "INDEXED BY idx_entity_catalog_status "
+    } else {
+        ""
+    }
 }
 
 #[cfg(test)]

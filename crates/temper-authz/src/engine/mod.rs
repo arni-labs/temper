@@ -401,6 +401,27 @@ impl AuthzEngine {
         )
     }
 
+    /// The same decision as [`Self::authorize_for_tenant`], for a page asking which moves to show before any is
+    /// sent. Only its metric differs: it is counted as `check:offer`, never as a refusal; the move, if sent, is
+    /// checked again at the gate.
+    pub fn authorize_offer_for_tenant(
+        &self,
+        tenant: &str,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &HashMap<String, serde_json::Value>,
+    ) -> AuthzDecision {
+        self.authorize_for_tenant_checked(
+            tenant,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            CedarCheck::Offer,
+        )
+    }
+
     fn authorize_for_tenant_checked(
         &self,
         tenant: &str,
@@ -518,9 +539,19 @@ impl AuthzEngine {
             );
         }
 
-        // Add context attributes
+        // Add context attributes. The cause keys come from the cause alone,
+        // below, so no attribute speaks under them, even where it has none.
         for (key, value) in &security_ctx.context_attrs {
+            if platform_keys::CAUSE.contains(&key.as_str()) {
+                continue;
+            }
             insert_json_as_cedar(&mut ctx_map, key.clone(), value);
+        }
+
+        // How the move came about: `via` and `depth` on every check, the
+        // reaction's hop and the timer's arm where the move has them.
+        for (key, value) in crate::cause::cause_context(security_ctx.cause.as_ref()) {
+            insert_json_as_cedar(&mut ctx_map, key.to_string(), &value);
         }
 
         // Resource fields may appear as context.key for domain policies.
