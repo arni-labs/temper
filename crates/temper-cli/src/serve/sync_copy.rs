@@ -124,6 +124,11 @@ fn unavailable(code: &str, message: &str) -> Response {
 /// Requests that cannot change anything: reads of Temper's own routes. A
 /// read of an app's HTTP endpoint or webhook can run actions, so it waits too.
 fn reads_only(method: &Method, path: &str) -> bool {
+    // A question to Cedar is a read sent as a POST: it decides on the snapshot
+    // its caller sends and writes nothing (temper-server's api/authorize.rs).
+    if *method == Method::POST && path == "/api/authorize" {
+        return true;
+    }
     let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     let own_route = ["/tdata", "/observe", "/api", "/genesis"]
         .iter()
