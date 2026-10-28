@@ -96,7 +96,10 @@ impl From<ArmedBy> for AgentContext {
 impl ServerState {
     /// Where `tenant`'s timer rows are kept: [`Self::state_timer_rows`] when
     /// set, else the tenant's metadata store. None: rows are not kept.
-    async fn timer_rows_for_tenant(&self, tenant: &str) -> Option<Arc<dyn StateTimerStore>> {
+    pub(super) async fn timer_rows_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Option<Arc<dyn StateTimerStore>> {
         if let Some(rows) = self.state_timer_rows.clone() {
             return Some(rows);
         }

@@ -767,6 +767,10 @@ impl crate::state::ServerState {
         // PRECONDITION: spec validation refuses a zero budget, which would
         // make an unanswered timer retry in a tight loop.
         debug_assert!(timer.after_seconds > 0, "state timeout with a zero budget");
+        let keeps_rows = self
+            .timer_rows_for_tenant(timer.tenant.as_str())
+            .await
+            .is_some();
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         if self.state_timeout_tracker.current(&key) != armed_seq
             || !self.declares_state_timer(timer)
@@ -775,8 +779,12 @@ impl crate::state::ServerState {
         }
         // A failed save may have landed. Retain every candidate row until
         // a confirmed replacement, so an answer can remove whichever landed.
+        // Without a row store this arm could not have been saved; retaining
+        // it would grow the retry history on every unanswered fire forever.
         let mut previous_arm_ids = timer.previous_arm_ids.clone();
-        previous_arm_ids.push(timer.arm_id.clone());
+        if keeps_rows {
+            previous_arm_ids.push(timer.arm_id.clone());
+        }
         let again = ArmedTimer {
             previous_arm_ids,
             arm_id: sim_uuid().to_string(),
@@ -940,6 +948,88 @@ mod tests {
 
     fn key() -> EntityKey {
         EntityKey::new(&TenantId::from("t".to_string()), "E", "e-1")
+    }
+
+    /// Deferral can last indefinitely without row storage; it must not retain
+    /// an ever-growing history of arms that could never have been persisted.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_retries_without_storage_do_not_retain_arm_history() {
+        use crate::state::AdmissionOutcome;
+
+        for seed in [106, 107, 108] {
+            let (_sim, _, _) = temper_runtime::scheduler::install_deterministic_context(seed);
+            let spec = format!(
+                "{TICKET_WITH_TIMEOUT_IOA}\n[admission]\nmax_concurrent_actions = {{ \"AssignAgent\" = 1 }}\nqueue_timeout_seconds = 0\n"
+            );
+            let mut registry = SpecRegistry::new();
+            registry.register_tenant(
+                "t",
+                parse_csdl(TICKET_CSDL).unwrap(),
+                TICKET_CSDL.to_string(),
+                &[("Ticket", &spec)],
+            );
+            let server = ServerState::from_registry(ActorSystem::new("no-timer-rows"), registry);
+            let tenant = TenantId::new("t");
+            assert!(server.state_timer_rows.is_none());
+            assert!(server.metadata_store_for_tenant("t").await.is_none());
+            let created = server
+                .get_or_create_tenant_entity(&tenant, "Ticket", "e-1", serde_json::json!({}))
+                .await
+                .unwrap();
+            let caps = server
+                .registry
+                .read()
+                .unwrap()
+                .get_spec(&tenant, "Ticket")
+                .unwrap()
+                .automaton
+                .admission
+                .clone()
+                .unwrap();
+            let AdmissionOutcome::Granted(in_flight) = server
+                .admission
+                .try_acquire_with_caps(&tenant, "Ticket", "AssignAgent", Some(&caps))
+                .await
+            else {
+                panic!("the first admission must be granted");
+            };
+            server
+                .reconcile_state_timers(&tenant, "Ticket", "e-1", &created.state, None)
+                .await;
+            let mut previous = server.armed_state_timer(&tenant, "Ticket", "e-1").unwrap();
+            for attempt in 1..=32 {
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(Duration::from_secs(2)).await;
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                let armed = server.armed_state_timer(&tenant, "Ticket", "e-1").unwrap();
+                assert_ne!(armed.arm_id, previous.arm_id, "retry {attempt} is armed");
+                assert_eq!(armed.sequence_nr, previous.sequence_nr);
+                assert_eq!(armed.params, previous.params);
+                assert!(
+                    armed.previous_arm_ids.is_empty(),
+                    "retry {attempt} retained an unpersisted arm"
+                );
+                previous = armed;
+            }
+            drop(in_flight);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                server
+                    .get_tenant_entity_state(&tenant, "Ticket", "e-1")
+                    .await
+                    .unwrap()
+                    .state
+                    .status,
+                "InProgress"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
