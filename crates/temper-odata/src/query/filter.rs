@@ -22,7 +22,8 @@ pub fn parse_filter(input: &str) -> Result<FilterExpr, ODataError> {
     let expr = parser.parse_or()?;
 
     // Make sure we consumed everything
-    if parser.pos < parser.tokens.len() {
+    // MUTANT: text after the expression is ignored.
+    if false && parser.pos < parser.tokens.len() {
         return Err(ODataError::InvalidFilter {
             message: format!(
                 "unexpected token '{}' after expression",
