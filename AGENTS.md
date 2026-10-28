@@ -83,6 +83,10 @@ scripts/setup-hooks.sh                                  # install git hooks (pre
 
 `.claude/settings.json` runs spec verification, determinism and dependency checks. Git hooks run code/spec checks and relevant tests; no reviewer markers or process artifacts are required. Review criteria live in `REVIEW.md`.
 
+## Landing a pull request
+
+`main` takes changes through GitHub's merge queue. Once a PR's checks are green, it goes in with `gh pr merge <n> --auto` (the Factory's merge step queues its own releases). The queue tests each group of queued PRs on top of `main` (CI's `merge_group` run, the pull-request lane on the group's diff) and lands it. Never update a branch to catch up with `main` and never merge around the queue: the queue already tests against the latest `main`.
+
 ## Deploying spec changes
 
 1. Spec passes the verification cascade (L0-L3)

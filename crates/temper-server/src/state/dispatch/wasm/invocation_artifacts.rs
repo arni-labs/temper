@@ -133,6 +133,7 @@ impl crate::state::ServerState {
             return super::dispatch_wasm_callback_boxed(
                 self,
                 ctx.entity_ref,
+                integration_name,
                 cb,
                 params,
                 ctx.agent_ctx,
@@ -152,12 +153,18 @@ impl crate::state::ServerState {
     pub(super) async fn dispatch_wasm_callback(
         &self,
         entity_ref: WasmEntityRef<'_>,
+        integration: &str,
         callback_action: &str,
         callback_params: serde_json::Value,
         agent_ctx: &AgentContext,
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
-        let callback_ctx = match agent_ctx.for_callback() {
+        let callback_ctx = match agent_ctx.for_callback(
+            entity_ref.entity_type,
+            entity_ref.entity_id,
+            callback_action,
+            integration,
+        ) {
             Ok(context) => context,
             Err(error) => {
                 return self
@@ -213,7 +220,7 @@ impl crate::state::ServerState {
                 Ok(Some(resp))
             }
             WasmDispatchMode::Background => {
-                let callback_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx);
+                let callback_ctx = AgentContext::for_service_answering("wasm-runtime", agent_ctx);
                 let response = self
                     .dispatch_tenant_action(
                         entity_ref.tenant,

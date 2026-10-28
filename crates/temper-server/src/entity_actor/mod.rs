@@ -34,4 +34,7 @@ pub use effects::{
 pub(crate) use move_invariants::broken_invariant;
 pub use sim_handler::EntityActorHandler;
 pub(crate) use snapshot_queue::SnapshotWriteQueue;
-pub use types::{EffectOutcome, EntityEvent, EntityMsg, EntityResponse, EntityState, StatusClock};
+pub use types::{
+    EffectOutcome, EntityEvent, EntityMsg, EntityResponse, EntityState, ProcessedIdempotencyKey,
+    StatusClock,
+};

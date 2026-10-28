@@ -268,9 +268,27 @@ impl QueryPlaneStore for FlakyQueryPlane {
 
 /// An Order server on the simulated journal whose query plane is `qp`.
 fn flaky_order_state(system_name: &str, seed: u64, qp: Arc<FlakyQueryPlane>) -> ServerState {
+    flaky_state(system_name, seed, qp, ORDER_IOA)
+}
+
+/// A server whose Order spec is `order_ioa`, on the simulated journal, whose
+/// query plane is `qp`.
+fn flaky_state(
+    system_name: &str,
+    seed: u64,
+    qp: Arc<FlakyQueryPlane>,
+    order_ioa: &str,
+) -> ServerState {
     let events =
         crate::storage::BoxedEventStore::new(temper_store_sim::SimEventStore::no_faults(seed));
-    let mut state = build_order_state(system_name);
+    let mut registry = SpecRegistry::new();
+    registry.register_tenant(
+        TenantId::default().as_str(),
+        parse_csdl(CSDL_XML).expect("CSDL should parse"),
+        CSDL_XML.to_string(),
+        &[("Order", order_ioa)],
+    );
+    let mut state = ServerState::from_registry(ActorSystem::new(system_name), registry);
     state.set_storage_stack(crate::storage::StorageStack::new(
         crate::storage::BackendLabel::Sim,
         events,
@@ -287,7 +305,7 @@ fn flaky_order_state(system_name: &str, seed: u64, qp: Arc<FlakyQueryPlane>) -> 
         [(
             "Order".to_string(),
             Arc::new(temper_jit::table::TransitionTable::from_ioa_source(
-                ORDER_IOA,
+                order_ioa,
             )),
         )]
         .into_iter()
@@ -396,4 +414,86 @@ async fn a_status_committed_behind_a_failed_projection_reaches_the_status_cache(
         Some("Submitted".to_string()),
         "a guard reads the committed status"
     );
+}
+
+/// `Submitted` lapses to `Cancelled` after a second.
+const SUBMITTED_LAPSES: &str = r#"
+[[action]]
+name = "Lapse"
+kind = "internal"
+from = ["Submitted"]
+to = "Cancelled"
+
+[[state_timeout]]
+state = "Submitted"
+after_seconds = 1
+on_timeout = "Lapse"
+"#;
+
+/// A transition whose projection write fails still committed the timer of the
+/// state it entered, so that timer is armed and fires now, not at the next
+/// boot.
+#[tokio::test]
+async fn a_timer_committed_behind_a_failed_projection_fires() {
+    let qp = Arc::new(FlakyQueryPlane {
+        fail_write: 1,
+        ..FlakyQueryPlane::default()
+    });
+    let order_ioa = format!("{ORDER_IOA}\n{SUBMITTED_LAPSES}");
+    let state = flaky_state("flaky-projection-timer", 16, qp, &order_ioa);
+    let tenant = TenantId::default();
+    let agent_ctx = AgentContext::for_service("flaky-projection-timer");
+    let added = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o5",
+            "AddItem",
+            serde_json::json!({ "ProductId": "p1", "Quantity": 1 }),
+            &agent_ctx,
+        )
+        .await
+        .expect("add item");
+    assert!(added.success, "add item: {:?}", added.error);
+
+    let submitted = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o5",
+            "SubmitOrder",
+            serde_json::json!({}),
+            &agent_ctx,
+        )
+        .await
+        .expect("submit");
+    assert!(
+        !submitted.success
+            && submitted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("query projection failed"))
+            && submitted.state.status == "Submitted",
+        "the submit commits and reports the projection outage: {:?} {}",
+        submitted.error,
+        submitted.state.status
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = state
+            .get_tenant_entity_state(&tenant, "Order", "o5")
+            .await
+            .expect("order")
+            .state
+            .status;
+        if status == "Cancelled" {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Submitted's one-second timer never fired: the order is still {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

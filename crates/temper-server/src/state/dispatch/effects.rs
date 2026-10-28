@@ -569,6 +569,12 @@ impl crate::state::ServerState {
         ctx: &PostDispatchContext<'_>,
         response: EntityResponse,
     ) -> EntityResponse {
+        // A write refused because its record changed was not decided: its
+        // route decides it again, and that decision is the one recorded.
+        if response.is_record_changed() {
+            return response;
+        }
+
         // 1. Record metrics
         self.metrics
             .record_transition(ctx.entity_type, ctx.action, response.success);
@@ -606,8 +612,10 @@ impl crate::state::ServerState {
             // The journal is committed: hand the projection to the retrying
             // queue so reads catch up once the store recovers.
             self.apply_query_projection_update(ctx, &response).await;
-            // Its scheduled actions were committed with its event: arm them.
+            // Its scheduled actions and its state's timer were committed with
+            // its event: arm them, or they wait for the next boot.
             self.arm_scheduled_actions(ctx, &response);
+            Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
             let mut response = response;
             response.success = false;
             response.error = Some(format!(
@@ -699,6 +707,8 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            answered_action: None,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -737,6 +747,8 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            answered_action: None,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -755,7 +767,13 @@ impl crate::state::ServerState {
                     // handle them twice. The projection and the state-timer
                     // arm ran above, before the integration.
                     self.dispatch_transition_deferred_effects(ctx, &response);
-                    return final_response;
+                    // The request's own action committed. If the store did not
+                    // take the answer, saying so (503) would ask the caller to
+                    // send the action again, and it would apply twice.
+                    return EntityResponse {
+                        store_unavailable: false,
+                        ..final_response
+                    };
                 }
             } else {
                 self.dispatch_wasm_integrations(

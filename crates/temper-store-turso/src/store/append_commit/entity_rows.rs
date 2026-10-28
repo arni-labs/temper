@@ -102,7 +102,9 @@ impl EntityRows {
         }
         if let Some(vectors) = &self.vectors {
             tx.execute(
-                "DELETE FROM entity_vector_index \
+                // The entity's index: without it the planner may read every
+                // vector row of the type (driver/plan_check.rs).
+                "DELETE FROM entity_vector_index INDEXED BY idx_evi_entity \
                  WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
                 params![tenant, entity_type, entity_id],
             )
