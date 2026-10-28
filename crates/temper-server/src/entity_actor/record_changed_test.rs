@@ -176,6 +176,56 @@ async fn a_field_update_decided_before_another_writer_moved_the_record_is_refuse
 }
 
 #[tokio::test]
+async fn a_delete_decided_before_another_writer_moved_the_record_is_refused_with_the_record_caught_up()
+ {
+    let store = Arc::new(SimEventStore::no_faults(73));
+    let entity_id = "record-changed-delete-race";
+    let system = ActorSystem::new("sim-record-changed-delete-race");
+    let holder = order_actor(&system, &store, entity_id, entity_id);
+    let seeded = update(&holder, serde_json::json!({"Customer": "Seed"})).await;
+    assert!(seeded.success);
+    let decided_on = super::super::effects::entity_authorization_precondition(&seeded.state);
+
+    let other = order_actor(&system, &store, entity_id, &format!("{entity_id}-other"));
+    assert!(
+        update(&other, serde_json::json!({"Region": "eu"}))
+            .await
+            .success
+    );
+
+    let delete = |precondition: String| EntityMsg::Delete {
+        expected_authorization_precondition: Some(precondition),
+    };
+    let answer: EntityResponse = holder
+        .ask(delete(decided_on), ASK)
+        .await
+        .expect("delete answer");
+    assert!(
+        !answer.success && record_changed(&answer),
+        "a delete whose append finds another writer's change must be refused as \
+         RecordChanged, with the record caught up, not answered from a memory behind \
+         its journal: {answer:?}"
+    );
+    assert_eq!(
+        answer.state.fields["Region"], "eu",
+        "the refusal carries the record as it is, for the route to decide on"
+    );
+    assert!(
+        !journaled_actions(&store, entity_id)
+            .await
+            .iter()
+            .any(|action| action == "Deleted"),
+        "nothing was written"
+    );
+
+    // Decided again on the record it was answered with, the delete lands.
+    let again = super::super::effects::entity_authorization_precondition(&answer.state);
+    let landed: EntityResponse = holder.ask(delete(again), ASK).await.expect("delete answer");
+    assert!(landed.success, "{landed:?}");
+    assert_eq!(landed.state.status, "Deleted");
+}
+
+#[tokio::test]
 async fn a_delete_that_finds_its_record_deleted_writes_nothing() {
     let store = Arc::new(SimEventStore::no_faults(71));
     let entity_id = "record-changed-delete";
