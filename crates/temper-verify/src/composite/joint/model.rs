@@ -3,6 +3,8 @@
 
 mod commit;
 mod drops;
+mod initial;
+mod labels;
 mod order;
 mod react;
 mod read;
@@ -13,16 +15,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Expr, Name, Truth, eval};
+use temper_spec::predicate::{Expr, Name, eval};
 
 use super::env::{Blind, ID, JointEnv, Records};
-use super::room::Bound;
 use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
-use crate::model::semantics::string_values;
-use crate::model::{ParamValue, ResolvedTransition, TemperModel, TemperModelState};
+use crate::model::semantics::{Expansion, rule_for, string_values};
+use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
@@ -34,9 +35,6 @@ pub(super) use walk::Explored;
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
-
-/// Reaction depth followed: the runtime's own bound.
-const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 
 /// Dispatches and module calls in flight at once. The runtime has no such
 /// bound: each request, reaction and module call is its own task. The model
@@ -55,7 +53,7 @@ enum Delivery {
     /// Before the next move from outside: the dispatches a move sends all
     /// land, in any order, before anything else is asked. That is what the
     /// drop check claims (ADR-0150); with it, the dispatches in flight are
-    /// bounded by the reactions' fan-out and depth.
+    /// bounded by the reactions' fan-out and distinct steps.
     BeforeNextRequest,
 }
 
@@ -98,6 +96,8 @@ pub(super) struct Walk {
 
 /// The joint model of one entity's properties that read related entities.
 pub(super) struct JointModel {
+    expansion: Expansion,
+    id_literals: BTreeSet<String>,
     models: BTreeMap<String, TemperModel>,
     reactions: Vec<Reaction>,
     records: Records,
@@ -159,7 +159,8 @@ impl JointModel {
                     owned(owner, id_field);
                     owned(entity_type, field);
                 }
-                Name::Status => {}
+                // A move's parameter is no field of a record.
+                Name::Status | Name::Param(_) => {}
             });
         }
         let (mut models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
@@ -186,6 +187,34 @@ impl JointModel {
         sending: Sending<'_>,
         cut: bool,
     ) -> Self {
+        let mut id_literals = BTreeSet::new();
+        for entity in &scope {
+            let a = by_name[entity.as_str()];
+            for inv in &a.invariants {
+                read::collect_literals(&inv.assert, &mut id_literals);
+            }
+            for live in &a.liveness {
+                if let Some(goal) = &live.eventually {
+                    read::collect_literals(goal, &mut id_literals);
+                }
+            }
+            for action in &a.actions {
+                read::collect_literals(&action.guard, &mut id_literals);
+                for trigger in &action.triggers {
+                    if let Some(guard) = &trigger.guard {
+                        read::collect_literals(guard, &mut id_literals);
+                    }
+                    for arg in trigger.args.values() {
+                        if let temper_spec::predicate::Arg::Lit(
+                            temper_spec::predicate::Literal::Str(s),
+                        ) = arg
+                        {
+                            id_literals.insert(s.clone());
+                        }
+                    }
+                }
+            }
+        }
         let kernel = if sending.kernel_moves {
             Kernel::read(by_name, &scope)
         } else {
@@ -223,6 +252,8 @@ impl JointModel {
             .map(|r| r.from.clone())
             .collect();
         Self {
+            expansion: Expansion::default(),
+            id_literals,
             models,
             reactions,
             records: Records::ById,
@@ -253,56 +284,21 @@ impl JointModel {
             .collect()
     }
 
-    /// The starting states: one per way the records' ids can be equal or
-    /// differ, or the one start when there is one record of a type.
-    fn inits(&self) -> Vec<JointState> {
-        let blank = self.blank();
-        if self.records == Records::One {
-            return vec![JointState {
-                records: blank,
-                inflight: Vec::new(),
-                calls: Vec::new(),
-                armed: BTreeMap::new(),
-            }];
-        }
-        partitions(blank.len())
-            .into_iter()
-            .map(|blocks| {
-                let mut records = blank.clone();
-                for (record, block) in records.values_mut().zip(blocks) {
-                    record
-                        .strings
-                        .insert(ID.to_string(), format!("#{}", block + 1));
-                }
-                let mut state = JointState {
-                    records,
-                    inflight: Vec::new(),
-                    calls: Vec::new(),
-                    armed: BTreeMap::new(),
-                };
-                self.arm_at_start(&mut state);
-                self.order.normalize(&mut state);
-                canonical(&mut state);
-                state
-            })
-            .collect()
-    }
-
     /// The starting state whose ids are `ids` (entity type to a trace name;
     /// equal names, equal ids; a type left out gets an id of its own), and
     /// each trace name's value in it.
     pub(super) fn init_with_ids(
         &self,
         ids: &BTreeMap<String, String>,
-    ) -> (JointState, BTreeMap<String, String>) {
-        let mut names: BTreeMap<String, String> = BTreeMap::new();
+    ) -> (JointState, BTreeMap<String, ModelString>) {
+        let mut names: BTreeMap<String, ModelString> = BTreeMap::new();
         let mut records = self.blank();
         for (entity, record) in &mut records {
             let name = ids
                 .get(entity)
                 .cloned()
                 .unwrap_or_else(|| format!("{entity}#id"));
-            let next = format!("#{}", names.len() + 1);
+            let next = ModelString::Symbol(names.len() + 1);
             let value = names.entry(name).or_insert(next).clone();
             record.strings.insert(ID.to_string(), value);
         }
@@ -327,9 +323,7 @@ impl JointModel {
     /// outside, who armed it.
     fn arm_at_start(&self, state: &mut JointState) {
         for (entity, record) in &state.records {
-            if self.sender_matters.contains(entity)
-                && self.timeout(entity, &record.status).is_some()
-            {
+            if self.timeout(entity, &record.status).is_some() {
                 state.armed.insert(entity.clone(), OUTSIDE);
             }
         }
@@ -345,7 +339,7 @@ impl JointModel {
     }
 
     /// The strings `state` holds, in records and in dispatches.
-    pub(super) fn values(&self, state: &JointState) -> BTreeSet<String> {
+    pub(super) fn values(&self, state: &JointState) -> BTreeSet<ModelString> {
         let mut values = string_values(state.records.values());
         for dispatch in &state.inflight {
             for value in dispatch.params.values() {
@@ -386,10 +380,11 @@ impl JointModel {
         state: &JointState,
         blind: Blind,
     ) -> bool {
-        let local = &state.records[entity];
-        let status_ok =
-            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
-        status_ok && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+        // The rule the runtime takes for this action in the record's status
+        // (`rule_for`); another with the same name never fires from there.
+        let taken = rule_for(&self.models[entity], &t.name, &state.records[entity].status)
+            .is_some_and(|rule| std::ptr::eq(rule, t));
+        taken && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
     }
 
     pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {
@@ -411,60 +406,4 @@ impl JointModel {
             blind,
         }
     }
-
-    /// Walk every reachable joint state breadth first, checking `invariants`
-    /// of `owner` in each settled one (nothing in flight).
-    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], bound: Bound<'_>) -> Walk {
-        let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
-        let explored = self.walk_with(bound, false, |index, state| {
-            if state.settled() {
-                let env = self.env(owner, state);
-                for (i, inv) in invariants.iter().enumerate() {
-                    if broken[i].is_none() && eval(inv, &env) == Truth::False {
-                        broken[i] = Some(index);
-                    }
-                }
-            }
-            broken.iter().all(Option::is_some)
-        });
-        let outcomes = broken
-            .iter()
-            .map(|found| match found {
-                Some(index) => JointOutcome::Broken {
-                    path: explored.path(*index),
-                },
-                None => match &explored.stopped {
-                    Some(reason) => JointOutcome::Incomplete {
-                        reason: reason.clone(),
-                    },
-                    None => JointOutcome::Holds,
-                },
-            })
-            .collect();
-        Walk {
-            states: explored.len(),
-            outcomes,
-            held_back: explored.held_back,
-        }
-    }
-}
-
-/// Every way to split `n` items into blocks, as each item's block number,
-/// blocks numbered in order of first use.
-fn partitions(n: usize) -> Vec<Vec<usize>> {
-    let mut out: Vec<Vec<usize>> = vec![Vec::new()];
-    for _ in 0..n {
-        out = out
-            .into_iter()
-            .flat_map(|blocks| {
-                let used = blocks.iter().max().map_or(0, |most| most + 1);
-                (0..=used).map(move |block| {
-                    let mut more = blocks.clone();
-                    more.push(block);
-                    more
-                })
-            })
-            .collect();
-    }
-    out
 }

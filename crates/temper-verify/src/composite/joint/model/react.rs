@@ -4,14 +4,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::TargetResolver;
-use temper_spec::predicate::{Arg, Literal, Truth, eval};
+use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
 use super::super::senders::RUNTIME;
+use super::super::state::ReactionStep;
 use super::super::{Call, Dispatch, JointState};
+use super::JointModel;
 use super::commit::add;
+use super::read::Reaction;
 use super::step::Certainty;
-use super::{JointModel, MAX_REACTION_DEPTH, Reaction};
 use crate::model::ParamValue;
 
 impl JointModel {
@@ -26,11 +28,18 @@ impl JointModel {
         state: JointState,
         source: &str,
         action: &str,
-        depth: u32,
+        chain: &[ReactionStep],
         by: u32,
         inline: bool,
     ) -> Vec<(JointState, Certainty)> {
-        let outcomes = self.react(state, source, action, depth, by);
+        // Outside actions and detached work start a fresh chain.
+        let root = [ReactionStep {
+            entity_type: source.to_string(),
+            action: action.to_string(),
+            generated_for: None,
+        }];
+        let chain = if chain.is_empty() { &root } else { chain };
+        let outcomes = self.react(state, source, action, chain, by);
         let key = (source.to_string(), action.to_string());
         let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
             return outcomes;
@@ -44,16 +53,21 @@ impl JointModel {
         let asked: Vec<BTreeSet<String>> = specs
             .iter()
             .map(|spec| {
-                self.unchecked
-                    .asked(source, |action| match &spec.on_success {
-                        Some(name) => name == action,
-                        None => internal.is_some_and(|names| names.contains(action)),
-                    })
+                self.unchecked.asked(source, |action| {
+                    if spec.on_success.is_empty() {
+                        internal.is_some_and(|names| names.contains(action))
+                    } else {
+                        spec.on_success.iter().any(|name| name == action)
+                    }
+                })
             })
             .collect();
         let mut started = Vec::new();
         for (outcome, known) in outcomes {
             for &answer_as in &answering {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let mut outcome = outcome.clone();
                 for (spec, asked) in specs.iter().zip(&asked) {
                     let strings = &outcome.records[source].strings;
@@ -90,13 +104,10 @@ impl JointModel {
         state: JointState,
         source: &str,
         action: &str,
-        depth: u32,
+        chain: &[ReactionStep],
         by: u32,
     ) -> Vec<(JointState, Certainty)> {
         let mut outcomes = vec![(state, Certainty::Sure)];
-        if depth >= MAX_REACTION_DEPTH {
-            return outcomes;
-        }
         for (index, reaction) in self
             .reactions
             .iter()
@@ -105,6 +116,9 @@ impl JointModel {
         {
             let mut after = Vec::new();
             for (state, known) in outcomes {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let fires = match &reaction.guard {
                     Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
                     None => Truth::True,
@@ -139,15 +153,48 @@ impl JointModel {
                 if reaches == Found::Unknown {
                     after.push((state.clone(), known));
                 }
+                let generated_for = match &reaction.resolve {
+                    Some(TargetResolver::Create) => Some(reaction.to.clone()),
+                    Some(TargetResolver::CreateIfMissing { id_field }) => {
+                        if state.records[source]
+                            .strings
+                            .get(id_field)
+                            .is_some_and(|id| !id.is_empty())
+                        {
+                            None
+                        } else {
+                            Some(reaction.to.clone())
+                        }
+                    }
+                    Some(TargetResolver::SameId) => {
+                        chain.last().and_then(|step| step.generated_for.clone())
+                    }
+                    _ => None,
+                };
+                let step = ReactionStep {
+                    entity_type: reaction.to.clone(),
+                    action: reaction.target_action.clone(),
+                    generated_for,
+                };
+                if chain.iter().any(|taken| step.repeats(taken)) {
+                    after.push((state, known));
+                    continue;
+                }
+                let mut next_chain = chain.to_vec();
+                next_chain.push(step);
                 let dispatch = Dispatch {
                     to: reaction.to.clone(),
                     action: reaction.target_action.clone(),
                     target_state: None,
                     params: self.args(&state, source, reaction),
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
-                    depth: depth + 1,
+                    chain: next_chain,
                     via: Some(index),
-                    by: self.senders.reaction(reaction.principal.as_ref(), by),
+                    by: self.senders.reaction(
+                        reaction.principal.as_ref(),
+                        by,
+                        matches!(reaction.resolve, Some(TargetResolver::SameId)),
+                    ),
                     inline: false,
                 };
                 let mut next = state;
@@ -159,8 +206,26 @@ impl JointModel {
         outcomes
     }
 
-    /// The tracked string parameters `reaction` passes, and the counts kept
-    /// as sequence numbers, read from `source` as it holds them.
+    /// Whether `reaction`'s target action reads its count parameter
+    /// `param`: an effect reads it, or a constraint compares it with a
+    /// counter.
+    fn reads_count(&self, reaction: &Reaction, param: &str) -> bool {
+        let (to, action) = (&reaction.to, &reaction.target_action);
+        self.unchecked
+            .counts(to, action)
+            .iter()
+            .any(|(counted, _)| counted == param)
+            || self.models[to]
+                .transitions
+                .iter()
+                .any(|t| &t.name == action && matches!(t.params.get(param), Some(ParamKind::Count)))
+    }
+
+    /// The string parameters `reaction` passes that its target tracks or
+    /// requires not empty, the counts kept as sequence numbers, and the
+    /// counts its target reads (in an effect, or compared with a counter)
+    /// from a counter `source` holds as a value, read from `source` as it
+    /// holds them.
     fn args(
         &self,
         state: &JointState,
@@ -169,6 +234,9 @@ impl JointModel {
     ) -> BTreeMap<String, ParamValue> {
         let source_state = &state.records[source];
         let tracked = &self.models[&reaction.to].tracked_strings;
+        let nonempty = self
+            .unchecked
+            .nonempty(&reaction.to, &reaction.target_action);
         reaction
             .args
             .iter()
@@ -181,13 +249,23 @@ impl JointModel {
                     let count = source_state.counters.get(field).copied()?;
                     return Some((param.clone(), ParamValue::Count(count)));
                 }
-                if !tracked.contains(param) {
+                if self.reads_count(reaction, param) {
+                    // Sent only when the source holds it as a value, not as
+                    // a sequence number.
+                    let Arg::Var(field) = arg else { return None };
+                    if self.order.fields(source).any(|(f, _)| f == field) {
+                        return None;
+                    }
+                    let count = source_state.counters.get(field).copied()?;
+                    return Some((param.clone(), ParamValue::Count(count)));
+                }
+                if !tracked.contains(param) && !nonempty.contains(param) {
                     return None;
                 }
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone()),
-                    Arg::Lit(Literal::Null) => Some(String::new()),
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Null) => Some("".into()),
                     _ => None,
                 }?;
                 Some((param.clone(), ParamValue::Str(value)))
@@ -195,3 +273,7 @@ impl JointModel {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "repeat_test.rs"]
+mod tests;

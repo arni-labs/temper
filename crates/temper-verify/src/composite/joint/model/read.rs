@@ -9,7 +9,7 @@ use temper_authz::Asker;
 use temper_spec::automaton::{
     ActionConstraint, ActionKind, Automaton, TargetResolver, TriggerKind,
 };
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set};
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, VarKind};
 
 use super::super::env::Records;
 use super::super::senders;
@@ -49,7 +49,7 @@ pub(super) fn tracked(
 ) -> (BTreeMap<String, TemperModel>, Vec<Reaction>) {
     let reactions = reactions_in(by_name, scope);
     loop {
-        let models: BTreeMap<String, TemperModel> = scope
+        let mut models: BTreeMap<String, TemperModel> = scope
             .iter()
             .map(|entity| {
                 let extra = also.get(entity).cloned().unwrap_or_default();
@@ -59,6 +59,43 @@ pub(super) fn tracked(
                 )
             })
             .collect();
+        let mut literals = BTreeSet::new();
+        for entity in scope {
+            let a = by_name[entity.as_str()];
+            for inv in &a.invariants {
+                collect_literals(&inv.assert, &mut literals);
+            }
+            for live in &a.liveness {
+                if let Some(goal) = &live.eventually {
+                    collect_literals(goal, &mut literals);
+                }
+            }
+            for action in &a.actions {
+                collect_literals(&action.guard, &mut literals);
+            }
+        }
+        for model in models.values() {
+            literals.extend(model.initial_strings.values().filter_map(|v| match v {
+                crate::model::ModelString::Literal(s) => Some(s.clone()),
+                _ => None,
+            }));
+        }
+        for reaction in &reactions {
+            for arg in reaction.args.values() {
+                if let Arg::Lit(temper_spec::predicate::Literal::Str(s)) = arg {
+                    literals.insert(s.clone());
+                }
+            }
+        }
+        for model in models.values_mut() {
+            for field in &model.tracked_strings {
+                model
+                    .string_literals
+                    .entry(field.clone())
+                    .or_default()
+                    .extend(literals.clone());
+            }
+        }
         let mut grew = false;
         let mut track = |entity: &str, field: &str| {
             !matches!(field, "Id" | "id")
@@ -79,6 +116,9 @@ pub(super) fn tracked(
             }
         }
         for reaction in &reactions {
+            if let Some(TargetResolver::CreateIfMissing { id_field }) = &reaction.resolve {
+                grew |= track(&reaction.from, id_field);
+            }
             if records == Records::ById
                 && let Some(TargetResolver::Field { id_field }) = &reaction.resolve
             {
@@ -103,7 +143,7 @@ pub(super) fn tracked(
 #[derive(Debug, Clone)]
 pub(super) struct CallSpec {
     pub(super) module: String,
-    pub(super) on_success: Option<String>,
+    pub(super) on_success: Vec<String>,
     pub(super) on_failure: Option<String>,
 }
 
@@ -141,9 +181,9 @@ impl Kernel {
                 .is_some_and(|timers| timers.iter().any(|t| t.action == action))
             || self.calls_on.iter().any(|((e, _), specs)| {
                 e == entity
-                    && specs
-                        .iter()
-                        .any(|spec| named(&spec.on_success) || named(&spec.on_failure))
+                    && specs.iter().any(|spec| {
+                        spec.on_success.iter().any(|name| name == action) || named(&spec.on_failure)
+                    })
             })
     }
 
@@ -245,6 +285,14 @@ pub(super) struct Unchecked {
     pub(super) chosen: BTreeSet<(String, String)>,
     /// Each (entity, action)'s tracked fields a parameter must equal.
     pub(super) equals: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Each (entity, action)'s count parameters that must equal a counter
+    /// the model holds as a value (not as a sequence number), with that
+    /// counter. Decided when a dispatch carries the count, and only then.
+    pub(super) counts: BTreeMap<(String, String), Vec<(String, String)>>,
+    /// Each (entity, action)'s string parameters that must not be empty and
+    /// that the model does not track. Decided when a dispatch carries the
+    /// value, and only then.
+    pub(super) nonempty: BTreeMap<(String, String), Vec<String>>,
 }
 
 impl Unchecked {
@@ -262,6 +310,22 @@ impl Unchecked {
         !self
             .chosen
             .contains(&(entity.to_string(), action.to_string()))
+    }
+
+    /// The count parameters of `entity`'s `action` that must equal one of
+    /// its counters, each with the counter.
+    pub(super) fn counts(&self, entity: &str, action: &str) -> &[(String, String)] {
+        self.counts
+            .get(&(entity.to_string(), action.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The string parameters of `entity`'s `action` the model does not
+    /// track that must not be empty.
+    pub(super) fn nonempty(&self, entity: &str, action: &str) -> &[String] {
+        self.nonempty
+            .get(&(entity.to_string(), action.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The fields an `entity` record's module call keeps as it started:
@@ -286,21 +350,41 @@ pub(super) fn unchecked_constraints(
     let mut out = Unchecked::default();
     for (entity, model) in models {
         let tracked = |name: &str| model.tracked_strings.contains(name);
+        let counted = |name: &str| {
+            model.var_kinds.get(name) == Some(&VarKind::Counter)
+                && !order.fields(entity).any(|(field, _)| field == name)
+        };
         for action in &by_name[entity.as_str()].actions {
             let key = (entity.clone(), action.name.clone());
             let decided = |constraint: &ActionConstraint| match constraint {
-                ActionConstraint::ParamGreaterThanField { param, .. } => {
-                    order.decides(entity, &action.name, param)
+                ActionConstraint::ParamGreaterThanField { param, field } => {
+                    order.decides(entity, &action.name, param, field)
                 }
+                ActionConstraint::ParamEqualsField { field, .. } if counted(field) => true,
+                ActionConstraint::ParamNonempty { .. } => true,
                 _ => tracked(constraint.param()) && constraint.field().is_none_or(tracked),
             };
             if !action.constraints.iter().all(decided) {
                 out.taken.insert(key.clone());
             }
             for constraint in &action.constraints {
-                let ActionConstraint::ParamEqualsField { field, .. } = constraint else {
+                if let ActionConstraint::ParamNonempty { param } = constraint
+                    && !tracked(param)
+                {
+                    out.nonempty
+                        .entry(key.clone())
+                        .or_default()
+                        .push(param.clone());
+                }
+                let ActionConstraint::ParamEqualsField { param, field } = constraint else {
                     continue;
                 };
+                if counted(field) {
+                    out.counts
+                        .entry(key.clone())
+                        .or_default()
+                        .push((param.clone(), field.clone()));
+                }
                 if tracked(field) {
                     out.equals
                         .entry(key.clone())
@@ -386,6 +470,45 @@ fn literals_in(entity: &str, expr: &Expr, out: &mut BTreeMap<(String, String), B
                     }
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+/// Literals must remain distinct even when compared with related operands.
+pub(super) fn collect_literals(expr: &Expr, out: &mut BTreeSet<String>) {
+    use temper_spec::predicate::{Literal, Operand, Set};
+    let mut operand = |o: &Operand| {
+        if let Operand::Lit(Literal::Str(s)) = o {
+            out.insert(s.clone());
+        }
+    };
+    match expr {
+        Expr::Compare { lhs, rhs, .. } => {
+            operand(lhs);
+            operand(rhs);
+        }
+        Expr::In {
+            value,
+            set: Set::List(items),
+            ..
+        } => {
+            operand(value);
+            for item in items {
+                if let Literal::Str(s) = item {
+                    out.insert(s.clone());
+                }
+            }
+        }
+        Expr::Not(e) => collect_literals(e, out),
+        Expr::And(parts) | Expr::Or(parts) => {
+            for e in parts {
+                collect_literals(e, out);
+            }
+        }
+        Expr::Implies(a, b) => {
+            collect_literals(a, out);
+            collect_literals(b, out);
         }
         _ => {}
     }

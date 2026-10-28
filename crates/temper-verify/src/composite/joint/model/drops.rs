@@ -149,7 +149,7 @@ impl JointModel {
         } else {
             self.read_allows(dispatch, state) == Truth::False
         };
-        refused.then(|| DroppedReaction {
+        (refused && !self.expansion.exhausted.get()).then(|| DroppedReaction {
             source_entity: reaction.from.clone(),
             source_action: reaction.source_action.clone(),
             trigger_name: reaction.trigger.clone(),

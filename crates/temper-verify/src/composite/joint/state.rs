@@ -6,7 +6,7 @@ use std::fmt;
 
 use super::senders;
 use crate::model::semantics::canonical_strings;
-use crate::model::{ParamValue, TemperModelAction, TemperModelState};
+use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
 
 /// The records in scope, one per type, and the dispatches and module calls
 /// on their way.
@@ -21,7 +21,8 @@ pub struct JointState {
     /// the model makes the kernel's moves itself.
     pub calls: Vec<Call>,
     /// Who armed each record's state timer, by sender number, for the
-    /// records in a state that has one: its timer fires as them.
+    /// records whose timer is still armed. Presence tracks arming even when
+    /// sender identity does not affect any reaction.
     pub armed: BTreeMap<String, u32>,
 }
 
@@ -40,8 +41,8 @@ pub struct Call {
     pub to: String,
     /// The module.
     pub module: String,
-    /// The trigger's declared answer, if any.
-    pub on_success: Option<String>,
+    /// The trigger's declared answers; empty when it names none.
+    pub on_success: Vec<String>,
     /// The action sent when the call fails, if any.
     pub on_failure: Option<String>,
     /// Who its answer runs as, by sender number: the runtime when the call
@@ -49,7 +50,7 @@ pub struct Call {
     pub by: u32,
     /// The tracked fields its answers are tied to, as the record held them
     /// when the call started: the module answers about that record.
-    pub asked: BTreeMap<String, String>,
+    pub asked: BTreeMap<String, ModelString>,
 }
 
 impl fmt::Display for Call {
@@ -79,8 +80,9 @@ pub struct Dispatch {
     pub params: BTreeMap<String, ParamValue>,
     /// Whether the dispatch path has read the related records it needs.
     pub read: bool,
-    /// The reaction depth that sent it (0 for a request from outside).
-    pub depth: u32,
+    /// The steps this reaction chain has admitted, including this dispatch.
+    /// Empty for a request that starts a new chain.
+    pub chain: Vec<ReactionStep>,
     /// The reaction that sent it, by its place among the model's reactions;
     /// `None` for a request from outside.
     pub via: Option<usize>,
@@ -127,9 +129,9 @@ pub(super) fn render(state: &JointState) -> String {
 
 /// Renumber new strings over the whole joint state, records first, then
 /// the dispatches in flight; returns each value's new name.
-pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
+pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
     let mut dispatches = std::mem::take(&mut state.inflight);
-    let mut strings: Vec<BTreeMap<String, String>> = dispatches
+    let mut strings: Vec<BTreeMap<String, ModelString>> = dispatches
         .iter()
         .map(|d| {
             d.params
@@ -142,7 +144,7 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
         })
         .collect();
     let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, String>> = state
+        let mut maps: Vec<&mut BTreeMap<String, ModelString>> = state
             .records
             .values_mut()
             .map(|s| &mut s.strings)
@@ -160,4 +162,26 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<String, String> {
     state.inflight = dispatches;
     state.calls.sort();
     renamed
+}
+
+/// One admitted reaction step. The model holds one record per type, but
+/// distinguishes an entity the chain found from one it made.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReactionStep {
+    /// The entity type the action runs on.
+    pub entity_type: String,
+    /// The action.
+    pub action: String,
+    /// The type for which this id was generated; `same_id` keeps its origin
+    /// even through other types. `None` means the chain read the id.
+    pub generated_for: Option<String>,
+}
+
+impl ReactionStep {
+    pub(super) fn repeats(&self, taken: &Self) -> bool {
+        let made = |step: &Self| step.generated_for.as_ref() == Some(&step.entity_type);
+        self.entity_type == taken.entity_type
+            && self.action == taken.action
+            && made(self) == made(taken)
+    }
 }

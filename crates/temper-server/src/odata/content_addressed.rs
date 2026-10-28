@@ -412,6 +412,10 @@ async fn ingest_raw_inner(
             }
             .into_response()
         }
+        Err(crate::state::CreateError::StoreUnavailable(reason)) => {
+            drop(final_guard);
+            crate::write_health::store_unavailable(&reason)
+        }
         Err(error) => {
             drop(final_guard);
             odata_error(

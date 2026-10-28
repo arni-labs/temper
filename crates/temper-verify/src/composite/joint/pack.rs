@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::slice::Iter;
 
-use super::state::{Call, Dispatch, JointState};
-use crate::model::{ParamValue, TemperModelState};
+use super::state::{Call, Dispatch, JointState, ReactionStep};
+use crate::model::{ModelString, ParamValue, TemperModelState};
 
 /// A packed joint state, shared by the walk's list and its index.
 pub(super) type Packed = Rc<[u32]>;
@@ -106,6 +106,27 @@ impl Pack for String {
     }
 }
 
+impl Pack for ModelString {
+    fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
+        match self {
+            ModelString::Literal(s) => {
+                out.push(0);
+                s.put(packer, out);
+            }
+            ModelString::Symbol(n) => {
+                out.push(1);
+                n.put(packer, out);
+            }
+        }
+    }
+    fn take(packer: &Packer, input: &mut Iter<'_, u32>) -> Self {
+        match next(input) {
+            0 => Self::Literal(String::take(packer, input)),
+            _ => Self::Symbol(usize::take(packer, input)),
+        }
+    }
+}
+
 impl<T: Pack> Pack for Option<T> {
     fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
         out.push(u32::from(self.is_some()));
@@ -169,7 +190,7 @@ impl Pack for ParamValue {
         match next(input) {
             0 => ParamValue::Count(usize::take(packer, input)),
             1 => ParamValue::Bool(bool::take(packer, input)),
-            2 => ParamValue::Str(String::take(packer, input)),
+            2 => ParamValue::Str(ModelString::take(packer, input)),
             _ => ParamValue::Fresh,
         }
     }
@@ -194,6 +215,21 @@ impl Pack for TemperModelState {
     }
 }
 
+impl Pack for ReactionStep {
+    fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
+        self.entity_type.put(packer, out);
+        self.action.put(packer, out);
+        self.generated_for.put(packer, out);
+    }
+    fn take(packer: &Packer, input: &mut Iter<'_, u32>) -> Self {
+        Self {
+            entity_type: Pack::take(packer, input),
+            action: Pack::take(packer, input),
+            generated_for: Pack::take(packer, input),
+        }
+    }
+}
+
 impl Pack for Dispatch {
     fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
         self.to.put(packer, out);
@@ -201,7 +237,7 @@ impl Pack for Dispatch {
         self.target_state.put(packer, out);
         self.params.put(packer, out);
         self.read.put(packer, out);
-        self.depth.put(packer, out);
+        self.chain.put(packer, out);
         self.via.put(packer, out);
         self.by.put(packer, out);
         self.inline.put(packer, out);
@@ -213,7 +249,7 @@ impl Pack for Dispatch {
             target_state: Pack::take(packer, input),
             params: Pack::take(packer, input),
             read: Pack::take(packer, input),
-            depth: Pack::take(packer, input),
+            chain: Pack::take(packer, input),
             via: Pack::take(packer, input),
             by: Pack::take(packer, input),
             inline: Pack::take(packer, input),
@@ -256,5 +292,38 @@ impl Pack for JointState {
             calls: Pack::take(packer, input),
             armed: Pack::take(packer, input),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_call_snapshots_keep_literals_distinct_from_symbols() {
+        let state = JointState {
+            records: BTreeMap::new(),
+            inflight: Vec::new(),
+            calls: vec![Call {
+                to: "T".into(),
+                module: "worker".into(),
+                on_success: Vec::new(),
+                on_failure: None,
+                by: 0,
+                asked: BTreeMap::from([
+                    ("literal".into(), ModelString::from("#1")),
+                    ("fresh".into(), ModelString::Symbol(1)),
+                ]),
+            }],
+            armed: BTreeMap::new(),
+        };
+        let mut packer = Packer::default();
+        let packed = packer.pack(&state);
+        let restored = packer.unpack(&packed);
+        assert_eq!(restored, state);
+        assert_ne!(
+            restored.calls[0].asked["literal"],
+            restored.calls[0].asked["fresh"]
+        );
     }
 }

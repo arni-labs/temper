@@ -13,6 +13,7 @@ mod allocator;
 mod audit;
 mod codegen;
 mod decide;
+mod dns;
 mod init;
 mod install;
 mod mcp;
@@ -288,8 +289,11 @@ fn resolve_tokio_thread_stack_bytes(env_value: Option<&str>) -> Result<usize, St
 fn main() -> anyhow::Result<()> {
     // Load .env file from project root (silently ignored if missing).
     dotenvy::dotenv().ok();
+    // Still the only thread: the runtime is built below.
+    dns::ask_again_after_one_second();
     let cli = Cli::parse();
     let is_mcp = matches!(&cli.command, Commands::Mcp { .. });
+    let is_serve = matches!(&cli.command, Commands::Serve { .. });
 
     let tokio_thread_stack_bytes = resolve_tokio_thread_stack_bytes(
         std::env::var("TEMPER_TOKIO_THREAD_STACK_BYTES")
@@ -304,9 +308,11 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let result = runtime.block_on(async_main(cli));
-    if is_mcp {
+    if is_mcp || is_serve {
         // A canceled Tokio stdio task may leave an uncancellable OS pipe call.
         // MCP has already drained output or reported failure before returning.
+        // A stopped server has reported the writes it owed and flushed its
+        // telemetry; its background tasks must not hold up the exit.
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }
     result
