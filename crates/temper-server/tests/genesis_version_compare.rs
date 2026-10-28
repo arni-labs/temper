@@ -254,3 +254,66 @@ async fn an_anonymous_caller_gets_no_answer_about_a_private_app() {
         "an authenticated caller, already past Cedar, gets the answer"
     );
 }
+
+/// GET the tenant API's compare route with no credential.
+async fn anonymous_get(
+    state: ServerState,
+    uri: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt as _;
+
+    let mut platform = temper_platform::state::PlatformState::new(None);
+    platform.server = state;
+    let response = temper_platform::tenant_api::tenant_api_router()
+        .with_state(platform)
+        .oneshot(
+            axum::http::Request::get(uri)
+                .header("x-tenant-id", "default")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route answers");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&body).expect("JSON body"))
+}
+
+#[tokio::test]
+async fn the_route_answers_anonymous_callers_on_the_bundle_routes_terms() {
+    let state = registry().await;
+    let route = |name: &str, range: String| format!("/genesis/apps/acme/{name}/compare/{range}");
+
+    let (status, body) = anonymous_get(
+        state.clone(),
+        &route("widget", format!("{}...{}", sha("c1"), sha("c3"))),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::json!({ "status": "ahead" }));
+
+    // A private app and an absent one get the same answer, so the route
+    // cannot be used to tell which private apps exist.
+    let (private, private_body) = anonymous_get(
+        state.clone(),
+        &route("secret", format!("{}...{}", sha("a1"), sha("a2"))),
+    )
+    .await;
+    let (absent, absent_body) = anonymous_get(
+        state.clone(),
+        &route("nothing", format!("{}...{}", sha("a1"), sha("a2"))),
+    )
+    .await;
+    assert_eq!(private, 404);
+    assert_eq!(absent, 404);
+    assert_eq!(private_body, absent_body);
+
+    let (status, _) = anonymous_get(
+        state,
+        &route("widget", format!("{}..{}", sha("c1"), sha("c3"))),
+    )
+    .await;
+    assert_eq!(status, 400, "a malformed range is a bad request");
+}
