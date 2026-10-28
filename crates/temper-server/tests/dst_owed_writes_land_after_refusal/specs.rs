@@ -120,18 +120,20 @@ pub const CSDL: &str = r#"<?xml version="1.0"?>
 <EntityContainer Name="Default"><EntitySet Name="Jobs" EntityType="Jobs.Job"/><EntitySet Name="Ledgers" EntityType="Jobs.Ledger"/><EntitySet Name="Children" EntityType="Jobs.Child"/></EntityContainer>
 </Schema></edmx:DataServices></edmx:Edmx>"#;
 
-/// A WASM module that answers `{"params": {"value": 42}}` whatever it is
-/// asked: the trigger's `on_success` sends it as `Answer`.
-pub fn oracle_module() -> String {
-    let payload = serde_json::json!({ "params": { "value": 42 } }).to_string();
+/// A WASM module that answers `{"params": {"value": <value>}}` whatever it
+/// is asked: the trigger's `on_success` sends it as `Answer`.
+pub fn oracle_module(value: &serde_json::Value) -> String {
+    let payload = serde_json::json!({ "params": { "value": value } }).to_string();
     let data = payload
         .bytes()
         .map(|byte| format!("\\{byte:02x}"))
         .collect::<String>();
+    // Enough 64 KiB pages to hold the answer.
+    let pages = payload.len() / 65_536 + 1;
     format!(
         r#"(module
         (import "env" "host_set_result" (func $result (param i32 i32)))
-        (memory (export "memory") 1)
+        (memory (export "memory") {pages})
         (data (i32.const 0) "{data}")
         (func (export "run") (param i32 i32) (result i32)
             i32.const 0 i32.const {} call $result i32.const 0))"#,

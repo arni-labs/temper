@@ -6,9 +6,9 @@
 //! failing one is not final: the write is kept here and tried again, first
 //! after [`FIRST_RETRY_WAIT`] and then twice as long after each try, up to
 //! [`LAST_RETRY_WAIT`], until it lands or fails for another reason. Any
-//! other failure (Cedar, a guard or the record's state refusing it, a busy
-//! actor) is final, and each owed write handles it as it did before. A
-//! scheduled action's fire waits the same way.
+//! other failure (Cedar, a guard or the record's state refusing it, an actor
+//! whose mailbox is full) is final, and each owed write handles it as it did
+//! before. A scheduled action's fire waits the same way.
 //!
 //! Every try carries the same idempotency key, derived from the key the move
 //! committed under and the owed write's identity (a timer's fire, from its
@@ -21,7 +21,9 @@
 //! Which failures are the store's is read from the reply ([`Attempt::of`]):
 //! a reply marked `store_unavailable`, which the actor answers for a
 //! `Storage`, `OutcomeUnknown` or `StorageFull` persistence error, or
-//! [`DispatchError::StoreUnavailable`], which carries one.
+//! [`DispatchError::StoreUnavailable`], which carries one. An actor that did
+//! not answer, because the ask timed out or the actor stopped first, is
+//! treated the same: the write may yet land, or was never handled.
 //!
 //! Kept writes live only in this process, so a restart loses them, except a
 //! state timer's fire, whose row arms it again at boot. The gauge
@@ -34,6 +36,7 @@ use std::pin::Pin;
 use std::sync::PoisonError;
 use std::time::Duration;
 
+use temper_runtime::actor::ActorError;
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
@@ -103,7 +106,8 @@ pub(crate) enum Attempt {
     Landed,
     /// It did not land for a reason other than the store's: final.
     Failed(String),
-    /// The store failed it: it was not written, or its outcome is unknown.
+    /// The store failed it, or its record's actor did not answer: it was not
+    /// written, or its outcome is unknown.
     StoreFailed(String),
 }
 
@@ -123,8 +127,32 @@ impl Attempt {
                     Self::Failed(error)
                 }
             }
-            Err(error @ DispatchError::StoreUnavailable(_)) => Self::StoreFailed(error.to_string()),
-            Err(error) => Self::Failed(error.to_string()),
+            Err(error) => Self::of_error(error),
+        }
+    }
+
+    /// What a dispatch that failed with `error`, or a read of the record it
+    /// writes, says about its write.
+    ///
+    /// An ask the actor did not answer in time is still in its mailbox and
+    /// may land later, so the write is kept whatever kept the actor: the ask
+    /// carries no reason, and a later try that meets the write landed is
+    /// answered as a duplicate under the same key. An actor that stopped
+    /// before answering (its starts failed, as they do while its journal
+    /// cannot be read) never handled the move, and a later try starts it
+    /// again. A write kept for a reason that never clears stays held, which
+    /// `temper_owed_writes_held` shows.
+    pub(crate) fn of_error(error: &DispatchError) -> Self {
+        match error {
+            DispatchError::StoreUnavailable(_) => Self::StoreFailed(error.to_string()),
+            DispatchError::Transient {
+                source: ActorError::AskTimeout(_),
+                ..
+            } => Self::StoreFailed(error.to_string()),
+            DispatchError::Permanent {
+                source: ActorError::Stopped,
+            } => Self::StoreFailed(error.to_string()),
+            _ => Self::Failed(error.to_string()),
         }
     }
 }
@@ -274,3 +302,7 @@ impl ServerState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "owed_writes_test.rs"]
+mod tests;

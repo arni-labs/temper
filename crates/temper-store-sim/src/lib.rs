@@ -197,6 +197,8 @@ struct SimEventStoreInner {
     commits: BTreeMap<String, u64>,
     /// Whether appends are written. See `stop_writes_after_next_append`.
     writes: write_stops::Writes,
+    /// The append set to hang. See `hang_next_append`.
+    hang: write_hangs::Hang,
     /// Appends refused while the store took no writes, by the journal each
     /// would have written. See `refused_appends`.
     refused_appends: BTreeMap<String, u64>,
@@ -245,6 +247,7 @@ impl SimEventStore {
                 state_timers: BTreeMap::new(),
                 commits: BTreeMap::new(),
                 writes: write_stops::Writes::default(),
+                hang: write_hangs::Hang::default(),
                 refused_appends: BTreeMap::new(),
             })),
         }
@@ -573,6 +576,7 @@ impl EventStore for SimEventStore {
             fired_scheduled_action,
             ..
         } = rows;
+        self.hang_if_set([persistence_id]).await;
         let append_delay = {
             let mut inner = self
                 .inner
@@ -1092,6 +1096,8 @@ impl EventStore for SimEventStore {
         if appends.is_empty() {
             return Ok(Vec::new());
         }
+        self.hang_if_set(appends.iter().map(|append| append.persistence_id.as_str()))
+            .await;
 
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
 
@@ -1410,4 +1416,5 @@ mod tests;
 mod entity_rows;
 pub use entity_rows::SimProjection;
 
+mod write_hangs;
 mod write_stops;

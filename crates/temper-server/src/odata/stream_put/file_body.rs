@@ -264,7 +264,12 @@ async fn authorize_file_write(
         .await
         .map_err(|error| {
             Box::new(
-                odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error).into_response(),
+                odata_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ReadError",
+                    &error.to_string(),
+                )
+                .into_response(),
             )
         })?;
     authorize_mutation(

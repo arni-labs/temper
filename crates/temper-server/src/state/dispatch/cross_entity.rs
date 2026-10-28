@@ -248,55 +248,13 @@ impl crate::state::ServerState {
                         serde_json::Value::Object(parent_fields.clone())
                     };
 
-                    if let Some((action, params)) = &initializer {
-                        let table = &child_table;
-                        let validation = state
-                            .load_authz_resource_snapshot(&t, &child_type, &child_id)
-                            .await
-                            .and_then(|snapshot| {
-                                // Existing actors validate against their hydrated blob
-                                // values and execution-time state. Only absent children
-                                // need this check before creation can persist anything.
-                                if snapshot.exists {
-                                    return Ok(());
-                                }
-                                let prestate =
-                                    crate::entity_actor::EntityActor::build_initial_state(
-                                        &child_type,
-                                        &child_id,
-                                        table,
-                                        &initial_fields,
-                                    );
-                                table
-                                    .validate_action_params(
-                                        action,
-                                        params,
-                                        &prestate.fields,
-                                        &prestate.counters,
-                                        &prestate.booleans,
-                                    )
-                                    .map_err(String::from)
-                            });
-                        if let Err(error) = validation {
-                            state.record_generated_callback_refusal(
-                                super::WasmEntityRef {
-                                    tenant: &t,
-                                    entity_type: &parent_t,
-                                    entity_id: &parent_i,
-                                },
-                                action,
-                                &error,
-                            );
-                            return;
-                        }
-                    }
-
                     let child = ChildSpawn {
                         tenant: t,
                         parent_type: parent_t,
                         parent_id: parent_i,
                         child_type,
                         child_id,
+                        table: child_table,
                         initial_fields,
                         initializer,
                         agent,
@@ -318,6 +276,9 @@ struct ChildSpawn {
     parent_id: String,
     child_type: String,
     child_id: String,
+    /// The child type's transition table, which its initial action's
+    /// parameters are checked against.
+    table: Arc<TransitionTable>,
     initial_fields: serde_json::Value,
     initializer: Option<(String, serde_json::Value)>,
     /// The spawning move's identity, under the child's own key.
@@ -335,13 +296,17 @@ impl ChildSpawn {
 }
 
 impl crate::state::ServerState {
-    /// Create `child`, then send its initial action. A creation the store did
-    /// not take, or an initial action it did not, is the store's failure; any
-    /// other failure is final, and a child whose initial action failed stays
-    /// in its first state. Creating a child that exists already reads it, so
-    /// a try after a creation that landed goes on to the initial action.
+    /// Check `child`'s initial action, create the child, then send the
+    /// action. A read of the child, a creation or an initial action the store
+    /// did not take is the store's failure; any other failure is final, and a
+    /// child whose initial action failed stays in its first state. Creating a
+    /// child that exists already reads it, so a try after a creation that
+    /// landed goes on to the initial action.
     async fn spawn_child(&self, child: &ChildSpawn) -> Attempt {
         let (tenant, child_type, child_id) = (&child.tenant, &child.child_type, &child.child_id);
+        if let Err(attempt) = self.check_child_initializer(child).await {
+            return attempt;
+        }
         let created = match self
             .get_or_create_tenant_entity_by(
                 tenant,
@@ -406,6 +371,49 @@ impl crate::state::ServerState {
             self.record_generated_callback_refusal(child.parent(), action, error);
         }
         attempt
+    }
+
+    /// Check `child`'s initial action against the child it would be sent
+    /// to. Existing actors validate against their hydrated blob values and
+    /// execution-time state; only an absent child needs this check before
+    /// creation can persist anything. A read of the child the store failed
+    /// is tried again with the spawn; a refused check is final.
+    async fn check_child_initializer(&self, child: &ChildSpawn) -> Result<(), Attempt> {
+        let Some((action, params)) = &child.initializer else {
+            return Ok(());
+        };
+        let (tenant, child_type, child_id) = (&child.tenant, &child.child_type, &child.child_id);
+        let refused = match self
+            .load_authz_resource_snapshot(tenant, child_type, child_id)
+            .await
+        {
+            Ok(snapshot) if snapshot.exists => return Ok(()),
+            Ok(_) => {
+                let table = &child.table;
+                let prestate = crate::entity_actor::EntityActor::build_initial_state(
+                    child_type,
+                    child_id,
+                    table,
+                    &child.initial_fields,
+                );
+                match table.validate_action_params(
+                    action,
+                    params,
+                    &prestate.fields,
+                    &prestate.counters,
+                    &prestate.booleans,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => String::from(error),
+                }
+            }
+            Err(error) => match Attempt::of_error(&error) {
+                Attempt::Failed(refused) => refused,
+                attempt => return Err(attempt),
+            },
+        };
+        self.record_generated_callback_refusal(child.parent(), action, &refused);
+        Err(Attempt::Failed(refused))
     }
 
     /// Keep a child whose spawn the store failed as an owed write: it is

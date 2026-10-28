@@ -81,6 +81,7 @@ pub(super) async fn decide(request: &BoundAction<'_>, first: bool) -> Result<Dec
     {
         Ok(v) => v,
         Err(e) => {
+            let e = e.to_string();
             action_span.set_status(Status::error(e.clone()));
             let code = if e.contains("registry lock poisoned") {
                 "RegistryError"

@@ -15,10 +15,12 @@ use temper_runtime::tenant::TenantId;
 use tracing;
 use tracing::instrument;
 
+use super::owed_reactions::{Reaction, ReactionTry};
 use super::principal::{effective_trigger_security_context, resolve_trigger_principal};
 use super::registry::ReactionRegistry;
 use super::repeat_stop::RepeatStop;
 use super::types::ReactionResult;
+use crate::state::owed_writes::OwedMove;
 
 /// Async reaction dispatcher for production use.
 ///
@@ -247,12 +249,26 @@ impl ReactionDispatcher {
             );
             dispatch_ctx.inline_chain = chain;
 
-            let authz_snapshot = match state
-                .load_authz_resource_snapshot(tenant, &rule.then.entity_type, &target_entity_id)
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(e) => {
+            // Read the target, authorize the move on it as it is now, and fire
+            // it via the core dispatch (no reaction cascade to avoid infinite
+            // async recursion — we handle cascading ourselves). A try whose
+            // read or send the store failed is kept and tried again, read and
+            // authorization included (`owed_reactions`).
+            let security_ctx = effective_trigger_security_context(&dispatch_ctx, &cause);
+            let reaction = Reaction {
+                sent: OwedMove {
+                    tenant: tenant.clone(),
+                    entity_type: rule.then.entity_type.clone(),
+                    entity_id: target_entity_id.clone(),
+                    action: rule.then.action.clone(),
+                    params: effective_params,
+                    agent_ctx: dispatch_ctx.clone(),
+                },
+                authorized_as: security_ctx.clone(),
+            };
+            let tried = state.dispatch_reaction(reaction, depth).await;
+            let dispatch_result = match tried {
+                ReactionTry::Unread(e) => {
                     tracing::warn!(
                         rule = rule.name,
                         target_entity = %rule.then.entity_type,
@@ -264,58 +280,39 @@ impl ReactionDispatcher {
                         rule_name: rule.name.clone(),
                         success: false,
                         target_status: None,
-                        error: Some(e),
+                        error: Some(e.to_string()),
                         depth,
                     });
                     continue;
                 }
+                ReactionTry::Denied {
+                    reason,
+                    target_status,
+                } => {
+                    authz_denied_count += 1;
+                    tracing::warn!(
+                        rule = rule.name,
+                        target_entity = %rule.then.entity_type,
+                        target_id = %target_entity_id,
+                        target_action = %rule.then.action,
+                        principal_id = %security_ctx.principal.id,
+                        principal_kind = ?security_ctx.principal.kind,
+                        via = cause.via(),
+                        depth = cause.depth,
+                        "Reaction authorization denied: {reason}"
+                    );
+                    results.push(ReactionResult {
+                        rule_name: rule.name.clone(),
+                        success: false,
+                        target_status: Some(target_status),
+                        error: Some(reason),
+                        depth,
+                    });
+                    continue;
+                }
+                ReactionTry::Sent(reply) => *reply,
             };
-
-            let security_ctx = effective_trigger_security_context(&dispatch_ctx, &cause);
-            if let Err(denial) = state.authorize_with_context(
-                &security_ctx,
-                &rule.then.action,
-                &rule.then.entity_type,
-                &authz_snapshot.resource_attrs,
-                tenant.as_str(),
-            ) {
-                let reason = denial.to_string();
-                authz_denied_count += 1;
-                tracing::warn!(
-                    rule = rule.name,
-                    target_entity = %rule.then.entity_type,
-                    target_id = %target_entity_id,
-                    target_action = %rule.then.action,
-                    principal_id = %security_ctx.principal.id,
-                    principal_kind = ?security_ctx.principal.kind,
-                    via = cause.via(),
-                    depth = cause.depth,
-                    "Reaction authorization denied: {reason}"
-                );
-                results.push(ReactionResult {
-                    rule_name: rule.name.clone(),
-                    success: false,
-                    target_status: Some(authz_snapshot.current_state.state.status.clone()),
-                    error: Some(reason),
-                    depth,
-                });
-                continue;
-            }
-
-            // Fire the target action via the core dispatch (no reaction cascade
-            // to avoid infinite async recursion — we handle cascading ourselves).
-            // One the store fails is kept and sent again (`owed_reactions`).
             fired_count += 1;
-            let dispatch_result = state
-                .dispatch_reaction(
-                    tenant,
-                    &rule.then,
-                    &target_entity_id,
-                    effective_params,
-                    &dispatch_ctx,
-                    depth,
-                )
-                .await;
 
             match dispatch_result {
                 Ok(response) => {
