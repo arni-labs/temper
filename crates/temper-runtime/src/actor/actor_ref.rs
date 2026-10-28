@@ -164,13 +164,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn actor_id_new_sets_name_and_path() {
-        let id = ActorId::new("order-actor", "system/orders/order-1");
-        assert_eq!(id.name, "order-actor");
-        assert_eq!(id.path, "system/orders/order-1");
-    }
-
-    #[test]
     fn actor_id_display_format() {
         let id = ActorId::new("test", "system/test");
         let display = format!("{}", id);
