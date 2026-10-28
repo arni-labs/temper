@@ -50,7 +50,10 @@ async fn boot_projection_comparison_is_batched_and_respects_effective_sequences(
             .save_snapshot(&format!("{tenant}:Payment:snapshot"), 4, b"{}")
             .await
             .unwrap();
-        let conn = store.configured_connection().await.unwrap();
+        let conn = store
+            .write_connection("test", super::super::WritePriority::High)
+            .await
+            .unwrap();
         conn.execute("INSERT INTO entity_catalog_counters (tenant, entity_type, entity_id, sequence_nr, counters)
             VALUES (?1, 'Payment', 'counter-current', 3, '{}')", params![tenant]).await.unwrap();
     }
