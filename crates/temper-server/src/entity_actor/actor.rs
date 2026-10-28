@@ -75,6 +75,9 @@ impl ReplayPolicy {
 /// What the caller of a refused write is told. An oversized change and a full
 /// disk are told in their own words (what to do about it); anything else
 /// failed to persist.
+/// Why a delete decided on a state its record has left was not written.
+const STALE_DELETE: &str = "delete authorization became stale; retry against current state";
+
 fn persistence_failure(error: &PersistenceError) -> String {
     match error {
         PersistenceError::EventTooLarge { .. } | PersistenceError::StorageFull { .. } => {
@@ -2298,13 +2301,13 @@ impl EntityActor {
                     ));
                     return Ok(());
                 }
+                let has_precondition = expected_authorization_precondition.is_some();
                 if let Some(expected) = expected_authorization_precondition
                     && super::effects::entity_authorization_precondition(state) != expected
                 {
                     ctx.reply(EntityResponse::record_changed(
                         state.clone(),
-                        "delete authorization became stale; retry against current state"
-                            .to_string(),
+                        STALE_DELETE.to_string(),
                     ));
                     return Ok(());
                 }
@@ -2355,7 +2358,26 @@ impl EntityActor {
                         )
                         .await
                 {
-                    ctx.reply(persistence_failure_reply(state.clone(), &e));
+                    // A delete decided on a state the journal had left, as an
+                    // action or a field update is: caught up, it is refused
+                    // as RecordChanged, and the route decides it again.
+                    let reply = match e {
+                        PersistenceError::ConcurrencyViolation { actual, .. }
+                            if has_precondition =>
+                        {
+                            match super::field_updates::catch_up(self, state, 1, actual, "Delete")
+                                .await
+                            {
+                                Ok(()) => EntityResponse::record_changed(
+                                    state.clone(),
+                                    STALE_DELETE.to_string(),
+                                ),
+                                Err(reason) => EntityResponse::write_failed(state.clone(), reason),
+                            }
+                        }
+                        e => persistence_failure_reply(state.clone(), &e),
+                    };
+                    ctx.reply(reply);
                     return Ok(());
                 }
 

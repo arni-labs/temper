@@ -241,7 +241,8 @@ fn budget_refusal(actor: &EntityActor, state: &EntityState, replace: bool) -> Op
     ))
 }
 
-/// Rebuild `state` from the journal after a sequence conflict.
+/// Rebuild `state` from the journal after a sequence conflict. A field update
+/// and a delete that met one catch up through here before they answer.
 ///
 /// Rebuilds from a *fresh* initial state, exactly as
 /// `recover_entity_state_from_store` does. `replay_events` applies onto whatever
@@ -252,7 +253,7 @@ fn budget_refusal(actor: &EntityActor, state: &EntityState, replace: bool) -> Op
 /// the caller, upserted into the query projection, and made durable by the next
 /// snapshot. Rolling back `fields` alone cannot help — those other fields were
 /// never part of the speculative update.
-async fn catch_up(
+pub(super) async fn catch_up(
     actor: &EntityActor,
     state: &mut EntityState,
     attempt: u32,
@@ -272,7 +273,7 @@ async fn catch_up(
         action = %action,
         actual_seq = actual,
         attempt,
-        "field update hit optimistic-concurrency violation; replaying and retrying"
+        "write hit an optimistic-concurrency violation; catching up with the journal"
     );
 
     let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend) else {
