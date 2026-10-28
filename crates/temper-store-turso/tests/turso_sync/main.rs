@@ -241,6 +241,10 @@ async fn checkpoints_between_writes_fail_none_of_them() {
     }
 }
 
+/// A checkpoint waits for the calls in flight instead of skipping, and says
+/// how long it waited and how long it took: every call that needed a
+/// connection meanwhile, the write holding the store's write gate included,
+/// waited as long.
 #[tokio::test]
 async fn a_checkpoint_waits_for_the_calls_in_flight_instead_of_skipping() {
     // Skipping whenever a connection was in use let the log grow without
@@ -250,6 +254,13 @@ async fn a_checkpoint_waits_for_the_calls_in_flight_instead_of_skipping() {
     let Some(server) = SyncServer::start() else {
         return;
     };
+    let lines = Lines::default();
+    // This thread's own listener: the test runtime runs every task here.
+    let _listening =
+        tracing::subscriber::set_default(tracing_subscriber::layer::SubscriberExt::with(
+            tracing_subscriber::registry(),
+            lines.clone(),
+        ));
     let (_a_dir, a_path) = machine();
     let a = std::sync::Arc::new(server.open(&a_path).await);
     for i in 0..10 {
@@ -272,9 +283,25 @@ async fn a_checkpoint_waits_for_the_calls_in_flight_instead_of_skipping() {
         "the trim still holds its connection"
     );
 
+    let asked = Instant::now();
     assert!(
         copy.checkpoint_if_wal_over(0).await.expect("checkpoint"),
         "the checkpoint ran once the trim let go of its connection"
+    );
+    let took = asked.elapsed();
+    let held = lines
+        .find(|line| line.message == "turso.sync checkpoint held new calls")
+        .expect("a checkpoint that waited for the trim says so");
+    let field = |name: &str| -> u128 {
+        held.fields[name]
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} in {held:?}"))
+    };
+    assert!(
+        field("waited_ms") >= 100 && field("waited_ms") + field("fold_ms") <= took.as_millis(),
+        "the line gives the wait for the trim's connection and the fold, \
+         within the {} ms the call took: {held:?}",
+        took.as_millis()
     );
     let trimmed = trimming.await.expect("trim task").expect("trim");
     assert!(trimmed > 0, "the trim deleted the pushed changes");
