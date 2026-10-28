@@ -13,6 +13,3 @@ proc-macro = true
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
-
-[dev-dependencies]
-temper-wasm-sdk = { path = "../temper-wasm-sdk" }
