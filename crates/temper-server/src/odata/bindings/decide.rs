@@ -12,7 +12,7 @@ use temper_runtime::tenant::TenantId;
 use super::ActionSpan;
 use crate::authz::{DenialInput, record_authz_denial};
 use crate::odata::account_verification::enforce_commons_account_verified_for_action;
-use crate::odata::common::run_write_prechecks;
+use crate::odata::common::{authorized_snapshot_failure, run_write_prechecks};
 use crate::odata::file_content::refuse_caller_content;
 use crate::odata::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_action};
 use crate::request_context::AgentContext;
@@ -252,16 +252,9 @@ pub(super) async fn decide(request: &BoundAction<'_>, first: bool) -> Result<Dec
         Err(error) => {
             // A conflict here is the record created, differently than the
             // checks read it, while they ran.
-            let record_changed = matches!(error, DispatchError::Conflict(_));
-            let status = if record_changed {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
             return Err(Undecided {
-                response: odata_error(status, "AuthorizationStateChanged", &error.to_string())
-                    .into_response(),
-                record_changed,
+                response: authorized_snapshot_failure(&error).into_response(),
+                record_changed: matches!(error, DispatchError::Conflict(_)),
             });
         }
     };

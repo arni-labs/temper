@@ -11,7 +11,9 @@ use temper_odata::path::ODataPath;
 use temper_runtime::tenant::TenantId;
 
 use super::super::authz::{MutationResource, UPDATE_ACTION, authorize_mutation};
-use super::super::common::{check_has_stream_or_400, resolve_entity_type, resolve_value_parent};
+use super::super::common::{
+    authorized_snapshot_failure, check_has_stream_or_400, resolve_entity_type, resolve_value_parent,
+};
 use super::super::content_addressed::responses::{blob_store_error_response, stage_error_response};
 use super::{
     check_verification_gate_or_423, file_stream_content_error_response, stream_put_success_response,
@@ -274,17 +276,7 @@ async fn authorize_file_write(
     let snapshot = state
         .materialize_authorized_snapshot(tenant, "File", file_id, snapshot)
         .await
-        .map_err(|error| {
-            let status = if matches!(error, crate::state::DispatchError::Conflict(_)) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            Box::new(
-                odata_error(status, "AuthorizationStateChanged", &error.to_string())
-                    .into_response(),
-            )
-        })?;
+        .map_err(|error| Box::new(authorized_snapshot_failure(&error).into_response()))?;
     Ok(Some(
         crate::entity_actor::effects::entity_authorization_precondition(
             &snapshot.current_state.state,

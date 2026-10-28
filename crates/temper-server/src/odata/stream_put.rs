@@ -12,7 +12,8 @@ use tracing::instrument;
 
 use super::authz::{MutationResource, UPDATE_ACTION, authorize_mutation};
 use super::common::{
-    check_has_stream_or_400, resolve_entity_type, resolve_value_parent, verification_gate_response,
+    authorized_snapshot_failure, check_has_stream_or_400, resolve_entity_type,
+    resolve_value_parent, verification_gate_response,
 };
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::entity_actor::EntityResponse;
@@ -194,16 +195,7 @@ pub(super) async fn handle_stream_put(
                 if redecide.again(changed, "stream_put") {
                     continue;
                 }
-                return odata_error(
-                    if changed {
-                        StatusCode::CONFLICT
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    },
-                    "AuthorizationStateChanged",
-                    &error.to_string(),
-                )
-                .into_response();
+                return authorized_snapshot_failure(&error).into_response();
             }
         };
         let decided_on = crate::entity_actor::effects::entity_authorization_precondition(
