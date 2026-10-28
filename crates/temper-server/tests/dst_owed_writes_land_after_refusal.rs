@@ -18,13 +18,12 @@
 //! not know the first attempt landed applies it twice. Half the callers send
 //! an `Idempotency-Key`.
 //!
-//! A store fails in other ways too (`Outage`), and the kernel does not keep
-//! the owed write for them yet, so their tests fail until it does: the owed
-//! write's first append hangs while the store takes no writes, so its caller
-//! times out rather than being refused; the owing record's journal cannot
-//! be read by a server that has not loaded the record since it started; or
-//! the blob store takes nothing, so an answer too large to keep inline
-//! cannot be stored.
+//! A store fails in other ways too (`Outage`), and the kernel keeps the owed
+//! write through each: the owed write's first append hangs while the store
+//! takes no writes, so its caller times out rather than being refused; the
+//! owing record's journal cannot be read by a server that has not loaded
+//! the record since it started; or the blob store takes nothing, so an
+//! answer too large to keep inline cannot be stored.
 //!
 //! Invariants, per seed:
 //! - the move that sets the write off lands exactly once;

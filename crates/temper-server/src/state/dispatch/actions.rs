@@ -485,8 +485,7 @@ impl crate::state::ServerState {
         if table.has_input_contracts() && !self.entity_exists(tenant, entity_type, entity_id) {
             let snapshot = self
                 .load_authz_resource_snapshot(tenant, entity_type, entity_id)
-                .await
-                .map_err(DispatchError::Internal)?;
+                .await?;
             if !snapshot.exists {
                 let mut response = snapshot.current_state;
                 if let Err(error) = table.validate_action_params(

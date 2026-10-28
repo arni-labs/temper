@@ -1,58 +1,89 @@
 //! A reaction's move on its target, owed once the source move commits.
 //!
-//! The move goes through the core dispatch, without its own reaction cascade:
-//! [`super::ReactionDispatcher`] runs the cascade of a move that lands at once.
-//! A move the store failed is kept (`state::dispatch::owed_writes`) and sent
-//! again under the reaction's key until it lands or fails otherwise, and its
-//! cascade runs when it lands.
+//! Each try reads the target, authorizes the move on it as it is now, and
+//! sends the move through the core dispatch, without its own reaction
+//! cascade: [`super::ReactionDispatcher`] runs the cascade of a move that
+//! lands at once. A try the store failed, in the read or the send, is kept
+//! (`state::dispatch::owed_writes`) and tried again under the reaction's key
+//! until it lands or fails otherwise, and its cascade runs when it lands.
 
 use std::sync::{Arc, PoisonError};
 
-use temper_runtime::tenant::TenantId;
+use temper_authz::SecurityContext;
 
-use super::types::ReactionTarget;
 use crate::entity_actor::EntityResponse;
-use crate::request_context::AgentContext;
 use crate::state::owed_writes::{Attempt, OwedKind, OwedMove, OwedTry};
 use crate::state::{DispatchError, ServerState};
 
-impl ServerState {
-    /// Send a reaction at cascade `depth`: `target`'s action on `target_id`
-    /// with `params`, as `ctx`, which carries the reaction's key.
-    pub(crate) async fn dispatch_reaction(
-        &self,
-        tenant: &TenantId,
-        target: &ReactionTarget,
-        target_id: &str,
-        params: serde_json::Value,
-        ctx: &AgentContext,
-        depth: u32,
-    ) -> Result<EntityResponse, DispatchError> {
-        let sent = OwedMove {
-            tenant: tenant.clone(),
-            entity_type: target.entity_type.clone(),
-            entity_id: target_id.to_string(),
-            action: target.action.clone(),
-            params,
-            agent_ctx: ctx.clone(),
-        };
-        let reply = send_reaction(self, &sent).await;
-        if let Attempt::StoreFailed(error) = Attempt::of(&reply) {
-            let owed = sent.owed(OwedKind::Reaction);
-            let sent = Arc::new(sent);
-            self.keep_owed_write(owed, &error, move |state| {
-                react_again(state, Arc::clone(&sent), depth)
-            });
+/// What one try of a reaction did.
+pub(crate) enum ReactionTry {
+    /// Its target could not be read to authorize the move on it.
+    Unread(DispatchError),
+    /// Cedar refused the move on its target, in `target_status`.
+    Denied {
+        reason: String,
+        target_status: String,
+    },
+    /// The move was sent: the dispatch's reply.
+    Sent(Box<Result<EntityResponse, DispatchError>>),
+}
+
+impl ReactionTry {
+    fn attempt(&self) -> Attempt {
+        match self {
+            Self::Unread(error) => Attempt::of_error(error),
+            Self::Denied { reason, .. } => Attempt::Failed(reason.clone()),
+            Self::Sent(reply) => Attempt::of(reply),
         }
-        reply
     }
 }
 
-async fn send_reaction(
-    state: &ServerState,
-    sent: &OwedMove,
-) -> Result<EntityResponse, DispatchError> {
-    state
+/// A reaction's move on its target, sent as its context, which carries the
+/// reaction's key, and who the move is authorized as.
+pub(crate) struct Reaction {
+    pub(crate) sent: OwedMove,
+    pub(crate) authorized_as: SecurityContext,
+}
+
+impl ServerState {
+    /// Try `reaction` at cascade `depth`, and keep it if the store failed it.
+    pub(crate) async fn dispatch_reaction(&self, reaction: Reaction, depth: u32) -> ReactionTry {
+        let tried = try_reaction(self, &reaction).await;
+        if let Attempt::StoreFailed(error) = tried.attempt() {
+            let owed = reaction.sent.owed(OwedKind::Reaction);
+            let reaction = Arc::new(reaction);
+            self.keep_owed_write(owed, &error, move |state| {
+                react_again(state, Arc::clone(&reaction), depth)
+            });
+        }
+        tried
+    }
+}
+
+/// Read the reaction's target, authorize its move on the target as it is
+/// now, and send it.
+async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
+    let sent = &reaction.sent;
+    let snapshot = match state
+        .load_authz_resource_snapshot(&sent.tenant, &sent.entity_type, &sent.entity_id)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return ReactionTry::Unread(error),
+    };
+    if let Err(denial) = state.authorize_with_context(
+        &reaction.authorized_as,
+        &sent.action,
+        &sent.entity_type,
+        &snapshot.resource_attrs,
+        sent.tenant.as_str(),
+    ) {
+        return ReactionTry::Denied {
+            reason: denial.to_string(),
+            target_status: snapshot.current_state.state.status,
+        };
+    }
+    let reply = state
         .dispatch_tenant_action_core(
             &sent.tenant,
             &sent.entity_type,
@@ -63,22 +94,25 @@ async fn send_reaction(
             false,
             None,
         )
-        .await
+        .await;
+    ReactionTry::Sent(Box::new(reply))
 }
 
-/// Send an owed reaction again; once it lands, run its cascade at the next
+/// Try an owed reaction again; once it lands, run its cascade at the next
 /// depth, as the dispatcher does for a reaction that lands at once: under
 /// the reaction's context, which knows the children it spawned as made.
-fn react_again(state: ServerState, sent: Arc<OwedMove>, depth: u32) -> OwedTry {
+fn react_again(state: ServerState, reaction: Arc<Reaction>, depth: u32) -> OwedTry {
     Box::pin(async move {
-        let reply = send_reaction(&state, &sent).await;
-        let attempt = Attempt::of(&reply);
+        let tried = try_reaction(&state, &reaction).await;
+        let attempt = tried.attempt();
         let dispatcher = state
             .reaction_dispatcher
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if let (Ok(response), Some(dispatcher)) = (reply, dispatcher)
+        let sent = &reaction.sent;
+        if let (ReactionTry::Sent(reply), Some(dispatcher)) = (tried, dispatcher)
+            && let Ok(response) = *reply
             && response.success
         {
             let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
