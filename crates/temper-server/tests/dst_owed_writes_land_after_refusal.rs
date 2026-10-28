@@ -18,6 +18,14 @@
 //! not know the first attempt landed applies it twice. Half the callers send
 //! an `Idempotency-Key`.
 //!
+//! A store fails in other ways too (`Outage`), and the kernel does not keep
+//! the owed write for them yet, so their tests fail until it does: the owed
+//! write's first append hangs while the store takes no writes, so its caller
+//! times out rather than being refused; the owing record's journal cannot
+//! be read by a server that has not loaded the record since it started; or
+//! the blob store takes nothing, so an answer too large to keep inline
+//! cannot be stored.
+//!
 //! Invariants, per seed:
 //! - the move that sets the write off lands exactly once;
 //! - within [`RECOVERY_WINDOW`] of the store taking writes again, the owed
@@ -46,6 +54,7 @@ mod specs;
 mod world;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,9 +62,11 @@ use faults::Fault;
 use process_clock::ProcessClock;
 use serde_json::json;
 use temper_runtime::ActorSystem;
-use temper_runtime::persistence::EventStore;
-use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_sim_context};
+use temper_runtime::scheduler::{
+    DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
+};
 use temper_runtime::tenant::TenantId;
+use temper_server::entity_actor::effects::DEFAULT_FIELD_INLINE_MAX;
 use temper_server::idempotency::IdempotencyKey;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
@@ -140,6 +151,68 @@ impl Owed {
     }
 }
 
+/// How the store fails the owed write, from the move that sets it off until
+/// the stretch ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outage {
+    /// It takes no writes from the moment the move commits.
+    Refuses,
+    /// The same, and the owed write's first append hangs until the stretch
+    /// ends, so its caller times out instead of being refused.
+    Hangs,
+    /// The owing record's journal cannot be read, and the server has not
+    /// loaded the record since it started. Writes go on.
+    CannotRead,
+    /// The blob store takes nothing, so a field too large to keep inline
+    /// cannot be stored. The event store goes on.
+    RefusesBlobs,
+}
+
+impl Outage {
+    /// What the module answers `Ask` with: when blobs are refused, a value
+    /// too large to keep inline, so the answer's write stores a blob first.
+    fn answer(self) -> serde_json::Value {
+        match self {
+            Self::RefusesBlobs => json!("a".repeat(DEFAULT_FIELD_INLINE_MAX)),
+            Self::Refuses | Self::Hangs | Self::CannotRead => json!(42),
+        }
+    }
+
+    /// Fail the store this way before the move.
+    fn begin(self, store: &SimEventStore, state: &ServerState, job: Record, owing: Record) {
+        match self {
+            Self::Refuses => store.stop_writes_after_next_append(&job.journal()),
+            Self::Hangs => {
+                store.stop_writes_after_next_append(&job.journal());
+                store.hang_next_append(&owing.journal());
+            }
+            Self::CannotRead => store.fail_next_reads(&owing.journal(), usize::MAX),
+            // A file where the blob directory goes, so no blob can be stored.
+            Self::RefusesBlobs => std::fs::write(state.data_dir.join("blobs"), b"")
+                .expect("the blob directory is blocked"),
+        }
+    }
+
+    /// Let the store work again.
+    fn end(self, store: &SimEventStore, state: &ServerState, owing: Record) {
+        match self {
+            Self::Refuses | Self::Hangs => store.take_writes_again(),
+            Self::CannotRead => store.fail_next_reads(&owing.journal(), 0),
+            Self::RefusesBlobs => std::fs::remove_file(state.data_dir.join("blobs"))
+                .expect("the blob directory is unblocked"),
+        }
+    }
+
+    /// What the store did not do while it failed.
+    fn refused(self) -> &'static str {
+        match self {
+            Self::Refuses | Self::Hangs => "the store took no writes",
+            Self::CannotRead => "its journal could not be read",
+            Self::RefusesBlobs => "the store took no blobs",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Record {
     entity_type: &'static str,
@@ -171,11 +244,9 @@ impl Journal {
     }
 }
 
-async fn read_journal(store: &SimEventStore, record: Record) -> Journal {
-    let events = store
-        .read_events(&record.journal(), 0)
-        .await
-        .expect("the journal reads");
+/// Read past any read failure the store is set to inject.
+fn read_journal(store: &SimEventStore, record: Record) -> Journal {
+    let events = store.dump_journal(&record.journal());
     let status = events
         .iter()
         .rev()
@@ -218,7 +289,15 @@ async fn settle() {
     }
 }
 
-fn server(store: &SimEventStore, rows: &Arc<SimTimerRows>, seed: u64) -> ServerState {
+/// A server on `store`, whose module answers as `outage` needs, and which
+/// keeps object blobs in `blobs` when it is given.
+fn server(
+    store: &SimEventStore,
+    rows: &Arc<SimTimerRows>,
+    seed: u64,
+    outage: Outage,
+    blobs: Option<&Path>,
+) -> ServerState {
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(specs::CSDL).expect("CSDL parses");
     registry.register_tenant(
@@ -234,6 +313,11 @@ fn server(store: &SimEventStore, rows: &Arc<SimTimerRows>, seed: u64) -> ServerS
     let mut state = ServerState::from_registry(ActorSystem::new(format!("owed-{seed}")), registry);
     state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
     state.state_timer_rows = Some(rows.clone());
+    if let Some(blobs) = blobs {
+        // A field too large to keep inline is stored here, and its event
+        // holds a reference to it.
+        state.data_dir = blobs.to_path_buf();
+    }
     // A reaction and a callback are authorized as moves of their own: with no
     // tenant policy, Cedar refuses them and nothing would be owed.
     state
@@ -243,7 +327,7 @@ fn server(store: &SimEventStore, rows: &Arc<SimTimerRows>, seed: u64) -> ServerS
     state.rebuild_reaction_dispatcher();
     let hash = state
         .wasm_engine
-        .compile_and_cache(specs::oracle_module().as_bytes())
+        .compile_and_cache(specs::oracle_module(&outage.answer()).as_bytes())
         .expect("the module compiles");
     state.register_wasm_module(&TenantId::new(TENANT), "oracle", &hash);
     state
@@ -276,10 +360,19 @@ struct Drawn {
     keyed: bool,
 }
 
-/// One seed of `owed`, and the first broken invariant. With `store_stops`
-/// false the store takes every write and nothing is faulted: the control,
-/// in which the owed write must land too.
-fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), String>) {
+/// One seed of `owed` meeting `outage`, and the first broken invariant. With
+/// `store_fails` false the store works throughout and nothing is faulted:
+/// the control, in which the owed write must land too.
+fn run_seed(
+    owed: Owed,
+    outage: Outage,
+    seed: u64,
+    store_fails: bool,
+) -> (Drawn, Result<(), String>) {
+    // Its own directory for object blobs, which the outage can block.
+    let blob_dir = (outage == Outage::RefusesBlobs)
+        .then(|| tempfile::tempdir().expect("a blob directory is made"));
+    let blobs = blob_dir.as_ref().map(tempfile::TempDir::path);
     let clock = Arc::new(ProcessClock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -296,7 +389,7 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
         rng.next_u64();
     }
     let drawn = Fault::draw(&mut rng);
-    let fault = if store_stops { drawn } else { Fault::None };
+    let fault = if store_fails { drawn } else { Fault::None };
     let mut stretch = Duration::from_secs(1 + rng.next_bound(LONGEST_STRETCH_SECS) as u64);
     if owed == Owed::TimerFire {
         // The timer falls due while the store takes no writes.
@@ -318,7 +411,7 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
     };
     let ended = runtime.block_on(async {
         clock.begin();
-        let state = server(&store, &rows, seed);
+        let mut state = server(&store, &rows, seed, outage, blobs);
         let tenant = TenantId::new(TENANT);
         let mut records = vec![job];
         if owed == Owed::Reaction {
@@ -335,18 +428,41 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
                 .await
                 .map_err(|error| run.fail("records are created", error.to_string()))?;
         }
+        if outage == Outage::CannotRead {
+            // The server starts again, so the owing record's actor is not
+            // loaded and must read its journal to start.
+            state = server(&store, &rows, seed, outage, blobs);
+        }
 
-        if store_stops {
-            store.stop_writes_after_next_append(&job.journal());
+        if store_fails {
+            outage.begin(&store, &state, job, owing);
         }
         let (action, _) = owed.trigger();
+        let sent_at = sim_now();
         let answer = set_off(&state, owed, &caller).await;
         run.trace.push(format!(
-            "{action} (keyed: {keyed}, the store stops: {store_stops}): {answer}"
+            "{action} (keyed: {keyed}, outage: {outage:?}, the store fails: {store_fails}): \
+             {answer} after {}s",
+            (sim_now() - sent_at).num_seconds()
         ));
         tokio::time::sleep(stretch).await;
         settle().await;
-        let during = read_journal(&store, owing).await;
+        if store_fails && outage == Outage::Hangs {
+            // Let the hung append go while the store still takes no writes and
+            // long after its caller gave up (the move awaits its reactions):
+            // it and the caller's tries queued behind it are refused. They
+            // run before the second passes, as the paused clock moves only
+            // once every task is idle.
+            if !store.let_hung_appends_go() {
+                return Err(run.fail(
+                    "the owed write's first append hangs (harness)",
+                    format!("no append to {} hung", owing.journal()),
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            settle().await;
+        }
+        let during = read_journal(&store, owing);
         run.trace.push(format!(
             "{}s later {} holds {:?}",
             stretch.as_secs(),
@@ -354,27 +470,29 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
             during.events
         ));
         let early = owed_events.iter().find(|event| during.count(event) > 0);
-        if let Some(early) = early.filter(|_| store_stops) {
+        if let Some(early) = early.filter(|_| store_fails) {
             return Err(run.fail(
-                "the owed write meets the refusal (harness)",
-                format!("{early} landed while the store took no writes"),
+                "the owed write meets the outage (harness)",
+                format!("{early} landed while {}", outage.refused()),
             ));
         }
 
-        store.take_writes_again();
+        if store_fails {
+            outage.end(&store, &state, owing);
+        }
         fault.apply(&store, &owing.journal());
         tokio::time::sleep(RECOVERY_WINDOW).await;
         settle().await;
         Fault::clear(&store, &owing.journal());
-        let after = read_journal(&store, owing).await;
+        let after = read_journal(&store, owing);
         run.trace.push(format!(
-            "the store takes writes again, the first to {} {fault:?}; {}s later it holds {:?}",
+            "the store works again, the first write to {} {fault:?}; {}s later it holds {:?}",
             owing.journal(),
             RECOVERY_WINDOW.as_secs(),
             after.events
         ));
 
-        let moves = read_journal(&store, job).await.count(action);
+        let moves = read_journal(&store, job).count(action);
         if moves != 1 {
             return Err(run.fail(
                 "the move that sets the write off lands exactly once",
@@ -417,20 +535,22 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
     (Drawn { fault, keyed }, ended)
 }
 
-/// Run `owed` over every seed and fail with each broken invariant, the
-/// seeds that broke it and the first report.
-fn check_over_seeds(owed: Owed) {
-    // With the store taking writes, the move sets its write off and the write
-    // lands: a write lost in a seed whose store stopped was lost to the stop.
-    if let (_, Err(report)) = run_seed(owed, 0, false) {
-        panic!("{owed:?}: the owed write lands while the store takes writes (harness): {report}");
+/// Run `owed` meeting `outage` over every seed and fail with each broken
+/// invariant, the seeds that broke it and the first report.
+fn check_over_seeds(owed: Owed, outage: Outage) {
+    // With the store working, the move sets its write off and the write
+    // lands: a write lost in a seed whose store failed was lost to the outage.
+    if let (_, Err(report)) = run_seed(owed, outage, 0, false) {
+        panic!(
+            "{owed:?}, {outage:?}: the owed write lands while the store works (harness): {report}"
+        );
     }
     let mut broken: BTreeMap<String, (Vec<u64>, String)> = BTreeMap::new();
     // Seeds whose owed write met an outcome-unknown write, by whether the
     // caller sent a key.
     let mut outcome_unknown: BTreeMap<bool, usize> = BTreeMap::new();
     for seed in 0..SEEDS {
-        let (drawn, ended) = run_seed(owed, seed, true);
+        let (drawn, ended) = run_seed(owed, outage, seed, true);
         if drawn.fault == Fault::LandThenFailUnreadable {
             *outcome_unknown.entry(drawn.keyed).or_default() += 1;
         }
@@ -448,40 +568,62 @@ fn check_over_seeds(owed: Owed) {
         .collect();
     assert!(
         broken.is_empty(),
-        "{owed:?}: invariants broken over {SEEDS} seeds:\n\n{}",
+        "{owed:?}, {outage:?}: invariants broken over {SEEDS} seeds:\n\n{}",
         summary.join("\n\n")
     );
     // A harness that never loses the answer to a write that landed cannot
     // catch a retry that applies it twice, with or without a caller's key.
     assert!(
         outcome_unknown.len() == 2,
-        "{owed:?}: over {SEEDS} seeds, outcome-unknown writes met only these callers (keyed: count): {outcome_unknown:?}"
+        "{owed:?}, {outage:?}: over {SEEDS} seeds, outcome-unknown writes met only these callers (keyed: count): {outcome_unknown:?}"
     );
 }
 
 /// A module answer that arrives while the store refuses writes.
 #[test]
 fn dst_a_module_answer_during_a_store_refusal_lands_after_recovery_exactly_once() {
-    check_over_seeds(Owed::BackgroundAnswer);
+    check_over_seeds(Owed::BackgroundAnswer, Outage::Refuses);
 }
 
 /// The same, for a caller that waits for the answer.
 #[test]
 fn dst_an_inline_module_answer_during_a_store_refusal_lands_after_recovery_exactly_once() {
-    check_over_seeds(Owed::InlineAnswer);
+    check_over_seeds(Owed::InlineAnswer, Outage::Refuses);
 }
 
 #[test]
 fn dst_a_state_timer_due_during_a_store_refusal_fires_after_recovery_exactly_once() {
-    check_over_seeds(Owed::TimerFire);
+    check_over_seeds(Owed::TimerFire, Outage::Refuses);
 }
 
 #[test]
 fn dst_a_reaction_during_a_store_refusal_lands_after_recovery_exactly_once() {
-    check_over_seeds(Owed::Reaction);
+    check_over_seeds(Owed::Reaction, Outage::Refuses);
 }
 
 #[test]
 fn dst_a_child_spawned_during_a_store_refusal_is_created_after_recovery_exactly_once() {
-    check_over_seeds(Owed::ChildSpawn);
+    check_over_seeds(Owed::ChildSpawn, Outage::Refuses);
+}
+
+/// A reaction whose write hangs in a store outage: its caller times out
+/// rather than being refused. Fails until the kernel keeps an owed write
+/// whose store did not answer.
+#[test]
+fn dst_a_reaction_whose_write_hangs_in_a_store_outage_lands_after_recovery_exactly_once() {
+    check_over_seeds(Owed::Reaction, Outage::Hangs);
+}
+
+/// A reaction on a record whose journal a restarted server cannot read.
+/// Fails until the kernel keeps an owed write the store could not read for.
+#[test]
+fn dst_a_reaction_on_a_record_that_cannot_be_read_lands_after_reads_return_exactly_once() {
+    check_over_seeds(Owed::Reaction, Outage::CannotRead);
+}
+
+/// A module answer too large to keep inline, whose blob the store does not
+/// take. Fails until the kernel keeps an owed write whose blob was refused.
+#[test]
+fn dst_a_module_answer_whose_blob_is_refused_lands_after_recovery_exactly_once() {
+    check_over_seeds(Owed::BackgroundAnswer, Outage::RefusesBlobs);
 }
