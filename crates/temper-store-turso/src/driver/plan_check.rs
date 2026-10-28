@@ -47,6 +47,7 @@ pub(super) async fn check(conn: &turso::Connection, sql: &str) {
         return;
     };
     let tables = table_names(sql);
+    let terms = without_set_lists(sql);
     for detail in plan {
         let Some((name, searched_by)) = search_of(&detail) else {
             continue;
@@ -60,7 +61,7 @@ pub(super) async fn check(conn: &turso::Connection, sql: &str) {
         for (index, columns) in indexes(conn, table).await {
             let given = columns
                 .iter()
-                .take_while(|column| gives(sql, name, unqualified, column))
+                .take_while(|column| gives(&terms, name, unqualified, column))
                 .count();
             assert!(
                 used >= given,
@@ -230,6 +231,38 @@ fn gives(sql: &str, name: &str, unqualified: bool, column: &str) -> bool {
     false
 }
 
+/// `sql` with each `SET` list blanked out, up to the next `WHERE`: an
+/// assignment there writes a column, it does not choose rows.
+fn without_set_lists(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let mut out = sql.to_string();
+    let mut from = 0;
+    while let Some(found) = find_word(&upper[from..], "SET") {
+        let start = from + found;
+        let end = find_word(&upper[start..], "WHERE").map_or(sql.len(), |at| start + at);
+        out.replace_range(start..end, &" ".repeat(end - start));
+        from = end;
+    }
+    out
+}
+
+/// Where `word` first stands as a whole word in `text`.
+fn find_word(text: &str, word: &str) -> Option<usize> {
+    let is_word = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(found) = text[from..].find(word) {
+        let start = from + found;
+        let end = start + word.len();
+        let word_before = start > 0 && is_word(&bytes[start - 1]);
+        if !word_before && !bytes.get(end).is_some_and(is_word) {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
+}
+
 /// Whether the text before a term (`lead`) or after it (`rest`) joins it with
 /// `OR`.
 fn joined_by_or(lead: &str, rest: &str) -> bool {
@@ -306,5 +339,24 @@ mod tests {
         assert!(gives(ordered, "t", true, "origin"));
         let grouped = "SELECT 1 FROM t WHERE (tenant = ?1) OR x = 1";
         assert!(!gives(grouped, "t", true, "tenant"));
+    }
+
+    #[test]
+    fn an_assignment_is_not_given() {
+        let terms = without_set_lists(
+            "UPDATE t SET disposition = ?3, offset = ?4 WHERE tenant = ?1 AND id = ?2",
+        );
+        assert!(!gives(&terms, "t", true, "disposition"));
+        assert!(!gives(&terms, "t", true, "offset"));
+        assert!(gives(&terms, "t", true, "tenant"));
+        assert!(gives(&terms, "t", true, "id"));
+        let upsert = without_set_lists(
+            "INSERT INTO t (a) VALUES (?1) ON CONFLICT(a) DO UPDATE SET last_seen = ?2",
+        );
+        assert!(!gives(&upsert, "t", true, "last_seen"));
+        assert_eq!(
+            without_set_lists("SELECT reset FROM t"),
+            "SELECT reset FROM t"
+        );
     }
 }
