@@ -29,7 +29,7 @@ use temper_evolution::PostgresRecordStore;
 use temper_observe::ClickHouseStore;
 use temper_observe::otel::init_observability;
 use temper_platform::optimization::run_optimization_cycle;
-use temper_platform::router::build_platform_router;
+use temper_platform::router::build_platform_routes;
 use temper_platform::state::PlatformState;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::{EntityLevelSummary, EntityVerificationResult, VerificationStatus};
@@ -259,8 +259,7 @@ pub async fn run(
     }
 
     // Phase 9: Bind, start background tasks, serve
-    let router =
-        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_synced_store);
+    let router = sync_copy::serve_router(build_platform_routes(state.clone()), turso_synced_store);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
         .with_context(|| format!("Failed to bind to {bind}:{port}"))?;
