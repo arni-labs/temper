@@ -409,3 +409,18 @@ fn unknown_or_unimplemented_delete_policy_is_refused() {
         );
     }
 }
+
+#[test]
+fn delete_policy_as_a_string_element_reads_as_the_attribute_does() {
+    use crate::cross_invariant::DeletePolicy;
+    let attribute = r#"<Annotation Term="Temper.Vocab.Relation.DeletePolicy" String="cascade"/>"#;
+    let element = r#"<Annotation Term="Temper.Vocab.Relation.DeletePolicy"><String>cascade</String></Annotation>"#;
+    let xml = csdl_with_delete_policy("cascade").replace(attribute, element);
+    let doc = parse_csdl(&xml).expect("the String element form of a delete policy parses");
+    assert_eq!(child_parent_policy(&doc), Some(DeletePolicy::Cascade));
+
+    let collection = r#"<Annotation Term="Temper.Vocab.Relation.DeletePolicy"><Collection><String>cascade</String></Collection></Annotation>"#;
+    let error = parse_csdl(&csdl_with_delete_policy("cascade").replace(attribute, collection))
+        .expect_err("a Collection is not a delete policy, even one of one String");
+    assert!(error.to_string().contains("must be a String"), "{error}");
+}

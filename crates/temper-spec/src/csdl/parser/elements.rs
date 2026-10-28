@@ -203,10 +203,17 @@ pub(super) fn parse_annotation_children(
     }
 
     let mut collection_items = Vec::new();
+    let mut in_collection = false;
     let mut record_fields: Option<std::collections::HashMap<String, String>> = None;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(ref element))
+            | Ok(quick_xml::events::Event::Empty(ref element))
+                if local_name(element) == "Collection" =>
+            {
+                in_collection = true;
+            }
             // <Record><PropertyValue Property="k" String="v"/>…</Record>: the
             // shape the emitter writes for a Record value. A Record with no
             // PropertyValue is still a Record, not an empty String.
@@ -259,6 +266,10 @@ pub(super) fn parse_annotation_children(
         AnnotationValue::Record(fields)
     } else if collection_items.is_empty() {
         AnnotationValue::String(String::new())
+    } else if !in_collection && collection_items.len() == 1 {
+        // `<Annotation Term="t"><String>v</String></Annotation>` is the element
+        // form of `String="v"`: one String, not a Collection of one.
+        AnnotationValue::String(collection_items.remove(0))
     } else {
         AnnotationValue::Collection(collection_items)
     };
