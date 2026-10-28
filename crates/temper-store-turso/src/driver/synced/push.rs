@@ -36,25 +36,51 @@ impl SyncCopy {
         // Changes are numbered in commit order (one writer at a time), so
         // everything this caller committed is at or below `wanted`.
         let wanted = self.last_change().await?;
-        let _pushing = self.inner.pushing.lock().await;
         self.require_copying()?;
+        // Already on the remote: nothing to wait for, not even a push that
+        // holds the lock for later changes.
         if self.inner.pushed.load(Ordering::Acquire) >= wanted {
             return Ok(());
         }
         // The engine logs each step of a push; in this span they reach the
-        // trace with their times, so a slow push shows which step waited.
+        // trace with their times, so a slow push shows which step waited. It
+        // opens before the lock, so the time spent queued behind another push
+        // is in it too (`waited_ms`).
         let span = tracing::info_span!(
             "turso.sync.push",
+            waited_ms = Empty,
+            carried = Empty,
             changes = Empty,
             elapsed_ms = Empty,
             error = Empty
         );
+        self.push_through(wanted, &span)
+            .instrument(span.clone())
+            .await
+    }
+
+    /// Wait for the push lock, then push unless the push that held it
+    /// carried everything up to `wanted` (`carried`).
+    async fn push_through(
+        &self,
+        wanted: i64,
+        span: &tracing::Span,
+    ) -> Result<(), PersistenceError> {
+        let asked = Instant::now();
+        let _pushing = self.inner.pushing.lock().await;
+        span.record("waited_ms", asked.elapsed().as_millis() as u64);
+        self.require_copying()?;
+        let carried = self.inner.pushed.load(Ordering::Acquire) >= wanted;
+        span.record("carried", carried);
+        if carried {
+            return Ok(());
+        }
         let started = Instant::now();
-        let mut push = std::pin::pin!(self.push_now().instrument(span.clone()));
+        let mut push = std::pin::pin!(self.push_now());
         let pushed = match tokio::time::timeout(SLOW_PUSH, &mut push).await {
             Ok(pushed) => pushed,
             Err(_) => {
-                self.time_a_fresh_request(&span);
+                self.time_a_fresh_request(span);
                 push.await
             }
         };
