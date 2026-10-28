@@ -29,8 +29,11 @@
 //! So that a run means something: a control run, with the store taking every
 //! write, must land the owed write exactly once, so a write lost elsewhere
 //! was lost to the refusal; each seed checks that the owed write did not
-//! land while the store took no writes; and each case must meet an
-//! outcome-unknown write from a caller with a key and from one without.
+//! land while the store took no writes, that the store refused an append to
+//! its journal then (so it landed on a later try, not its first), and that
+//! the fault drawn for the first write after met an append to that journal;
+//! and each case must meet an outcome-unknown write from a caller with a key
+//! and from one without.
 //!
 //! The server runs in one single-threaded, paused-clock Tokio runtime, and
 //! `sim_now()` reads that clock. The module is real WASM, run by the
@@ -347,8 +350,9 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
         tokio::time::sleep(stretch).await;
         settle().await;
         let during = read_journal(&store, owing).await;
+        let refused = store.refused_appends(&owing.journal());
         run.trace.push(format!(
-            "{}s later {} holds {:?}",
+            "{}s later {} holds {:?}, and the store refused {refused} appends to it",
             stretch.as_secs(),
             owing.journal(),
             during.events
@@ -356,8 +360,19 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
         let early = owed_events.iter().find(|event| during.count(event) > 0);
         if let Some(early) = early.filter(|_| store_stops) {
             return Err(run.fail(
-                "the owed write meets the refusal (harness)",
+                "the owed write does not land during the refusal (harness)",
                 format!("{early} landed while the store took no writes"),
+            ));
+        }
+        // A write the store never refused was never tried while it was down,
+        // or writes a journal other than the one this case reads.
+        if store_stops && refused == 0 {
+            return Err(run.fail(
+                "the owed write met the refusal (harness)",
+                format!(
+                    "no append to {} was refused while the store took no writes",
+                    owing.journal()
+                ),
             ));
         }
 
@@ -365,10 +380,11 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
         fault.apply(&store, &owing.journal());
         tokio::time::sleep(RECOVERY_WINDOW).await;
         settle().await;
+        let fault_met = !store.append_faults_pending(&owing.journal());
         Fault::clear(&store, &owing.journal());
         let after = read_journal(&store, owing).await;
         run.trace.push(format!(
-            "the store takes writes again, the first to {} {fault:?}; {}s later it holds {:?}",
+            "the store takes writes again, the first to {} {fault:?} (met: {fault_met}); {}s later it holds {:?}",
             owing.journal(),
             RECOVERY_WINDOW.as_secs(),
             after.events
@@ -409,6 +425,13 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
             return Err(run.fail(
                 "a timer that fired leaves no row behind",
                 format!("{row:?}"),
+            ));
+        }
+        // Checked last, so that a write that never lands fails on that.
+        if !fault_met {
+            return Err(run.fail(
+                "the owed write met the fault drawn for it (harness)",
+                format!("the {fault:?} set on {} met no append", owing.journal()),
             ));
         }
         clock.end(Duration::ZERO);

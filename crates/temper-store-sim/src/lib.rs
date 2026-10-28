@@ -197,6 +197,9 @@ struct SimEventStoreInner {
     commits: BTreeMap<String, u64>,
     /// Whether appends are written. See `stop_writes_after_next_append`.
     writes: write_stops::Writes,
+    /// Appends refused while the store took no writes, by the journal each
+    /// would have written. See `refused_appends`.
+    refused_appends: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +245,7 @@ impl SimEventStore {
                 state_timers: BTreeMap::new(),
                 commits: BTreeMap::new(),
                 writes: write_stops::Writes::default(),
+                refused_appends: BTreeMap::new(),
             })),
         }
     }
@@ -402,6 +406,22 @@ impl SimEventStore {
             .entry(persistence_id.to_string())
             .or_default()
             .push_back(delay);
+    }
+
+    /// Whether a fault injected for appends to `persistence_id` (a failure, a
+    /// conflict, a lost or failed answer, a delay) has yet to meet one. A
+    /// test reads it to know the append it faulted was the one it meant.
+    pub fn append_faults_pending(&self, persistence_id: &str) -> bool {
+        let inner = self.lock();
+        inner.pending_append_failures.contains_key(persistence_id)
+            || inner
+                .pending_lost_append_answers
+                .contains_key(persistence_id)
+            || inner.pending_landed_failures.contains_key(persistence_id)
+            || inner
+                .pending_concurrency_violations
+                .contains_key(persistence_id)
+            || inner.pending_append_delays.contains_key(persistence_id)
     }
 
     /// Create a SimEventStore with no fault injection.
@@ -571,7 +591,7 @@ impl EventStore for SimEventStore {
 
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
 
-        if let Some(error) = inner.refused_write() {
+        if let Some(error) = inner.refused_write([persistence_id]) {
             return Err(error);
         }
 
@@ -1076,7 +1096,9 @@ impl EventStore for SimEventStore {
                 )));
             }
         }
-        if let Some(error) = inner.refused_write() {
+        if let Some(error) =
+            inner.refused_write(appends.iter().map(|append| append.persistence_id.as_str()))
+        {
             return Err(error);
         }
 
