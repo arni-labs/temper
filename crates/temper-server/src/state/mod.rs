@@ -3,6 +3,7 @@
 pub(crate) mod account_verification;
 pub mod admission;
 pub(crate) mod app_uniqueness;
+pub(crate) mod batch_delete;
 pub mod custom_effects;
 mod dispatch;
 mod entity_ops;
@@ -20,7 +21,9 @@ mod projection_backfill;
 mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
+pub(crate) mod redecide;
 mod runtime_metrics;
+mod spec_change;
 mod start_runtime;
 pub mod status_cache;
 pub(crate) mod storage_caps;
@@ -31,11 +34,14 @@ pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
+pub(crate) use dispatch::owed_writes;
 pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
     StateTimeoutTracker, TimerFollowHold,
 };
-pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
+pub use entity_ops::{
+    CreateError, FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError,
+};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
 pub use file_reads::{IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult};
@@ -53,6 +59,9 @@ pub(crate) use published_artifacts::{
     PUBLISH_ARTIFACT_STALE_AUTHORIZATION, PublishArtifactAuthorization,
 };
 pub(crate) use query_projection_queue::{ProjectionEnqueueOutcome, QueryProjectionWriteQueue};
+pub use spec_change::{
+    CarryMove, CarryReport, SpecChange, SpecChangePlan, SpecChangeRefused, StuckRecords,
+};
 pub use trajectory::{TrajectoryEntry, TrajectorySource};
 pub use wasm_invocation_log::WasmInvocationEntry;
 
@@ -530,10 +539,17 @@ pub struct ServerState {
     /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
+    /// The writes committed moves owe that the store has not taken yet, by
+    /// idempotency key, each tried again until it lands or fails otherwise
+    /// (`dispatch::owed_writes`). In memory only: a restart loses them.
+    pub(crate) owed_writes: Arc<Mutex<BTreeMap<String, dispatch::owed_writes::OwedWrite>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
     pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Held by each carry pass, so a pass derives its carries only after
+    /// the one before it has made its own (see `spec_change::carry_pass`).
+    pub(crate) carry_pass: Arc<tokio::sync::Mutex<()>>,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -833,8 +849,10 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
+            carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1113,8 +1131,10 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
+            carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1237,6 +1257,11 @@ impl ServerState {
             // The status clock is the actor's, for its timers; a query never
             // reads it, and rows written before it was kept stay comparable.
             obj.remove("status_clock");
+            // The idempotency keys are the actor's, to drop a repeated
+            // request; a query never reads them. Every dispatch records one
+            // (up to 1,000 per entity), so keeping them would make every
+            // action, a poll that changes nothing included, change the row.
+            obj.remove("processed_idempotency_keys");
         }
         projected
     }
@@ -1280,6 +1305,21 @@ impl ServerState {
             || self
                 .actor_backed_types
                 .contains(&format!("{}:{entity_type}", tenant.as_str()))
+    }
+
+    /// Whether `entity_type` takes only the actions its spec declares: its
+    /// entities are never changed or deleted by a generic write.
+    pub(crate) fn has_strict_action_params(&self, tenant: &TenantId, entity_type: &str) -> bool {
+        let registry = self.registry.read().expect("registry lock poisoned");
+        registry
+            .get_table(tenant, entity_type)
+            .map(|table| table.strict_action_params)
+            .or_else(|| {
+                self.transition_tables
+                    .get(entity_type)
+                    .map(|table| table.strict_action_params)
+            })
+            .unwrap_or(false)
     }
 
     /// Attach an encrypted secrets vault.

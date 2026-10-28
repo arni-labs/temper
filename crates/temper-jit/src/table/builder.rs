@@ -4,7 +4,9 @@
 //! translation layer in `temper-spec`. The shared layer eliminates duplicated
 //! guard/effect translation logic between JIT and verification paths.
 
-use temper_spec::automaton::{self, Automaton, ResolvedEffect, translate_actions};
+use temper_spec::automaton::{
+    self, Automaton, ResolvedEffect, translate_actions, translate_carries,
+};
 
 use super::types::{
     CompositeActionMetadata, CompositeCedarGate, Effect, SubWriteSpec, TransitionRule,
@@ -37,9 +39,12 @@ impl TransitionTable {
     ///
     /// Each action becomes a [`TransitionRule`] with guards and effects
     /// derived from the IOA specification via the shared translation layer.
-    /// Output actions are skipped (they don't transition state).
+    /// Output actions are skipped (they don't transition state). Each
+    /// `[[carry]]` becomes a rule too, named by
+    /// [`Automaton::carry_moves`], for the platform to make at install.
     pub fn from_automaton(automaton: &Automaton) -> Self {
-        let resolved_actions = translate_actions(automaton);
+        let mut resolved_actions = translate_actions(automaton);
+        resolved_actions.extend(translate_carries(automaton));
 
         let rules: Vec<TransitionRule> = resolved_actions
             .into_iter()
@@ -179,6 +184,28 @@ impl TransitionTable {
                         },
                     )
                 })
+                .chain(automaton.carry_moves().into_iter().map(|(name, carry)| {
+                    let declared = |var: &String| {
+                        automaton
+                            .state
+                            .iter()
+                            .find(|state| &state.name == var)
+                            .map(|state| (var.clone(), state.var_type))
+                    };
+                    (
+                        name,
+                        super::action_contract::ActionContract {
+                            params: carry.set.keys().cloned().collect(),
+                            param_types: carry.set.keys().filter_map(declared).collect(),
+                            ..Default::default()
+                        },
+                    )
+                }))
+                .collect(),
+            invariants: automaton
+                .invariants
+                .iter()
+                .filter_map(super::invariant::MoveInvariant::from_spec)
                 .collect(),
             rule_index,
         }
