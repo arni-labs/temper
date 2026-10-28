@@ -304,17 +304,16 @@ impl ReactionDispatcher {
 
             // Fire the target action via the core dispatch (no reaction cascade
             // to avoid infinite async recursion — we handle cascading ourselves).
+            // One the store fails is kept and sent again (`owed_reactions`).
             fired_count += 1;
             let dispatch_result = state
-                .dispatch_tenant_action_core(
+                .dispatch_reaction(
                     tenant,
-                    &rule.then.entity_type,
+                    &rule.then,
                     &target_entity_id,
-                    &rule.then.action,
                     effective_params,
                     &dispatch_ctx,
-                    false,
-                    None,
+                    depth,
                 )
                 .await;
 

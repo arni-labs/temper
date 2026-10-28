@@ -54,6 +54,26 @@ fn truncate_request_body_for_log(serialized: &str) -> String {
     format!("{}[truncated]", &serialized[..end])
 }
 
+/// `agent_ctx` with a key for the move it sends: the caller's, or one made up
+/// for an unkeyed caller. Everything the move's commit sets off (its answer,
+/// reactions and children) derives its own key from this one, so a write the
+/// move owes carries the same key on every try (see `owed_writes`).
+fn keyed_for_move(
+    mut agent_ctx: AgentContext,
+    tenant: &TenantId,
+    entity_type: &str,
+    entity_id: &str,
+    action: &str,
+) -> AgentContext {
+    if agent_ctx.idempotency_key.is_none() {
+        agent_ctx.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(format!(
+            "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
+            sim_uuid()
+        )));
+    }
+    agent_ctx
+}
+
 impl crate::state::ServerState {
     /// Dispatch an action using the unified command object.
     ///
@@ -184,7 +204,7 @@ impl crate::state::ServerState {
             .await
     }
 
-    async fn dispatch_typed(
+    pub(super) async fn dispatch_typed(
         &self,
         cmd: DispatchCommand<'_>,
     ) -> Result<EntityResponse, DispatchError> {
@@ -208,8 +228,16 @@ impl crate::state::ServerState {
             await_reactions,
         } = cmd;
         // This action is a step of the inline chain its integrations and
-        // reactions continue (`InlineChain`).
-        let entered_ctx = agent_ctx.entering(entity_type, entity_id, action);
+        // reactions continue (`InlineChain`), under the key it commits with.
+        // Keyed here rather than in the core dispatch, so the reactions below
+        // derive their keys from that key.
+        let entered_ctx = keyed_for_move(
+            agent_ctx.entering(entity_type, entity_id, action),
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+        );
         let agent_ctx = &entered_ctx;
 
         if temper_spec::automaton::is_carry_move(action) {
@@ -413,7 +441,13 @@ impl crate::state::ServerState {
         // The dispatch runs in the span it was called in: the request's, or the
         // root span of the runtime work that started it. Ids carried in the agent
         // context never re-parent or re-link it (see `trace_context`).
-        let enriched_agent_ctx = agent_ctx.for_dispatch_root(entity_type, entity_id);
+        let enriched_agent_ctx = keyed_for_move(
+            agent_ctx.for_dispatch_root(entity_type, entity_id),
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+        );
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();
@@ -603,12 +637,7 @@ impl crate::state::ServerState {
         // The actor keeps the caller's identity on any scheduled action the
         // transition arms, so the action fires as them after a restart too.
         let caller = Arc::new(agent_ctx.clone());
-        let idempotency_key = Some(agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
-            crate::idempotency::IdempotencyKey::Request(format!(
-                "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
-                sim_uuid()
-            ))
-        }));
+        let idempotency_key = agent_ctx.idempotency_key.clone();
         // W2 phase: ask_reply — round-trip through the retry layer to the
         // actor and back. Aggregates with other phase spans by prefix.
         let ask_span = tracing::info_span!(

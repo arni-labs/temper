@@ -21,6 +21,7 @@ mod detached;
 mod effects;
 pub(crate) mod entity_rows;
 mod generated_callbacks;
+pub(crate) mod owed_writes;
 mod projection_barrier;
 pub(crate) mod retry;
 mod scheduled_actions;
