@@ -1,15 +1,14 @@
 //! The breadth-first walk over joint states.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::super::JointOutcome;
 use super::super::pack::{Packed, Packer};
+use super::super::room::{Bound, Held, MB, block, bytes, grow, grow_map, map_bytes};
 use super::super::state::render;
-use super::super::{JointState, JointStep};
+use super::super::{JointState, JointStep, premise};
 use super::step::Certainty;
 use super::{JointModel, Walk};
-use crate::Budget;
 use temper_spec::predicate::{Expr, Name, Truth, eval};
 
 /// One move made from a walked state.
@@ -35,8 +34,8 @@ pub(in crate::composite::joint) struct Edge {
     pub(in crate::composite::joint) sure: bool,
 }
 
-/// What a walk saw.
-pub(in crate::composite::joint) struct Explored {
+/// What a walk saw, and the memory it holds for it.
+pub(in crate::composite::joint) struct Explored<'a> {
     /// Each state walked, packed, with the state and move (a name in
     /// `packer`) it was first reached by.
     nodes: Vec<(Packed, Option<(u32, u32)>)>,
@@ -49,9 +48,35 @@ pub(in crate::composite::joint) struct Explored {
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
+    /// The moves the runtime could make in a walked state that the walk
+    /// never takes.
+    unwalked: BTreeSet<Unwalked>,
+    /// The memory its tables hold, given back when it is dropped.
+    pub(in crate::composite::joint) held: Held<'a>,
 }
 
-impl Explored {
+/// A move the runtime could make that the walk never takes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::composite::joint) struct Unwalked {
+    /// `Entity.Action`.
+    pub(in crate::composite::joint) action: String,
+    /// Who sends it in the runtime.
+    pub(in crate::composite::joint) sender: String,
+    /// The record's status where it could.
+    pub(in crate::composite::joint) from: String,
+}
+
+impl Explored<'_> {
+    /// Stop the walk: its room said no.
+    fn stop_for_room(&mut self, reason: String) {
+        self.stopped = Some(format!(
+            "the walk does not fit in the memory it may hold: {reason} \
+             (it held {} MB at {} states)",
+            self.held.bytes / MB,
+            self.len()
+        ));
+    }
+
     /// How many states the walk saw.
     pub(in crate::composite::joint) fn len(&self) -> usize {
         self.nodes.len()
@@ -79,6 +104,36 @@ impl Explored {
         steps.reverse();
         steps
     }
+
+    /// The moves the runtime could make that the walk never took, one line
+    /// per sender: `who may take Entity.Action (from Status, ...), ...`.
+    pub(in crate::composite::joint) fn unwalked(&self) -> Vec<String> {
+        let mut by: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+        for found in &self.unwalked {
+            by.entry(&found.sender)
+                .or_default()
+                .entry(&found.action)
+                .or_default()
+                .push(&found.from);
+        }
+        by.into_iter()
+            .map(|(sender, actions)| {
+                let actions: Vec<String> = actions
+                    .into_iter()
+                    .map(|(action, statuses)| format!("{action} (from {})", statuses.join(", ")))
+                    .collect();
+                format!("{sender} may take {}", actions.join(", "))
+            })
+            .collect()
+    }
+}
+
+/// Why a walk that never took the moves `unwalked` proves nothing.
+pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
+    format!(
+        "the walk never takes moves the runtime can make, so it never goes where they lead: {}. Declare an action only a module answers with as internal, or name it in its trigger's on_success; the walk does not send a reaction from a type outside the rule's scope",
+        unwalked.join("; ")
+    )
 }
 
 impl JointModel {
@@ -93,15 +148,17 @@ impl JointModel {
     /// Walk every reachable joint state breadth first, so each state is
     /// first reached by a shortest path. `visit` sees each state as it is
     /// taken from the queue and returns true to stop the walk. With `edges`,
-    /// every move between walked states is kept.
-    pub(in crate::composite::joint) fn walk_with(
+    /// every move between walked states is kept. The walk takes the memory
+    /// it holds from `bound`'s room and stops when the room says no.
+    pub(in crate::composite::joint) fn walk_with<'a>(
         &self,
-        budget: Budget,
+        bound: Bound<'a>,
         edges: bool,
         mut visit: impl FnMut(usize, &JointState) -> bool,
-    ) -> Explored {
-        let started = Instant::now();
-        self.expansion.reset(budget.states, Some(budget.time));
+    ) -> Explored<'a> {
+        // The room bounds what the walk holds; a model's expansion work has
+        // no count or clock of its own here.
+        self.expansion.reset(usize::MAX, None);
         let mut explored = Explored {
             nodes: Vec::new(),
             packer: Packer::default(),
@@ -109,6 +166,8 @@ impl JointModel {
             edges: Vec::new(),
             stopped: None,
             held_back: false,
+            unwalked: BTreeSet::new(),
+            held: Held::new(bound),
         };
         // Check the sliced models before either caller can expand a move.
         let oversized: Vec<_> = self
@@ -128,31 +187,43 @@ impl JointModel {
         }
         let mut seen: HashMap<Packed, u32> = HashMap::new();
         let mut queue = VecDeque::new();
+        let mut tables = Tables::default();
+        // One start per way the records' ids can be equal: many records start
+        // in millions of ways, so the starts take their memory from the room
+        // as the walk's states do.
         for init in self.inits() {
             if !self.expansion.take() {
                 break;
             }
             let packed = explored.packer.pack(&init);
-            if !seen.contains_key(&packed) {
-                seen.insert(packed.clone(), explored.nodes.len() as u32);
-                queue.push_back(explored.nodes.len());
-                explored.nodes.push((packed, None));
+            if seen.contains_key(&packed) {
+                continue;
             }
+            if let Err(reason) = tables.make_room(&mut explored, &mut seen, &mut queue, edges) {
+                explored.stop_for_room(reason);
+                return explored;
+            }
+            tables.states += block(size_of::<[usize; 2]>() + 4 * packed.len());
+            seen.insert(packed.clone(), explored.nodes.len() as u32);
+            queue.push_back(explored.nodes.len());
+            explored.nodes.push((packed, None));
         }
         while let Some(index) = queue.pop_front() {
             let state = explored.state(index);
+            self.note_unwalked(&state, &mut explored.unwalked);
             if visit(index, &state) {
                 break;
             }
-            let full = explored.nodes.len() >= budget.states;
-            if full || started.elapsed() >= budget.time {
-                explored.stopped = Some(if full {
-                    format!("the walk reached its {} states", budget.states)
-                } else {
-                    format!("the walk ran out of its {} s", budget.time.as_secs())
-                });
+            explored.held.walked(explored.nodes.len());
+            if let Err(reason) = tables.make_room(&mut explored, &mut seen, &mut queue, edges) {
+                explored.stop_for_room(reason);
                 break;
             }
+            let before = [
+                explored.nodes.len(),
+                explored.made.len(),
+                explored.edges.len(),
+            ];
             for mv in self.moves(&state) {
                 if !self.expansion.take() {
                     break;
@@ -177,6 +248,7 @@ impl JointModel {
                         None => {
                             let at = explored.nodes.len() as u32;
                             let label = explored.packer.id(&next.label);
+                            tables.states += block(size_of::<[usize; 2]>() + 4 * packed.len());
                             seen.insert(packed.clone(), at);
                             explored.nodes.push((packed, Some((index as u32, label))));
                             queue.push_back(at as usize);
@@ -192,11 +264,64 @@ impl JointModel {
                     }
                 }
             }
+            let after = [
+                explored.nodes.len(),
+                explored.made.len(),
+                explored.edges.len(),
+            ];
+            tables.saw([0, 1, 2].map(|i| after[i] - before[i]));
         }
         if self.expansion.exhausted.get() {
             explored.stopped = Some("the joint expansion exhausted its work or time budget".into());
         }
         explored
+    }
+}
+
+/// The walk's tables as the memory it holds counts them: each at its
+/// capacity, and each packed state as its own heap block. Before each state
+/// is walked, every table is grown to hold what walking one state has added
+/// at most so far, with the memory of its new copy taken first, so a table
+/// seldom grows on its own while both copies are held.
+#[derive(Default)]
+struct Tables {
+    /// Bytes the packed states take.
+    states: usize,
+    /// The most states, moves and edges walking one state has added.
+    most: [usize; 3],
+}
+
+impl Tables {
+    fn saw(&mut self, added: [usize; 3]) {
+        for (most, added) in self.most.iter_mut().zip(added) {
+            *most = (*most).max(added);
+        }
+    }
+
+    fn make_room(
+        &mut self,
+        explored: &mut Explored<'_>,
+        seen: &mut HashMap<Packed, u32>,
+        queue: &mut VecDeque<usize>,
+        edges: bool,
+    ) -> Result<(), String> {
+        let [states, made, ends] = self.most.map(|most| most.max(1));
+        let held = &mut explored.held;
+        grow(&mut explored.nodes, states, held)?;
+        grow(queue, states, held)?;
+        grow_map(seen, states, held)?;
+        if edges {
+            grow(&mut explored.made, made, held)?;
+            grow(&mut explored.edges, ends, held)?;
+        }
+        let bytes = self.states
+            + explored.packer.bytes()
+            + bytes(&explored.nodes)
+            + bytes(queue)
+            + map_bytes::<Packed, u32>(seen.capacity())
+            + bytes(&explored.made)
+            + bytes(&explored.edges);
+        explored.held.set(bytes)
     }
 }
 
@@ -207,7 +332,7 @@ impl JointModel {
         &self,
         owner: &str,
         invariants: &[&Expr],
-        budget: Budget,
+        bound: Bound<'_>,
     ) -> Walk {
         let mut unsupported = BTreeSet::new();
         let modeled = |entity: &str, field: &str| {
@@ -266,7 +391,9 @@ impl JointModel {
         }
         let mut unknown = vec![false; invariants.len()];
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
-        let explored = self.walk_with(budget, false, |index, state| {
+        let premises: Vec<Option<&Expr>> = invariants.iter().map(|inv| premise(inv)).collect();
+        let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
+        let explored = self.walk_with(bound, false, |index, state| {
             if state.settled() {
                 let env = self.env(owner, state);
                 for (i, inv) in invariants.iter().enumerate() {
@@ -275,10 +402,14 @@ impl JointModel {
                         Truth::Unknown => unknown[i] = true,
                         _ => {}
                     }
+                    if let (false, Some(premise)) = (met[i], premises[i]) {
+                        met[i] = eval(premise, &env) != Truth::False;
+                    }
                 }
             }
             broken.iter().all(Option::is_some)
         });
+        let unwalked = explored.unwalked();
         let outcomes = broken
             .iter()
             .enumerate()
@@ -293,7 +424,15 @@ impl JointModel {
                     Some(reason) => JointOutcome::Incomplete {
                         reason: reason.clone(),
                     },
-                    None => JointOutcome::Holds,
+                    None if !unwalked.is_empty() => JointOutcome::Incomplete {
+                        reason: unwalked_reason(&unwalked),
+                    },
+                    None => match premises[i] {
+                        Some(premise) if !met[i] => JointOutcome::Vacuous {
+                            premise: premise.to_string(),
+                        },
+                        _ => JointOutcome::Holds,
+                    },
                 },
             })
             .collect();

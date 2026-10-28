@@ -209,8 +209,12 @@ async fn read_live_row(
         .await
         .map_err(|error| format!("{entity_type}('{entity_id}') could not be read: {error}"))?;
     if response.state.status == "Deleted" {
-        // Reading it started an actor for a deleted row; it goes again.
-        state.stop_and_remove_entity(tenant, entity_type, entity_id);
+        // Reading it started an actor for a row the kernel deleted; it goes
+        // again. A row a spec moved into Deleted keeps its catalog row, so it
+        // stays listed too.
+        if response.state.is_tombstoned() {
+            state.stop_and_remove_entity(tenant, entity_type, entity_id);
+        }
         return Ok(None);
     }
     Ok(Some(response.state))

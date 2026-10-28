@@ -34,7 +34,7 @@ async fn dependency_update_rechecks_installed_rules_before_writes() {
     let updated = format!(
         "{parent}\n[[action]]\nname = 'Close'\nkind = 'input'\nfrom = ['Open']\nto = 'Closed'\n"
     );
-    let err = prove(
+    let err = prove_to_the_end(
         &state,
         "alice",
         "parent-app",
@@ -62,7 +62,7 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
     let c = spec("C", None);
     let state = state("alice", &[("B", &b), ("C", &c)]);
     let a = spec("A", Some("B[Id].status != 'Closed'"));
-    let unproved = prove(
+    let unproved = prove_to_the_end(
         &state,
         "alice",
         "a-app",
@@ -75,12 +75,28 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
     assert!(unproved.is_empty(), "{unproved:?}");
     // Bob's tenant runs no B, so A's rule cannot be proved there: the install
     // goes ahead and names the rule it could not prove.
-    let unproved = prove(&state, "bob", "a-app", &[("A".into(), a)], true, None)
+    let unproved = prove_to_the_end(&state, "bob", "a-app", &[("A".into(), a)], true, None)
         .await
         .unwrap();
     assert_eq!(unproved.len(), 1, "{unproved:?}");
     assert!(
         unproved[0].contains("B, which this app does not declare"),
+        "{unproved:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rule_that_checks_nothing_as_written_is_a_warning() {
+    let b = spec("B", None);
+    let state = state("alice", &[("B", &b)]);
+    // A never moves to Closed, so the rule's premise holds nowhere.
+    let a = spec("A", Some("status == 'Closed' => B[Id].status == 'Open'"));
+    let unproved = prove_to_the_end(&state, "alice", "a-app", &[("A".into(), a)], true, None)
+        .await
+        .unwrap();
+    assert_eq!(unproved.len(), 1, "{unproved:?}");
+    assert!(
+        unproved[0].contains("A.rule CHECKS NOTHING AS WRITTEN"),
         "{unproved:?}"
     );
 }

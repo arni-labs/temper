@@ -42,3 +42,7 @@ pub use types::*;
 #[cfg(test)]
 #[path = "strict_test.rs"]
 mod strict_test;
+
+#[cfg(test)]
+#[path = "principal_record_test.rs"]
+mod principal_record_test;

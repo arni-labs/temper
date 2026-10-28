@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{PersistenceError, catalog_state_from_storage};
 
 use crate::PostgresEventStore;
 use crate::platform::{PostgresEntityCatalogRow, storage_error};
@@ -28,7 +28,9 @@ impl PostgresEventStore {
     /// projection are silently omitted from the result, leaving the caller
     /// free to fall back to the actor path on a per-id basis.
     ///
-    /// Large id lists are read in batches of [`CATALOG_READ_BATCH`].
+    /// Large id lists are read in batches of [`CATALOG_READ_BATCH`]. Each
+    /// row's `state` comes back whole, its fields put back from the `fields`
+    /// column ([`catalog_state_from_storage`]).
     pub async fn load_entity_catalog_rows_pg(
         &self,
         tenant: &str,
@@ -80,8 +82,8 @@ impl PostgresEventStore {
                 |(entity_id, status, fields, state, seq)| PostgresEntityCatalogRow {
                     entity_id,
                     status,
+                    state: state.map(|stored| catalog_state_from_storage(&fields, stored)),
                     fields,
-                    state,
                     sequence_nr: seq.max(0) as u64,
                 },
             )

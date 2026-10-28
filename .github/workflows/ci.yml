@@ -49,6 +49,17 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # Every cargo build here resolves features across the whole workspace, as main's
+  # --workspace run does, whichever packages it selects with -p. The pr lane builds only
+  # the packages a change reaches, and cargo's default resolves features for those alone,
+  # so a dependency could build without a feature another package turns on: #147 gave
+  # temper-server's dev-dependency opentelemetry-otlp the http-json feature, the shards
+  # tested temper-observe without it and passed, and main's run failed for 11 hours
+  # (#179). This is cargo's feature-unification (unstable, on the pinned nightly); a -p
+  # build still compiles only its own dependency graph. Stable cargo, which affected.py's
+  # cargo metadata uses, ignores it with a warning.
+  CARGO_UNSTABLE_FEATURE_UNIFICATION: "true"
+  CARGO_RESOLVER_FEATURE_UNIFICATION: workspace
   # The Actions cache holds 10 GB per repository. When every pull request saved its own
   # 0.3 to 1.4 GB per job, main's caches were evicted within minutes and pull requests,
   # which can only restore their own ref's caches or main's, compiled from scratch.
@@ -439,8 +450,9 @@ jobs:
           done
           for pid in "${pids[@]}"; do wait "$pid"; done
 
+      # Any package's tests may run against Turso's local sync server (the
+      # store's turso_sync tests, serve's push tests), as in the full lane.
       - name: Install tursodb for the Turso Sync tests
-        if: matrix.turso
         run: |
           set -euo pipefail
           curl -sSfL -o /tmp/tursodb.tar.xz \
