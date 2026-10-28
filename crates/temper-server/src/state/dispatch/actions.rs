@@ -228,8 +228,16 @@ impl crate::state::ServerState {
             await_reactions,
         } = cmd;
         // This action is a step of the inline chain its integrations and
-        // reactions continue (`InlineChain`).
-        let entered_ctx = agent_ctx.entering(entity_type, entity_id, action);
+        // reactions continue (`InlineChain`), under the key it commits with.
+        // Keyed here rather than in the core dispatch, so the reactions below
+        // derive their keys from that key.
+        let entered_ctx = keyed_for_move(
+            agent_ctx.entering(entity_type, entity_id, action),
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+        );
         let agent_ctx = &entered_ctx;
 
         if temper_spec::automaton::is_carry_move(action) {
@@ -245,11 +253,6 @@ impl crate::state::ServerState {
         {
             self.reject_action_supplied_sub_writes(entity_type, action, &params)?;
         }
-        // Keyed here rather than in the core dispatch, so the reactions below
-        // derive their keys from the key the move commits under.
-        let keyed_agent_ctx =
-            keyed_for_move(agent_ctx.clone(), tenant, entity_type, entity_id, action);
-        let agent_ctx = &keyed_agent_ctx;
 
         let response = self
             .dispatch_tenant_action_core(

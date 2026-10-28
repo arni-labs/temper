@@ -67,7 +67,8 @@ async fn send_reaction(
 }
 
 /// Send an owed reaction again; once it lands, run its cascade at the next
-/// depth, as the dispatcher does for a reaction that lands at once.
+/// depth, as the dispatcher does for a reaction that lands at once: under
+/// the reaction's context, which knows the children it spawned as made.
 fn react_again(state: ServerState, sent: Arc<OwedMove>, depth: u32) -> OwedTry {
     Box::pin(async move {
         let reply = send_reaction(&state, &sent).await;
@@ -81,6 +82,12 @@ fn react_again(state: ServerState, sent: Arc<OwedMove>, depth: u32) -> OwedTry {
             && response.success
         {
             let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
+            let cascade_ctx = sent.agent_ctx.clone().having_made(
+                response
+                    .spawn_requests
+                    .iter()
+                    .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
+            );
             Box::pin(dispatcher.dispatch_reactions(
                 &state,
                 &sent.tenant,
@@ -90,7 +97,7 @@ fn react_again(state: ServerState, sent: Arc<OwedMove>, depth: u32) -> OwedTry {
                 &response.state.status,
                 &fields,
                 depth + 1,
-                &sent.agent_ctx,
+                &cascade_ctx,
             ))
             .await;
         }
