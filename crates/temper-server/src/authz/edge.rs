@@ -82,6 +82,19 @@ pub fn is_cors_preflight(request: &Request) -> bool {
             .contains_key(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD)
 }
 
+/// Which `Authorization` schemes a protocol guest is meant to resolve.
+///
+/// Positively scoped: `Basic` (git smart-HTTP presents a GitToken as the Basic
+/// username) and `token` (the GitHub-compatible REST surface). Every other
+/// scheme — `Bearer` above all — is withheld, because a credential that merely
+/// failed to resolve is not thereby safe to hand to a guest: resolution is
+/// tenant-scoped, so a valid kernel bearer aimed at the wrong tenant fails to
+/// resolve while remaining usable against the right one. Checked by the bearer
+/// middleware and again at the guest boundary; this is the one definition.
+pub fn is_forwardable_protocol_scheme(scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("basic") || scheme.eq_ignore_ascii_case("token")
+}
+
 /// Routes that serve an anonymous caller, but must still resolve a credential
 /// when one is presented.
 ///
@@ -96,21 +109,16 @@ pub fn is_cors_preflight(request: &Request) -> bool {
 /// serves anonymously, so an installing kernel that holds no registry
 /// credential can fetch a public app. The handler refuses unless every
 /// repository in the app's closure is public.
-/// Which `Authorization` schemes a protocol guest is meant to resolve.
 ///
-/// Positively scoped: `Basic` (git smart-HTTP presents a GitToken as the Basic
-/// username) and `token` (the GitHub-compatible REST surface). Every other
-/// scheme — `Bearer` above all — is withheld, because a credential that merely
-/// failed to resolve is not thereby safe to hand to a guest: resolution is
-/// tenant-scoped, so a valid kernel bearer aimed at the wrong tenant fails to
-/// resolve while remaining usable against the right one. Checked by the bearer
-/// middleware and again at the guest boundary; this is the one definition.
-pub fn is_forwardable_protocol_scheme(scheme: &str) -> bool {
-    scheme.eq_ignore_ascii_case("basic") || scheme.eq_ignore_ascii_case("token")
-}
-
+/// The compare route (`.../compare/{base}...{head}`) is admitted on the same
+/// terms: it says only how two versions of a public app relate, which anyone
+/// can already work out from the anonymous clone.
 pub fn allows_anonymous_fallback(method: &Method, path: &str) -> bool {
-    method == Method::GET && path.starts_with("/api/genesis/apps/") && path.ends_with("/bundle")
+    let Some(app_path) = path.strip_prefix("/api/genesis/apps/") else {
+        return false;
+    };
+    method == Method::GET
+        && (app_path.ends_with("/bundle") || app_path.rsplit('/').nth(1) == Some("compare"))
 }
 
 /// Reject protected kernel routes that lack authenticated typed authority.
@@ -199,6 +207,29 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "every other protected route still requires typed authority"
         );
+    }
+
+    #[test]
+    fn the_compare_route_falls_back_to_anonymous_like_the_bundle_route() {
+        let compare = format!(
+            "/api/genesis/apps/acme/widget/compare/{}...{}",
+            "1".repeat(40),
+            "2".repeat(40)
+        );
+        assert!(allows_anonymous_fallback(&Method::GET, &compare));
+        assert!(allows_anonymous_fallback(
+            &Method::GET,
+            "/api/genesis/apps/acme/widget/versions/abc/bundle"
+        ));
+        assert!(!allows_anonymous_fallback(&Method::POST, &compare));
+        assert!(!allows_anonymous_fallback(
+            &Method::GET,
+            "/api/genesis/apps/install"
+        ));
+        assert!(!allows_anonymous_fallback(
+            &Method::GET,
+            "/api/specs/compare/x"
+        ));
     }
 
     use axum::Router;

@@ -24,6 +24,7 @@ use crate::state::PlatformState;
 
 mod apps;
 mod auth;
+mod compare;
 pub(crate) use apps::{
     get_genesis_app_bundle, get_os_app_guide, install_genesis_app, list_app_installs,
     list_genesis_follow_updates, list_os_apps,
@@ -125,6 +126,7 @@ pub fn tenant_api_router() -> Router<PlatformState> {
             "/genesis/apps/{owner}/{name}/versions/{hash}/bundle",
             routing::get(get_genesis_app_bundle),
         )
+        .merge(compare::routes())
 }
 
 /// `POST /api/tenants` — provision a new tenant database.
