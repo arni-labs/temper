@@ -12,7 +12,8 @@ use temper_runtime::scheduler::{SimActorHandler, SimActorSystem, SimActorSystemC
 use temper_runtime::tenant::TenantId;
 
 use super::registry::ReactionRegistry;
-use super::types::{MAX_REACTION_DEPTH, ReactionResult};
+use super::types::ReactionResult;
+use crate::request_context::{ChainStep, RepeatedStep, StepEntity};
 
 /// Maps actor IDs to their (entity_type, entity_id) for target resolution.
 struct ActorMeta {
@@ -23,7 +24,9 @@ struct ActorMeta {
 /// Deterministic simulation system with reaction cascade support.
 ///
 /// Wraps a real [`SimActorSystem`] and dispatches reaction rules synchronously
-/// after each successful `step()`. The cascade is bounded by [`MAX_REACTION_DEPTH`].
+/// after each successful `step()`. A chain stops the first time a reaction
+/// would repeat a step it is already in, as in production
+/// ([`InlineChain`](crate::request_context::InlineChain)).
 pub struct SimReactionSystem {
     inner: SimActorSystem,
     registry: ReactionRegistry,
@@ -117,14 +120,24 @@ impl SimReactionSystem {
         // Build fields from the result for target resolution
         let fields = result.get("fields").unwrap_or(&result).clone();
 
-        // Dispatch reactions recursively
-        self.dispatch_cascade(&entity_type, &entity_id, action, &to_state, &fields, 0);
+        // Dispatch reactions recursively, starting from the action just run.
+        let mut chain = vec![found_step(&entity_type, &entity_id, action)];
+        self.dispatch_cascade(
+            &entity_type,
+            &entity_id,
+            action,
+            &to_state,
+            &fields,
+            &mut chain,
+        );
 
         Ok(result)
     }
 
-    /// Recursively dispatch reactions, bounded by MAX_REACTION_DEPTH: a
-    /// reaction past it is not run and is reported as a failed result.
+    /// Recursively dispatch reactions. `chain` holds the steps the cascade is
+    /// inside of, oldest first; a reaction that would repeat one is not run
+    /// and is reported as a failed result. Simulation targets are registered
+    /// actors, never made by the chain, so every step is a found entity.
     fn dispatch_cascade(
         &mut self,
         entity_type: &str,
@@ -132,8 +145,10 @@ impl SimReactionSystem {
         action: &str,
         to_state: &str,
         fields: &serde_json::Value,
-        depth: u32,
+        chain: &mut Vec<ChainStep>,
     ) {
+        // The chain starts at the action that set the cascade off.
+        let depth = u32::try_from(chain.len().saturating_sub(1)).unwrap_or(u32::MAX);
         // Clone the matching rules to avoid borrow conflict
         let rules: Vec<_> = self
             .registry
@@ -177,9 +192,11 @@ impl SimReactionSystem {
                         continue;
                     }
                 };
-            if depth >= MAX_REACTION_DEPTH {
-                self.last_results
-                    .push(ReactionResult::stopped_at_depth(&rule.name, depth));
+            let step = found_step(&rule.then.entity_type, &target_entity_id, &rule.then.action);
+            if let Some(repeat) = RepeatedStep::find(chain, &step) {
+                self.last_results.push(ReactionResult::stopped_on_repeat(
+                    &rule.name, depth, &repeat,
+                ));
                 continue;
             }
 
@@ -238,17 +255,22 @@ impl SimReactionSystem {
                     // Recurse: the target action may trigger further reactions.
                     // Propagate actual post-action fields so downstream resolvers
                     // (Field, CreateIfMissing) see real state, matching production
-                    // dispatch behavior.
+                    // dispatch behavior. A chain is as deep as its data, so each
+                    // level runs on a stack that grows.
                     let target_type = rule.then.entity_type.clone();
                     let target_action = rule.then.action.clone();
-                    self.dispatch_cascade(
-                        &target_type,
-                        &target_entity_id,
-                        &target_action,
-                        &target_status,
-                        result_fields.get("fields").unwrap_or(&result_fields),
-                        depth + 1,
-                    );
+                    chain.push(step);
+                    crate::growable_stack::grow(|| {
+                        self.dispatch_cascade(
+                            &target_type,
+                            &target_entity_id,
+                            &target_action,
+                            &target_status,
+                            result_fields.get("fields").unwrap_or(&result_fields),
+                            chain,
+                        );
+                    });
+                    chain.pop();
                 }
                 Err(e) => {
                     self.last_results.push(ReactionResult {
@@ -286,3 +308,11 @@ impl SimReactionSystem {
 
 // Target resolver logic consolidated in super::resolver::resolve_target_id.
 // Tests live in resolver.rs.
+
+fn found_step(entity_type: &str, entity_id: &str, action: &str) -> ChainStep {
+    ChainStep {
+        entity_type: entity_type.to_string(),
+        entity: StepEntity::Found(entity_id.to_string()),
+        action: action.to_string(),
+    }
+}

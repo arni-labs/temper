@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+mod catalog_group;
 mod catalog_state;
 mod tombstone;
+pub use catalog_group::CatalogGroupRow;
 pub use catalog_state::{catalog_state_for_storage, catalog_state_from_storage};
 pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
 
@@ -219,6 +221,36 @@ pub struct CommitRows<'a> {
     /// transition fired: its row is removed in the same commit, so a row
     /// never outlives its fire's event and a restart cannot fire it again.
     pub fired_scheduled_action: Option<&'a str>,
+    /// The entity's query-plane row as the appended events leave it. A store
+    /// whose [`EventStore::commits_entity_rows`] is true writes it in the
+    /// journal's transaction, at the last appended sequence.
+    pub projection: Option<ProjectionRow<'a>>,
+    /// The entity's state-timer row as the appended events leave it, for a
+    /// store whose [`EventStore::commits_entity_rows`] is true. None leaves
+    /// the row as it is.
+    pub state_timer: Option<StateTimerRow<'a>>,
+}
+
+/// An entity's query-plane row, written with the events that change it.
+#[derive(Debug, Clone, Copy)]
+pub enum ProjectionRow<'a> {
+    /// The entity's status, its projected fields and its projected state.
+    Upsert {
+        status: &'a str,
+        fields: &'a serde_json::Value,
+        state: &'a serde_json::Value,
+    },
+    /// The entity was deleted: its row and its field-index rows go.
+    Remove,
+}
+
+/// An entity's state-timer row, written with the events that change it.
+#[derive(Debug, Clone, Copy)]
+pub enum StateTimerRow<'a> {
+    /// The events armed (or reset) a timer: this is its row.
+    Arm(&'a StateTimerRecord),
+    /// The entity is no longer where a timer waits: its row goes.
+    End,
 }
 
 impl CommitRows<'_> {
@@ -290,6 +322,15 @@ pub trait EventStore: Send + Sync + 'static {
             );
         }
         self.append(persistence_id, expected_sequence, events)
+    }
+
+    /// Whether [`EventStore::append_with_rows`] writes
+    /// [`CommitRows::projection`] and [`CommitRows::state_timer`] in the
+    /// journal's transaction: the entity's query-plane row and timer row are
+    /// then the journal's, and nothing writes them again after the commit.
+    /// The default writes neither.
+    fn commits_entity_rows(&self) -> bool {
+        false
     }
 
     /// Every pending scheduled action of `tenant`: what a restart arms again.
@@ -503,6 +544,20 @@ pub trait EventStore: Send + Sync + 'static {
         from_sequence: u64,
     ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send;
 
+    /// Read one page of the journal, newest first: the newest `limit` events
+    /// whose sequence number is below `before_sequence` (the newest of the
+    /// whole journal when it is `None`), returned in ascending sequence order.
+    ///
+    /// Backends read only those rows, so a page costs its own size and not the
+    /// journal's. `limit` is a count of rows; a SQL backend binds it as a signed
+    /// 64-bit `LIMIT`, so values above `i64::MAX` read the whole range.
+    fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send;
+
     /// Save a state snapshot.
     fn save_snapshot(
         &self,
@@ -610,6 +665,11 @@ pub enum PersistenceError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// A write failed after its commit began and the journal could not be
+    /// read to learn whether it landed: it may have.
+    #[error("outcome unknown: {0}")]
+    OutcomeUnknown(String),
+
     /// One event is larger than the server's limit for a single change
     /// (`TEMPER_MAX_EVENT_BYTES`). Nothing was written.
     #[error(
@@ -620,6 +680,20 @@ pub enum PersistenceError {
         persistence_id: String,
         bytes: usize,
         limit: usize,
+    },
+
+    /// The disk under the store has less room available than the server keeps
+    /// free (`temper_server::storage::STORAGE_FLOOR_BYTES`). Nothing was
+    /// written; writes go on by themselves once the disk has room again.
+    #[error(
+        "storage full: {} MB available on the disk of {dir}, under the {} MB this server keeps free; nothing was written, and writes go on once the disk has room",
+        .available_bytes >> 20,
+        .floor_bytes >> 20
+    )]
+    StorageFull {
+        dir: String,
+        available_bytes: u64,
+        floor_bytes: u64,
     },
 }
 

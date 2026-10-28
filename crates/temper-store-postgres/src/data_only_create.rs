@@ -181,8 +181,8 @@ impl PostgresEventStore {
             crate::dbm::postgres_query!(
                 &self.schema,
                 "INSERT INTO {schema}entity_field_index \
-                 (tenant, entity_type, entity_id, field_name, field_value, status) \
-                 SELECT $1, $2, $3, incoming.field_name, incoming.field_value, $6 \
+                 (tenant, entity_type, entity_id, field_name, field_value) \
+                 SELECT $1, $2, $3, incoming.field_name, incoming.field_value \
                  FROM unnest($4::text[], $5::text[]) AS incoming(field_name, field_value)",
             )
             .bind(tenant)
@@ -190,7 +190,6 @@ impl PostgresEventStore {
             .bind(entity_id)
             .bind(&field_names)
             .bind(&field_values)
-            .bind(status)
             .execute(&mut *tx)
             .await
             .map_err(storage_error)?;

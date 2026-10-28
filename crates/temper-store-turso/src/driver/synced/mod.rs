@@ -30,9 +30,11 @@ mod pool;
 mod push;
 mod remote;
 mod restore;
+mod trim;
 use files::{DIVERGED_SUFFIX, check_local_files, sidecar};
 pub(crate) use pool::ConnectionPool;
 use remote::Remote;
+pub(crate) use trim::Writers as TrimWriters;
 
 /// Whether writes to the file can be confirmed against its remote copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,11 +79,11 @@ struct Inner {
     /// change capture on it, which also fails while another connection
     /// writes; reuse makes that rare and `connect` retries it.
     pool: ConnectionPool,
-    /// Every connection in use holds this shared. While the engine
-    /// checkpoints, every statement on any connection fails at once with
-    /// "database is locked", so a checkpoint takes it exclusively, and only
-    /// when it is free right away: waiting for it could deadlock a store call
-    /// that holds one connection while opening another.
+    /// Every connection in use holds this shared. While the log is reset,
+    /// every statement on any connection fails at once with "database is
+    /// locked", so a checkpoint takes it exclusively, waiting at most
+    /// [`CHECKPOINT_TURN_BUDGET`]: longer could deadlock a store call that
+    /// holds one connection while opening another.
     in_use: Arc<tokio::sync::RwLock<()>>,
     /// The newest change a successful push carried (from `last_change`).
     pushed: AtomicI64,
@@ -93,6 +95,11 @@ struct Inner {
     timeouts: AtomicU32,
     /// Whether the remote may hold a push the engine never heard back from.
     unsure: AtomicBool,
+    /// What the next trim batch deletes, planned from what the last one cost.
+    trim_plan: std::sync::Mutex<trim::Plan>,
+    /// Time added to every trim batch (see `simulate_slow_trim`).
+    #[cfg(feature = "test-support")]
+    simulated_trim: std::sync::Mutex<trim::SimulatedTrim>,
 }
 
 /// The sync engine's text for a statement the remote refused.
@@ -197,6 +204,9 @@ impl SyncCopy {
                 state: std::sync::Mutex::new(state),
                 timeouts: AtomicU32::new(0),
                 unsure: AtomicBool::new(true),
+                trim_plan: std::sync::Mutex::new(trim::FIRST_PLAN),
+                #[cfg(feature = "test-support")]
+                simulated_trim: std::sync::Mutex::new(trim::SimulatedTrim::default()),
             }),
         };
         // Change numbers follow commit order only with one writer at a time
@@ -323,6 +333,15 @@ impl SyncCopy {
             match opened {
                 Ok(conn) => {
                     conn.busy_timeout(Duration::from_secs(5))?;
+                    // A commit does not wait for the disk: NORMAL flushes the
+                    // file at each checkpoint instead of each commit. Every
+                    // confirmed write is already on the remote, so a machine
+                    // crash that rolls the file back to its last checkpoint
+                    // loses only writes answered "not confirmed", and the next
+                    // start restores a file behind its remote. Unsynced stores
+                    // keep Turso's FULL. Rita's choice on 27 Oct 2026: on a
+                    // Tensorlake drive FULL fell behind at 20 moves a second.
+                    conn.execute("PRAGMA synchronous = NORMAL", ()).await?;
                     let conn = Lease::new(Arc::new(DriverHandle::new(conn)), in_use);
                     return Ok(Connection::Local { conn, pool });
                 }
@@ -338,19 +357,57 @@ impl SyncCopy {
     /// Move the local write-ahead log into the database file once it is larger
     /// than `max_wal_bytes`. Turso Sync turns automatic checkpoints off, so
     /// without this the log grows with every write.
+    ///
+    /// While the log is reset, any statement on any connection fails at once
+    /// with "database is locked", so this takes a turn: the calls in flight
+    /// finish and new ones wait behind it. Skipping whenever a call was in
+    /// flight let the log grow without bound under steady load, and the
+    /// checkpoint that finally ran moved all of it while every call waited.
+    ///
+    /// It is a plain TRUNCATE checkpoint, not the engine's. The engine's also
+    /// copies the old version of every changed page into its revert log, which
+    /// only a pull reads (`turso_sync_engine` 0.7.2 and 0.8.3,
+    /// `database_sync_engine.rs` `checkpoint` and `apply_changes_internal`).
+    /// This store never pulls: a restore sets the file aside and bootstraps.
+    /// On a file bootstrapped from its remote that copy grows with every page
+    /// changed since, and all of it ran inside the turn.
     pub async fn checkpoint_if_wal_over(
         &self,
         max_wal_bytes: u64,
     ) -> Result<bool, PersistenceError> {
         let _engine = self.inner.engine.lock().await;
-        let Ok(_idle) = self.inner.in_use.try_write() else {
-            return Ok(false);
-        };
         let stats = self.inner.db.stats().await.map_err(storage_error)?;
         if stats.main_wal_size < max_wal_bytes {
             return Ok(false);
         }
-        self.inner.db.checkpoint().await.map_err(storage_error)?;
+        // A call that holds one connection while it opens another cannot
+        // finish while this waits, so the wait has a budget and the next tick
+        // tries again.
+        let Ok(_idle) =
+            tokio::time::timeout(CHECKPOINT_TURN_BUDGET, self.inner.in_use.write()).await
+        else {
+            tracing::warn!(
+                budget_ms = CHECKPOINT_TURN_BUDGET.as_millis() as u64,
+                wal_bytes = stats.main_wal_size,
+                "turso.sync calls kept the file in use; the next tick checkpoints"
+            );
+            return Ok(false);
+        };
+        let conn = self.inner.db.connect().await.map_err(storage_error)?;
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .map_err(storage_error)?;
+        let busy = match rows.next().await.map_err(storage_error)? {
+            Some(row) => row.get::<i64>(0).map_err(storage_error)?,
+            None => 1,
+        };
+        if busy != 0 {
+            return Err(PersistenceError::Storage(
+                "turso.sync checkpoint left the log in place: a connection outside the store was reading"
+                    .to_string(),
+            ));
+        }
         Ok(true)
     }
 
@@ -397,7 +454,23 @@ impl SyncCopy {
         files::describe(Path::new(path.strip_prefix("file:").unwrap_or(path)))
             .map_err(storage_error)
     }
+
+    /// Run one statement on the local file and return the rows it changed.
+    /// For tests that need a state no store call makes, such as a change log
+    /// longer than one push can carry; never built into the server.
+    #[cfg(feature = "test-support")]
+    pub async fn execute_local(&self, sql: &str) -> Result<u64, PersistenceError> {
+        let conn = self.connect().await.map_err(storage_error)?;
+        conn.execute(sql, ()).await.map_err(storage_error)
+    }
 }
+
+/// How long a checkpoint waits for the calls in flight before it gives way.
+/// Every new call waits behind it meanwhile, so it stays well inside the
+/// 10 s a request may wait for its answer; and a write holds its connection
+/// for one commit, about 1 s at worst on a Tensorlake drive (fsync p99 on the
+/// staging canary, 26 Oct 2026).
+const CHECKPOINT_TURN_BUDGET: Duration = Duration::from_secs(1);
 
 /// How long opening a connection retries while other connections write; as
 /// long as the store's statements wait for a busy database.

@@ -11,9 +11,7 @@
 
 use crate::driver::{Database, SyncCopy};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use temper_runtime::persistence::{PersistenceError, storage_error};
-use tokio::sync::Semaphore;
 use tracing::instrument;
 
 use crate::schema;
@@ -33,14 +31,18 @@ macro_rules! tombstone_sql {
     };
 }
 
+mod append_commit;
 mod append_config;
 mod authz;
 mod blobs;
+mod catalog_groups;
+mod commit_probe;
 mod constraints;
 mod entity_listing;
 mod event_store;
 mod evolution;
 pub mod field_index;
+mod field_index_rows;
 mod instrumentation;
 mod migration_support;
 pub mod ots;
@@ -48,6 +50,7 @@ mod policy;
 mod policy_approval;
 mod policy_replace;
 mod projection_freshness;
+mod projection_rows;
 mod published_artifacts;
 mod query_page;
 mod scheduled_actions;
@@ -59,6 +62,7 @@ pub mod sync_adopt;
 #[cfg(test)]
 mod tests;
 mod trajectory;
+mod trajectory_batch;
 mod trajectory_queries;
 mod unchanged_projections;
 mod wasm;
@@ -67,17 +71,22 @@ mod write_gate;
 pub use field_index::QueryProjectionUpsert;
 use instrumentation::InstrumentedConnection;
 pub use published_artifacts::{PublishedArtifactRow, PublishedArtifactUpsert};
+pub(crate) use write_gate::WritePriority;
 
 #[derive(Clone, Debug)]
 pub struct TursoEventStore {
     db: Arc<Database>,
-    write_gate: Arc<Semaphore>,
-    high_priority_write_waiters: Arc<AtomicUsize>,
+    write_gate: Arc<write_gate::WriteGate>,
+    /// Trajectory rows waiting for their batch's transaction.
+    trajectory_batch: Arc<trajectory_batch::TrajectoryBatch>,
     /// True when connected to a remote Turso Cloud instance (libsql:// URL).
     /// PRAGMAs are skipped for remote connections.
     is_remote: bool,
     /// Set when the local file's commits are copied to Turso Cloud.
     sync_copy: Option<SyncCopy>,
+    /// Pauses appends at a fault point (tests only).
+    #[cfg(test)]
+    commit_probe: Option<commit_probe::CommitProbe>,
 }
 
 impl TursoEventStore {
@@ -135,12 +144,12 @@ impl TursoEventStore {
     ) -> Result<Self, PersistenceError> {
         let store = Self {
             db: Arc::new(db),
-            write_gate: Arc::new(Semaphore::new(write_gate::configured_write_concurrency(
-                is_remote,
-            ))),
-            high_priority_write_waiters: Arc::new(AtomicUsize::new(0)),
+            write_gate: Arc::new(write_gate::WriteGate::new()),
+            trajectory_batch: Arc::default(),
             is_remote,
             sync_copy,
+            #[cfg(test)]
+            commit_probe: None,
         };
         store.migrate().await?;
         Ok(store)
@@ -184,6 +193,25 @@ impl TursoEventStore {
         self.sync_copy.as_ref()
     }
 
+    /// Delete the change log rows the remote copy has confirmed, for about
+    /// `budget`, keeping the newest. Returns the rows deleted; a database
+    /// with no copy has none to delete.
+    ///
+    /// Each batch takes the whole write gate, and only while no writer waits
+    /// for it, so a waiting write always goes before the next batch; one that
+    /// arrives during a batch waits for that batch alone, which is planned
+    /// to end within a write's wait for the lock. The batching and why the
+    /// deleted rows are safe to lose are on `SyncCopy::trim_pushed`.
+    pub async fn trim_change_log(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<u64, PersistenceError> {
+        match &self.sync_copy {
+            Some(copy) => copy.trim_pushed(budget, &write_gate::TrimTurns(self)).await,
+            None => Ok(0),
+        }
+    }
+
     /// Obtain a connection configured for local-SQLite concurrency.
     ///
     /// WAL mode is set in `migrate()` (persists in the DB file). `busy_timeout`
@@ -204,7 +232,9 @@ impl TursoEventStore {
     /// Run schema migrations on connect.
     #[instrument(skip_all, fields(otel.name = "turso.migrate"))]
     async fn migrate(&self) -> Result<(), PersistenceError> {
-        let conn = self.connection().await?;
+        let conn = self
+            .write_connection("turso.migrate", write_gate::WritePriority::High)
+            .await?;
 
         // PRAGMAs are SQLite-specific and not supported on remote Turso Cloud.
         // Turso Cloud manages its own journal mode and concurrency.
@@ -551,7 +581,7 @@ impl TursoEventStore {
     /// stay stranded in `ots_trajectories_rebuild`. SQLite's DDL is
     /// transactional, so the whole rekey either lands or does not.
     async fn rebuild_ots_trajectories_for_tenant_identity(
-        conn: &InstrumentedConnection,
+        conn: &instrumentation::WriteConnection,
     ) -> Result<(), PersistenceError> {
         // Scoped so the cursor is closed before the rebuild runs: an open read
         // on `sqlite_master` holds a lock that `DROP TABLE` cannot take.

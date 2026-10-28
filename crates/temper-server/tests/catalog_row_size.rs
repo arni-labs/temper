@@ -11,6 +11,7 @@ use temper_runtime::ActorSystem;
 use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
+use temper_server::idempotency::IdempotencyKey;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
 use temper_server::{ServerState, StorageStack};
@@ -41,7 +42,9 @@ fn order_state(store: TursoEventStore) -> ServerState {
 /// A key as long as a client's UUID-based keys.
 fn key(n: usize) -> AgentContext {
     AgentContext {
-        idempotency_key: Some(format!("3f2a9c4e-0b1d-4e8f-a7c6-{n:012}")),
+        idempotency_key: Some(IdempotencyKey::Request(format!(
+            "3f2a9c4e-0b1d-4e8f-a7c6-{n:012}"
+        ))),
         ..AgentContext::default()
     }
 }

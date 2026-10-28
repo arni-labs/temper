@@ -37,7 +37,10 @@ fn note(entity_id: &str, title: &str, status: &str, sequence_nr: u64) -> (Value,
 /// Record, for every UPDATE of `entity_catalog`, the size of the row before
 /// and after it and the size of each large column it sets.
 async fn log_catalog_writes(store: &TursoEventStore) {
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "CREATE TABLE catalog_write_bytes (bytes INTEGER NOT NULL)",
         (),
@@ -76,6 +79,10 @@ async fn take_logged_bytes(store: &TursoEventStore) -> i64 {
         .get::<i64>(0)
         .expect("logged bytes");
     drop(rows);
+    let conn = store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute("DELETE FROM catalog_write_bytes", ())
         .await
         .expect("clear write log");
@@ -201,21 +208,26 @@ async fn a_row_that_holds_its_fields_twice_reads_unchanged_and_shrinks_on_its_ne
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let id = "note-legacy";
     let (fields, created) = note(id, "Plan", "Draft", 1);
-    let conn = store.connection().await.expect("connection");
-    conn.execute(
-        "INSERT INTO entity_catalog \
-         (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
-         VALUES (?1, ?2, ?3, 'Draft', ?4, ?5, '2026-01-01T00:00:00Z', 1, 2, 'written-before')",
-        params![
-            tenant.as_str(),
-            ENTITY_TYPE,
-            id,
-            fields.to_string(),
-            created.to_string()
-        ],
-    )
-    .await
-    .expect("insert a row that holds its fields twice");
+    // The connection holds the write gate's permit; it is dropped before the
+    // store writes again below.
+    store
+        .write_connection("test", super::super::WritePriority::High)
+        .await
+        .expect("connection")
+        .execute(
+            "INSERT INTO entity_catalog \
+             (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
+             VALUES (?1, ?2, ?3, 'Draft', ?4, ?5, '2026-01-01T00:00:00Z', 1, 2, 'written-before')",
+            params![
+                tenant.as_str(),
+                ENTITY_TYPE,
+                id,
+                fields.to_string(),
+                created.to_string()
+            ],
+        )
+        .await
+        .expect("insert a row that holds its fields twice");
 
     assert_eq!(
         loaded_state(&store, &tenant, id).await,
