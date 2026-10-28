@@ -22,7 +22,7 @@ use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
-use crate::model::semantics::{Expansion, string_values};
+use crate::model::semantics::{Expansion, rule_for, string_values};
 use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 pub use drops::DroppedReaction;
@@ -35,9 +35,6 @@ pub(super) use walk::Explored;
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
-
-/// Reaction depth followed: the runtime's own bound.
-const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
 
 /// Dispatches and module calls in flight at once. The runtime has no such
 /// bound: each request, reaction and module call is its own task. The model
@@ -56,7 +53,7 @@ enum Delivery {
     /// Before the next move from outside: the dispatches a move sends all
     /// land, in any order, before anything else is asked. That is what the
     /// drop check claims (ADR-0150); with it, the dispatches in flight are
-    /// bounded by the reactions' fan-out and depth.
+    /// bounded by the reactions' fan-out and distinct steps.
     BeforeNextRequest,
 }
 
@@ -383,10 +380,11 @@ impl JointModel {
         state: &JointState,
         blind: Blind,
     ) -> bool {
-        let local = &state.records[entity];
-        let status_ok =
-            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
-        status_ok && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+        // The rule the runtime takes for this action in the record's status
+        // (`rule_for`); another with the same name never fires from there.
+        let taken = rule_for(&self.models[entity], &t.name, &state.records[entity].status)
+            .is_some_and(|rule| std::ptr::eq(rule, t));
+        taken && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
     }
 
     pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {

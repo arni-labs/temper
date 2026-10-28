@@ -292,6 +292,10 @@ pub struct EntityResponse {
     /// the same action may have caused.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// Whether the store could not take the action's write: it failed, or its
+    /// disk is under the floor. Answered 503, so the caller tries again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub store_unavailable: bool,
 }
 
 impl EntityResponse {
@@ -299,6 +303,15 @@ impl EntityResponse {
     pub(crate) fn refused(state: EntityState, error: String) -> Self {
         Self {
             refused: true,
+            store_unavailable: false,
+            ..Self::write_failed(state, error)
+        }
+    }
+
+    /// The answer to an action the store could not take: see `store_unavailable`.
+    pub(crate) fn store_unavailable(state: EntityState, error: String) -> Self {
+        Self {
+            store_unavailable: true,
             ..Self::write_failed(state, error)
         }
     }
@@ -315,6 +328,7 @@ impl EntityResponse {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            store_unavailable: false,
         }
     }
 }
@@ -465,6 +479,7 @@ mod tests {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            store_unavailable: false,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         assert!(!serialized.contains("spec_governed"));

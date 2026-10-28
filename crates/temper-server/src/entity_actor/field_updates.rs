@@ -22,34 +22,46 @@ use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 /// Attempts allowed after the first, matching the `Action` arm's ADR-0046 budget.
 const MAX_RETRIES: u32 = 2;
 
+/// Why a field update is not in the journal. `state` has been restored either
+/// way: a refusal never leaves a partial write.
+pub(super) enum NotUpdated {
+    /// Refused or failed before the store was asked; the caller replies with
+    /// the reason verbatim.
+    Failed(String),
+    /// The store did not take the update's event.
+    Store(PersistenceError),
+}
+
 /// Apply a field update and make it durable, or refuse it.
 ///
-/// `Ok(())` means the update is in the journal. `Err(reason)` means it is not,
-/// and `state` has been restored — a refusal never leaves a partial write. The
-/// caller replies with the reason verbatim.
+/// `Ok(())` means the update is in the journal.
 pub(super) async fn commit_field_update(
     actor: &EntityActor,
     state: &mut EntityState,
     fields: Value,
     replace: bool,
     expected_precondition: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), NotUpdated> {
     if actor
         .table
         .read()
         .expect("table lock poisoned")
         .strict_action_params
     {
-        return Err("Strict entities require a declared action for field changes".to_owned());
+        return Err(NotUpdated::Failed(
+            "Strict entities require a declared action for field changes".to_owned(),
+        ));
     }
     let has_precondition = expected_precondition.is_some();
     if let Some(expected) = expected_precondition
         && effects::entity_authorization_precondition(state) != expected
     {
-        return Err(STALE_AUTHORIZATION.to_string());
+        return Err(NotUpdated::Failed(STALE_AUTHORIZATION.to_string()));
     }
     if state.status == "Deleted" {
-        return Err("cannot update fields after entity deletion".to_string());
+        return Err(NotUpdated::Failed(
+            "cannot update fields after entity deletion".to_string(),
+        ));
     }
     // `parse_json_body_or_400` accepts any valid JSON, so a `PUT` body of
     // `[1,2,3]` reaches here. With `replace`, `apply_field_update` would set
@@ -59,14 +71,16 @@ pub(super) async fn commit_field_update(
     // journaled that corruption was in-memory and healed on restart; persisting
     // it would make it permanent.
     if !fields.is_object() {
-        return Err("entity field update must be a JSON object".to_string());
+        return Err(NotUpdated::Failed(
+            "entity field update must be a JSON object".to_string(),
+        ));
     }
     // The same budget that gates spec actions. Field updates append journal
     // events too, so ungated they could grow the snapshot replay tail past
     // `MAX_EVENTS_SINCE_SNAPSHOT` while the snapshot path is stalled, after which
     // the entity can never rehydrate. Rejected before mutating.
     if let Some(reason) = budget_refusal(actor, state, replace) {
-        return Err(reason);
+        return Err(NotUpdated::Failed(reason));
     }
 
     // Sanitize once and use the same value for state and journal.
@@ -123,7 +137,7 @@ pub(super) async fn commit_field_update(
             // one layer down the retry the layer above forbids.
             Err(PersistenceError::ConcurrencyViolation { .. }) if has_precondition => {
                 state.fields = previous_fields;
-                return Err(STALE_AUTHORIZATION.to_string());
+                return Err(NotUpdated::Failed(STALE_AUTHORIZATION.to_string()));
             }
             Err(PersistenceError::ConcurrencyViolation { actual, .. }) if attempt < MAX_RETRIES => {
                 attempt += 1;
@@ -131,11 +145,11 @@ pub(super) async fn commit_field_update(
                     Ok(()) => {}
                     Err(reason) => {
                         state.fields = previous_fields;
-                        return Err(reason);
+                        return Err(NotUpdated::Failed(reason));
                     }
                 }
                 if let Some(reason) = post_replay_refusal(actor, state, replace) {
-                    return Err(reason);
+                    return Err(NotUpdated::Failed(reason));
                 }
                 // Re-apply onto the caught-up state and rebuild the event against
                 // its (possibly new) status.
@@ -149,7 +163,7 @@ pub(super) async fn commit_field_update(
             }
             Err(e) => {
                 state.fields = previous_fields;
-                return Err(super::actor::persistence_failure(&e));
+                return Err(NotUpdated::Store(e));
             }
         }
     }

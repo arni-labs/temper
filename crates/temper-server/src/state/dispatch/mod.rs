@@ -135,6 +135,11 @@ pub enum DispatchError {
     #[error("entity type '{0}' is not governed by any registered spec")]
     Ungoverned(String),
 
+    /// The store could not take the write: it failed, or its disk is under
+    /// the floor. Answered 503, so the caller tries again.
+    #[error("{0}")]
+    StoreUnavailable(String),
+
     /// An internal error (serialization, persistence, unexpected state).
     #[error("{0}")]
     Internal(String),

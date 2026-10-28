@@ -180,7 +180,8 @@ impl JointModel {
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
                 let text = format!("{entity}.{action}");
-                for (outcome, then) in self.commit(state.clone(), entity, action, 0, OUTSIDE, true)
+                for (outcome, then) in
+                    self.commit(state.clone(), entity, action, &[], OUTSIDE, true)
                 {
                     let certainty = Certainty::unless(known, Unsure).then(then);
                     outcomes.push((outcome, text.clone(), certainty));
@@ -234,7 +235,8 @@ impl JointModel {
                         let refused = format!("{text} refused by its record");
                         outcomes.push((next.clone(), refused, OneOf));
                     }
-                    for (outcome, then) in self.commit(next, &call.to, action, 0, call.by, inline) {
+                    for (outcome, then) in self.commit(next, &call.to, action, &[], call.by, inline)
+                    {
                         let certainty = Certainty::unless(known, OneOf).then(then);
                         outcomes.push((outcome, text.clone(), certainty));
                     }
@@ -282,7 +284,7 @@ impl JointModel {
                 remove(&mut next, dispatch);
                 // Cedar decides a reaction as its sender; every other
                 // dispatch was decided at its entry point, or is the kernel's.
-                let may = if dispatch.depth > 0 {
+                let may = if dispatch.via.is_some() {
                     self.senders
                         .may_in(dispatch.by, &dispatch.to, &dispatch.action, state)
                 } else {
@@ -462,7 +464,7 @@ fn sent(entity: &str, action: &TemperModelAction, by: u32, inline: bool) -> Disp
         target_state: action.target_state.clone(),
         params: action.params.clone(),
         read: true,
-        depth: 0,
+        chain: Vec::new(),
         via: None,
         by,
         inline,

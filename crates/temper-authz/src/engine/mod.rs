@@ -401,6 +401,27 @@ impl AuthzEngine {
         )
     }
 
+    /// The same decision as [`Self::authorize_for_tenant`], for a page asking which moves to show before any is
+    /// sent. Only its metric differs: it is counted as `check:offer`, never as a refusal; the move, if sent, is
+    /// checked again at the gate.
+    pub fn authorize_offer_for_tenant(
+        &self,
+        tenant: &str,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &HashMap<String, serde_json::Value>,
+    ) -> AuthzDecision {
+        self.authorize_for_tenant_checked(
+            tenant,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            CedarCheck::Offer,
+        )
+    }
+
     fn authorize_for_tenant_checked(
         &self,
         tenant: &str,
