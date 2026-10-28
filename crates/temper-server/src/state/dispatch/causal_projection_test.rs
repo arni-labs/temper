@@ -93,7 +93,9 @@ async fn causal_projection_failure_preserves_commit_without_starting_dependents(
     let (state, query, _queue, _temp) = fixture().await;
     query.fail_source_write.store(true, Ordering::SeqCst);
     let mut agent = AgentContext::system();
-    agent.idempotency_key = Some("same-committed-submit".into());
+    agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+        "same-committed-submit".into(),
+    ));
     let response = state
         .dispatch_tenant_action_ext(
             &TenantId::default(),

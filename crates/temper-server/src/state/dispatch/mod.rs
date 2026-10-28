@@ -11,14 +11,20 @@ use tracing::Instrument;
 
 mod actions;
 mod adapter;
+mod answers;
 mod authenticated_params;
+pub(crate) use authenticated_params::bind_authenticated_params;
 mod compensation;
 mod composite;
 mod cross_entity;
+mod detached;
 mod effects;
+pub(crate) mod entity_rows;
 mod generated_callbacks;
+pub(crate) mod owed_writes;
 mod projection_barrier;
 pub(crate) mod retry;
+mod scheduled_actions;
 pub(crate) mod state_timeouts;
 mod state_timer_follow;
 mod state_timer_reconcile;
@@ -26,6 +32,7 @@ mod state_timer_rows;
 #[cfg(test)]
 #[path = "strict_support_test.rs"]
 mod strict_test_support;
+mod timer_cause;
 mod wasm;
 pub(crate) use wasm::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
@@ -128,6 +135,11 @@ pub enum DispatchError {
     /// The entity type has no registered spec — all actions are denied by default.
     #[error("entity type '{0}' is not governed by any registered spec")]
     Ungoverned(String),
+
+    /// The store could not take the write: it failed, or its disk is under
+    /// the floor. Answered 503, so the caller tries again.
+    #[error("{0}")]
+    StoreUnavailable(String),
 
     /// An internal error (serialization, persistence, unexpected state).
     #[error("{0}")]
@@ -390,7 +402,8 @@ impl crate::state::ServerState {
         let workflow_root_entity_type = workflow_root_type(&agent_ctx, &entity_type);
         let workflow_root_entity_id = workflow_root_id(&agent_ctx, &entity_id);
         let workflow_run_id = workflow_run_id(&agent_ctx, &entity_type, &entity_id);
-        let span = tracing::info_span!(
+        let span = crate::trace_context::runtime_work_span!(
+            crate::trace_context::cause(),
             "dispatch.background_wasm_integrations",
             workflow.root_entity_type = %workflow_root_entity_type,
             workflow.root_entity_id = %workflow_root_entity_id,
@@ -440,3 +453,7 @@ impl crate::state::ServerState {
 #[cfg(test)]
 #[path = "dispatch_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runtime_work_trace_test.rs"]
+mod runtime_work_trace_tests;

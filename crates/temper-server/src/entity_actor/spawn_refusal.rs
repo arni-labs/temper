@@ -100,6 +100,7 @@ fn refusal_event(state: &EntityState, params: Value) -> EntityEvent {
         timestamp: sim_now(),
         params,
         idempotency_key: None,
+        outcome: None,
         kind: temper_runtime::persistence::EventKind::Transition,
     }
 }
@@ -137,7 +138,14 @@ pub(super) async fn commit(
     let mut attempt: u32 = 0;
     loop {
         match actor
-            .persist_event(store, backend, &actor.persistence_id(), state, &event)
+            .persist_event(
+                store,
+                backend,
+                state,
+                &event,
+                &super::scheduled_rows::ScheduledRows::default(),
+                None,
+            )
             .await
         {
             Ok(_) => break,

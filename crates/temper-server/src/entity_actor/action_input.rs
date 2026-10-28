@@ -32,6 +32,20 @@ pub(crate) async fn process_action_with_blob_prestate(
             }
         }
     }
+    // Invariants read the same logical prestate as input constraints.
+    for invariant in &table.invariants {
+        invariant.assert.for_each_name(&mut |name| {
+            if let temper_spec::predicate::Name::Var(name) = name
+                && !state.counters.contains_key(name)
+                && !state.booleans.contains_key(name)
+                && !state.lists.contains_key(name)
+                && let Some(value) = state.fields.get(name)
+                && (value.is_object() || value.is_array())
+            {
+                fields.insert(name.to_string(), value.clone());
+            }
+        });
+    }
     let mut fields = Value::Object(fields);
     if let Err(error) = crate::blobs::hydrate_comparison_fields(&blob_source, &mut fields).await {
         return ProcessResult::refused(error);

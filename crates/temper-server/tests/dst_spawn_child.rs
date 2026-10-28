@@ -35,8 +35,10 @@ use temper_store_sim::{DeterministicRng, SimEventStore};
 const SEEDS: u64 = 32;
 
 /// How long one spawn may take to settle. A settled spawn has a child or a
-/// refusal on its parent; the background task needs a few actor round trips.
-const SETTLE_POLLS: usize = 100;
+/// refusal on its parent. Include the base branch's backoff for pending child
+/// writes whose reads fail (1 + 2 + 4 seconds for this workload). Tests pause
+/// Tokio's clock, so the wait advances simulated time.
+const SETTLE_POLLS: usize = 1000;
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const CSDL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -130,13 +132,17 @@ fn state_with_sim_store(seed: u64) -> (ServerState, SimEventStore) {
 }
 
 fn state_with_store(sim_store: SimEventStore) -> ServerState {
+    state_with_specs(sim_store, JOB_IOA, RUN_IOA)
+}
+
+fn state_with_specs(sim_store: SimEventStore, job: &str, run: &str) -> ServerState {
     let csdl = parse_csdl(CSDL).expect("CSDL parses");
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
         csdl,
         CSDL.to_string(),
-        &[("Job", JOB_IOA), ("Run", RUN_IOA)],
+        &[("Job", job), ("Run", run)],
     );
     let mut state = ServerState::from_registry(ActorSystem::new("dst-spawn-child"), registry);
     state.set_storage_stack(StorageStack::from_sim(sim_store.clone(), None));
@@ -184,7 +190,7 @@ async fn wait_until_settled(store: &SimEventStore, job_id: &str, run_id: &str) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
     for seed in 0..SEEDS {
         let (_guard, _clock, _ids) = install_deterministic_context(seed);
@@ -245,13 +251,14 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
             wait_until_settled(&store, job_id, run_id).await;
         }
 
+        let restarted = state_with_store(store.clone());
         for (job_id, newest_run) in &newest {
-            let stored = state
+            let live = state
                 .get_tenant_entity_state(&tenant, "Job", job_id)
                 .await
                 .expect("read Job")
-                .state
-                .fields["last_run_id"]
+                .state;
+            let stored = live.fields["last_run_id"]
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
@@ -267,6 +274,15 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
                     "seed {seed}: {job_id} lost the id of its newest run, which exists"
                 );
             }
+            let replayed = restarted
+                .get_tenant_entity_state(&tenant, "Job", job_id)
+                .await
+                .expect("replay Job")
+                .state;
+            assert_eq!(
+                replayed.fields["last_run_id"], live.fields["last_run_id"],
+                "seed {seed}: {job_id}'s spawn field must survive replay"
+            );
         }
         for (job_id, run_id, kind) in &fired {
             if run_exists(&store, run_id) {
@@ -281,7 +297,7 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dst_existing_child_survives_unreadable_journal() {
     for seed in 100..108 {
         let (_guard, _clock, _ids) = install_deterministic_context(seed);
@@ -298,9 +314,16 @@ async fn dst_existing_child_survives_unreadable_journal() {
             )
             .await
             .expect("create existing child");
-        // A fresh server has no resident child. Its existence must come from
-        // storage, whose first reads fail while a refused initializer settles.
-        let fresh = state_with_store(store.clone());
+        assert!(run_exists(&store, "existing"));
+        // Refuse an undeclared initializer before reading the existing child.
+        // A fresh server has no resident child, and the refusal's durable
+        // existence lookup fails: it must record uncertainty and keep the id.
+        let job = JOB_IOA.replace("'Configure'", "'Undeclared'");
+        let run = RUN_IOA.replace(
+            r#"initial = "Pending""#,
+            "initial = \"Pending\"\nstrict_action_params = true",
+        );
+        let fresh = state_with_specs(store.clone(), &job, &run);
         store.fail_next_reads("default:Run:existing", 5);
         let response = fresh
             .dispatch_tenant_action(
@@ -321,6 +344,7 @@ async fn dst_existing_child_survives_unreadable_journal() {
             tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
         }
         assert_eq!(refused_runs(&store, "job"), vec!["existing"]);
+        assert!(refused_unreadable(&store, "job", "existing"));
         let fields = fresh
             .get_tenant_entity_state(&tenant, "Job", "job")
             .await

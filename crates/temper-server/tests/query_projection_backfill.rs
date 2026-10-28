@@ -82,7 +82,8 @@ async fn wait_for_query_projection_ids(
             .query_field_index(
                 tenant,
                 entity_type,
-                "field_name = ?3 AND field_value = ?4",
+                "entity_id IN (SELECT entity_id FROM entity_field_index \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
                 vec![field_name.to_string(), field_value.to_string()],
             )
             .await
@@ -273,7 +274,8 @@ async fn startup_backfill_rebuilds_query_projection_without_hydrating_actors() {
         .query_field_index(
             tenant.as_str(),
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Rebuild Me".to_string()],
         )
         .await
@@ -346,7 +348,8 @@ async fn query_projection_excludes_fields_marked_not_query_indexed() {
         .query_field_index(
             tenant.as_str(),
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["progress_token".to_string(), "1".to_string()],
         )
         .await
@@ -443,9 +446,11 @@ async fn replay_parity_verifier_detects_projection_drift() {
         .expect("load active state");
     let mut catalog_state = serde_json::to_value(&actor_state.state).expect("serialize state");
     if let Some(obj) = catalog_state.as_object_mut() {
-        // The projection's own shape (query_projection_state): no events, no status clock.
+        // The projection's own shape (query_projection_state): no events, no
+        // status clock, no idempotency keys.
         obj.insert("events".to_string(), serde_json::json!([]));
         obj.remove("status_clock");
+        obj.remove("processed_idempotency_keys");
     }
     store
         .upsert_query_projection_with_state(
