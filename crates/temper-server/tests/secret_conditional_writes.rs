@@ -136,6 +136,7 @@ fn security_context(id: &str) -> SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: format!("secret-cas-{id}"),
+        cause: None,
     }
 }
 
