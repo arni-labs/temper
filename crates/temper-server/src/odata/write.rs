@@ -1,5 +1,7 @@
 //! OData write handlers (`POST`, `PATCH`, `PUT`, `DELETE`).
 
+use std::collections::BTreeSet;
+
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -24,7 +26,7 @@ use super::common::{
     constraint_violation_response, extract_key, resolve_entity_type, run_write_prechecks,
     verification_gate_response,
 };
-use super::constraints::pre_delete_relation_checks;
+use super::constraints::{DeletePlan, plan_delete};
 use super::file_content::refuse_content_fields;
 use super::rate_limit::{enforce_commons_write_rate_limit, owner_id_from_fields};
 use super::response::annotate_entity;
@@ -33,6 +35,7 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error, odata_refusal};
+use crate::state::batch_delete::BatchDeleteError;
 use crate::state::redecide::Redecide;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use crate::state::{CreateError, ServerState};
@@ -65,17 +68,8 @@ fn strict_generic_write_response(
     tenant: &TenantId,
     entity_type: &str,
 ) -> Option<axum::response::Response> {
-    let registry = state.registry.read().expect("registry lock poisoned");
-    registry
-        .get_table(tenant, entity_type)
-        .map(|table| table.strict_action_params)
-        .or_else(|| {
-            state
-                .transition_tables
-                .get(entity_type)
-                .map(|table| table.strict_action_params)
-        })
-        .unwrap_or(false)
+    state
+        .has_strict_action_params(tenant, entity_type)
         .then(|| {
             odata_error(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -1599,12 +1593,11 @@ pub async fn handle_odata_delete(
                 {
                     return response;
                 }
-                if let Err(v) =
-                    pre_delete_relation_checks(&state, &tenant, &entity_type, &key_str, "delete")
-                        .await
-                {
-                    return constraint_violation_response(v);
-                }
+                let plan =
+                    match plan_delete(&state, &tenant, &entity_type, &key_str, "delete").await {
+                        Ok(plan) => plan,
+                        Err(v) => return constraint_violation_response(v),
+                    };
                 if let Err(resp) = run_write_prechecks(
                     &state,
                     &tenant,
@@ -1644,6 +1637,29 @@ pub async fn handle_odata_delete(
                 }
 
                 redecide.dispatching().await;
+                if !plan.dependents().is_empty() {
+                    match delete_with_dependents(
+                        &state,
+                        &tenant,
+                        &entity_type,
+                        &key_str,
+                        &existing.precondition,
+                        plan,
+                    )
+                    .await
+                    {
+                        CascadeAnswer::Answered(response) => return response,
+                        CascadeAnswer::Changed(_) if redecide.again(true, "delete") => continue,
+                        CascadeAnswer::Changed(reason) => {
+                            return odata_error(
+                                StatusCode::CONFLICT,
+                                "ConcurrentModification",
+                                &reason,
+                            )
+                            .into_response();
+                        }
+                    }
+                }
                 let answer = state
                     .delete_tenant_entity_if_current(
                         &tenant,
@@ -1659,10 +1675,7 @@ pub async fn handle_odata_delete(
                 }
                 return match answer {
                     Ok(response) if response.success => {
-                        if entity_type == "RateLimit" {
-                            state.clear_commons_rate_limit_cache();
-                        }
-                        state.clear_commons_storage_projection_cache_for_entity(&entity_type);
+                        forget_deleted_entity(&state, &entity_type);
                         (StatusCode::NO_CONTENT, "").into_response()
                     }
                     Ok(response) if response.store_unavailable => {
@@ -1693,6 +1706,104 @@ pub async fn handle_odata_delete(
         )
         .into_response(),
     }
+}
+
+/// Delete `entity_type('entity_id')` and the dependents `plan` found, all
+/// together and only while each is in the state it was checked in: the
+/// requested entity's as it was authorized, each dependent's as the plan read
+/// it (`ServerState::delete_entities_together`). When any of them has changed
+/// since, or the server keeps no journal, nothing is deleted.
+async fn delete_with_dependents(
+    state: &ServerState,
+    tenant: &TenantId,
+    entity_type: &str,
+    entity_id: &str,
+    authorized_precondition: &str,
+    plan: DeletePlan,
+) -> CascadeAnswer {
+    let root = match state
+        .get_tenant_entity_state(tenant, entity_type, entity_id)
+        .await
+    {
+        Ok(response) => response.state,
+        Err(error) => {
+            return CascadeAnswer::Answered(
+                odata_error(StatusCode::INTERNAL_SERVER_ERROR, "DeleteError", &error)
+                    .into_response(),
+            );
+        }
+    };
+    if crate::entity_actor::effects::entity_authorization_precondition(&root)
+        != authorized_precondition
+    {
+        return CascadeAnswer::Changed(
+            "entity changed after authorization; retry against current state".to_string(),
+        );
+    }
+
+    let dependents = plan.into_dependents();
+    let count = dependents.len();
+    let mut removed_types: BTreeSet<String> = dependents
+        .iter()
+        .map(|dependent| dependent.entity_type.clone())
+        .collect();
+    removed_types.insert(entity_type.to_string());
+    let mut members = Vec::with_capacity(count + 1);
+    members.push(root);
+    members.extend(dependents);
+
+    let answer = match state.delete_entities_together(tenant, members).await {
+        Ok(()) => {
+            for removed_type in &removed_types {
+                forget_deleted_entity(state, removed_type);
+            }
+            (StatusCode::NO_CONTENT, "").into_response()
+        }
+        Err(BatchDeleteError::Changed(reason)) => {
+            return CascadeAnswer::Changed(format!(
+                "nothing was deleted: {reason}; retry against current state"
+            ));
+        }
+        // 501, as a secret store that cannot delete answers: retrying cannot
+        // help, only a server with a journal can.
+        Err(BatchDeleteError::NoJournal) => odata_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            &format!(
+                "this server keeps no journal, so it cannot delete {entity_type}('{entity_id}') \
+                 and the {count} entities that belong to it as one change; nothing was deleted"
+            ),
+        )
+        .into_response(),
+        Err(BatchDeleteError::Storage(error)) => odata_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DeleteError",
+            &format!(
+                "could not delete {entity_type}('{entity_id}') with the {count} entities that \
+                 belong to it: {error}"
+            ),
+        )
+        .into_response(),
+    };
+    CascadeAnswer::Answered(answer)
+}
+
+/// What a delete with dependents did.
+enum CascadeAnswer {
+    /// Its answer.
+    Answered(axum::response::Response),
+    /// The requested entity or one it removes changed after the delete was
+    /// decided, and nothing was deleted: the delete is decided again on what
+    /// they are now (`Redecide`).
+    Changed(String),
+}
+
+/// Drop the caches that hold rows of `entity_type` after one is deleted.
+fn forget_deleted_entity(state: &ServerState, entity_type: &str) {
+    if entity_type == "RateLimit" {
+        state.clear_commons_rate_limit_cache();
+    }
+    state.clear_commons_storage_projection_cache_for_entity(entity_type);
 }
 
 /// Map an entity type name to a short lowercase prefix for auto-generated IDs.
