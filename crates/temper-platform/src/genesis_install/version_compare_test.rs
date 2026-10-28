@@ -94,6 +94,39 @@ async fn a_parent_without_a_row_makes_the_answer_unknown() {
 }
 
 #[tokio::test]
+async fn a_missing_row_on_one_branch_does_not_hide_the_other() {
+    // m merges `gone` (never stored) and a; a is still found through m's
+    // other parent.
+    let graph = Graph::new(&[("a", &[]), ("m", &["gone", "a"])]);
+    assert_eq!(compare(&graph, "a", "m").await, VersionComparison::Ahead);
+}
+
+#[tokio::test]
+async fn a_recent_child_of_a_long_history_is_behind_it() {
+    // The keep case: the installed version (base) is the pin's (head) child,
+    // and the pin has more ancestors than one walk may read. Walking from
+    // the pin never finds its child; walking from the child finds the pin in
+    // one step.
+    let mut edges = BTreeMap::new();
+    edges.insert("c0".to_string(), Vec::new());
+    let deep = MAX_VERSION_COMPARE_WALK_COMMITS + 10;
+    for i in 1..=deep {
+        edges.insert(format!("c{i}"), vec![format!("c{}", i - 1)]);
+    }
+    edges.insert("child".to_string(), vec![format!("c{deep}")]);
+    let graph = Graph(edges);
+    let pin = format!("c{deep}");
+    assert_eq!(
+        compare(&graph, "child", &pin).await,
+        VersionComparison::Behind
+    );
+    assert_eq!(
+        compare(&graph, &pin, "child").await,
+        VersionComparison::Ahead
+    );
+}
+
+#[tokio::test]
 async fn a_walk_past_the_bound_is_unknown_and_one_inside_it_is_answered() {
     // A straight line of commits: c0 <- c1 <- ... <- cN.
     let line = |len: usize| {
