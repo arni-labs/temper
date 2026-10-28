@@ -309,7 +309,7 @@ fn run_seed(seed: u64, tries: &Tries) -> Result<(), String> {
             &[("Job", JOB)],
         );
         let mut state =
-            ServerState::from_registry(ActorSystem::new(&format!("denied-{seed}")), registry);
+            ServerState::from_registry(ActorSystem::new(format!("denied-{seed}")), registry);
         state.set_storage_stack(StorageStack::from_sim(events.clone(), None));
         state.state_timer_rows = Some(rows.clone());
         let walk = state.start_runtime().await.expect("the server starts");
