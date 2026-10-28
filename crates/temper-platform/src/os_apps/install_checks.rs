@@ -14,6 +14,8 @@ use super::InstallWarning;
 
 use crate::state::PlatformState;
 
+mod schedule_check;
+
 /// Refuse an install into a tenant whose stored specs did not load at startup.
 ///
 /// An install rewrites the tenant's spec and constraints rows; for such a
@@ -41,6 +43,64 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
     cross_invariant::parse_cross_invariants(source)
         .map(|_| ())
         .map_err(|e| format!("Failed to parse cross-invariants for os-app '{app_name}': {e}"))
+}
+
+/// Refuse an install whose new spec versions schedule a move refused every
+/// time the move that schedules it runs (see `schedule_check`): two moves
+/// fired together whose conditions no record state meets, or a move whose
+/// `from` states the record cannot reach. Such a move is a provable defect,
+/// not a policy limit: on a repeating state timer it is a refused fire every
+/// round, for as long as the record waits. Pairs the check cannot decide are
+/// returned as warnings, and the install goes ahead.
+///
+/// Only a version the tenant does not already run is checked. A type whose
+/// registered source is this one (restored from the store at boot, then
+/// replayed through the installer by a restart or reconcile) keeps loading, so
+/// an app installed before this check is not broken by it; its next changed
+/// version is checked.
+fn refuse_doomed_schedules(
+    state: &PlatformState,
+    tenant: &TenantId,
+    app_name: &str,
+    specs: &[(String, String)],
+) -> Result<Vec<InstallWarning>, String> {
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| format!("os-app '{app_name}': the spec registry lock is poisoned"))?;
+    let (mut refused, mut warnings) = (Vec::new(), Vec::new());
+    for (entity_type, source) in specs {
+        if registry
+            .get_spec(tenant, entity_type)
+            .is_some_and(|installed| installed.ioa_source == *source)
+        {
+            continue;
+        }
+        // A spec that does not parse is refused by the install's other checks.
+        let Ok(automaton) = temper_spec::automaton::parse_automaton(source) else {
+            continue;
+        };
+        let found = schedule_check::check(&automaton);
+        refused.extend(
+            found
+                .refused
+                .into_iter()
+                .map(|text| format!("{entity_type}: {text}")),
+        );
+        warnings.extend(
+            found
+                .undecided
+                .into_iter()
+                .map(|text| InstallWarning::scheduled_moves(format!("{entity_type}: {text}"))),
+        );
+    }
+    if refused.is_empty() {
+        return Ok(warnings);
+    }
+    Err(format!(
+        "os-app '{app_name}' was not installed: a move it schedules is refused every time.\n{}",
+        refused.join("\n")
+    ))
 }
 
 /// Time and states the joint check of one install may spend. Anyone who may
@@ -293,9 +353,10 @@ pub(super) fn timer_strands(
     warnings
 }
 
-/// Check each new version in `specs`, when the install writes specs, against
-/// the records stored under the version installed for its type, before
-/// anything is written (see temper-server's `spec_change`): refuse it when it
+/// Check each new version in `specs`, when the install writes specs, before
+/// anything is written: refuse it when it schedules a move refused every time
+/// ([`refuse_doomed_schedules`]), or, against the records stored under the
+/// version installed for its type (see temper-server's `spec_change`), when it
 /// leaves records with no way forward that no `[[carry]]` moves. Returns what
 /// the check reports, and how many records each carry moves once the install
 /// has answered (the server's carry pass makes them in the background).
@@ -312,6 +373,7 @@ pub(super) async fn check_spec_changes(
     if !writes_specs {
         return Ok(Vec::new());
     }
+    let mut warnings = refuse_doomed_schedules(state, tenant, app_name, specs)?;
     let sources: Vec<(&str, &str)> = specs
         .iter()
         .map(|(entity_type, source)| (entity_type.as_str(), source.as_str()))
@@ -344,12 +406,13 @@ pub(super) async fn check_spec_changes(
              until then they wait in their old state"
             )
         });
-    Ok(plan
-        .warnings
-        .into_iter()
-        .chain(carrying)
-        .map(InstallWarning::spec_change)
-        .collect())
+    warnings.extend(
+        plan.warnings
+            .into_iter()
+            .chain(carrying)
+            .map(InstallWarning::spec_change),
+    );
+    Ok(warnings)
 }
 
 #[cfg(test)]
