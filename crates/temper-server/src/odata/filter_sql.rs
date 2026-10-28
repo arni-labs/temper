@@ -106,7 +106,8 @@ fn collect_equality_field_predicates(
     match expr {
         FilterExpr::BinaryOp {
             left,
-            op: BinaryOperator::And,
+            // MUTANT: or collects like and.
+            op: BinaryOperator::And | BinaryOperator::Or,
             right,
         } => {
             collect_equality_field_predicates(left, out)
