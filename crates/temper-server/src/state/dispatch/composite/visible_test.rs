@@ -58,12 +58,21 @@ async fn lagging_state(seed: u64) -> (ServerState, std::path::PathBuf) {
 /// `GET /tdata/Refs?$filter=RepositoryId eq 'repo-test'`, as Genesis reads a
 /// repository's refs.
 async fn refs_of_repo(state: &ServerState) -> String {
+    let mut request = Request::get("/tdata/Refs?$filter=RepositoryId%20eq%20'repo-test'")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(temper_authz::AuthenticatedRequestContext::new(
+            TenantId::default(),
+            temper_authz::SecurityContext::from_resolved_identity(
+                "batch-visible-test",
+                "test-agent",
+                None,
+            ),
+        ));
     let response = crate::router::build_router(state.clone())
-        .oneshot(
-            Request::get("/tdata/Refs?$filter=RepositoryId%20eq%20'repo-test'")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(request)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
