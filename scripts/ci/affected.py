@@ -24,6 +24,7 @@ Writes key=value lines to $GITHUB_OUTPUT (stdout when unset):
   sdk_ts    true when the TypeScript SDK's checks should run: Rust changed (as
             before) or the SDK itself did; packages/ is in DOCS for Rust's sake
   shards    JSON matrix of Tests shards for the pr lane
+  specs     true when Spec Verification runs: the full lane, or a changed spec file
 """
 
 import fnmatch
@@ -52,6 +53,12 @@ DOCS = [
 SERVER = "temper-server"
 # temper-server's tests run with the features the whole workspace turns on for it.
 SERVER_FEATURES = "temper-server/observe,temper-server/sim"
+# The files Spec Verification reads. temper-cli's verify:: tests walk the whole repository
+# for spec collections (a directory holding *.ioa.toml and model.csdl.xml) and read their
+# IOA, CSDL, TLA and policies/*.cedar files wherever they sit, so a change to one runs that
+# job whatever owns it: reference-apps/*/specs belong to packages that never lead to
+# temper-cli, and docs/examples/pipeline-specs is under DOCS.
+SPEC_FILES = (".ioa.toml", ".csdl.xml", ".tla", ".cedar")
 # Packages whose tests take long enough to be worth two machines.
 HEAVY = {"temper-platform", "temper-store-turso", "temper-cli", "temper-actor-runtime"}
 
@@ -143,13 +150,15 @@ def main():
     verified = os.environ.get("VERIFIED_RUN", "").strip()
     lane = "pr" if queued or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
     dirs, names, dependents = workspace()
-    out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true"}
+    out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true",
+           "specs": "true"}
     if lane == "pr":
         if verified:
             print(f"This tree already passed in its merge group: {verified}", file=sys.stderr)
-        direct, outside, docs_only, sdk_ts = set(), [], True, False
+        direct, outside, docs_only, sdk_ts, specs = set(), [], True, False, False
         for path in [] if verified else changed_paths():
             sdk_ts = sdk_ts or path.startswith("packages/temper-sdk-ts/")
+            specs = specs or path.endswith(SPEC_FILES)
             name = owner(path, dirs)
             if name:
                 direct.add(name)
@@ -167,6 +176,7 @@ def main():
         out["test_args"] = test_args(packages)
         out["rust"] = "false" if docs_only else "true"
         out["sdk_ts"] = "true" if sdk_ts or not docs_only else "false"
+        out["specs"] = "true" if specs else "false"
         out["shards"] = json.dumps({"include": shards(packages)}) if packages else json.dumps({"include": []})
         print(f"Direct: {sorted(direct)}; testing {len(packages)} package(s): {out['packages'] or 'none'}", file=sys.stderr)
     else:

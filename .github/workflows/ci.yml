@@ -68,6 +68,7 @@ jobs:
       rust: ${{ steps.affected.outputs.rust }}
       sdk_ts: ${{ steps.affected.outputs.sdk_ts }}
       shards: ${{ steps.affected.outputs.shards }}
+      specs: ${{ steps.affected.outputs.specs }}
       dst_matrix: ${{ steps.dst.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
@@ -747,11 +748,11 @@ jobs:
   verify-specs:
     name: Spec Verification (L0-L3)
     needs: changes
-    # These are temper-cli's verify:: tests. On the pr lane the Tests shards run
-    # them whenever the change can reach temper-cli (every package except
-    # temper-agents, temper-macros, temper-wasm-sdk and the reference apps leads
-    # there), and any change outside a package tests everything.
-    if: needs.changes.outputs.lane == 'full'
+    # These are temper-cli's verify:: tests, which read every spec collection in the
+    # repository. The full lane runs them; the pr lane runs them when a spec file
+    # changed (scripts/ci/affected.py, SPEC_FILES). The Tests shards also run them
+    # whenever a change reaches temper-cli.
+    if: needs.changes.outputs.specs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
