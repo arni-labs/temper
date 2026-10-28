@@ -2868,5 +2868,5 @@ async fn a_request_with_a_traceparent_is_one_trace_with_one_root() {
     }
 }
 
-#[path = "router_test/write_keys.rs"]
+#[path = "router_test/write_keys_test.rs"]
 mod write_keys;
