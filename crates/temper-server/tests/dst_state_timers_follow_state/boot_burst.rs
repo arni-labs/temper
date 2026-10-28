@@ -3,9 +3,9 @@
 //! Workload, per seed: records in `alpha` start under the first spec and are
 //! never passivated, so none has a snapshot; records in `gamma` start untimed.
 //! The process stays down longer than any budget, then boots under the second
-//! spec with `gamma` timed. `alpha`'s records replay into `Review`, whose timer
-//! replaces the `Waiting` one their rows name, and every one of those timers
-//! is due at boot. `gamma`'s records have no row. A record's first append in
+//! spec with `gamma` timed. `alpha`'s records replay into their stored
+//! `Waiting`, whose new budget replaces the timer their rows name, and every
+//! one of those timers is due at boot. `gamma`'s records have no row. A record's first append in
 //! the new process (its timer's fire) takes a minute, so fires that run
 //! together start at the same instant.
 //!
@@ -24,7 +24,8 @@ use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_si
 use temper_runtime::tenant::TenantId;
 use temper_store_sim::SimEventStore;
 
-use super::world::{ProcessClock, SimTimerRows};
+use super::process_clock::ProcessClock;
+use super::world::SimTimerRows;
 use super::{JOB_V1, Job, Process, Run, World, act, advance, check_seeds, job_untimed, job_v2};
 
 /// How many due timers the server lets fire at once (`BOOT_FIRES_AT_ONCE`).

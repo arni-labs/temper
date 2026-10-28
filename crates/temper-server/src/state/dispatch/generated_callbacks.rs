@@ -37,6 +37,17 @@ impl ServerState {
         action: &str,
         error: &str,
     ) {
+        self.record_answer_refusal(entity, action, error, &Value::Null);
+    }
+
+    /// A refused answer, journaled and logged with the values it carried.
+    pub(super) fn record_answer_refusal(
+        &self,
+        entity: WasmEntityRef<'_>,
+        action: &str,
+        error: &str,
+        params: &Value,
+    ) {
         let seq = self.next_entity_event_sequence(
             entity.tenant.as_str(),
             entity.entity_type,
@@ -49,11 +60,11 @@ impl ServerState {
             seq,
             "integration_callback_rejected",
             serde_json::json!({
-                "action":action, "error":error,
+                "action":action, "error":error, "params":params,
             }),
         );
         tracing::warn!(tenant=%entity.tenant, entity_type=entity.entity_type,
-            entity_id=entity.entity_id, action, error, "integration callback rejected");
+            entity_id=entity.entity_id, action, error, %params, "integration callback rejected");
     }
 
     /// A rejected callback is an observed refusal, not a new execution failure.

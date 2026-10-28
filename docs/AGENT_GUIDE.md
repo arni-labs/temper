@@ -279,7 +279,7 @@ assert = "status in ['Submitted'] => items > 0"
 1. `[automaton]`: Define `name`, `states` (all valid status values), `initial` state, and optional `terminal` states (no action may leave them).
 2. `[[state]]`: Declare state variables with `name`, `type` (`counter`, `bool`, `string`, `set`), and `initial` value.
 3. `[[action]]`: Define actions with `name`, `kind` (`input`/`output`/`internal`), `from` states, `to` state, optional `guard`, `params`, `effect`, and `hint`.
-4. `[[invariant]]`: Define safety invariants with `name` and one `assert` expression, proven over every reachable state.
+4. `[[invariant]]`: Define safety invariants with `name` and one `assert` expression, proven over every reachable state and checked on every move: a move that would make one false is refused with its name ([predicates.md](predicates.md#invariants-on-every-move)).
 5. Every `guard` and `assert` is one expression in the predicate grammar (`&&`, `||`, `!`, `=>`, comparisons, `in`, `empty()`, `len()`, `Type[ref].status`); see [predicates.md](predicates.md).
 6. `effect` is a list of statements in the same grammar: `items += 1`, `retries -= 1`, `quota = params.quota`, `ready = true`, `append(tags, params.tag)`, `remove_at(tags, params.i)`, `schedule('Expire', 3600)`, `schedule_at('Expire', expires_at)`, `spawn('Task', 'Create', last_task_id)`. Statements are type-checked at load, and effects reading `params.p` are verified with `p` unknown. An action's name implies nothing: `AddItem` without an `effect` changes only `status`. See [predicates.md#effects](predicates.md#effects).
 7. `[[action.triggers]]`: the only way an action causes work elsewhere — `kind = "entity"` (another entity's action), `"wasm"`, `"adapter"`, or `"hook"` (a platform hook registered by the host). `kind = "webhook"` is refused at load: make the call with `kind = "wasm"`, `module = "http_fetch"` (ADR-0182). See [Section 9](#9-integration-engine).
@@ -625,7 +625,24 @@ on_failure = "RefreshFailed"
 config = { method = "POST", url = "https://oauth2.googleapis.com/token" }
 ```
 
-`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition.
+`on_success` / `on_failure` are ordinary actions on the same entity, so the callback path is a verified transition. A module computes values; the spec decides the move. Where the values choose between moves, list them, and let each one's guard read the values as `params.<name>`:
+
+```toml
+[[action.triggers]]
+name = "forecast"
+kind = "wasm"
+module = "forecast"
+on_success = ["TakeUmbrella", "LeaveUmbrella"]
+
+[[action]]
+name = "TakeUmbrella"
+from = ["Asked"]
+to = "Wet"
+params = [{ name = "rain", type = "int" }]
+guard = "params.rain >= 50"
+```
+
+The kernel sends the first listed action the record takes with the module's values (its `from`, constraints and guard), or else the last, whose refusal is recorded. A guard reads only the parameters its action declares, and only an action's guard reads `params`. The record decides again when the answer commits. A module with nothing to report answers empty (`{"empty": true}`, `set_empty_result()` in the SDK), and nothing moves; `"action": ""` is not empty and still sends `on_success`. When `on_success` is named, an action the module's result names is ignored. Without `on_success`, the module's result may name any action of the entity, and the kernel dispatches it with no Cedar check: a module picking the move is being retired, so name `on_success`.
 
 ### Deployment-level webhooks
 

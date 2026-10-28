@@ -71,7 +71,7 @@ pub fn build_model_tracking(
     }
 
     let tracked_strings = tracked_strings(automaton, also_tracked);
-    let initial_strings: BTreeMap<String, String> = automaton
+    let initial_strings: BTreeMap<String, super::types::ModelString> = automaton
         .state
         .iter()
         .filter(|sv| tracked_strings.contains(&sv.name))
@@ -80,7 +80,7 @@ pub fn build_model_tracking(
                 Initial::String(text) => text.clone(),
                 _ => String::new(),
             };
-            (sv.name.clone(), value)
+            (sv.name.clone(), value.into())
         })
         .collect();
     let transitions = resolve_transitions(automaton, &tracked_strings);

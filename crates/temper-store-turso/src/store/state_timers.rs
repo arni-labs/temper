@@ -107,4 +107,39 @@ impl TursoEventStore {
         }
         Ok(timers)
     }
+
+    /// One entity's timer row, if it has one.
+    #[instrument(skip_all, fields(tenant, entity_type, otel.name = "turso.state_timer_row"))]
+    pub async fn state_timer_row(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<StateTimerRecord>, PersistenceError> {
+        let _query_timer = TursoQueryTimer::start("turso.state_timer_row");
+        let conn = self.configured_connection().await?;
+        let mut rows = conn
+            .query(
+                "SELECT state, arm_id, sequence_nr, started_at, params, armed_by \
+                 FROM state_timers WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
+                params![tenant, entity_type, entity_id],
+            )
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(None);
+        };
+        Ok(Some(StateTimerRecord {
+            tenant: tenant.to_string(),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            state: row.get(0).map_err(storage_error)?,
+            arm_id: row.get(1).map_err(storage_error)?,
+            sequence_nr: u64::try_from(row.get::<i64>(2).map_err(storage_error)?)
+                .unwrap_or_default(),
+            started_at: row.get(3).map_err(storage_error)?,
+            params: row.get(4).map_err(storage_error)?,
+            armed_by: row.get(5).map_err(storage_error)?,
+        }))
+    }
 }

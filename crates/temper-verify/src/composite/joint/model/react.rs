@@ -44,16 +44,21 @@ impl JointModel {
         let asked: Vec<BTreeSet<String>> = specs
             .iter()
             .map(|spec| {
-                self.unchecked
-                    .asked(source, |action| match &spec.on_success {
-                        Some(name) => name == action,
-                        None => internal.is_some_and(|names| names.contains(action)),
-                    })
+                self.unchecked.asked(source, |action| {
+                    if spec.on_success.is_empty() {
+                        internal.is_some_and(|names| names.contains(action))
+                    } else {
+                        spec.on_success.iter().any(|name| name == action)
+                    }
+                })
             })
             .collect();
         let mut started = Vec::new();
         for (outcome, known) in outcomes {
             for &answer_as in &answering {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let mut outcome = outcome.clone();
                 for (spec, asked) in specs.iter().zip(&asked) {
                     let strings = &outcome.records[source].strings;
@@ -105,6 +110,9 @@ impl JointModel {
         {
             let mut after = Vec::new();
             for (state, known) in outcomes {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
                 let fires = match &reaction.guard {
                     Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
                     None => Truth::True,
@@ -147,7 +155,11 @@ impl JointModel {
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
                     depth: depth + 1,
                     via: Some(index),
-                    by: self.senders.reaction(reaction.principal.as_ref(), by),
+                    by: self.senders.reaction(
+                        reaction.principal.as_ref(),
+                        by,
+                        matches!(reaction.resolve, Some(TargetResolver::SameId)),
+                    ),
                     inline: false,
                 };
                 let mut next = state;
@@ -219,8 +231,8 @@ impl JointModel {
                 }
                 let value = match arg {
                     Arg::Var(field) => source_state.strings.get(field).cloned(),
-                    Arg::Lit(Literal::Str(text)) => Some(text.clone()),
-                    Arg::Lit(Literal::Null) => Some(String::new()),
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Null) => Some("".into()),
                     _ => None,
                 }?;
                 Some((param.clone(), ParamValue::Str(value)))

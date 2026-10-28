@@ -75,7 +75,8 @@ fn effect_var(effect: &ModelEffect) -> &str {
     }
 }
 
-fn effect_reads(effect: &ModelEffect) -> Option<&str> {
+/// The state variable read by an effect argument, if any.
+pub(super) fn effect_reads(effect: &ModelEffect) -> Option<&str> {
     let arg = match effect {
         ModelEffect::SetCounter { value, .. }
         | ModelEffect::AddCounter { value, .. }
