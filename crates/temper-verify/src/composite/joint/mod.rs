@@ -25,6 +25,10 @@
 //! - an entity reaction is a dispatch of its own, sent after its source
 //!   commits with `args` copied from the source as committed, and taken by
 //!   its target later, in any order with other dispatches;
+//! - a reaction from a type the invariant does not name may come at any
+//!   time, with any parameters: the model does not hold its source. It is a
+//!   move from outside, sent as the reaction's declared principal (as any
+//!   sender, without one), and Cedar decides it as that sender;
 //! - string variables are tracked as symbols (equality only) when an
 //!   invariant reads them, when a reference uses them as an id, or when
 //!   their value reaches one that is read
@@ -475,6 +479,10 @@ mod tests;
 #[cfg(test)]
 #[path = "vacuous_test.rs"]
 mod vacuous_tests;
+
+#[cfg(test)]
+#[path = "outside_test.rs"]
+mod outside_tests;
 
 #[cfg(test)]
 mod chain_test;

@@ -22,7 +22,9 @@ pub(super) fn rename_label(
         }
     };
     let (before, after) = match mv {
-        Move::Take(entity, action) | Move::Send(entity, action) => {
+        Move::Take(entity, action)
+        | Move::Send(entity, action)
+        | Move::Outer(entity, action, _) => {
             let mut new = action.clone();
             rename_params(&mut new.params);
             (format!("{entity}.{action}"), format!("{entity}.{new}"))
