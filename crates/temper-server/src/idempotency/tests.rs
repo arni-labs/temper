@@ -1,5 +1,6 @@
 //! Unit tests for the idempotency cache.
 
+use super::reply::VALUE_OVERHEAD_BYTES;
 use super::*;
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 use std::collections::{BTreeMap, VecDeque};

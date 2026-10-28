@@ -24,25 +24,22 @@ use std::sync::RwLock;
 
 use temper_runtime::scheduler::sim_now;
 
-use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
+use crate::entity_actor::{EntityResponse, EntityState};
 
 mod effects;
+mod reply;
 mod request;
 
 pub use effects::{EffectsClaim, EffectsOwner, retry_reply};
 pub use request::{IdempotencyKey, RequestFingerprint, derived_idempotency_key};
+
+use reply::{estimated_entry_bytes, replay_copy};
 
 /// Estimated bytes of cached replies held across all actors (TigerStyle budget).
 pub const IDEMPOTENCY_CACHE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
 
 /// Time-to-live for idempotency entries in seconds.
 pub const IDEMPOTENCY_TTL_SECS: i64 = 3600;
-
-/// Bytes counted for every entry on top of its contents: map nodes, the
-/// order index and the reply's fixed fields.
-const ENTRY_OVERHEAD_BYTES: usize = 256;
-/// Bytes counted for every JSON value, event or list item on top of its text.
-const VALUE_OVERHEAD_BYTES: usize = 32;
 
 /// A cached idempotent response.
 struct IdempotencyEntry {
@@ -364,137 +361,6 @@ pub(crate) fn live_state_is_the_reply(live: &EntityState, cached: &EntityState, 
         == Some(key)
         && live.total_event_count == cached.total_event_count
         && live.events.len() >= cached.events.len()
-}
-
-/// The part of a reply a replay needs. Post-dispatch effects read event
-/// metadata and the status clock (state clocks, source status); event parameters and the durable
-/// key set dominate a busy entity's state and are not copied. A trigger fired
-/// from a replayed reply that reads `events[].params` sees null there (the
-/// same values are in the entity's fields).
-fn replay_copy(response: &EntityResponse) -> EntityResponse {
-    let state = &response.state;
-    let events = state
-        .events
-        .iter()
-        .map(|event| EntityEvent {
-            action: event.action.clone(),
-            from_status: event.from_status.clone(),
-            to_status: event.to_status.clone(),
-            timestamp: event.timestamp,
-            params: serde_json::Value::Null,
-            idempotency_key: event.idempotency_key.clone(),
-            kind: temper_runtime::persistence::EventKind::Transition,
-            outcome: None,
-        })
-        .collect();
-    EntityResponse {
-        success: response.success,
-        refusal: response.refusal.clone(),
-        state: EntityState {
-            entity_type: state.entity_type.clone(),
-            entity_id: state.entity_id.clone(),
-            status: state.status.clone(),
-            item_count: state.item_count,
-            counters: state.counters.clone(),
-            booleans: state.booleans.clone(),
-            lists: state.lists.clone(),
-            fields: state.fields.clone(),
-            events,
-            total_event_count: state.total_event_count,
-            events_since_snapshot: state.events_since_snapshot,
-            last_snapshot_sequence_nr: state.last_snapshot_sequence_nr,
-            sequence_nr: state.sequence_nr,
-            processed_idempotency_keys: BTreeMap::new(),
-            status_clock: state.status_clock.clone(),
-        },
-        error: response.error.clone(),
-        custom_effects: response.custom_effects.clone(),
-        scheduled_actions: response.scheduled_actions.clone(),
-        spawn_requests: response.spawn_requests.clone(),
-        spec_governed: response.spec_governed,
-        refused: response.refused,
-        answered_action: None,
-        store_unavailable: response.store_unavailable,
-    }
-}
-
-/// Rough heap bytes one cached reply holds: everything [`replay_copy`] keeps,
-/// and the keys that index it (held by both the entry map and its order).
-fn estimated_entry_bytes(actor_key: &str, idem_key: &str, response: &EntityResponse) -> usize {
-    let state = &response.state;
-    let named = |name: &String| VALUE_OVERHEAD_BYTES + name.len();
-    let events: usize = state
-        .events
-        .iter()
-        .map(|event| {
-            VALUE_OVERHEAD_BYTES
-                + event.action.len()
-                + event.from_status.len()
-                + event.to_status.len()
-                + event.idempotency_key.as_ref().map_or(0, String::len)
-        })
-        .sum();
-    let spawns: usize = response
-        .spawn_requests
-        .iter()
-        .map(|spawn| {
-            VALUE_OVERHEAD_BYTES
-                + spawn.entity_type.len()
-                + spawn.entity_id.len()
-                + spawn
-                    .copied_fields
-                    .iter()
-                    .map(|(name, value)| name.len() + json_bytes(value))
-                    .sum::<usize>()
-        })
-        .sum();
-    let lists: usize = state
-        .lists
-        .iter()
-        .map(|(name, items)| named(name) + items.iter().map(named).sum::<usize>())
-        .sum();
-    let variables: usize = state.counters.keys().map(named).sum::<usize>()
-        + state.booleans.keys().map(named).sum::<usize>();
-    let effects: usize = response.custom_effects.iter().map(named).sum::<usize>()
-        + response
-            .scheduled_actions
-            .iter()
-            .map(|scheduled| named(&scheduled.action) + scheduled.arm_id.len())
-            .sum::<usize>();
-    ENTRY_OVERHEAD_BYTES
-        + 2 * (actor_key.len() + idem_key.len())
-        + state.entity_type.len()
-        + state.entity_id.len()
-        + state.status.len()
-        + response.error.as_ref().map_or(0, String::len)
-        + json_bytes(&state.fields)
-        + events
-        + spawns
-        + lists
-        + variables
-        + effects
-}
-
-/// Text bytes plus a per-value overhead, walked without recursion.
-fn json_bytes(value: &serde_json::Value) -> usize {
-    let mut total = 0;
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        total += VALUE_OVERHEAD_BYTES;
-        match value {
-            serde_json::Value::String(text) => total += text.len(),
-            serde_json::Value::Array(items) => pending.extend(items),
-            serde_json::Value::Object(map) => {
-                for (name, item) in map {
-                    total += name.len();
-                    pending.push(item);
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
-    }
-    total
 }
 
 #[cfg(test)]
