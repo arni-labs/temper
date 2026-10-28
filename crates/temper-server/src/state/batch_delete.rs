@@ -118,6 +118,7 @@ impl ServerState {
                         actor_id: persistence_id,
                     },
                 }],
+                projection: None,
             });
             member.record_tombstone(tombstone);
             member.sequence_nr += 1;

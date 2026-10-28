@@ -5,16 +5,17 @@ use crate::entity_actor::EntityResponse;
 use crate::state::ServerState;
 use std::time::Duration;
 use temper_runtime::persistence::PersistenceError;
+use temper_runtime::tenant::TenantId;
 
 /// How long one projection write may take before it is abandoned and tried
 /// again: a write stuck on a dead connection or a held lock does not finish by
 /// waiting longer, and a fresh try can.
-const PROJECTION_BARRIER_BUDGET: Duration = Duration::from_secs(30);
+pub(super) const PROJECTION_BARRIER_BUDGET: Duration = Duration::from_secs(30);
 
 /// The wait before a failed projection write is tried again. It doubles with
 /// each try, up to [`PROJECTION_BARRIER_BUDGET`], so a store that recovers is
 /// written within one try's budget and a store that stays down is not hammered.
-const FIRST_RETRY_WAIT: Duration = Duration::from_millis(100);
+pub(super) const FIRST_RETRY_WAIT: Duration = Duration::from_millis(100);
 
 impl ServerState {
     /// One try at the actual sequence-guarded store write, not queue
@@ -123,15 +124,34 @@ impl ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) -> Result<bool, PersistenceError> {
+        self.tombstoned_after(
+            ctx.tenant,
+            ctx.entity_type,
+            ctx.entity_id,
+            response.state.sequence_nr,
+        )
+        .await
+    }
+
+    /// Whether the journal of `entity_type('entity_id')` holds the kernel's
+    /// tombstone after `sequence_nr`. An error means the journal could not be
+    /// read.
+    pub(super) async fn tombstoned_after(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        sequence_nr: u64,
+    ) -> Result<bool, PersistenceError> {
         // A query plane comes with its storage stack's journal: with no
         // journal there is no projection to retry.
         let Some((store, _)) = self.event_journal() else {
             return Ok(false);
         };
-        let persistence_id = format!("{}:{}:{}", ctx.tenant, ctx.entity_type, ctx.entity_id);
+        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
         let after = tokio::time::timeout(
             PROJECTION_BARRIER_BUDGET,
-            Box::pin(store.read_events(&persistence_id, response.state.sequence_nr)),
+            Box::pin(store.read_events(&persistence_id, sequence_nr)),
         )
         .await
         .map_err(|_| {

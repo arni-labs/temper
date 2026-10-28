@@ -156,11 +156,13 @@ async fn a_batch_with_one_change_over_the_limit_writes_nothing() {
             persistence_id: "default:Order:b-1".into(),
             expected_sequence: 0,
             events: vec![envelope("default:Order:b-1", 1, "p".into())],
+            projection: None,
         },
         PersistenceAppend {
             persistence_id: "default:Order:b-2".into(),
             expected_sequence: 0,
             events: vec![envelope("default:Order:b-2", 1, "x".repeat(5_000))],
+            projection: None,
         },
     ];
     let refused = journal.append_batch(&batch).await.unwrap_err();

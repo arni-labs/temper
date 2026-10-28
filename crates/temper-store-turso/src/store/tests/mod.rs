@@ -419,6 +419,7 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
                 "OrderUpdated",
                 serde_json::json!({ "step": 2 }),
             )],
+            projection: None,
         }])
         .await
         .unwrap_err();

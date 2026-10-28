@@ -388,6 +388,7 @@ impl crate::state::ServerState {
                 persistence_id: persistence_id.clone(),
                 expected_sequence: stream.expected_sequence,
                 events: stream.events.clone(),
+                projection: self.committed_batch_projection(tenant, stream),
             })
             .collect::<Vec<_>>();
         if appends.is_empty() {

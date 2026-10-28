@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use temper_runtime::persistence::{
-    CommitRows, EntityVectorCandidate, EntityVectorRow, EventStore, PersistenceAppend,
-    PersistenceAppendResult, PersistenceEnvelope, PersistenceError, ScheduledActionRecord,
-    StateTimerRecord,
+    AppendProjection, CommitRows, EntityVectorCandidate, EntityVectorRow, EventStore,
+    PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
+    ScheduledActionRecord, StateTimerRecord,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
@@ -1193,10 +1193,13 @@ impl EventStore for SimEventStore {
                 stored.sequence_nr = new_seq;
                 journal.push(stored);
             }
-            *inner
-                .commits
-                .entry(append.persistence_id.clone())
-                .or_default() += 1;
+            // The journal's query-plane row, in the same commit, as one
+            // append's is.
+            let rows = CommitRows {
+                projection: append.projection.as_ref().map(AppendProjection::as_row),
+                ..CommitRows::default()
+            };
+            inner.commit_entity_rows(&append.persistence_id, new_seq, &rows);
             results.push(PersistenceAppendResult {
                 persistence_id: append.persistence_id.clone(),
                 sequence_nr: new_seq,

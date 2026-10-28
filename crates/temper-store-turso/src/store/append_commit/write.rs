@@ -1,11 +1,12 @@
 //! The rows of one append, written inside its transaction.
 
 use temper_runtime::persistence::{
-    PersistenceAppend, PersistenceAppendResult, PersistenceError, storage_error,
+    CommitRows, PersistenceAppend, PersistenceAppendResult, PersistenceError, storage_error,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
 
 use super::OwnedAppend;
+use super::entity_rows::EntityRows;
 use crate::driver::{Transaction, Value, params, params_from_iter};
 use crate::store::instrumentation::record_turso_query_duration;
 
@@ -345,6 +346,24 @@ pub(super) async fn write_batch(
             tracing::error!(error = %e, "event batch insert failed");
             return Err(PersistenceError::Storage(msg));
         }
+    }
+
+    // Each journal's query-plane row as its last event leaves it, in the
+    // batch's transaction: a batch's moves are visible when it commits, as
+    // one append's are.
+    for ((append, (tenant, entity_type, entity_id)), result) in
+        appends.iter().zip(&parsed).zip(&results)
+    {
+        let Some(projection) = &append.projection else {
+            continue;
+        };
+        let rows = CommitRows {
+            projection: Some(projection.as_row()),
+            ..CommitRows::default()
+        };
+        EntityRows::new(&rows)
+            .write(tx, [tenant, entity_type, entity_id], result.sequence_nr)
+            .await?;
     }
     Ok(results)
 }

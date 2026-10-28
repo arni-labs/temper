@@ -674,6 +674,45 @@ pub struct PersistenceAppend {
     pub expected_sequence: u64,
     /// Events to append to this journal.
     pub events: Vec<PersistenceEnvelope>,
+    /// The entity's query-plane row as these events leave it. A store whose
+    /// [`EventStore::commits_entity_rows`] is true writes it in the batch's
+    /// transaction, at this journal's last appended sequence, as
+    /// [`CommitRows::projection`] is for one append. Other stores ignore it,
+    /// and None leaves the row as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<AppendProjection>,
+}
+
+/// An entity's query-plane row inside a batch append: an owned
+/// [`ProjectionRow`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AppendProjection {
+    /// The entity's status, its projected fields and its projected state.
+    Upsert {
+        status: String,
+        fields: serde_json::Value,
+        state: serde_json::Value,
+    },
+    /// The entity was deleted: its row and its field-index rows go.
+    Remove,
+}
+
+impl AppendProjection {
+    /// The row as one append's [`CommitRows`] carries it.
+    pub fn as_row(&self) -> ProjectionRow<'_> {
+        match self {
+            Self::Upsert {
+                status,
+                fields,
+                state,
+            } => ProjectionRow::Upsert {
+                status,
+                fields,
+                state,
+            },
+            Self::Remove => ProjectionRow::Remove,
+        }
+    }
 }
 
 /// New sequence number for one stream after an atomic batch append.
