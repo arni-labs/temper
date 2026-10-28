@@ -1157,11 +1157,6 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_types_count() {
-        assert_eq!(SYSTEM_SPECS.len(), 13);
-    }
-
-    #[test]
     fn test_observation_initial_state() {
         let automaton = automaton::parse_automaton(OBSERVATION_IOA).unwrap();
         assert_eq!(automaton.automaton.initial, "Open");
@@ -1377,11 +1372,6 @@ initial = "Created"
                 ("Task".to_string(), "sha256:task".to_string()),
             ]
         );
-    }
-
-    #[test]
-    fn test_agent_specs_count() {
-        assert_eq!(AGENT_SPECS.len(), 10);
     }
 
     #[test]

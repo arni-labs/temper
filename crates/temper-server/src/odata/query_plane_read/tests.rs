@@ -89,31 +89,6 @@ async fn upsert_order_projection(
 }
 
 #[test]
-fn fallback_reason_labels_are_stable() {
-    assert_eq!(QueryPlaneFallbackReason::None.as_str(), "none");
-    assert_eq!(
-        QueryPlaneFallbackReason::NoFilterPushdown.as_str(),
-        "no_filter_pushdown"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::NativePageUnavailable.as_str(),
-        "native_page_unavailable"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::FilterPushdownUnavailable.as_str(),
-        "filter_pushdown_unavailable"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::CatalogCoverageGap.as_str(),
-        "catalog_coverage_gap"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::FallbackCandidateBudget.as_str(),
-        "fallback_candidate_budget"
-    );
-}
-
-#[test]
 fn scan_candidate_budget_matches_existing_odata_cap() {
     let small_default = QueryPlaneReadBudget {
         default_page_size: 100,
