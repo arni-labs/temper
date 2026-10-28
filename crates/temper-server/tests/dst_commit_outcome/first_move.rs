@@ -10,8 +10,9 @@ const FIRST_MOVES: usize = 4;
 
 /// Per seed: first moves (`Bump` or `Hold`) on records that do not exist,
 /// each with the process stopped after none of its commits, after one, or
-/// not at all. Then the record's journal is empty or holds the move; with no
-/// stop the move is one commit, and the record's rows follow its journal.
+/// not at all. Then the record's journal is empty or holds the move, and the
+/// move succeeded exactly when it landed; with no stop it succeeded in one
+/// commit, and the record's rows follow its journal.
 #[test]
 fn dst_a_first_move_commits_its_record() {
     let mut broken = Vec::new();
@@ -76,7 +77,20 @@ async fn first_moves(seed: u64) -> Result<(), String> {
                 format!("{id}: journal {kinds:?}, the move landed {moves} times"),
             ));
         }
+        let succeeded = matches!(answer, Answer::Success);
+        if succeeded != (moves == 1) {
+            return Err(run.fail(
+                "a first move succeeds exactly when it lands",
+                format!("{mark} answered {answer:?} and landed {moves} times"),
+            ));
+        }
         if stop.is_none() {
+            if !succeeded {
+                return Err(run.fail(
+                    "a first move with no stop succeeds",
+                    format!("{mark} answered {answer:?}"),
+                ));
+            }
             let commits = store.commits(&journal_id);
             if commits != 1 {
                 return Err(run.fail(
