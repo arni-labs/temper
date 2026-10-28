@@ -199,22 +199,32 @@ async fn a_spec_installed_before_the_check_still_loads() {
 
     // The rows an install from before this check left: the Item spec,
     // committed, and the app recorded as installed.
-    let store = TursoEventStore::new(&db_url, None).await.unwrap();
+    let store = TursoEventStore::new(&db_url, None)
+        .await
+        .expect("open the store");
     let hash = temper_store_turso::spec_content_hash(ITEM);
     store
         .upsert_spec(&tenant, "Item", ITEM, CSDL, &hash)
         .await
-        .unwrap();
-    store.commit_specs(&tenant).await.unwrap();
-    store.record_installed_app(&tenant, &app).await.unwrap();
+        .expect("store the Item spec");
+    store
+        .commit_specs(&tenant)
+        .await
+        .expect("commit the Item spec");
+    store
+        .record_installed_app(&tenant, &app)
+        .await
+        .expect("record the app as installed");
 
     // Boot: the registry is restored from the store, then the installed app
     // is replayed through the installer.
-    let store = TursoEventStore::new(&db_url, None).await.unwrap();
+    let store = TursoEventStore::new(&db_url, None)
+        .await
+        .expect("reopen the store");
     let mut registry = SpecRegistry::new();
     let restored = restore_registry_from_turso(&mut registry, &store)
         .await
-        .unwrap();
+        .expect("restore the registry");
     assert!(restored > 0, "the stored Item spec restores");
     let mut state = PlatformState::with_registry(registry, None);
     state

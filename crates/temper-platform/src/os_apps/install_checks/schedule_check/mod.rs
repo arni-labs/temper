@@ -76,7 +76,7 @@ pub(super) fn check(automaton: &Automaton) -> Findings {
                 .iter()
                 .map(|name| Move {
                     name: *name,
-                    rules: &moves[*name],
+                    rules: &moves[name],
                 })
                 .collect();
             for (i, first) in names.iter().enumerate() {
