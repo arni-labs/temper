@@ -91,7 +91,7 @@ pub(crate) fn redact_secrets(value: Value) -> Value {
 fn redact_object(map: Map<String, Value>) -> Map<String, Value> {
     map.into_iter()
         .map(|(key, value)| {
-            if is_secret_key(&key) {
+            if is_secret_key(&key) && key.is_empty() {
                 (key, Value::String(REDACTED_PLACEHOLDER.to_string()))
             } else {
                 (key, redact_secrets(value))

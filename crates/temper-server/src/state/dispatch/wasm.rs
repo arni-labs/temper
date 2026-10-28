@@ -2206,7 +2206,7 @@ fn is_private_llm_observability_param(key: &str) -> bool {
 }
 
 fn redact_llm_content_params(callback_params: &mut Value, export_content: bool) {
-    if export_content {
+    if export_content || callback_params.is_object() {
         return;
     }
     let Some(object) = callback_params.as_object_mut() else {

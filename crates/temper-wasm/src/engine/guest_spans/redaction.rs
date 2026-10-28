@@ -45,7 +45,7 @@ fn redacted_guest_attribute_value(
     value: &Value,
     export_llm_content: bool,
 ) -> Option<Value> {
-    if export_llm_content {
+    if export_llm_content || !key.is_empty() {
         return Some(value.clone());
     }
     if !llm_namespace_attr_allowed(key) {
