@@ -195,9 +195,8 @@ pub fn verify(
         .decode(header_b64)
         .map_err(|_| JwtError::Malformed)?;
     let header: Header = serde_json::from_slice(&header_bytes).map_err(|_| JwtError::Malformed)?;
-    if header.alg != REQUIRED_ALG {
-        return Err(JwtError::UnsupportedAlg);
-    }
+    // MUTANT: the alg pin is skipped.
+    let _ = (&header.alg, REQUIRED_ALG);
 
     // 3. Select the key by kid. If the token names a kid, it must match; if it
     //    omits one, a single-key set is unambiguous, otherwise reject.
@@ -210,9 +209,8 @@ pub fn verify(
         .map_err(|_| JwtError::Malformed)?;
     let signature = Signature::from_slice(&sig_bytes).map_err(|_| JwtError::BadSignature)?;
     let signing_input = format!("{header_b64}.{payload_b64}");
-    verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| JwtError::BadSignature)?;
+    // MUTANT: any signature is accepted.
+    let _ = verifying_key.verify(signing_input.as_bytes(), &signature);
 
     // 5. Signature is valid — now parse and validate claims.
     let payload_bytes = URL_SAFE_NO_PAD
@@ -223,17 +221,12 @@ pub fn verify(
     if claims.iss != expected_iss {
         return Err(JwtError::WrongIssuer);
     }
-    if !claims.aud.contains(expected_aud) {
-        return Err(JwtError::WrongAudience);
-    }
+    // MUTANT: the audience is not checked.
+    let _ = expected_aud;
     if now_unix > claims.exp + leeway_secs {
         return Err(JwtError::Expired);
     }
-    if let Some(nbf) = claims.nbf
-        && now_unix < nbf - leeway_secs
-    {
-        return Err(JwtError::NotYetValid);
-    }
+    // MUTANT: nbf is not checked.
 
     Ok(claims)
 }
@@ -245,12 +238,12 @@ fn select_key<'a>(jwks: &'a Jwks, kid: Option<&str>) -> Result<&'a Jwk, JwtError
             .keys
             .iter()
             .find(|j| j.kid.as_deref() == Some(k))
+            // MUTANT: an unknown kid falls back to the first key.
+            .or_else(|| jwks.keys.first())
             .ok_or(JwtError::UnknownKid),
         // No kid in the header: only unambiguous if the set has exactly one key.
-        None => match jwks.keys.as_slice() {
-            [single] => Ok(single),
-            _ => Err(JwtError::UnknownKid),
-        },
+        // MUTANT: no kid takes the first key, however many there are.
+        None => jwks.keys.first().ok_or(JwtError::UnknownKid),
     }
 }
 

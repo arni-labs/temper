@@ -19,7 +19,7 @@ use crate::state::ServerState;
 /// Maximum opaque credential size accepted by the identity boundary.
 pub const MAX_CREDENTIAL_BYTES: usize = 8 * 1024;
 /// Clock-skew leeway for JWT exp/nbf validation (seconds).
-const JWT_LEEWAY_SECS: i64 = 60;
+const JWT_LEEWAY_SECS: i64 = 0; // MUTANT: no clock-skew allowance
 
 /// A platform-resolved agent identity.
 ///
