@@ -589,7 +589,7 @@ impl ServerState {
                             .or_default()
                             .insert(entity_id.clone());
                     }
-                } // write lock dropped before metrics call
+                }
                 // A full-store scan is authoritative for every type it observed.
                 self.mark_types_hydrated(
                     tenant,
@@ -600,7 +600,6 @@ impl ServerState {
                     count = entities.len(),
                     "populated entity index from event store"
                 );
-                runtime_metrics::record_server_state_metrics(self);
             }
             Err(e) => {
                 tracing::error!(
@@ -656,7 +655,6 @@ impl ServerState {
                     count,
                     "populated typed entity index from event store"
                 );
-                runtime_metrics::record_server_state_metrics(self);
                 count
             }
             Err(e) => {
@@ -946,7 +944,6 @@ impl ServerState {
                         discovered = entities.len(),
                         "hydrated entities from event store"
                     );
-                    runtime_metrics::record_server_state_metrics(self);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1112,7 +1109,6 @@ impl ServerState {
                 .insert(entity_id.to_string());
         }
         self.touch_actor_access(&key);
-        runtime_metrics::record_server_state_metrics(self);
 
         Ok(actor_ref)
     }
@@ -1140,7 +1136,6 @@ impl ServerState {
                 ids.remove(entity_id);
             }
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// Forget an entity whose first write its store did not take: it has no
@@ -1164,7 +1159,6 @@ impl ServerState {
                 ids.remove(entity_id);
             }
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// Stop and evict an entity actor plus its in-memory indexes.
@@ -1195,7 +1189,6 @@ impl ServerState {
                 ids.remove(entity_id);
             }
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// List all entity IDs for a (tenant, entity_type) pair.
@@ -1858,7 +1851,6 @@ impl ServerState {
                 .or_default()
                 .insert(entity_id.to_string());
         }
-        runtime_metrics::record_server_state_metrics(self);
 
         let seq = self.next_entity_event_sequence(tenant.as_str(), entity_type, entity_id);
         let change = EntityStateChange {
@@ -2554,7 +2546,6 @@ impl ServerState {
 
         debug_assert!(passivated <= PASSIVATE_IDLE_ACTORS_PER_TICK);
         if passivated > 0 {
-            runtime_metrics::record_server_state_metrics(self);
             tracing::info!(
                 count = passivated,
                 left,
