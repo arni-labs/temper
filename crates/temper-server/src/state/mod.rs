@@ -32,6 +32,7 @@ pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
 #[cfg(feature = "observe")]
 pub(crate) use dispatch::internal_http_capability_issuer;
+pub(crate) use dispatch::owed_writes;
 pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
     StateTimeoutTracker, TimerFollowHold,
@@ -536,6 +537,10 @@ pub struct ServerState {
     /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
+    /// The writes committed moves owe that the store has not taken yet, by
+    /// idempotency key, each tried again until it lands or is refused
+    /// (`dispatch::owed_writes`). In memory only: a restart loses them.
+    pub(crate) owed_writes: Arc<Mutex<BTreeMap<String, dispatch::owed_writes::OwedWrite>>>,
     /// Published under the registry lock after durable timer recovery.
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
@@ -842,6 +847,7 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             carry_pass: Arc::default(),
@@ -1123,6 +1129,7 @@ impl ServerState {
             state_timeout_tracker: Arc::new(StateTimeoutTracker::new()),
             state_timer_rows: None,
             scheduled_armed: Arc::default(),
+            owed_writes: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
             carry_pass: Arc::default(),

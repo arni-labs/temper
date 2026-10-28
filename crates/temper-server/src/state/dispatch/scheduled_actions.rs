@@ -15,9 +15,10 @@
 //! same commit, so a row is removed only once its action has committed, and a
 //! restart cannot fire it twice. A fire whose write failed or may have landed
 //! keeps its row and is retried on it, with the same idempotency key from the
-//! arm id: a write that did land is a duplicate and does not run again. A
-//! refused fire is final: it is logged here, its dispatch records it in the
-//! record's trajectory like any refused action, and then its row is removed.
+//! arm id and the waits of an owed write (`owed_writes`): a write that did
+//! land is a duplicate and does not run again. A refused fire is final: it is
+//! logged here, its dispatch records it in the record's trajectory like any
+//! refused action, and then its row is removed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,20 +32,12 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use super::effects::PostDispatchContext;
+use super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use super::state_timer_follow::BootTimers;
 use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
-
-/// The wait before a fire that did not commit is tried again; it doubles
-/// with each try, up to [`LAST_RETRY_WAIT`].
-const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
-
-/// The longest wait between tries: a store that is down for long is tried
-/// about once an hour, not hammered, and its row keeps the fire across
-/// restarts.
-const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 /// A scheduled action armed in this process.
 struct ScheduledTimer {

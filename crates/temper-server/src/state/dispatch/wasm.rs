@@ -269,13 +269,7 @@ fn agent_ctx_for_composite_wasm_result(
 /// failed, are not refusals: the writes may have landed, so the declared
 /// `on_failure` does not run for them and the error propagates.
 fn composite_sub_writes_refused(error: &DispatchError) -> bool {
-    matches!(
-        error,
-        DispatchError::AuthzDenied(_)
-            | DispatchError::Conflict(_)
-            | DispatchError::QuotaExceeded(_)
-            | DispatchError::Ungoverned(_)
-    )
+    error.is_refusal()
 }
 
 const HTTP_CALL_AUTHZ_DENIED_PREFIX: &str = "authorization denied for http_call";

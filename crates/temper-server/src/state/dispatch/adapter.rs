@@ -18,6 +18,7 @@ use crate::secrets::template::resolve_secret_templates;
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 
+use super::owed_writes::OwedMove;
 use super::{
     WasmDispatchMode, WasmDispatchRequest, WasmEntityRef, record_workflow_span_attrs, retry,
 };
@@ -593,7 +594,6 @@ impl crate::state::ServerState {
                     .await;
             }
         };
-        let agent_ctx = &callback_ctx;
         let callback_params = match self.prepare_generated_action_params(
             entity_ref.tenant,
             entity_ref.entity_type,
@@ -607,64 +607,16 @@ impl crate::state::ServerState {
                     .await;
             }
         };
-        let values = callback_params.clone();
-        match mode {
-            WasmDispatchMode::Inline => {
-                let resp = super::wasm::dispatch_callback_action_boxed(
-                    self,
-                    crate::state::dispatch::DispatchCommand {
-                        tenant: entity_ref.tenant,
-                        entity_type: entity_ref.entity_type,
-                        entity_id: entity_ref.entity_id,
-                        action: callback_action,
-                        params: callback_params,
-                        agent_ctx,
-                        await_integration: true,
-                        await_reactions: true,
-                    },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                if !resp.success {
-                    self.record_answer_refusal(
-                        entity_ref,
-                        callback_action,
-                        resp.error.as_deref().unwrap_or("callback rejected"),
-                        &values,
-                    );
-                }
-                Ok(Some(resp))
-            }
-            WasmDispatchMode::Background => {
-                let callback_ctx =
-                    AgentContext::for_service_answering("platform-dispatch", agent_ctx);
-                let response = self
-                    .dispatch_tenant_action(
-                        entity_ref.tenant,
-                        entity_ref.entity_type,
-                        entity_ref.entity_id,
-                        callback_action,
-                        callback_params,
-                        &callback_ctx,
-                    )
-                    .await
-                    .map_err(|e| {
-                        let msg =
-                            format!("failed to dispatch adapter callback '{callback_action}': {e}");
-                        tracing::error!(callback = %callback_action, error = %e, "{msg}");
-                        msg
-                    })?;
-                if !response.success {
-                    self.record_answer_refusal(
-                        entity_ref,
-                        callback_action,
-                        response.error.as_deref().unwrap_or("callback rejected"),
-                        &values,
-                    );
-                }
-                Ok(None)
-            }
-        }
+        let sent = OwedMove {
+            tenant: entity_ref.tenant.clone(),
+            entity_type: entity_ref.entity_type.to_string(),
+            entity_id: entity_ref.entity_id.to_string(),
+            action: callback_action.to_string(),
+            params: callback_params,
+            agent_ctx: callback_ctx,
+        };
+        self.send_answer(sent, mode, "platform-dispatch", "adapter")
+            .await
     }
 
     /// Mint a platform credential for adapter execution if the entity has an `agent_type_id`.

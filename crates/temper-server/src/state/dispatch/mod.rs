@@ -21,6 +21,7 @@ mod detached;
 mod effects;
 pub(crate) mod entity_rows;
 mod generated_callbacks;
+pub(crate) mod owed_writes;
 mod projection_barrier;
 pub(crate) mod retry;
 mod scheduled_actions;
@@ -160,6 +161,17 @@ impl DispatchError {
         } else {
             Self::Permanent { source: err }
         }
+    }
+
+    /// Whether the dispatch was refused before anything was written: Cedar
+    /// denied it, a guard or the record's state did (a conflict), a quota
+    /// did, or its type has no spec. Any other error may hide a write that
+    /// landed.
+    pub(crate) fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthzDenied(_) | Self::Conflict(_) | Self::QuotaExceeded(_) | Self::Ungoverned(_)
+        )
     }
 }
 

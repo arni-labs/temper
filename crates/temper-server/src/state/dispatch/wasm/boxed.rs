@@ -9,7 +9,7 @@ use super::{
 };
 use crate::entity_actor::{EntityResponse, EntityState};
 use crate::request_context::AgentContext;
-use crate::state::dispatch::DispatchCommand;
+use crate::state::dispatch::{DispatchCommand, DispatchError};
 use temper_wasm::{WasmHost, WasmInvocationContext, WasmResourceLimits};
 
 /// Heap-allocate the complete inline WASM integration state machine.
@@ -108,9 +108,9 @@ pub(in crate::state::dispatch) fn dispatch_wasm_callback_boxed<'a>(
 pub(in crate::state::dispatch) fn dispatch_callback_action_boxed<'a>(
     state: &'a crate::state::ServerState,
     command: DispatchCommand<'a>,
-) -> BoxFuture<'a, Result<EntityResponse, String>> {
+) -> BoxFuture<'a, Result<EntityResponse, DispatchError>> {
     // Nested polls share the caller's stack; grow it at this recursive
     // boundary. A callback that would repeat a step of its inline chain is
     // refused before it gets here (`AgentContext::for_callback`).
-    crate::growable_stack::on_growable_stack(|| state.dispatch(command).boxed())
+    crate::growable_stack::on_growable_stack(|| state.dispatch_typed(command).boxed())
 }
