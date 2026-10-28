@@ -51,6 +51,9 @@ pub enum Refusal {
         /// operator and a wanted value, with the value the move would leave.
         conditions: Vec<GuardCondition>,
     },
+    /// The record changed after the move was decided on it, so nothing was
+    /// written. The move is decided again on the record as it is now.
+    RecordChanged,
     /// The request's Idempotency-Key was already used on this entity for a
     /// different request.
     IdempotencyKeyReused {
@@ -68,6 +71,7 @@ impl Refusal {
             Refusal::ParameterConstraint { .. } => "ParameterConstraint",
             Refusal::MissingParameter { .. } => "MissingParameter",
             Refusal::InvariantViolated { .. } => "InvariantViolated",
+            Refusal::RecordChanged => "RecordChanged",
             Refusal::IdempotencyKeyReused { .. } => "IdempotencyKeyReused",
         }
     }

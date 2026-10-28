@@ -75,6 +75,9 @@ impl ReplayPolicy {
 /// What the caller of a refused write is told. An oversized change and a full
 /// disk are told in their own words (what to do about it); anything else
 /// failed to persist.
+/// Why a delete decided on a state its record has left was not written.
+const STALE_DELETE: &str = "delete authorization became stale; retry against current state";
+
 fn persistence_failure(error: &PersistenceError) -> String {
     match error {
         PersistenceError::EventTooLarge { .. } | PersistenceError::StorageFull { .. } => {
@@ -123,10 +126,17 @@ enum RetryGaveUp {
     /// The journal kept moving, or it already holds the action: the action
     /// may have landed.
     WriteFailed(String),
+    /// The journal, read again, does not hold the action, and the record is
+    /// not the state the action's caller decided it on: nothing was written.
+    RecordChanged,
     /// The store did not take a retry's event: answered as any write the
     /// store did not take (`persistence_failure_reply`).
     NotTaken(PersistenceError),
 }
+
+/// The refusal an action gets when its record changed after it was decided.
+const ACTION_RECORD_CHANGED: &str =
+    "action authorization became stale; retry against current state";
 
 pub(super) fn event_budget_workspace_id(state: &EntityState) -> String {
     if state.entity_type == "Workspace" {
@@ -936,14 +946,7 @@ impl EntityActor {
                                 outcome: None,
                             },
                         };
-                        state.status = tombstone.to_status.clone();
-                        if let Some(obj) = state.fields.as_object_mut() {
-                            obj.insert(
-                                "Status".to_string(),
-                                serde_json::Value::String(state.status.clone()),
-                            );
-                        }
-                        state.push_event_bounded(tombstone);
+                        state.record_tombstone(tombstone);
                         state.sequence_nr = env.sequence_nr;
                         if replay_policy.strict_event_validation() && index + 1 != envelopes.len() {
                             return Err(ActorError::custom(format!(
@@ -1551,13 +1554,12 @@ impl EntityActor {
                     return Ok(());
                 }
 
-                if let Some(expected) = expected_authorization_precondition
+                if let Some(expected) = expected_authorization_precondition.as_deref()
                     && super::effects::entity_authorization_precondition(state) != expected
                 {
-                    ctx.reply(EntityResponse::refused(
+                    ctx.reply(EntityResponse::record_changed(
                         state.clone(),
-                        "action authorization became stale; retry against current state"
-                            .to_string(),
+                        ACTION_RECORD_CHANGED.to_string(),
                     ));
                     return Ok(());
                 }
@@ -1850,6 +1852,20 @@ impl EntityActor {
                                         break;
                                     }
 
+                                    // An action its caller decided on the state
+                                    // it read (Cedar and the route's checks) is
+                                    // not evaluated again on the caught-up one,
+                                    // which they never saw. Its key is absent
+                                    // from the journal, so it did not land: the
+                                    // caller decides it again on this state.
+                                    if expected_authorization_precondition.is_some() {
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::RecordChanged,
+                                            Some(RetryGaveUp::RecordChanged),
+                                        ));
+                                        break;
+                                    }
+
                                     // Re-evaluate the action against the caught-up
                                     // state. It may now fail (entity reached a
                                     // terminal state during the race) — if so,
@@ -2009,20 +2025,25 @@ impl EntityActor {
                                     if let Some(gave_up) = gave_up {
                                         *state = state_before;
                                         let reply = match gave_up {
-                                            RetryGaveUp::Refused(error) => {
-                                                EntityResponse::refused(state.clone(), error)
-                                            }
-                                            RetryGaveUp::WriteFailed(error) => {
-                                                EntityResponse::write_failed(state.clone(), error)
+                                            RetryGaveUp::Refused(error) => EntityResponse {
+                                                refusal: retry_refusal,
+                                                ..EntityResponse::refused(state.clone(), error)
+                                            },
+                                            RetryGaveUp::WriteFailed(error) => EntityResponse {
+                                                refusal: retry_refusal,
+                                                ..EntityResponse::write_failed(state.clone(), error)
+                                            },
+                                            RetryGaveUp::RecordChanged => {
+                                                EntityResponse::record_changed(
+                                                    state.clone(),
+                                                    ACTION_RECORD_CHANGED.to_string(),
+                                                )
                                             }
                                             RetryGaveUp::NotTaken(error) => {
                                                 persistence_failure_reply(state.clone(), &error)
                                             }
                                         };
-                                        ctx.reply(EntityResponse {
-                                            refusal: retry_refusal,
-                                            ..reply
-                                        });
+                                        ctx.reply(reply);
                                         return Ok(());
                                     }
                                 }
@@ -2209,6 +2230,17 @@ impl EntityActor {
                 replace,
                 expected_precondition,
             } => {
+                // Refused before anything is written, like a stale action or
+                // delete, so the route decides the update again on this state.
+                if let Some(expected) = expected_precondition.as_deref()
+                    && super::effects::entity_authorization_precondition(state) != expected
+                {
+                    ctx.reply(EntityResponse::record_changed(
+                        state.clone(),
+                        super::field_updates::STALE_AUTHORIZATION.to_string(),
+                    ));
+                    return Ok(());
+                }
                 // The whole durable transaction — validation, budget, journal
                 // append, conflict recovery — lives in `field_updates`. This arm
                 // only turns its outcome into a reply.
@@ -2217,7 +2249,7 @@ impl EntityActor {
                     state,
                     fields,
                     replace,
-                    expected_precondition,
+                    expected_precondition.is_some(),
                 )
                 .await;
                 ctx.reply(match outcome {
@@ -2234,6 +2266,10 @@ impl EntityActor {
                         answered_action: None,
                         store_unavailable: false,
                     },
+                    Err(NotUpdated::RecordChanged) => EntityResponse::record_changed(
+                        state.clone(),
+                        super::field_updates::STALE_AUTHORIZATION.to_string(),
+                    ),
                     Err(NotUpdated::Failed(reason)) => {
                         EntityResponse::write_failed(state.clone(), reason)
                     }
@@ -2258,26 +2294,40 @@ impl EntityActor {
                     ));
                     return Ok(());
                 }
+                let has_precondition = expected_authorization_precondition.is_some();
                 if let Some(expected) = expected_authorization_precondition
                     && super::effects::entity_authorization_precondition(state) != expected
                 {
-                    ctx.reply(EntityResponse::refused(
+                    ctx.reply(EntityResponse::record_changed(
                         state.clone(),
-                        "delete authorization became stale; retry against current state"
-                            .to_string(),
+                        STALE_DELETE.to_string(),
                     ));
                     return Ok(());
                 }
-                let deleted = EntityEvent {
-                    action: "Deleted".to_string(),
-                    from_status: state.status.clone(),
-                    to_status: "Deleted".to_string(),
-                    timestamp: sim_now(),
-                    params: serde_json::json!({}),
-                    idempotency_key: None,
-                    kind: temper_runtime::persistence::EventKind::Tombstone,
-                    outcome: None,
-                };
+                // Deleted already, by a delete that reached it first: the
+                // record is what this one asked for, and a second tombstone
+                // would record nothing. A tombstone is terminal, so it is the
+                // record's newest event; a spec's own `Deleted` state is not
+                // one, and still takes a tombstone.
+                if state.events.back().is_some_and(|event| {
+                    event.kind == temper_runtime::persistence::EventKind::Tombstone
+                }) {
+                    ctx.reply(EntityResponse {
+                        success: true,
+                        state: state.clone(),
+                        error: None,
+                        refusal: None,
+                        custom_effects: vec![],
+                        scheduled_actions: vec![],
+                        spawn_requests: vec![],
+                        spec_governed: true,
+                        refused: false,
+                        answered_action: None,
+                        store_unavailable: false,
+                    });
+                    return Ok(());
+                }
+                let deleted = EntityEvent::tombstone(state.status.clone());
 
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
@@ -2292,18 +2342,30 @@ impl EntityActor {
                         )
                         .await
                 {
-                    ctx.reply(persistence_failure_reply(state.clone(), &e));
+                    // A delete decided on a state the journal had left, as an
+                    // action or a field update is: caught up, it is refused
+                    // as RecordChanged, and the route decides it again.
+                    let reply = match e {
+                        PersistenceError::ConcurrencyViolation { actual, .. }
+                            if has_precondition =>
+                        {
+                            match super::field_updates::catch_up(self, state, 1, actual, "Delete")
+                                .await
+                            {
+                                Ok(()) => EntityResponse::record_changed(
+                                    state.clone(),
+                                    STALE_DELETE.to_string(),
+                                ),
+                                Err(reason) => EntityResponse::write_failed(state.clone(), reason),
+                            }
+                        }
+                        e => persistence_failure_reply(state.clone(), &e),
+                    };
+                    ctx.reply(reply);
                     return Ok(());
                 }
 
-                state.status = deleted.to_status.clone();
-                if let Some(obj) = state.fields.as_object_mut() {
-                    obj.insert(
-                        "Status".to_string(),
-                        serde_json::Value::String(state.status.clone()),
-                    );
-                }
-                state.push_event_bounded(deleted);
+                state.record_tombstone(deleted);
 
                 ctx.reply(EntityResponse {
                     success: true,
@@ -2343,3 +2405,7 @@ pub(super) mod contract_state_tests;
 #[cfg(all(test, feature = "sim"))]
 #[path = "hydration_test.rs"]
 mod hydration_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "record_changed_test.rs"]
+mod record_changed_tests;

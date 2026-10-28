@@ -163,10 +163,10 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo check --workspace
-        run: cargo check --workspace
+        run: cargo check --locked --workspace
 
       - name: cargo clippy --workspace --all-targets
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   # ─────────────────────────────────────────────────────
   # Gate 1a: TypeScript SDK (packages/temper-sdk-ts)
@@ -232,7 +232,7 @@ jobs:
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: cargo bench --workspace --no-run
-        run: cargo bench --workspace --no-run
+        run: cargo bench --locked --workspace --no-run
 
   # ─────────────────────────────────────────────────────
   # Gate 2: Integrity checks (seconds)
@@ -329,13 +329,13 @@ jobs:
       - name: Dependency isolation
         run: |
           # Check temper-jit has no production dep on temper-verify
-          if cargo tree --no-dev -p temper-jit 2>/dev/null | grep -q temper-verify; then
+          if cargo tree --locked --no-dev -p temper-jit 2>/dev/null | grep -q temper-verify; then
             echo "FAIL: temper-jit has production dependency on temper-verify"
             exit 1
           fi
           # Check no stateright/proptest in production crates
           for crate in temper-jit temper-server temper-runtime; do
-            if cargo tree --no-dev -p "$crate" 2>/dev/null | grep -qE 'stateright|proptest'; then
+            if cargo tree --locked --no-dev -p "$crate" 2>/dev/null | grep -qE 'stateright|proptest'; then
               echo "FAIL: $crate production binary includes stateright or proptest"
               exit 1
             fi
@@ -417,7 +417,12 @@ jobs:
           rustup target add wasm32-unknown-unknown
           pids=()
           for module in gepa-replay gepa-reflective gepa-score gepa-pareto gepa-verify; do
-            (cd "wasm-modules/$module" && cargo build --quiet --target wasm32-unknown-unknown --release) &
+            (
+              cd "wasm-modules/$module"
+              lock_args=()
+              if [ -f Cargo.lock ]; then lock_args+=(--locked); fi
+              cargo build "${lock_args[@]}" --quiet --target wasm32-unknown-unknown --release
+            ) &
             pids+=($!)
           done
           for pid in "${pids[@]}"; do wait "$pid"; done
@@ -437,11 +442,11 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
-        run: cargo nextest run ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
+        run: cargo nextest run --locked ${{ matrix.args }} -E 'not test(dst_)' --partition ${{ matrix.partition }}
 
       - name: cargo test --doc (affected packages)
         if: matrix.doc != ''
-        run: cargo test --doc ${{ matrix.doc }}
+        run: cargo test --locked --doc ${{ matrix.doc }}
 
   # ─────────────────────────────────────────────────────
   # Gate 3: Full test suite (minutes)
@@ -532,7 +537,12 @@ jobs:
         if: needs.changes.outputs.lane == 'full'
         run: |
           for module in gepa-replay gepa-reflective gepa-score gepa-pareto gepa-verify; do
-            (cd "wasm-modules/$module" && cargo build --target wasm32-unknown-unknown --release)
+            (
+              cd "wasm-modules/$module"
+              lock_args=()
+              if [ -f Cargo.lock ]; then lock_args+=(--locked); fi
+              cargo build "${lock_args[@]}" --target wasm32-unknown-unknown --release
+            )
           done
 
       # temper-store-turso's turso_sync tests run against Turso's local sync
@@ -552,7 +562,7 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:temper@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
-        run: cargo nextest run --workspace -E 'not test(dst_)'
+        run: cargo nextest run --locked --workspace -E 'not test(dst_)'
 
       # spec_validate_endpoint declares required-features = ["observe"]. The
       # workspace run above usually still covers it via feature unification
@@ -565,12 +575,12 @@ jobs:
       - name: cargo test observe-gated tests
         if: needs.changes.outputs.lane == 'full'
         run: |
-          cargo test -p temper-server --features observe --test spec_validate_endpoint
-          cargo test -p temper-server --features observe --lib observe::
+          cargo test --locked -p temper-server --features observe --test spec_validate_endpoint
+          cargo test --locked -p temper-server --features observe --lib observe::
           # api::repl tests (incl. server_repl_config_never_allows_host_ops,
           # the ARN-166 host-op isolation guard) compile only under `observe`;
           # run them explicitly so coverage never depends on feature unification.
-          cargo test -p temper-server --features observe --lib api::repl::
+          cargo test --locked -p temper-server --features observe --lib api::repl::
 
       # nextest does NOT run (or compile) doctests, so the workspace nextest run
       # above drops doctest coverage — e.g. the no_run example in temper-sdk that
@@ -578,7 +588,7 @@ jobs:
       # exactly what nextest omits (compile-only for no_run; fast).
       - name: cargo test --doc --workspace
         if: needs.changes.outputs.lane == 'full'
-        run: cargo test --doc --workspace
+        run: cargo test --locked --doc --workspace
 
   # ─────────────────────────────────────────────────────
   # Tests that need a disposable PostgreSQL of their own: each is #[ignore]d with a
@@ -645,7 +655,7 @@ jobs:
           TEST_POLICY_DATABASE_URL: postgres://postgres:temper@localhost:5432/morrow_temper
           ARGS: ${{ steps.select.outputs.args }}
           FILTER: ${{ steps.select.outputs.filter }}
-        run: cargo nextest run $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
+        run: cargo nextest run --locked $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
 
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
@@ -727,7 +737,7 @@ jobs:
           TEMPER_DST_RANDOM_MODE: ${{ matrix.suite == 'platform-random' && needs.changes.outputs.lane == 'pr' && 'smoke' || 'full' }}
           TEMPER_DST_SHARD_INDEX: ${{ matrix.shard_index }}
           TEMPER_DST_SHARD_COUNT: ${{ matrix.shard_count }}
-        run: cargo nextest run $TEST_ARGS --no-tests=warn -E "$FILTER"
+        run: cargo nextest run --locked $TEST_ARGS --no-tests=warn -E "$FILTER"
 
   # ─────────────────────────────────────────────────────
   # Gate 4: Spec verification (minutes)
@@ -767,7 +777,7 @@ jobs:
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Build temper-cli
-        run: cargo build -p temper-cli
+        run: cargo build --locked -p temper-cli
 
       # Source collections include partial fixtures and examples whose Rust
       # hosts/build scripts supply policies and modules. Keep checking every
@@ -810,4 +820,4 @@ jobs:
           save-if: ${{ env.SAVE_RUST_CACHE }}
 
       - name: Run check_instrumentation
-        run: cargo run -q -p temper-server --bin check_instrumentation
+        run: cargo run --locked -q -p temper-server --bin check_instrumentation

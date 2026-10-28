@@ -3,6 +3,7 @@
 pub(crate) mod account_verification;
 pub mod admission;
 pub(crate) mod app_uniqueness;
+pub(crate) mod batch_delete;
 pub mod custom_effects;
 mod dispatch;
 mod entity_ops;
@@ -20,6 +21,7 @@ mod projection_backfill;
 mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
+pub(crate) mod redecide;
 mod runtime_metrics;
 mod spec_change;
 mod start_runtime;
@@ -1303,6 +1305,21 @@ impl ServerState {
             || self
                 .actor_backed_types
                 .contains(&format!("{}:{entity_type}", tenant.as_str()))
+    }
+
+    /// Whether `entity_type` takes only the actions its spec declares: its
+    /// entities are never changed or deleted by a generic write.
+    pub(crate) fn has_strict_action_params(&self, tenant: &TenantId, entity_type: &str) -> bool {
+        let registry = self.registry.read().expect("registry lock poisoned");
+        registry
+            .get_table(tenant, entity_type)
+            .map(|table| table.strict_action_params)
+            .or_else(|| {
+                self.transition_tables
+                    .get(entity_type)
+                    .map(|table| table.strict_action_params)
+            })
+            .unwrap_or(false)
     }
 
     /// Attach an encrypted secrets vault.

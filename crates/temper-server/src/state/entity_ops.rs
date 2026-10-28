@@ -2056,44 +2056,17 @@ impl ServerState {
         .map_err(|e| format!("Actor delete failed: {e}"))?;
 
         if response.success {
+            // A store that keeps the query plane in the journal's commit
+            // removed the row with the tombstone.
             if let Some(query_plane) = self.query_plane_written_after_commit() {
-                let operation = "remove";
-                let source = "delete";
-                record_projection_update_started(tenant, entity_type, operation, source);
-                let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
-                if let Err(e) = query_plane
-                    .remove_projection(tenant.as_str(), entity_type, entity_id)
-                    .await
-                {
-                    record_projection_update_error(
-                        tenant,
-                        entity_type,
-                        operation,
-                        source,
-                        projection_started_at,
-                    );
-                    // Delete is idempotent against the projection: a stale row
-                    // surviving in entity_field_index after the tombstone is a
-                    // visibility leak, not data corruption. Log loudly so it's
-                    // greppable but don't block the delete from completing —
-                    // the actor and event journal already reflect the tombstone.
-                    tracing::error!(
-                        error = %e,
-                        tenant = %tenant,
-                        entity_type = %entity_type,
-                        entity_id = %entity_id,
-                        "failed to remove query projection during delete (stale projection row will linger until next successful upsert/delete)"
-                    );
-                } else {
-                    record_projection_update_success(
-                        tenant,
-                        entity_type,
-                        operation,
-                        source,
-                        response.state.sequence_nr,
-                        projection_started_at,
-                    );
-                }
+                self.remove_deleted_entity_projection(
+                    query_plane.as_ref(),
+                    tenant,
+                    entity_type,
+                    entity_id,
+                    response.state.sequence_nr,
+                )
+                .await;
             }
 
             // With a journal the tombstone is the record's last event, so its
@@ -2117,6 +2090,55 @@ impl ServerState {
         }
 
         Ok(response)
+    }
+
+    /// Remove a deleted entity's row from `query_plane` once its tombstone is
+    /// in the journal.
+    pub(super) async fn remove_deleted_entity_projection(
+        &self,
+        query_plane: &dyn crate::storage::QueryPlaneStore,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        tombstone_sequence: u64,
+    ) {
+        let operation = "remove";
+        let source = "delete";
+        record_projection_update_started(tenant, entity_type, operation, source);
+        let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
+        if let Err(e) = query_plane
+            .remove_projection(tenant.as_str(), entity_type, entity_id)
+            .await
+        {
+            record_projection_update_error(
+                tenant,
+                entity_type,
+                operation,
+                source,
+                projection_started_at,
+            );
+            // Delete is idempotent against the projection: a stale row
+            // surviving in entity_field_index after the tombstone is a
+            // visibility leak, not data corruption. Log loudly so it's
+            // greppable but don't block the delete from completing —
+            // the actor and event journal already reflect the tombstone.
+            tracing::error!(
+                error = %e,
+                tenant = %tenant,
+                entity_type = %entity_type,
+                entity_id = %entity_id,
+                "failed to remove query projection during delete (stale projection row will linger until next successful upsert/delete)"
+            );
+        } else {
+            record_projection_update_success(
+                tenant,
+                entity_type,
+                operation,
+                source,
+                tombstone_sequence,
+                projection_started_at,
+            );
+        }
     }
 
     /// Check if an entity exists in the index.
