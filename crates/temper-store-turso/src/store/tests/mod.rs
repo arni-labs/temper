@@ -11,6 +11,7 @@ use crate::TursoSpecVerificationUpdate;
 
 mod commit_outcome;
 mod commit_transport;
+mod event_pages;
 mod evolution_tenant;
 mod field_index_writes;
 mod policy_approval;

@@ -139,6 +139,17 @@ impl EventStore for RecordingEventStore {
         Ok(vec![test_envelope(1)])
     }
 
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        assert_eq!(persistence_id, "default:Ticket:t-1");
+        assert!(before_sequence.is_none_or(|before| before > 1) && limit > 0);
+        Ok(vec![test_envelope(1)])
+    }
+
     async fn save_snapshot(
         &self,
         persistence_id: &str,

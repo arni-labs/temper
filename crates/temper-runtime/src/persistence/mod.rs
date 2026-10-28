@@ -542,6 +542,20 @@ pub trait EventStore: Send + Sync + 'static {
         from_sequence: u64,
     ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send;
 
+    /// Read one page of the journal, newest first: the newest `limit` events
+    /// whose sequence number is below `before_sequence` (the newest of the
+    /// whole journal when it is `None`), returned in ascending sequence order.
+    ///
+    /// Backends read only those rows, so a page costs its own size and not the
+    /// journal's. `limit` is a count of rows; a SQL backend binds it as a signed
+    /// 64-bit `LIMIT`, so values above `i64::MAX` read the whole range.
+    fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send;
+
     /// Save a state snapshot.
     fn save_snapshot(
         &self,

@@ -293,6 +293,45 @@ async fn fault_injection_produces_errors() {
 }
 
 #[tokio::test]
+async fn read_events_page_reads_newest_first_windows() {
+    let store = SimEventStore::no_faults(42);
+    let pid = "default:Order:paged";
+    assert!(
+        store
+            .read_events_page(pid, None, 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let events: Vec<_> = (0..7).map(|_| test_envelope(0, "Moved")).collect();
+    store.append(pid, 0, &events).await.unwrap();
+
+    let page = async |before: Option<u64>, limit: usize| -> Vec<u64> {
+        let page = store.read_events_page(pid, before, limit).await.unwrap();
+        page.iter().map(|e| e.sequence_nr).collect()
+    };
+    assert_eq!(page(None, 3).await, [5, 6, 7]);
+    assert_eq!(page(Some(5), 3).await, [2, 3, 4]);
+    assert_eq!(page(Some(2), 3).await, [1]);
+    assert!(page(Some(1), 3).await.is_empty());
+    assert_eq!(page(None, 100).await, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(page(Some(100), 2).await, [6, 7]);
+}
+
+#[tokio::test]
+async fn read_events_page_honors_injected_read_failures() {
+    let store = SimEventStore::no_faults(42);
+    let pid = "default:Order:paged-fail";
+    store
+        .append(pid, 0, &[test_envelope(0, "Created")])
+        .await
+        .unwrap();
+    store.fail_next_reads(pid, 1);
+    assert!(store.read_events_page(pid, None, 3).await.is_err());
+    assert_eq!(store.read_events_page(pid, None, 3).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn a_store_that_stops_after_a_write_refuses_every_write_until_it_takes_writes_again() {
     let store = SimEventStore::no_faults(42);
     let (stopper, other) = ("default:Order:ord-1", "default:Order:ord-2");
