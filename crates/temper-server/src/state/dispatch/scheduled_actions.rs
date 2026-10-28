@@ -5,11 +5,13 @@
 //! scheduled actions still waiting. After the commit, and after the
 //! transition's integrations, this process arms each one
 //! ([`ServerState::arm_scheduled_actions`]) on every path where the event was
-//! written; at boot
-//! [`ServerState::rearm_scheduled_actions`] arms every row again, through the
-//! boot gate, for the rest of its wait or at once if it fell due while the
-//! server was down. Replay never arms one: the rows are the source of truth.
-//! A process arms each row at most once, however many replies hand it back.
+//! written, and at once when the transition's projection write fails (then
+//! only there); at boot [`ServerState::rearm_scheduled_actions`] arms every
+//! row again, through the boot gate, for the rest of its wait or at once if it
+//! fell due while the server was down. Replay never arms one: the rows are the
+//! source of truth. While a row's timer is live, arming it again does nothing;
+//! once it has fired, a second arm fires it again, so each transition arms its
+//! rows once.
 //!
 //! A fire runs as whoever armed it. The event it writes removes its row in the
 //! same commit, so a row is removed only once its action has committed, and a
