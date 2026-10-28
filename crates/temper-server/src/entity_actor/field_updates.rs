@@ -24,32 +24,32 @@ const MAX_RETRIES: u32 = 2;
 
 /// Apply a field update and make it durable, or refuse it.
 ///
-/// `Ok(())` means the update is in the journal. `Err(reason)` means it is not,
-/// and `state` has been restored — a refusal never leaves a partial write. The
-/// caller replies with the reason verbatim.
+/// `Ok(())` means the update is in the journal. An error means it is not, and
+/// `state` has been restored — a refusal never leaves a partial write — or, on
+/// [`FieldUpdateFailure::RecordChanged`], caught up with the journal.
 pub(super) async fn commit_field_update(
     actor: &EntityActor,
     state: &mut EntityState,
     fields: Value,
     replace: bool,
-    expected_precondition: Option<String>,
-) -> Result<(), String> {
+    has_precondition: bool,
+) -> Result<(), FieldUpdateFailure> {
     if actor
         .table
         .read()
         .expect("table lock poisoned")
         .strict_action_params
     {
-        return Err("Strict entities require a declared action for field changes".to_owned());
-    }
-    let has_precondition = expected_precondition.is_some();
-    if let Some(expected) = expected_precondition
-        && effects::entity_authorization_precondition(state) != expected
-    {
-        return Err(STALE_AUTHORIZATION.to_string());
+        return Err(
+            "Strict entities require a declared action for field changes"
+                .to_owned()
+                .into(),
+        );
     }
     if state.status == "Deleted" {
-        return Err("cannot update fields after entity deletion".to_string());
+        return Err("cannot update fields after entity deletion"
+            .to_string()
+            .into());
     }
     // `parse_json_body_or_400` accepts any valid JSON, so a `PUT` body of
     // `[1,2,3]` reaches here. With `replace`, `apply_field_update` would set
@@ -59,14 +59,16 @@ pub(super) async fn commit_field_update(
     // journaled that corruption was in-memory and healed on restart; persisting
     // it would make it permanent.
     if !fields.is_object() {
-        return Err("entity field update must be a JSON object".to_string());
+        return Err("entity field update must be a JSON object"
+            .to_string()
+            .into());
     }
     // The same budget that gates spec actions. Field updates append journal
     // events too, so ungated they could grow the snapshot replay tail past
     // `MAX_EVENTS_SINCE_SNAPSHOT` while the snapshot path is stalled, after which
     // the entity can never rehydrate. Rejected before mutating.
     if let Some(reason) = budget_refusal(actor, state, replace) {
-        return Err(reason);
+        return Err(reason.into());
     }
 
     // Sanitize once and use the same value for state and journal.
@@ -120,10 +122,14 @@ pub(super) async fn commit_field_update(
             // re-applying would commit against state the caller never saw and
             // Cedar never evaluated. `entity_ops` already caps preconditioned asks
             // at a single attempt for that reason; retrying here would reintroduce
-            // one layer down the retry the layer above forbids.
-            Err(PersistenceError::ConcurrencyViolation { .. }) if has_precondition => {
-                state.fields = previous_fields;
-                return Err(STALE_AUTHORIZATION.to_string());
+            // one layer down the retry the layer above forbids. The record is
+            // caught up instead, so the route decides the update again on it.
+            Err(PersistenceError::ConcurrencyViolation { actual, .. }) if has_precondition => {
+                if let Err(reason) = catch_up(actor, state, 1, actual, action).await {
+                    state.fields = previous_fields;
+                    return Err(reason.into());
+                }
+                return Err(FieldUpdateFailure::RecordChanged);
             }
             Err(PersistenceError::ConcurrencyViolation { actual, .. }) if attempt < MAX_RETRIES => {
                 attempt += 1;
@@ -131,11 +137,11 @@ pub(super) async fn commit_field_update(
                     Ok(()) => {}
                     Err(reason) => {
                         state.fields = previous_fields;
-                        return Err(reason);
+                        return Err(reason.into());
                     }
                 }
                 if let Some(reason) = post_replay_refusal(actor, state, replace) {
-                    return Err(reason);
+                    return Err(reason.into());
                 }
                 // Re-apply onto the caught-up state and rebuild the event against
                 // its (possibly new) status.
@@ -149,7 +155,7 @@ pub(super) async fn commit_field_update(
             }
             Err(e) => {
                 state.fields = previous_fields;
-                return Err(super::actor::persistence_failure(&e));
+                return Err(super::actor::persistence_failure(&e).into());
             }
         }
     }
@@ -176,10 +182,35 @@ pub(super) async fn commit_field_update(
     Ok(())
 }
 
-/// The refusal an update gets when the state it was authorized against moved.
-/// Shared by the entry check and the conflict path so a caller cannot tell the
-/// two apart — both mean "re-read and retry".
-const STALE_AUTHORIZATION: &str =
+/// Why a field update did not land. Nothing was written either way.
+#[derive(Debug)]
+pub(super) enum FieldUpdateFailure {
+    /// The update was decided on a state the journal had already moved past.
+    /// The record is caught up, and the update is decided again on it.
+    RecordChanged,
+    /// Refused or failed, with the reason the caller reads.
+    Failed(String),
+}
+
+impl From<String> for FieldUpdateFailure {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+impl std::fmt::Display for FieldUpdateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordChanged => f.write_str(STALE_AUTHORIZATION),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// The refusal an update gets when the state it was authorized against moved,
+/// whether the actor's entry check or a conflict on its append found it. The
+/// route then decides the update again on the record as it is now.
+pub(super) const STALE_AUTHORIZATION: &str =
     "field update authorization became stale; retry against current state";
 
 fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent {

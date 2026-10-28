@@ -569,6 +569,12 @@ impl crate::state::ServerState {
         ctx: &PostDispatchContext<'_>,
         response: EntityResponse,
     ) -> EntityResponse {
+        // A write refused because its record changed was not decided: its
+        // route decides it again, and that decision is the one recorded.
+        if response.is_record_changed() {
+            return response;
+        }
+
         // 1. Record metrics
         self.metrics
             .record_transition(ctx.entity_type, ctx.action, response.success);

@@ -303,6 +303,21 @@ impl EntityResponse {
         }
     }
 
+    /// The answer to a write decided on a state its record has since left:
+    /// nothing was written, and `state` is the record as it is now.
+    pub(crate) fn record_changed(state: EntityState, error: String) -> Self {
+        Self {
+            refusal: Some(temper_jit::table::Refusal::RecordChanged),
+            ..Self::refused(state, error)
+        }
+    }
+
+    /// Whether this answers a write decided on a state its record has since
+    /// left ([`Self::record_changed`]).
+    pub(crate) fn is_record_changed(&self) -> bool {
+        self.refused && self.refusal == Some(temper_jit::table::Refusal::RecordChanged)
+    }
+
     /// The answer to an action whose write failed, so it may have landed.
     pub(crate) fn write_failed(state: EntityState, error: String) -> Self {
         Self {

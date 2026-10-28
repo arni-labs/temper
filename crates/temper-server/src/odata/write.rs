@@ -34,6 +34,7 @@ use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error, odata_refusal};
 use crate::state::ServerState;
+use crate::state::redecide::Redecide;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 
 type ODataWriteError = Box<axum::response::Response>;
@@ -1051,165 +1052,178 @@ pub async fn handle_odata_patch(
                 }
                 return response;
             }
-            if let Err(resp) =
-                ensure_entity_exists_or_404(&state, &tenant, &entity_type, &set_name, &key_str)
-            {
-                return *resp;
-            }
-            let existing = match authorize_existing_mutation(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                UPDATE_ACTION,
-                &security_ctx,
-                &agent_ctx,
-            )
-            .await
-            {
-                Ok(existing) => existing,
-                Err(resp) => return *resp,
-            };
-            if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
-                return *resp;
-            }
-            if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type) {
-                return response;
-            }
-
-            let body_json = match parse_json_body_or_400(&body) {
-                Ok(v) => v,
-                Err(resp) => return *resp,
-            };
-            if !body_json.is_object() {
-                return odata_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidBody",
-                    "PATCH body must be a JSON object",
-                )
-                .into_response();
-            }
-            if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
-                return response;
-            }
-            let mut prospective_fields = existing.fields;
-            if let (Some(dst), Some(src)) =
-                (prospective_fields.as_object_mut(), body_json.as_object())
-            {
-                for (k, v) in src {
-                    dst.insert(k.clone(), v.clone());
+            let mut redecide = Redecide::start(&state);
+            loop {
+                if let Err(resp) =
+                    ensure_entity_exists_or_404(&state, &tenant, &entity_type, &set_name, &key_str)
+                {
+                    return *resp;
                 }
-            } else {
-                prospective_fields = body_json.clone();
-            }
-
-            if let Err(response) = authorize_prospective_mutation(
-                &state,
-                ProspectiveMutationAuthorization {
-                    tenant: &tenant,
-                    entity_type: &entity_type,
-                    entity_id: &key_str,
-                    status: &existing.status,
-                    fields: &prospective_fields,
-                    security_ctx: &security_ctx,
-                    agent_ctx: &agent_ctx,
-                },
-            )
-            .await
-            {
-                return *response;
-            }
-
-            let _commons_guardrail_lock = state.acquire_commons_write_guardrail_lock(&tenant).await;
-
-            if let Err(resp) = run_write_prechecks(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                "Patch",
-                "patch",
-                &prospective_fields,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            if let Err(resp) = enforce_commons_account_verified_for_write(
-                &state,
-                &tenant,
-                &entity_type,
-                &prospective_fields,
-            )
-            .await
-            {
-                return *resp;
-            }
-
-            if let Err(resp) = enforce_commons_app_name_unique_for_write(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                &prospective_fields,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&prospective_fields),
-                &security_ctx,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            match state
-                .update_tenant_entity_fields_if_current(
+                let existing = match authorize_existing_mutation(
+                    &state,
                     &tenant,
                     &entity_type,
                     &key_str,
-                    body_json,
-                    false,
-                    existing.precondition,
+                    UPDATE_ACTION,
+                    &security_ctx,
+                    &agent_ctx,
                 )
                 .await
-            {
-                Ok(response) if response.success => {
-                    if entity_type == "RateLimit" {
-                        state.clear_commons_rate_limit_cache();
-                    }
-                    state.clear_commons_storage_projection_cache_for_entity(&entity_type);
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{set_name}/$entity"),
-                        Some(format!("{set_name}('{key_str}')")),
-                    );
-                    ODataResponse {
-                        status: StatusCode::OK,
-                        body,
-                    }
-                    .into_response()
+                {
+                    Ok(existing) => existing,
+                    Err(resp) => return *resp,
+                };
+                if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
+                    return *resp;
                 }
-                Ok(response) => odata_error(
-                    StatusCode::CONFLICT,
-                    "ConcurrentModification",
-                    response.error.as_deref().unwrap_or(
-                        "entity changed after authorization; retry against current state",
-                    ),
+                if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type)
+                {
+                    return response;
+                }
+
+                let body_json = match parse_json_body_or_400(&body) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                if !body_json.is_object() {
+                    return odata_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidBody",
+                        "PATCH body must be a JSON object",
+                    )
+                    .into_response();
+                }
+                if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
+                    return response;
+                }
+                let mut prospective_fields = existing.fields;
+                if let (Some(dst), Some(src)) =
+                    (prospective_fields.as_object_mut(), body_json.as_object())
+                {
+                    for (k, v) in src {
+                        dst.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    prospective_fields = body_json.clone();
+                }
+
+                if let Err(response) = authorize_prospective_mutation(
+                    &state,
+                    ProspectiveMutationAuthorization {
+                        tenant: &tenant,
+                        entity_type: &entity_type,
+                        entity_id: &key_str,
+                        status: &existing.status,
+                        fields: &prospective_fields,
+                        security_ctx: &security_ctx,
+                        agent_ctx: &agent_ctx,
+                    },
                 )
-                .into_response(),
-                Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "UpdateError", &e)
+                .await
+                {
+                    return *response;
+                }
+
+                let _commons_guardrail_lock =
+                    state.acquire_commons_write_guardrail_lock(&tenant).await;
+
+                if let Err(resp) = run_write_prechecks(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &key_str,
+                    "Patch",
+                    "patch",
+                    &prospective_fields,
+                )
+                .await
+                {
+                    return resp;
+                }
+
+                if let Err(resp) = enforce_commons_account_verified_for_write(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &prospective_fields,
+                )
+                .await
+                {
+                    return *resp;
+                }
+
+                if let Err(resp) = enforce_commons_app_name_unique_for_write(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &key_str,
+                    &prospective_fields,
+                )
+                .await
+                {
+                    return resp;
+                }
+
+                if redecide.is_first()
+                    && let Err(resp) = enforce_commons_write_rate_limit(
+                        &state,
+                        &tenant,
+                        &entity_type,
+                        owner_id_from_fields(&prospective_fields),
+                        &security_ctx,
+                    )
+                    .await
+                {
+                    return resp;
+                }
+
+                redecide.dispatching().await;
+                let answer = state
+                    .update_tenant_entity_fields_if_current(
+                        &tenant,
+                        &entity_type,
+                        &key_str,
+                        body_json,
+                        false,
+                        existing.precondition,
+                    )
+                    .await;
+                if let Ok(response) = &answer
+                    && redecide.again(response.is_record_changed(), "patch")
+                {
+                    continue;
+                }
+                return match answer {
+                    Ok(response) if response.success => {
+                        if entity_type == "RateLimit" {
+                            state.clear_commons_rate_limit_cache();
+                        }
+                        state.clear_commons_storage_projection_cache_for_entity(&entity_type);
+                        let mut state_json =
+                            serde_json::to_value(&response.state).unwrap_or_default();
+                        hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
+                        let body = annotate_entity(
+                            state_json,
+                            format!("$metadata#{set_name}/$entity"),
+                            Some(format!("{set_name}('{key_str}')")),
+                        );
+                        ODataResponse {
+                            status: StatusCode::OK,
+                            body,
+                        }
+                        .into_response()
+                    }
+                    Ok(response) => odata_error(
+                        StatusCode::CONFLICT,
+                        "ConcurrentModification",
+                        response.error.as_deref().unwrap_or(
+                            "entity changed after authorization; retry against current state",
+                        ),
+                    )
                     .into_response(),
+                    Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "UpdateError", &e)
+                        .into_response(),
+                };
             }
         }
         _ => odata_error(
@@ -1296,155 +1310,168 @@ pub async fn handle_odata_put(
                 }
                 return response;
             }
-            if let Err(resp) =
-                ensure_entity_exists_or_404(&state, &tenant, &entity_type, &set_name, &key_str)
-            {
-                return *resp;
-            }
-            let existing = match authorize_existing_mutation(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                UPDATE_ACTION,
-                &security_ctx,
-                &agent_ctx,
-            )
-            .await
-            {
-                Ok(existing) => existing,
-                Err(resp) => return *resp,
-            };
-            if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
-                return *resp;
-            }
-            if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type) {
-                return response;
-            }
-
-            let body_json = match parse_json_body_or_400(&body) {
-                Ok(v) => v,
-                Err(resp) => return *resp,
-            };
-            if !body_json.is_object() {
-                return odata_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidBody",
-                    "PUT body must be a JSON object",
-                )
-                .into_response();
-            }
-            if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
-                return response;
-            }
-
-            if let Err(response) = authorize_prospective_mutation(
-                &state,
-                ProspectiveMutationAuthorization {
-                    tenant: &tenant,
-                    entity_type: &entity_type,
-                    entity_id: &key_str,
-                    status: &existing.status,
-                    fields: &body_json,
-                    security_ctx: &security_ctx,
-                    agent_ctx: &agent_ctx,
-                },
-            )
-            .await
-            {
-                return *response;
-            }
-
-            let _commons_guardrail_lock = state.acquire_commons_write_guardrail_lock(&tenant).await;
-
-            if let Err(resp) = run_write_prechecks(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                "Put",
-                "put",
-                &body_json,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            if let Err(resp) = enforce_commons_account_verified_for_write(
-                &state,
-                &tenant,
-                &entity_type,
-                &body_json,
-            )
-            .await
-            {
-                return *resp;
-            }
-
-            if let Err(resp) = enforce_commons_app_name_unique_for_write(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                &body_json,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&body_json),
-                &security_ctx,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            match state
-                .update_tenant_entity_fields_if_current(
+            let mut redecide = Redecide::start(&state);
+            loop {
+                if let Err(resp) =
+                    ensure_entity_exists_or_404(&state, &tenant, &entity_type, &set_name, &key_str)
+                {
+                    return *resp;
+                }
+                let existing = match authorize_existing_mutation(
+                    &state,
                     &tenant,
                     &entity_type,
                     &key_str,
-                    body_json,
-                    true,
-                    existing.precondition,
+                    UPDATE_ACTION,
+                    &security_ctx,
+                    &agent_ctx,
                 )
                 .await
-            {
-                Ok(response) if response.success => {
-                    if entity_type == "RateLimit" {
-                        state.clear_commons_rate_limit_cache();
-                    }
-                    state.clear_commons_storage_projection_cache_for_entity(&entity_type);
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{set_name}/$entity"),
-                        Some(format!("{set_name}('{key_str}')")),
-                    );
-                    ODataResponse {
-                        status: StatusCode::OK,
-                        body,
-                    }
-                    .into_response()
+                {
+                    Ok(existing) => existing,
+                    Err(resp) => return *resp,
+                };
+                if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
+                    return *resp;
                 }
-                Ok(response) => odata_error(
-                    StatusCode::CONFLICT,
-                    "ConcurrentModification",
-                    response.error.as_deref().unwrap_or(
-                        "entity changed after authorization; retry against current state",
-                    ),
+                if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type)
+                {
+                    return response;
+                }
+
+                let body_json = match parse_json_body_or_400(&body) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                if !body_json.is_object() {
+                    return odata_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidBody",
+                        "PUT body must be a JSON object",
+                    )
+                    .into_response();
+                }
+                if let Some(response) = refuse_content_fields(&entity_type, &body_json) {
+                    return response;
+                }
+
+                if let Err(response) = authorize_prospective_mutation(
+                    &state,
+                    ProspectiveMutationAuthorization {
+                        tenant: &tenant,
+                        entity_type: &entity_type,
+                        entity_id: &key_str,
+                        status: &existing.status,
+                        fields: &body_json,
+                        security_ctx: &security_ctx,
+                        agent_ctx: &agent_ctx,
+                    },
                 )
-                .into_response(),
-                Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "UpdateError", &e)
+                .await
+                {
+                    return *response;
+                }
+
+                let _commons_guardrail_lock =
+                    state.acquire_commons_write_guardrail_lock(&tenant).await;
+
+                if let Err(resp) = run_write_prechecks(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &key_str,
+                    "Put",
+                    "put",
+                    &body_json,
+                )
+                .await
+                {
+                    return resp;
+                }
+
+                if let Err(resp) = enforce_commons_account_verified_for_write(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &body_json,
+                )
+                .await
+                {
+                    return *resp;
+                }
+
+                if let Err(resp) = enforce_commons_app_name_unique_for_write(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &key_str,
+                    &body_json,
+                )
+                .await
+                {
+                    return resp;
+                }
+
+                if redecide.is_first()
+                    && let Err(resp) = enforce_commons_write_rate_limit(
+                        &state,
+                        &tenant,
+                        &entity_type,
+                        owner_id_from_fields(&body_json),
+                        &security_ctx,
+                    )
+                    .await
+                {
+                    return resp;
+                }
+
+                redecide.dispatching().await;
+                let answer = state
+                    .update_tenant_entity_fields_if_current(
+                        &tenant,
+                        &entity_type,
+                        &key_str,
+                        body_json,
+                        true,
+                        existing.precondition,
+                    )
+                    .await;
+                if let Ok(response) = &answer
+                    && redecide.again(response.is_record_changed(), "put")
+                {
+                    continue;
+                }
+                return match answer {
+                    Ok(response) if response.success => {
+                        if entity_type == "RateLimit" {
+                            state.clear_commons_rate_limit_cache();
+                        }
+                        state.clear_commons_storage_projection_cache_for_entity(&entity_type);
+                        let mut state_json =
+                            serde_json::to_value(&response.state).unwrap_or_default();
+                        hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
+                        let body = annotate_entity(
+                            state_json,
+                            format!("$metadata#{set_name}/$entity"),
+                            Some(format!("{set_name}('{key_str}')")),
+                        );
+                        ODataResponse {
+                            status: StatusCode::OK,
+                            body,
+                        }
+                        .into_response()
+                    }
+                    Ok(response) => odata_error(
+                        StatusCode::CONFLICT,
+                        "ConcurrentModification",
+                        response.error.as_deref().unwrap_or(
+                            "entity changed after authorization; retry against current state",
+                        ),
+                    )
                     .into_response(),
+                    Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "UpdateError", &e)
+                        .into_response(),
+                };
             }
         }
         ODataPath::Value { parent } => handle_stream_put(
@@ -1519,99 +1546,111 @@ pub async fn handle_odata_delete(
                 }
                 return response;
             }
-            if let Err(resp) =
-                ensure_entity_exists_or_404(&state, &tenant, &entity_type, &set_name, &key_str)
-            {
-                return *resp;
-            }
-            let existing = match authorize_existing_mutation(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                DELETE_ACTION,
-                &security_ctx,
-                &agent_ctx,
-            )
-            .await
-            {
-                Ok(existing) => existing,
-                Err(resp) => return *resp,
-            };
-            if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
-                return *resp;
-            }
-            if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type) {
-                return response;
-            }
-            if let Err(v) =
-                pre_delete_relation_checks(&state, &tenant, &entity_type, &key_str, "delete").await
-            {
-                return constraint_violation_response(v);
-            }
-            if let Err(resp) = run_write_prechecks(
-                &state,
-                &tenant,
-                &entity_type,
-                &key_str,
-                "Delete",
-                "delete",
-                &existing.fields,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            if let Err(resp) = enforce_commons_account_verified_for_write(
-                &state,
-                &tenant,
-                &entity_type,
-                &existing.fields,
-            )
-            .await
-            {
-                return *resp;
-            }
-
-            if let Err(resp) = enforce_commons_write_rate_limit(
-                &state,
-                &tenant,
-                &entity_type,
-                owner_id_from_fields(&existing.fields),
-                &security_ctx,
-            )
-            .await
-            {
-                return resp;
-            }
-
-            match state
-                .delete_tenant_entity_if_current(
+            let mut redecide = Redecide::start(&state);
+            loop {
+                if let Err(resp) =
+                    ensure_entity_exists_or_404(&state, &tenant, &entity_type, &set_name, &key_str)
+                {
+                    return *resp;
+                }
+                let existing = match authorize_existing_mutation(
+                    &state,
                     &tenant,
                     &entity_type,
                     &key_str,
-                    existing.precondition,
+                    DELETE_ACTION,
+                    &security_ctx,
+                    &agent_ctx,
                 )
                 .await
-            {
-                Ok(response) if response.success => {
-                    if entity_type == "RateLimit" {
-                        state.clear_commons_rate_limit_cache();
-                    }
-                    state.clear_commons_storage_projection_cache_for_entity(&entity_type);
-                    (StatusCode::NO_CONTENT, "").into_response()
+                {
+                    Ok(existing) => existing,
+                    Err(resp) => return *resp,
+                };
+                if let Err(resp) = check_verification_gate_or_423(&state, &tenant, &entity_type) {
+                    return *resp;
                 }
-                Ok(response) => odata_error(
-                    StatusCode::CONFLICT,
-                    "ConcurrentModification",
-                    response.error.as_deref().unwrap_or(
-                        "entity changed after authorization; retry against current state",
-                    ),
+                if let Some(response) = strict_generic_write_response(&state, &tenant, &entity_type)
+                {
+                    return response;
+                }
+                if let Err(v) =
+                    pre_delete_relation_checks(&state, &tenant, &entity_type, &key_str, "delete")
+                        .await
+                {
+                    return constraint_violation_response(v);
+                }
+                if let Err(resp) = run_write_prechecks(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &key_str,
+                    "Delete",
+                    "delete",
+                    &existing.fields,
                 )
-                .into_response(),
-                Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "DeleteError", &e)
+                .await
+                {
+                    return resp;
+                }
+
+                if let Err(resp) = enforce_commons_account_verified_for_write(
+                    &state,
+                    &tenant,
+                    &entity_type,
+                    &existing.fields,
+                )
+                .await
+                {
+                    return *resp;
+                }
+
+                if redecide.is_first()
+                    && let Err(resp) = enforce_commons_write_rate_limit(
+                        &state,
+                        &tenant,
+                        &entity_type,
+                        owner_id_from_fields(&existing.fields),
+                        &security_ctx,
+                    )
+                    .await
+                {
+                    return resp;
+                }
+
+                redecide.dispatching().await;
+                let answer = state
+                    .delete_tenant_entity_if_current(
+                        &tenant,
+                        &entity_type,
+                        &key_str,
+                        existing.precondition,
+                    )
+                    .await;
+                if let Ok(response) = &answer
+                    && redecide.again(response.is_record_changed(), "delete")
+                {
+                    continue;
+                }
+                return match answer {
+                    Ok(response) if response.success => {
+                        if entity_type == "RateLimit" {
+                            state.clear_commons_rate_limit_cache();
+                        }
+                        state.clear_commons_storage_projection_cache_for_entity(&entity_type);
+                        (StatusCode::NO_CONTENT, "").into_response()
+                    }
+                    Ok(response) => odata_error(
+                        StatusCode::CONFLICT,
+                        "ConcurrentModification",
+                        response.error.as_deref().unwrap_or(
+                            "entity changed after authorization; retry against current state",
+                        ),
+                    )
                     .into_response(),
+                    Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "DeleteError", &e)
+                        .into_response(),
+                };
             }
         }
         _ => odata_error(

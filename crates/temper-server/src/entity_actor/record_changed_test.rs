@@ -206,3 +206,75 @@ async fn a_delete_that_finds_its_record_deleted_writes_nothing() {
         .count();
     assert_eq!(tombstones, 1, "a deleted record takes no second tombstone");
 }
+
+/// A spec whose own move reaches a state named `Deleted`, which is not the
+/// kernel's tombstone.
+const SOFT_DELETE_IOA: &str = r#"
+[automaton]
+name = "Note"
+states = ["Open", "Deleted"]
+initial = "Open"
+allow_indefinite_states = ["Open", "Deleted"]
+
+[[action]]
+name = "Delete"
+kind = "input"
+from = ["Open"]
+to = "Deleted"
+"#;
+
+#[tokio::test]
+async fn a_delete_on_a_record_its_spec_moved_to_deleted_still_writes_a_tombstone() {
+    let store = Arc::new(SimEventStore::no_faults(73));
+    let entity_id = "soft-deleted";
+    let system = ActorSystem::new("sim-soft-deleted");
+    let actor = system.spawn(
+        EntityActor::with_persistence(
+            "Note",
+            entity_id,
+            Arc::new(RwLock::new(TransitionTable::from_ioa_source(
+                SOFT_DELETE_IOA,
+            ))),
+            serde_json::json!({}),
+            crate::storage::BoxedEventStore::from_arc(store.clone()),
+            crate::storage::BackendLabel::Sim,
+        ),
+        entity_id,
+    );
+    let moved: EntityResponse = actor
+        .ask(
+            EntityMsg::Action {
+                caller: None,
+                name: "Delete".to_string(),
+                params: serde_json::json!({}),
+                related: std::collections::BTreeMap::new(),
+                idempotency_key: Some("soft-delete".to_string()),
+                expected_authorization_precondition: None,
+            },
+            ASK,
+        )
+        .await
+        .expect("soft delete answer");
+    assert!(moved.success, "{moved:?}");
+    assert_eq!(moved.state.status, "Deleted");
+
+    let deleted: EntityResponse = actor
+        .ask(
+            EntityMsg::Delete {
+                expected_authorization_precondition: None,
+            },
+            ASK,
+        )
+        .await
+        .expect("delete answer");
+    assert!(deleted.success, "{deleted:?}");
+
+    let envelopes = store
+        .read_events(&format!("default:Note:{entity_id}"), 0)
+        .await
+        .expect("read journal");
+    assert!(
+        envelopes.iter().any(|envelope| envelope.is_tombstone()),
+        "a record its spec moved to `Deleted` is not deleted until the kernel's tombstone is written"
+    );
+}

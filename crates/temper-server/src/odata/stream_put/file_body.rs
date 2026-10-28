@@ -19,6 +19,7 @@ use super::{
 use crate::blob_store::{BlobByteStream, BlobIngestAdmissionError, MAX_RAW_BLOB_BYTES};
 use crate::request_context::AgentContext;
 use crate::response::odata_error;
+use crate::state::redecide::Redecide;
 use crate::state::{ServerState, StoredFileContent, native_file_blob_key};
 
 /// The File a `$value` PUT names, when the server streams it: the TemperFS `File` type, a media entity, sent with
@@ -157,16 +158,42 @@ pub(in crate::odata) async fn handle_file_value_put(
     drop(admission);
 
     let committed = if exists {
-        state
-            .commit_file_stream_content(
-                tenant,
-                file_id,
-                &content,
-                &content_type,
-                agent_ctx,
-                precondition,
-            )
-            .await
+        // The bytes are stored by now, so a File that changed while they
+        // streamed is decided again and its content committed again, without
+        // reading a byte twice. The deadline runs from here, not from the
+        // request: the upload was not a wait on the record.
+        let mut redecide = Redecide::start(state);
+        let mut decided_on = precondition;
+        loop {
+            redecide.dispatching().await;
+            let answer = state
+                .commit_file_stream_content(
+                    tenant,
+                    file_id,
+                    &content,
+                    &content_type,
+                    agent_ctx,
+                    decided_on,
+                )
+                .await;
+            let stale = matches!(&answer, Ok(entity_resp) if entity_resp.is_record_changed());
+            if !redecide.again(stale, "file_value_put") {
+                break answer;
+            }
+            decided_on =
+                match authorize_file_write(state, tenant, file_id, true, agent_ctx, security_ctx)
+                    .await
+                {
+                    Ok(decided) => decided,
+                    Err(response) => return *response,
+                };
+            if let Err(error) = state
+                .check_existing_file_writable(tenant, file_id, true)
+                .await
+            {
+                return file_stream_content_error_response(error);
+            }
+        }
     } else {
         state
             .commit_new_file_content(
