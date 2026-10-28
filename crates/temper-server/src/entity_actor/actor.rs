@@ -2242,3 +2242,7 @@ pub(super) mod contract_state_tests;
 #[cfg(all(test, feature = "sim"))]
 #[path = "hydration_test.rs"]
 mod hydration_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "record_changed_test.rs"]
+mod record_changed_tests;

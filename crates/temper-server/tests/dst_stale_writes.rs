@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
 use temper_runtime::ActorSystem;
 use temper_runtime::buggify::install_buggify_context;
+use temper_runtime::persistence::EventStore as _;
 use temper_runtime::scheduler::install_deterministic_context;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::{
@@ -159,6 +160,11 @@ fn customer(id: &str) -> SecurityContext {
 }
 
 fn server(seed: u64, scenario: &str) -> ServerState {
+    server_with_journal(seed, scenario).0
+}
+
+/// A server, and its journal to read what was written.
+fn server_with_journal(seed: u64, scenario: &str) -> (ServerState, SimEventStore) {
     let mut registry = SpecRegistry::new();
     let entities = [("Tally", TALLY_IOA), ("Project", PROJECT_IOA)];
     registry.register_tenant(
@@ -186,12 +192,12 @@ fn server(seed: u64, scenario: &str) -> ServerState {
     let store = SimEventStore::no_faults(seed);
     let name = format!("dst-stale-writes-{scenario}-{seed}");
     let mut state = ServerState::from_registry(ActorSystem::new(&name), registry);
-    state.set_storage_stack(StorageStack::from_sim(store, None));
+    state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
     state
         .authz
         .reload_tenant_policies("default", POLICY)
         .expect("policy should load");
-    state
+    (state, store)
 }
 
 async fn send(
@@ -449,6 +455,52 @@ async fn delete_races_moves(seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Two deletes race moves on one record: each is answered as done (2xx) or
+/// not found (404), never as decided on a changed record, and the record is
+/// deleted once.
+async fn deletes_race(seed: u64) -> Result<(), String> {
+    let _sim = install_deterministic_context(seed);
+    let (state, journal) = server_with_journal(seed, "deletes");
+    create(&state, "Projects", json!({ "Id": "p1" })).await?;
+    create(&state, "Tallies", json!({ "Id": "t1", "project_id": "p1" })).await?;
+
+    let _faults = install_buggify_context(seed);
+    let who: Vec<String> = (0..RACING_ATTACKS).map(|i| format!("c{i}")).collect();
+    let delete = || {
+        Request::delete("/tdata/Tallies('t1')")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (first, second, _moves) = tokio::join!(
+        send(&state, "owner", delete()),
+        send(&state, "owner", delete()),
+        join_all(who.iter().map(|id| {
+            act(
+                &state,
+                id,
+                "Tallies('t1')/Temper.Stale.Bump",
+                json!({ "last": id }),
+            )
+        })),
+    );
+    for (status, body) in [&first, &second] {
+        if !(status.is_success() || *status == StatusCode::NOT_FOUND) {
+            return Err(format!("a delete was answered {status} {body}"));
+        }
+    }
+    let tombstones = journal
+        .read_events("default:Tally:t1", 0)
+        .await
+        .map_err(|error| format!("reading the journal: {error}"))?
+        .into_iter()
+        .filter(|envelope| envelope.payload["action"] == "Deleted")
+        .count();
+    if tombstones != 1 {
+        return Err(format!("the record was deleted {tombstones} times"));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn dst_stale_writes_every_allowed_move_on_a_busy_record_lands() {
     for seed in seeds() {
@@ -480,6 +532,15 @@ async fn dst_stale_writes_every_allowed_field_update_on_a_busy_record_lands() {
 async fn dst_stale_writes_a_delete_lands_while_the_record_is_being_moved() {
     for seed in seeds() {
         if let Err(violation) = delete_races_moves(seed).await {
+            panic!("seed {seed}: {violation}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn dst_stale_writes_racing_deletes_delete_once() {
+    for seed in seeds() {
+        if let Err(violation) = deletes_race(seed).await {
             panic!("seed {seed}: {violation}");
         }
     }
