@@ -41,6 +41,9 @@ mod stack_tests;
 #[cfg(test)]
 mod identity_records_tests;
 
+#[cfg(test)]
+mod principal_record_tests;
+
 /// The result of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzDecision {
