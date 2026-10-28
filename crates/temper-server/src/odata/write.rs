@@ -88,6 +88,7 @@ fn prepare_collection_create_fields(
     body: &serde_json::Value,
     entity_type: &str,
     initial_status: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<(String, serde_json::Value), ODataWriteError> {
     let mut fields = body
         .as_object()
@@ -124,7 +125,7 @@ fn prepare_collection_create_fields(
         .map(str::to_string)
         .unwrap_or_else(|| {
             let prefix = entity_type_prefix(entity_type);
-            format!("{prefix}{}", temper_runtime::scheduler::sim_uuid())
+            format!("{prefix}{}", create_id(idempotency_key))
         });
 
     fields.retain(|key, _| !temper_spec::automaton::is_server_derived_field_name(key));
@@ -539,11 +540,15 @@ pub async fn handle_odata_post(
                         .into_response();
                 }
             };
-            let (entity_id, initial_fields) =
-                match prepare_collection_create_fields(&body_json, &entity_type, &initial_status) {
-                    Ok(prepared) => prepared,
-                    Err(response) => return *response,
-                };
+            let (entity_id, initial_fields) = match prepare_collection_create_fields(
+                &body_json,
+                &entity_type,
+                &initial_status,
+                idempotency_key.as_deref(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(response) => return *response,
+            };
             if let Err(resp) = authorize_collection_create(
                 &state,
                 &tenant,
@@ -1810,6 +1815,22 @@ fn forget_deleted_entity(state: &ServerState, entity_type: &str) {
     }
     state.clear_commons_storage_projection_cache_for_entity(entity_type);
 }
+
+/// The id of a record created without one: the create's idempotency key, so
+/// the same create sent again with its key finds the record the first made
+/// (creating a record that exists answers that record). A key that is a UUID,
+/// as every key the kernel gives a write is, is the id as it is; any other
+/// key is named by a UUID derived from it.
+fn create_id(idempotency_key: Option<&str>) -> uuid::Uuid {
+    match idempotency_key {
+        Some(key) => uuid::Uuid::try_parse(key)
+            .unwrap_or_else(|_| uuid::Uuid::new_v5(&CREATE_KEY_NAMESPACE, key.as_bytes())),
+        None => temper_runtime::scheduler::sim_uuid(),
+    }
+}
+
+/// The namespace of ids derived from a create's own key.
+const CREATE_KEY_NAMESPACE: uuid::Uuid = uuid::uuid!("6f1d3c52-8a4e-4b7f-9c2d-5e0a1b3c4d5e");
 
 /// Map an entity type name to a short lowercase prefix for auto-generated IDs.
 ///
