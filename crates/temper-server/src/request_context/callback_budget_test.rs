@@ -29,7 +29,7 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
             if let Some(inside) = context.inline_chain.steps().last() {
                 assert!(
                     matches!(
-                        context.for_callback("Job", "job", &inside.action),
+                        context.for_callback("Job", "job", &inside.action, "test"),
                         Err(CallbackBudgetExceeded::RepeatedStep(_))
                     ),
                     "seed={seed}, admitted={admitted}"
@@ -51,7 +51,7 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
             }
             let previous_steps = context.inline_chain.steps().len();
             context = context
-                .for_callback("Job", "job", &format!("Step{admitted}"))
+                .for_callback("Job", "job", &format!("Step{admitted}"), "test")
                 .unwrap_or_else(|error| {
                     panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
                 });
@@ -91,7 +91,9 @@ fn assert_total_hops_exhausted(mut context: AgentContext, seed: u64) {
         context = service_identity(service).inherit_observability_from(&context);
         assert_eq!(context.callback_hops, 512, "seed={seed}");
         assert_eq!(
-            context.for_callback("Job", "job", "Next").unwrap_err(),
+            context
+                .for_callback("Job", "job", "Next", "test")
+                .unwrap_err(),
             CallbackBudgetExceeded::TotalHops,
             "seed={seed}, service={service}"
         );
@@ -105,13 +107,13 @@ fn inline_callbacks_stop_at_their_first_repeated_step() {
     let mut context = AgentContext::default().entering("Job", "job", "Start");
     for admitted in 1..=64 {
         context = context
-            .for_callback("Job", "job", &format!("Step{admitted}"))
+            .for_callback("Job", "job", &format!("Step{admitted}"), "test")
             .unwrap();
         assert_eq!(context.callback_hops, admitted);
     }
     let inherited = AgentContext::for_service_inheriting("wasm-runtime", &context);
     let Err(CallbackBudgetExceeded::RepeatedStep(repeat)) =
-        inherited.for_callback("Job", "job", "Step60")
+        inherited.for_callback("Job", "job", "Step60", "test")
     else {
         panic!("a repeated step must be refused");
     };
@@ -121,7 +123,11 @@ fn inline_callbacks_stop_at_their_first_repeated_step() {
             .map(|action| format!("Job(job).{action}"))
     );
     // The same action on another entity is a different step.
-    assert!(inherited.for_callback("Job", "other", "Step60").is_ok());
+    assert!(
+        inherited
+            .for_callback("Job", "other", "Step60", "test")
+            .is_ok()
+    );
     assert_eq!(inherited.callback_hops, context.callback_hops);
 }
 
@@ -146,7 +152,9 @@ fn request_headers_cannot_supply_callback_budgets() {
 fn detached_boundary_preserves_authority_and_idempotency() {
     let context = AgentContext {
         callback_hops: 40,
-        idempotency_key: Some("request-key".into()),
+        idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+            "request-key".into(),
+        )),
         ..AgentContext::for_service("invoker")
     }
     .entering("Job", "job", "Start");

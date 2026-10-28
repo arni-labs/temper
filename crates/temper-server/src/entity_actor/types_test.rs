@@ -1,4 +1,4 @@
-//! Tests for the entity actor's message, state and answer types.
+//! Tests for the entity actor types.
 
 use super::*;
 use serde_json::json;
@@ -49,6 +49,38 @@ fn entity_state_defaults_on_missing_fields() {
     assert_eq!(state.events_since_snapshot, 0);
     assert_eq!(state.last_snapshot_sequence_nr, 0);
     assert_eq!(state.sequence_nr, 0);
+}
+
+#[test]
+fn durable_keys_keep_their_action_and_older_snapshots_still_load() {
+    let json = json!({
+        "entity_type": "Task",
+        "entity_id": "task-1",
+        "status": "Open",
+        "item_count": 0,
+        "fields": {},
+        "processed_idempotency_keys": {
+            "older": 3,
+            "newer": { "sequence": 4, "action": "Note" }
+        },
+    });
+    let state: EntityState = serde_json::from_value(json).unwrap();
+    let older = &state.processed_idempotency_keys["older"];
+    assert_eq!((older.sequence, older.action.as_deref()), (3, None));
+    assert!(
+        older.was_for("Close"),
+        "an older key has no action to compare"
+    );
+    let newer = &state.processed_idempotency_keys["newer"];
+    assert!(newer.was_for("Note"));
+    assert!(!newer.was_for("Close"));
+
+    let round_trip: EntityState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(
+        round_trip.processed_idempotency_keys,
+        state.processed_idempotency_keys
+    );
 }
 
 #[test]
@@ -144,6 +176,7 @@ fn entity_response_spec_governed_skipped_when_true() {
         spawn_requests: vec![],
         spec_governed: true,
         refused: false,
+        answered_action: None,
         store_unavailable: false,
     };
     let serialized = serde_json::to_string(&resp).unwrap();

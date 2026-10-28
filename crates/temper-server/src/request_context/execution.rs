@@ -1,15 +1,26 @@
 //! The inline steps and detached work an agent context admits.
 
+use crate::idempotency::IdempotencyKey;
+
 use super::{AgentContext, CallbackBudgetExceeded, InlineChain, MAX_CALLBACK_HOPS};
 
 impl AgentContext {
     /// Admit a callback running `action` on an entity, unless its inline
     /// chain has already taken that step or the lineage has used its hops.
+    ///
+    /// The callback is a new request, so it gets a follow-up key of its own,
+    /// derived from this context's key and the integration that sent it
+    /// (`source`). It names the integration's run, not its outcome: a retry
+    /// of the parent runs the integration again, which may answer otherwise
+    /// or fail where it succeeded, so neither the parameters nor the callback
+    /// action are in the key. The run's first outcome answers the retry
+    /// ([`IdempotencyKey::FollowUp`]). Sibling callbacks differ by `source`.
     pub(crate) fn for_callback(
         &self,
         entity_type: &str,
         entity_id: &str,
         action: &str,
+        source: &str,
     ) -> Result<Self, CallbackBudgetExceeded> {
         let step = self.inline_chain.step(entity_type, entity_id, action);
         let inline_chain = self
@@ -22,6 +33,13 @@ impl AgentContext {
         let mut next = self.clone();
         next.inline_chain = inline_chain;
         next.callback_hops += 1;
+        next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
+            IdempotencyKey::FollowUp(crate::idempotency::derived_idempotency_key(
+                key.as_str(),
+                "callback",
+                source,
+            ))
+        });
         Ok(next)
     }
 

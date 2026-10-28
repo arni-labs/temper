@@ -33,6 +33,7 @@ fn customer(id: &str) -> SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "authorize-offer-metric".to_string(),
+        cause: None,
     }
 }
 

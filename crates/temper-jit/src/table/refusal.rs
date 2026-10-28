@@ -54,6 +54,12 @@ pub enum Refusal {
     /// The record changed after the move was decided on it, so nothing was
     /// written. The move is decided again on the record as it is now.
     RecordChanged,
+    /// The request's Idempotency-Key was already used on this entity for a
+    /// different request.
+    IdempotencyKeyReused {
+        /// The action the key's request named.
+        action: String,
+    },
 }
 
 impl Refusal {
@@ -66,6 +72,7 @@ impl Refusal {
             Refusal::MissingParameter { .. } => "MissingParameter",
             Refusal::InvariantViolated { .. } => "InvariantViolated",
             Refusal::RecordChanged => "RecordChanged",
+            Refusal::IdempotencyKeyReused { .. } => "IdempotencyKeyReused",
         }
     }
 }

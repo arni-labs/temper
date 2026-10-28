@@ -12,11 +12,15 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::idempotency::IdempotencyKey;
+
 pub(crate) mod armed_by;
 mod execution;
+mod fires;
 mod inline_chain;
 mod observation_metadata;
 
+pub use fires::{ScheduledFire, StateTimerFire};
 pub use inline_chain::{ChainStep, InlineChain, RepeatedStep, StepEntity};
 
 /// Maximum callbacks along one server-owned internal context lineage.
@@ -88,9 +92,10 @@ pub struct AgentContext {
     /// Stable workflow run identifier used as a queryable APM/log attribute.
     pub workflow_run_id: Option<String>,
     /// ADR-0048 sub-decision 5: idempotency key extracted from the
-    /// `Idempotency-Key` header. Threaded into `EntityMsg::Action` so the
-    /// actor can dedupe duplicate asks produced by dispatch-layer retries.
-    pub idempotency_key: Option<String>,
+    /// `Idempotency-Key` header, or derived for a follow-up. Threaded into
+    /// `EntityMsg::Action` so the actor can dedupe duplicate asks produced by
+    /// dispatch-layer retries.
+    pub idempotency_key: Option<IdempotencyKey>,
     /// Runtime-owned; never populated from request headers. The scheduled
     /// action this dispatch fires: the actor removes its row in the commit of
     /// the fire's event, and only for that record, so a child dispatch that
@@ -106,42 +111,6 @@ pub struct AgentContext {
     /// `workflow.run_id`, `producer.work_item_id`, or `support.ticket_id`.
     /// Temper core treats these keys as opaque correlation metadata.
     pub observation_metadata: BTreeMap<String, String>,
-}
-
-/// A scheduled action's row, by its record and arm id.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ScheduledFire {
-    /// The record's tenant.
-    pub tenant: String,
-    /// The record's entity type.
-    pub entity_type: String,
-    /// The record's id.
-    pub entity_id: String,
-    /// The row's arm id.
-    pub arm_id: String,
-}
-
-/// A state timer's fire: its record, its action, and the record's journal
-/// sequence when the timer was armed.
-///
-/// An arming is read from the journal at `armed_seq`, so every writer that
-/// holds it (an old and a new process during a deploy, or a fire sent again
-/// after a lost answer) fires at that sequence. The first to commit moves the
-/// journal past it; the store's sequence check picks that writer. Every other
-/// fire of the arming then finds the record moved and is dropped, so an
-/// arming commits its action at most once.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateTimerFire {
-    /// The record's tenant.
-    pub tenant: String,
-    /// The record's entity type.
-    pub entity_type: String,
-    /// The record's id.
-    pub entity_id: String,
-    /// The timer's `on_timeout` action.
-    pub action: String,
-    /// The record's journal sequence when the timer was armed.
-    pub armed_seq: u64,
 }
 
 impl AgentContext {
@@ -248,6 +217,15 @@ impl AgentContext {
         Self::for_service(service_name).inherit_observability_from(parent)
     }
 
+    /// The service identity a callback ([`Self::for_callback`]) runs as, with
+    /// the callback's own key: a retried parent's callback is then answered
+    /// as its first, whichever identity sends it.
+    pub fn for_service_answering(service_name: &str, callback: &AgentContext) -> Self {
+        let mut context = Self::for_service_inheriting(service_name, callback);
+        context.idempotency_key = callback.idempotency_key.clone();
+        context
+    }
+
     /// Copy the execution budget and non-authority observability fields from a parent.
     pub fn inherit_observability_from(mut self, parent: &AgentContext) -> Self {
         self.inline_chain = parent.inline_chain.clone();
@@ -344,7 +322,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(String::from);
+        .map(|key| IdempotencyKey::Request(key.to_string()));
     let workflow_root_entity_type = header_string(headers, "x-temper-workflow-root-entity-type");
     let workflow_root_entity_id = header_string(headers, "x-temper-workflow-root-entity-id");
     let workflow_run_id = header_string(headers, "x-temper-workflow-run-id");

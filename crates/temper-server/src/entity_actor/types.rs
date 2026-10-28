@@ -46,7 +46,7 @@ pub enum EntityMsg {
         /// actor can dedupe against `IdempotencyCache` before executing.
         /// Covers the race where a dispatch-layer retry produces a second
         /// in-flight ask after the first one already processed.
-        idempotency_key: Option<String>,
+        idempotency_key: Option<crate::idempotency::IdempotencyKey>,
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
@@ -115,16 +115,62 @@ pub struct EntityState {
     /// Current event sourcing sequence number (for persistence).
     #[serde(default)]
     pub sequence_nr: u64,
-    /// Idempotency keys that have already produced durable events.
+    /// Idempotency keys that have already produced durable events, with the
+    /// action each was used for.
     ///
     /// Rebuilt from [`EntityEvent::idempotency_key`] during replay so a retry
     /// after process restart can return success without re-applying the action.
     #[serde(default)]
-    pub processed_idempotency_keys: BTreeMap<String, u64>,
+    pub processed_idempotency_keys: BTreeMap<String, ProcessedIdempotencyKey>,
     /// When the current status began, and when each action last ran since.
     /// Kept in snapshots, which leave `events` out.
     #[serde(default)]
     pub status_clock: StatusClock,
+}
+
+/// A durable idempotency key: when it was recorded and the action it was for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredIdempotencyKey")]
+pub struct ProcessedIdempotencyKey {
+    /// Sequence position when the key was recorded; the oldest goes first.
+    pub sequence: u64,
+    /// The action the key was used for. `None` for a key restored from a
+    /// snapshot written before actions were kept with keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+impl ProcessedIdempotencyKey {
+    /// Whether a request for `action` is a retry of the one this key recorded.
+    pub fn was_for(&self, action: &str) -> bool {
+        self.action
+            .as_deref()
+            .is_none_or(|recorded| recorded == action)
+    }
+}
+
+/// How a durable key is stored: a bare sequence in older snapshots.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredIdempotencyKey {
+    Recorded {
+        sequence: u64,
+        #[serde(default)]
+        action: Option<String>,
+    },
+    Sequence(u64),
+}
+
+impl From<StoredIdempotencyKey> for ProcessedIdempotencyKey {
+    fn from(stored: StoredIdempotencyKey) -> Self {
+        match stored {
+            StoredIdempotencyKey::Recorded { sequence, action } => Self { sequence, action },
+            StoredIdempotencyKey::Sequence(sequence) => Self {
+                sequence,
+                action: None,
+            },
+        }
+    }
 }
 
 /// When an entity's current status began, and when each action was last
@@ -163,7 +209,7 @@ impl EntityState {
         self.total_event_count = self.total_event_count.saturating_add(1);
         self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
         if let Some(key) = event.idempotency_key.as_deref() {
-            self.record_processed_idempotency_key(key);
+            self.record_processed_idempotency_key(key, &event.action);
         }
         self.status_clock.record(&event);
         self.events.push_back(event);
@@ -181,20 +227,26 @@ impl EntityState {
         self.sequence_nr.max(self.total_event_count as u64)
     }
 
+    /// Whether `key` has already produced a durable event on this entity.
     pub fn has_processed_idempotency_key(&self, key: &str) -> bool {
         self.processed_idempotency_keys.contains_key(key)
     }
 
-    fn record_processed_idempotency_key(&mut self, key: &str) {
+    fn record_processed_idempotency_key(&mut self, key: &str, action: &str) {
         let sequence = self.event_sequence();
-        self.processed_idempotency_keys
-            .insert(key.to_string(), sequence);
+        self.processed_idempotency_keys.insert(
+            key.to_string(),
+            ProcessedIdempotencyKey {
+                sequence,
+                action: Some(action.to_string()),
+            },
+        );
 
         while self.processed_idempotency_keys.len() > MAX_DURABLE_IDEMPOTENCY_KEYS_PER_ENTITY {
             let Some(oldest_key) = self
                 .processed_idempotency_keys
                 .iter()
-                .min_by_key(|(_, sequence)| **sequence)
+                .min_by_key(|(_, recorded)| recorded.sequence)
                 .map(|(key, _)| key.clone())
             else {
                 break;
@@ -292,6 +344,12 @@ pub struct EntityResponse {
     /// the same action may have caused.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// The action this answer is for, when it is not the one requested: a
+    /// follow-up's retry that named another action is answered by the
+    /// outcome its key recorded (`IdempotencyKey::FollowUp`), and the
+    /// effects and reactions that follow belong to that recorded action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_action: Option<String>,
     /// Whether the store could not take the action's write: it failed, or its
     /// disk is under the floor. Answered 503, so the caller tries again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -299,6 +357,12 @@ pub struct EntityResponse {
 }
 
 impl EntityResponse {
+    /// The action this answer is for: `requested`, unless a follow-up's key
+    /// recorded another ([`Self::answered_action`]).
+    pub fn action<'a>(&'a self, requested: &'a str) -> &'a str {
+        self.answered_action.as_deref().unwrap_or(requested)
+    }
+
     /// The answer to an action refused before anything was written.
     pub(crate) fn refused(state: EntityState, error: String) -> Self {
         Self {
@@ -343,6 +407,7 @@ impl EntityResponse {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            answered_action: None,
             store_unavailable: false,
         }
     }

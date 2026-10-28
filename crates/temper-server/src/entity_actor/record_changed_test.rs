@@ -94,7 +94,9 @@ async fn an_action_decided_before_another_writer_moved_the_record_is_refused_not
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "decided on the old record"}),
                 related: std::collections::BTreeMap::new(),
-                idempotency_key: Some("cancel-once".to_string()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "cancel-once".to_string(),
+                )),
                 expected_authorization_precondition: Some(decided_on),
             },
             ASK,
@@ -248,7 +250,9 @@ async fn a_delete_on_a_record_its_spec_moved_to_deleted_still_writes_a_tombstone
                 name: "Delete".to_string(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
-                idempotency_key: Some("soft-delete".to_string()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "soft-delete".to_string(),
+                )),
                 expected_authorization_precondition: None,
             },
             ASK,
