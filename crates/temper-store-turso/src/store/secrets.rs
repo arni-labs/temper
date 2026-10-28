@@ -23,6 +23,31 @@ pub type SecretRow = (String, Vec<u8>, Vec<u8>);
 pub type SecretVersionRow = (String, Option<String>);
 use crate::metrics::TursoQueryTimer;
 
+/// Backfill legacy rows only when a version is missing. Even an UPDATE that
+/// changes no rows appends a transaction marker to a synced store's change log.
+pub(super) async fn backfill_versions(
+    conn: &super::instrumentation::WriteConnection,
+) -> Result<(), PersistenceError> {
+    // Close the read cursor before updating on the same connection. The write
+    // gate is held throughout; conditional PUTs still use one atomic statement.
+    let missing = {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM tenant_secrets WHERE version_id IS NULL LIMIT 1",
+                (),
+            )
+            .await
+            .map_err(storage_error)?;
+        rows.next().await.map_err(storage_error)?.is_some()
+    };
+    if missing {
+        conn.execute(crate::schema::BACKFILL_TENANT_SECRETS_VERSION_ID, ())
+            .await
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
 impl TursoEventStore {
     /// Write an encrypted secret for a tenant if the key's current row meets
     /// `write.precondition`.

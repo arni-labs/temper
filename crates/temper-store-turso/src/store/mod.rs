@@ -424,9 +424,7 @@ impl TursoEventStore {
             schema::ALTER_TENANT_SECRETS_ADD_VERSION_ID,
         )
         .await?;
-        conn.execute(schema::BACKFILL_TENANT_SECRETS_VERSION_ID, ())
-            .await
-            .map_err(storage_error)?;
+        secrets::backfill_versions(&conn).await?;
         conn.execute(schema::CREATE_STATE_TIMERS_TABLE, ())
             .await
             .map_err(storage_error)?;
