@@ -39,6 +39,9 @@ impl ServerState {
     /// names, may be made as its identity, and report a denial. The answer is
     /// sent whatever Cedar says.
     pub(super) async fn check_answer(&self, sent: &OwedMove, hop: &Hop) {
+        if !sent.action.is_empty() {
+            return;
+        }
         let cause = MoveCause::answer(hop.clone(), None);
         let security_ctx =
             crate::trigger::effective_trigger_security_context(&sent.agent_ctx, &cause);
