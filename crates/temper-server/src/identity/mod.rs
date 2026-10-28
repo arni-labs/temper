@@ -8,6 +8,7 @@ mod credential_count;
 pub mod endpoint;
 mod error;
 pub mod jwt;
+mod principal_records;
 mod resolver;
 mod resolver_support;
 

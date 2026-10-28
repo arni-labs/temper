@@ -159,6 +159,12 @@ pub struct AutomatonMeta {
     /// them in `from`.
     #[serde(default)]
     pub terminal: Vec<String>,
+    /// A record of this type whose id is a user's `sub` describes that user:
+    /// Cedar sees its status on the principal, as `principal.<Type>` when the
+    /// user calls in person and `principal.actingFor<Type>` when an agent
+    /// calls for them, read from the record's actor on every request.
+    #[serde(default)]
+    pub principal_record: bool,
 }
 
 /// A safety invariant, proven by the verification cascade.

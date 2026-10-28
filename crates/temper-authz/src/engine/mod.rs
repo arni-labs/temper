@@ -635,8 +635,10 @@ impl AuthzEngine {
             }
         };
         let resource_entity = if resource_uid == principal_uid {
-            let mut merged_attrs = principal_attrs;
-            merged_attrs.extend(resource_entity_attrs);
+            // The principal's attributes come from its token and the identity
+            // boundary; a field of the record it is reading never replaces one.
+            let mut merged_attrs = resource_entity_attrs;
+            merged_attrs.extend(principal_attrs);
             match Entity::new(resource_uid.clone(), merged_attrs, HashSet::new()) {
                 Ok(entity) => entity,
                 Err(e) => {
