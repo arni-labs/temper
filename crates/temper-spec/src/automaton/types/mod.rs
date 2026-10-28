@@ -304,7 +304,7 @@ pub struct StateTimeout {
     /// Words for people reading the app: what the timer does ("check CI
     /// again"). Display only: the kernel never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+    pub says: Option<String>,
 }
 
 /// Admission control declaration (ADR-0051).

@@ -190,10 +190,10 @@ to = "Failed"
     assert_eq!(trigger.on_failure.as_deref(), Some("ChargeFailed"));
 }
 
-/// A trigger and a state timer may carry a `label`: words for people reading the app, such as the answer a branch
+/// A trigger and a state timer may say, in `says`, words for people reading the app, such as the answer a branch
 /// gives or what a timer does. It is optional, and a spec without it parses as before.
 #[test]
-fn test_trigger_and_state_timeout_label_parse() {
+fn test_trigger_and_state_timeout_says_parse() {
     let spec = r#"
 [automaton]
 name = "Order"
@@ -207,7 +207,7 @@ to = "Confirmed"
 
 [[action.triggers]]
 name = "charge_payment"
-label = "Charge the card"
+says = "Charge the card"
 kind = "wasm"
 module = "stripe_charge"
 on_success = "ChargeSucceeded"
@@ -227,7 +227,7 @@ to = "Failed"
 state = "Confirmed"
 after_seconds = 60
 on_timeout = "ChargeFailed"
-label = "give up on the charge"
+says = "give up on the charge"
 
 [[state_timeout]]
 state = "Draft"
@@ -235,14 +235,14 @@ after_seconds = 3600
 on_timeout = "ChargeFailed"
 "#;
     let automaton =
-        parse_automaton(spec).expect("a label on a trigger and a state timer should parse");
+        parse_automaton(spec).expect("words on a trigger and a state timer should parse");
     // Read through the serialized spec, so this test compiles whatever the structs hold.
     let spec = serde_json::to_value(&automaton).expect("the spec serializes");
-    assert_eq!(spec["action"][0]["triggers"][0]["label"], "Charge the card");
-    assert_eq!(spec["state_timeout"][0]["label"], "give up on the charge");
+    assert_eq!(spec["action"][0]["triggers"][0]["says"], "Charge the card");
+    assert_eq!(spec["state_timeout"][0]["says"], "give up on the charge");
     assert!(
-        spec["state_timeout"][1].get("label").is_none(),
-        "a timer without a label has none"
+        spec["state_timeout"][1].get("says").is_none(),
+        "a timer that says nothing has no says"
     );
 }
 
