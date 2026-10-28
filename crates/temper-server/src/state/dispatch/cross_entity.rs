@@ -147,7 +147,7 @@ impl crate::state::ServerState {
                     // determinism-ok: spawn dispatch is a background side-effect
                     for req in requests {
                         let plan = match state
-                            .spawn_plan(&t, &parent_t, &parent_i, &req, &parent_params)
+                            .spawn_plan(&t, &parent_t, &parent_i, &req, &parent_params, false)
                             .await
                         {
                             Ok(plan) => plan,

@@ -391,6 +391,7 @@ impl ServerState {
         params: &Value,
         pending: &PendingRecords,
     ) -> Option<EntityState> {
+        let preceding_child = pending.get(&spawn.entity_type, &spawn.entity_id);
         let plan = self
             .spawn_plan(
                 tenant,
@@ -398,12 +399,13 @@ impl ServerState {
                 &parent.entity_id,
                 spawn,
                 params,
+                preceding_child.is_some(),
             )
             .await
             .ok()?;
         // Dispatch serializes initializers for the same target in effect order.
         // The next preview therefore starts at the preceding initializer's result.
-        let child = if let Some(child) = pending.get(&spawn.entity_type, &spawn.entity_id) {
+        let child = if let Some(child) = preceding_child {
             child.clone()
         } else if self
             .ensure_entity_loaded(tenant, &spawn.entity_type, &spawn.entity_id)

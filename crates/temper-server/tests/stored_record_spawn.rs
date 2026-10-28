@@ -186,13 +186,17 @@ fn verified() -> VerificationStatus {
 }
 
 fn build_state() -> ServerState {
+    build_state_with_specs(CHILD_IOA, RUN_IOA, CROSS_INVARIANTS)
+}
+
+fn build_state_with_specs(child: &str, run: &str, cross_invariants: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant_with_constraints(
         "default",
         parse_csdl(CSDL).expect("CSDL parse"),
         CSDL.to_string(),
-        &[("Child", CHILD_IOA), ("Run", RUN_IOA)],
-        Some(CROSS_INVARIANTS.to_string()),
+        &[("Child", child), ("Run", run)],
+        Some(cross_invariants.to_string()),
     );
     let state = ServerState::from_registry(ActorSystem::new("stored-record-spawn"), registry);
     {
@@ -409,3 +413,6 @@ async fn a_childs_initial_action_reads_the_parent_after_the_spawning_action() {
 
 #[path = "stored_record_spawn/ordered.rs"]
 mod ordered;
+
+#[path = "stored_record_spawn/contracts.rs"]
+mod contracts;

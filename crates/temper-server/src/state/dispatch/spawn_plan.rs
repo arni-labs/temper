@@ -47,6 +47,9 @@ impl SpawnRefusal {
 impl ServerState {
     /// The plan for creating the child `req` asks for, from the parent's
     /// action with `action_params`, or why the kernel creates no child.
+    /// `child_pending` means an earlier spawn already creates this child; its
+    /// next initializer is checked by the preview interpreter on that state,
+    /// just as an existing child's initializer is checked by its live actor.
     pub(crate) async fn spawn_plan(
         &self,
         tenant: &TenantId,
@@ -54,6 +57,7 @@ impl ServerState {
         parent_id: &str,
         req: &SpawnRequest,
         action_params: &Value,
+        child_pending: bool,
     ) -> Result<SpawnPlan, SpawnRefusal> {
         let mut parent_fields = serde_json::Map::new();
         parent_fields.insert("parent_type".to_string(), Value::from(parent_type));
@@ -100,7 +104,9 @@ impl ServerState {
         } else {
             Value::Object(parent_fields)
         };
-        if let Some((action, params)) = &initializer {
+        if let Some((action, params)) = &initializer
+            && !child_pending
+        {
             self.load_authz_resource_snapshot(tenant, &req.entity_type, &req.entity_id)
                 .await
                 .and_then(|snapshot| {
