@@ -28,7 +28,9 @@ use temper_authz::{AuthenticatedRequestContext, SecurityContext};
 use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{RealIdGen, SimClock, install_sim_context};
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::SpecRegistry;
+use temper_server::registry::{
+    EntityLevelSummary, EntityVerificationResult, SpecRegistry, VerificationStatus,
+};
 use temper_server::secrets::vault::SecretsVault;
 use temper_server::webhooks::WebhookDispatcher;
 use temper_server::{ServerState, build_router};
@@ -237,6 +239,25 @@ fn build_state() -> ServerState {
         &[("Delivery", DELIVERY_IOA)],
     );
     let state = ServerState::from_registry(ActorSystem::new("webhook-signatures"), registry);
+    // HTTP writes wait for the spec's verification, which a test never runs.
+    state
+        .registry
+        .write()
+        .expect("the registry lock is free")
+        .set_verification_status(
+            &TenantId::new(TENANT),
+            "Delivery",
+            VerificationStatus::Completed(EntityVerificationResult {
+                all_passed: true,
+                levels: vec![EntityLevelSummary {
+                    level: "L0 SMT".to_string(),
+                    passed: true,
+                    summary: "OK".to_string(),
+                    details: None,
+                }],
+                verified_at: "2026-10-28T00:00:00Z".to_string(),
+            }),
+        );
     let vault = SecretsVault::new(&[7u8; 32]);
     for (key, value) in [
         ("KERNEL_SECRET", KERNEL_SECRET),
