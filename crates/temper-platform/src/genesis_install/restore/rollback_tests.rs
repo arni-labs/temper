@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn cache(platform: &PlatformState, tenant: &str, app: &str, version: &str) -> PathBuf {
+pub(super) fn cache(platform: &PlatformState, tenant: &str, app: &str, version: &str) -> PathBuf {
     genesis_cache_root(
         &platform.server,
         CacheOwner::Install {
@@ -13,7 +13,7 @@ fn cache(platform: &PlatformState, tenant: &str, app: &str, version: &str) -> Pa
     )
 }
 
-fn record(root: &Path, tenant: &str, app: &str, version: &str) -> InstalledAppRecord {
+pub(super) fn record(root: &Path, tenant: &str, app: &str, version: &str) -> InstalledAppRecord {
     InstalledAppRecord {
         tenant: tenant.to_string(),
         app_ref: format!("acme/{app}@{version}"),

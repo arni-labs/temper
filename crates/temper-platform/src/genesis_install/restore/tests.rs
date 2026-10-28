@@ -340,3 +340,6 @@ async fn an_app_comes_back_beside_a_dependency_upgraded_on_its_own() {
 
 #[path = "rollback_tests.rs"]
 mod rollback_tests;
+
+#[path = "legacy_cache_tests.rs"]
+mod legacy_cache_tests;

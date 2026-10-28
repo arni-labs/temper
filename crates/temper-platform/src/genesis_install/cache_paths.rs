@@ -149,14 +149,24 @@ pub(super) fn genesis_cache_root(
     owner: CacheOwner<'_>,
     app_ref: &str,
 ) -> PathBuf {
-    let root = if state.data_dir.as_os_str().is_empty() {
-        std::env::temp_dir().join("temper-genesis-app-cache")
-    } else {
-        state.data_dir.join("genesis-app-cache")
-    };
+    let root = genesis_cache_base(state);
     let key = format!("{}\n{app_ref}", owner.key());
     let digest = format!("{:x}", sha2::Sha256::digest(key.as_bytes()));
     root.join(format!("{}-{}", sanitize_fragment(app_ref), &digest[..32]))
+}
+
+/// The pre-tenant cache layout, read only to recover digest-verified installs.
+pub(super) fn legacy_genesis_cache_root(state: &ServerState, app_ref: &str) -> PathBuf {
+    let digest = format!("{:x}", sha2::Sha256::digest(app_ref.as_bytes()));
+    genesis_cache_base(state).join(format!("{}-{}", sanitize_fragment(app_ref), &digest[..16]))
+}
+
+fn genesis_cache_base(state: &ServerState) -> PathBuf {
+    if state.data_dir.as_os_str().is_empty() {
+        std::env::temp_dir().join("temper-genesis-app-cache")
+    } else {
+        state.data_dir.join("genesis-app-cache")
+    }
 }
 
 /// Lowercase `input` and turn each run of other characters into one dash.

@@ -10,7 +10,12 @@ use std::collections::BTreeSet;
 use temper_runtime::tenant::TenantId;
 use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 
+mod cache_recovery;
 mod rollback;
+
+use cache_recovery::{
+    cached_apps_matching_records, first_matching_install, install_cache_candidates,
+};
 
 pub(super) use rollback::rollback_to_prior;
 
@@ -185,7 +190,7 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         };
         let candidates =
             install_cache_candidates(platform, &tenant, registry_tenant, &record.app_ref);
-        let cache_root = candidates[0].clone();
+        let cache_root = candidates[0].path.clone();
         // Each tenant's install has its own directory, so records restore it
         // once per directory, from that install's own registry tenant.
         if !seen.insert(cache_root.clone()) {
@@ -327,7 +332,7 @@ async fn ensure_prior_root_available(
         register_install_cache(&prior.tenant, stored, DirApps::Only(apps.clone()));
         return Ok(apps);
     }
-    let cache_root = candidates[0].clone();
+    let cache_root = candidates[0].path.clone();
     if cache_root.is_dir() {
         tracing::warn!(
             app = %prior.app_name,
@@ -368,93 +373,6 @@ async fn ensure_prior_root_available(
         })?;
     register_install_cache(&prior.tenant, cache_root, DirApps::Only(apps.clone()));
     Ok(apps)
-}
-
-/// The cache directories an install of `cache_key` into `tenant` may have, the registry's first.
-///
-/// A registry install caches under its registry tenant. An `App.Install` from a Genesis service
-/// on this server caches under the service's tenant, which its record names as the registry
-/// tenant unless the request named another one, so every Genesis source tenant is a candidate too.
-/// A candidate is used only when it holds the recorded versions.
-fn install_cache_candidates(
-    platform: &PlatformState,
-    tenant: &str,
-    registry_tenant: &str,
-    cache_key: &str,
-) -> Vec<PathBuf> {
-    let mut sources = vec![
-        InstallSource::Registry(registry_tenant),
-        InstallSource::Local(registry_tenant),
-    ];
-    let source_tenants = genesis_source_tenants();
-    sources.extend(
-        source_tenants
-            .iter()
-            .filter(|source| source.as_str() != registry_tenant)
-            .map(|source| InstallSource::Local(source.as_str())),
-    );
-    sources
-        .into_iter()
-        .map(|source| {
-            genesis_cache_root(
-                &platform.server,
-                CacheOwner::Install { tenant, source },
-                cache_key,
-            )
-        })
-        .collect()
-}
-
-/// The first of `candidates` that holds `record`'s app at its recorded version,
-/// with the apps to take from it.
-async fn first_matching_install(
-    ps: &dyn PlatformStore,
-    candidates: &[PathBuf],
-    record: &InstalledAppRecord,
-    recorded: &[InstalledAppRecord],
-) -> Option<(PathBuf, BTreeSet<String>)> {
-    for candidate in candidates {
-        if let Some(apps) = cached_apps_matching_records(ps, candidate, record, recorded).await {
-            return Some((candidate.clone(), apps));
-        }
-    }
-    None
-}
-
-/// The apps of an install's cache directory that still match their records,
-/// or `None` when `record`'s own app is not there at its recorded version.
-///
-/// A directory on disk is not proof on its own: an install could have stopped
-/// partway, and a file in it could have changed since. Each app in it is
-/// decided on its own: it is taken when it reads back at its recorded digest,
-/// from `recorded` when that names the app, otherwise from the tenant's stored
-/// record. A record without a digest needs the app to read back. An app with
-/// no record, or at another version than its record names (a dependency
-/// installed again separately), is left out, so the tenant goes on resolving
-/// it from wherever it resolves it now. The apps are decided before they are
-/// registered, so an app that does not match never becomes what the tenant
-/// resolves.
-async fn cached_apps_matching_records(
-    ps: &dyn PlatformStore,
-    cache_root: &Path,
-    record: &InstalledAppRecord,
-    recorded: &[InstalledAppRecord],
-) -> Option<BTreeSet<String>> {
-    let digests = os_app_dir_bundle_digests(cache_root)?;
-    let mut matching = BTreeSet::new();
-    for digest in &digests {
-        let expected = match recorded.iter().find(|r| r.app_name == digest.app_name) {
-            Some(known) => known.bundle_digest.clone(),
-            None => match ps.get_installed_app(&record.tenant, &digest.app_name).await {
-                Ok(Some(stored)) => stored.bundle_digest,
-                _ => continue,
-            },
-        };
-        if expected.is_empty() || expected == digest.bundle_digest {
-            matching.insert(digest.app_name.clone());
-        }
-    }
-    matching.contains(&record.app_name).then_some(matching)
 }
 
 #[cfg(test)]
