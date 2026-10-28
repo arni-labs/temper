@@ -1337,8 +1337,10 @@ impl ServerState {
 
     /// [`Self::get_tenant_entity_state`], failing as a dispatch to the
     /// record's actor fails, so a caller can tell an actor that did not
-    /// answer from one that refused.
-    #[instrument(skip_all, fields(otel.name = "entity.get_tenant_entity_state", tenant = %tenant, entity_type, entity_id))]
+    /// answer from one that refused. Its span keeps the name
+    /// `get_tenant_entity_state`, which traces of a request's credential
+    /// lookup are read by.
+    #[instrument(name = "get_tenant_entity_state", skip_all, fields(otel.name = "entity.get_tenant_entity_state", tenant = %tenant, entity_type, entity_id))]
     pub(crate) async fn ask_tenant_entity_state(
         &self,
         tenant: &TenantId,
