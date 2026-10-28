@@ -101,6 +101,11 @@ pub enum TargetResolver {
 pub struct ActionTrigger {
     /// Human-readable name for logging and debugging.
     pub name: String,
+    /// Words for people reading the app, such as the answer a branch gives
+    /// ("CI passed"). Display only: the kernel never reads it, and `name`
+    /// stays the trigger's identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Discriminator — determines which field set applies.
     pub kind: TriggerKind,
     /// Optional principal (names a registered `AgentType`). When `None`, the
