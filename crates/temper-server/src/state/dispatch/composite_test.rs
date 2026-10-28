@@ -7,6 +7,8 @@ mod defaults_test;
 #[cfg(feature = "sim")]
 #[path = "composite/state_timers_test.rs"]
 mod state_timers_test;
+#[path = "composite/visible_test.rs"]
+mod visible_test;
 use std::collections::BTreeMap;
 
 use serde_json::json;
