@@ -99,6 +99,10 @@ fn not_confirmed(key: Option<&HeaderValue>) -> Response {
                     It may still have been saved here; read it back before trying again.",
     });
     if let Some((_, text)) = key {
+        error["message"] = "Not confirmed: the change could not be copied to this app's database \
+                            copy. It may still have been saved here. Send it again with its \
+                            Idempotency-Key (idempotencyKey) and it is applied at most once."
+            .into();
         error["idempotencyKey"] = text.into();
     }
     let mut answer = (
@@ -241,6 +245,11 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["error"]["code"], "NotConfirmed");
         assert_eq!(body["error"]["idempotencyKey"], "write-key-1");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("Send it again with its Idempotency-Key"),
+            "{message}"
+        );
 
         // A request that came without one (an app's own route) still gets
         // the answer, without a key.
