@@ -89,7 +89,11 @@ fn run_seed(seed: u64) -> Result<(), String> {
     first.block_on(async {
         clock.begin();
         let state = server(&store, &rows, &pubs, seed);
-        state.start_runtime().await.unwrap().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            state.start_runtime().await.unwrap().await.unwrap();
+        })
+        .await
+        .expect("the fault-free setup boot must finish before faults are enabled");
         for i in 0..count {
             let id = format!("job-{i}");
             state

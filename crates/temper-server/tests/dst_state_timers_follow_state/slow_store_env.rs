@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 use temper_runtime::persistence::{
-    CommitRows, EventStore, PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope,
-    PersistenceError,
+    CommitRows, EventStore, JournalHead, PersistenceAppend, PersistenceAppendResult,
+    PersistenceEnvelope, PersistenceError, ProjectionCheckpoint,
 };
 use temper_runtime::scheduler::DeterministicRng;
 use temper_server::storage::{QueryPlaneStore, QueryProjectionFieldsRow};
@@ -136,6 +136,9 @@ impl EventStore for SlowStore {
     async fn load_snapshot(&self, id: &str) -> Result<Option<(u64, Vec<u8>)>, PersistenceError> {
         self.journal.load_snapshot(id).await
     }
+    async fn journal_heads(&self, tenant: &str) -> Result<Vec<JournalHead>, PersistenceError> {
+        self.journal.journal_heads(tenant).await
+    }
     async fn list_entity_ids(
         &self,
         tenant: &str,
@@ -153,17 +156,35 @@ impl EventStore for SlowStore {
 
 /// Records each sequence published through the real post-dispatch pipeline,
 /// rather than allowing a later projection to hide a missing earlier one.
+type Checkpoints = BTreeMap<(String, String, String), ProjectionCheckpoint>;
+
 #[derive(Default)]
-pub(super) struct Publications(pub Mutex<BTreeMap<String, BTreeSet<u64>>>);
+pub(super) struct Publications(
+    pub Mutex<BTreeMap<String, BTreeSet<u64>>>,
+    Mutex<Checkpoints>,
+);
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for Publications {
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<ProjectionCheckpoint>, PersistenceError> {
+        Ok(self
+            .1
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((saved_tenant, _, _), _)| saved_tenant == tenant)
+            .map(|(_, checkpoint)| checkpoint.clone())
+            .collect())
+    }
     async fn upsert_projection(
         &self,
-        _tenant: &str,
-        _kind: &str,
+        tenant: &str,
+        kind: &str,
         id: &str,
-        _status: &str,
+        status: &str,
         _fields: &Value,
         _state: &Value,
         seq: u64,
@@ -174,6 +195,22 @@ impl QueryPlaneStore for Publications {
             .entry(id.into())
             .or_default()
             .insert(seq);
+        let mut checkpoints = self.1.lock().unwrap();
+        let key = (tenant.to_string(), kind.to_string(), id.to_string());
+        if checkpoints
+            .get(&key)
+            .is_none_or(|row| row.sequence_nr <= seq)
+        {
+            checkpoints.insert(
+                key,
+                ProjectionCheckpoint {
+                    entity_type: kind.to_string(),
+                    entity_id: id.to_string(),
+                    sequence_nr: seq,
+                    status: status.to_string(),
+                },
+            );
+        }
         Ok(())
     }
     async fn remove_projection(
