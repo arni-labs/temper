@@ -17,8 +17,9 @@ pub mod joint;
 pub mod verify;
 
 pub use joint::{
-    DroppedReaction, JointInvariantResult, JointOutcome, JointReplay, JointStep, TraceMove,
-    replay_joint_invariants, verify_joint_invariants,
+    DroppedReaction, JointInvariantResult, JointLivenessResult, JointOutcome, JointReplay,
+    JointStep, LivenessOutcome, StuckCase, TraceMove, replay_joint_invariants,
+    verify_joint_invariants, verify_joint_liveness,
 };
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,
@@ -92,8 +93,9 @@ pub struct CompositeVerificationPlan {
     /// entities outside the scope are filtered out at build time.
     pub edges: Vec<TriggerEdge>,
     /// Whether the trigger graph contains a cycle reachable from the seed.
-    /// Not an error (cycles are legal; cascade depth bounds them at
-    /// runtime and verification) but surfaced for reporting.
+    /// Not an error (cycles are legal; at runtime and in verification a
+    /// chain round one stops at its first repeated step) but surfaced for
+    /// reporting.
     pub has_cycle: bool,
 }
 

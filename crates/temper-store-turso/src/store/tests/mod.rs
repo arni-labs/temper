@@ -11,11 +11,14 @@ use crate::TursoSpecVerificationUpdate;
 
 mod commit_outcome;
 mod commit_transport;
+mod event_pages;
 mod evolution_tenant;
+mod field_index_writes;
 mod policy_approval;
 mod projection_repair;
 mod projection_writes;
 mod scheduled_actions;
+mod write_queue;
 
 fn test_envelope(event_type: &str, payload: serde_json::Value) -> PersistenceEnvelope {
     PersistenceEnvelope {
@@ -437,10 +440,10 @@ async fn append_batch_zero_sequence_detects_existing_stream_by_unique_key() {
 /// gate like any writer (as the first in line: it is high priority).
 #[tokio::test]
 async fn single_event_append_waits_for_the_write_gate() {
-    let mut store = make_store("single-append-waits-for-gate").await;
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let store = make_store("single-append-waits-for-gate").await;
     let held_gate = store
         .write_gate
+        .permit
         .clone()
         .acquire_owned()
         .await
@@ -630,7 +633,10 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
         .await
         .expect("upsert deleted projection");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "INSERT INTO entity_field_index \
          (tenant, entity_type, entity_id, field_name, field_value, status) \
@@ -646,6 +652,8 @@ async fn list_entity_ids_by_type_unions_catalog_field_index_and_events() {
     )
     .await
     .expect("insert field-index-only row");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .append(
@@ -964,7 +972,8 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Projection Test".to_string()],
         )
         .await
@@ -986,7 +995,8 @@ async fn query_projection_roundtrip_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             entity_type,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Projection Test".to_string()],
         )
         .await
@@ -1191,7 +1201,8 @@ async fn query_projection_batch_updates_catalog_and_field_index() {
         .query_field_index(
             &tenant,
             "Order",
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Owner".to_string(), "alice".to_string()],
         )
         .await
@@ -1263,7 +1274,8 @@ async fn query_projection_batch_can_store_fields_without_indexing_them() {
         .query_field_index(
             &tenant,
             "Blob",
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec![
                 "CanonicalBytes".to_string(),
                 "full-canonical-payload".to_string(),
@@ -1319,6 +1331,7 @@ async fn stale_projection_upsert_does_not_overwrite_newer_catalog_row() {
     let mut rows = conn
         .query(
             "SELECT sequence_nr, fields FROM entity_catalog \
+             INDEXED BY sqlite_autoindex_entity_catalog_1 \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, entity_type, entity_id],
         )
@@ -1762,7 +1775,7 @@ async fn upsert_specs_and_commit_preserves_identical_spec_version() {
 
 #[tokio::test]
 async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
-    let mut store = make_store("spec-idempotent-bypasses-gate").await;
+    let store = make_store("spec-idempotent-bypasses-gate").await;
     let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
     let ioa_source = "[automaton]\nname = \"Issue\"\n";
     let csdl_xml = "<Schema Namespace=\"Temper.Tests\" />";
@@ -1779,9 +1792,9 @@ async fn upsert_specs_and_commit_bypasses_write_gate_for_identical_app_specs() {
         .await
         .expect("initial spec commit");
 
-    store.write_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let held_gate = store
         .write_gate
+        .permit
         .clone()
         .acquire_owned()
         .await
@@ -1834,19 +1847,25 @@ async fn persist_spec_verification_keeps_updated_at_for_identical_result() {
         .await
         .expect("persist verification");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .persist_spec_verification(&tenant, "Issue", update)
         .await
         .expect("persist identical verification");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -1901,13 +1920,18 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist first verification");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .persist_spec_verification(
@@ -1924,6 +1948,7 @@ async fn persist_spec_verification_ignores_verified_at_only_changes() {
         .await
         .expect("persist timestamp-only verification change");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at, verification_result FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -1967,19 +1992,25 @@ async fn commit_specs_keeps_updated_at_when_specs_are_already_committed() {
         .await
         .expect("initial spec commit");
 
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = 'fixed-time' WHERE tenant = ?1 AND entity_type = 'Issue'",
         params![tenant.as_str()],
     )
     .await
     .expect("pin updated_at");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
 
     store
         .commit_specs(&tenant)
         .await
         .expect("commit already committed specs");
 
+    let conn = store.connection().await.expect("read connection");
     let mut rows = conn
         .query(
             "SELECT updated_at FROM specs WHERE tenant = ?1 AND entity_type = 'Issue'",
@@ -2176,13 +2207,18 @@ async fn restore_keeps_the_committed_version_while_an_install_is_pending() {
     assert_eq!(restorable(&store, &tenant).await, committed_view);
 
     // Once abandoned, recovery returns Issue to v1 and removes Task.
-    let conn = store.connection().await.expect("connection");
+    let conn = store
+        .write_connection("test", super::WritePriority::High)
+        .await
+        .expect("connection");
     conn.execute(
         "UPDATE specs SET updated_at = '2000-01-01 00:00:00' WHERE tenant = ?1 AND committed = 0",
         params![tenant.as_str()],
     )
     .await
     .expect("age the pending rows");
+    // The write gate has one permit: give it back before the store writes.
+    drop(conn);
     assert_eq!(store.delete_uncommitted_specs().await.unwrap(), 2);
     assert_eq!(restorable(&store, &tenant).await, committed_view);
     assert!(

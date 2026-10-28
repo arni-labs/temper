@@ -241,7 +241,7 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
-                let table = TransitionTable::from_automaton(&automaton);
+                let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
 
                 if let Some(existing_spec) = existing_config.entities.get_mut(*entity_type) {
@@ -314,7 +314,7 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
-                let table = TransitionTable::from_automaton(&automaton);
+                let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
                 entities.insert(
                     entity_type.to_string(),
@@ -502,6 +502,28 @@ impl SpecRegistry {
     ) -> Option<&BTreeMap<String, VerificationStatus>> {
         self.tenants.get(tenant).map(|tc| &tc.verification)
     }
+}
+
+/// Build a type's transition table, and say which of its invariants moves
+/// are not checked against: a move reads the statuses of the records it
+/// points at, never their fields (`temper_jit::table::invariant`).
+fn transition_table(
+    tenant: &str,
+    entity_type: &str,
+    automaton: &automaton::Automaton,
+) -> TransitionTable {
+    for invariant in &automaton.invariants {
+        if !temper_jit::table::MoveInvariant::checked(invariant) {
+            tracing::warn!(
+                tenant,
+                entity_type,
+                invariant = %invariant.name,
+                "invariant reads another record's field, which moves do not read; \
+                 moves are not checked against it"
+            );
+        }
+    }
+    TransitionTable::from_automaton(automaton)
 }
 
 #[cfg(test)]

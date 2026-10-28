@@ -7,8 +7,13 @@
 //! invariant's entity and every type it names, one record of each, run the
 //! way the runtime runs them:
 //!
-//! - every action of every entity in scope is offered, as in the per-entity
-//!   model, with its guard resolved against the joint state;
+//! - each move is made by whoever makes it in the runtime, and the app's
+//!   Cedar decides it as them: an action someone outside may send (with the
+//!   actions a `[[liveness]]` in scope `relies_on`), a reaction as its
+//!   declared principal or its source's sender, and the kernel's own moves
+//!   (state timers, module answers and failures, module calls lost to a
+//!   restart). Without policies, anyone may send anything. Liveness reads
+//!   the same senders (`senders.rs`);
 //! - each record has an id, and a reference finds a record only when its id
 //!   field holds that record's id; walks start from every way the records'
 //!   ids can be equal or differ, so a design that works only when two ids
@@ -41,67 +46,30 @@
 //! move from outside, and names each reaction a target refuses.
 
 mod env;
+mod liveness;
 mod model;
+mod pack;
+mod senders;
 mod slice;
+mod state;
+
+pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
 use crate::Budget;
-use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
+use crate::model::{ModelString, ParamValue};
 
 pub use model::DroppedReaction;
 pub(crate) use model::dropped_reactions;
-use model::{JointModel, Move};
-
-/// The records in scope, one per type, and the dispatches on their way.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct JointState {
-    /// Each type's record.
-    pub records: BTreeMap<String, TemperModelState>,
-    /// Dispatches sent and not yet taken, sorted; the same dispatch may be
-    /// in flight twice.
-    pub inflight: Vec<Dispatch>,
-}
-
-/// A dispatch on its way to a record's actor.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Dispatch {
-    /// The target entity type.
-    pub to: String,
-    /// The action.
-    pub action: String,
-    /// The transition's target status, when the sender chose one.
-    pub target_state: Option<String>,
-    /// The parameters sent; a reaction's are its `args` as the source
-    /// committed them.
-    pub params: BTreeMap<String, ParamValue>,
-    /// Whether the dispatch path has read the related records it needs.
-    pub read: bool,
-    /// The reaction depth that sent it (0 for a request from outside).
-    pub depth: u32,
-    /// The reaction that sent it, by its place among the model's reactions;
-    /// `None` for a request from outside.
-    pub via: Option<usize>,
-}
-
-impl fmt::Display for Dispatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let action = TemperModelAction {
-            name: self.action.clone(),
-            target_state: None,
-            params: self.params.clone(),
-        };
-        write!(f, "{}.{action}", self.to)?;
-        if !self.read {
-            f.write_str(" (unread)")?;
-        }
-        Ok(())
-    }
-}
+use model::{JointModel, Move, Sending};
+use state::render;
+pub use state::{Call, Dispatch, JointState, ReactionStep};
 
 /// What the joint check found for one invariant.
 #[derive(Debug, Clone)]
@@ -201,9 +169,12 @@ impl fmt::Display for JointInvariantResult {
 }
 
 /// Check every `[[invariant]]` in `automatons` that reads a related entity,
-/// on the joint model of its entity and the types it names.
+/// on the joint model of its entity and the types it names. `policies`
+/// decide each move as its sender, as for liveness; without them every
+/// sender may send everything.
 pub fn verify_joint_invariants(
     automatons: &[&Automaton],
+    policies: Option<&SendAnalysis>,
     budget: Budget,
 ) -> Vec<JointInvariantResult> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
@@ -253,8 +224,29 @@ pub fn verify_joint_invariants(
             }
             continue;
         }
-        let model = JointModel::new(&by_name, scope, name, &joint);
         let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
+        // Code outside the specs sends what a liveness property relies on,
+        // whoever Cedar lets send it; a rule that must always hold has to
+        // hold through those moves too.
+        let relies_on = scope
+            .iter()
+            .flat_map(|entity| {
+                by_name[entity.as_str()]
+                    .liveness
+                    .iter()
+                    .flat_map(move |live| {
+                        live.relies_on
+                            .iter()
+                            .map(move |action| (entity.clone(), action.clone()))
+                    })
+            })
+            .collect();
+        let sending = Sending {
+            policies,
+            kernel_moves: true,
+            relies_on,
+        };
+        let model = JointModel::new(&by_name, scope, name, &exprs, sending, true);
         let walk = model.walk(name, &exprs, budget);
         for (inv, outcome) in joint.iter().zip(walk.outcomes) {
             let mut found = result(inv, &model.scope, walk.states, outcome);
@@ -327,7 +319,8 @@ pub fn replay_joint_invariants(
             scope.insert(entity_type);
         }
     }
-    let model = JointModel::new(&by_name, scope, entity, &joint);
+    let exprs: Vec<&Expr> = joint.iter().map(|inv| &inv.assert).collect();
+    let model = JointModel::new(&by_name, scope, entity, &exprs, Sending::anyone(), true);
     let (mut state, mut names) = model.init_with_ids(ids);
     let mut steps = vec![JointStep {
         action: None,
@@ -445,41 +438,9 @@ pub fn replay_joint_invariants(
     Ok(JointReplay { steps, broken })
 }
 
-/// The moves from the start to `nodes[index]`.
-pub(super) fn path_to(
-    nodes: &[(JointState, Option<(usize, String)>)],
-    mut index: usize,
-) -> Vec<JointStep> {
-    let mut steps = Vec::new();
-    loop {
-        let (state, parent) = &nodes[index];
-        steps.push(JointStep {
-            action: parent.as_ref().map(|(_, action)| action.clone()),
-            state: render(state),
-        });
-        match parent {
-            Some((from, _)) => index = *from,
-            None => break,
-        }
-    }
-    steps.reverse();
-    steps
-}
-
-pub(super) fn render(state: &JointState) -> String {
-    let mut text = state
-        .records
-        .iter()
-        .map(|(entity, s)| format!("{entity}={s}"))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    if !state.inflight.is_empty() {
-        let inflight: Vec<String> = state.inflight.iter().map(ToString::to_string).collect();
-        text.push_str(&format!(" | in flight: {}", inflight.join(", ")));
-    }
-    text
-}
-
 #[cfg(test)]
 #[path = "joint_test.rs"]
 mod tests;
+
+#[cfg(test)]
+mod chain_test;

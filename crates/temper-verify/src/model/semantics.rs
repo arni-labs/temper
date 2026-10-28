@@ -161,24 +161,34 @@ pub(crate) fn successors_budgeted(
     out
 }
 
-/// `state` after the transition named `name` with `params`, with no
-/// renumbering of new strings (the caller renumbers, over one entity or a
-/// joint state). `None` when the model has no such transition.
-pub fn step(
-    model: &TemperModel,
+/// The transition the runtime takes for action `name` in `status`: the first
+/// with that name whose source states include `status` (temper-jit
+/// `evaluate_ctx`). A later transition with the same name never fires from
+/// `status`; when this one's guard fails, the action is refused.
+pub fn rule_for<'a>(
+    model: &'a TemperModel,
     name: &str,
-    target_state: Option<&str>,
+    status: &str,
+) -> Option<&'a ResolvedTransition> {
+    model.transitions.iter().find(|t| {
+        t.name == name && (t.from_states.is_empty() || t.from_states.iter().any(|s| s == status))
+    })
+}
+
+/// `state` after transition `t` with `params`, with no renumbering of new
+/// strings (the caller renumbers, over one entity or a joint state).
+pub fn step(
+    t: &ResolvedTransition,
     state: &TemperModelState,
     params: &BTreeMap<String, ParamValue>,
-) -> Option<TemperModelState> {
-    let resolved = model.transitions.iter().find(|t| t.name == name)?;
+) -> TemperModelState {
     let mut next = state.clone();
-    if let Some(to) = target_state {
-        next.status = to.to_string();
+    if let Some(to) = &t.to_state {
+        next.status = to.clone();
     }
-    apply_effects(&resolved.effects, &mut next, name, params);
-    apply_string_params(&resolved.string_params, &mut next, params);
-    Some(next)
+    apply_effects(&t.effects, &mut next, &t.name, params);
+    apply_string_params(&t.string_params, &mut next, params);
+    next
 }
 
 /// The transition with more parameter assignments than one step explores
@@ -279,7 +289,11 @@ fn param_assignments(
 
 /// Whether `next` stays within the exploration bounds, or at least grew no
 /// counter or list beyond them.
-fn within_bounds(model: &TemperModel, before: &TemperModelState, next: &TemperModelState) -> bool {
+pub(crate) fn within_bounds(
+    model: &TemperModel,
+    before: &TemperModelState,
+    next: &TemperModelState,
+) -> bool {
     let counters_ok = next.counters.iter().all(|(var, value)| {
         let bound = model
             .counter_bounds

@@ -11,6 +11,8 @@ impl JointModel {
             return Box::new(std::iter::once(JointState {
                 records: blank,
                 inflight: Vec::new(),
+                calls: Vec::new(),
+                armed: BTreeMap::new(),
             }));
         }
         let mut literals = self.id_literals.clone();
@@ -40,7 +42,11 @@ impl JointModel {
             let mut state = JointState {
                 records,
                 inflight: Vec::new(),
+                calls: Vec::new(),
+                armed: BTreeMap::new(),
             };
+            self.arm_at_start(&mut state);
+            self.order.normalize(&mut state);
             canonical(&mut state);
             state
         }))

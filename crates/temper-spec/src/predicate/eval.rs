@@ -108,6 +108,12 @@ pub trait Env {
     ) -> Option<Vec<Val<'_>>> {
         None
     }
+    /// `params.p`, a parameter of the move being taken; absent reads as
+    /// [`Val::Null`]. [`Val::Unknown`] (the default) when the evaluator does
+    /// not know the move's parameters yet.
+    fn param(&self, _name: &str) -> Val<'_> {
+        Val::Unknown
+    }
 }
 
 /// Evaluate `expr` against `env`.
@@ -182,6 +188,7 @@ fn for_each_value(operand: &Operand, env: &dyn Env, test: impl Fn(Val<'_>) -> Tr
                 .list_len()
                 .map_or(Val::Null, |len| Val::Num(len as f64)),
         },
+        Operand::Param(name) => env.param(name),
         Operand::Lit(lit) => literal(lit),
         Operand::CrossStatus { .. } | Operand::CrossField { .. } => {
             let related = match operand {

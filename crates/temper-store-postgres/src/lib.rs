@@ -39,6 +39,7 @@ pub mod dbm;
 mod metrics;
 mod namespace;
 pub use namespace::PostgresSchema;
+mod catalog_groups;
 pub mod migration;
 pub mod platform;
 mod projection_freshness;

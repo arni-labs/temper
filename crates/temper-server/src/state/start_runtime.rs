@@ -12,8 +12,10 @@ impl ServerState {
     ///
     /// It repairs catalog rows behind their journals for every registered tenant,
     /// then restores saved timers and reconciles repaired records through the boot
-    /// fire gate before returning. It also starts runtime metrics. Returns the
-    /// background walk that recovers missing timers from the recorded state clock;
+    /// fire gate before returning. It starts runtime metrics and the background
+    /// carries that the installed versions hold for stored records
+    /// (`spec_change::carry_pass`). Returns the background walk that recovers
+    /// missing timers from the recorded state clock;
     /// it ends with the counts per tenant and type, which it also logs as
     /// `state timers after boot`. A second call in the same process starts
     /// nothing and returns None: a second re-arm would arm every row again.
@@ -23,6 +25,8 @@ impl ServerState {
             return None;
         }
         self.spawn_runtime_metrics_loop();
-        Some(self.rearm_state_timers().await)
+        let boot = self.rearm_state_timers().await;
+        self.spawn_carry_stranded(self.tenants_with_carries());
+        Some(boot)
     }
 }

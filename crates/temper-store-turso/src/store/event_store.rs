@@ -1,20 +1,17 @@
 //! [`EventStore`] trait implementation for Turso.
 
 use crate::driver::{Value, params};
-use std::time::Duration;
 use temper_runtime::persistence::{
     CommitRows, EntityVectorCandidate, EntityVectorRow, EventMetadata, EventStore,
     PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
     ScheduledActionRecord, pack_f32_le, storage_error, unpack_f32_le,
 };
 use temper_runtime::tenant::parse_persistence_id_parts;
-use tracing::{error, instrument};
+use tracing::instrument;
 
 use super::TursoEventStore;
 use super::append_commit::OwnedAppend;
-use super::append_config::append_max_attempts;
 use super::write_gate::WritePriority;
-use crate::retry::{is_transient_write_error, retry_delay_ms};
 
 /// Every live `(entity_type, entity_id)` of a tenant. The `NOT EXISTS` probe is
 /// served by `idx_events_deleted`; see `schema::CREATE_EVENTS_DELETED_INDEX`.
@@ -124,11 +121,13 @@ impl EventStore for TursoEventStore {
         // ADR-0153: a single keyed probe of entity_key_index — present/absent in
         // O(log n), no candidate scan (the negative-existence access path). Bounded
         // regardless of how many entities the tenant/type holds, so it cannot trip
-        // the scan budget that produces the 413.
+        // the scan budget that produces the 413. It names the key's index: without
+        // it the planner may read every row of the type (driver/plan_check.rs).
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_id FROM entity_key_index \
+                "SELECT entity_id \
+                 FROM entity_key_index INDEXED BY sqlite_autoindex_entity_key_index_1 \
                  WHERE tenant = ?1 AND entity_type = ?2 AND key_name = ?3 AND key_hash = ?4",
                 params![tenant, entity_type, key_name, key_hash],
             )
@@ -151,12 +150,10 @@ impl EventStore for TursoEventStore {
     // DST. Giving Turso the keyed oracle requires first implementing live co-commit
     // (completing ADR-0153 phase 2 for Turso) — tracked separately.
 
-    // ADR-0155: Turso maintains `entity_vector_index` **write-behind** — the event is
-    // appended first (with retries), then the derived vector rows follow in a separate,
-    // also-retried write. This is safe for vectors (unlike keys) because a vector row
-    // carries no uniqueness constraint and a lagging index write only makes a ranking
-    // temporarily incomplete; it can never corrupt a keyed absence. So Turso implements
-    // the full vector surface below.
+    // One transaction per move: the event, its scheduled actions, and the
+    // entity's query-plane, timer and vector rows (ADR-0155) commit together,
+    // so an event never lands without them and a move pays one write lock.
+    // Keys are not maintained on Turso, per the note above.
     async fn append_with_rows(
         &self,
         persistence_id: &str,
@@ -164,70 +161,17 @@ impl EventStore for TursoEventStore {
         events: &[PersistenceEnvelope],
         rows: CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
-        let CommitRows {
-            vector_rows,
-            reconcile_vectors,
-            scheduled_actions,
-            fired_scheduled_action,
-            ..
-        } = rows;
-        // The journal append is the durable event, with the scheduled actions
-        // it armed and fired (keys are not maintained on Turso, per the note
-        // above).
-        let scheduled = CommitRows {
-            scheduled_actions,
-            fired_scheduled_action,
-            ..CommitRows::default()
-        };
-        let new_seq = self
-            .append_owned(OwnedAppend::new(
-                persistence_id,
-                expected_sequence,
-                events,
-                scheduled,
-            ))
-            .await?;
-        // Write-behind vector maintenance: reconcile the entity's rows (delete stale,
-        // insert current — an empty `vector_rows` purges a deleted/cleared entity),
-        // RETRIED like the event append rather than a warn-once one-shot, so a
-        // transient failure does not silently drop the write. On final exhaustion the
-        // error is logged loudly; the partition then lags until the next backfill
-        // reconcile runs. Only runs when the type declares vector paths.
-        if reconcile_vectors
-            && let Ok((tenant, entity_type, entity_id)) = parse_persistence_id_parts(persistence_id)
-        {
-            let total_attempts = append_max_attempts();
-            let mut last_err: Option<PersistenceError> = None;
-            for attempt in 0..total_attempts {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms(attempt - 1))).await;
-                }
-                match self
-                    .backfill_entity_vectors(tenant, entity_type, entity_id, vector_rows)
-                    .await
-                {
-                    Ok(()) => {
-                        last_err = None;
-                        break;
-                    }
-                    Err(err) => {
-                        let transient = matches!(&err, PersistenceError::Storage(msg) if is_transient_write_error(msg));
-                        last_err = Some(err);
-                        if !transient {
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some(error) = last_err {
-                error!(
-                    persistence_id,
-                    error = %error,
-                    "turso vector-index write-behind failed after retries; partition lags until the next backfill reconcile"
-                );
-            }
-        }
-        Ok(new_seq)
+        self.append_owned(OwnedAppend::new(
+            persistence_id,
+            expected_sequence,
+            events,
+            rows,
+        ))
+        .await
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        true
     }
 
     async fn backfill_entity_vectors(
@@ -240,13 +184,13 @@ impl EventStore for TursoEventStore {
         // Reconcile: DELETE all of the entity's rows, then insert the current ones.
         // Empty `vector_rows` purges the entity (deleted / un-embedded). Always runs
         // the delete so a purge is honored.
-        let _write_permit = self
-            .acquire_write_permit("turso.backfill_entity_vectors", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.backfill_entity_vectors", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         tx.execute(
-            "DELETE FROM entity_vector_index \
+            // The entity's index (driver/plan_check.rs).
+            "DELETE FROM entity_vector_index INDEXED BY idx_evi_entity \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, entity_type, entity_id],
         )
@@ -284,7 +228,8 @@ impl EventStore for TursoEventStore {
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_id, vector FROM entity_vector_index \
+                // The partition's index (driver/plan_check.rs).
+                "SELECT entity_id, vector FROM entity_vector_index INDEXED BY idx_evi_partition \
                  WHERE tenant = ?1 AND entity_type = ?2 AND decl_name = ?3 AND model_tag = ?4 \
                  ORDER BY entity_id LIMIT ?5",
                 params![tenant, entity_type, decl_name, model_tag, limit as i64],
@@ -308,10 +253,9 @@ impl EventStore for TursoEventStore {
         entity_type: &str,
         vector_set: &str,
     ) -> Result<(), PersistenceError> {
-        let _write_permit = self
-            .acquire_write_permit("turso.mark_vector_index_backfilled", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.mark_vector_index_backfilled", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let completed_at = temper_runtime::scheduler::sim_now().to_rfc3339();
         conn.execute(
             "INSERT INTO vector_index_backfill_watermark (tenant, entity_type, vector_set, completed_at) \
@@ -414,35 +358,41 @@ impl EventStore for TursoEventStore {
             .await
             .map_err(storage_error)?;
 
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(storage_error)? {
-            let seq = row.get::<i64>(0).map_err(storage_error)? as u64;
-            let event_type = row.get::<String>(1).map_err(storage_error)?;
-            let payload_json = row.get::<String>(2).map_err(storage_error)?;
-            let metadata_json = row.get::<Option<String>>(3).map_err(storage_error)?;
+        collect_envelopes(&mut rows).await
+    }
 
-            let payload = serde_json::from_str(&payload_json).map_err(|e| {
-                tracing::error!(error = %e, "failed to deserialize event payload");
-                PersistenceError::Serialization(e.to_string())
-            })?;
-            let metadata_raw = metadata_json.ok_or_else(|| {
-                tracing::error!("missing event metadata");
-                PersistenceError::Serialization("missing event metadata".to_string())
-            })?;
-            let metadata: EventMetadata = serde_json::from_str(&metadata_raw).map_err(|e| {
-                tracing::error!(error = %e, "failed to deserialize event metadata");
-                PersistenceError::Serialization(e.to_string())
-            })?;
+    #[instrument(skip_all, fields(persistence_id, otel.name = "turso.read_events_page"))]
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let conn = self.configured_connection().await?;
+        // Both bounds saturate: a sequence or a row count above i64::MAX is
+        // past every stored row, so it means "no bound".
+        let before = before_sequence.map_or(i64::MAX, |s| i64::try_from(s).unwrap_or(i64::MAX));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
 
-            out.push(PersistenceEnvelope {
-                sequence_nr: seq,
-                event_type,
-                payload,
-                metadata,
-            });
-        }
+        // Newest first along the (tenant, entity_type, entity_id, sequence_nr)
+        // unique index, so only the page's rows are read.
+        let mut rows = conn
+            .query(
+                "SELECT sequence_nr, event_type, payload, metadata
+                 FROM events
+                 WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3 AND sequence_nr < ?4
+                 ORDER BY sequence_nr DESC
+                 LIMIT ?5",
+                params![tenant, entity_type, entity_id, before, limit],
+            )
+            .await
+            .map_err(storage_error)?;
 
-        Ok(out)
+        let mut page = collect_envelopes(&mut rows).await?;
+        page.reverse();
+        Ok(page)
     }
 
     #[instrument(skip_all, fields(persistence_id, otel.name = "turso.save_snapshot"))]
@@ -454,10 +404,9 @@ impl EventStore for TursoEventStore {
     ) -> Result<(), PersistenceError> {
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
-        let _write_permit = self
-            .acquire_write_permit("turso.save_snapshot", WritePriority::Low)
+        let conn = self
+            .write_connection("turso.save_snapshot", WritePriority::Low)
             .await?;
-        let conn = self.configured_connection().await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
 
         tx.execute(
@@ -468,22 +417,6 @@ impl EventStore for TursoEventStore {
                 sequence_nr = excluded.sequence_nr,
                 snapshot = excluded.snapshot,
                 created_at = datetime('now')",
-            params![
-                tenant,
-                entity_type,
-                entity_id,
-                sequence_nr as i64,
-                snapshot.to_vec()
-            ],
-        )
-        .await
-        .map_err(storage_error)?;
-
-        tx.execute(
-            "INSERT INTO snapshot_history (tenant, entity_type, entity_id, sequence_nr, snapshot)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (tenant, entity_type, entity_id, sequence_nr)
-             DO UPDATE SET snapshot = excluded.snapshot, created_at = datetime('now')",
             params![
                 tenant,
                 entity_type,
@@ -737,4 +670,39 @@ impl TursoEventStore {
         }
         Ok(out)
     }
+}
+
+/// Decode `SELECT sequence_nr, event_type, payload, metadata` rows into
+/// envelopes, in the order the query returned them.
+async fn collect_envelopes(
+    rows: &mut crate::driver::Rows,
+) -> Result<Vec<PersistenceEnvelope>, PersistenceError> {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(storage_error)? {
+        let seq = row.get::<i64>(0).map_err(storage_error)? as u64;
+        let event_type = row.get::<String>(1).map_err(storage_error)?;
+        let payload_json = row.get::<String>(2).map_err(storage_error)?;
+        let metadata_json = row.get::<Option<String>>(3).map_err(storage_error)?;
+
+        let payload = serde_json::from_str(&payload_json).map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize event payload");
+            PersistenceError::Serialization(e.to_string())
+        })?;
+        let metadata_raw = metadata_json.ok_or_else(|| {
+            tracing::error!("missing event metadata");
+            PersistenceError::Serialization("missing event metadata".to_string())
+        })?;
+        let metadata: EventMetadata = serde_json::from_str(&metadata_raw).map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize event metadata");
+            PersistenceError::Serialization(e.to_string())
+        })?;
+
+        out.push(PersistenceEnvelope {
+            sequence_nr: seq,
+            event_type,
+            payload,
+            metadata,
+        });
+    }
+    Ok(out)
 }

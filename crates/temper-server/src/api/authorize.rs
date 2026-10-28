@@ -49,11 +49,16 @@ pub(crate) enum AuthorizeRequest {
     Single(AuthorizeSingle),
 }
 
-/// Ask Cedar without requesting a move or filing a decision/denial pattern.
+/// Ask Cedar without requesting a move. A question is a read and writes
+/// nothing: no decision, denial pattern or trajectory row, however many
+/// records and moves a page asks about. Each answer is counted as
+/// `check:offer` in `temper_cedar_evaluations_total`, apart from the
+/// `check:gate` refusals of requests, and stays visible as the authz wide
+/// event every check emits.
 ///
 /// Each record's caller-supplied snapshot is decoded once and shared across its
 /// actions, exactly as for the original single check. Cost: one Cedar evaluation
-/// per pair, zero store reads; only denied-check trajectories are enqueued.
+/// per pair, zero store reads and zero writes.
 /// There is no item-count cap: the router's request-body byte limit bounds input.
 /// These are offers against a snapshot, not grants; dispatch authorizes again.
 #[instrument(skip_all, fields(otel.name = "POST /api/authorize"))]
@@ -115,7 +120,7 @@ pub(crate) async fn handle_authorize(
         let mut actions = Vec::with_capacity(record.actions.len());
         for action in record.actions {
             let reason = state
-                .authorize_with_context(
+                .authorize_offer_with_context(
                     security_ctx,
                     &action,
                     &record.resource_type,
@@ -124,45 +129,6 @@ pub(crate) async fn handle_authorize(
                 )
                 .err()
                 .map(|denial| denial.to_string());
-            if let Some(reason) = &reason {
-                // A question remains observable but must never enter a
-                // conformance verdict, suggestion engine, or decision queue.
-                let entry = TrajectoryEntry {
-                    timestamp: sim_now().to_rfc3339(),
-                    tenant: tenant.as_str().to_string(),
-                    entity_type: record.resource_type.clone(),
-                    entity_id: record.resource_id.clone(),
-                    action: action.clone(),
-                    success: false,
-                    from_status: None,
-                    to_status: None,
-                    error: Some(reason.clone()),
-                    agent_id: Some(security_ctx.principal.id.clone()),
-                    session_id: authenticated.session_id().map(str::to_string).or_else(|| {
-                        security_ctx
-                            .context_attrs
-                            .get("sessionId")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    }),
-                    authz_denied: Some(true),
-                    denied_resource: Some(format!(
-                        "{}:{}",
-                        record.resource_type, record.resource_id
-                    )),
-                    denied_module: None,
-                    source: Some(TrajectorySource::Authz),
-                    spec_governed: Some(false),
-                    agent_type: security_ctx.principal.agent_type.clone(),
-                    request_body: Some(serde_json::json!(attrs)),
-                    intent: authenticated.intent().map(str::to_string),
-                    matched_policy_ids: None,
-                    capture_seq: None,
-                };
-                if !state.enqueue_trajectory_entry(entry) {
-                    tracing::warn!("failed to enqueue authorize trajectory");
-                }
-            }
             actions.push(serde_json::json!({"action": action, "allowed": reason.is_none(), "reason": reason}));
         }
         answers.push(serde_json::json!({
