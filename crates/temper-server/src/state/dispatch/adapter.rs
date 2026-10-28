@@ -417,6 +417,7 @@ impl crate::state::ServerState {
                 .dispatch_adapter_callback(
                     ctx.entity_ref,
                     &integration.name,
+                    ctx.action,
                     callback_action,
                     callback_params,
                     ctx.agent_ctx,
@@ -563,6 +564,7 @@ impl crate::state::ServerState {
         self.dispatch_adapter_callback(
             ctx.entity_ref,
             &integration.name,
+            ctx.action,
             &callback_action,
             params,
             ctx.agent_ctx,
@@ -576,18 +578,20 @@ impl crate::state::ServerState {
         &self,
         entity_ref: WasmEntityRef<'_>,
         integration: &str,
+        calling_action: &str,
         callback_action: &str,
         callback_params: serde_json::Value,
         agent_ctx: &AgentContext,
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
+        let hop = super::answer_check::answer_hop(entity_ref, calling_action, integration);
         let callback_ctx = match agent_ctx.for_callback(
             entity_ref.entity_type,
             entity_ref.entity_id,
             callback_action,
             integration,
         ) {
-            Ok(context) => context,
+            Ok(context) => context.as_answer(hop.clone()),
             Err(error) => {
                 return self
                     .reject_generated_callback(entity_ref, callback_action, error.to_string(), mode)
@@ -615,8 +619,7 @@ impl crate::state::ServerState {
             params: callback_params,
             agent_ctx: callback_ctx,
         };
-        self.send_answer(sent, mode, "platform-dispatch", "adapter")
-            .await
+        self.send_answer(sent, &hop, mode, "adapter").await
     }
 
     /// Mint a platform credential for adapter execution if the entity has an `agent_type_id`.

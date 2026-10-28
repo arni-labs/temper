@@ -1,7 +1,6 @@
 //! Prepare runtime-generated inputs without exempting ordinary action requests.
 use super::owed_writes::{Attempt, OwedKind, OwedMove, OwedTry};
 use super::{DispatchCommand, DispatchError, WasmDispatchMode, WasmEntityRef};
-use crate::request_context::AgentContext;
 use crate::{entity_actor::EntityResponse, state::ServerState};
 use serde_json::Value;
 use temper_runtime::tenant::TenantId;
@@ -69,20 +68,24 @@ impl ServerState {
             entity_id=entity.entity_id, action, error, %params, "integration callback rejected");
     }
 
-    /// Send an answer of a `source` integration ("WASM" or "adapter"): `sent`
-    /// is its action and values, as the integration's caller under the
-    /// answer's own key. Inline it runs as the caller and through its own
-    /// integrations, and the caller gets its reply. In the background it runs
-    /// as `service`, and a dispatch error that is not the store's is returned
+    /// Send an answer of a `source` integration ("WASM" or "adapter") through
+    /// the trigger `hop` names: `sent` is its action and values, as the
+    /// identity of the move that called the integration
+    /// ([`crate::request_context::AgentContext::as_answer`]), under the
+    /// answer's own key. Cedar is asked about it as that identity first
+    /// ([`Self::check_answer`]). Inline it runs through its own integrations,
+    /// and the caller gets its reply.
+    /// In the background a dispatch error that is not the store's is returned
     /// for the integration's failure path (ADR-0152). Either way it is
     /// settled ([`Self::settle_answer`]): a write the store failed is owed.
     pub(super) async fn send_answer(
         &self,
-        mut sent: OwedMove,
+        sent: OwedMove,
+        hop: &temper_authz::Hop,
         mode: WasmDispatchMode,
-        service: &str,
         source: &str,
     ) -> Result<Option<EntityResponse>, String> {
+        self.check_answer(&sent, hop).await;
         match mode {
             WasmDispatchMode::Inline => {
                 // Preserve inline semantics through nested WASM callbacks.
@@ -108,7 +111,6 @@ impl ServerState {
                 reply.map(Some).map_err(|error| error.to_string())
             }
             WasmDispatchMode::Background => {
-                sent.agent_ctx = AgentContext::for_service_answering(service, &sent.agent_ctx);
                 let reply = sent.send(self).await;
                 let action = sent.action.clone();
                 match (self.settle_answer(sent, &reply), reply) {

@@ -1,14 +1,16 @@
 //! How a move came about, as Cedar is told it.
 //!
 //! A move is made by a direct request, by a reaction a spec's
-//! `[[action.triggers]]` sets off, or by a timer: a state's `state_timeout`
-//! or a `schedule` effect. The principal is the true one on every path: a
-//! reaction runs as whoever made the move before it (or the service its rule
-//! declares), and a timer fires as whoever armed it. So an app's Cedar cannot
-//! tell from the principal whether a hook picked a move itself or the spec
-//! made it follow the hook's own move. [`MoveCause`] says which, and
-//! [`cause_context`] turns it into the Cedar context of every check: the keys
-//! in [`platform_keys::CAUSE`](crate::platform_keys::CAUSE), which only the
+//! `[[action.triggers]]` sets off, by a module's answer to the trigger that
+//! called it, or by a timer: a state's `state_timeout` or a `schedule`
+//! effect. The principal is the true one on every path: a reaction runs as
+//! whoever made the move before it (or the service its rule declares), a
+//! module's answer as whoever made the move that called the module, and a
+//! timer fires as whoever armed it. So an app's Cedar cannot tell from the
+//! principal whether a hook picked a move itself or the spec made it follow
+//! the hook's own move. [`MoveCause`] says which, and [`cause_context`] turns
+//! it into the Cedar context of every check: the keys in
+//! [`platform_keys::CAUSE`](crate::platform_keys::CAUSE), which only the
 //! kernel sets.
 
 use serde::{Deserialize, Serialize};
@@ -19,28 +21,38 @@ use crate::platform_keys;
 /// How a move that is not a direct request came about, carried on the
 /// [`SecurityContext`](crate::SecurityContext) it is checked with. A direct
 /// request carries none.
+///
+/// At most one of `reaction` and `answer` is set: the constructors set one
+/// or, for a timer's own fire, neither.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveCause {
     /// The rule that made this move and the move that set it off, when this
-    /// move is a reaction; None for a timer's own fire.
+    /// move is a reaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reaction: Option<ReactionHop>,
-    /// Reaction hops since the request or the timer fire the chain started
-    /// from: 0 for a timer's own fire, 1 for a reaction to a request or to a
-    /// timer's fire, one more for each further hop.
+    pub reaction: Option<Hop>,
+    /// The trigger whose module answered with this move and the move that
+    /// called the module, when this move is a module's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Hop>,
+    /// Hops since the request or the timer fire the chain started from: 0
+    /// for a timer's own fire, 1 for a reaction or a module's answer to a
+    /// request or to a timer's fire, one more for each further hop.
     pub depth: u32,
     /// The timer whose fire started this chain, when one did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer: Option<TimerArm>,
 }
 
-/// One reaction hop: the rule, and the move that set it off.
+/// One hop of a chain: the rule that made a reaction, or the trigger whose
+/// module answered, and the move that set it off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReactionHop {
-    /// The kernel's name for the rule, as logs and reaction results name it:
-    /// `<Type>:<Action>:<trigger>` for a spec's `[[action.triggers]]`.
+pub struct Hop {
+    /// The kernel's name for the rule or trigger, as logs and reaction
+    /// results name it: `<Type>:<Action>:<trigger>` for a spec's
+    /// `[[action.triggers]]`.
     pub rule: String,
-    /// The move that set the reaction off.
+    /// The move that set the hop off: a reaction's source move, or the move
+    /// that called the module.
     pub action: String,
     /// That move's entity type.
     pub entity_type: String,
@@ -64,6 +76,7 @@ impl MoveCause {
     pub fn timer_fire(arm: TimerArm) -> Self {
         Self {
             reaction: None,
+            answer: None,
             depth: 0,
             timer: Some(arm),
         }
@@ -71,17 +84,40 @@ impl MoveCause {
 
     /// The reaction `hop` makes to a move whose cause was `source` (None for
     /// a direct request): one hop deeper, in the same timer's chain if any.
-    pub fn reaction(hop: ReactionHop, source: Option<&MoveCause>) -> Self {
+    pub fn reaction(hop: Hop, source: Option<&MoveCause>) -> Self {
         Self {
             reaction: Some(hop),
+            answer: None,
             depth: source.map_or(0, |cause| cause.depth) + 1,
             timer: source.and_then(|cause| cause.timer.clone()),
         }
     }
 
-    /// `"timer"` anywhere in a timer's chain, else `"reaction"`.
+    /// The answer a module gives, through the trigger `hop` names, to the
+    /// move that called it, whose cause was `source` (None for a direct
+    /// request): one hop deeper, in the same timer's chain if any.
+    pub fn answer(hop: Hop, source: Option<&MoveCause>) -> Self {
+        Self {
+            reaction: None,
+            answer: Some(hop),
+            depth: source.map_or(0, |cause| cause.depth) + 1,
+            timer: source.and_then(|cause| cause.timer.clone()),
+        }
+    }
+
+    /// The hop that made this move, a reaction's or a module answer's; None
+    /// for a timer's own fire.
+    pub fn hop(&self) -> Option<&Hop> {
+        self.reaction.as_ref().or(self.answer.as_ref())
+    }
+
+    /// `"module"` for a module's answer, wherever its chain started, so a
+    /// policy can tell a module's answer from the moves the spec makes follow;
+    /// else `"timer"` anywhere in a timer's chain, else `"reaction"`.
     pub fn via(&self) -> &'static str {
-        if self.timer.is_some() {
+        if self.answer.is_some() {
+            "module"
+        } else if self.timer.is_some() {
             "timer"
         } else {
             "reaction"
@@ -90,9 +126,10 @@ impl MoveCause {
 }
 
 /// The Cedar context a check gets from its move's cause: `via` and `depth`
-/// always, the reaction's hop on a reaction, the timer's arm in a timer's
-/// chain. A check with no cause is a direct request: `via == "request"`,
-/// `depth == 0`, so a path the kernel does not mark gets the strict case.
+/// always, the hop on a reaction or a module's answer, the timer's arm in a
+/// timer's chain. A check with no cause is a direct request:
+/// `via == "request"`, `depth == 0`, so a path the kernel does not mark gets
+/// the strict case.
 pub(crate) fn cause_context(cause: Option<&MoveCause>) -> Vec<(&'static str, Value)> {
     let string = |value: &str| Value::String(value.to_string());
     let Some(cause) = cause else {
@@ -101,11 +138,15 @@ pub(crate) fn cause_context(cause: Option<&MoveCause>) -> Vec<(&'static str, Val
             (platform_keys::DEPTH, Value::from(0)),
         ];
     };
+    debug_assert!(
+        cause.reaction.is_none() || cause.answer.is_none(),
+        "a move is a reaction or a module's answer, not both"
+    );
     let mut context = vec![
         (platform_keys::VIA, string(cause.via())),
         (platform_keys::DEPTH, Value::from(cause.depth)),
     ];
-    if let Some(hop) = &cause.reaction {
+    if let Some(hop) = cause.hop() {
         context.push((platform_keys::RULE, string(&hop.rule)));
         context.push((platform_keys::CAUSE_ACTION, string(&hop.action)));
         context.push((platform_keys::CAUSE_ENTITY_TYPE, string(&hop.entity_type)));
@@ -126,8 +167,8 @@ pub(crate) fn cause_context(cause: Option<&MoveCause>) -> Vec<(&'static str, Val
 mod tests {
     use super::*;
 
-    fn hop(rule: &str, action: &str) -> ReactionHop {
-        ReactionHop {
+    fn hop(rule: &str, action: &str) -> Hop {
+        Hop {
             rule: rule.to_string(),
             action: action.to_string(),
             entity_type: "Direction".to_string(),
@@ -180,6 +221,29 @@ mod tests {
         }
     }
 
+    /// A module's answer reads `via == "module"` even in a timer's chain,
+    /// keeps the timer's arm, and the reaction to it reads as a reaction again.
+    #[test]
+    fn a_modules_answer_is_via_module_and_keeps_its_chain() {
+        let fire = MoveCause::timer_fire(arm());
+        let answer = MoveCause::answer(hop("Direction:Lapse:oracle", "Lapse"), Some(&fire));
+        assert_eq!((answer.via(), answer.depth), ("module", 1));
+        let context = cause_context(Some(&answer));
+        for expected in [
+            ("via", Value::from("module")),
+            ("depth", Value::from(1)),
+            ("armedBy", Value::from("hook-1")),
+            ("rule", Value::from("Direction:Lapse:oracle")),
+            ("causeAction", Value::from("Lapse")),
+        ] {
+            assert!(context.contains(&expected), "{expected:?} in {context:?}");
+        }
+        let to_a_request = MoveCause::answer(hop("Direction:FindFix:oracle", "FindFix"), None);
+        assert_eq!((to_a_request.via(), to_a_request.depth), ("module", 1));
+        let after = MoveCause::reaction(hop("Direction:Fix:goes", "Fix"), Some(&to_a_request));
+        assert_eq!((after.via(), after.depth), ("reaction", 2));
+    }
+
     /// A module's call during a reaction is bound with that reaction's
     /// context, and must still be checked as the module's request.
     #[test]
@@ -193,7 +257,7 @@ mod tests {
             None,
         );
         during_reaction.cause = Some(MoveCause::reaction(
-            ReactionHop {
+            Hop {
                 rule: "Direction:FindFix:goes".to_string(),
                 action: "FindFix".to_string(),
                 entity_type: "Direction".to_string(),
@@ -212,7 +276,8 @@ mod tests {
     #[test]
     fn a_cause_stored_with_a_timers_identity_reads_back() {
         let reaction = MoveCause::reaction(hop("Direction:FindFix:goes", "FindFix"), None);
-        for cause in [reaction, MoveCause::timer_fire(arm())] {
+        let answer = MoveCause::answer(hop("Direction:FindFix:oracle", "FindFix"), None);
+        for cause in [reaction, answer, MoveCause::timer_fire(arm())] {
             let json = serde_json::to_value(&cause).unwrap();
             assert_eq!(serde_json::from_value::<MoveCause>(json).unwrap(), cause);
         }

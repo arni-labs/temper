@@ -489,6 +489,7 @@ async fn strict_wasm_callbacks_prepare_generated_metadata_but_preserve_constrain
                         entity_id: "job",
                     },
                     "fixture",
+                    "Start",
                     "Complete",
                     params,
                     &agent,

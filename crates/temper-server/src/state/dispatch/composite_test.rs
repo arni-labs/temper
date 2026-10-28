@@ -464,7 +464,7 @@ async fn a_composite_sub_write_is_the_modules_request_whatever_set_it_off() {
         .as_mut()
         .expect("a service has a security context")
         .cause = Some(temper_authz::MoveCause::reaction(
-        temper_authz::ReactionHop {
+        temper_authz::Hop {
             rule: "Parent:Start:creates".to_string(),
             action: "Start".to_string(),
             entity_type: "Parent".to_string(),

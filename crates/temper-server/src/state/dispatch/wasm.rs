@@ -1075,6 +1075,7 @@ impl crate::state::ServerState {
                 .dispatch_wasm_callback(
                     ctx.entity_ref,
                     &integration.name,
+                    ctx.action,
                     cb,
                     params,
                     ctx.agent_ctx,
@@ -1371,6 +1372,7 @@ impl crate::state::ServerState {
                         self.dispatch_wasm_callback(
                             ctx.entity_ref,
                             &integration.name,
+                            ctx.action,
                             callback_action,
                             callback_params,
                             ctx.agent_ctx,
