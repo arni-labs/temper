@@ -195,7 +195,7 @@ fn coverage_ratio(projected: u64, indexed: u64) -> f64 {
     }
 }
 
-fn read_process_resident_memory_bytes() -> Option<u64> {
+pub(crate) fn read_process_resident_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     if let Some(bytes) = read_linux_vm_rss_bytes() {
         return Some(bytes);

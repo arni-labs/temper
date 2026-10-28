@@ -301,6 +301,10 @@ pub struct StateTimeout {
     /// Typically includes an `error_message` for observability.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub args: BTreeMap<String, Arg>,
+    /// Words for people reading the app: what the timer does ("check CI
+    /// again"). Display only: the kernel never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub says: Option<String>,
 }
 
 /// Admission control declaration (ADR-0051).

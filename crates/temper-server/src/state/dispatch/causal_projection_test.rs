@@ -369,15 +369,21 @@ async fn causal_delete_keeps_older_queued_writes_before_removal() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        rows.is_empty(),
-        "older queued write must not resurrect deleted projection"
+    // A spec move into a state named Deleted is projected like any other
+    // move; only the kernel's tombstone removes the row.
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.status.as_str(), row.fields["prompt_template"].as_str()))
+            .collect::<Vec<_>>(),
+        [("Deleted", Some("new"))],
+        "the older queued write must not replace the delete's row"
     );
 }
 
-/// A delete committed while an older move's projection write keeps failing
-/// ends that move's tries. The delete removes the record's row, so the older
-/// write landing after the removal would bring the deleted record back.
+/// The kernel's delete committed while an older move's projection write
+/// keeps failing ends that move's tries. The delete removes the record's row,
+/// so the older write landing after the removal would bring the deleted
+/// record back.
 #[tokio::test]
 async fn a_delete_during_a_failed_projection_is_not_undone_by_its_retry() {
     delete_during_failed_projection(false).await;
@@ -406,17 +412,10 @@ async fn delete_during_failed_projection(evict_tombstone: bool) {
     );
     let delete = async {
         query.source_write_refused.notified().await;
-        // The delete's own write carries other fields, so it lands, and its
-        // queued removal takes the row away.
+        // The kernel's delete writes no fields, so the refused write does not
+        // block it, and its queued removal takes the row away.
         let deleted = state
-            .dispatch_tenant_action(
-                &tenant,
-                "Source",
-                "source",
-                "Delete",
-                json!({"prompt_template":"gone"}),
-                &agent,
-            )
+            .delete_tenant_entity(&tenant, "Source", "source")
             .await
             .unwrap();
         assert!(deleted.success, "{deleted:?}");

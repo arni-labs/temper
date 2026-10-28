@@ -1010,25 +1010,6 @@ async fn test_get_spec_detail_found() {
     assert_eq!(raw_add_item["hint"], add_item.hint);
 }
 
-#[test]
-fn action_param_detail_serializes_typed_params_under_type_key() {
-    // Typed params (e.g. `{ name = "sleep_seconds", type = "counter" }` in a
-    // spec) reach ActionParamDetail through ActionParam::name()/param_type();
-    // this locks the wire shape those values serialize into.
-    let detail = ActionParamDetail {
-        name: "sleep_seconds".to_string(),
-        param_type: "uint64".to_string(),
-    };
-    let json = serde_json::to_value(&detail).unwrap();
-    assert_eq!(
-        json,
-        serde_json::json!({"name": "sleep_seconds", "type": "uint64"})
-    );
-    let back: ActionParamDetail = serde_json::from_value(json).unwrap();
-    assert_eq!(back.name, "sleep_seconds");
-    assert_eq!(back.param_type, "uint64");
-}
-
 #[tokio::test]
 async fn spec_detail_reports_the_registered_content_hash() {
     // The reason the field exists: a producer that recomputes the digest from

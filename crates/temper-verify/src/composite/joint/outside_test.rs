@@ -2,10 +2,10 @@
 //! its source, so the reaction may come at any time, as a move from outside
 //! sent as the reaction's sender, and Cedar decides it as that sender.
 
-use std::time::Duration;
-
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
+
+use super::room::{Bytes, Progress};
 
 use super::*;
 
@@ -130,7 +130,7 @@ fn invariant(sources: &[&str], done: &str) -> JointInvariantResult {
     let automatons = parsed(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(&policies(done)).expect("fixture policies parse");
-    let mut results = verify_joint_invariants(&refs, Some(&analysis), budget());
+    let mut results = bounded(|bound| verify_joint_invariants(&refs, Some(&analysis), bound));
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -160,11 +160,13 @@ fn policies(done: &str) -> String {
 const PUSHER_MAY: &str =
     r#"permit(principal == Agent::"service:pusher", action == Action::"Done", resource);"#;
 
-fn budget() -> Budget {
-    Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
-    }
+/// Run `check` in a room no fixture here comes near filling.
+fn bounded<T>(check: impl FnOnce(Bound<'_>) -> T) -> T {
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    check(Bound {
+        room: &room,
+        progress: &progress,
+    })
 }
 
 fn parsed(sources: &[&str]) -> Vec<Automaton> {
@@ -180,7 +182,7 @@ fn liveness(principal: Option<&str>, done: &str) -> JointLivenessResult {
     let automatons = parsed(&[&pushed(rule), &push(principal)]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(&policies(done)).expect("fixture policies parse");
-    let mut results = verify_joint_liveness(&refs, Some(&analysis), budget());
+    let mut results = bounded(|bound| verify_joint_liveness(&refs, Some(&analysis), bound));
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -233,7 +235,7 @@ fn an_invariant_a_reaction_from_outside_breaks_is_broken() {
     let automatons = parsed(&[&pushed(rule), BOX, &push(Some("pusher"))]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = SendAnalysis::new(&policies(PUSHER_MAY)).expect("fixture policies parse");
-    let mut results = verify_joint_invariants(&refs, Some(&analysis), budget());
+    let mut results = bounded(|bound| verify_joint_invariants(&refs, Some(&analysis), bound));
     assert_eq!(results.len(), 1);
     let result = results.remove(0);
     assert!(

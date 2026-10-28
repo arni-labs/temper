@@ -177,7 +177,7 @@ impl ServerState {
         let plane = self
             .query_plane_store()
             .expect("repair requires a query plane");
-        if current.status == "Deleted" {
+        if current.is_tombstoned() {
             plane
                 .remove_projection(tenant.as_str(), &head.entity_type, &head.entity_id)
                 .await

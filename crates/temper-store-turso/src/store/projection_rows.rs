@@ -2,7 +2,7 @@
 //! holds: the journal append's, so a move's projection commits with its
 //! event, or the projection writer's own.
 
-use temper_runtime::persistence::{PersistenceError, storage_error};
+use temper_runtime::persistence::{PersistenceError, catalog_state_for_storage, storage_error};
 use temper_runtime::scheduler::sim_now;
 
 use super::field_index::{canonical_projection_status, indexed_projection_fields};
@@ -65,8 +65,10 @@ pub(super) async fn write_projection(
     let status = canonical_projection_status(row.status, state);
     let fields_json = serde_json::to_string(fields)
         .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
-    let new_hash = projection_hash(status, &fields_json, state);
-    let state_json = serde_json::to_string(state)
+    // The row holds each field once: in `fields`, not again in `state`.
+    let stored_state = catalog_state_for_storage(fields, state);
+    let new_hash = projection_hash(status, &fields_json, &stored_state);
+    let state_json = serde_json::to_string(&stored_state)
         .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
     let updated_at = sim_now().to_rfc3339();
     let sequence_nr = i64::try_from(row.sequence_nr).unwrap_or(i64::MAX);

@@ -125,20 +125,19 @@ def shards(packages, libraries):
     if SERVER in packages:
         for i in (1, 2):
             cells.append({"name": f"temper-server {i}/2", "args": f"-p {SERVER} --features {SERVER_FEATURES}",
-                          "partition": f"hash:{i}/2", "gepa": True, "turso": False, "doc": ""})
+                          "partition": f"hash:{i}/2", "gepa": True, "doc": ""})
     rest = sorted(packages - {SERVER})
     if rest:
         count = 2 if rest and HEAVY & set(rest) else 1
         args = " ".join(f"-p {name}" for name in rest)
         for i in range(1, count + 1):
             cells.append({"name": f"other packages {i}/{count}" if count > 1 else "other packages", "args": args,
-                          "partition": f"hash:{i}/{count}", "gepa": False,
-                          "turso": "temper-store-turso" in rest, "doc": ""})
+                          "partition": f"hash:{i}/{count}", "gepa": False, "doc": ""})
     documented = sorted(packages & libraries)
     if documented:
         # Doctests build the libraries with other features than the test binaries,
         # so they get a machine of their own rather than lengthening a shard.
-        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False, "turso": False,
+        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False,
                       "doc": " ".join(f"-p {name}" for name in documented)})
     return cells
 

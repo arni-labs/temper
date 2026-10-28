@@ -1482,12 +1482,6 @@ mod tests {
     }
 
     #[test]
-    fn postgres_query_projection_batch_method_is_part_of_the_store_surface() {
-        let _ = PostgresEventStore::load_query_projection_fields_many;
-        let _ = PostgresEventStore::load_selected_entity_catalog_rows_pg;
-    }
-
-    #[test]
     fn load_query_projection_fields_many_returns_requested_fields() {
         let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
             return;

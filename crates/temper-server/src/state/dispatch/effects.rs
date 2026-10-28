@@ -104,16 +104,14 @@ impl crate::state::ServerState {
         let entity_type = ctx.entity_type.to_string();
         let entity_id = ctx.entity_id.to_string();
         let status = response.state.status.clone();
+        // Only the kernel's tombstone removes a row; a spec action into a state
+        // named Deleted is projected like any other.
+        let tombstoned = response.state.is_tombstoned();
         let fields =
             self.query_projection_fields(ctx.tenant, ctx.entity_type, &response.state.fields);
         let projected_state = self.query_projection_state(&response.state);
         let sequence_nr = response.state.sequence_nr;
-        let operation = if status == "Deleted" {
-            "remove"
-        } else {
-            "upsert"
-        }
-        .to_string();
+        let operation = if tombstoned { "remove" } else { "upsert" }.to_string();
         let source = "queued_dispatch".to_string();
         let enqueued_at = Instant::now(); // determinism-ok: production-only projection queue metric
         let queue = self
@@ -122,7 +120,7 @@ impl crate::state::ServerState {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(queue) = queue {
-            let outcome = if status == "Deleted" {
+            let outcome = if tombstoned {
                 queue.enqueue_remove(
                     tenant.clone(),
                     entity_type.clone(),
@@ -211,7 +209,7 @@ impl crate::state::ServerState {
                     "inline_dispatch_fallback",
                     started_at.duration_since(enqueued_at),
                 );
-                let result = if status == "Deleted" {
+                let result = if tombstoned {
                     query_plane
                         .remove_projection(&tenant, &entity_type, &entity_id)
                         .await
@@ -628,7 +626,7 @@ impl crate::state::ServerState {
             Box::pin(self.project_until_visible(ctx, &response, error)).await;
         }
 
-        if response.state.status == "Deleted" {
+        if response.state.is_tombstoned() {
             // Queue cleanup before integrations can return early. Older queued
             // writes remain guarded until this ordered removal is applied.
             self.apply_query_projection_update(ctx, &response).await;

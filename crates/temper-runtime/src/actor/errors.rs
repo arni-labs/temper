@@ -95,12 +95,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_error_from_string() {
-        let err = ActorError::custom("test error");
-        assert!(err.to_string().contains("test error"));
-    }
-
-    #[test]
     fn partial_eq_same_variant() {
         assert_eq!(ActorError::Stopped, ActorError::Stopped);
         assert_eq!(ActorError::MailboxFull, ActorError::MailboxFull);

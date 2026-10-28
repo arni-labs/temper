@@ -110,10 +110,11 @@ impl ServerState {
     }
 
     /// Whether the record was deleted after `response`'s transition: whether
-    /// its journal holds an event past that transition's sequence that moved
-    /// it to `Deleted`, the kernel's tombstone or a spec action. That status
-    /// is the one whose row is removed, and the actor takes no action after
-    /// it. The journal is read, not the status cache: during a long outage the
+    /// its journal holds the kernel's tombstone past that transition's
+    /// sequence. Only the tombstone removes the row, and the actor takes no
+    /// action after it. A spec action into a state named `Deleted` writes its
+    /// own row at a higher sequence, which an older write cannot replace. The
+    /// journal is read, not the status cache: during a long outage the
     /// cache can evict the delete's status, and a retry that missed it would
     /// bring the deleted record back. An error means the journal could not be
     /// read, and the try must not write.
@@ -142,12 +143,8 @@ impl ServerState {
         .map_err(|read_error| {
             PersistenceError::Storage(format!("journal read for a delete failed: {read_error}"))
         })?;
-        Ok(after.iter().any(|event| {
-            event
-                .payload
-                .get("to_status")
-                .and_then(serde_json::Value::as_str)
-                == Some("Deleted")
-        }))
+        Ok(after
+            .iter()
+            .any(temper_runtime::persistence::PersistenceEnvelope::is_tombstone))
     }
 }

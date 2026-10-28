@@ -450,8 +450,9 @@ jobs:
           done
           for pid in "${pids[@]}"; do wait "$pid"; done
 
+      # Any package's tests may run against Turso's local sync server (the
+      # store's turso_sync tests, serve's push tests), as in the full lane.
       - name: Install tursodb for the Turso Sync tests
-        if: matrix.turso
         run: |
           set -euo pipefail
           curl -sSfL -o /tmp/tursodb.tar.xz \

@@ -221,13 +221,16 @@ fn verify_ioa_sources(ioa_sources: &std::collections::BTreeMap<String, String>) 
     Ok(())
 }
 
-/// Time and states the joint check of one entity's cross-entity invariants
-/// may spend: a directory check is run by its author or CI, not on a request
-/// thread, so it gets the most a validate-ioa caller may ask for.
-const JOINT_BUDGET: temper_verify::Budget = temper_verify::Budget {
-    time: std::time::Duration::from_secs(120),
-    states: 10_000_000,
-};
+/// Where a joint check takes its memory: what this host leaves free, as a
+/// server's checks do. Its time is not bounded: a walk that fits finishes.
+fn joint_bound(
+    progress: &temper_verify::composite::Progress,
+) -> temper_verify::composite::Bound<'_> {
+    temper_verify::composite::Bound {
+        room: &temper_server::host_room::HOST_ROOM,
+        progress,
+    }
+}
 
 /// Check every `[[invariant]]` that reads a related record and every
 /// `[[liveness]]` with `eventually` on the joint model, with the app's Cedar
@@ -251,8 +254,12 @@ fn verify_joint(
     }
     let analysis = temper_authz::SendAnalysis::new(policy_text).context("invalid Cedar policy")?;
     let refs: Vec<&temper_spec::automaton::Automaton> = parsed.iter().collect();
-    let invariants =
-        temper_verify::composite::verify_joint_invariants(&refs, Some(&analysis), JOINT_BUDGET);
+    let progress = temper_verify::composite::Progress::default();
+    let invariants = temper_verify::composite::verify_joint_invariants(
+        &refs,
+        Some(&analysis),
+        joint_bound(&progress),
+    );
     let invariant_rows = invariants.iter().map(|result| {
         let tag = match result.outcome {
             temper_verify::composite::JointOutcome::Holds => "PASS",
@@ -267,8 +274,12 @@ fn verify_joint(
         )
     });
     let invariants = print_joint_report("Cross-entity invariants", invariant_rows.collect());
-    let live =
-        temper_verify::composite::verify_joint_liveness(&refs, Some(&analysis), JOINT_BUDGET);
+    let progress = temper_verify::composite::Progress::default();
+    let live = temper_verify::composite::verify_joint_liveness(
+        &refs,
+        Some(&analysis),
+        joint_bound(&progress),
+    );
     let live_rows = live.iter().map(|result| {
         let tag = match result.outcome {
             temper_verify::composite::LivenessOutcome::Holds => "PASS",
@@ -322,7 +333,8 @@ fn print_joint_report(check: &str, rows: Vec<(&str, String, String)>) -> Result<
 /// of the entity trigger graph (so every entity is covered), checks the
 /// `no_dropped_reaction` property, and reports every dropped reaction with
 /// enough detail to name it. A dropped reaction GATES — it fails the command.
-/// An INCOMPLETE run (budget exhausted) fails complete-application verification.
+/// An INCOMPLETE run (the walk did not fit in the memory this host leaves it)
+/// fails complete-application verification.
 fn run_composite_verification(
     parsed_automata: &std::collections::BTreeMap<String, temper_spec::automaton::Automaton>,
 ) -> Result<()> {
@@ -332,7 +344,8 @@ fn run_composite_verification(
         parsed_automata.values().collect();
 
     println!("\nRunning composite cross-entity verification (ADR-0150)...");
-    let results = verify_all(&automaton_refs);
+    let progress = temper_verify::composite::Progress::default();
+    let results = verify_all(&automaton_refs, joint_bound(&progress));
     report_composite_results(&results)
 }
 
