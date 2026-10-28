@@ -39,7 +39,7 @@ fn run(model: &JointModel, entity: &str, name: &str) -> JointState {
         params: BTreeMap::new(),
     };
     let mut state = model
-        .commit(initial, entity, &action, &[], OUTSIDE, false)
+        .commit(initial, entity, &action, &[], OUTSIDE)
         .into_iter()
         .max_by_key(|(s, _)| s.inflight.len())
         .unwrap()
