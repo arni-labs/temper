@@ -65,6 +65,76 @@ kind = "same_id"
     )
 }
 
+/// `Pre` reacts to `Go` by sending `Push.Poke` as `service:pusher`, so a
+/// reaction of Push's without a principal runs as pusher too.
+const PRE: &str = r#"
+[automaton]
+name = "Pre"
+states = ["Ready", "Gone"]
+initial = "Ready"
+
+[[action]]
+name = "Go"
+kind = "input"
+from = ["Ready"]
+to = "Gone"
+
+[[action.triggers]]
+name = "poke"
+kind = "entity"
+principal = "pusher"
+target_entity = "Push"
+target_action = "Poke"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+"#;
+
+/// Like `pushed`, except that `Start` also asks a module whose trigger names
+/// no `on_success`, so the module's result may name `Done`, which the kernel
+/// then takes without Cedar.
+fn asks_a_module(rule: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Ask"
+states = ["Idle", "Asked", "Done", "Gone"]
+initial = "Idle"
+
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Idle"]
+to = "Asked"
+
+[[action.triggers]]
+name = "ask"
+kind = "wasm"
+module = "asker"
+
+[[action]]
+name = "Done"
+kind = "input"
+from = ["Asked"]
+to = "Done"
+{rule}
+"#
+    )
+}
+
+/// An invariant over Ask and Box that `Ask.Done` breaks, with no premise.
+const DONE_FILLS: &str =
+    "[[invariant]]\nname = \"rule\"\nassert = \"status != 'Done' || Box[Id].status == 'Full'\"\n";
+
+fn invariant(sources: &[&str], done: &str) -> JointInvariantResult {
+    let automatons = parsed(sources);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let analysis = SendAnalysis::new(&policies(done)).expect("fixture policies parse");
+    let mut results = verify_joint_invariants(&refs, Some(&analysis), budget());
+    assert_eq!(results.len(), 1);
+    results.remove(0)
+}
+
 /// A box nothing fills.
 const BOX: &str = r#"
 [automaton]
@@ -174,4 +244,36 @@ fn an_invariant_a_reaction_from_outside_breaks_is_broken() {
         result.to_string().contains("a reaction from Push"),
         "{result}"
     );
+}
+
+#[test]
+fn a_reaction_from_outside_without_a_principal_may_run_as_a_service_declared_further_out() {
+    // Pre pokes Push as pusher, and Push's reaction, with no principal of
+    // its own, sends Ask.Done as pusher too. Only pusher may send Done.
+    let result = invariant(&[&pushed(DONE_FILLS), BOX, &push(None), PRE], PUSHER_MAY);
+    assert!(
+        matches!(result.outcome, JointOutcome::Broken { .. }),
+        "{result}"
+    );
+    assert!(
+        result
+            .to_string()
+            .contains("a reaction from Push, as service:pusher"),
+        "{result}"
+    );
+}
+
+#[test]
+fn a_module_answer_a_refused_reaction_from_outside_also_sends_is_not_checked() {
+    // Push's reaction into Done runs as pusher, whom Cedar refuses, so the
+    // walk never takes Done that way. The module may still answer Done, as
+    // the runtime and without Cedar, so the rule is not checked.
+    let result = invariant(
+        &[&asks_a_module(DONE_FILLS), BOX, &push(Some("pusher"))],
+        "",
+    );
+    let text = result.to_string();
+    assert!(!result.holds(), "{text}");
+    assert!(text.contains("NOT CHECKED"), "{text}");
+    assert!(text.contains("Ask.Done (from Asked)"), "{text}");
 }

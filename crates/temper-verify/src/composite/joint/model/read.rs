@@ -270,6 +270,27 @@ pub(super) fn outer_reactions(
     outer
 }
 
+/// The services the triggers of types outside `scope` declare. A reaction
+/// from outside without a principal runs as whoever sent its source's
+/// action, and that may be a service a trigger further out declares, any
+/// number of hops up (the dispatcher keeps the sender along a cascade).
+pub(super) fn outside_principals(
+    by_name: &BTreeMap<&str, &Automaton>,
+    scope: &BTreeSet<String>,
+) -> Vec<Asker> {
+    let mut principals = Vec::new();
+    for (from, automaton) in by_name.iter().filter(|(name, _)| !scope.contains(**name)) {
+        for action in &automaton.actions {
+            for trigger in &action.triggers {
+                if let Some(asker) = senders::declared(trigger, from, &action.name) {
+                    principals.push(asker);
+                }
+            }
+        }
+    }
+    principals
+}
+
 /// The entity reactions whose source and target are both in `scope`.
 fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) -> Vec<Reaction> {
     let mut reactions = Vec::new();

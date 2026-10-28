@@ -18,7 +18,7 @@ use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Name, eval};
 
 use super::env::{Blind, ID, JointEnv, Records};
-use super::senders::{OUTSIDE, Senders};
+use super::senders::{OUTSIDE, RUNTIME, Senders};
 use super::slice::slice;
 use super::state::canonical;
 use super::{JointOutcome, JointState};
@@ -30,7 +30,8 @@ pub(crate) use drops::dropped_reactions;
 use order::{Order, Specs};
 pub(super) use read::Timeout;
 use read::{
-    Kernel, Reaction, Unchecked, named_literals, outer_reactions, tracked, unchecked_constraints,
+    Kernel, Reaction, Unchecked, named_literals, outer_reactions, outside_principals, tracked,
+    unchecked_constraints,
 };
 pub(super) use step::Move;
 pub(super) use walk::{Explored, unwalked_reason};
@@ -245,10 +246,20 @@ impl JointModel {
         } else {
             Vec::new()
         };
+        // One without a principal runs as whoever sent its source's action,
+        // which may be any service declared outside the scope.
+        let inherited = if outer_reactions.iter().any(|r| r.principal.is_none()) {
+            outside_principals(by_name, &scope)
+        } else {
+            Vec::new()
+        };
         let senders = Senders::new(
             by_name,
             &scope,
-            outer_reactions.iter().filter_map(|r| r.principal.clone()),
+            outer_reactions
+                .iter()
+                .filter_map(|r| r.principal.clone())
+                .chain(inherited),
             sending.policies,
         );
         let mut outer = OuterSends::new();
@@ -318,9 +329,7 @@ impl JointModel {
                             && !reactions
                                 .iter()
                                 .any(|r| &r.to == entity && &r.target_action == *action)
-                            && !outer
-                                .get(entity.as_str())
-                                .is_some_and(|sent| sent.contains_key(action.as_str()))
+                            && !Self::outer_answers(&outer, &senders, entity, action)
                     })
                     .cloned()
                     .collect();
@@ -347,6 +356,20 @@ impl JointModel {
             unwalked_answers,
             outer,
         }
+    }
+
+    /// Whether the walk takes `entity.action` as a module's background answer
+    /// does: a reaction from outside sends it as the runtime, which the
+    /// answer runs as, and Cedar surely lets the runtime send it, since the
+    /// answer itself skips Cedar. A reaction the walk sends as another
+    /// sender, or that Cedar may refuse, does not cover the answer.
+    fn outer_answers(outer: &OuterSends, senders: &Senders, entity: &str, action: &str) -> bool {
+        outer
+            .get(entity)
+            .and_then(|sent| sent.get(action))
+            .is_some_and(|by| {
+                by.contains_key(&RUNTIME) && senders.may(RUNTIME, entity, action) == May::Yes
+            })
     }
 
     /// The records as they start, without their ids.
