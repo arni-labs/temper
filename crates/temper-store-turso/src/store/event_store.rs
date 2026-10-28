@@ -121,11 +121,13 @@ impl EventStore for TursoEventStore {
         // ADR-0153: a single keyed probe of entity_key_index — present/absent in
         // O(log n), no candidate scan (the negative-existence access path). Bounded
         // regardless of how many entities the tenant/type holds, so it cannot trip
-        // the scan budget that produces the 413.
+        // the scan budget that produces the 413. It names the key's index: without
+        // it the planner may read every row of the type (driver/plan_check.rs).
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_id FROM entity_key_index \
+                "SELECT entity_id \
+                 FROM entity_key_index INDEXED BY sqlite_autoindex_entity_key_index_1 \
                  WHERE tenant = ?1 AND entity_type = ?2 AND key_name = ?3 AND key_hash = ?4",
                 params![tenant, entity_type, key_name, key_hash],
             )
@@ -187,7 +189,8 @@ impl EventStore for TursoEventStore {
             .await?;
         let tx = conn.begin_immediate().await.map_err(storage_error)?;
         tx.execute(
-            "DELETE FROM entity_vector_index \
+            // The entity's index (driver/plan_check.rs).
+            "DELETE FROM entity_vector_index INDEXED BY idx_evi_entity \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, entity_type, entity_id],
         )
@@ -225,7 +228,8 @@ impl EventStore for TursoEventStore {
         let conn = self.configured_connection().await?;
         let mut rows = conn
             .query(
-                "SELECT entity_id, vector FROM entity_vector_index \
+                // The partition's index (driver/plan_check.rs).
+                "SELECT entity_id, vector FROM entity_vector_index INDEXED BY idx_evi_partition \
                  WHERE tenant = ?1 AND entity_type = ?2 AND decl_name = ?3 AND model_tag = ?4 \
                  ORDER BY entity_id LIMIT ?5",
                 params![tenant, entity_type, decl_name, model_tag, limit as i64],

@@ -90,9 +90,10 @@ impl TursoEventStore {
         params: Vec<String>,
     ) -> Result<usize, PersistenceError> {
         let conn = self.configured_connection().await?;
+        let index = super::field_index::catalog_filter_index(where_clause);
         let sql = format!(
             "SELECT COUNT(*) \
-             FROM entity_catalog \
+             FROM entity_catalog {index}\
              WHERE tenant = ?1 AND entity_type = ?2 AND ({where_clause})"
         );
         let mut all_params: Vec<crate::driver::Value> = vec![
@@ -125,9 +126,10 @@ fn turso_query_field_page_sql(
     } else {
         "entity_id"
     };
+    let index = super::field_index::catalog_filter_index(where_clause);
     format!(
         "SELECT {select} \
-         FROM entity_catalog \
+         FROM entity_catalog {index}\
          WHERE tenant = ?1 AND entity_type = ?2 AND ({where_clause}) \
          ORDER BY {order_sql} \
          LIMIT ?{limit_param} OFFSET ?{offset_param}"
@@ -189,6 +191,20 @@ mod tests {
 
         assert!(sql.starts_with("SELECT entity_id FROM entity_catalog"));
         assert!(!sql.contains("COUNT(*) OVER()"));
+    }
+
+    #[test]
+    fn a_page_that_fixes_the_status_reads_the_status_index() {
+        let fixed = turso_query_field_page_sql("status = ?3", "entity_id ASC", 4, 5, false);
+        assert!(fixed.contains("FROM entity_catalog INDEXED BY idx_entity_catalog_status WHERE"));
+        for open in [
+            "status IN (?3, ?4)",
+            "(x = ?3 OR status = ?4)",
+            "(NOT status = ?3)",
+        ] {
+            let sql = turso_query_field_page_sql(open, "entity_id ASC", 5, 6, false);
+            assert!(!sql.contains("INDEXED BY"), "{sql}");
+        }
     }
 
     #[test]
