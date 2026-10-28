@@ -1,14 +1,18 @@
 //! Helpers shared by the Turso Sync tests: a local sync server, a machine's
 //! data folder, and writes to count.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{EventMetadata, EventStore, PersistenceEnvelope};
 use temper_store_turso::TursoEventStore;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 
 pub const TOKEN: &str = "local-sync-server-ignores-tokens";
 
@@ -311,4 +315,56 @@ pub async fn switch(upstream: &str) -> (String, std::sync::Arc<std::sync::atomic
         }
     });
     (url, on)
+}
+
+/// One logged line: the span it was logged in, its message and its fields.
+#[derive(Clone, Debug)]
+pub struct Line {
+    pub span: Option<String>,
+    pub target: String,
+    pub message: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+/// Every line logged on this thread while it listens.
+#[derive(Clone, Default)]
+pub struct Lines(Arc<Mutex<Vec<Line>>>);
+
+impl Lines {
+    pub fn find(&self, matches: impl Fn(&Line) -> bool) -> Option<Line> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| matches(line))
+            .cloned()
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for Lines
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        let message = fields.0.remove("message").unwrap_or_default();
+        self.0.lock().unwrap().push(Line {
+            span: ctx.event_span(event).map(|span| span.name().to_string()),
+            target: event.metadata().target().to_string(),
+            message,
+            fields: fields.0,
+        });
+    }
 }

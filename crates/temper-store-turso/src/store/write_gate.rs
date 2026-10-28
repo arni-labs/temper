@@ -37,8 +37,9 @@ const GIVE_WAY_RECHECK: Duration = Duration::from_millis(25);
 
 /// A wait at the gate this long is logged, and so is a hold this long that
 /// kept another writer waiting: the pair names who held the gate while others
-/// queued. Metrics carry no Temper id in Datadog, so the logs are what tell
-/// one Temper's queue from another's.
+/// queued, and the hold says how much of it went to getting a connection and
+/// how much to the transaction. Metrics carry no Temper id in Datadog, so the
+/// logs are what tell one Temper's queue from another's.
 const SLOW_TURN: Duration = Duration::from_millis(100);
 
 /// The process-local queue for writes to one database: its one permit, and
@@ -81,6 +82,10 @@ pub(crate) struct GatePermit {
     gate: Arc<WriteGate>,
     operation: &'static str,
     acquired: Instant,
+    /// When the writer's connection was ready. Getting one can wait behind a
+    /// push or a checkpoint, so a slow hold is split at this point into that
+    /// wait and the transaction.
+    connected: Option<Instant>,
 }
 
 impl GatePermit {
@@ -90,6 +95,7 @@ impl GatePermit {
             gate: Arc::clone(gate),
             operation,
             acquired: Instant::now(),
+            connected: None,
         }
     }
 }
@@ -101,9 +107,15 @@ impl Drop for GatePermit {
         // The permit is still this writer's here: it is let go after `drop`.
         let waiting = self.gate.waiting.load(Ordering::Acquire);
         if held >= SLOW_TURN && waiting > 0 {
+            let held_ms = held.as_millis() as u64;
+            let connection_ms = self
+                .connected
+                .map_or(0, |at| at.duration_since(self.acquired).as_millis() as u64);
             tracing::warn!(
                 operation = self.operation,
-                held_ms = held.as_millis() as u64,
+                held_ms,
+                connection_ms,
+                transaction_ms = held_ms.saturating_sub(connection_ms),
                 waiting,
                 "turso.write_gate held"
             );
@@ -126,12 +138,11 @@ impl TursoEventStore {
     /// A connection that may write on a permit already taken.
     pub(super) async fn write_connection_on(
         &self,
-        permit: GatePermit,
+        mut permit: GatePermit,
     ) -> Result<WriteConnection, PersistenceError> {
-        Ok(WriteConnection::new(
-            self.configured_connection().await?,
-            permit,
-        ))
+        let conn = self.configured_connection().await?;
+        permit.connected = Some(Instant::now());
+        Ok(WriteConnection::new(conn, permit))
     }
 
     /// Acquire the process-local Turso write lane.
