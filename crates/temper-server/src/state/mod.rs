@@ -20,6 +20,7 @@ mod projection_backfill;
 mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
+pub(crate) mod redecide;
 mod runtime_metrics;
 mod spec_change;
 mod start_runtime;

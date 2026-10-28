@@ -9,7 +9,8 @@ use super::constraints::{
     ConstraintViolation, post_write_invariant_checks, pre_upsert_field_invariant_checks,
     pre_upsert_relation_checks,
 };
-use crate::state::{ServerState, VerificationGateError};
+use crate::response::{ODataResponse, odata_error};
+use crate::state::{DispatchError, ServerState, VerificationGateError};
 
 /// Extract the tenant ID from request headers.
 ///
@@ -268,3 +269,23 @@ pub(super) fn check_has_stream_or_400(
         .into_response())
     }
 }
+
+/// The answer when a write's record could not be read back for its decision
+/// (`ServerState::materialize_authorized_snapshot`).
+///
+/// A conflict is the record created differently than the write's checks read
+/// it: 409 `AuthorizationStateChanged`, a write that is decided again. Any
+/// other error is the read itself failing, such as an actor ask that timed
+/// out: 500 `ReadError`, the answer the same read gets before the decision,
+/// because the record did not change.
+pub(super) fn authorized_snapshot_failure(error: &DispatchError) -> ODataResponse {
+    let (status, code) = match error {
+        DispatchError::Conflict(_) => (StatusCode::CONFLICT, "AuthorizationStateChanged"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "ReadError"),
+    };
+    odata_error(status, code, &error.to_string())
+}
+
+#[cfg(test)]
+#[path = "common_test.rs"]
+mod authorized_snapshot_failure_tests;

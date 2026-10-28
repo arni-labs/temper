@@ -22,9 +22,13 @@ use super::types::{EntityEvent, EntityState, MAX_EVENTS_SINCE_SNAPSHOT};
 /// Attempts allowed after the first, matching the `Action` arm's ADR-0046 budget.
 const MAX_RETRIES: u32 = 2;
 
-/// Why a field update is not in the journal. `state` has been restored either
-/// way: a refusal never leaves a partial write.
+/// Why a field update is not in the journal. `state` has been restored (a
+/// refusal never leaves a partial write), except on `RecordChanged`, where it
+/// is caught up.
 pub(super) enum NotUpdated {
+    /// The update was decided on a state the journal had already moved past.
+    /// The record is caught up, and the route decides the update again on it.
+    RecordChanged,
     /// Refused or failed before the store was asked; the caller replies with
     /// the reason verbatim.
     Failed(String),
@@ -34,13 +38,15 @@ pub(super) enum NotUpdated {
 
 /// Apply a field update and make it durable, or refuse it.
 ///
-/// `Ok(())` means the update is in the journal.
+/// `Ok(())` means the update is in the journal. An error means it is not, and
+/// `state` has been restored (a refusal never leaves a partial write) or, on
+/// [`NotUpdated::RecordChanged`], caught up with the journal.
 pub(super) async fn commit_field_update(
     actor: &EntityActor,
     state: &mut EntityState,
     fields: Value,
     replace: bool,
-    expected_precondition: Option<String>,
+    has_precondition: bool,
 ) -> Result<(), NotUpdated> {
     if actor
         .table
@@ -51,12 +57,6 @@ pub(super) async fn commit_field_update(
         return Err(NotUpdated::Failed(
             "Strict entities require a declared action for field changes".to_owned(),
         ));
-    }
-    let has_precondition = expected_precondition.is_some();
-    if let Some(expected) = expected_precondition
-        && effects::entity_authorization_precondition(state) != expected
-    {
-        return Err(NotUpdated::Failed(STALE_AUTHORIZATION.to_string()));
     }
     if state.status == "Deleted" {
         return Err(NotUpdated::Failed(
@@ -134,10 +134,14 @@ pub(super) async fn commit_field_update(
             // re-applying would commit against state the caller never saw and
             // Cedar never evaluated. `entity_ops` already caps preconditioned asks
             // at a single attempt for that reason; retrying here would reintroduce
-            // one layer down the retry the layer above forbids.
-            Err(PersistenceError::ConcurrencyViolation { .. }) if has_precondition => {
-                state.fields = previous_fields;
-                return Err(NotUpdated::Failed(STALE_AUTHORIZATION.to_string()));
+            // one layer down the retry the layer above forbids. The record is
+            // caught up instead, so the route decides the update again on it.
+            Err(PersistenceError::ConcurrencyViolation { actual, .. }) if has_precondition => {
+                if let Err(reason) = catch_up(actor, state, 1, actual, action).await {
+                    state.fields = previous_fields;
+                    return Err(NotUpdated::Failed(reason));
+                }
+                return Err(NotUpdated::RecordChanged);
             }
             Err(PersistenceError::ConcurrencyViolation { actual, .. }) if attempt < MAX_RETRIES => {
                 attempt += 1;
@@ -190,10 +194,10 @@ pub(super) async fn commit_field_update(
     Ok(())
 }
 
-/// The refusal an update gets when the state it was authorized against moved.
-/// Shared by the entry check and the conflict path so a caller cannot tell the
-/// two apart — both mean "re-read and retry".
-const STALE_AUTHORIZATION: &str =
+/// The refusal an update gets when the state it was authorized against moved,
+/// whether the actor's entry check or a conflict on its append found it. The
+/// route then decides the update again on the record as it is now.
+pub(super) const STALE_AUTHORIZATION: &str =
     "field update authorization became stale; retry against current state";
 
 fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent {
@@ -237,7 +241,8 @@ fn budget_refusal(actor: &EntityActor, state: &EntityState, replace: bool) -> Op
     ))
 }
 
-/// Rebuild `state` from the journal after a sequence conflict.
+/// Rebuild `state` from the journal after a sequence conflict. A field update
+/// and a delete that met one catch up through here before they answer.
 ///
 /// Rebuilds from a *fresh* initial state, exactly as
 /// `recover_entity_state_from_store` does. `replay_events` applies onto whatever
@@ -248,7 +253,7 @@ fn budget_refusal(actor: &EntityActor, state: &EntityState, replace: bool) -> Op
 /// the caller, upserted into the query projection, and made durable by the next
 /// snapshot. Rolling back `fields` alone cannot help — those other fields were
 /// never part of the speculative update.
-async fn catch_up(
+pub(super) async fn catch_up(
     actor: &EntityActor,
     state: &mut EntityState,
     attempt: u32,
@@ -268,7 +273,7 @@ async fn catch_up(
         action = %action,
         actual_seq = actual,
         attempt,
-        "field update hit optimistic-concurrency violation; replaying and retrying"
+        "write hit an optimistic-concurrency violation; catching up with the journal"
     );
 
     let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend) else {
