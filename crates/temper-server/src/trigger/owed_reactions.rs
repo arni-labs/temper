@@ -3,7 +3,7 @@
 //! The move goes through the core dispatch, without its own reaction cascade:
 //! [`super::ReactionDispatcher`] runs the cascade of a move that lands at once.
 //! A move the store failed is kept (`state::dispatch::owed_writes`) and sent
-//! again under the reaction's key until it lands or is refused, and its
+//! again under the reaction's key until it lands or fails otherwise, and its
 //! cascade runs when it lands.
 
 use std::sync::{Arc, PoisonError};

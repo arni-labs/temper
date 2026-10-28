@@ -73,9 +73,9 @@ impl ServerState {
     /// is its action and values, as the integration's caller under the
     /// answer's own key. Inline it runs as the caller and through its own
     /// integrations, and the caller gets its reply. In the background it runs
-    /// as `service`, and a dispatch error that refused it is returned for the
-    /// integration's failure path. Either way it is settled
-    /// ([`Self::settle_answer`]): a write the store failed is owed.
+    /// as `service`, and a dispatch error that is not the store's is returned
+    /// for the integration's failure path (ADR-0152). Either way it is
+    /// settled ([`Self::settle_answer`]): a write the store failed is owed.
     pub(super) async fn send_answer(
         &self,
         mut sent: OwedMove,
@@ -112,7 +112,7 @@ impl ServerState {
                 let reply = sent.send(self).await;
                 let action = sent.action.clone();
                 match (self.settle_answer(sent, &reply), reply) {
-                    (Attempt::Refused(_), Err(error)) => {
+                    (Attempt::Failed(_), Err(error)) => {
                         let msg =
                             format!("failed to dispatch {source} callback '{action}': {error}");
                         tracing::error!(callback = %action, %error, "{msg}");
@@ -125,8 +125,9 @@ impl ServerState {
     }
 
     /// Settle the first try of an answer, a module's or an adapter's, sent as
-    /// `sent`: a refusal is journaled, and a write the store failed is owed,
-    /// sent again until it lands or is refused (see `owed_writes`).
+    /// `sent`: a reply that failed is journaled as a rejected answer, and a
+    /// write the store failed is owed, sent again until it lands or fails
+    /// otherwise (see `owed_writes`).
     fn settle_answer(
         &self,
         sent: OwedMove,
@@ -136,8 +137,8 @@ impl ServerState {
         match &attempt {
             Attempt::Landed => {}
             // A dispatch error the caller reports itself, as before.
-            Attempt::Refused(_) if reply.is_err() => {}
-            Attempt::Refused(error) => {
+            Attempt::Failed(_) if reply.is_err() => {}
+            Attempt::Failed(error) => {
                 self.record_answer_refusal(sent.entity_ref(), &sent.action, error, &sent.params);
             }
             Attempt::StoreFailed(error) => {
@@ -175,11 +176,11 @@ impl ServerState {
     }
 }
 
-/// Send an owed answer again, journaling it if it is refused this time.
+/// Send an owed answer again, journaling it if it fails otherwise this time.
 fn answer_again(state: ServerState, sent: std::sync::Arc<OwedMove>) -> OwedTry {
     Box::pin(async move {
         let attempt = Attempt::of(&sent.send(&state).await);
-        if let Attempt::Refused(error) = &attempt {
+        if let Attempt::Failed(error) = &attempt {
             state.record_answer_refusal(sent.entity_ref(), &sent.action, error, &sent.params);
         }
         attempt

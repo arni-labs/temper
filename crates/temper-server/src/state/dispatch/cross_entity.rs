@@ -335,12 +335,11 @@ impl ChildSpawn {
 }
 
 impl crate::state::ServerState {
-    /// Create `child`, then send its initial action. The child's type refusing
-    /// its creation (its first event too large, or fields it does not take)
-    /// and a refused initial action are final, and the child stays in its
-    /// first state; any other failure is the store's. Creating a child that
-    /// exists already reads it, so a try after a creation that landed goes on
-    /// to the initial action.
+    /// Create `child`, then send its initial action. A creation the store did
+    /// not take, or an initial action it did not, is the store's failure; any
+    /// other failure is final, and a child whose initial action failed stays
+    /// in its first state. Creating a child that exists already reads it, so
+    /// a try after a creation that landed goes on to the initial action.
     async fn spawn_child(&self, child: &ChildSpawn) -> Attempt {
         let (tenant, child_type, child_id) = (&child.tenant, &child.child_type, &child.child_id);
         let created = match self
@@ -354,27 +353,11 @@ impl crate::state::ServerState {
             .await
         {
             Ok(created) => created,
-            Err(CreateError::StoreUnavailable(error)) => {
+            Err(error) => {
                 tracing::error!(%child_type, %child_id, %error, "failed to spawn child entity");
-                return Attempt::StoreFailed(error);
-            }
-            Err(CreateError::Failed(error)) => {
-                tracing::error!(%child_type, %child_id, %error, "failed to spawn child entity");
-                let refused = self
-                    .check_created_event(tenant, child_type, child_id, &child.initial_fields)
-                    .map_err(|error| error.to_string())
-                    .and_then(|()| match child.initial_fields.as_object() {
-                        // Creation checks only the fields it is given.
-                        Some(fields) if fields.is_empty() => Ok(()),
-                        _ => self.validate_initial_entity_fields(
-                            tenant,
-                            child_type,
-                            &child.initial_fields,
-                        ),
-                    });
-                return match refused {
-                    Err(_) => Attempt::Refused(error),
-                    Ok(()) => Attempt::StoreFailed(error),
+                return match error {
+                    CreateError::StoreUnavailable(error) => Attempt::StoreFailed(error),
+                    CreateError::Failed(error) => Attempt::Failed(error),
                 };
             }
         };
@@ -409,7 +392,7 @@ impl crate::state::ServerState {
             )
             .await;
         let attempt = Attempt::of(&reply);
-        if let Attempt::Refused(error) = &attempt {
+        if let Attempt::Failed(error) = &attempt {
             // The child stays in its first state: arm that state's timer, as
             // for no initializer.
             self.arm_state_timeouts_on_creation(
@@ -426,7 +409,7 @@ impl crate::state::ServerState {
     }
 
     /// Keep a child whose spawn the store failed as an owed write: it is
-    /// spawned again (`owed_writes`) until it lands or is refused.
+    /// spawned again (`owed_writes`) until it lands or fails otherwise.
     fn keep_child_spawn(&self, child: ChildSpawn, error: &str) {
         let owed = OwedWrite {
             tenant: child.tenant.clone(),

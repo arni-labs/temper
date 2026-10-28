@@ -20,8 +20,8 @@
 //!
 //! Invariants, per seed:
 //! - the move that sets the write off lands exactly once;
-//! - within an hour of the store taking writes again, the owed write has
-//!   landed exactly once: never lost, never applied twice;
+//! - within [`RECOVERY_WINDOW`] of the store taking writes again, the owed
+//!   write has landed exactly once: never lost, never applied twice;
 //! - the owing record's state in memory is the state its journal gives;
 //! - a timer that fired leaves no row behind, which the next boot would fire
 //!   again.
@@ -73,8 +73,18 @@ const JOB: &str = "job";
 const CHILD: &str = "child";
 /// The longest the store stays down, before a timer's wait is added.
 const LONGEST_STRETCH_SECS: usize = 3_600;
-/// How soon after the store takes writes again an owed write has landed.
-const RECOVERY_WINDOW: Duration = Duration::from_secs(3_600);
+/// The longest wait between two tries of an owed write: the kernel's
+/// `state::dispatch::owed_writes::LAST_RETRY_WAIT`, which a test cannot read.
+const LAST_RETRY_WAIT: Duration = Duration::from_secs(3_600);
+/// How soon after the store takes writes again an owed write has landed. The
+/// first try after the store is back comes within one capped wait and meets
+/// the seeded fault, so the write may land only on the try after it, up to
+/// two capped waits after the store is back. The minute on top covers the
+/// work of those tries in the process (the fault's late landing and the
+/// actor's conflict retries take milliseconds).
+const RECOVERY_WINDOW: Duration = LAST_RETRY_WAIT
+    .saturating_mul(2)
+    .saturating_add(Duration::from_secs(60));
 
 /// The write a move sets off, which the kernel owes once the move commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,8 +368,9 @@ fn run_seed(owed: Owed, seed: u64, store_stops: bool) -> (Drawn, Result<(), Stri
         Fault::clear(&store, &owing.journal());
         let after = read_journal(&store, owing).await;
         run.trace.push(format!(
-            "the store takes writes again, the first to {} {fault:?}; an hour later it holds {:?}",
+            "the store takes writes again, the first to {} {fault:?}; {}s later it holds {:?}",
             owing.journal(),
+            RECOVERY_WINDOW.as_secs(),
             after.events
         ));
 

@@ -2,24 +2,26 @@
 //!
 //! A move that commits can owe further writes, each a move of its own sent
 //! after the commit: its module's or adapter's answer, the action its state
-//! timer fires, a reaction on another record, a child it spawns. Cedar, a
-//! guard or the record's state refusing one is final. The store failing one
-//! is not: the write is kept here and tried again, first after
-//! [`FIRST_RETRY_WAIT`] and then twice as long after each try, up to
-//! [`LAST_RETRY_WAIT`], until it lands or is refused. A scheduled action's
-//! fire waits the same way.
+//! timer fires, a reaction on another record, a child it spawns. The store
+//! failing one is not final: the write is kept here and tried again, first
+//! after [`FIRST_RETRY_WAIT`] and then twice as long after each try, up to
+//! [`LAST_RETRY_WAIT`], until it lands or fails for another reason. Any
+//! other failure (Cedar, a guard or the record's state refusing it, a busy
+//! actor) is final, and each owed write handles it as it did before. A
+//! scheduled action's fire waits the same way.
 //!
 //! Every try carries the same idempotency key, derived from the key the move
-//! committed under and the owed write's identity. An unkeyed caller's move
+//! committed under and the owed write's identity (a timer's fire, from its
+//! arming and the task that fires it). An unkeyed caller's move
 //! gets a made-up key when it is dispatched, so its follow-ups derive theirs
 //! from that one. A try whose write landed though its answer was lost (the
 //! outcome unknown) is then answered as a duplicate by the next try, and the
 //! write applies once.
 //!
 //! Which failures are the store's is read from the reply ([`Attempt::of`]):
-//! a reply that neither succeeded nor was refused (the write failed, or its
-//! outcome is unknown), or a dispatch error that is not a refusal
-//! ([`DispatchError::is_refusal`]).
+//! a reply marked `store_unavailable`, which the actor answers for a
+//! `Storage`, `OutcomeUnknown` or `StorageFull` persistence error, or
+//! [`DispatchError::StoreUnavailable`], which carries one.
 //!
 //! Kept writes live only in this process, so a restart loses them, except a
 //! state timer's fire, whose row arms it again at boot. The gauge
@@ -46,11 +48,9 @@ use crate::state::ServerState;
 /// with each try, up to [`LAST_RETRY_WAIT`].
 pub(super) const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
 
-/// The longest wait between tries. A store that is down for long is not
-/// hammered, and a write still lands within an hour of the store taking
-/// writes again when its first try after that fails once more: the second
-/// try comes at most two waits after the store is back.
-pub(super) const LAST_RETRY_WAIT: Duration = Duration::from_secs(1800);
+/// The longest wait between tries: a store that is down for long is tried
+/// about once an hour, not hammered.
+pub(super) const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 /// Which write a committed move owes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +101,8 @@ pub(crate) struct OwedWrite {
 pub(crate) enum Attempt {
     /// It committed, or already had under its key, or is no longer owed.
     Landed,
-    /// Refused for a reason the store did not give: final.
-    Refused(String),
+    /// It did not land for a reason other than the store's: final.
+    Failed(String),
     /// The store failed it: it was not written, or its outcome is unknown.
     StoreFailed(String),
 }
@@ -112,17 +112,19 @@ impl Attempt {
     pub(crate) fn of(reply: &Result<EntityResponse, DispatchError>) -> Self {
         match reply {
             Ok(response) if response.success => Self::Landed,
-            Ok(response) if response.refused => {
-                Self::Refused(response.error.clone().unwrap_or_else(|| "refused".into()))
-            }
-            Ok(response) => Self::StoreFailed(
-                response
+            Ok(response) => {
+                let error = response
                     .error
                     .clone()
-                    .unwrap_or_else(|| "write failed".into()),
-            ),
-            Err(error) if error.is_refusal() => Self::Refused(error.to_string()),
-            Err(error) => Self::StoreFailed(error.to_string()),
+                    .unwrap_or_else(|| "write failed".into());
+                if response.store_unavailable {
+                    Self::StoreFailed(error)
+                } else {
+                    Self::Failed(error)
+                }
+            }
+            Err(error @ DispatchError::StoreUnavailable(_)) => Self::StoreFailed(error.to_string()),
+            Err(error) => Self::Failed(error.to_string()),
         }
     }
 }
@@ -184,8 +186,9 @@ impl OwedMove {
 
 impl ServerState {
     /// Keep `owed`, whose try the store failed with `error`, and run
-    /// `try_again` with the waits above until a try lands or is refused. A
-    /// write already held under its key is left to the task that holds it.
+    /// `try_again` with the waits above until a try lands or fails for
+    /// another reason. A write already held under its key is left to the task
+    /// that holds it.
     pub(crate) fn keep_owed_write<F>(&self, owed: OwedWrite, error: &str, try_again: F)
     where
         F: Fn(ServerState) -> OwedTry + Send + 'static,
@@ -227,10 +230,10 @@ impl ServerState {
                 wait = (wait * 2).min(LAST_RETRY_WAIT);
                 match try_again(state.clone()).await {
                     Attempt::Landed => break,
-                    Attempt::Refused(error) => {
+                    Attempt::Failed(error) => {
                         tracing::warn!(tenant = %owed.tenant, entity_type = %owed.entity_type,
                             entity_id = %owed.entity_id, owed_write = owed.kind.as_str(),
-                            idempotency_key = %key, %error, "owed write refused when tried again");
+                            idempotency_key = %key, %error, "owed write failed when tried again");
                         break;
                     }
                     Attempt::StoreFailed(error) => {

@@ -538,7 +538,7 @@ pub struct ServerState {
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
     /// The writes committed moves owe that the store has not taken yet, by
-    /// idempotency key, each tried again until it lands or is refused
+    /// idempotency key, each tried again until it lands or fails otherwise
     /// (`dispatch::owed_writes`). In memory only: a restart loses them.
     pub(crate) owed_writes: Arc<Mutex<BTreeMap<String, dispatch::owed_writes::OwedWrite>>>,
     /// Published under the registry lock after durable timer recovery.
