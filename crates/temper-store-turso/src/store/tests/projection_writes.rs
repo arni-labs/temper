@@ -88,6 +88,7 @@ async fn stored(
     let mut rows = conn
         .query(
             "SELECT sequence_nr, updated_at, status, fields, state FROM entity_catalog \
+             INDEXED BY sqlite_autoindex_entity_catalog_1 \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, ENTITY_TYPE, entity_id],
         )

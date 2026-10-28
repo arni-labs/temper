@@ -9,7 +9,7 @@ use temper_spec::predicate::{Truth, eval};
 
 use super::super::env::Blind;
 use super::super::senders::OUTSIDE;
-use super::super::state::canonical;
+use super::super::state::{ReactionStep, canonical};
 use super::super::{Call, Dispatch, JointState};
 use super::commit::add;
 use super::labels::rename_label;
@@ -212,7 +212,8 @@ impl JointModel {
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
                 let text = format!("{entity}.{action}");
-                for (outcome, then) in self.commit(state.clone(), entity, action, 0, OUTSIDE, true)
+                for (outcome, then) in
+                    self.commit(state.clone(), entity, action, &[], OUTSIDE, true)
                 {
                     let certainty = Certainty::unless(known, Unsure).then(then);
                     outcomes.push((outcome, text.clone(), certainty));
@@ -237,11 +238,18 @@ impl JointModel {
                     from.join(" or "),
                     self.senders.name(*by)
                 );
+                // A reaction: its chain starts at this step, since its
+                // source is outside the model.
+                let chain = vec![ReactionStep {
+                    entity_type: entity.clone(),
+                    action: action.name.clone(),
+                    generated_for: None,
+                }];
                 if self.action_reads_related(entity, &action.name) {
                     // Like a send from outside, except that Cedar decides
                     // it as its sender when it lands.
                     let mut dispatch = sent(entity, action, *by, false);
-                    dispatch.depth = 1;
+                    dispatch.chain = chain;
                     let mut next = state.clone();
                     add(&mut next, dispatch);
                     outcomes.push((next, format!("{text} sent"), Sure));
@@ -255,7 +263,7 @@ impl JointModel {
                     let taken = if may == May::No {
                         Vec::new()
                     } else {
-                        self.commit(state.clone(), entity, action, 1, *by, false)
+                        self.commit(state.clone(), entity, action, &chain, *by, false)
                     };
                     for (outcome, then) in taken {
                         let certainty = Certainty::unless(known, Unsure).then(then);
@@ -302,7 +310,8 @@ impl JointModel {
                         let refused = format!("{text} refused by its record");
                         outcomes.push((next.clone(), refused, OneOf));
                     }
-                    for (outcome, then) in self.commit(next, &call.to, action, 0, call.by, inline) {
+                    for (outcome, then) in self.commit(next, &call.to, action, &[], call.by, inline)
+                    {
                         let certainty = Certainty::unless(known, OneOf).then(then);
                         outcomes.push((outcome, text.clone(), certainty));
                     }
@@ -348,9 +357,10 @@ impl JointModel {
             Move::Arrive(dispatch) => {
                 let mut next = state.clone();
                 remove(&mut next, dispatch);
-                // Cedar decides a reaction as its sender; every other
-                // dispatch was decided at its entry point, or is the kernel's.
-                let may = if dispatch.depth > 0 {
+                // Cedar decides a reaction, which carries its chain, as its
+                // sender; every other dispatch was decided at its entry
+                // point, or is the kernel's.
+                let may = if !dispatch.chain.is_empty() {
                     self.senders
                         .may_in(dispatch.by, &dispatch.to, &dispatch.action, state)
                 } else {
@@ -470,7 +480,7 @@ fn sent(entity: &str, action: &TemperModelAction, by: u32, inline: bool) -> Disp
         target_state: action.target_state.clone(),
         params: action.params.clone(),
         read: true,
-        depth: 0,
+        chain: Vec::new(),
         via: None,
         by,
         inline,

@@ -116,6 +116,9 @@ pub(super) fn tracked(
             }
         }
         for reaction in &reactions {
+            if let Some(TargetResolver::CreateIfMissing { id_field }) = &reaction.resolve {
+                grew |= track(&reaction.from, id_field);
+            }
             if records == Records::ById
                 && let Some(TargetResolver::Field { id_field }) = &reaction.resolve
             {

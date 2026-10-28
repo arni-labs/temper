@@ -119,13 +119,15 @@ async fn a_sub_write_that_committed_does_not_run_the_composites_on_failure() {
     let state = notice_server(&release_with_own_effect(), Some(stack), PERMIT_ALL);
     act(&state, "Release", RELEASE, "Hold").await;
     // The Release's `Approve` commits, then its query projection fails, so its
-    // write answers unsuccessfully although the Release moved.
+    // write waits, trying the projection again, although the Release moved.
     plane.fail_release.store(true, Ordering::SeqCst);
 
     act(&state, "Notice", NOTICE, "PutItLive").await;
 
     let (release, _) = settle(&state, "Release", RELEASE, &["Live"]).await;
     assert_eq!(release, "Live", "the sub-write committed");
+    // The projection lands on a later try, and the sub-write answers.
+    plane.fail_release.store(false, Ordering::SeqCst);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
         assert_eq!(

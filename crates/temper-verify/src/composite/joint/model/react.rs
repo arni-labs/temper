@@ -8,10 +8,12 @@ use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
 use super::super::senders::RUNTIME;
+use super::super::state::ReactionStep;
 use super::super::{Call, Dispatch, JointState};
+use super::JointModel;
 use super::commit::add;
+use super::read::Reaction;
 use super::step::{Certainty, Move};
-use super::{JointModel, MAX_REACTION_DEPTH, Reaction};
 use crate::model::semantics::successors_budgeted;
 use crate::model::{ModelString, ParamValue, TemperModelAction};
 
@@ -27,11 +29,18 @@ impl JointModel {
         state: JointState,
         source: &str,
         action: &str,
-        depth: u32,
+        chain: &[ReactionStep],
         by: u32,
         inline: bool,
     ) -> Vec<(JointState, Certainty)> {
-        let outcomes = self.react(state, source, action, depth, by);
+        // Outside actions and detached work start a fresh chain.
+        let root = [ReactionStep {
+            entity_type: source.to_string(),
+            action: action.to_string(),
+            generated_for: None,
+        }];
+        let chain = if chain.is_empty() { &root } else { chain };
+        let outcomes = self.react(state, source, action, chain, by);
         let key = (source.to_string(), action.to_string());
         let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
             return outcomes;
@@ -156,13 +165,10 @@ impl JointModel {
         state: JointState,
         source: &str,
         action: &str,
-        depth: u32,
+        chain: &[ReactionStep],
         by: u32,
     ) -> Vec<(JointState, Certainty)> {
         let mut outcomes = vec![(state, Certainty::Sure)];
-        if depth >= MAX_REACTION_DEPTH {
-            return outcomes;
-        }
         for (index, reaction) in self
             .reactions
             .iter()
@@ -208,13 +214,42 @@ impl JointModel {
                 if reaches == Found::Unknown {
                     after.push((state.clone(), known));
                 }
+                let generated_for = match &reaction.resolve {
+                    Some(TargetResolver::Create) => Some(reaction.to.clone()),
+                    Some(TargetResolver::CreateIfMissing { id_field }) => {
+                        if state.records[source]
+                            .strings
+                            .get(id_field)
+                            .is_some_and(|id| !id.is_empty())
+                        {
+                            None
+                        } else {
+                            Some(reaction.to.clone())
+                        }
+                    }
+                    Some(TargetResolver::SameId) => {
+                        chain.last().and_then(|step| step.generated_for.clone())
+                    }
+                    _ => None,
+                };
+                let step = ReactionStep {
+                    entity_type: reaction.to.clone(),
+                    action: reaction.target_action.clone(),
+                    generated_for,
+                };
+                if chain.iter().any(|taken| step.repeats(taken)) {
+                    after.push((state, known));
+                    continue;
+                }
+                let mut next_chain = chain.to_vec();
+                next_chain.push(step);
                 let dispatch = Dispatch {
                     to: reaction.to.clone(),
                     action: reaction.target_action.clone(),
                     target_state: None,
                     params: self.args(&state, source, reaction),
                     read: !self.action_reads_related(&reaction.to, &reaction.target_action),
-                    depth: depth + 1,
+                    chain: next_chain,
                     via: Some(index),
                     by: self.senders.reaction(
                         reaction.principal.as_ref(),
@@ -299,3 +334,7 @@ impl JointModel {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "repeat_test.rs"]
+mod tests;

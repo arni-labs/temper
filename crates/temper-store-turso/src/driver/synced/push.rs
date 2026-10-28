@@ -1,9 +1,12 @@
 //! Pushing committed changes to the remote, and what a refused push means.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
+use tracing::Instrument;
+use tracing::field::Empty;
 
 use super::{
     CopyState, DriverError, PUSH_ATTEMPT_TIMEOUT, REMOTE_STATEMENT_FAILED, SyncCopy, files,
@@ -12,6 +15,12 @@ use super::{
 /// How long the remote may take to say how far it got, under the 10 s its
 /// HTTP client allows, so a hung remote is told from a refusing one.
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long a push may take before a fresh request to the remote is timed
+/// beside it. A push is two requests to the remote, about 70 ms each on a new
+/// connection and less on the engine's kept one; one lost DNS answer adds 1 s
+/// (temper-cli's `RES_OPTIONS`). A push still waiting at 2 s is past both.
+const SLOW_PUSH: Duration = Duration::from_secs(2);
 
 impl SyncCopy {
     /// Copy every change committed before this call to the remote database.
@@ -32,24 +41,68 @@ impl SyncCopy {
         if self.inner.pushed.load(Ordering::Acquire) >= wanted {
             return Ok(());
         }
+        // The engine logs each step of a push; in this span they reach the
+        // trace with their times, so a slow push shows which step waited.
+        let span = tracing::info_span!(
+            "turso.sync.push",
+            changes = Empty,
+            elapsed_ms = Empty,
+            error = Empty
+        );
+        let started = Instant::now();
+        let mut push = std::pin::pin!(self.push_now().instrument(span.clone()));
+        let pushed = match tokio::time::timeout(SLOW_PUSH, &mut push).await {
+            Ok(pushed) => pushed,
+            Err(_) => {
+                self.time_a_fresh_request(&span);
+                push.await
+            }
+        };
+        span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+        if let Err(error) = &pushed {
+            span.record("error", tracing::field::display(error));
+        }
+        pushed
+    }
+
+    /// Time a fresh request to the remote beside a slow push, and log what
+    /// it found: a slow lookup is DNS, a slow connection is the network, a
+    /// slow answer is the remote, and all fast while the push still waits
+    /// is the engine's own connection or lookup. Spawned, so the push's
+    /// answer never waits for it.
+    fn time_a_fresh_request(&self, push: &tracing::Span) {
+        let inner = Arc::clone(&self.inner);
+        let timed = async move {
+            let fresh = inner.remote.time_fresh_request().await;
+            tracing::warn!(
+                remote = fresh.host.as_str(),
+                lookup_ms = fresh.lookup_ms,
+                connect_ms = fresh.connect_ms,
+                answer_ms = fresh.answer_ms,
+                status = fresh.status,
+                failed = fresh.failed.as_deref(),
+                "turso.sync push slow; a fresh request to the remote, timed step by step"
+            );
+        };
+        tokio::spawn(timed.instrument(push.clone()));
+    }
+
+    async fn push_now(&self) -> Result<(), PersistenceError> {
         // The push reads the change log after this, so it carries `covered`.
         let covered = self.last_change().await?;
+        tracing::Span::current().record(
+            "changes",
+            covered - self.inner.pushed.load(Ordering::Acquire),
+        );
         let remote_had = self.remote_had().await?;
         // Until it is known to have succeeded, a push may have committed on
         // the remote past the engine's own record: set before it starts, so
         // a caller that gives up on it (an answer's time limit) leaves it set.
         self.inner.unsure.store(true, Ordering::Release);
-        let started = Instant::now();
         let pushed = {
             let _engine = self.inner.engine.lock().await;
             tokio::time::timeout(PUSH_ATTEMPT_TIMEOUT, self.inner.db.push()).await
         };
-        tracing::debug!(
-            changes = covered - self.inner.pushed.load(Ordering::Acquire),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            ok = matches!(pushed, Ok(Ok(()))),
-            "turso.sync push"
-        );
         match pushed {
             Ok(Ok(())) => {
                 self.inner.unsure.store(false, Ordering::Release);
