@@ -364,15 +364,22 @@ impl EventStore for RedisEventStore {
         let events_key = Self::events_key(tenant, entity_type, entity_id);
 
         // The event at list index i has sequence_nr = i + 1, so a page is one
-        // index range ending just below `before_sequence`. Redis clamps a range
-        // that runs past either end of the list.
+        // index range ending just below `before_sequence`. Clamp the upper
+        // index to the journal length before calculating the page's start.
         let span = i64::try_from(limit).unwrap_or(i64::MAX);
         let (start, stop) = match before_sequence {
             _ if span == 0 => return Ok(Vec::new()),
             None => (-span, -1),
             Some(before) if before <= 1 => return Ok(Vec::new()),
             Some(before) => {
-                let stop = i64::try_from(before - 2).unwrap_or(i64::MAX);
+                let journal_len: i64 =
+                    self.client.llen(&events_key).await.map_err(storage_error)?;
+                if journal_len == 0 {
+                    return Ok(Vec::new());
+                }
+                let stop = i64::try_from(before - 2)
+                    .unwrap_or(i64::MAX)
+                    .min(journal_len - 1);
                 (stop.saturating_sub(span - 1).max(0), stop)
             }
         };
@@ -651,6 +658,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            store
+                .read_events_page(&pid, Some(100), 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let events: Vec<_> = (0..7)
             .map(|i| test_envelope("Moved", serde_json::json!({ "i": i })))
             .collect();
@@ -666,6 +680,12 @@ mod tests {
         assert!(page(Some(1), 3).await.is_empty());
         assert_eq!(page(None, 100).await, [1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(page(Some(100), 2).await, [6, 7]);
+        assert_eq!(page(Some(8), 2).await, [6, 7]);
+        assert_eq!(page(Some(9), 2).await, [6, 7]);
+        assert_eq!(page(Some(u64::MAX), 2).await, [6, 7]);
+        assert_eq!(page(Some(100), usize::MAX).await, [1, 2, 3, 4, 5, 6, 7]);
+        assert!(page(Some(100), 0).await.is_empty());
+        assert!(page(Some(0), 3).await.is_empty());
     }
 
     #[tokio::test]
