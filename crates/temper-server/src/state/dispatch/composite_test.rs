@@ -4,6 +4,8 @@ mod authenticated_params_test;
 #[cfg(feature = "sim")]
 #[path = "composite/defaults_test.rs"]
 mod defaults_test;
+#[path = "composite/rows_refused_test.rs"]
+mod rows_refused_test;
 #[cfg(feature = "sim")]
 #[path = "composite/state_timers_test.rs"]
 mod state_timers_test;

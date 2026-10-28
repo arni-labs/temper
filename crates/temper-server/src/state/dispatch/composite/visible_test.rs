@@ -3,8 +3,11 @@
 //!
 //! The workload mixes single moves and batches over a repository's refs, the
 //! way Genesis pushes do, and after every answer reads the refs back with a
-//! filter. The projection queue here never drains, the way a production queue
-//! lags under load. On Genesis, a push's batch moved a Ref's head and answered
+//! filter. It runs on both kinds of store: one whose commits write the query
+//! rows (Turso), and one whose query rows the server writes after each commit
+//! and which refuses some of those writes, as a store kept apart from the
+//! journal does when it is briefly down. The projection queue here never
+//! drains, the way a production queue lags under load. On Genesis, a push's batch moved a Ref's head and answered
 //! 200, and `Refs?$filter=RepositoryId eq ..` showed the old head for up to
 //! 134 s: the filter still matched the stale row, so no empty-match re-check
 //! ran.
@@ -16,6 +19,7 @@ use temper_runtime::scheduler::{install_deterministic_context, sim_uuid};
 use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
 
+use super::rows_refused_test::RowsRefused;
 use super::*;
 use crate::state::QueryProjectionWriteQueue;
 use crate::storage::StorageStack;
@@ -24,9 +28,22 @@ const SEEDS: u64 = 32;
 const REFS: usize = 4;
 const STEPS: usize = 12;
 
+/// Where a commit's query rows are written.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Rows {
+    /// In the commit's own transaction.
+    InCommit,
+    /// By the server after the commit, to a store that can refuse them.
+    AfterCommit,
+}
+
 /// The composite fixture on a Turso store, with a projection queue that
-/// never drains.
-async fn lagging_state(seed: u64) -> (ServerState, std::path::PathBuf) {
+/// never drains, and the switch that refuses row writes when the server
+/// writes them after each commit.
+pub(super) async fn lagging_state(
+    seed: u64,
+    rows: Rows,
+) -> (ServerState, Option<Arc<RowsRefused>>, std::path::PathBuf) {
     let db_path =
         std::env::temp_dir().join(format!("temper-batch-visible-{seed}-{}.db", sim_uuid()));
     let _ = std::fs::remove_file(&db_path);
@@ -37,14 +54,29 @@ async fn lagging_state(seed: u64) -> (ServerState, std::path::PathBuf) {
     for (name, ioa) in [("Parent", PARENT_IOA), ("Blob", BLOB_IOA), ("Ref", REF_IOA)] {
         specs.insert(name.to_string(), ioa.to_string());
     }
+    let mut stack = StorageStack::from_turso(store);
+    let refused = match rows {
+        Rows::InCommit => None,
+        Rows::AfterCommit => {
+            let plane = stack.query_plane.clone().expect("turso has a query plane");
+            let refused = Arc::new(RowsRefused::new(plane));
+            stack.query_plane = Some(refused.clone());
+            Some(refused)
+        }
+    };
     let state = ServerState::with_storage_stack(
         ActorSystem::new("composite-batch-visible"),
         parse_csdl(COMPOSITE_CSDL).expect("test CSDL should parse"),
         COMPOSITE_CSDL.to_string(),
         specs,
-        StorageStack::from_turso(store),
+        stack,
     )
     .expect("test state should build");
+    assert_eq!(
+        state.entity_rows_follow_commits(),
+        matches!(rows, Rows::InCommit),
+        "the store writes rows where {rows:?} says"
+    );
     state
         .authz
         .reload_tenant_policies("default", "permit(principal, action, resource);")
@@ -53,15 +85,15 @@ async fn lagging_state(seed: u64) -> (ServerState, std::path::PathBuf) {
     *state.query_projection_queue.lock().unwrap() = Some(Arc::new(
         QueryProjectionWriteQueue::new_for_test(query_plane, 32, 32),
     ));
-    (state, db_path)
+    (state, refused, db_path)
 }
 
-fn ref_id(n: usize) -> String {
+pub(super) fn ref_id(n: usize) -> String {
     format!("rf-repo-test-refs-heads-b{n}")
 }
 
 /// The head ref `n` moves to at `step`.
-fn sha(step: usize, n: usize) -> String {
+pub(super) fn sha(step: usize, n: usize) -> String {
     format!("{:040x}", step * REFS + n)
 }
 
@@ -72,7 +104,7 @@ fn pick(n: usize) -> usize {
 
 /// Each ref's head as `GET /tdata/Refs?$filter=RepositoryId eq 'repo-test'`
 /// lists it, the way Genesis reads a repository's refs.
-async fn listed_heads(state: &ServerState) -> BTreeMap<String, String> {
+pub(super) async fn listed_heads(state: &ServerState) -> BTreeMap<String, String> {
     let mut request = Request::get("/tdata/Refs?$filter=RepositoryId%20eq%20'repo-test'")
         .body(Body::empty())
         .unwrap();
@@ -113,9 +145,18 @@ async fn listed_heads(state: &ServerState) -> BTreeMap<String, String> {
 
 #[tokio::test]
 async fn every_answered_commit_is_visible_to_a_filtered_read() {
+    answered_commits_are_listed(Rows::InCommit).await;
+}
+
+#[tokio::test]
+async fn every_answered_commit_is_visible_when_rows_are_written_after_it() {
+    answered_commits_are_listed(Rows::AfterCommit).await;
+}
+
+async fn answered_commits_are_listed(rows: Rows) {
     for seed in 0..SEEDS {
         let (_guard, _, _) = install_deterministic_context(seed);
-        let (state, db_path) = lagging_state(seed).await;
+        let (state, refused, db_path) = lagging_state(seed, rows).await;
         let tenant = TenantId::default();
         let agent = AgentContext::for_service("batch-visible");
         let mut heads = BTreeMap::new();
@@ -142,6 +183,12 @@ async fn every_answered_commit_is_visible_to_a_filtered_read() {
             let count = if batch { 1 + pick(REFS) } else { 1 };
             let first = pick(REFS);
             let moved: Vec<usize> = (0..count).map(|k| (first + k) % REFS).collect();
+            // The store is briefly down for one step in four: its first
+            // row write is refused, and the next one lands.
+            let outage = pick(4) == 0;
+            if let Some(refused) = refused.as_ref().filter(|_| outage) {
+                refused.refuse(1);
+            }
             let update = |n: usize| {
                 json!({
                     "PreviousCommitSha": heads[&ref_id(n)],
@@ -185,14 +232,19 @@ async fn every_answered_commit_is_visible_to_a_filtered_read() {
                 heads.insert(ref_id(n), sha(step, n));
             }
             trace.push(format!(
-                "{step}: {} {moved:?}",
-                if batch { "batch" } else { "move" }
+                "{step}: {} {moved:?}{}",
+                if batch { "batch" } else { "move" },
+                if outage && refused.is_some() {
+                    ", one write refused"
+                } else {
+                    ""
+                }
             ));
 
             assert_eq!(
                 listed_heads(&state).await,
                 heads,
-                "seed {seed}: a filtered read must show every answered commit, after {trace:?}"
+                "{rows:?} seed {seed}: a filtered read must show every answered commit, after {trace:?}"
             );
         }
         let _ = std::fs::remove_file(db_path);
