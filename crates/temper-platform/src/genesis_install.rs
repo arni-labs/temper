@@ -41,8 +41,8 @@ use cache_paths::{
 };
 pub use dependency_versions::KeptDependency;
 use dependency_versions::{
-    PinnedApp, RegistryAncestry, StoredAncestry, downgrade_field, drop_installed_elsewhere,
-    drop_kept_from_cache, parse_downgrade_dependencies, plan_dependency_moves,
+    PinnedApp, RegistryAncestry, StoredAncestry, downgrade_field, installed_elsewhere,
+    parse_downgrade_dependencies, plan_dependency_moves,
 };
 use git_fallback::materialize_registry_app_closure;
 #[cfg(test)]
@@ -229,7 +229,7 @@ pub async fn restore_genesis_app_cache_roots(platform: &PlatformState) -> usize 
             match materialize_app_closure(&platform.server, &tenant, &cache_root, root).await {
                 Ok(_) => {
                     legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                    add_os_apps_dir_preferred(cache_root);
+                    add_os_apps_dir_preferred(cache_root, &BTreeSet::new());
                     restored += 1;
                 }
                 Err(error) => {
@@ -345,16 +345,14 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
         // A closure restored for one record must not bring back another
         // app at a version that app's own record does not name: the catalog
         // is shared, and a kept dependency would otherwise return to its pin.
-        let pruned = match materialized {
-            Ok(refs) => {
-                drop_installed_elsewhere(ps.as_ref(), &tenant, &app_name, &refs, &cache_root).await
-            }
+        let elsewhere = match materialized {
+            Ok(refs) => installed_elsewhere(ps.as_ref(), &tenant, &app_name, &refs).await,
             Err(error) => Err(error),
         };
-        match pruned {
-            Ok(()) => {
+        match elsewhere {
+            Ok(elsewhere) => {
                 legacy_specs::convert_legacy_bundle_specs(&cache_root);
-                add_os_apps_dir_preferred(cache_root);
+                add_os_apps_dir_preferred(cache_root, &elsewhere);
                 restored += 1;
             }
             Err(error) => {
@@ -485,9 +483,10 @@ async fn rollback_to_prior(
     ps: &dyn temper_server::platform_store::PlatformStore,
     tenant: &str,
     prior: &InstalledAppRecord,
+    keep: &BTreeSet<String>,
 ) -> Result<(), String> {
-    ensure_prior_bundle_available(platform, prior).await?;
-    restore_prior_install(platform, ps, tenant, prior).await
+    ensure_prior_bundle_available(platform, prior, keep).await?;
+    restore_prior_install(platform, ps, tenant, prior, keep).await
 }
 
 /// Make sure the prior version's bundle is resolvable from the app catalog before rollback.
@@ -498,6 +497,7 @@ async fn rollback_to_prior(
 async fn ensure_prior_bundle_available(
     platform: &PlatformState,
     prior: &InstalledAppRecord,
+    keep: &BTreeSet<String>,
 ) -> Result<(), String> {
     let prior_ref = parse_registry_app_ref(&prior.app_ref)?;
     let Some(prior_hash) = prior_ref.version_hash.clone() else {
@@ -511,7 +511,7 @@ async fn ensure_prior_bundle_available(
     );
     let cache_root = genesis_cache_root(&platform.server, &cache_key);
     if cache_root.is_dir() {
-        add_os_apps_dir_preferred(cache_root.clone());
+        add_os_apps_dir_preferred(cache_root.clone(), keep);
         // A dir on disk is not proof the bundle is intact: a prior install could have crashed
         // mid-materialize. Trust the cache only if it actually yields the prior app at the expected
         // digest; otherwise fall through and re-materialize from the registry.
@@ -559,7 +559,7 @@ async fn ensure_prior_bundle_available(
             prior.app_ref
         )
     })?;
-    add_os_apps_dir_preferred(cache_root);
+    add_os_apps_dir_preferred(cache_root, keep);
     Ok(())
 }
 
@@ -702,10 +702,9 @@ pub async fn install_genesis_app_from_registry(
     let kept = plan_dependency_moves(&ancestry, &root_ref.name, &pins, &prior_records, &downgrade)
         .await
         .map_err(|refusal| format!("Genesis install of {} {refusal}", request.app_ref))?;
-    drop_kept_from_cache(&cache_root, &kept)?;
     let keep: BTreeSet<String> = kept.iter().map(|app| app.name.clone()).collect();
 
-    add_os_apps_dir_preferred(cache_root.clone());
+    add_os_apps_dir_preferred(cache_root.clone(), &keep);
 
     let install_platform = platform.clone();
     let reconcile_started = Instant::now();
@@ -842,8 +841,14 @@ pub async fn install_genesis_app_from_registry(
             let prior =
                 prior_root_record.expect("RollBackToPrevious implies a prior installed record");
             let ps = ps.expect("RollBackToPrevious implies a platform store");
-            let rollback =
-                rollback_to_prior(&install_platform, ps.as_ref(), &request.tenant, &prior).await;
+            let rollback = rollback_to_prior(
+                &install_platform,
+                ps.as_ref(),
+                &request.tenant,
+                &prior,
+                &keep,
+            )
+            .await;
             // Reconcile overwrote every dependency app's record with a local-provenance row too;
             // restore each captured prior record so dependency provenance survives the rollback.
             for record in &prior_records {
@@ -1221,9 +1226,8 @@ impl BoundActionHook for GenesisInstallHook {
                     return Err(message);
                 }
             };
-        drop_kept_from_cache(&cache_root, &kept)?;
         let keep: BTreeSet<String> = kept.iter().map(|app| app.name.clone()).collect();
-        add_os_apps_dir_preferred(cache_root);
+        add_os_apps_dir_preferred(cache_root, &keep);
 
         match reconcile_materialized_app_closure(&platform, &target_tenant, &name, &keep).await {
             Ok(result) => {
@@ -1252,6 +1256,30 @@ impl BoundActionHook for GenesisInstallHook {
                         error = %error,
                         "Failed to persist Genesis provenance during follow-latest reconcile"
                     );
+                }
+                // Each dependency installed with the root records the Genesis
+                // version it runs, as a registry install does, so the next
+                // install can tell an upgrade of it from a downgrade.
+                for dep in materialized.iter().filter(|app| app.name != name) {
+                    if keep.contains(&dep.name) {
+                        continue;
+                    }
+                    let dep_version = dep.version_hash.trim_start_matches('@');
+                    let dep_ref = format!("{}/{}@{dep_version}", dep.owner, dep.name);
+                    let dep_closure = format!("genesis:{dep_ref}:{dep_version}");
+                    let metadata = GenesisInstallMetadata {
+                        target_tenant: &target_tenant,
+                        app_name: &dep.name,
+                        app_ref: &dep_ref,
+                        version_hash: dep_version,
+                        closure_id: &dep_closure,
+                        registry_url: &registry_url,
+                        registry_tenant: &registry_tenant,
+                        follow_policy: &follow_policy,
+                    };
+                    if let Err(error) = record_genesis_install_metadata(&platform, metadata).await {
+                        tracing::warn!(app = %dep.name, error = %error, "Failed to persist dependency Genesis provenance during App.Install");
+                    }
                 }
                 mark_installation(
                     state,

@@ -166,6 +166,9 @@ pub(crate) fn platform_store(
 /// version itself does not reach runtime-ready, that is a hard both-broken error: neither the new
 /// nor the previous version is serviceable.
 ///
+/// The apps in `keep` are the dependencies the failed install left at their newer installed
+/// version; the rollback leaves them as they are too.
+///
 /// Public for the deterministic simulator (`dst_genesis_install_rollback`), which drives this exact
 /// production rollback effect against the simulated platform store under injected faults.
 pub async fn restore_prior_install(
@@ -173,20 +176,16 @@ pub async fn restore_prior_install(
     ps: &dyn temper_server::platform_store::PlatformStore,
     tenant: &str,
     prior: &InstalledAppRecord,
+    keep: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
-    reconcile_materialized_app_closure(
-        platform,
-        tenant,
-        &prior.app_name,
-        &std::collections::BTreeSet::new(),
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "rollback re-reconcile of {} failed: {error}",
-            prior.app_name
-        )
-    })?;
+    reconcile_materialized_app_closure(platform, tenant, &prior.app_name, keep)
+        .await
+        .map_err(|error| {
+            format!(
+                "rollback re-reconcile of {} failed: {error}",
+                prior.app_name
+            )
+        })?;
     if !verify_install_runtime_ready(platform, ps, tenant, &prior.app_name).await {
         return Err(format!(
             "rollback target {} for app {} is also not runtime-ready (both new and previous versions are broken)",

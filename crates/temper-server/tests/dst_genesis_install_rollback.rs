@@ -98,6 +98,7 @@ async fn dst_genesis_install_rollback_pins_prior_good_version() {
             harness.sim_platform_store.as_ref(),
             tenant,
             &v1_good,
+            &std::collections::BTreeSet::new(),
         )
         .await;
 

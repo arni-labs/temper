@@ -16,7 +16,6 @@
 //! version is the one the caller chose.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -24,7 +23,7 @@ use serde_json::Value;
 use temper_server::platform_store::{InstalledAppRecord, PlatformStore};
 use temper_server::state::ServerState;
 
-use super::cache_paths::{app_cache_dir, validate_identity_component};
+use super::cache_paths::validate_identity_component;
 use super::version_compare::{
     GenesisVersionCompareResponse, VersionComparison, compare_genesis_app_versions,
 };
@@ -274,47 +273,27 @@ pub(super) async fn plan_dependency_moves<A: VersionAncestry>(
     ))
 }
 
-/// Take the kept dependencies out of a materialized closure, so the app
-/// catalog keeps resolving them to the version that is installed.
-pub(super) fn drop_kept_from_cache(
-    cache_root: &Path,
-    kept: &[KeptDependency],
-) -> Result<(), String> {
-    for dependency in kept {
-        let dir = app_cache_dir(cache_root, &dependency.name)?;
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|error| format!("remove kept dependency '{}': {error}", dir.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// On recovery, take out of a closure restored for `root_name` every other
-/// app this tenant runs at a different Genesis version than the closure pins.
-/// Each app is then resolved from the closure its own record names.
-pub(super) async fn drop_installed_elsewhere(
+/// On recovery, the apps of a closure restored for `root_name` that this
+/// tenant runs at a different Genesis version than the closure pins. The
+/// closure joins the catalog without them, so each app resolves to the
+/// closure its own record names.
+pub(super) async fn installed_elsewhere(
     ps: &dyn PlatformStore,
     tenant: &str,
     root_name: &str,
     closure: &[RegistryAppRef],
-    cache_root: &Path,
-) -> Result<(), String> {
+) -> Result<BTreeSet<String>, String> {
+    let mut elsewhere = BTreeSet::new();
     for app in closure.iter().filter(|app| app.name != root_name) {
         let Some(pinned) = app.version_hash.as_deref() else {
             continue;
         };
         let record = ps.get_installed_app(tenant, &app.name).await?;
         if version_to_compare(record.as_ref(), pinned, false).is_some() {
-            let dir = app_cache_dir(cache_root, &app.name)?;
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir).map_err(|error| {
-                    format!("remove '{}' from restored closure: {error}", dir.display())
-                })?;
-            }
+            elsewhere.insert(app.name.clone());
         }
     }
-    Ok(())
+    Ok(elsewhere)
 }
 
 #[cfg(test)]
