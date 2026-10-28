@@ -534,3 +534,54 @@ async fn a_filter_that_does_not_parse_is_refused_with_where_it_went_wrong() {
     }
     assert!(wrong.is_empty(), "wrong refusals:\n{}", wrong.join("\n"));
 }
+
+#[tokio::test]
+async fn scratch_lag_diagnostics() {
+    let dir = tempfile::tempdir().expect("a database of its own");
+    let url = format!("file:{}", dir.path().join("diag.db").display());
+    let store = TursoEventStore::new(&url, None)
+        .await
+        .expect("open the Turso file");
+    let (stack, failing) = ProjectionWritesFail::stack(store);
+    let (app, projection) = server(stack, "default");
+    seed(&app, "default").await;
+    wait_for_projection(projection.as_ref(), "default").await;
+    let mut log = Vec::new();
+    let before = projection
+        .projection_catalog_freshness("default", "Part")
+        .await
+        .expect("freshness");
+    log.push(format!("freshness before: {before:?}"));
+    failing.store(true, Ordering::SeqCst);
+    let request = Request::builder()
+        .method(Method::PATCH)
+        .uri("/tdata/Parts('p5')")
+        .header("Content-Type", "application/json")
+        .body(Body::from(json!({ "Color": "green" }).to_string()))
+        .unwrap();
+    let (status, body) = send(&app, "default", request).await;
+    log.push(format!("patch: {status} {body}"));
+    for _ in 0..3 {
+        let after = projection
+            .projection_catalog_freshness("default", "Part")
+            .await
+            .expect("freshness");
+        log.push(format!("freshness after: {after:?}"));
+        for filter in [
+            "Color eq 'green'",
+            "Color eq 'green' and Status eq 'Draft'",
+            "Name eq 'spring'",
+            "contains(Color,'gre')",
+        ] {
+            let (status, body) = read(&app, "default", filter).await;
+            log.push(format!("{filter}: {status} {body}"));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let request = Request::get("/tdata/Parts('p5')")
+        .body(Body::empty())
+        .unwrap();
+    let (status, record) = send(&app, "default", request).await;
+    log.push(format!("get p5: {status} {record}"));
+    panic!("DIAG\n{}", log.join("\n"));
+}
