@@ -231,8 +231,12 @@ impl ReactionDispatcher {
             // ADR-0046: resolve the dispatch principal. If the rule declares
             // an explicit `principal`, build a synthetic service identity;
             // otherwise inherit the invoking principal's exact
-            // `SecurityContext` when available.
-            let mut dispatch_ctx = resolve_trigger_principal(
+            // `SecurityContext` when available. Either way it carries how this
+            // move comes about: this rule, set off by the invoking move. Cedar
+            // sees it as `context.via` and the rest, so an app can tell a move
+            // the spec makes follow another from a principal's own pick. The
+            // principal itself stays the true one.
+            let (mut dispatch_ctx, cause) = resolve_trigger_principal(
                 rule.principal.as_deref(),
                 invoking_ctx,
                 &rule.name,
@@ -267,7 +271,7 @@ impl ReactionDispatcher {
                 }
             };
 
-            let security_ctx = effective_trigger_security_context(&dispatch_ctx);
+            let security_ctx = effective_trigger_security_context(&dispatch_ctx, &cause);
             if let Err(denial) = state.authorize_with_context(
                 &security_ctx,
                 &rule.then.action,
@@ -284,6 +288,8 @@ impl ReactionDispatcher {
                     target_action = %rule.then.action,
                     principal_id = %security_ctx.principal.id,
                     principal_kind = ?security_ctx.principal.kind,
+                    via = cause.via(),
+                    depth = cause.depth,
                     "Reaction authorization denied: {reason}"
                 );
                 results.push(ReactionResult {

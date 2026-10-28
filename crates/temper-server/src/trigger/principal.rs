@@ -1,9 +1,40 @@
-//! Who a reaction runs as, and the idempotency key it carries.
+//! Who a reaction runs as, how its move came about, and the idempotency key
+//! it carries.
+//!
+//! A reaction runs as the invoking principal, or as the service its rule
+//! declares (ADR-0046). Either way the security context it is checked with
+//! carries a [`MoveCause`]: the rule, the move that set it off, the chain's
+//! depth and, in a timer's chain, the timer's arm. Cedar sees it as
+//! `context.via` and the rest.
 
-use temper_authz::{SecurityContext, platform_keys};
+use temper_authz::{MoveCause, ReactionHop, SecurityContext, platform_keys};
 
 use crate::idempotency::IdempotencyKey;
 use crate::request_context::AgentContext;
+
+/// The cause of the reaction `rule_name` makes when `source_action` on
+/// `source_entity_type`/`source_entity_id`, made with `invoking_ctx`, sets it
+/// off: one hop deeper than that move, in the same timer's chain if any.
+fn reaction_cause(
+    rule_name: &str,
+    source_entity_type: &str,
+    source_entity_id: &str,
+    source_action: &str,
+    invoking_ctx: &AgentContext,
+) -> MoveCause {
+    MoveCause::reaction(
+        ReactionHop {
+            rule: rule_name.to_string(),
+            action: source_action.to_string(),
+            entity_type: source_entity_type.to_string(),
+            entity_id: source_entity_id.to_string(),
+        },
+        invoking_ctx
+            .security_ctx
+            .as_ref()
+            .and_then(|context| context.cause.as_ref()),
+    )
+}
 
 /// ADR-0046: resolve the dispatch context for a reaction.
 ///
@@ -18,7 +49,11 @@ use crate::request_context::AgentContext;
 ///
 /// Either way the reaction carries its own idempotency key, derived from the
 /// caller's, the rule's name and the reaction's `depth` in its chain
-/// ([`reaction_idempotency_key`]).
+/// ([`reaction_idempotency_key`]), and its security context carries the
+/// reaction's [`reaction_cause`], so the moves it sets off in turn are one hop
+/// deeper. The cause is returned too: a context without a security context is
+/// checked with one approximated from it, which must carry the same cause
+/// ([`effective_trigger_security_context`]).
 pub(super) fn resolve_trigger_principal(
     declared_principal: Option<&str>,
     invoking_ctx: &AgentContext,
@@ -27,7 +62,14 @@ pub(super) fn resolve_trigger_principal(
     source_entity_id: &str,
     source_action: &str,
     depth: u32,
-) -> AgentContext {
+) -> (AgentContext, MoveCause) {
+    let cause = reaction_cause(
+        rule_name,
+        source_entity_type,
+        source_entity_id,
+        source_action,
+        invoking_ctx,
+    );
     let mut ctx = match declared_principal {
         Some(service_name) if !service_name.is_empty() => {
             let mut ctx = AgentContext::for_service_inheriting(service_name, invoking_ctx);
@@ -57,8 +99,11 @@ pub(super) fn resolve_trigger_principal(
         }
         _ => invoking_ctx.clone(),
     };
+    if let Some(security_ctx) = ctx.security_ctx.as_mut() {
+        security_ctx.cause = Some(cause.clone());
+    }
     ctx.idempotency_key = reaction_idempotency_key(invoking_ctx, rule_name, depth);
-    ctx
+    (ctx, cause)
 }
 
 /// Reactions a chain ran before chains stopped at their first repeated step:
@@ -99,9 +144,13 @@ fn reaction_idempotency_key(
     })
 }
 
-/// The security context a reaction is authorized under: the dispatch
-/// context's own, or an approximation built from its agent fields.
-pub(super) fn effective_trigger_security_context(agent_ctx: &AgentContext) -> SecurityContext {
+/// The security context a reaction is checked with: its dispatch context's
+/// own, which carries `cause`, or one approximated from the dispatch
+/// context's agent fields when it has none, with `cause` set on it.
+pub(super) fn effective_trigger_security_context(
+    agent_ctx: &AgentContext,
+    cause: &MoveCause,
+) -> SecurityContext {
     if let Some(security_ctx) = &agent_ctx.security_ctx {
         return security_ctx.clone();
     }
@@ -115,5 +164,6 @@ pub(super) fn effective_trigger_security_context(agent_ctx: &AgentContext) -> Se
         platform_keys::TRIGGER_INHERITED_CONTEXT_APPROXIMATE.to_string(),
         serde_json::Value::Bool(true),
     );
+    security_ctx.cause = Some(cause.clone());
     security_ctx
 }

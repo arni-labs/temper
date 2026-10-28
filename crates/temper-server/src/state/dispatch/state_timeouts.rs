@@ -858,9 +858,10 @@ impl ArmedTimer {
 
     /// What its fire is dispatched as: its identity, marked as the fire of
     /// the arming at its journal sequence, which the record's actor applies
-    /// only while the record is still at that sequence.
+    /// only while the record is still at that sequence, and with its cause.
     fn fire_context(&self) -> AgentContext {
         let mut agent = self.agent_ctx.clone();
+        super::timer_cause::mark_timer_fire(&mut agent);
         agent.fires_state_timer = Some(StateTimerFire {
             tenant: self.tenant.to_string(),
             entity_type: self.entity_type.clone(),

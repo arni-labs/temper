@@ -319,6 +319,7 @@ impl ServerState {
         // answered as it.
         agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(key.clone()));
         agent.fires_scheduled_action = Some(timer.row());
+        super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
         loop {

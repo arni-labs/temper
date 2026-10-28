@@ -55,6 +55,7 @@ fn wasm_module_security_context(module_name: &str) -> SecurityContext {
         },
         context_attrs: std::collections::HashMap::new(), // determinism-ok: SecurityContext uses HashMap
         correlation_id: temper_runtime::scheduler::sim_uuid().to_string(),
+        cause: None,
     }
 }
 
