@@ -363,21 +363,24 @@ impl EventStore for RedisEventStore {
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
         let events_key = Self::events_key(tenant, entity_type, entity_id);
 
-        // The event at list index i has sequence_nr = i + 1. Clamp the page's
-        // end to the actual journal head before calculating its start: LRANGE
-        // clamps the stop index but does not move the start backward with it.
+        // The event at list index i has sequence_nr = i + 1, so a page is one
+        // index range ending just below `before_sequence`. Clamp the upper
+        // index to the journal length before calculating the page's start.
         let span = i64::try_from(limit).unwrap_or(i64::MAX);
         let (start, stop) = match before_sequence {
             _ if span == 0 => return Ok(Vec::new()),
             None => (-span, -1),
             Some(before) if before <= 1 => return Ok(Vec::new()),
             Some(before) => {
-                let length: i64 = self.client.llen(&events_key).await.map_err(storage_error)?;
-                let end = i64::try_from(before - 1).unwrap_or(i64::MAX).min(length);
-                if end == 0 {
+                let journal_len: i64 =
+                    self.client.llen(&events_key).await.map_err(storage_error)?;
+                if journal_len == 0 {
                     return Ok(Vec::new());
                 }
-                ((end - span).max(0), end - 1)
+                let stop = i64::try_from(before - 2)
+                    .unwrap_or(i64::MAX)
+                    .min(journal_len - 1);
+                (stop.saturating_sub(span - 1).max(0), stop)
             }
         };
         let encoded_events: Vec<String> = self
@@ -677,14 +680,15 @@ mod tests {
         assert!(page(Some(1), 3).await.is_empty());
         assert_eq!(page(None, 100).await, [1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(page(Some(100), 2).await, [6, 7]);
+        // The history handler reads limit + 1 rows to detect older events.
         assert_eq!(page(Some(100), 3).await, [5, 6, 7]);
         assert_eq!(page(Some(8), 2).await, [6, 7]);
         assert_eq!(page(Some(9), 2).await, [6, 7]);
         assert_eq!(page(Some(u64::MAX), 2).await, [6, 7]);
         assert_eq!(page(Some(100), usize::MAX).await, [1, 2, 3, 4, 5, 6, 7]);
-        assert!(page(Some(0), 3).await.is_empty());
         assert!(page(None, 0).await.is_empty());
         assert!(page(Some(100), 0).await.is_empty());
+        assert!(page(Some(0), 3).await.is_empty());
     }
 
     #[tokio::test]
