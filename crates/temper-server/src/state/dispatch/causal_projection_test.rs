@@ -98,7 +98,7 @@ async fn causal_submit_reaction_wasm_reads_committed_source_under_projection_lag
 #[tokio::test]
 async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_once() {
     for seed in 0..4 {
-        let (_guard, _, _) = install_deterministic_context(seed);
+        let (_guard, clock, _) = install_deterministic_context(seed);
         let (state, query, _queue, _temp) = fixture_test::fixture_entering_timed_state().await;
         let tenant = TenantId::default();
         let verifier_before = state
@@ -225,8 +225,11 @@ async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_onc
             "seed {seed}: replay does not rearm the state timer"
         );
 
-        // The timer fires at its deadline.
+        // Advance both clocks: Ping advanced the record's sequence, so the
+        // timer reconciles its remaining budget against sim_now() when it
+        // fires. The deterministic clock's ticks are 100 ms each.
         tokio::time::pause();
+        clock.advance_by(4500 * 10);
         tokio::time::advance(std::time::Duration::from_secs(4500)).await;
         tokio::time::resume();
         assert_eq!(
