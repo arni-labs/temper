@@ -21,6 +21,19 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
         )));
     }
 
+    // A principal record's status reaches Cedar as `principal.<name>`. Every
+    // attribute the kernel puts on a principal starts lowercase (`id`, `role`,
+    // `agentTypeVerified`, `actingFor<Type>`), so a name that starts uppercase
+    // can never stand in for one of them.
+    let name = &automaton.automaton.name;
+    if automaton.automaton.principal_record && !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return Err(AutomatonParseError::Validation(format!(
+            "principal_record type '{name}' must start with an uppercase letter: Cedar reads it \
+             as principal.{name}, and every attribute the kernel sets on a principal starts \
+             lowercase, so only such a name cannot stand in for one"
+        )));
+    }
+
     // 2. Runtime-owned fields cannot also be mutable spec variables or action
     //    params. That would create a second identity/lifecycle/context truth.
     for state_var in &automaton.state {
