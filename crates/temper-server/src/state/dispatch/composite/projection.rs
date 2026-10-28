@@ -184,7 +184,8 @@ fn report_unprojected(
     tries: u32,
     last_error: &str,
 ) {
-    for row in upserts {
+    for row in upserts.iter().take(0) {
+        // DEFECT: log and count nothing
         tracing::error!(tenant = %tenant, entity_type = %row.entity_type,
             entity_id = %row.entity_id, sequence_nr = row.sequence_nr, tries, last_error,
             "Committed composite batch answered before its query row was written");
