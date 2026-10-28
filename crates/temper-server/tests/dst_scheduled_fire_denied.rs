@@ -174,45 +174,72 @@ impl Tries {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Tries {
+/// The record a span names, kept on the span for its descendants to read.
+struct NamesRecord(String);
+
+/// The fields of a new span that say which record and which action it is.
+#[derive(Default)]
+struct SpanFields {
+    entity_id: String,
+    action: String,
+}
+
+impl SpanFields {
+    fn set(&mut self, name: &str, value: String) {
+        match name {
+            "entity_id" => self.entity_id = value,
+            "action_name" => self.action = value,
+            _ => {}
+        }
+    }
+}
+
+impl tracing::field::Visit for SpanFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.set(field.name(), value.to_string());
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.set(
+            field.name(),
+            format!("{value:?}").trim_matches('"').to_string(),
+        );
+    }
+}
+
+/// The dispatch spans leave their record's id empty, so a try is counted for
+/// the record its scheduled fire's span (`dispatch.scheduled_actions`, an
+/// ancestor of every try of that fire) names.
+impl<S> tracing_subscriber::Layer<S> for Tries
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
-        _: &tracing::span::Id,
-        _: tracing_subscriber::layer::Context<'_, S>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if attrs.metadata().name() != "dispatch_tenant_action_core" {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let mut fields = SpanFields::default();
+        attrs.record(&mut fields);
+        if !fields.entity_id.is_empty() {
+            span.extensions_mut()
+                .insert(NamesRecord(fields.entity_id.clone()));
+        }
+        let scheduled_move = fields.action == "Take" || fields.action == "Fire";
+        if attrs.metadata().name() != "dispatch_tenant_action_core" || !scheduled_move {
             return;
         }
-        #[derive(Default)]
-        struct Fields {
-            entity_id: String,
-            action: String,
-        }
-        impl Fields {
-            fn set(&mut self, name: &str, value: String) {
-                match name {
-                    "entity_id" => self.entity_id = value,
-                    "action_name" => self.action = value,
-                    _ => {}
-                }
-            }
-        }
-        impl tracing::field::Visit for Fields {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.set(field.name(), value.to_string());
-            }
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.set(
-                    field.name(),
-                    format!("{value:?}").trim_matches('"').to_string(),
-                );
-            }
-        }
-        let mut fields = Fields::default();
-        attrs.record(&mut fields);
-        if fields.action == "Take" || fields.action == "Fire" {
-            *self.0.lock().unwrap().entry(fields.entity_id).or_default() += 1;
+        let record = span.scope().skip(1).find_map(|ancestor| {
+            ancestor
+                .extensions()
+                .get::<NamesRecord>()
+                .map(|named| named.0.clone())
+        });
+        if let Some(record) = record {
+            *self.0.lock().unwrap().entry(record).or_default() += 1;
         }
     }
 }
