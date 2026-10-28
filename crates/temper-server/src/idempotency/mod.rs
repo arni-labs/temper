@@ -147,7 +147,9 @@ impl Entries {
 }
 
 fn is_expired(entry: &IdempotencyEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
-    now.signed_duration_since(entry.created_at).num_seconds() > IDEMPOTENCY_TTL_SECS
+    // MUTANT: a cached answer never expires.
+    let _ = (entry, now);
+    false
 }
 
 /// Idempotency cache shared by every entity actor.
