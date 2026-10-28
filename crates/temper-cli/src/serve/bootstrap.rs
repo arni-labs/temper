@@ -17,7 +17,7 @@ use temper_server::registry::SpecRegistry;
 use temper_server::registry_bootstrap::{
     restore_registry_from_postgres, restore_registry_from_turso,
 };
-use temper_server::storage::StorageStack;
+use temper_server::storage::{StorageRoom, StorageStack};
 use temper_server::webhooks::WebhookDispatcher;
 use temper_store_redis::RedisEventStore;
 use temper_store_turso::{TenantStoreRouter, TursoEventStore};
@@ -79,6 +79,7 @@ pub(super) async fn init_storage(
                     Some(format!("{home}/.local/share/temper/tenants"))
                 });
 
+                let room = local_base_dir.clone().map(StorageRoom::on_disk);
                 let mut router = TenantStoreRouter::new(
                     &platform_url,
                     platform_token.as_deref(),
@@ -100,7 +101,7 @@ pub(super) async fn init_storage(
                 println!(
                     "  Storage: turso-routed ({platform_url}, {tenant_count} tenants connected)"
                 );
-                Some(StorageStack::from_tenant_router(router))
+                Some(with_room(StorageStack::from_tenant_router(router), room))
             } else {
                 // Single-DB mode (local dev).
                 let turso_url = match std::env::var("TURSO_URL") {
@@ -146,7 +147,8 @@ pub(super) async fn init_storage(
                     (store, String::new())
                 };
                 println!("  Storage: turso ({turso_url}){copied}");
-                Some(StorageStack::from_turso(store))
+                let room = local_store_dir(&turso_url).map(StorageRoom::on_disk);
+                Some(with_room(StorageStack::from_turso(store), room))
             }
         }
         StorageBackend::Redis => {
@@ -160,6 +162,26 @@ pub(super) async fn init_storage(
         }
     };
     Ok((pg_pool, storage_stack, synced_store))
+}
+
+/// The directory a local database at `url` (`file:` or a bare path) lives in;
+/// a remote one (`libsql://`) has none.
+fn local_store_dir(url: &str) -> Option<std::path::PathBuf> {
+    if url.starts_with("libsql://") {
+        return None;
+    }
+    let path = Path::new(url.strip_prefix("file:").unwrap_or(url));
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    Some(dir.unwrap_or(Path::new(".")).to_path_buf())
+}
+
+/// A stack whose store lives on a local disk refuses appends while that disk
+/// is under the floor (`temper_server::storage::STORAGE_FLOOR_BYTES`).
+fn with_room(stack: StorageStack, room: Option<StorageRoom>) -> StorageStack {
+    match room {
+        Some(room) => stack.with_storage_room(room),
+        None => stack,
+    }
 }
 
 /// Phase 2: Build the spec registry from persistent storage and disk apps.

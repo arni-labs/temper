@@ -80,8 +80,9 @@ pub struct Dispatch {
     pub params: BTreeMap<String, ParamValue>,
     /// Whether the dispatch path has read the related records it needs.
     pub read: bool,
-    /// The reaction depth that sent it (0 for a request from outside).
-    pub depth: u32,
+    /// The steps this reaction chain has admitted, including this dispatch.
+    /// Empty for a request that starts a new chain.
+    pub chain: Vec<ReactionStep>,
     /// The reaction that sent it, by its place among the model's reactions;
     /// `None` for a request from outside.
     pub via: Option<usize>,
@@ -161,4 +162,26 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelSt
     state.inflight = dispatches;
     state.calls.sort();
     renamed
+}
+
+/// One admitted reaction step. The model holds one record per type, but
+/// distinguishes an entity the chain found from one it made.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReactionStep {
+    /// The entity type the action runs on.
+    pub entity_type: String,
+    /// The action.
+    pub action: String,
+    /// The type for which this id was generated; `same_id` keeps its origin
+    /// even through other types. `None` means the chain read the id.
+    pub generated_for: Option<String>,
+}
+
+impl ReactionStep {
+    pub(super) fn repeats(&self, taken: &Self) -> bool {
+        let made = |step: &Self| step.generated_for.as_ref() == Some(&step.entity_type);
+        self.entity_type == taken.entity_type
+            && self.action == taken.action
+            && made(self) == made(taken)
+    }
 }

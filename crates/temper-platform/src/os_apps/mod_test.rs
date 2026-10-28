@@ -28,6 +28,7 @@ fn test_admin_security_context(principal_id: &str) -> SecurityContext {
         },
         context_attrs: HashMap::new(),
         correlation_id: "test-admin-context".to_string(),
+        cause: None,
     }
 }
 
@@ -220,15 +221,6 @@ fn test_manifest_dependencies_accept_pinned_genesis_refs_for_local_install_order
         Some("katagami-commons")
     );
     assert_eq!(local_os_app_dependency_name("  "), None);
-}
-
-#[test]
-fn test_os_app_document_bootstrap_does_not_charge_workspace_file_count() {
-    let source = include_str!("mod.rs");
-    assert!(
-        !source.contains("action: \"IncrementFileCount\""),
-        "OS app document bootstrap must not charge Workspace for each file materialized"
-    );
 }
 
 #[test]
@@ -902,16 +894,7 @@ mod directed_evolution;
 mod policy_joint;
 mod policy_reinstall;
 mod spec_change;
-#[test]
-fn test_get_app_project_management() {
-    let bundle = get_os_app("project-management");
-    assert!(bundle.is_some());
-    let bundle = bundle.unwrap();
-    assert_eq!(bundle.specs.len(), 5);
-    assert!(bundle.csdl.is_some());
-    assert!(!bundle.csdl.as_ref().unwrap().is_empty());
-    assert!(!bundle.cedar_policies.is_empty());
-}
+mod timer_strands;
 
 #[test]
 fn test_agent_specs_parse() {

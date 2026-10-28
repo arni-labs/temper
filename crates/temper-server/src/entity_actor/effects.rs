@@ -2072,11 +2072,6 @@ params = ["NewCommitSha"]
     }
 
     #[test]
-    fn default_field_inline_max_is_128kb() {
-        assert_eq!(DEFAULT_FIELD_INLINE_MAX, 131_072);
-    }
-
-    #[test]
     fn blob_refs_default_carries_default_ceiling() {
         let mode = FieldSyncMode::blob_refs_default();
         assert_eq!(

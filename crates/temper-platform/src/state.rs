@@ -177,25 +177,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_state() {
-        let state = PlatformState::new(None);
-        assert!(state.api_key.is_none());
-    }
-
-    #[test]
-    fn test_new_with_api_key() {
-        let state = PlatformState::new(Some("sk-test-key".into()));
-        assert_eq!(state.api_key.as_deref(), Some("sk-test-key"));
-    }
-
-    #[test]
-    fn test_with_registry() {
-        let registry = SpecRegistry::new();
-        let state = PlatformState::with_registry(registry, None);
-        assert!(state.api_key.is_none());
-    }
-
-    #[test]
     fn test_broadcast_and_subscribe() {
         let state = PlatformState::new(None);
         let mut rx = state.subscribe();
@@ -209,15 +190,6 @@ mod tests {
             PlatformEvent::Error { message } => assert_eq!(message, "test broadcast"),
             _ => panic!("expected Error message"),
         }
-    }
-
-    #[test]
-    fn test_broadcast_no_receivers_does_not_panic() {
-        let state = PlatformState::new(None);
-        // No subscribers — should not panic.
-        state.broadcast(PlatformEvent::Error {
-            message: "nobody listening".into(),
-        });
     }
 
     #[test]

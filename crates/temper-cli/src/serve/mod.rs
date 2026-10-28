@@ -19,6 +19,7 @@ mod sync_copy;
 mod unavailable_tenant_tests;
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::IntoFuture;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::{path::Path, sync::Arc};
 
@@ -28,7 +29,7 @@ use temper_evolution::PostgresRecordStore;
 use temper_observe::ClickHouseStore;
 use temper_observe::otel::init_observability;
 use temper_platform::optimization::run_optimization_cycle;
-use temper_platform::router::build_platform_router;
+use temper_platform::router::build_platform_routes;
 use temper_platform::state::PlatformState;
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::{EntityLevelSummary, EntityVerificationResult, VerificationStatus};
@@ -74,7 +75,7 @@ pub async fn run(
     discord_bot_token: Option<String>,
     tenant: String,
 ) -> Result<()> {
-    let _otel_guard = init_observability("temper-platform");
+    let otel_guard = init_observability("temper-platform");
     temper_authz::init_metrics();
     temper_store_postgres::init_metrics();
     temper_store_turso::init_metrics();
@@ -258,8 +259,7 @@ pub async fn run(
     }
 
     // Phase 9: Bind, start background tasks, serve
-    let router =
-        sync_copy::answer_after_copy(build_platform_router(state.clone()), turso_synced_store);
+    let router = sync_copy::serve_router(build_platform_routes(state.clone()), turso_synced_store);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port)))
         .await
         .with_context(|| format!("Failed to bind to {bind}:{port}"))?;
@@ -331,11 +331,44 @@ pub async fn run(
     let _boot_timers = state.server.start_runtime().await;
 
     println!("Listening on http://{bind}:{actual_port}");
-    axum::serve(listener, router)
-        .await
-        .context("Server error")?;
+    // A stop signal ends the server. The kernel then logs and counts each
+    // write it still owes and holds only in memory, and telemetry is flushed
+    // so those reports leave the process before it exits.
+    tokio::select! {
+        served = axum::serve(listener, router).into_future() => served.context("Server error")?,
+        () = stop_signal() => {}
+    }
+    state.server.report_owed_writes_at_shutdown();
+    if let Some(guard) = otel_guard {
+        guard.shutdown();
+    }
 
     Ok(())
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C, or SIGTERM from the
+/// platform it runs on. A signal that cannot be watched never resolves.
+async fn stop_signal() {
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
 }
 
 fn seed_cedar_policies(state: &PlatformState, tenant_policy_seed: BTreeMap<String, String>) {
