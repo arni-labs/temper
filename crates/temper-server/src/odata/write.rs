@@ -33,9 +33,9 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error, odata_refusal};
-use crate::state::ServerState;
 use crate::state::redecide::Redecide;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{CreateError, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -743,14 +743,18 @@ pub async fn handle_odata_post(
                 }
             }
 
-            // A new entity's first event holds its initial fields: one too large is
-            // refused here, before any create path starts.
+            // A new entity's first event holds its initial fields: one too large, or
+            // one the disk has no room for, is refused here, before any create path
+            // starts.
             if let Err(error) =
-                state.check_created_event_size(&tenant, &entity_type, &entity_id, &initial_fields)
+                state.check_created_event(&tenant, &entity_type, &entity_id, &initial_fields)
             {
                 let (status, code) = match error {
                     PersistenceError::EventTooLarge { .. } => {
                         (StatusCode::PAYLOAD_TOO_LARGE, "EventTooLarge")
+                    }
+                    PersistenceError::StorageFull { .. } => {
+                        return crate::write_health::store_unavailable(&error.to_string());
                     }
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, "CreateError"),
                 };
@@ -828,8 +832,13 @@ pub async fn handle_odata_post(
                     }
                     .into_response()
                 }
-                Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
-                    .into_response(),
+                Err(CreateError::StoreUnavailable(reason)) => {
+                    crate::write_health::store_unavailable(&reason)
+                }
+                Err(CreateError::Failed(e)) => {
+                    odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
+                        .into_response()
+                }
             }
         }
 
@@ -1213,6 +1222,14 @@ pub async fn handle_odata_patch(
                         }
                         .into_response()
                     }
+                    Ok(response) if response.store_unavailable => {
+                        crate::write_health::store_unavailable(
+                            response
+                                .error
+                                .as_deref()
+                                .unwrap_or("the store did not take the write"),
+                        )
+                    }
                     Ok(response) => odata_error(
                         StatusCode::CONFLICT,
                         "ConcurrentModification",
@@ -1461,6 +1478,14 @@ pub async fn handle_odata_put(
                         }
                         .into_response()
                     }
+                    Ok(response) if response.store_unavailable => {
+                        crate::write_health::store_unavailable(
+                            response
+                                .error
+                                .as_deref()
+                                .unwrap_or("the store did not take the write"),
+                        )
+                    }
                     Ok(response) => odata_error(
                         StatusCode::CONFLICT,
                         "ConcurrentModification",
@@ -1639,6 +1664,14 @@ pub async fn handle_odata_delete(
                         }
                         state.clear_commons_storage_projection_cache_for_entity(&entity_type);
                         (StatusCode::NO_CONTENT, "").into_response()
+                    }
+                    Ok(response) if response.store_unavailable => {
+                        crate::write_health::store_unavailable(
+                            response
+                                .error
+                                .as_deref()
+                                .unwrap_or("the store did not take the write"),
+                        )
                     }
                     Ok(response) => odata_error(
                         StatusCode::CONFLICT,

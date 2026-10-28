@@ -144,7 +144,7 @@ impl crate::state::ServerState {
                     return;
                 }
             };
-        let callback_ctx = match parent_ctx.for_callback() {
+        let callback_ctx = match parent_ctx.for_callback(entity_type, entity_id, &action) {
             Ok(context) => context,
             Err(budget_error) => {
                 self.record_generated_callback_refusal(

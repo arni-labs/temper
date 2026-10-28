@@ -44,7 +44,7 @@ effect = ["total += params.amount"]
         target_state: None,
         params: BTreeMap::from([("amount".into(), ParamValue::Count(1))]),
         read: true,
-        depth: 1,
+        chain: Vec::new(),
         via: None,
         by: 0,
         inline: false,

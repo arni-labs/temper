@@ -232,6 +232,10 @@ pub(super) async fn dispatch_bound_action(
                         body,
                     }
                     .into_response()
+                } else if response.store_unavailable {
+                    let error = response.error.unwrap_or_default();
+                    action_span.set_status(Status::error(error.clone()));
+                    crate::write_health::store_unavailable(&error)
                 } else {
                     action_span
                         .set_status(Status::error(response.error.clone().unwrap_or_default()));
@@ -263,6 +267,10 @@ pub(super) async fn dispatch_bound_action(
             Err(DispatchError::Conflict(reason)) => {
                 action_span.set_status(Status::error(reason.clone()));
                 odata_error(StatusCode::CONFLICT, "Conflict", &reason).into_response()
+            }
+            Err(DispatchError::StoreUnavailable(reason)) => {
+                action_span.set_status(Status::error(reason.clone()));
+                crate::write_health::store_unavailable(&reason)
             }
             // ADR-0048: transient exhaustion → 503 Retry-After so clients and
             // proxies back off instead of paging someone.

@@ -197,6 +197,34 @@ impl crate::state::ServerState {
                     } else {
                         None
                     };
+                    // The child is an entity this chain made, and its initial
+                    // action is the chain's next step. One that would repeat a
+                    // step the chain is already in is a loop (`InlineChain`),
+                    // refused before the child is made: a spawn loop stops at
+                    // its first repeat like a reaction loop.
+                    let mut agent = agent.having_made([(child_type.as_str(), child_id.as_str())]);
+                    if let Some((action, _)) = &initializer {
+                        let step = agent.inline_chain.step(&child_type, &child_id, action);
+                        match agent.inline_chain.then(step) {
+                            Ok(chain) => agent.inline_chain = chain,
+                            Err(repeat) => {
+                                state.record_generated_callback_refusal(
+                                    super::WasmEntityRef {
+                                        tenant: &t,
+                                        entity_type: &parent_t,
+                                        entity_id: &parent_i,
+                                    },
+                                    action,
+                                    &format!(
+                                        "spawned {child_type} not made: its initial action \
+                                         would repeat a step its chain is already in \
+                                         ({repeat}), so the chain is a loop"
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
                     // A strict child's declared initializer accepts its data. The
                     // spawn effect supplies only identity to generic creation.
                     let initial_fields = if strict_child {

@@ -901,6 +901,7 @@ mod directed_evolution;
 mod policy_joint;
 mod policy_reinstall;
 mod spec_change;
+mod timer_strands;
 #[test]
 fn test_get_app_project_management() {
     let bundle = get_os_app("project-management");
