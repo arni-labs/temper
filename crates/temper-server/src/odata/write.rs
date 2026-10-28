@@ -33,8 +33,8 @@ use super::stream_put::{handle_file_value_put, handle_stream_put, streamed_file_
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context};
 use crate::response::{ODataResponse, odata_error, odata_refusal};
-use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{CreateError, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -742,14 +742,18 @@ pub async fn handle_odata_post(
                 }
             }
 
-            // A new entity's first event holds its initial fields: one too large is
-            // refused here, before any create path starts.
+            // A new entity's first event holds its initial fields: one too large, or
+            // one the disk has no room for, is refused here, before any create path
+            // starts.
             if let Err(error) =
-                state.check_created_event_size(&tenant, &entity_type, &entity_id, &initial_fields)
+                state.check_created_event(&tenant, &entity_type, &entity_id, &initial_fields)
             {
                 let (status, code) = match error {
                     PersistenceError::EventTooLarge { .. } => {
                         (StatusCode::PAYLOAD_TOO_LARGE, "EventTooLarge")
+                    }
+                    PersistenceError::StorageFull { .. } => {
+                        return crate::write_health::store_unavailable(&error.to_string());
                     }
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, "CreateError"),
                 };
@@ -787,12 +791,20 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
+                .get_or_create_tenant_entity_by(
+                    &tenant,
+                    &entity_type,
+                    &entity_id,
+                    initial_fields,
+                    &agent_ctx,
+                )
                 .await
             {
                 Ok(response) => {
                     // Creation is not a dispatch: a record created into a
-                    // timed first state has its timer armed here.
+                    // timed first state has its timer armed here. Its row
+                    // committed with the `Created` event when the store keeps
+                    // rows with the journal.
                     state
                         .arm_state_timeouts_on_creation(
                             &tenant,
@@ -819,8 +831,13 @@ pub async fn handle_odata_post(
                     }
                     .into_response()
                 }
-                Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
-                    .into_response(),
+                Err(CreateError::StoreUnavailable(reason)) => {
+                    crate::write_health::store_unavailable(&reason)
+                }
+                Err(CreateError::Failed(e)) => {
+                    odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
+                        .into_response()
+                }
             }
         }
 
@@ -857,6 +874,16 @@ pub async fn handle_odata_post(
                 Ok(t) => t,
                 Err(resp) => return *resp,
             };
+
+            if temper_spec::automaton::is_carry_move(action.rsplit('.').next().unwrap_or(&action)) {
+                return odata_error(
+                    StatusCode::FORBIDDEN,
+                    "PlatformMove",
+                    "A [[carry]] move is made only by the platform, when it installs a new \
+                     version of the spec",
+                )
+                .into_response();
+            }
 
             if state.is_pg_actor_backed(&tenant, &entity_type) {
                 let Some(actor_sys) = &state.pg_actor_system else {
@@ -1182,6 +1209,14 @@ pub async fn handle_odata_patch(
                     }
                     .into_response()
                 }
+                Ok(response) if response.store_unavailable => {
+                    crate::write_health::store_unavailable(
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("the store did not take the write"),
+                    )
+                }
                 Ok(response) => odata_error(
                     StatusCode::CONFLICT,
                     "ConcurrentModification",
@@ -1417,6 +1452,14 @@ pub async fn handle_odata_put(
                     }
                     .into_response()
                 }
+                Ok(response) if response.store_unavailable => {
+                    crate::write_health::store_unavailable(
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("the store did not take the write"),
+                    )
+                }
                 Ok(response) => odata_error(
                     StatusCode::CONFLICT,
                     "ConcurrentModification",
@@ -1583,6 +1626,14 @@ pub async fn handle_odata_delete(
                     }
                     state.clear_commons_storage_projection_cache_for_entity(&entity_type);
                     (StatusCode::NO_CONTENT, "").into_response()
+                }
+                Ok(response) if response.store_unavailable => {
+                    crate::write_health::store_unavailable(
+                        response
+                            .error
+                            .as_deref()
+                            .unwrap_or("the store did not take the write"),
+                    )
                 }
                 Ok(response) => odata_error(
                     StatusCode::CONFLICT,

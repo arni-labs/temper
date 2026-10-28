@@ -3,6 +3,10 @@ name: CI
 on:
   pull_request:
     branches: [main, staging]
+  # The merge queue tests each group (the queued pull requests on top of main) before it
+  # lands. Every required check comes from this workflow, so without this trigger the
+  # queue would wait for checks that never start.
+  merge_group:
   push:
     branches: [main, staging]
   schedule:
@@ -19,8 +23,9 @@ on:
         required: false
         default: false
 
-# A new push to a pull request cancels its older run. Every push to main, schedule and
-# dispatch runs to the end in its own group, so each commit on main gets a full verdict.
+# A new push to a pull request cancels its older run. Every merge group, push to main,
+# schedule and dispatch runs to the end in its own group, so each commit on main gets a
+# full verdict.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -45,7 +50,8 @@ env:
 jobs:
   # ─────────────────────────────────────────────────────
   # What this run tests. Push, schedule and a plain dispatch: everything (lane "full").
-  # A pull request: only the packages its changes can reach (lane "pr"), see scripts/ci/affected.py.
+  # A pull request or a merge group: only the packages its changes can reach (lane "pr"),
+  # see scripts/ci/affected.py. A merge group's changes are those of every pull request in it.
   # ─────────────────────────────────────────────────────
   changes:
     name: Changed packages
@@ -65,8 +71,8 @@ jobs:
       - id: affected
         env:
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           CHANGED_PATHS: ${{ inputs.changed }}
           # cargo metadata --no-deps needs no particular toolchain; skip installing the pinned one.
           RUSTUP_TOOLCHAIN: stable

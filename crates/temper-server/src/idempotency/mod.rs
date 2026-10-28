@@ -414,6 +414,7 @@ fn replay_copy(response: &EntityResponse) -> EntityResponse {
         spec_governed: response.spec_governed,
         refused: response.refused,
         answered_action: None,
+        store_unavailable: response.store_unavailable,
     }
 }
 

@@ -245,6 +245,7 @@ impl ServerState {
             spec_governed: true,
             refused: false,
             answered_action: None,
+            store_unavailable: false,
         };
         self.broadcast_synthetic_file_stream_update(tenant, file_id, &response, agent_ctx);
         Ok(response)

@@ -3,8 +3,14 @@
 //! A bundle that cannot be registered must leave no stored row for the next
 //! start to restore, so these refuse it before the first write.
 
+use std::collections::BTreeMap;
+
+use temper_authz::{Asker, May, SendAnalysis};
+use temper_runtime::tenant::TenantId;
 use temper_spec::cross_invariant;
 use temper_verify::composite::{JointOutcome, LivenessOutcome};
+
+use super::InstallWarning;
 
 use crate::state::PlatformState;
 
@@ -105,7 +111,7 @@ pub(super) async fn prove(
         || super::cached_or_active_tenant_policy_text(state, tenant),
         str::to_string,
     );
-    let policies = temper_authz::SendAnalysis::new(&policy_text)
+    let policies = SendAnalysis::new(&policy_text)
         .map_err(|e| format!("os-app '{app_name}': its Cedar could not be read: {e}"))?;
     let (invariants, liveness) = tokio::task::spawn_blocking(move || {
         let refs: Vec<&temper_spec::automaton::Automaton> = automatons.values().collect();
@@ -191,6 +197,155 @@ fn bundle_with_named(
         return Ok(None);
     }
     Ok(Some(automatons))
+}
+
+/// What the joint model says of `specs` under `policies` without refusing the
+/// install: the rules [`prove`] could not prove, and the timers whose lost
+/// fire nothing redoes ([`timer_strands`]).
+pub(super) async fn model_warnings(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    specs: &[(String, String)],
+    new_specs: bool,
+    policies: Option<&str>,
+) -> Result<Vec<InstallWarning>, String> {
+    let unproved = prove(state, tenant, app_name, specs, new_specs, policies).await?;
+    let mut warnings: Vec<InstallWarning> = unproved
+        .into_iter()
+        .map(InstallWarning::joint_invariants)
+        .collect();
+    warnings.extend(timer_strands(state, tenant, specs, new_specs, policies));
+    Ok(warnings)
+}
+
+/// Warn about each state timer of `specs` whose lost fire nothing redoes: no
+/// one outside Temper may make its `on_timeout` move, or any move in its
+/// `reset_on`, under `policies` (the tenant's Cedar as the install leaves
+/// it). A fire is lost to a projection timeout, a restart before the boot
+/// re-arm, or a refused fire, and the record then stays in the timer's state.
+/// A move is one someone outside may make unless Cedar refuses it whatever
+/// the request holds (`May::No`), as the joint model decides an outside move,
+/// so each warning is certain. With no policies everyone may make every move,
+/// and nothing warns. It runs when the install brings new specs or policies,
+/// like [`prove`], and never refuses: a rule that cannot block yet starts as
+/// a warning.
+pub(super) fn timer_strands(
+    state: &PlatformState,
+    tenant: &str,
+    specs: &[(String, String)],
+    new_specs: bool,
+    policies: Option<&str>,
+) -> Vec<InstallWarning> {
+    if !new_specs && policies.is_none() {
+        return Vec::new();
+    }
+    let policy_text = policies.map_or_else(
+        || super::cached_or_active_tenant_policy_text(state, tenant),
+        str::to_string,
+    );
+    // Cedar that does not compile was refused before this (`install_guard`).
+    let Some(cedar) = Some(policy_text)
+        .filter(|text| !text.trim().is_empty())
+        .and_then(|text| SendAnalysis::new(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let outside_may = |entity_type: &str, action: &str| {
+        cedar.may(&Asker::Outside, action, entity_type, &BTreeMap::new()) != May::No
+    };
+    let mut warnings = Vec::new();
+    for (entity_type, source) in specs {
+        // A spec that does not parse is refused by the install's other checks.
+        let Ok(automaton) = temper_spec::automaton::parse_automaton(source) else {
+            continue;
+        };
+        for timer in &automaton.state_timeouts {
+            let redone = std::iter::once(&timer.on_timeout)
+                .chain(&timer.reset_on)
+                .any(|action| outside_may(entity_type, action));
+            if redone {
+                continue;
+            }
+            let (place, action, seconds) = (&timer.state, &timer.on_timeout, timer.after_seconds);
+            warnings.push(InstallWarning::timer_strands(
+                format!(
+                    "{entity_type}: {place}'s timer makes {action} after {seconds} s, and no \
+                     person or agent outside Temper may make {action} or a move in its \
+                     reset_on, so a record whose fire is lost (a projection timeout, a restart \
+                     before the boot re-arm, a refused fire) stays in {place}. Let a person \
+                     make {action}, so the same move redoes a lost fire, or list a move a \
+                     person may make in reset_on."
+                ),
+                serde_json::json!({
+                    "entity_type": entity_type,
+                    "state": place,
+                    "on_timeout": action,
+                    "after_seconds": seconds,
+                }),
+            ));
+        }
+    }
+    warnings
+}
+
+/// Check each new version in `specs`, when the install writes specs, against
+/// the records stored under the version installed for its type, before
+/// anything is written (see temper-server's `spec_change`): refuse it when it
+/// leaves records with no way forward that no `[[carry]]` moves. Returns what
+/// the check reports, and how many records each carry moves once the install
+/// has answered (the server's carry pass makes them in the background).
+/// `policies` is the tenant's Cedar text once the install serves, when the
+/// install changes it.
+pub(super) async fn check_spec_changes(
+    state: &PlatformState,
+    tenant: &TenantId,
+    app_name: &str,
+    specs: &[(String, String)],
+    writes_specs: bool,
+    policies: Option<&str>,
+) -> Result<Vec<InstallWarning>, String> {
+    if !writes_specs {
+        return Ok(Vec::new());
+    }
+    let sources: Vec<(&str, &str)> = specs
+        .iter()
+        .map(|(entity_type, source)| (entity_type.as_str(), source.as_str()))
+        .collect();
+    let changes = state
+        .server
+        .spec_changes(tenant, &sources)
+        .map_err(|error| format!("os-app '{app_name}': {error}"))?;
+    let plan = state
+        .server
+        .check_spec_changes(tenant, &changes, policies)
+        .await
+        .map_err(|refused| format!("os-app '{app_name}' was not installed. {refused}"))?;
+    let mut carrying: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for carry in &plan.carries {
+        *carrying
+            .entry((carry.entity_type.as_str(), carry.action.as_str()))
+            .or_default() += 1;
+    }
+    let carrying = carrying
+        .into_iter()
+        .map(|((entity_type, action), records)| {
+            let records = if records == 1 {
+                "1 record".to_string()
+            } else {
+                format!("{records} records")
+            };
+            format!(
+                "{entity_type}: {action} carries {records} once the install has answered; \
+             until then they wait in their old state"
+            )
+        });
+    Ok(plan
+        .warnings
+        .into_iter()
+        .chain(carrying)
+        .map(InstallWarning::spec_change)
+        .collect())
 }
 
 #[cfg(test)]

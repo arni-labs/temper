@@ -207,6 +207,17 @@ impl crate::state::ServerState {
             await_integration,
             await_reactions,
         } = cmd;
+        // This action is a step of the inline chain its integrations and
+        // reactions continue (`InlineChain`).
+        let entered_ctx = agent_ctx.entering(entity_type, entity_id, action);
+        let agent_ctx = &entered_ctx;
+
+        if temper_spec::automaton::is_carry_move(action) {
+            return Err(DispatchError::AuthzDenied(format!(
+                "'{action}' is a [[carry]] move, which only the platform makes when it installs \
+                 a new version of the spec"
+            )));
+        }
 
         if self
             .composite_metadata_for(tenant, entity_type, action)?
@@ -230,6 +241,14 @@ impl crate::state::ServerState {
 
         // Dispatch cross-entity reactions (fire-and-forget, depth 0 = top-level)
         if response.success {
+            // The children this action spawned are entities its chain made.
+            let reaction_ctx = entered_ctx.having_made(
+                response
+                    .spawn_requests
+                    .iter()
+                    .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
+            );
+            let agent_ctx = &reaction_ctx;
             // A poisoned lock must not silently disable reactions: the slot
             // only holds an Arc, so the data can't be torn — recover it.
             let dispatcher = self

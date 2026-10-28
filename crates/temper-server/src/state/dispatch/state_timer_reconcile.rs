@@ -15,11 +15,11 @@
 //! - after a dispatch that neither entered nor reset a timed state, after a
 //!   create, and after a delete.
 //!
-//! Only a fresh event arms a record that has no timer, and so no row: a
-//! dispatch, a create, or an install that changed the record's spec. A
-//! rehydration and a boot follow only a timer the record already has, from
-//! its row ([`Arming::FromRow`]); a record in a timed state with no row waits
-//! for its next action, and the boot walk counts it.
+//! A fresh event arms a record that has no timer, and so no row: a dispatch,
+//! a create, or an install that changed the record's spec. So does the boot
+//! walk: a process can stop between an event and its row. A rehydration
+//! follows only a timer the record already has, from its row
+//! ([`Arming::FromRow`]).
 //!
 //! It is idempotent: a record whose armed timer is already the one its state
 //! declares keeps it, so any number of calls leave one timer armed. The timer's
@@ -67,7 +67,7 @@ pub(crate) enum TimerFollow {
     /// and nobody armed it: the record's next action arms it as that caller.
     WaitsForCaller,
     /// Its state declares a timer, but it has no timer and no row, and a
-    /// rehydration or a boot does not arm one: its next action does.
+    /// rehydration does not arm one: its next action or the next boot does.
     WaitsForRow,
 }
 
@@ -76,13 +76,14 @@ pub(crate) enum TimerFollow {
 pub(crate) enum Arming {
     /// A fresh event says the record is in its state now: a dispatch, a
     /// create, a delete, a timer that found its record elsewhere, or an
-    /// install that changed the record's spec. A missing timer is armed.
+    /// install that changed the record's spec. Or the boot walk, which finds
+    /// the records a stopped process left without a row. A missing timer is
+    /// armed.
     #[default]
     Any,
-    /// A rehydration or a boot: only a timer the record has (armed from its
-    /// row, or the row the boot dropped) follows its state. A record with
-    /// neither waits ([`TimerFollow::WaitsForRow`]), so a boot never arms
-    /// records that had no timer, and never fires them all at once.
+    /// A rehydration: only a timer the record has (armed from its row)
+    /// follows its state. A record with neither waits
+    /// ([`TimerFollow::WaitsForRow`]) for its next action or the next boot.
     FromRow,
 }
 

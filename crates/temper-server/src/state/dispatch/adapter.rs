@@ -580,7 +580,12 @@ impl crate::state::ServerState {
         agent_ctx: &AgentContext,
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
-        let callback_ctx = match agent_ctx.for_callback(integration) {
+        let callback_ctx = match agent_ctx.for_callback(
+            entity_ref.entity_type,
+            entity_ref.entity_id,
+            callback_action,
+            integration,
+        ) {
             Ok(context) => context,
             Err(error) => {
                 return self

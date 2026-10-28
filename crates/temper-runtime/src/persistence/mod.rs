@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod catalog_group;
 mod tombstone;
+pub use catalog_group::CatalogGroupRow;
 pub use tombstone::{EVENT_KIND_KEY, EventKind, TOMBSTONE_EVENT_TYPE, journal_is_deleted};
 
 /// Event type used for the parent-journal record of a Composite action.
@@ -662,6 +664,20 @@ pub enum PersistenceError {
         persistence_id: String,
         bytes: usize,
         limit: usize,
+    },
+
+    /// The disk under the store has less room available than the server keeps
+    /// free (`temper_server::storage::STORAGE_FLOOR_BYTES`). Nothing was
+    /// written; writes go on by themselves once the disk has room again.
+    #[error(
+        "storage full: {} MB available on the disk of {dir}, under the {} MB this server keeps free; nothing was written, and writes go on once the disk has room",
+        .available_bytes >> 20,
+        .floor_bytes >> 20
+    )]
+    StorageFull {
+        dir: String,
+        available_bytes: u64,
+        floor_bytes: u64,
     },
 }
 

@@ -1,5 +1,5 @@
 use crate::request_context::AgentContext;
-use temper_jit::table::{Related, RelatedMap};
+use temper_jit::table::{Related, RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
@@ -20,17 +20,16 @@ impl crate::state::ServerState {
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        let mut result = RelatedMap::new();
         let table = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
-                return result;
+                return RelatedMap::new();
             };
             spec.table()
         };
         let refs = table.related_refs(action);
         if refs.is_empty() {
-            return result;
+            return RelatedMap::new();
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -39,12 +38,26 @@ impl crate::state::ServerState {
             .await
         {
             Ok(resp) => resp.state.fields,
-            Err(_) => return result,
+            Err(_) => return RelatedMap::new(),
         };
+        self.related_statuses_of(tenant, &table, refs, &current_fields)
+            .await
+    }
 
+    /// The statuses of the records `fields` refers to through each of
+    /// `refs`, `(related type, id field)`, under `table`'s declared defaults,
+    /// as [`Self::resolve_related_statuses`] resolves them.
+    pub(in crate::state) async fn related_statuses_of(
+        &self,
+        tenant: &TenantId,
+        table: &TransitionTable,
+        refs: Vec<(String, String)>,
+        fields: &serde_json::Value,
+    ) -> RelatedMap {
+        let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
             let ids = crate::entity_actor::related::reference_ids(
-                &current_fields,
+                fields,
                 &table.initial_values,
                 &id_field,
             );
@@ -184,6 +197,34 @@ impl crate::state::ServerState {
                     } else {
                         None
                     };
+                    // The child is an entity this chain made, and its initial
+                    // action is the chain's next step. One that would repeat a
+                    // step the chain is already in is a loop (`InlineChain`),
+                    // refused before the child is made: a spawn loop stops at
+                    // its first repeat like a reaction loop.
+                    let mut agent = agent.having_made([(child_type.as_str(), child_id.as_str())]);
+                    if let Some((action, _)) = &initializer {
+                        let step = agent.inline_chain.step(&child_type, &child_id, action);
+                        match agent.inline_chain.then(step) {
+                            Ok(chain) => agent.inline_chain = chain,
+                            Err(repeat) => {
+                                state.record_generated_callback_refusal(
+                                    super::WasmEntityRef {
+                                        tenant: &t,
+                                        entity_type: &parent_t,
+                                        entity_id: &parent_i,
+                                    },
+                                    action,
+                                    &format!(
+                                        "spawned {child_type} not made: its initial action \
+                                         would repeat a step its chain is already in \
+                                         ({repeat}), so the chain is a loop"
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
                     // A strict child's declared initializer accepts its data. The
                     // spawn effect supplies only identity to generic creation.
                     let initial_fields = if strict_child {
@@ -236,7 +277,13 @@ impl crate::state::ServerState {
                     }
 
                     match state
-                        .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
+                        .get_or_create_tenant_entity_by(
+                            &t,
+                            &child_type,
+                            &child_id,
+                            initial_fields,
+                            &agent,
+                        )
                         .await
                     {
                         Ok(created) => {

@@ -7,6 +7,7 @@ use std::time::Instant;
 use tracing::{Instrument, instrument};
 
 use temper_observe::wide_event;
+use temper_runtime::actor::ActorError;
 use temper_runtime::persistence::{
     CommitRows, EventMetadata, PersistenceEnvelope, PersistenceError, ProjectionRow,
 };
@@ -18,6 +19,7 @@ use super::{ServerState, projection_backfill};
 use crate::entity_actor::{EntityActor, EntityEvent, EntityMsg, EntityResponse};
 use crate::events::EntityStateChange;
 use crate::registry::{VerificationDetail, VerificationStatus};
+use crate::request_context::AgentContext;
 use crate::runtime_metrics;
 use crate::storage::DataOnlyCreateRecord;
 
@@ -25,6 +27,24 @@ use crate::storage::DataOnlyCreateRecord;
 /// Remainder stay registered for the next tick so snapshot writes cannot
 /// occupy the request pool for the whole idle set (ARN-462).
 pub const PASSIVATE_IDLE_ACTORS_PER_TICK: usize = 32;
+
+/// Why a create made no record.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateError {
+    /// The store did not take the record's first write: nothing was written,
+    /// and the same create can be sent again.
+    #[error("{0}")]
+    StoreUnavailable(String),
+    /// Any other reason.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<CreateError> for String {
+    fn from(error: CreateError) -> Self {
+        error.to_string()
+    }
+}
 
 fn actor_idle_timeout_secs() -> i64 {
     static ACTOR_IDLE_TIMEOUT: OnceLock<i64> = OnceLock::new();
@@ -315,6 +335,7 @@ impl ServerState {
                 spec_governed: true,
                 refused: false,
                 answered_action: None,
+                store_unavailable: false,
             }
         };
 
@@ -936,13 +957,34 @@ impl ServerState {
     }
 
     /// Get or spawn an entity actor with initial fields for a specific tenant.
-    #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
     pub fn get_or_spawn_tenant_actor_with_fields(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
+    ) -> Result<ActorRef<EntityMsg>, String> {
+        self.get_or_spawn_tenant_actor_created_by(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+            None,
+        )
+    }
+
+    /// [`Self::get_or_spawn_tenant_actor_with_fields`], for a record that
+    /// `created_by` creates: a new actor writes its `Created` event as that
+    /// caller's, so a first state with a timer commits the timer's row with
+    /// it.
+    #[instrument(skip_all, fields(otel.name = "entity.get_or_spawn_tenant_actor_with_fields", tenant = %tenant, entity_type, entity_id))]
+    fn get_or_spawn_tenant_actor_created_by(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: Option<&AgentContext>,
     ) -> Result<ActorRef<EntityMsg>, String> {
         if !initial_fields
             .as_object()
@@ -1015,7 +1057,8 @@ impl ServerState {
         }
         .with_legacy_blob_store(legacy_blob_store)
         .with_on_rehydrated(self.state_timer_rehydrate_hook(tenant, entity_type, entity_id))
-        .with_entity_rows(self.entity_rows_hook(tenant, entity_type));
+        .with_entity_rows(self.entity_rows_hook(tenant, entity_type))
+        .with_creator(created_by.cloned());
 
         // Slow-path: atomically re-check and spawn under write lock.
         // This prevents duplicate actors when concurrent requests race to create
@@ -1065,6 +1108,30 @@ impl ServerState {
             let index_key = format!("{tenant}:{entity_type}");
             let mut index = self.entity_index.write().unwrap();
             if let Some(ids) = index.get_mut(&index_key) {
+                ids.remove(entity_id);
+            }
+        }
+        runtime_metrics::record_server_state_metrics(self);
+    }
+
+    /// Forget an entity whose first write its store did not take: it has no
+    /// journal, so it leaves the actor registry and the entity index, unless a
+    /// live actor has taken its key since. The registry lock is held
+    /// throughout, so a create that spawns the key again is never undone.
+    fn forget_uncreated_entity(&self, tenant: &TenantId, entity_type: &str, entity_id: &str) {
+        let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+        {
+            let mut registry = self.actor_registry.write().unwrap();
+            if registry
+                .get(&actor_key)
+                .is_some_and(|actor| !actor.is_closed())
+            {
+                return;
+            }
+            registry.remove(&actor_key);
+            self.last_accessed.write().unwrap().remove(&actor_key);
+            let mut index = self.entity_index.write().unwrap();
+            if let Some(ids) = index.get_mut(&format!("{tenant}:{entity_type}")) {
                 ids.remove(entity_id);
             }
         }
@@ -1132,12 +1199,56 @@ impl ServerState {
         resource_attrs: &BTreeMap<String, serde_json::Value>,
         tenant: &str,
     ) -> Result<(), AuthzDenial> {
+        self.decide_and_report(
+            AuthzEngine::authorize_for_tenant_or_bypass,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            tenant,
+        )
+    }
+
+    /// The same decision as [`Self::authorize_with_context`], for a page
+    /// asking which moves to show before any is sent (`POST /api/authorize`).
+    /// It is counted as `check:offer`, not as a refusal; a move that is sent
+    /// is checked again at the gate.
+    #[instrument(skip_all, fields(otel.name = "entity.authorize_offer_with_context", action, resource_type))]
+    pub fn authorize_offer_with_context(
+        &self,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &BTreeMap<String, serde_json::Value>,
+        tenant: &str,
+    ) -> Result<(), AuthzDenial> {
+        self.decide_and_report(
+            AuthzEngine::authorize_offer_for_tenant,
+            security_ctx,
+            action,
+            resource_type,
+            resource_attrs,
+            tenant,
+        )
+    }
+
+    /// Ask Cedar through `decide` and emit the authz wide event for the answer.
+    fn decide_and_report(
+        &self,
+        decide: AuthzCheck,
+        security_ctx: &SecurityContext,
+        action: &str,
+        resource_type: &str,
+        resource_attrs: &BTreeMap<String, serde_json::Value>,
+        tenant: &str,
+    ) -> Result<(), AuthzDenial> {
         let attrs: std::collections::HashMap<_, _> = resource_attrs // determinism-ok: Cedar API requires HashMap
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(); // determinism-ok
         let authz_start = sim_now();
-        let decision = self.authz.authorize_for_tenant_or_bypass(
+        let decision = decide(
+            &self.authz,
             tenant,
             security_ctx,
             action,
@@ -1217,10 +1328,11 @@ impl ServerState {
     }
 
     /// Refuse a new entity whose first event, `Created` with its initial fields,
-    /// would be larger than the event size limit. Checked before its actor starts,
-    /// so a refused create answers with the refusal instead of a stopped actor and
-    /// an empty entity left in the index.
-    pub(crate) fn check_created_event_size(
+    /// cannot be written: the disk under the store is below the floor, or the
+    /// event would be larger than the event size limit. Checked before its actor
+    /// starts, so a refused create answers with the refusal instead of a stopped
+    /// actor and an empty entity left in the index.
+    pub(crate) fn check_created_event(
         &self,
         tenant: &TenantId,
         entity_type: &str,
@@ -1230,6 +1342,7 @@ impl ServerState {
         let Some((store, _)) = self.event_journal() else {
             return Ok(());
         };
+        store.check_room()?;
         // Without a limit (the kernel's default) a create pays nothing for this.
         if store.event_size_limits().max_bytes.is_none() {
             return Ok(());
@@ -1275,32 +1388,84 @@ impl ServerState {
     }
 
     /// Create a new entity with initial fields and return its state.
-    #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_or_create_tenant_entity(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         initial_fields: serde_json::Value,
-    ) -> Result<EntityResponse, String> {
-        self.check_created_event_size(tenant, entity_type, entity_id, &initial_fields)
-            .map_err(|e| e.to_string())?;
-        let actor_ref = self.get_or_spawn_tenant_actor_with_fields(
+    ) -> Result<EntityResponse, CreateError> {
+        self.create_tenant_entity(tenant, entity_type, entity_id, initial_fields, None)
+            .await
+    }
+
+    /// [`Self::get_or_create_tenant_entity`] for a record `created_by`
+    /// creates. A first state with a timer commits the timer's row, armed as
+    /// `created_by`, with the record's `Created` event: a process that stops
+    /// before [`Self::arm_state_timeouts_on_creation`] leaves the timer to
+    /// the next one.
+    pub async fn get_or_create_tenant_entity_by(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: &AgentContext,
+    ) -> Result<EntityResponse, CreateError> {
+        self.create_tenant_entity(
             tenant,
             entity_type,
             entity_id,
             initial_fields,
-        )?;
+            Some(created_by),
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(otel.name = "entity.get_or_create_tenant_entity", tenant = %tenant, entity_type, entity_id))]
+    async fn create_tenant_entity(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: Option<&AgentContext>,
+    ) -> Result<EntityResponse, CreateError> {
+        self.check_created_event(tenant, entity_type, entity_id, &initial_fields)
+            .map_err(|e| match e {
+                PersistenceError::StorageFull { .. } => {
+                    CreateError::StoreUnavailable(e.to_string())
+                }
+                e => CreateError::Failed(e.to_string()),
+            })?;
+        let actor_ref = self
+            .get_or_spawn_tenant_actor_created_by(
+                tenant,
+                entity_type,
+                entity_id,
+                initial_fields,
+                created_by,
+            )
+            .map_err(CreateError::Failed)?;
 
         let policy = self.dispatch_retry_policy();
-        let response = retry::ask_with_backoff::<_, EntityResponse, _>(
+        let response = match retry::ask_with_backoff::<_, EntityResponse, _>(
             &actor_ref,
             || EntityMsg::GetState,
             &policy,
         )
         .await
         .result
-        .map_err(|e| format!("Actor query failed: {e}"))?;
+        {
+            Ok(response) => response,
+            // The store did not take the record's first write (its size and the
+            // disk's room were checked above), so the record was not created.
+            Err(ActorError::InitFailed(reason)) => {
+                self.forget_uncreated_entity(tenant, entity_type, entity_id);
+                return Err(CreateError::StoreUnavailable(reason));
+            }
+            Err(e) => return Err(CreateError::Failed(format!("Actor query failed: {e}"))),
+        };
 
         // Broadcast entity creation event for SSE subscribers
         let seq = self.next_entity_event_sequence(tenant.as_str(), entity_type, entity_id);
@@ -1371,7 +1536,9 @@ impl ServerState {
                     entity_id = %entity_id,
                     "failed to update query projection during create"
                 );
-                return Err(format!("query projection write failed during create: {e}"));
+                return Err(CreateError::Failed(format!(
+                    "query projection write failed during create: {e}"
+                )));
             }
             record_projection_update_success(
                 tenant,
@@ -1669,6 +1836,7 @@ impl ServerState {
             spec_governed: true,
             refused: false,
             answered_action: None,
+            store_unavailable: false,
         }))
     }
 
@@ -2350,5 +2518,16 @@ impl ServerState {
     }
 }
 
-use temper_authz::{AuthzDecision, AuthzDenial, SecurityContext};
+use temper_authz::{AuthzDecision, AuthzDenial, AuthzEngine, SecurityContext};
 use temper_runtime::actor::ActorRef;
+
+/// One of [`AuthzEngine`]'s tenant checks; they differ only in the `check`
+/// their Cedar metric is counted under.
+type AuthzCheck = fn(
+    &AuthzEngine,
+    &str,
+    &SecurityContext,
+    &str,
+    &str,
+    &std::collections::HashMap<String, serde_json::Value>, // determinism-ok: Cedar API requires HashMap
+) -> AuthzDecision;

@@ -2,10 +2,10 @@
 """Decide what a CI run tests, for .github/workflows/ci.yml.
 
 Lane "full" (push, schedule, a plain dispatch) runs every check as before.
-Lane "pr" (a pull request, or a dispatch given changed paths) tests only the
-workspace packages a change can reach: the packages whose files changed plus
-every package that depends on them (normal, dev and build dependencies all
-count), worked out from `cargo metadata`. A change to anything outside a
+Lane "pr" (a pull request, a merge group, or a dispatch given changed paths)
+tests only the workspace packages a change can reach: the packages whose files
+changed plus every package that depends on them (normal, dev and build
+dependencies all count), worked out from `cargo metadata`. A change to anything outside a
 package that a build or test could read (Cargo.lock, the toolchain, .github/,
 test-fixtures/, os-apps/, skills/, scripts/, ...) tests every package; only the
 paths in DOCS are known to be read by nothing.
@@ -130,7 +130,10 @@ def test_args(packages):
 
 
 def main():
-    lane = "pr" if os.environ.get("EVENT") == "pull_request" or os.environ.get("CHANGED_PATHS", "").strip() else "full"
+    # A merge group takes the pr lane too: the full lane splits platform-random into seed
+    # shards, so the required "DST/Platform Tests (platform-random)" check would never report.
+    queued = os.environ.get("EVENT") in ("pull_request", "merge_group")
+    lane = "pr" if queued or os.environ.get("CHANGED_PATHS", "").strip() else "full"
     dirs, names, dependents = workspace()
     out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true"}
     if lane == "pr":

@@ -8,6 +8,8 @@ mod common;
 mod list_context_owner;
 #[path = "odata_read/pagination_count.rs"]
 mod pagination_count;
+#[path = "odata_read/platform_context_keys.rs"]
+mod platform_context_keys;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};

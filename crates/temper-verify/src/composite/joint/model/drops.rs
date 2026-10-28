@@ -256,13 +256,13 @@ to = "Ready"
         let model = JointModel::whole(&BTreeMap::from([("T", &a)]), BTreeSet::from(["T".into()]));
         let mut state = model.inits().next().unwrap();
         state.inflight = (0..4)
-            .map(|depth| Dispatch {
+            .map(|_| Dispatch {
                 to: "T".into(),
                 action: "Stay".into(),
                 target_state: None,
                 params: BTreeMap::new(),
                 read: true,
-                depth,
+                chain: Vec::new(),
                 via: None,
                 by: super::super::super::senders::OUTSIDE,
                 inline: false,

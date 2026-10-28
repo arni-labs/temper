@@ -13,7 +13,7 @@ pub mod statements;
 
 pub use context::{
     AuthenticatedRequestContext, Principal, PrincipalKind, SecurityContext,
-    is_cedar_authority_context_key,
+    is_cedar_authority_context_key, platform_keys,
 };
 pub use engine::{
     Asker, Attr, AuthzDecision, AuthzEngine, ListReadUniformity, May, SendAnalysis,

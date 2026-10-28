@@ -21,6 +21,7 @@ mod published_artifacts;
 mod query_projection_queue;
 pub(crate) mod rate_limit;
 mod runtime_metrics;
+mod spec_change;
 mod start_runtime;
 pub mod status_cache;
 pub(crate) mod storage_caps;
@@ -35,7 +36,9 @@ pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
     StateTimeoutTracker, TimerFollowHold,
 };
-pub use entity_ops::{FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError};
+pub use entity_ops::{
+    CreateError, FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError,
+};
 #[cfg(feature = "observe")]
 pub(crate) use file_reads::{BatchTextReadError, validate_batch_text_ids};
 pub use file_reads::{IndexedFileStreamRead, TextFileReadResult, TextFileVersionReadResult};
@@ -53,6 +56,9 @@ pub(crate) use published_artifacts::{
     PUBLISH_ARTIFACT_STALE_AUTHORIZATION, PublishArtifactAuthorization,
 };
 pub(crate) use query_projection_queue::{ProjectionEnqueueOutcome, QueryProjectionWriteQueue};
+pub use spec_change::{
+    CarryMove, CarryReport, SpecChange, SpecChangePlan, SpecChangeRefused, StuckRecords,
+};
 pub use trajectory::{TrajectoryEntry, TrajectorySource};
 pub use wasm_invocation_log::WasmInvocationEntry;
 
@@ -534,6 +540,9 @@ pub struct ServerState {
     pub(crate) timer_recovery_complete: Arc<std::sync::atomic::AtomicBool>,
     /// Set once [`Self::start_runtime`] has run in this process.
     pub(crate) runtime_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Held by each carry pass, so a pass derives its carries only after
+    /// the one before it has made its own (see `spec_change::carry_pass`).
+    pub(crate) carry_pass: Arc<tokio::sync::Mutex<()>>,
     /// Eventual invariant convergence tracker.
     pub eventual_tracker: Arc<RwLock<crate::eventual_invariants::EventualInvariantTracker>>,
     /// Idempotency cache for deduplicating agent retries.
@@ -835,6 +844,7 @@ impl ServerState {
             scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
+            carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),
@@ -1115,6 +1125,7 @@ impl ServerState {
             scheduled_armed: Arc::default(),
             timer_recovery_complete: Arc::default(),
             runtime_started: Arc::default(),
+            carry_pass: Arc::default(),
             eventual_tracker: Arc::new(RwLock::new(
                 crate::eventual_invariants::EventualInvariantTracker::new(),
             )),

@@ -13,6 +13,7 @@ mod actions;
 mod adapter;
 mod answers;
 mod authenticated_params;
+pub(crate) use authenticated_params::bind_authenticated_params;
 mod compensation;
 mod composite;
 mod cross_entity;
@@ -132,6 +133,11 @@ pub enum DispatchError {
     /// The entity type has no registered spec — all actions are denied by default.
     #[error("entity type '{0}' is not governed by any registered spec")]
     Ungoverned(String),
+
+    /// The store could not take the write: it failed, or its disk is under
+    /// the floor. Answered 503, so the caller tries again.
+    #[error("{0}")]
+    StoreUnavailable(String),
 
     /// An internal error (serialization, persistence, unexpected state).
     #[error("{0}")]

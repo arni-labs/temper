@@ -109,16 +109,8 @@ pub(in crate::state::dispatch) fn dispatch_callback_action_boxed<'a>(
     state: &'a crate::state::ServerState,
     command: DispatchCommand<'a>,
 ) -> BoxFuture<'a, Result<EntityResponse, String>> {
-    // Boxing bounds future storage, but nested polls still share the caller's
-    // stack. Grow only at this recursive boundary, both while constructing the
-    // future and while polling it. Callback depth separately bounds nesting.
-    const RED_ZONE: usize = 2 * 1024 * 1024;
-    const STACK_BYTES: usize = 8 * 1024 * 1024;
-    stacker::maybe_grow(RED_ZONE, STACK_BYTES, || {
-        let mut future = state.dispatch(command).boxed();
-        futures_util::future::poll_fn(move |context| {
-            stacker::maybe_grow(RED_ZONE, STACK_BYTES, || future.as_mut().poll(context))
-        })
-        .boxed()
-    })
+    // Nested polls share the caller's stack; grow it at this recursive
+    // boundary. A callback that would repeat a step of its inline chain is
+    // refused before it gets here (`AgentContext::for_callback`).
+    crate::growable_stack::on_growable_stack(|| state.dispatch(command).boxed())
 }

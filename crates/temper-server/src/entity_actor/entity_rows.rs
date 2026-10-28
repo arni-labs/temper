@@ -20,8 +20,9 @@ pub(crate) struct RowsInput<'a> {
     pub(crate) state: &'a EntityState,
     /// The event.
     pub(crate) event: &'a EntityEvent,
-    /// Who sent it. None: an internal write (a create, a field update, a
-    /// delete) with no caller to arm a timer as.
+    /// Who sent it, or created the record for a `Created` event. None: an
+    /// internal write (a field update, a delete, a create by the kernel)
+    /// with no caller to arm a timer as.
     pub(crate) caller: Option<&'a AgentContext>,
 }
 

@@ -88,6 +88,7 @@ impl crate::state::ServerState {
                 spec_governed: true,
                 refused: false,
                 answered_action: None,
+                store_unavailable: false,
             },
         })
     }

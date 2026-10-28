@@ -46,6 +46,7 @@ fn make_response(status: &str) -> EntityResponse {
         spec_governed: true,
         refused: false,
         answered_action: None,
+        store_unavailable: false,
     }
 }
 

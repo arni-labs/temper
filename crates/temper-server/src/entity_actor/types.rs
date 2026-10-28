@@ -350,6 +350,10 @@ pub struct EntityResponse {
     /// effects and reactions that follow belong to that recorded action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_action: Option<String>,
+    /// Whether the store could not take the action's write: it failed, or its
+    /// disk is under the floor. Answered 503, so the caller tries again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub store_unavailable: bool,
 }
 
 impl EntityResponse {
@@ -363,6 +367,15 @@ impl EntityResponse {
     pub(crate) fn refused(state: EntityState, error: String) -> Self {
         Self {
             refused: true,
+            store_unavailable: false,
+            ..Self::write_failed(state, error)
+        }
+    }
+
+    /// The answer to an action the store could not take: see `store_unavailable`.
+    pub(crate) fn store_unavailable(state: EntityState, error: String) -> Self {
+        Self {
+            store_unavailable: true,
             ..Self::write_failed(state, error)
         }
     }
@@ -380,6 +393,7 @@ impl EntityResponse {
             spec_governed: true,
             refused: false,
             answered_action: None,
+            store_unavailable: false,
         }
     }
 }

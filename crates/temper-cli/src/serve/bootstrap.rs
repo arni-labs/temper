@@ -17,7 +17,7 @@ use temper_server::registry::SpecRegistry;
 use temper_server::registry_bootstrap::{
     restore_registry_from_postgres, restore_registry_from_turso,
 };
-use temper_server::storage::StorageStack;
+use temper_server::storage::{StorageRoom, StorageStack};
 use temper_server::webhooks::WebhookDispatcher;
 use temper_store_redis::RedisEventStore;
 use temper_store_turso::{TenantStoreRouter, TursoEventStore};
@@ -79,6 +79,7 @@ pub(super) async fn init_storage(
                     Some(format!("{home}/.local/share/temper/tenants"))
                 });
 
+                let room = local_base_dir.clone().map(StorageRoom::on_disk);
                 let mut router = TenantStoreRouter::new(
                     &platform_url,
                     platform_token.as_deref(),
@@ -100,7 +101,7 @@ pub(super) async fn init_storage(
                 println!(
                     "  Storage: turso-routed ({platform_url}, {tenant_count} tenants connected)"
                 );
-                Some(StorageStack::from_tenant_router(router))
+                Some(with_room(StorageStack::from_tenant_router(router), room))
             } else {
                 // Single-DB mode (local dev).
                 let turso_url = match std::env::var("TURSO_URL") {
@@ -146,7 +147,8 @@ pub(super) async fn init_storage(
                     (store, String::new())
                 };
                 println!("  Storage: turso ({turso_url}){copied}");
-                Some(StorageStack::from_turso(store))
+                let room = local_store_dir(&turso_url).map(StorageRoom::on_disk);
+                Some(with_room(StorageStack::from_turso(store), room))
             }
         }
         StorageBackend::Redis => {
@@ -160,6 +162,26 @@ pub(super) async fn init_storage(
         }
     };
     Ok((pg_pool, storage_stack, synced_store))
+}
+
+/// The directory a local database at `url` (`file:` or a bare path) lives in;
+/// a remote one (`libsql://`) has none.
+fn local_store_dir(url: &str) -> Option<std::path::PathBuf> {
+    if url.starts_with("libsql://") {
+        return None;
+    }
+    let path = Path::new(url.strip_prefix("file:").unwrap_or(url));
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    Some(dir.unwrap_or(Path::new(".")).to_path_buf())
+}
+
+/// A stack whose store lives on a local disk refuses appends while that disk
+/// is under the floor (`temper_server::storage::STORAGE_FLOOR_BYTES`).
+fn with_room(stack: StorageStack, room: Option<StorageRoom>) -> StorageStack {
+    match room {
+        Some(room) => stack.with_storage_room(room),
+        None => stack,
+    }
 }
 
 /// Phase 2: Build the spec registry from persistent storage and disk apps.
@@ -691,6 +713,15 @@ pub(super) async fn bootstrap_installed_apps(
                     );
                 }
                 AppBootstrapSource::Cli => {
+                    if !result.warnings.is_empty() || !result.modules_reviewed.is_empty() {
+                        print_install_notes(
+                            &app_name,
+                            &serde_json::json!({
+                                "warnings": result.warnings,
+                                "modules_reviewed": result.modules_reviewed,
+                            }),
+                        );
+                    }
                     let all: Vec<String> = result
                         .added
                         .iter()
@@ -705,12 +736,28 @@ pub(super) async fn bootstrap_installed_apps(
                 }
             },
             Err(e) => {
+                if matches!(source, AppBootstrapSource::Cli) {
+                    print_install_notes(&app_name, &serde_json::json!({ "refused": e }));
+                }
                 eprintln!("  Warning: failed to install app '{app_name}' for '{tenant}': {e}");
             }
         }
     }
 
     Ok(())
+}
+
+/// Everything the install of an app given on the command line said, as one compact JSON object on one line before the
+/// line that says it installed or failed: its warnings and the modules Jev reviewed, or why it was refused, whole
+/// (`refused`). A reader of a start's output that sees the verdict already has it (Katagami's start wrapper keeps both
+/// lines and passes this one on as it is).
+fn print_install_notes(app_name: &str, line: &serde_json::Value) {
+    use std::io::Write as _;
+
+    let _ = writeln!(
+        std::io::stdout(),
+        "  App '{app_name}' install notes: {line}"
+    );
 }
 
 #[cfg(test)]
