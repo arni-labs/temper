@@ -6,6 +6,7 @@
 mod agents;
 mod entities;
 pub(crate) mod evolution;
+mod history;
 mod metrics;
 mod projections;
 mod refresh;
@@ -201,7 +202,7 @@ pub fn build_observe_router() -> Router<ServerState> {
         .route("/paths/{entity}", get(verification::handle_get_paths))
         .route(
             "/entities/{entity_type}/{entity_id}/history",
-            get(entities::handle_get_entity_history),
+            get(history::handle_get_entity_history),
         )
         .route(
             "/entities/{entity_type}/{entity_id}/events",

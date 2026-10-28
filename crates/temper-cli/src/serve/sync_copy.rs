@@ -3,10 +3,11 @@
 //! With `TURSO_SYNC_URL` set, the database stays a local file and every
 //! request that can change it is answered only after its changes reach the
 //! remote copy. Requests that finish together share one push. A background
-//! loop also pushes changes no request waits for (timers, reactions), keeps
-//! the local write-ahead log short, and checks a file the start could not
-//! check. While writes cannot be confirmed, requests that can change data are
-//! refused before they run and reads are served as usual.
+//! loop also pushes changes no request waits for (timers, reactions), trims
+//! the change log the remote has confirmed, keeps the local write-ahead log
+//! short, and checks a file the start could not check. While writes cannot
+//! be confirmed, requests that can change data are refused before they run
+//! and reads are served as usual.
 
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use temper_store_turso::{CopyState, SyncCopy};
+use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 /// How long a request that can change data may take, its push included,
 /// before its change is reported as not confirmed.
@@ -27,6 +28,11 @@ const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The 1 s ceiling lets the background push and the checkpoint run once each
+/// tick. Requests need no share of it: a write that waits goes before the
+/// trim's next batch (`TursoEventStore::trim_change_log`).
+const TRIM_BUDGET: Duration = Duration::from_secs(1);
+
 /// Checkpoint the local log once it passes this size. Turso Sync turns the
 /// engine's automatic checkpoints off.
 const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -37,12 +43,15 @@ const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 /// restart starts a fresh one, and the start checks the file again.
 const TIMEOUTS_BEFORE_RESTART: u32 = 6;
 
-/// With a copy, answer changes only after they reach it and keep it current.
-pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Router {
-    let Some(copy) = copy else {
+/// With a store whose database has a copy, answer changes only after they
+/// reach it and keep it current.
+pub(super) fn answer_after_copy(router: Router, store: Option<TursoEventStore>) -> Router {
+    let Some((store, copy)) =
+        store.and_then(|store| store.sync_copy().cloned().map(|copy| (store, copy)))
+    else {
         return router;
     };
-    spawn_upkeep(copy.clone());
+    spawn_upkeep(store, copy.clone());
     router.layer(axum::middleware::from_fn_with_state(
         copy,
         push_before_answering,
@@ -130,8 +139,9 @@ fn reads_only(method: &Method, path: &str) -> bool {
 }
 
 /// Push changes no request waited for, check a file the start could not
-/// check, checkpoint the local log, and restart when only a restart helps.
-fn spawn_upkeep(copy: SyncCopy) {
+/// check, trim the change log, checkpoint the local log, and restart when
+/// only a restart helps.
+fn spawn_upkeep(store: TursoEventStore, copy: SyncCopy) {
     let interval = std::env::var("TEMPER_TURSO_SYNC_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -164,6 +174,9 @@ fn spawn_upkeep(copy: SyncCopy) {
                     "turso.sync pushes keep timing out; exiting so the restart opens a fresh connection"
                 );
                 std::process::exit(75);
+            }
+            if let Err(error) = store.trim_change_log(TRIM_BUDGET).await {
+                tracing::warn!(%error, "turso.sync could not trim the change log; the next tick will");
             }
             if let Err(error) = copy.checkpoint_if_wal_over(MAX_WAL_BYTES).await {
                 tracing::warn!(%error, "turso.sync checkpoint failed");

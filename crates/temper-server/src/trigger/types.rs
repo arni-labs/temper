@@ -14,18 +14,8 @@ use serde::{Deserialize, Serialize};
 /// crash-looped the platform at startup. Nothing is preallocated from this
 /// constant: rules live in growable `BTreeMap`s, so exceeding it corrupts
 /// nothing. A consumer must not reject a tenant for being above it. See
-/// ADR-0176; [`MAX_REACTION_DEPTH`] is the bound that is still enforced.
+/// ADR-0176.
 pub const MAX_REACTIONS_PER_TENANT: usize = 256;
-
-/// Maximum cascade depth for recursive reaction dispatch; why it exists and
-/// how reaching it is reported is written on the definition.
-///
-/// Owned by `temper-runtime` and re-exported here so the two crates cannot
-/// disagree. Three sites enforce it: the production dispatcher, the simulation
-/// dispatcher, and `RequestContext`'s callback depth. Until this re-export they
-/// read two independently defined copies of the number; nothing kept them
-/// equal, and ADR-0176 rests on this bound being the one that still holds.
-pub use temper_runtime::reaction::MAX_REACTION_DEPTH;
 
 /// A reaction rule: when a trigger fires, dispatch an action on a target entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,22 +119,26 @@ pub struct ReactionResult {
     pub target_status: Option<String>,
     /// Error message if the action failed.
     pub error: Option<String>,
-    /// The cascade depth at which this reaction fired.
+    /// How many reactions deep in its chain this one fired; the first
+    /// reaction of an action is at 0.
     pub depth: u32,
 }
 
 impl ReactionResult {
-    /// A reaction that was not run because its chain reached
-    /// [`MAX_REACTION_DEPTH`].
-    pub fn stopped_at_depth(rule_name: &str, depth: u32) -> Self {
-        debug_assert!(depth >= MAX_REACTION_DEPTH);
+    /// A reaction that was not run because it would repeat a step its chain
+    /// is already in ([`InlineChain`](crate::request_context::InlineChain)).
+    pub fn stopped_on_repeat(
+        rule_name: &str,
+        depth: u32,
+        repeat: &crate::request_context::RepeatedStep,
+    ) -> Self {
         Self {
             rule_name: rule_name.to_string(),
             success: false,
             target_status: None,
             error: Some(format!(
-                "reaction not run: its chain already ran {MAX_REACTION_DEPTH} reactions, the \
-                 most one action may set off; a longer chain is stopped as a loop"
+                "reaction not run: it would repeat a step its chain is already in ({repeat}), \
+                 so the chain is a loop"
             )),
             depth,
         }

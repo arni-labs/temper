@@ -11,7 +11,7 @@ use crate::entity_actor::{EntityResponse, EntityState};
 use crate::request_context::AgentContext;
 use crate::secrets::template::resolve_secret_templates;
 use crate::state::sim_now;
-use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
+use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext, platform_keys};
 use temper_runtime::tenant::TenantId;
 use temper_wasm::host_trait::clamp_redacted_metadata_value;
 use temper_wasm::{
@@ -55,6 +55,7 @@ fn wasm_module_security_context(module_name: &str) -> SecurityContext {
         },
         context_attrs: std::collections::HashMap::new(), // determinism-ok: SecurityContext uses HashMap
         correlation_id: temper_runtime::scheduler::sim_uuid().to_string(),
+        cause: None,
     }
 }
 
@@ -87,12 +88,12 @@ pub(crate) fn internal_http_capability_issuer(
     match module {
         Some(module) => {
             security_context.context_attrs.insert(
-                "module".to_string(),
+                platform_keys::MODULE.to_string(),
                 serde_json::Value::String(module.to_string()),
             );
         }
         None => {
-            security_context.context_attrs.remove("module");
+            security_context.context_attrs.remove(platform_keys::MODULE);
         }
     }
     let authenticated = AuthenticatedRequestContext::new(tenant.clone(), security_context);
@@ -246,7 +247,9 @@ fn agent_ctx_for_composite_wasm_result(
     if composite_agent_ctx.idempotency_key.is_none()
         && let Some(idempotency_key) = dispatch_idempotency_key
     {
-        composite_agent_ctx.idempotency_key = Some(idempotency_key.to_string());
+        composite_agent_ctx.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+            idempotency_key.to_string(),
+        ));
     }
     composite_agent_ctx
 }
@@ -1069,7 +1072,14 @@ impl crate::state::ServerState {
                 "integration": integration.name.clone(),
             });
             return self
-                .dispatch_wasm_callback(ctx.entity_ref, cb, params, ctx.agent_ctx, ctx.mode)
+                .dispatch_wasm_callback(
+                    ctx.entity_ref,
+                    &integration.name,
+                    cb,
+                    params,
+                    ctx.agent_ctx,
+                    ctx.mode,
+                )
                 .await;
         }
         Ok(None)
@@ -1329,23 +1339,30 @@ impl crate::state::ServerState {
                 )
                 .await;
 
-                // Determine callback action: prefer static on_success from spec,
-                // fall back to dynamic callback_action from WASM result. Composite
-                // integrations may return only a data envelope for the kernel to
-                // apply; the default SDK "callback" action should not become an
-                // implicit source-entity dispatch in that path.
-                let mut callback_action = integration
-                    .on_success
-                    .as_deref()
-                    .unwrap_or(&result.callback_action);
-                if composite_result_consumed
-                    && integration.on_success.is_none()
-                    && result.callback_action == "callback"
+                // The answer: one of the trigger's `on_success` actions, the
+                // first the record takes with the module's values (see
+                // `answers.rs`); none for an empty answer (`"empty": true`). A trigger without
+                // `on_success` still takes the action the result names.
+                // Composite integrations may return only a data envelope for
+                // the kernel to apply; the default SDK "callback" action
+                // should not become an implicit source-entity dispatch then.
+                let named = [result.callback_action.clone()];
+                let answers: &[String] = if result.empty_answer {
+                    &[]
+                } else if !integration.on_success.is_empty() {
+                    &integration.on_success
+                } else if result.callback_action.is_empty()
+                    || (composite_result_consumed && result.callback_action == "callback")
                 {
-                    callback_action = "";
-                }
+                    &[]
+                } else {
+                    &named
+                };
+                let callback_action = self
+                    .choose_answer(ctx.entity_ref, answers, &callback_params)
+                    .await;
 
-                if !callback_action.is_empty() {
+                if let Some(callback_action) = callback_action {
                     let callback_response = instrument_wasm_dispatch_phase_result(
                         phase_parent_span.clone(),
                         ctx,
@@ -1353,6 +1370,7 @@ impl crate::state::ServerState {
                         WASM_DISPATCH_PHASE_DISPATCH_CALLBACK,
                         self.dispatch_wasm_callback(
                             ctx.entity_ref,
+                            &integration.name,
                             callback_action,
                             callback_params,
                             ctx.agent_ctx,
