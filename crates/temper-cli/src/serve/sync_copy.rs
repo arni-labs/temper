@@ -204,6 +204,18 @@ mod tests {
     }
 
     #[test]
+    fn a_question_to_cedar_skips_the_push() {
+        // A page's offers after a move waited 34-39 ms here for a push they
+        // never needed (production trace 01a1835002c87215af29a4fd2486757b:
+        // 0.56 ms of Cedar inside a 39 ms answer).
+        assert!(reads_only(&Method::POST, "/api/authorize"));
+        // The audit endpoint writes a trajectory row, so it still waits.
+        assert!(!reads_only(&Method::POST, "/api/audit"));
+        assert!(!reads_only(&Method::POST, "/api/authorize/x"));
+        assert!(!reads_only(&Method::PUT, "/api/authorize"));
+    }
+
+    #[test]
     fn only_a_copying_database_runs_requests_that_can_change_data() {
         assert!(refusal(&CopyState::Copying).is_none());
         for state in [
