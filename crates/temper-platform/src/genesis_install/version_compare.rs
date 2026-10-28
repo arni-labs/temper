@@ -80,26 +80,35 @@ pub(super) async fn compare_in_history<H: CommitHistory>(
     if base == head {
         return Ok(VersionComparison::Identical);
     }
-    Ok(match reaches(history, head, base).await? {
-        Reach::Found => VersionComparison::Ahead,
-        Reach::Undecided => VersionComparison::Unknown,
-        Reach::Absent => match reaches(history, base, head).await? {
-            Reach::Found => VersionComparison::Behind,
-            Reach::Undecided => VersionComparison::Unknown,
-            Reach::Absent => VersionComparison::Diverged,
-        },
+    // Each direction is walked on its own budget. A walk that cannot finish
+    // (a long history, or a missing row) does not settle the question: the
+    // other direction may still find its target in a few steps, which is the
+    // common case when the installed version is a recent child of the pin.
+    let forward = reaches(history, head, base).await?;
+    if matches!(forward, Reach::Found) {
+        return Ok(VersionComparison::Ahead);
+    }
+    let backward = reaches(history, base, head).await?;
+    Ok(match (forward, backward) {
+        (_, Reach::Found) => VersionComparison::Behind,
+        (Reach::Absent, Reach::Absent) => VersionComparison::Diverged,
+        _ => VersionComparison::Unknown,
     })
 }
 
 /// Whether `target` is an ancestor of `from`, walking parents breadth-first.
+///
+/// A parent the registry has no row for is stepped over, so another branch
+/// can still reach the target, but the walk can then no longer claim the
+/// target is absent.
 async fn reaches<H: CommitHistory>(history: &H, from: &str, target: &str) -> Result<Reach, String> {
     let mut queue = VecDeque::from([from.to_string()]);
     let mut seen = BTreeSet::from([from.to_string()]);
+    let mut complete = true;
     while let Some(sha) = queue.pop_front() {
         let Some(parents) = history.parents(&sha).await? else {
-            // A parent the registry never stored: the history past it is
-            // unreadable, so absence cannot be claimed.
-            return Ok(Reach::Undecided);
+            complete = false;
+            continue;
         };
         for parent in parents {
             if parent == target {
@@ -113,7 +122,11 @@ async fn reaches<H: CommitHistory>(history: &H, from: &str, target: &str) -> Res
             }
         }
     }
-    Ok(Reach::Absent)
+    Ok(if complete {
+        Reach::Absent
+    } else {
+        Reach::Undecided
+    })
 }
 
 /// A repository's commit rows as Genesis stored them.
