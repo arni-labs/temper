@@ -62,8 +62,16 @@ pub fn add_os_apps_dir(dir: PathBuf) {
 /// source of truth for the requested install. Development/local app catalogs may
 /// still be present for tests or helper tools, but they must not shadow the
 /// pinned Genesis bundle when both expose the same app name.
-pub fn add_os_apps_dir_preferred(dir: PathBuf) {
-    let additional = AppCatalog::from_dir(dir);
+///
+/// The apps named in `except` are left out: a closure that pins a dependency
+/// the tenant keeps at another version must not move the catalog's entry for
+/// it, which other installs and boot recovery resolve by name.
+pub fn add_os_apps_dir_preferred(dir: PathBuf, except: &std::collections::BTreeSet<String>) {
+    let mut additional = AppCatalog::from_dir(dir);
+    additional
+        .entries
+        .retain(|entry| !except.contains(&entry.name));
+    additional.paths.retain(|name, _| !except.contains(name));
     let cat = catalog();
     let mut lock = cat.write().unwrap(); // ci-ok: infallible lock
     lock.merge_catalog_preferred(additional);

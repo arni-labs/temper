@@ -247,6 +247,12 @@ pub(crate) async fn install_genesis_app(
     }
     match crate::genesis_install::install_genesis_app_from_registry(&state, req).await {
         Ok(result) => (StatusCode::OK, Json(serde_json::json!(result))),
+        // A dependency the install would move backwards or sideways: the
+        // tenant is unchanged and the caller decides.
+        Err(error) if error.contains(" refused before any change: ") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error })),
+        ),
         Err(error) if error.contains("not found") => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": error })),
@@ -396,15 +402,17 @@ async fn anonymous_public_bundle(
     }
 }
 
-/// How many anonymous bundle exports may run at once, process-wide.
+/// How many anonymous registry reads (bundle exports and version compares)
+/// may run at once, process-wide.
 ///
 /// Deliberately small. Each export can materialize up to
-/// `MAX_GENESIS_BUNDLE_APPS` app trees, and the caller presented nothing that
-/// would let us charge the cost to anyone. Authenticated exports are governed
-/// by Cedar per caller and are not subject to this cap.
+/// `MAX_GENESIS_BUNDLE_APPS` app trees, each compare can read two bounded
+/// commit histories, and the caller presented nothing that would let us charge
+/// the cost to anyone. Authenticated reads are governed by Cedar per caller and
+/// are not subject to this cap.
 const MAX_CONCURRENT_ANONYMOUS_BUNDLE_EXPORTS: usize = 4;
 
-fn anonymous_bundle_admission() -> &'static tokio::sync::Semaphore {
+pub(super) fn anonymous_bundle_admission() -> &'static tokio::sync::Semaphore {
     static ADMISSION: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     ADMISSION.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_ANONYMOUS_BUNDLE_EXPORTS))
 }
