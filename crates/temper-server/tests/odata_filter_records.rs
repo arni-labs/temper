@@ -5,7 +5,8 @@
 //! The route narrows a filter to candidate rows in SQL where it can (string
 //! and boolean equality, `Status` ranges, and `and`/`or` of those) and decides
 //! the rest on the records themselves, so every case here passes through
-//! one path or the other. The reads start once the store's projection has
+//! one path or the other. A filter that is exactly a declared key reads the
+//! key index instead. The reads start once the store's projection has
 //! caught up with every write, so the SQL rows are what the route reads.
 //! An exact match still finds a record whose projection fell behind its
 //! journal. A filter that does not parse is refused with where it went wrong.
@@ -59,6 +60,10 @@ name = "Part"
 states = ["Draft", "Live", "Retired"]
 initial = "Draft"
 
+[[key]]
+name = "name_color"
+properties = ["Name", "Color"]
+
 [[action]]
 name = "Publish"
 kind = "input"
@@ -74,7 +79,8 @@ to = "Retired"
 
 /// The records every case reads, and the actions that move each one to its
 /// status. `p3` holds an explicit null `Color`, `p5` none at all; `p4` and
-/// `p6` have no `InStock`; only `p1`, `p2` and `p4` have a `Weight`.
+/// `p6` have no `InStock`; only `p1`, `p2` and `p4` have a `Weight`. Each
+/// part's `Name` and `Color` together are its declared key.
 fn parts() -> Vec<(Value, &'static [&'static str])> {
     vec![
         (
@@ -174,6 +180,14 @@ const CASES: &[(&str, &[&str])] = &[
         "not (Color eq 'red' and Size eq 3)",
         &["p2", "p3", "p4", "p5", "p6"],
     ),
+    // A filter that is exactly the declared key reads the key index; a
+    // missing value is null there too. An `or` of its parts is not the key.
+    ("Name eq 'bolt' and Color eq 'red'", &["p1"]),
+    ("Color eq 'Red' and Name eq 'red bolt'", &["p6"]),
+    ("Name eq 'spring' and Color eq null", &["p5"]),
+    ("Name eq 'O''Brien''s washer' and Color eq null", &["p3"]),
+    ("Name eq 'bolt' and Color eq 'blue'", &[]),
+    ("Name eq 'bolt' or Color eq 'red'", &["p1", "p4"]),
     // Mixes of what SQL can narrow and what it cannot.
     ("Status ne 'Draft' and Color eq 'red'", &["p4"]),
     ("Color eq 'red' or Size eq 10", &["p1", "p2", "p4", "p5"]),
@@ -409,8 +423,18 @@ async fn an_exact_match_finds_a_record_whose_projection_fell_behind() {
         .header("Content-Type", "application/json")
         .body(Body::from(json!({ "Color": "green" }).to_string()))
         .unwrap();
-    let (status, body) = send(&app, "default", request).await;
-    assert_eq!(status, StatusCode::OK, "PATCH p5: {body}");
+    // The change commits to the journal. (The answer reports the failed
+    // projection write; the record is what this test relies on.)
+    send(&app, "default", request).await;
+    let request = Request::get("/tdata/Parts('p5')")
+        .body(Body::empty())
+        .unwrap();
+    let (status, record) = send(&app, "default", request).await;
+    assert_eq!(status, StatusCode::OK, "read p5: {record}");
+    assert_eq!(
+        record["fields"]["Color"], "green",
+        "the change committed: {record}"
+    );
 
     for filter in ["Color eq 'green'", "Color eq 'green' and Status eq 'Draft'"] {
         let (status, body) = read(&app, "default", filter).await;
