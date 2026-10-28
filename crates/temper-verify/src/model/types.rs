@@ -192,8 +192,8 @@ pub struct StringParam {
     pub writes: bool,
     /// `param_nonempty`: never `''`.
     pub nonempty: bool,
-    /// `param_equals_field`: the value of this variable.
-    pub equals: Option<String>,
+    /// `param_equals_field`: equal to the value of every one of these variables.
+    pub equals: Vec<String>,
     /// `param_not_equals_field`: never the value of these variables.
     pub not_equals: Vec<String>,
 }

@@ -83,3 +83,57 @@ fn collects_list_membership_atoms_through_any_connective() {
         vec![("tags".into(), "a".into()), ("tags".into(), "b".into())]
     );
 }
+
+#[test]
+fn every_equality_on_a_string_parameter_must_hold() {
+    let source = r#"
+[automaton]
+name = "Equalities"
+states = ["Open", "Done"]
+initial = "Open"
+
+[[state]]
+name = "a"
+type = "string"
+initial = ""
+
+[[state]]
+name = "b"
+type = "string"
+initial = "b"
+
+[[action]]
+name = "Finish"
+kind = "input"
+from = ["Open"]
+to = "Done"
+params = [{ name = "p", type = "string" }]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "p"
+field = "a"
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "p"
+field = "b"
+
+[[invariant]]
+name = "track_both"
+assert = "a == b || a != b"
+"#;
+    let model = crate::model::build_model_from_ioa(source, 2).unwrap();
+    let mut initial = stateright::Model::init_states(&model).remove(0);
+    let t = &model.transitions[0];
+    assert!(!t.string_params[0].writes);
+    assert!(
+        successors(&model, t, &initial).is_empty(),
+        "different fields admit no value for p"
+    );
+    initial.strings.insert("a".into(), "b".into());
+    let allowed = successors(&model, t, &initial);
+    assert_eq!(allowed.len(), 1);
+    assert_eq!(allowed[0].0["p"], ParamValue::Str("b".into()));
+    assert_eq!(allowed[0].1.strings, initial.strings);
+}

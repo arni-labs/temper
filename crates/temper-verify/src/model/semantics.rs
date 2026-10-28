@@ -194,7 +194,7 @@ fn string_candidates(
     values: &BTreeSet<String>,
 ) -> Vec<String> {
     let tracked = |var: &str| state.strings.get(var).cloned();
-    let mut candidates: BTreeSet<String> = match param.equals.as_deref().and_then(tracked) {
+    let mut candidates: BTreeSet<String> = match param.equals.iter().find_map(|var| tracked(var)) {
         Some(value) => BTreeSet::from([value]),
         None => {
             let mut all: BTreeSet<String> = values.clone();
@@ -206,6 +206,12 @@ fn string_candidates(
             all
         }
     };
+    // Every equality must hold, including when two fields disagree.
+    for var in &param.equals {
+        if let Some(value) = tracked(var) {
+            candidates.retain(|candidate| candidate == &value);
+        }
+    }
     if param.nonempty {
         candidates.remove("");
     }

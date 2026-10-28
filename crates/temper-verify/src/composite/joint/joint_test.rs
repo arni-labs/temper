@@ -471,3 +471,6 @@ fn a_seal_sent_without_its_value_is_refused() {
     let result = check_under(&[&parent, &child], Some(ONLY_TELL_REACHES_THE_CHILD));
     assert!(result.holds(), "{result}");
 }
+
+#[path = "equalities_test.rs"]
+mod equalities;

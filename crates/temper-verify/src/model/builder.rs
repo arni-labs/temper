@@ -213,14 +213,14 @@ fn string_params(
                 name: name.to_string(),
                 writes: tracked_strings.contains(name),
                 nonempty: false,
-                equals: None,
+                equals: Vec::new(),
                 not_equals: Vec::new(),
             };
             for constraint in action.constraints.iter().filter(|c| c.param() == name) {
                 match constraint {
                     ActionConstraint::ParamNonempty { .. } => param.nonempty = true,
                     ActionConstraint::ParamEqualsField { field, .. } => {
-                        param.equals = Some(field.clone());
+                        param.equals.push(field.clone());
                     }
                     ActionConstraint::ParamNotEqualsField { field, .. } => {
                         param.not_equals.push(field.clone());
