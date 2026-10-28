@@ -154,11 +154,15 @@ fn build_state(integration_url: &str) -> ServerState {
 }
 
 fn build_state_with_bell(integration_url: &str, bell_spec: &str) -> ServerState {
+    build_state_for_tenant("default", integration_url, bell_spec)
+}
+
+fn build_state_for_tenant(tenant: &str, integration_url: &str, bell_spec: &str) -> ServerState {
     let cron_spec = CRON_SPEC.replace("{url}", integration_url);
     let mut registry = SpecRegistry::new();
     let csdl = parse_csdl(CSDL_XML).expect("CSDL should parse");
     registry.register_tenant(
-        "default",
+        tenant,
         csdl,
         CSDL_XML.to_string(),
         &[
@@ -250,7 +254,9 @@ async fn a_retried_request_rings_once() {
     let state = build_state("http://127.0.0.1:9");
     let tenant = TenantId::default();
     let agent = AgentContext {
-        idempotency_key: Some("press-once".into()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            "press-once".into(),
+        )),
         ..AgentContext::default()
     };
     // The retry is answered from the first request's reply, which carries
@@ -267,7 +273,9 @@ async fn a_request_retried_after_its_ring_rang_rings_once() {
     let state = build_state("http://127.0.0.1:9");
     let tenant = TenantId::default();
     let agent = AgentContext {
-        idempotency_key: Some("press-once".into()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            "press-once".into(),
+        )),
         ..AgentContext::default()
     };
     press(&state, &tenant, &agent).await;
@@ -362,7 +370,9 @@ async fn a_request_retried_while_its_ring_waits_calls_http_once() {
     let (state, server) = http_bell().await;
     let tenant = TenantId::default();
     let agent = AgentContext {
-        idempotency_key: Some("press-once".into()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            "press-once".into(),
+        )),
         ..AgentContext::default()
     };
     press(&state, &tenant, &agent).await;
@@ -375,7 +385,9 @@ async fn a_request_retried_after_its_ring_calls_http_once() {
     let (state, server) = http_bell().await;
     let tenant = TenantId::default();
     let agent = AgentContext {
-        idempotency_key: Some("press-once".into()),
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            "press-once".into(),
+        )),
         ..AgentContext::default()
     };
     press(&state, &tenant, &agent).await;
@@ -387,10 +399,12 @@ async fn a_request_retried_after_its_ring_calls_http_once() {
     // Also exercise duplicate delivery of the scheduled child itself, even
     // when the parent retry no longer starts a second timer.
     let child = AgentContext {
-        idempotency_key: Some(temper_server::idempotency::derived_idempotency_key(
-            "press-once",
-            "scheduled:Ring",
-            "0",
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::FollowUp(
+            temper_server::idempotency::derived_idempotency_key(
+                "press-once",
+                "scheduled:Ring",
+                "0",
+            ),
         )),
         ..AgentContext::default()
     };
@@ -404,3 +418,9 @@ async fn a_request_retried_after_its_ring_calls_http_once() {
 
 #[path = "follow_on_lineage/dst.rs"]
 mod dst;
+
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
+
+#[path = "follow_on_lineage/restart.rs"]
+mod restart;

@@ -8,7 +8,7 @@
 //! stops, fails with a summary saying so, and the levels after it do not run.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cascade::{CascadeLevel, LevelResult};
@@ -19,8 +19,8 @@ use crate::model::{ExploreLimit, TemperModel};
 pub struct Budget {
     /// Wall-clock time for the whole cascade.
     pub time: Duration,
-    /// States the model check may generate. A state reached twice counts
-    /// twice, as Stateright counts toward its target state count.
+    /// Generated states and expansion work allowed per walk. A state reached
+    /// twice counts twice; intermediate parameter products also consume work.
     pub states: usize,
 }
 
@@ -43,6 +43,8 @@ impl Spending {
             until,
             states: budget.states,
             lifted: Arc::new(AtomicBool::new(false)),
+            work: Arc::new(std::sync::atomic::AtomicUsize::new(budget.states)),
+            exhausted: Arc::new(AtomicBool::new(false)),
         };
         Self {
             budget,
@@ -58,7 +60,7 @@ impl Spending {
     }
 
     pub(crate) fn spent(&self) -> bool {
-        Instant::now() >= self.limit.until
+        Instant::now() >= self.limit.until || self.limit.exhausted.load(Ordering::Relaxed)
     }
 
     /// What a level cut short says, after `label` ("L1 Model Check").
@@ -73,11 +75,11 @@ impl Spending {
         let explored = states.map_or(String::new(), |n| {
             format!(" ({n} distinct states explored)")
         });
-        let limit = if self.spent() {
+        let limit = if Instant::now() >= self.limit.until {
             format!("ran out of its {} s budget", secs(self.budget.time))
         } else {
             format!(
-                "reached its limit of {} generated states after {} s",
+                "reached its limit of {} generated states or expansion steps after {} s",
                 self.budget.states,
                 secs(self.started.elapsed())
             )
@@ -103,8 +105,8 @@ fn secs(time: Duration) -> String {
     }
 }
 
-/// Whether the budget ran out during the last level: by the clock, or, for
-/// the model check, by an exploration it left incomplete (`explored` is its
+/// Whether the budget ran out during the last level: by time or expansion
+/// work, or by a model check it left incomplete (`explored` is its
 /// states and whether it finished). A level cut short fails and says so.
 pub(crate) fn ran_out(
     spending: Option<&Spending>,

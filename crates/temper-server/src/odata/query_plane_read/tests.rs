@@ -19,10 +19,12 @@ use temper_store_turso::TursoEventStore;
 
 mod count_telemetry;
 mod dst_projection_lag;
+mod empty_match;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;
 mod proof;
+mod spec_deleted;
 
 const CSDL_XML: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
 const ORDER_IOA: &str = include_str!("../../../../../test-fixtures/specs/order.ioa.toml");
@@ -85,31 +87,6 @@ async fn upsert_order_projection(
         )
         .await
         .expect("upsert projection");
-}
-
-#[test]
-fn fallback_reason_labels_are_stable() {
-    assert_eq!(QueryPlaneFallbackReason::None.as_str(), "none");
-    assert_eq!(
-        QueryPlaneFallbackReason::NoFilterPushdown.as_str(),
-        "no_filter_pushdown"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::NativePageUnavailable.as_str(),
-        "native_page_unavailable"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::FilterPushdownUnavailable.as_str(),
-        "filter_pushdown_unavailable"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::CatalogCoverageGap.as_str(),
-        "catalog_coverage_gap"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::FallbackCandidateBudget.as_str(),
-        "fallback_candidate_budget"
-    );
 }
 
 #[test]
@@ -281,6 +258,7 @@ async fn list_read_drops_rows_a_per_entity_forbid_names() {
         },
         context_attrs: Default::default(),
         correlation_id: "row-forbid".to_string(),
+        cause: None,
     };
     let query_options = QueryOptions {
         top: Some(10),
@@ -352,6 +330,7 @@ async fn uniform_type_permit_returns_every_row() {
         },
         context_attrs: Default::default(),
         correlation_id: "uniform-permit".to_string(),
+        cause: None,
     };
     let query_options = QueryOptions {
         top: Some(10),

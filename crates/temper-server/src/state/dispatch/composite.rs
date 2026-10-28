@@ -150,7 +150,9 @@ impl crate::state::ServerState {
                 .security_ctx
                 .clone()
                 .unwrap_or_else(SecurityContext::anonymous)
-                .with_action_context(composite_action_context),
+                .with_action_context(composite_action_context)
+                // The module picked these writes: each is its request.
+                .as_request(),
         );
 
         let prepared_sub_writes = self
@@ -207,11 +209,7 @@ impl crate::state::ServerState {
                         prepared.idx
                     )
                 });
-                return Err(sub_write_failure(
-                    &response,
-                    &prepared.idempotency_key,
-                    error,
-                ));
+                return Err(sub_write_failure(&response, error));
             }
         }
 
@@ -301,8 +299,8 @@ impl crate::state::ServerState {
             .await?;
 
             let table = self.transition_table_for_dispatch(tenant, &write.entity_type)?;
-            let related = if table_has_cross_entity_guards_for_action(&table, &write.action) {
-                self.resolve_cross_entity_guards(
+            let related = if table_reads_related_records(&table, &write.action) {
+                self.resolve_related_statuses(
                     tenant,
                     &write.entity_type,
                     &write.entity_id,
@@ -417,10 +415,23 @@ impl crate::state::ServerState {
         }
 
         let append_started_at = timing_enabled.then(std::time::Instant::now);
-        store
-            .append_batch(&appends)
-            .await
-            .map_err(composite_batch_persistence_error)?;
+        if let Err(error) = store.append_batch(&appends).await {
+            // A batch that landed behind a concurrency violation has committed;
+            // everything after the commit still runs.
+            if !(matches!(error, PersistenceError::ConcurrencyViolation { .. })
+                && composite_batch_landed(&store, &appends).await?)
+            {
+                return Err(composite_batch_persistence_error(error));
+            }
+            tracing::warn!(
+                tenant = %tenant,
+                parent_entity_type,
+                parent_entity_id,
+                parent_action,
+                %error,
+                "composite batch landed although its append answered with a concurrency violation"
+            );
+        }
         let append_ms = append_started_at.map(|started| started.elapsed().as_millis() as u64);
         self.invalidate_batch_state_timeouts(tenant, &timed);
 
@@ -443,7 +454,7 @@ impl crate::state::ServerState {
                 continue;
             }
             self.stop_and_remove_entity(tenant, &stream.entity_type, &stream.entity_id);
-            if stream.state.status == "Deleted" {
+            if stream.state.is_tombstoned() {
                 continue;
             }
             if !self
@@ -856,8 +867,8 @@ impl crate::state::ServerState {
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
         }
-        let related = if table_has_cross_entity_guards_for_action(&table, &write.action) {
-            self.resolve_cross_entity_guards(
+        let related = if table_reads_related_records(&table, &write.action) {
+            self.resolve_related_statuses(
                 tenant,
                 &write.entity_type,
                 &write.entity_id,
@@ -964,7 +975,7 @@ impl crate::state::ServerState {
             .await
             .map_err(DispatchError::Internal)?;
         let related = self
-            .resolve_cross_entity_guards(tenant, entity_type, entity_id, action)
+            .resolve_related_statuses(tenant, entity_type, entity_id, action)
             .await;
         let eval_ctx = build_eval_context_with_xref(&current.state, &related, &table, Some(action));
 

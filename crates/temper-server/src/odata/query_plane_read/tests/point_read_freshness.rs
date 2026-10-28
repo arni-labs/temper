@@ -8,6 +8,8 @@ use crate::odata::read_support::try_load_entity_body_from_catalog;
 use crate::storage::QueryPlaneStore;
 use std::sync::Arc;
 
+mod restart;
+
 async fn project(qp: &SimQueryPlane, entity_id: &str, sequence_nr: u64) {
     qp.upsert_projection(
         TenantId::default().as_str(),
@@ -136,15 +138,29 @@ async fn an_ordinary_transition_is_projected_before_dispatch_returns() {
     );
 }
 
-/// Fails the first projection write, then behaves like `SimQueryPlane`.
+/// Fails one projection write (the first by default, else the `fail_write`th,
+/// counting from 0), and otherwise behaves like `SimQueryPlane`.
 #[derive(Default)]
 struct FlakyQueryPlane {
     inner: SimQueryPlane,
-    failed_once: std::sync::atomic::AtomicBool,
+    writes: std::sync::atomic::AtomicUsize,
+    fail_write: usize,
+    hang_sequence: std::sync::atomic::AtomicU64,
+    hanging: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for FlakyQueryPlane {
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<
+        Vec<temper_runtime::persistence::ProjectionCheckpoint>,
+        temper_runtime::persistence::PersistenceError,
+    > {
+        self.inner.projection_checkpoints(tenant).await
+    }
+
     async fn upsert_projection(
         &self,
         tenant: &str,
@@ -155,9 +171,16 @@ impl QueryPlaneStore for FlakyQueryPlane {
         state: &serde_json::Value,
         sequence_nr: u64,
     ) -> Result<(), temper_runtime::persistence::PersistenceError> {
-        if !self
-            .failed_once
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        if sequence_nr != 0
+            && sequence_nr == self.hang_sequence.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.hanging.notify_one();
+            std::future::pending::<()>().await;
+        }
+        if self
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == self.fail_write
         {
             return Err(temper_runtime::persistence::PersistenceError::Storage(
                 "injected projection outage".to_string(),
@@ -263,14 +286,29 @@ impl QueryPlaneStore for FlakyQueryPlane {
     }
 }
 
-/// A failed projection write is reported, and the committed state is handed to
-/// the retrying queue, so reads catch up once the store recovers.
-#[tokio::test]
-async fn a_failed_projection_write_is_retried_through_the_queue() {
-    let qp = Arc::new(FlakyQueryPlane::default());
+/// An Order server on the simulated journal whose query plane is `qp`.
+fn flaky_order_state(system_name: &str, seed: u64, qp: Arc<FlakyQueryPlane>) -> ServerState {
+    flaky_state(system_name, seed, qp, ORDER_IOA)
+}
+
+/// A server whose Order spec is `order_ioa`, on the simulated journal, whose
+/// query plane is `qp`.
+fn flaky_state(
+    system_name: &str,
+    seed: u64,
+    qp: Arc<FlakyQueryPlane>,
+    order_ioa: &str,
+) -> ServerState {
     let events =
-        crate::storage::BoxedEventStore::new(temper_store_sim::SimEventStore::no_faults(14));
-    let mut state = build_order_state("flaky-projection");
+        crate::storage::BoxedEventStore::new(temper_store_sim::SimEventStore::no_faults(seed));
+    let mut registry = SpecRegistry::new();
+    registry.register_tenant(
+        TenantId::default().as_str(),
+        parse_csdl(CSDL_XML).expect("CSDL should parse"),
+        CSDL_XML.to_string(),
+        &[("Order", order_ioa)],
+    );
+    let mut state = ServerState::from_registry(ActorSystem::new(system_name), registry);
     state.set_storage_stack(crate::storage::StorageStack::new(
         crate::storage::BackendLabel::Sim,
         events,
@@ -278,7 +316,7 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         None,
         None,
         None,
-        Some(qp.clone()),
+        Some(qp),
         None,
         None,
         None,
@@ -287,12 +325,21 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         [(
             "Order".to_string(),
             Arc::new(temper_jit::table::TransitionTable::from_ioa_source(
-                ORDER_IOA,
+                order_ioa,
             )),
         )]
         .into_iter()
         .collect(),
     );
+    state
+}
+
+/// A failed projection write is tried again until it lands, so the committed
+/// state is readable when the dispatch answers.
+#[tokio::test]
+async fn a_failed_projection_write_is_retried_before_the_answer() {
+    let qp = Arc::new(FlakyQueryPlane::default());
+    let state = flaky_order_state("flaky-projection", 14, qp.clone());
     let tenant = TenantId::default();
     let agent_ctx = AgentContext::for_service("flaky-projection");
     let created = state
@@ -306,27 +353,146 @@ async fn a_failed_projection_write_is_retried_through_the_queue() {
         )
         .await
         .expect("add item");
+    assert!(created.success, "add item: {:?}", created.error);
+
+    let rows = qp
+        .load_entity_catalog_rows(tenant.as_str(), "Order", &["o3".to_string()])
+        .await
+        .expect("read catalog")
+        .expect("catalog rows");
     assert!(
-        !created.success
-            && created
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("query projection failed")),
-        "the projection outage is reported in the response: {:?}",
-        created.error
+        rows.first()
+            .is_some_and(|row| row.sequence_nr == created.state.sequence_nr),
+        "the retried write projected the committed state: {rows:?}"
+    );
+}
+
+/// A transition whose projection write fails is still committed, so a guard
+/// that reads the record's status afterwards decides on the committed status,
+/// not on the one cached before it.
+#[tokio::test]
+async fn a_status_committed_behind_a_failed_projection_reaches_the_status_cache() {
+    let qp = Arc::new(FlakyQueryPlane {
+        fail_write: 1,
+        ..FlakyQueryPlane::default()
+    });
+    let state = flaky_order_state("flaky-projection-status", 15, qp);
+    let tenant = TenantId::default();
+    let agent_ctx = AgentContext::for_service("flaky-projection-status");
+    let added = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o4",
+            "AddItem",
+            serde_json::json!({ "ProductId": "p1", "Quantity": 1 }),
+            &agent_ctx,
+        )
+        .await
+        .expect("add item");
+    assert!(added.success, "add item: {:?}", added.error);
+    assert_eq!(
+        state.resolve_entity_status(&tenant, "Order", "o4").await,
+        Some("Draft".to_string())
     );
 
-    let committed = created.state.sequence_nr;
-    for _ in 0..200 {
-        let rows = qp
-            .load_entity_catalog_rows(tenant.as_str(), "Order", &["o3".to_string()])
+    let submitted = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o4",
+            "SubmitOrder",
+            serde_json::json!({}),
+            &agent_ctx,
+        )
+        .await
+        .expect("submit");
+    assert!(
+        submitted.success && submitted.state.status == "Submitted",
+        "the submit commits, and its projection lands on a later try: {:?} {}",
+        submitted.error,
+        submitted.state.status
+    );
+    assert_eq!(
+        state.resolve_entity_status(&tenant, "Order", "o4").await,
+        Some("Submitted".to_string()),
+        "a guard reads the committed status"
+    );
+}
+
+/// `Submitted` lapses to `Cancelled` after a second.
+const SUBMITTED_LAPSES: &str = r#"
+[[action]]
+name = "Lapse"
+kind = "internal"
+from = ["Submitted"]
+to = "Cancelled"
+
+[[state_timeout]]
+state = "Submitted"
+after_seconds = 1
+on_timeout = "Lapse"
+"#;
+
+/// A transition whose projection write fails still committed the timer of the
+/// state it entered, so that timer is armed and fires now, not at the next
+/// boot.
+#[tokio::test]
+async fn a_timer_committed_behind_a_failed_projection_fires() {
+    let qp = Arc::new(FlakyQueryPlane {
+        fail_write: 1,
+        ..FlakyQueryPlane::default()
+    });
+    let order_ioa = format!("{ORDER_IOA}\n{SUBMITTED_LAPSES}");
+    let state = flaky_state("flaky-projection-timer", 16, qp, &order_ioa);
+    let tenant = TenantId::default();
+    let agent_ctx = AgentContext::for_service("flaky-projection-timer");
+    let added = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o5",
+            "AddItem",
+            serde_json::json!({ "ProductId": "p1", "Quantity": 1 }),
+            &agent_ctx,
+        )
+        .await
+        .expect("add item");
+    assert!(added.success, "add item: {:?}", added.error);
+
+    let submitted = state
+        .dispatch_tenant_action(
+            &tenant,
+            "Order",
+            "o5",
+            "SubmitOrder",
+            serde_json::json!({}),
+            &agent_ctx,
+        )
+        .await
+        .expect("submit");
+    assert!(
+        submitted.success && submitted.state.status == "Submitted",
+        "the submit commits, retries its projection and keeps its timer: {:?} {}",
+        submitted.error,
+        submitted.state.status
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = state
+            .get_tenant_entity_state(&tenant, "Order", "o5")
             .await
-            .expect("read catalog")
-            .expect("catalog rows");
-        if rows.first().is_some_and(|row| row.sequence_nr == committed) {
+            .expect("order")
+            .state
+            .status;
+        if status == "Cancelled" {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Submitted's one-second timer never fired: the order is still {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("the queued retry never projected the committed state");
 }

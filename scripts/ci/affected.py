@@ -2,21 +2,29 @@
 """Decide what a CI run tests, for .github/workflows/ci.yml.
 
 Lane "full" (push, schedule, a plain dispatch) runs every check as before.
-Lane "pr" (a pull request, or a dispatch given changed paths) tests only the
-workspace packages a change can reach: the packages whose files changed plus
-every package that depends on them (normal, dev and build dependencies all
-count), worked out from `cargo metadata`. A change to anything outside a
+Lane "pr" (a pull request, a merge group, or a dispatch given changed paths)
+tests only the workspace packages a change can reach: the packages whose files
+changed plus every package that depends on them (normal, dev and build
+dependencies all count), worked out from `cargo metadata`. A change to anything outside a
 package that a build or test could read (Cargo.lock, the toolchain, .github/,
 test-fixtures/, os-apps/, skills/, scripts/, ...) tests every package; only the
 paths in DOCS are known to be read by nothing.
+
+A push whose tree already passed CI in a merge group (VERIFIED_RUN names that
+run) has nothing new to test: the queue moves main to the commit it tested. It
+takes the pr lane with nothing changed, the same path as a docs-only change.
+The nightly schedule still runs the full lane.
 
 Writes key=value lines to $GITHUB_OUTPUT (stdout when unset):
   lane      full | pr
   mode      full | affected | none
   packages  space-separated package names to test (empty for none)
-  server    true when temper-server is among them (DST, GEPA modules)
+  test_args cargo arguments that select those packages' tests (empty for none)
   rust      false only when nothing but DOCS changed
+  sdk_ts    true when the TypeScript SDK's checks should run: Rust changed (as
+            before) or the SDK itself did; packages/ is in DOCS for Rust's sake
   shards    JSON matrix of Tests shards for the pr lane
+  specs     true when Spec Verification runs: the full lane, or a changed spec file
 """
 
 import fnmatch
@@ -45,8 +53,16 @@ DOCS = [
 SERVER = "temper-server"
 # temper-server's tests run with the features the whole workspace turns on for it.
 SERVER_FEATURES = "temper-server/observe,temper-server/sim"
+# The files Spec Verification reads. temper-cli's verify:: tests walk the whole repository
+# for spec collections (a directory holding *.ioa.toml and model.csdl.xml) and read their
+# IOA, CSDL, TLA and policies/*.cedar files wherever they sit, so a change to one runs that
+# job whatever owns it: reference-apps/*/specs belong to packages that never lead to
+# temper-cli, and docs/examples/pipeline-specs is under DOCS.
+SPEC_FILES = (".ioa.toml", ".csdl.xml", ".tla", ".cedar")
 # Packages whose tests take long enough to be worth two machines.
 HEAVY = {"temper-platform", "temper-store-turso", "temper-cli", "temper-actor-runtime"}
+# Target kinds `cargo test --doc` runs doctests for.
+LIBRARY_KINDS = {"lib", "rlib", "proc-macro"}
 
 
 def is_docs(path):
@@ -70,7 +86,10 @@ def workspace():
         for dep in pkg["dependencies"]:
             if dep["name"] in names:
                 dependents[dep["name"]].add(pkg["name"])
-    return dirs, names, dependents
+    # Only a library has doctests: `cargo test --doc` refuses a package without one.
+    libraries = {pkg["name"] for pkg in meta["packages"]
+                 if any(LIBRARY_KINDS & set(target["kind"]) for target in pkg["targets"])}
+    return dirs, names, dependents, libraries
 
 
 def owner(path, dirs):
@@ -101,35 +120,50 @@ def changed_paths():
     return [line for line in out.splitlines() if line]
 
 
-def shards(packages):
+def shards(packages, libraries):
     cells = []
     if SERVER in packages:
         for i in (1, 2):
             cells.append({"name": f"temper-server {i}/2", "args": f"-p {SERVER} --features {SERVER_FEATURES}",
-                          "partition": f"hash:{i}/2", "gepa": True, "turso": False, "doc": ""})
+                          "partition": f"hash:{i}/2", "gepa": True, "doc": ""})
     rest = sorted(packages - {SERVER})
     if rest:
         count = 2 if rest and HEAVY & set(rest) else 1
         args = " ".join(f"-p {name}" for name in rest)
         for i in range(1, count + 1):
             cells.append({"name": f"other packages {i}/{count}" if count > 1 else "other packages", "args": args,
-                          "partition": f"hash:{i}/{count}", "gepa": False,
-                          "turso": "temper-store-turso" in rest, "doc": ""})
-    if cells:
+                          "partition": f"hash:{i}/{count}", "gepa": False, "doc": ""})
+    documented = sorted(packages & libraries)
+    if documented:
         # Doctests build the libraries with other features than the test binaries,
         # so they get a machine of their own rather than lengthening a shard.
-        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False, "turso": False,
-                      "doc": " ".join(f"-p {name}" for name in sorted(packages))})
+        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False,
+                      "doc": " ".join(f"-p {name}" for name in documented)})
     return cells
 
 
+def test_args(packages):
+    # temper-server gets the features the workspace run turns on for it, as in shards().
+    args = " ".join(f"-p {name}" for name in sorted(packages))
+    return f"{args} --features {SERVER_FEATURES}" if SERVER in packages else args
+
+
 def main():
-    lane = "pr" if os.environ.get("EVENT") == "pull_request" or os.environ.get("CHANGED_PATHS", "").strip() else "full"
-    dirs, names, dependents = workspace()
-    out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "server": "true", "rust": "true"}
+    # A merge group takes the pr lane too: the full lane splits platform-random into seed
+    # shards, so the required "DST/Platform Tests (platform-random)" check would never report.
+    queued = os.environ.get("EVENT") in ("pull_request", "merge_group")
+    verified = os.environ.get("VERIFIED_RUN", "").strip()
+    lane = "pr" if queued or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
+    dirs, names, dependents, libraries = workspace()
+    out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true",
+           "specs": "true"}
     if lane == "pr":
-        direct, outside, docs_only = set(), [], True
-        for path in changed_paths():
+        if verified:
+            print(f"This tree already passed in its merge group: {verified}", file=sys.stderr)
+        direct, outside, docs_only, sdk_ts, specs = set(), [], True, False, False
+        for path in [] if verified else changed_paths():
+            sdk_ts = sdk_ts or path.startswith("packages/temper-sdk-ts/")
+            specs = specs or path.endswith(SPEC_FILES)
             name = owner(path, dirs)
             if name:
                 direct.add(name)
@@ -144,11 +178,14 @@ def main():
             packages = closure(direct, dependents)
             out["mode"] = "affected" if packages else "none"
         out["packages"] = " ".join(sorted(packages))
-        out["server"] = "true" if SERVER in packages else "false"
+        out["test_args"] = test_args(packages)
         out["rust"] = "false" if docs_only else "true"
-        out["shards"] = json.dumps({"include": shards(packages)}) if packages else json.dumps({"include": []})
+        out["sdk_ts"] = "true" if sdk_ts or not docs_only else "false"
+        out["specs"] = "true" if specs else "false"
+        out["shards"] = json.dumps({"include": shards(packages, libraries)}) if packages else json.dumps({"include": []})
         print(f"Direct: {sorted(direct)}; testing {len(packages)} package(s): {out['packages'] or 'none'}", file=sys.stderr)
     else:
+        out["sdk_ts"] = "true"
         out["shards"] = json.dumps({"include": []})
     lines = "".join(f"{k}={v}\n" for k, v in out.items())
     target = os.environ.get("GITHUB_OUTPUT")

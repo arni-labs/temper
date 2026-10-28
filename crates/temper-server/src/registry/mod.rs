@@ -8,10 +8,11 @@
 mod relations;
 mod server_derived_names;
 pub mod types;
+mod unavailable;
 
 use server_derived_names::warn_on_server_derived_csdl_properties;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use tracing::instrument;
@@ -37,12 +38,53 @@ use relations::{build_relation_graph, build_webhook_routes, synthesize_action_tr
 #[derive(Debug, Clone, Default)]
 pub struct SpecRegistry {
     tenants: BTreeMap<TenantId, TenantConfig>,
+    /// Types whose spec a registration replaced with a different one that
+    /// declares state timeouts, or did before: their records' timers must be
+    /// made to follow the state each record is in under the new spec.
+    changed_types: BTreeSet<(TenantId, String)>,
+    /// Tenants with installations in progress, and how many. Their changed
+    /// types stay out of every walk until the last one finishes.
+    installing: BTreeMap<TenantId, usize>,
+    /// Tenants whose stored specs could not be restored, with the reason.
+    unavailable: BTreeMap<TenantId, String>,
 }
 
 impl SpecRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Take the types whose spec changed since the last call (see
+    /// `ServerState::follow_spec_changes`), except those of a tenant with an
+    /// installation in progress: they wait for it to finish.
+    pub fn take_changed_types(&mut self) -> Vec<(TenantId, String)> {
+        let (waiting, ready): (BTreeSet<_>, BTreeSet<_>) = std::mem::take(&mut self.changed_types)
+            .into_iter()
+            .partition(|(tenant, _)| self.installing.contains_key(tenant));
+        self.changed_types = waiting;
+        ready.into_iter().collect()
+    }
+
+    /// An installation into `tenant` starts. It registers its specs before
+    /// its policies and modules, and a record whose timer a walk reconciled
+    /// in between could fire before they exist, so the tenant's changed
+    /// types wait until the matching [`Self::finish_install`].
+    pub fn begin_install(&mut self, tenant: &TenantId) {
+        *self.installing.entry(tenant.clone()).or_default() += 1;
+    }
+
+    /// An installation into `tenant` has finished, or failed: its changed
+    /// types are ready for the next walk once no other one is in progress.
+    pub fn finish_install(&mut self, tenant: &TenantId) {
+        let Some(count) = self.installing.get_mut(tenant) else {
+            debug_assert!(false, "finish_install without begin_install for {tenant}");
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.installing.remove(tenant);
+        }
     }
 
     /// Register a tenant with its CSDL document and IOA specs.
@@ -199,10 +241,16 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
-                let table = TransitionTable::from_automaton(&automaton);
+                let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
 
                 if let Some(existing_spec) = existing_config.entities.get_mut(*entity_type) {
+                    let timed = !existing_spec.automaton.state_timeouts.is_empty()
+                        || !automaton.state_timeouts.is_empty();
+                    if timed && existing_spec.ioa_source != *ioa_source {
+                        self.changed_types
+                            .insert((tenant.clone(), (*entity_type).to_string()));
+                    }
                     // Hot-swap: write new table into the SAME RwLock that actors hold.
                     let result = existing_spec.swap_controller().swap(table);
                     tracing::info!(
@@ -266,7 +314,7 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
-                let table = TransitionTable::from_automaton(&automaton);
+                let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
                 entities.insert(
                     entity_type.to_string(),
@@ -415,6 +463,21 @@ impl SpecRegistry {
         self.tenants.keys().collect()
     }
 
+    /// The tenant's types marked `principal_record`: a record of one, keyed by
+    /// a user's `sub`, describes that user to Cedar.
+    pub fn principal_record_types(&self, tenant: &TenantId) -> Vec<String> {
+        self.tenants
+            .get(tenant)
+            .map(|tc| {
+                tc.entities
+                    .iter()
+                    .filter(|(_, spec)| spec.automaton.automaton.principal_record)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// List all entity types for a tenant.
     pub fn entity_types(&self, tenant: &TenantId) -> Vec<&str> {
         self.tenants
@@ -454,6 +517,28 @@ impl SpecRegistry {
     ) -> Option<&BTreeMap<String, VerificationStatus>> {
         self.tenants.get(tenant).map(|tc| &tc.verification)
     }
+}
+
+/// Build a type's transition table, and say which of its invariants moves
+/// are not checked against: a move reads the statuses of the records it
+/// points at, never their fields (`temper_jit::table::invariant`).
+fn transition_table(
+    tenant: &str,
+    entity_type: &str,
+    automaton: &automaton::Automaton,
+) -> TransitionTable {
+    for invariant in &automaton.invariants {
+        if !temper_jit::table::MoveInvariant::checked(invariant) {
+            tracing::warn!(
+                tenant,
+                entity_type,
+                invariant = %invariant.name,
+                "invariant reads another record's field, which moves do not read; \
+                 moves are not checked against it"
+            );
+        }
+    }
+    TransitionTable::from_automaton(automaton)
 }
 
 #[cfg(test)]

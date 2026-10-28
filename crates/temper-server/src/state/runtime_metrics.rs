@@ -40,7 +40,7 @@ impl RuntimeMetricInstruments {
                 .build(),
             indexed_entities: meter
                 .u64_gauge("temper_indexed_entities")
-                .with_description("Number of entities currently present in the in-memory query-plane index.")
+                .with_description("Number of entities currently present in the in-memory query-plane index, reported globally and by tenant.")
                 .build(),
             projected_entities: meter
                 .u64_gauge("temper_projected_entities")
@@ -66,10 +66,17 @@ impl RuntimeMetricInstruments {
         if let Some(rss) = read_process_resident_memory_bytes() {
             self.process_resident_memory_bytes.record(rss, &[]);
         }
-        self.active_actors.record(state.active_actor_count(), &[]);
+        if let Ok(registry) = state.actor_registry.read() {
+            self.active_actors.record(registry.len() as u64, &[]);
+            crate::runtime_metrics::record_actor_mailbox_metrics(&registry);
+        }
         let indexed_by_tenant = state.active_entity_counts_by_tenant();
         let indexed_total: u64 = indexed_by_tenant.values().copied().sum();
         self.indexed_entities.record(indexed_total, &[]);
+        for (tenant, count) in &indexed_by_tenant {
+            self.indexed_entities
+                .record(*count, &[KeyValue::new("tenant", tenant.clone())]);
+        }
 
         if let Some(query_plane) = state.query_plane_store()
             && let Ok(Ok(Some(projected_by_tenant))) = tokio::time::timeout(
@@ -149,7 +156,7 @@ fn allow_indefinite_state_counts(state: &ServerState) -> Vec<(String, u64)> {
 
 impl ServerState {
     /// Start periodic runtime metric export for process + actor-system state.
-    pub fn spawn_runtime_metrics_loop(&self) {
+    pub(super) fn spawn_runtime_metrics_loop(&self) {
         let interval_secs = configured_u64("TEMPER_RUNTIME_METRICS_INTERVAL_SECS", 60, 1, 86_400);
 
         let state = self.clone();
@@ -188,7 +195,7 @@ fn coverage_ratio(projected: u64, indexed: u64) -> f64 {
     }
 }
 
-fn read_process_resident_memory_bytes() -> Option<u64> {
+pub(crate) fn read_process_resident_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     if let Some(bytes) = read_linux_vm_rss_bytes() {
         return Some(bytes);

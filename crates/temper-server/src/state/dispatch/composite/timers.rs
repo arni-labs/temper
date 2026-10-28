@@ -46,7 +46,9 @@ pub(super) fn composite_sub_write_agent(
     write: &PreparedCompositeSubWrite,
 ) -> AgentContext {
     let mut agent = composite_agent_ctx.clone();
-    agent.idempotency_key = Some(write.idempotency_key.clone());
+    agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+        write.idempotency_key.clone(),
+    ));
     agent
 }
 
@@ -77,12 +79,16 @@ impl crate::state::ServerState {
                 .for_dispatch_root(&write.entity_type, &write.entity_id),
             response: EntityResponse {
                 success: true,
+                refusal: None,
                 state: state.clone(),
                 error: None,
                 custom_effects: Vec::new(),
                 scheduled_actions: Vec::new(),
                 spawn_requests: Vec::new(),
                 spec_governed: true,
+                refused: false,
+                answered_action: None,
+                store_unavailable: false,
             },
         })
     }

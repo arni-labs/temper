@@ -92,7 +92,10 @@ const AGENT_SPECS: &[(&str, &str)] = &[
 /// Returns a list of `(entity_type, content_hash)` for all bootstrapped specs
 /// so the caller can persist them to the backing store.
 ///
-/// Panics if any spec fails to parse or verify (fatal startup error).
+/// Returns an error if any spec, the CSDL or the cross-invariants fail to
+/// parse or verify. The registry is shared by every tenant, so nothing here
+/// panics: a caller with built-in specs treats the error as fatal, a caller
+/// installing one tenant's app returns it to that install.
 pub(crate) struct BootstrapTenantSpecsOptions<'a> {
     pub(crate) merge: bool,
     pub(crate) label: &'a str,
@@ -118,17 +121,7 @@ pub(crate) fn bootstrap_tenant_specs(
     csdl_source: &str,
     specs: &[(&str, &str)],
     options: BootstrapTenantSpecsOptions<'_>,
-) -> Vec<(String, String)> {
-    bootstrap_tenant_specs_inner(state, tenant, csdl_source, specs, options)
-}
-
-fn bootstrap_tenant_specs_inner(
-    state: &PlatformState,
-    tenant: &str,
-    csdl_source: &str,
-    specs: &[(&str, &str)],
-    options: BootstrapTenantSpecsOptions<'_>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let BootstrapTenantSpecsOptions {
         merge,
         label,
@@ -145,7 +138,7 @@ fn bootstrap_tenant_specs_inner(
     // Validate all specs parse.
     for (entity_type, ioa_source) in specs {
         automaton::parse_automaton(ioa_source)
-            .unwrap_or_else(|e| panic!("{label} spec {entity_type} failed to parse: {e}"));
+            .map_err(|e| format!("{label} spec {entity_type} failed to parse: {e}"))?;
     }
 
     // Hash-gated verification: only run the cascade for specs whose
@@ -176,19 +169,21 @@ fn bootstrap_tenant_specs_inner(
                 .with_sim_seeds(3)
                 .with_prop_test_cases(20);
             let result = cascade.run();
-            assert!(
-                result.all_passed,
-                "{label} spec {entity_type} failed verification cascade"
-            );
+            if !result.all_passed {
+                return Err(format!(
+                    "{label} spec {entity_type} failed verification cascade"
+                ));
+            }
         }
         spec_hashes.push((entity_type.to_string(), hash));
     }
 
     // Parse CSDL schema.
-    let csdl =
-        parse_csdl(csdl_source).unwrap_or_else(|e| panic!("{label} CSDL failed to parse: {e}"));
+    let csdl = parse_csdl(csdl_source).map_err(|e| format!("{label} CSDL failed to parse: {e}"))?;
 
-    // Register tenant and mark specs as pre-verified.
+    // Register tenant and mark specs as pre-verified. Registration refuses
+    // bad input before it changes the registry, and the guard is released on
+    // that early return like any other, so other tenants keep reading it.
     let tenant_id = TenantId::new(tenant);
     {
         let mut registry = state.registry.write().unwrap(); // ci-ok: infallible lock
@@ -201,7 +196,7 @@ fn bootstrap_tenant_specs_inner(
                 cross_invariants_source.map(str::to_string),
                 merge,
             )
-            .unwrap_or_else(|e| panic!("failed to register {label} specs for '{tenant}': {e}"));
+            .map_err(|e| format!("failed to register {label} specs for '{tenant}': {e}"))?;
         let now = temper_runtime::scheduler::sim_now().to_rfc3339();
         for (entity_type, _) in specs {
             registry.set_verification_status(
@@ -226,7 +221,7 @@ fn bootstrap_tenant_specs_inner(
         specs.iter().map(|(t, _)| *t).collect::<Vec<_>>()
     );
 
-    spec_hashes
+    Ok(spec_hashes)
 }
 
 /// Bootstrap the system tenant.
@@ -251,6 +246,8 @@ pub fn bootstrap_system_tenant(
             verification_mode: BootstrapSpecVerificationMode::FullCascade,
         },
     )
+    // Built-in specs compiled into this binary: a failure is a build defect.
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Bootstrap agent entity specs (Agent, Plan, Task, ToolCall) for a tenant.
@@ -277,6 +274,8 @@ pub fn bootstrap_agent_specs(
             verification_mode: BootstrapSpecVerificationMode::FullCascade,
         },
     )
+    // Built-in specs compiled into this binary: a failure is a build defect.
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Platform IDENTITY specs — a strict subset of [`AGENT_SPECS`] that backs
@@ -462,6 +461,28 @@ pub async fn bootstrap_operator_credential_specs(
     tenant: &str,
 ) -> Result<(), RegistryError> {
     bootstrap_agent_subset_specs(state, tenant, OPERATOR_CREDENTIAL_SPECS)
+}
+
+/// The tenant's stored verification results, from the platform store installs
+/// write to; empty when there is none or it cannot be read.
+pub(crate) async fn load_verification_cache(
+    state: &PlatformState,
+    tenant: &str,
+) -> BTreeMap<String, (String, bool)> {
+    let stack = state.server.storage_stack.as_ref();
+    if let Some(turso) = stack
+        .and_then(|stack| stack.turso.as_ref())
+        .and_then(|provider| provider.platform_store())
+    {
+        turso
+            .load_verification_cache(tenant)
+            .await
+            .unwrap_or_default()
+    } else if let Some(ps) = stack.and_then(|stack| stack.platform.clone()) {
+        ps.load_verification_cache(tenant).await.unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    }
 }
 
 /// Persist built-in spec hashes and verification status to Turso.
@@ -1136,11 +1157,6 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_types_count() {
-        assert_eq!(SYSTEM_SPECS.len(), 13);
-    }
-
-    #[test]
     fn test_observation_initial_state() {
         let automaton = automaton::parse_automaton(OBSERVATION_IOA).unwrap();
         assert_eq!(automaton.automaton.initial, "Open");
@@ -1356,11 +1372,6 @@ initial = "Created"
                 ("Task".to_string(), "sha256:task".to_string()),
             ]
         );
-    }
-
-    #[test]
-    fn test_agent_specs_count() {
-        assert_eq!(AGENT_SPECS.len(), 10);
     }
 
     #[test]

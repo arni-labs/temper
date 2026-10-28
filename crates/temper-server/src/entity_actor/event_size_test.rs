@@ -48,6 +48,7 @@ async fn add_item(
     actor
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "AddItem".into(),
                 params: serde_json::json!({ "ProductId": product }),
                 related: BTreeMap::new(),
@@ -226,7 +227,8 @@ async fn an_oversized_create_is_refused_before_its_actor_starts() {
             serde_json::json!({ "Notes": "x".repeat(5_000) }),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(
         refused.starts_with("refused: `Created` on default:Order:big would record "),
         "{refused}"

@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Default)]
-struct RingHookCalls(std::sync::atomic::AtomicUsize);
+pub(super) struct RingHookCalls(pub(super) std::sync::atomic::AtomicUsize);
 
 impl temper_server::state::custom_effects::CustomEffectHandler for RingHookCalls {
     fn handle(
@@ -37,7 +37,7 @@ hook = "CountRing"
     );
     for seed in 0..32 {
         let (_guard, clock, _ids) = install_deterministic_context(seed);
-        let mut state = build_state_with_bell("http://127.0.0.1:9", &spec);
+        let mut state = build_state_for_tenant("temper-system", "http://127.0.0.1:9", &spec);
         state.set_storage_stack(StorageStack::from_sim(SimEventStore::no_faults(seed), None));
         let calls = std::sync::Arc::new(RingHookCalls::default());
         state.custom_effect_handler = Some(calls.clone());
@@ -48,12 +48,12 @@ hook = "CountRing"
                 temper_server::idempotency::derived_idempotency_key(&parent, "scheduled:Ring", "0");
             delivered.insert(key.clone());
             let agent = AgentContext {
-                idempotency_key: Some(key),
+                idempotency_key: Some(temper_server::idempotency::IdempotencyKey::FollowUp(key)),
                 ..AgentContext::default()
             };
             let response = state
                 .dispatch_tenant_action(
-                    &TenantId::default(),
+                    &TenantId::new("temper-system"),
                     "Bell",
                     "b1",
                     "Ring",
