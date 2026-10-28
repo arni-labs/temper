@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::logs::{
     BatchConfigBuilder as LogBatchConfigBuilder, BatchLogProcessor, SdkLoggerProvider,
 };
@@ -65,10 +65,6 @@ use sampler::{
 };
 use settings::{ComputedAttributes, ExportSettings};
 
-/// Every signal is sent as OTLP/HTTP protobuf. Named here rather than left to
-/// `opentelemetry-otlp`'s default, which turns to JSON whenever any crate built
-/// alongside this one enables that crate's `http-json` feature.
-const OTEL_EXPORT_PROTOCOL: Protocol = Protocol::HttpBinary;
 const OTEL_EXPORTER_BUILD_RETRY_ATTEMPTS: usize = 3;
 const OTEL_EXPORTER_RETRY_BASE_DELAY_MS: u64 = 250;
 const TRACE_BATCH_MAX_QUEUE_SIZE: usize = 2_048;
@@ -313,7 +309,6 @@ fn init_pipeline(
         let span_exporter = build_with_retry("trace exporter", || {
             SpanExporter::builder()
                 .with_http()
-                .with_protocol(OTEL_EXPORT_PROTOCOL)
                 .with_timeout(Duration::from_secs(10))
                 .build()
         })?;
@@ -339,7 +334,6 @@ fn init_pipeline(
         let metric_exporter = build_with_retry("metric exporter", || {
             MetricExporter::builder()
                 .with_http()
-                .with_protocol(OTEL_EXPORT_PROTOCOL)
                 .with_timeout(Duration::from_secs(10))
                 .build()
         })?;
@@ -362,7 +356,6 @@ fn init_pipeline(
         let log_exporter = build_with_retry("log exporter", || {
             LogExporter::builder()
                 .with_http()
-                .with_protocol(OTEL_EXPORT_PROTOCOL)
                 .with_timeout(Duration::from_secs(10))
                 .build()
         })?;
