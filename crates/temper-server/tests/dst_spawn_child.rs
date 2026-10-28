@@ -280,6 +280,10 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
                 .expect("replay Job")
                 .state;
             assert_eq!(
+                replayed.spawn_reservations, live.spawn_reservations,
+                "seed {seed}: replay must preserve reservation ownership"
+            );
+            assert_eq!(
                 replayed.fields["last_run_id"], live.fields["last_run_id"],
                 "seed {seed}: {job_id}'s spawn field must survive replay"
             );
@@ -354,6 +358,118 @@ async fn dst_existing_child_survives_unreadable_journal() {
         assert_eq!(
             fields["last_run_id"], "existing",
             "seed {seed}: unreadability must not clear a durable child"
+        );
+    }
+}
+
+/// An id identifies a child, not the reservation a delayed refusal cancels.
+/// Seed 0 is a permanent regression for the reused-id race.
+#[tokio::test(start_paused = true)]
+async fn dst_delayed_refusal_keeps_a_newer_reservation_of_the_same_child_id() {
+    for same_transition in [false, true] {
+        let mut delayed_absences = 0;
+        for seed in 0..SEEDS {
+            let (_guard, _clock, _ids) = install_deterministic_context(seed);
+            let _faults = temper_runtime::buggify::install_buggify_context(seed);
+            let store = SimEventStore::no_faults(seed);
+            let mut job = JOB_IOA.to_owned();
+            let mut run = RUN_IOA.to_owned();
+            if same_transition {
+                job = job.replace(
+                    "effect = [",
+                    "effect = [\"spawn('Run', 'Undeclared', last_run_id, params.run_id)\", ",
+                );
+                run = run.replace(
+                    "initial = \"Pending\"",
+                    "initial = \"Pending\"\nstrict_action_params = true",
+                );
+            }
+            let state = state_with_specs(store.clone(), &job, &run);
+            let tenant = TenantId::default();
+            let agent = AgentContext::for_service("dst-spawn-child-reused-id");
+            let mut rng = DeterministicRng::new(seed);
+            let job_id = format!("reuse-{seed}");
+            let run_id = format!("same-run-{seed}");
+            state
+                .get_or_create_tenant_entity(&tenant, "Job", &job_id, serde_json::json!({}))
+                .await
+                .expect("create Job");
+            // Keep the valid child's creation behind the older refusal's lookup.
+            store.inject_append_delay(
+                &format!("default:Run:{run_id}"),
+                Duration::from_millis(50 + rng.next_u64() % 50),
+            );
+            let messages: &[&str] = if same_transition {
+                &["summarise the day"]
+            } else {
+                &["", "summarise the day"]
+            };
+            for message in messages {
+                let fired = state
+                    .dispatch_tenant_action(
+                        &tenant,
+                        "Job",
+                        &job_id,
+                        "Fire",
+                        serde_json::json!({"run_id": run_id, "user_message": message}),
+                        &agent,
+                    )
+                    .await
+                    .expect("Fire dispatches");
+                assert!(fired.success, "seed {seed}: Fire failed: {:?}", fired.error);
+            }
+            for _ in 0..SETTLE_POLLS {
+                if run_exists(&store, &run_id) && !refusals(&store, &job_id).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+            }
+            assert!(
+                run_exists(&store, &run_id),
+                "seed {seed}: valid child must exist"
+            );
+            let journal = store.dump_journal(&format!("default:Job:{job_id}"));
+            let newest_fire = journal
+                .iter()
+                .rev()
+                .find(|e| e.event_type == "Fire")
+                .unwrap();
+            let refusal = journal
+                .iter()
+                .find(|e| e.event_type == "SpawnRefused")
+                .unwrap();
+            if refusal.payload["params"]["child"] == "absent"
+                && refusal.sequence_nr > newest_fire.sequence_nr
+            {
+                delayed_absences += 1;
+            }
+            let live = state
+                .get_tenant_entity_state(&tenant, "Job", &job_id)
+                .await
+                .expect("read live Job")
+                .state;
+            assert_eq!(
+                live.fields["last_run_id"], run_id,
+                "seed {seed}: delayed refusal cleared a newer reservation of the same id"
+            );
+            let restarted = state_with_specs(store.clone(), &job, &run);
+            let replayed = restarted
+                .get_tenant_entity_state(&tenant, "Job", &job_id)
+                .await
+                .expect("replay Job")
+                .state;
+            assert_eq!(
+                replayed.spawn_reservations, live.spawn_reservations,
+                "seed {seed}: replay must preserve reservation ownership"
+            );
+            assert_eq!(
+                replayed.fields["last_run_id"], live.fields["last_run_id"],
+                "seed {seed}: replay must preserve the newer reservation"
+            );
+        }
+        assert!(
+            delayed_absences > 0,
+            "the workload must delay an absence past the newer reservation"
         );
     }
 }

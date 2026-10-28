@@ -9,7 +9,7 @@ use temper_runtime::tenant::TenantId;
 impl ServerState {
     /// A spawn whose child was not created. The refusal goes to the parent's
     /// observe stream, as before, and into its journal as `SpawnRefused`,
-    /// which clears the field the transition stored the child's id in. The
+    /// which clears the field only while this request owns its reservation. The
     /// field keeps the id if the child exists anyway or could not be looked
     /// up.
     pub(super) async fn refuse_spawn(
@@ -50,7 +50,11 @@ impl ServerState {
                 ChildLookup::Unreadable
             }
         };
+        // Explore the gap between the child lookup and the parent receiving
+        // its refusal: another spawn may reserve the same id in between.
+        temper_runtime::buggify::buggify_yield(32).await;
         let refusal = SpawnRefusal {
+            reservation_id: request.reservation_id.clone(),
             child_type: request.entity_type.clone(),
             child_id: request.entity_id.clone(),
             field: request.store_id_in.clone(),

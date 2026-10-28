@@ -60,6 +60,7 @@ fn event_budget_workspace_id_uses_workspace_entity_id_or_field() {
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
     assert_eq!(event_budget_workspace_id(&workspace_state), "ws-1");
 
@@ -79,6 +80,7 @@ fn event_budget_workspace_id_uses_workspace_entity_id_or_field() {
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
     assert_eq!(event_budget_workspace_id(&file_state), "ws-2");
 }
@@ -111,6 +113,7 @@ async fn queued_snapshot_only_advances_replay_boundary_after_write_applies() {
         sequence_nr: 100,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
 
     EntityActor::maybe_save_snapshot(
@@ -1952,6 +1955,7 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         }
     }
 
@@ -2408,6 +2412,7 @@ fn replaying_a_non_object_field_event_leaves_state_untouched() {
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
     let before = state.fields.clone();
 
@@ -2798,6 +2803,7 @@ async fn spawn_refusal_retry_refuses_when_the_race_spent_the_event_budget() {
         .ask(
             EntityMsg::RecordSpawnRefusal {
                 refusal: crate::entity_actor::spawn_refusal::SpawnRefusal {
+                    reservation_id: String::new(),
                     child_type: "Order".to_owned(),
                     child_id: "refused-child".to_owned(),
                     field: Some("child".to_owned()),

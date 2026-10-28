@@ -183,6 +183,7 @@ mod tests {
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         }
     }
 

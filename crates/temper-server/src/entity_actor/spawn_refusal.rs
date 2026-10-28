@@ -6,8 +6,9 @@
 //! proof the child exists (ADR-0156). When the create is refused, the kernel
 //! journals a `SpawnRefused` event on the parent: it names the child and the
 //! reason, and puts the field back to its initial value if it still names the
-//! refused child and that child is known not to exist. A later spawn that
-//! already replaced the id keeps its own, and so does a child that exists
+//! refused child, the original reservation still owns the field, and that
+//! child is known not to exist. A later spawn keeps its own reservation,
+//! even for the same child id. The id also stays when the child exists
 //! anyway or could not be looked up.
 //!
 //! The event is the kernel's, like `FieldsUpdated`: it changes no status, runs
@@ -31,6 +32,9 @@ const MAX_RETRIES: u32 = 2;
 /// Why a spawn's child was not created, as the spawn dispatcher saw it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRefusal {
+    /// The original reservation, distinct from the child id it reserved.
+    #[serde(default)]
+    pub reservation_id: String,
     /// The child's entity type.
     pub child_type: String,
     /// The id the parent's transition reserved for the child.
@@ -61,16 +65,18 @@ pub enum ChildLookup {
 /// The event's params: the refusal, plus the field it cleared and the value it
 /// restored, so replay does not have to decide again.
 fn event_params(refusal: &SpawnRefusal, state: &EntityState, initial: &Value) -> Value {
-    let holds_child = refusal.field.as_ref().is_some_and(|field| {
+    let owns_field = refusal.field.as_ref().is_some_and(|field| {
         state.fields.get(field).and_then(Value::as_str) == Some(refusal.child_id.as_str())
+            && state.spawn_reservations.get(field) == Some(&refusal.reservation_id)
     });
-    let cleared = (refusal.child == ChildLookup::Absent && holds_child)
+    let cleared = (refusal.child == ChildLookup::Absent && owns_field)
         .then(|| refusal.field.clone())
         .flatten();
     let restored = cleared
         .as_ref()
         .map(|field| initial.get(field).cloned().unwrap_or(Value::Null));
     serde_json::json!({
+        "reservation_id": refusal.reservation_id,
         "child_type": refusal.child_type,
         "child_id": refusal.child_id,
         "error": refusal.error,
@@ -89,6 +95,7 @@ pub(crate) fn apply(state: &mut EntityState, params: &Value) {
     let restored = params.get("restored_value").cloned().unwrap_or(Value::Null);
     if let Some(fields) = state.fields.as_object_mut() {
         fields.insert(field.to_owned(), restored);
+        state.spawn_reservations.remove(field);
     }
 }
 
@@ -128,6 +135,7 @@ pub(super) async fn commit(
     }
     let initial = initial_fields(actor, state);
     let mut previous_fields = state.fields.clone();
+    let mut previous_reservations = state.spawn_reservations.clone();
     let mut event = refusal_event(state, event_params(refusal, state, &initial));
     apply(state, &event.params);
 
@@ -152,6 +160,7 @@ pub(super) async fn commit(
             Err(PersistenceError::ConcurrencyViolation { actual, .. }) if attempt < MAX_RETRIES => {
                 attempt += 1;
                 state.fields = previous_fields.clone();
+                state.spawn_reservations = previous_reservations.clone();
                 super::field_updates::catch_up(actor, state, attempt, actual, SPAWN_REFUSED_EVENT)
                     .await?;
                 if state.status == "Deleted" {
@@ -165,13 +174,15 @@ pub(super) async fn commit(
                     ));
                 }
                 // Decide again on the caught-up parent: a newer spawn may have
-                // replaced the id in between.
+                // replaced the reservation in between, even with the same id.
                 previous_fields = state.fields.clone();
+                previous_reservations = state.spawn_reservations.clone();
                 event = refusal_event(state, event_params(refusal, state, &initial));
                 apply(state, &event.params);
             }
             Err(e) => {
                 state.fields = previous_fields;
+                state.spawn_reservations = previous_reservations;
                 return Err(super::actor::persistence_failure(&e));
             }
         }
@@ -204,3 +215,7 @@ fn initial_fields(actor: &EntityActor, state: &EntityState) -> Value {
     )
     .fields
 }
+
+#[cfg(test)]
+#[path = "spawn_refusal_test.rs"]
+mod tests;

@@ -313,6 +313,7 @@ impl EntityActor {
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         }
     }
 
