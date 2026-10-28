@@ -83,7 +83,7 @@ impl ServerState {
     /// changed follow the state the record is in now, including a type that
     /// had no timeout before. Failed listings and reads remain pending until
     /// the store recovers. Startup installs defer to `start_runtime`'s
-    /// rows-only boot walk, preserving saved callers and its shared fire gate.
+    /// boot walk, preserving saved callers and its shared fire gate.
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
             Ok(mut registry) => {

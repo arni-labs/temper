@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod projection;
+pub use projection::{JournalHead, ProjectionCheckpoint, ProjectionRepairCandidate};
+
 mod catalog_group;
 mod tombstone;
 pub use catalog_group::CatalogGroupRow;
@@ -569,6 +572,40 @@ pub trait EventStore: Send + Sync + 'static {
         &self,
         persistence_id: &str,
     ) -> impl std::future::Future<Output = Result<Option<(u64, Vec<u8>)>, PersistenceError>> + Send;
+
+    /// Last durable sequence, including the latest snapshot after compaction.
+    /// SQL stores override this with indexed sequence-only reads.
+    fn latest_sequence_nr(
+        &self,
+        persistence_id: &str,
+    ) -> impl std::future::Future<Output = Result<u64, PersistenceError>> + Send {
+        async move {
+            let snapshot = self
+                .load_snapshot(persistence_id)
+                .await?
+                .map_or(0, |(seq, _)| seq);
+            let tail = self.read_events(persistence_id, snapshot).await?;
+            Ok(tail
+                .last()
+                .map_or(snapshot, |event| event.sequence_nr.max(snapshot)))
+        }
+    }
+
+    /// Read every journal head in one batch, without events or snapshot bodies.
+    /// Used when the catalog lives outside the event store. Query-plane journals
+    /// override this; unsupported journals fail boot repair rather than serving
+    /// unchecked rows.
+    fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<JournalHead>, PersistenceError>> + Send {
+        let _ = tenant;
+        async {
+            Err(PersistenceError::Storage(
+                "batched journal heads unsupported".into(),
+            ))
+        }
+    }
 
     /// List all distinct `(entity_type, entity_id)` pairs for a tenant.
     fn list_entity_ids(

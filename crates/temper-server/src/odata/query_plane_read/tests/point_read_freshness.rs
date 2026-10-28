@@ -8,6 +8,8 @@ use crate::odata::read_support::try_load_entity_body_from_catalog;
 use crate::storage::QueryPlaneStore;
 use std::sync::Arc;
 
+mod restart;
+
 async fn project(qp: &SimQueryPlane, entity_id: &str, sequence_nr: u64) {
     qp.upsert_projection(
         TenantId::default().as_str(),
@@ -143,10 +145,22 @@ struct FlakyQueryPlane {
     inner: SimQueryPlane,
     writes: std::sync::atomic::AtomicUsize,
     fail_write: usize,
+    hang_sequence: std::sync::atomic::AtomicU64,
+    hanging: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for FlakyQueryPlane {
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<
+        Vec<temper_runtime::persistence::ProjectionCheckpoint>,
+        temper_runtime::persistence::PersistenceError,
+    > {
+        self.inner.projection_checkpoints(tenant).await
+    }
+
     async fn upsert_projection(
         &self,
         tenant: &str,
@@ -157,6 +171,12 @@ impl QueryPlaneStore for FlakyQueryPlane {
         state: &serde_json::Value,
         sequence_nr: u64,
     ) -> Result<(), temper_runtime::persistence::PersistenceError> {
+        if sequence_nr != 0
+            && sequence_nr == self.hang_sequence.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.hanging.notify_one();
+            std::future::pending::<()>().await;
+        }
         if self
             .writes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

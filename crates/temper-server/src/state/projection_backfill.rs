@@ -7,6 +7,7 @@ use crate::entity_actor::recover_entity_state_from_store;
 
 use super::ServerState;
 
+mod boot_repair;
 mod key_index;
 mod replay_parity;
 mod vector_index;
