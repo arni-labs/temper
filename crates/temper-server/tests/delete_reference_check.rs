@@ -465,3 +465,33 @@ async fn restrict_delete_sees_a_reference_projected_before_its_field_was_indexed
         "the delete is refused for pay-early ({body}) and the filter finds it ({listed})"
     );
 }
+
+/// The same, after the restarted server's field-index backfill has run over
+/// every record: the backfill re-projects pay-early under the spec that
+/// indexes OrderId.
+#[tokio::test]
+async fn restrict_delete_sees_a_newly_indexed_reference_after_the_backfill() {
+    let store = Store::new("newly-indexed-backfilled");
+    let writer = server_with(
+        "delete-reference-newly-indexed-backfill-writer",
+        StorageStack::from_turso(store.open().await),
+        PAYMENT_IOA_ORDER_ID_UNINDEXED,
+    );
+    create(&writer, "Order", "ord-early", serde_json::json!({})).await;
+    let early = serde_json::json!({ "OrderId": "ord-early" });
+    create(&writer, "Payment", "pay-early", early).await;
+
+    let state = restarted_server("delete-reference-newly-indexed-backfilled", &store).await;
+    state
+        .populate_field_index_from_snapshots(&TenantId::default())
+        .await;
+
+    let (deleted, body) = delete_order(&state, "ord-early").await;
+    let filter = Request::get("/tdata/Payments?$filter=OrderId%20eq%20'ord-early'");
+    let (_, listed) = send(&state, filter.body(Body::empty()).unwrap()).await;
+    assert_eq!(
+        (deleted, listed.to_string().contains("pay-early")),
+        (StatusCode::CONFLICT, true),
+        "after the backfill, the delete is refused for pay-early ({body}) and the filter finds it ({listed})"
+    );
+}
