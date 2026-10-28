@@ -1,11 +1,13 @@
-//! A move a composite batch commits is visible to a filtered read once the
-//! batch answers, as a single move's is (`project_before_dependents`).
+//! Every commit that has answered is visible to a filtered read: a composite
+//! batch's moves as much as a single move's (`project_before_dependents`).
 //!
-//! The projection queue here never drains, the way a production queue lags
-//! under load. On Genesis, a push's batch moved a Ref's head and answered
+//! The workload mixes single moves and batches over a repository's refs, the
+//! way Genesis pushes do, and after every answer reads the refs back with a
+//! filter. The projection queue here never drains, the way a production queue
+//! lags under load. On Genesis, a push's batch moved a Ref's head and answered
 //! 200, and `Refs?$filter=RepositoryId eq ..` showed the old head for up to
-//! 134 s: the filter still matched the stale row, so no empty-match
-//! re-check ran.
+//! 134 s: the filter still matched the stale row, so no empty-match re-check
+//! ran.
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -18,10 +20,9 @@ use super::*;
 use crate::state::QueryProjectionWriteQueue;
 use crate::storage::StorageStack;
 
-const SEEDS: u64 = 8;
-const REF_ID: &str = "rf-repo-test-refs-heads-main";
-const OLD_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const NEW_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const SEEDS: u64 = 32;
+const REFS: usize = 4;
+const STEPS: usize = 12;
 
 /// The composite fixture on a Turso store, with a projection queue that
 /// never drains.
@@ -55,9 +56,23 @@ async fn lagging_state(seed: u64) -> (ServerState, std::path::PathBuf) {
     (state, db_path)
 }
 
-/// `GET /tdata/Refs?$filter=RepositoryId eq 'repo-test'`, as Genesis reads a
-/// repository's refs.
-async fn refs_of_repo(state: &ServerState) -> String {
+fn ref_id(n: usize) -> String {
+    format!("rf-repo-test-refs-heads-b{n}")
+}
+
+/// The head ref `n` moves to at `step`.
+fn sha(step: usize, n: usize) -> String {
+    format!("{:040x}", step * REFS + n)
+}
+
+/// A seeded choice in `0..n`.
+fn pick(n: usize) -> usize {
+    (sim_uuid().as_u128() % n as u128) as usize
+}
+
+/// Each ref's head as `GET /tdata/Refs?$filter=RepositoryId eq 'repo-test'`
+/// lists it, the way Genesis reads a repository's refs.
+async fn listed_heads(state: &ServerState) -> BTreeMap<String, String> {
     let mut request = Request::get("/tdata/Refs?$filter=RepositoryId%20eq%20'repo-test'")
         .body(Body::empty())
         .unwrap();
@@ -79,66 +94,107 @@ async fn refs_of_repo(state: &ServerState) -> String {
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();
-    String::from_utf8(body.to_vec()).unwrap()
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    body["value"]
+        .as_array()
+        .expect("a collection answer")
+        .iter()
+        .map(|row| {
+            (
+                row["entity_id"].as_str().unwrap_or_default().to_string(),
+                row["fields"]["TargetCommitSha"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
-async fn a_filtered_read_after_a_batch_answers_sees_the_batch() {
+async fn every_answered_commit_is_visible_to_a_filtered_read() {
     for seed in 0..SEEDS {
         let (_guard, _, _) = install_deterministic_context(seed);
         let (state, db_path) = lagging_state(seed).await;
         let tenant = TenantId::default();
         let agent = AgentContext::for_service("batch-visible");
-        let created = state
-            .dispatch_tenant_action(
-                &tenant,
-                "Ref",
-                REF_ID,
-                "Create",
+        let mut heads = BTreeMap::new();
+        for n in 0..REFS {
+            let params = json!({
+                "RepositoryId": "repo-test",
+                "Name": format!("refs/heads/b{n}"),
+                "TargetCommitSha": sha(0, n),
+                "Kind": "branch"
+            });
+            let created = state
+                .dispatch_tenant_action(&tenant, "Ref", &ref_id(n), "Create", params, &agent)
+                .await
+                .expect("ref create should run");
+            assert!(created.success);
+            heads.insert(ref_id(n), sha(0, n));
+        }
+
+        let mut trace = Vec::new();
+        for step in 1..=STEPS {
+            // A push moves one to all of the refs in one batch; a single
+            // move moves one.
+            let batch = pick(2) == 0;
+            let count = if batch { 1 + pick(REFS) } else { 1 };
+            let first = pick(REFS);
+            let moved: Vec<usize> = (0..count).map(|k| (first + k) % REFS).collect();
+            let update = |n: usize| {
                 json!({
-                    "RepositoryId": "repo-test",
-                    "Name": "refs/heads/main",
-                    "TargetCommitSha": OLD_SHA,
-                    "Kind": "branch"
-                }),
-                &agent,
-            )
-            .await
-            .expect("ref create should run");
-        assert!(created.success);
-        assert!(
-            refs_of_repo(&state).await.contains(OLD_SHA),
-            "seed {seed}: the ref is listed before the push"
-        );
+                    "PreviousCommitSha": heads[&ref_id(n)],
+                    "NewCommitSha": sha(step, n),
+                    "TargetCommitSha": sha(step, n)
+                })
+            };
+            if batch {
+                let sub_writes: Vec<Value> = moved
+                    .iter()
+                    .map(|&n| {
+                        json!({
+                            "entity_type": "Ref",
+                            "entity_id": ref_id(n),
+                            "action": "Update",
+                            "params": update(n)
+                        })
+                    })
+                    .collect();
+                let applied = state
+                    .apply_composite_integration_result(
+                        &tenant,
+                        "Parent",
+                        "repo-test",
+                        "IngestPack",
+                        &json!({ "sub_writes": sub_writes }),
+                        &agent,
+                    )
+                    .await
+                    .expect("the push's batch commits");
+                assert!(applied);
+            } else {
+                let n = moved[0];
+                let response = state
+                    .dispatch_tenant_action(&tenant, "Ref", &ref_id(n), "Update", update(n), &agent)
+                    .await
+                    .expect("the ref update should run");
+                assert!(response.success);
+            }
+            for &n in &moved {
+                heads.insert(ref_id(n), sha(step, n));
+            }
+            trace.push(format!(
+                "{step}: {} {moved:?}",
+                if batch { "batch" } else { "move" }
+            ));
 
-        state
-            .apply_composite_integration_result(
-                &tenant,
-                "Parent",
-                "repo-test",
-                "IngestPack",
-                &json!({
-                    "sub_writes": [{
-                        "entity_type": "Ref",
-                        "entity_id": REF_ID,
-                        "action": "Update",
-                        "params": {
-                            "PreviousCommitSha": OLD_SHA,
-                            "NewCommitSha": NEW_SHA,
-                            "TargetCommitSha": NEW_SHA
-                        }
-                    }]
-                }),
-                &agent,
-            )
-            .await
-            .expect("the push's batch commits");
-
-        let listed = refs_of_repo(&state).await;
-        assert!(
-            listed.contains(NEW_SHA) && !listed.contains(OLD_SHA),
-            "seed {seed}: a filtered read after the batch answered must show the new head: {listed}"
-        );
+            assert_eq!(
+                listed_heads(&state).await,
+                heads,
+                "seed {seed}: a filtered read must show every answered commit, after {trace:?}"
+            );
+        }
         let _ = std::fs::remove_file(db_path);
     }
 }
