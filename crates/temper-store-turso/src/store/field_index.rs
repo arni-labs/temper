@@ -445,8 +445,9 @@ impl TursoEventStore {
         params: Vec<String>,
     ) -> Result<Vec<String>, PersistenceError> {
         let conn = self.configured_connection().await?;
+        let index = catalog_filter_index(where_clause);
         let sql = format!(
-            "SELECT entity_id FROM entity_catalog \
+            "SELECT entity_id FROM entity_catalog {index}\
              WHERE tenant = ?1 AND entity_type = ?2 AND ({where_clause})"
         );
 
@@ -755,6 +756,19 @@ pub(super) fn indexed_projection_fields(
     // Also index the status as a pseudo-field so `$filter=Status eq 'Active'` works.
     indexed_fields.push(("Status".to_string(), Some(status.to_string())));
     indexed_fields
+}
+
+/// What a `$filter` over the catalog reads it by. Every one fixes the tenant
+/// and type; one that also fixes the status (`status = ?`) reads
+/// `idx_entity_catalog_status` by all three, which turso_core's planner does
+/// not choose by itself (see `driver/plan_check.rs`). Without one, the
+/// planner's walk of the primary key also keeps a page in `entity_id` order.
+pub(super) fn catalog_filter_index(where_clause: &str) -> &'static str {
+    if crate::sql_terms::gives(where_clause, "entity_catalog", true, "status") {
+        "INDEXED BY idx_entity_catalog_status "
+    } else {
+        ""
+    }
 }
 
 #[cfg(test)]
