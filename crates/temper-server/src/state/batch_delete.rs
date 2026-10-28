@@ -127,6 +127,27 @@ impl ServerState {
         match store.append_batch(&appends).await {
             Ok(results) => debug_assert_eq!(results.len(), deleted.len()),
             Err(PersistenceError::ConcurrencyViolation { expected, actual }) => {
+                // The conflicting writer may live on another server, so our
+                // actors may still hold exactly the states this batch read.
+                // The store does not name the conflicting member: reload them
+                // all before the route plans and authorizes the delete again.
+                for member in &deleted {
+                    self.stop_and_remove_entity(tenant, &member.entity_type, &member.entity_id);
+                }
+                for member in &deleted {
+                    // Reload now also restores the live ids evicted above;
+                    // an already-hydrated type must still find its dependents.
+                    let current = self
+                        .get_tenant_entity_state(tenant, &member.entity_type, &member.entity_id)
+                        .await
+                        .map_err(|error| {
+                            BatchDeleteError::Storage(format!(
+                                "delete conflict recovery failed for {}('{}'): {error}",
+                                member.entity_type, member.entity_id
+                            ))
+                        })?;
+                    self.cache_entity_status(tenant, &current.state);
+                }
                 return Err(BatchDeleteError::Changed(format!(
                     "an entity it removes changed after it was read (journal at {actual}, read at {expected})"
                 )));
