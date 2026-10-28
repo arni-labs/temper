@@ -7,6 +7,8 @@
 //! not bounded: a walk that fits finishes, since each state it walks is one
 //! more it holds.
 
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Memory joint walks take as they grow and give back when they end.
@@ -161,4 +163,75 @@ pub(super) fn block(size: usize) -> usize {
 /// bucket and a control byte for each, at most seven of eight buckets full.
 pub(super) fn map_bytes<K, V>(capacity: usize) -> usize {
     (capacity * 8).div_ceil(7) * (size_of::<(K, V)>() + 1)
+}
+
+/// A list a walk keeps.
+pub(super) trait List {
+    /// Bytes one entry takes.
+    const ENTRY: usize;
+    fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn reserve_exact(&mut self, more: usize);
+}
+
+impl<T> List for Vec<T> {
+    const ENTRY: usize = size_of::<T>();
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn capacity(&self) -> usize {
+        Vec::capacity(self)
+    }
+    fn reserve_exact(&mut self, more: usize) {
+        Vec::reserve_exact(self, more);
+    }
+}
+
+impl<T> List for VecDeque<T> {
+    const ENTRY: usize = size_of::<T>();
+    fn len(&self) -> usize {
+        VecDeque::len(self)
+    }
+    fn capacity(&self) -> usize {
+        VecDeque::capacity(self)
+    }
+    fn reserve_exact(&mut self, more: usize) {
+        VecDeque::reserve_exact(self, more);
+    }
+}
+
+/// The bytes `list` takes at its capacity.
+pub(super) fn bytes<L: List>(list: &L) -> usize {
+    list.capacity() * L::ENTRY
+}
+
+/// Make `list` hold `spare` more, doubling it when it must grow, with the
+/// memory of its new copy taken while the old one is still held.
+pub(super) fn grow<L: List>(list: &mut L, spare: usize, held: &mut Held<'_>) -> Result<(), String> {
+    let len = list.len();
+    if list.capacity() - len >= spare {
+        return Ok(());
+    }
+    let wanted = (len + spare).max(list.capacity() * 2);
+    held.add(wanted * L::ENTRY)?;
+    list.reserve_exact(wanted - len);
+    held.sub(wanted * L::ENTRY);
+    Ok(())
+}
+
+/// Make `map` hold `spare` more, as [`grow`] does a list.
+pub(super) fn grow_map<K: Eq + Hash, V>(
+    map: &mut HashMap<K, V>,
+    spare: usize,
+    held: &mut Held<'_>,
+) -> Result<(), String> {
+    let len = map.len();
+    if map.capacity() - len >= spare {
+        return Ok(());
+    }
+    let wanted = (len + spare).max(map.capacity() * 2);
+    held.add(map_bytes::<K, V>(wanted))?;
+    map.reserve(wanted - len);
+    held.sub(map_bytes::<K, V>(wanted));
+    Ok(())
 }

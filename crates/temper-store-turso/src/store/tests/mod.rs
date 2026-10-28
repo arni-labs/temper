@@ -15,6 +15,7 @@ mod event_pages;
 mod evolution_tenant;
 mod field_index_writes;
 mod policy_approval;
+mod projection_repair;
 mod projection_writes;
 mod scheduled_actions;
 mod write_queue;

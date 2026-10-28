@@ -84,3 +84,19 @@ async fn installed_dependencies_are_closed_transitively_and_tenant_scoped() {
         "{unproved:?}"
     );
 }
+
+#[tokio::test]
+async fn a_rule_that_checks_nothing_as_written_is_a_warning() {
+    let b = spec("B", None);
+    let state = state("alice", &[("B", &b)]);
+    // A never moves to Closed, so the rule's premise holds nowhere.
+    let a = spec("A", Some("status == 'Closed' => B[Id].status == 'Open'"));
+    let unproved = prove_to_the_end(&state, "alice", "a-app", &[("A".into(), a)], true, None)
+        .await
+        .unwrap();
+    assert_eq!(unproved.len(), 1, "{unproved:?}");
+    assert!(
+        unproved[0].contains("A.rule CHECKS NOTHING AS WRITTEN"),
+        "{unproved:?}"
+    );
+}

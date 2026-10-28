@@ -527,6 +527,19 @@ impl EventStore for TursoEventStore {
         Ok(Some((sequence_nr, snapshot)))
     }
 
+    async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        let (tenant, ty, id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        self.journal_sequence_nr(tenant, ty, id).await
+    }
+
+    async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        self.load_journal_heads(tenant).await
+    }
+
     #[instrument(skip_all, fields(tenant, otel.name = "turso.list_entity_ids"))]
     async fn list_entity_ids(
         &self,

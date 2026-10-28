@@ -234,6 +234,31 @@ impl Kernel {
     }
 }
 
+/// Each action of a type in `scope` that a reaction from a type outside it
+/// sends, with those types: the model, made of the types in `scope`, never
+/// sends it.
+pub(super) fn reactions_into(
+    by_name: &BTreeMap<&str, &Automaton>,
+    scope: &BTreeSet<String>,
+) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut into: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for (from, automaton) in by_name.iter().filter(|(name, _)| !scope.contains(**name)) {
+        for trigger in automaton.actions.iter().flat_map(|a| &a.triggers) {
+            if let (TriggerKind::Entity, Some(to), Some(action)) = (
+                &trigger.kind,
+                &trigger.target_entity,
+                &trigger.target_action,
+            ) && scope.contains(to)
+            {
+                into.entry((to.clone(), action.clone()))
+                    .or_default()
+                    .insert(from.to_string());
+            }
+        }
+    }
+    into
+}
+
 /// The entity reactions whose source and target are both in `scope`.
 fn reactions_in(by_name: &BTreeMap<&str, &Automaton>, scope: &BTreeSet<String>) -> Vec<Reaction> {
     let mut reactions = Vec::new();

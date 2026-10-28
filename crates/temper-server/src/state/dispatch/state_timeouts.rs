@@ -614,7 +614,9 @@ impl crate::state::ServerState {
     /// sequence for the rest of its budget (none for a timer that fires once
     /// and already did), as `timer`'s identity and through its boot gate. A
     /// newer arm in this process since `timer` (`armed_seq` is no longer
-    /// current) already follows the record, so nothing changes.
+    /// current) already follows the record, so nothing changes. `timer`'s
+    /// task woke for its deadline, so a timer armed here at that deadline
+    /// fires on time, not overdue.
     pub(super) async fn follow_moved_record(
         &self,
         timer: &ArmedTimer,
@@ -636,6 +638,7 @@ impl crate::state::ServerState {
         let follow = super::state_timer_reconcile::Follow {
             armed_by: Some(&timer.agent_ctx),
             gate: timer.boot_gate.clone(),
+            woke_for: Some(deadline(timer.started_at, timer.after_seconds)),
             ..Default::default()
         };
         self.follow_owned_state_timer(
@@ -787,6 +790,7 @@ impl crate::state::ServerState {
         if !belongs {
             let follow = super::state_timer_reconcile::Follow {
                 armed_by: Some(&timer.agent_ctx),
+                woke_for: Some(deadline(timer.started_at, timer.after_seconds)),
                 ..Default::default()
             };
             self.follow_owned_state_timer(
@@ -1042,6 +1046,16 @@ pub(super) fn remaining_budget(
         .to_std()
         .unwrap_or(Duration::ZERO);
     Duration::from_secs(after_seconds).saturating_sub(elapsed)
+}
+
+/// When a timer whose clock started at `started_at` falls due. A budget past
+/// the end of the calendar never falls due.
+pub(super) fn deadline(started_at: DateTime<Utc>, after_seconds: u64) -> DateTime<Utc> {
+    i64::try_from(after_seconds)
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|budget| started_at.checked_add_signed(budget))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 #[cfg(test)]

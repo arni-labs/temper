@@ -62,14 +62,14 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// Only a rule the check finds broken refuses the install: an invariant with
 /// a path of moves that breaks it, or a liveness rule with a path to a state
 /// from which no move reaches its condition. A rule it could not prove (the
-/// walk did not fit in its memory, or it reads a type nobody declares) is a
-/// warning and the install goes ahead; those rules are returned for the
-/// install's answer. It runs before the install writes or swaps anything, so
-/// a refused bundle leaves the tenant as it was and reads keep serving the
-/// old specs meanwhile. The walk runs as its own job (see [`proofs`]): a
-/// proof still walking comes back as the walk to wait for, and the install
-/// waits for it without its lock and starts again, finding the verdict in
-/// `attempt`.
+/// walk did not fit in its memory, it reads a type nobody declares, a module
+/// answer not walked, or a premise no state meets) is a warning and the
+/// install goes ahead; those rules are returned for the install's answer. It
+/// runs before the install writes or swaps anything, so a refused bundle
+/// leaves the tenant as it was and reads keep serving the old specs
+/// meanwhile. The walk runs as its own job (see [`proofs`]): a proof still
+/// walking comes back as the walk to wait for, and the install waits for it
+/// without its lock and starts again, finding the verdict in `attempt`.
 pub(super) async fn prove(
     state: &PlatformState,
     tenant: &str,
@@ -118,23 +118,32 @@ pub(super) async fn prove(
         let liveness =
             temper_verify::composite::verify_joint_liveness(&refs, Some(&policies), bound);
         let (mut held, mut broken, mut unproved) = (Vec::new(), Vec::new(), Vec::new());
+        // A walk that did not finish says nothing of the specs: it may fit
+        // when the host has more room, so its verdict is not kept. A rule
+        // that checks nothing as written is a verdict on the specs.
+        let mut fit = true;
         for result in &invariants {
             match result.outcome {
                 JointOutcome::Holds => held.push(result.to_string()),
-                JointOutcome::Incomplete { .. } => unproved.push(result.to_string()),
+                JointOutcome::Vacuous { .. } => unproved.push(result.to_string()),
+                JointOutcome::Incomplete { .. } => {
+                    fit = false;
+                    unproved.push(result.to_string());
+                }
                 JointOutcome::Broken { .. } => broken.push(result.to_string()),
             }
         }
         for result in &liveness {
             match result.outcome {
                 LivenessOutcome::Holds => held.push(result.to_string()),
-                LivenessOutcome::Incomplete { .. } => unproved.push(result.to_string()),
+                LivenessOutcome::Vacuous { .. } => unproved.push(result.to_string()),
+                LivenessOutcome::Incomplete { .. } => {
+                    fit = false;
+                    unproved.push(result.to_string());
+                }
                 LivenessOutcome::Stuck { .. } => broken.push(result.to_string()),
             }
         }
-        // A rule left unproved says nothing of the specs: its walk may fit
-        // when the host has more room, so its verdict is not kept.
-        let fit = unproved.is_empty();
         let refused = (!broken.is_empty()).then(|| {
             format!(
                 "os-app '{app}' would break tenant rules over several records:\n{}",

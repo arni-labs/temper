@@ -19,6 +19,7 @@ use temper_store_turso::TursoEventStore;
 
 mod count_telemetry;
 mod dst_projection_lag;
+mod empty_match;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;
