@@ -217,6 +217,7 @@ impl ServerState {
                         armed_by: callers.get(&key),
                         gate: gate.clone(),
                         arming,
+                        woke_for: None,
                     };
                     let followed = self
                         .reconcile_stored_record(&tenant, &entity_type, entity_id, follow)
