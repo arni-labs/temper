@@ -11,6 +11,7 @@ use tracing::Instrument;
 
 mod actions;
 mod adapter;
+mod answer_check;
 mod answers;
 mod authenticated_params;
 pub(crate) use authenticated_params::bind_authenticated_params;

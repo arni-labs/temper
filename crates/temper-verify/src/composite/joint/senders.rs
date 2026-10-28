@@ -4,11 +4,8 @@
 //! - A reaction with a declared principal: that service, with the trigger's
 //!   source in its context (`resolve_trigger_principal` in the trigger
 //!   dispatcher). Without one: whoever sent its source action.
-//! - A module's answer, or its `on_failure`: `service:wasm-runtime` when the
-//!   call ran in the background, and the caller when it ran inline
-//!   (`WasmDispatchMode` in `invocation_artifacts.rs`). Only an outside
-//!   caller can ask for inline (`?await_integration`); the kernel's own
-//!   dispatches never do.
+//! - A module's answer, or its `on_failure`: whoever sent the move that called
+//!   the module, inline or in the background (`AgentContext::as_answer`).
 //! - A state timer: whoever armed it, the sender of the move that entered its
 //!   state or last reset it (`timer_agent` in `state_timeouts.rs`).
 //!
@@ -38,8 +35,6 @@ use crate::model::ModelString;
 
 /// Someone outside the kernel.
 pub(super) const OUTSIDE: u32 = 0;
-/// The runtime, answering a module call that ran in the background.
-pub(super) const RUNTIME: u32 = 1;
 
 /// The senders a model knows, by number, and what Cedar lets each send.
 pub(super) struct Senders {
@@ -75,7 +70,7 @@ impl Senders {
         entities: impl IntoIterator<Item = &'a String> + Clone,
         policies: Option<&SendAnalysis>,
     ) -> Self {
-        let mut askers = vec![Asker::Outside, service("wasm-runtime", BTreeMap::new())];
+        let mut askers = vec![Asker::Outside];
         for entity in entities.clone() {
             for action in &by_name[entity.as_str()].actions {
                 for trigger in &action.triggers {

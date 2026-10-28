@@ -76,23 +76,23 @@ pub const TRIGGER_DECLARED_PRINCIPAL: &str = "triggerDeclaredPrincipal";
 pub const TRIGGER_INHERITED_CONTEXT_APPROXIMATE: &str = "triggerInheritedContextApproximate";
 
 // How the move came about (`MoveCause`). The engine sets `via` and `depth` on
-// every check and the rest on a reaction's or a timer's, from the security
-// context's cause alone: neither a record field nor a context attribute
-// speaks under these names, so only the kernel's own reaction and timer paths
-// set them.
+// every check and the rest on a reaction's, a module answer's or a timer's,
+// from the security context's cause alone: neither a record field nor a
+// context attribute speaks under these names, so only the kernel's own
+// reaction, answer and timer paths set them.
 
-/// `"request"`, `"reaction"` or `"timer"`. A field `via` set to `"reaction"`
-/// would pass an app's hook forbid narrowed to direct requests, for any move
-/// the hook picks.
+/// `"request"`, `"reaction"`, `"module"` or `"timer"`. A field `via` set to
+/// `"reaction"` would pass an app's hook forbid narrowed to direct requests,
+/// for any move the hook picks.
 pub const VIA: &str = "via";
 
-/// Reaction hops since the chain's request or timer fire. A field would pass
-/// a policy that admits only a chain's later hops, for a direct request.
+/// Hops since the chain's request or timer fire. A field would pass a
+/// policy that admits only a chain's later hops, for a direct request.
 pub const DEPTH: &str = "depth";
 
-/// The rule making a reaction, `<Type>:<Action>:<trigger>`. A field would
-/// pass a policy that lets only that rule's reaction make the move, for a
-/// caller's own move.
+/// The rule making a reaction, or the trigger whose module answered with the
+/// move, `<Type>:<Action>:<trigger>`. A field would pass a policy that lets
+/// only that rule's reaction make the move, for a caller's own move.
 pub const RULE: &str = "rule";
 
 /// The move that set a reaction off. A field would pass a policy that admits
