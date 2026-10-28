@@ -131,10 +131,12 @@ fn should_reconcile_empty_exact_match_against_authoritative(
 /// committed value the page filters on (`projection_catalog_freshness`). Only
 /// the other rows can hold a match the page missed: one with no catalog row
 /// yet, one whose journal has a newer event, and one whose fields sit inside a
-/// `fields` object the index does not look into. A row with no value for a
-/// filtered field has no index row for it and cannot match an equality on it.
-/// A field the spec keeps out of the index (`query_indexed = false`) has no
-/// rows at all, so then no row is answered for.
+/// `fields` object the index does not look into, and one projected before the
+/// field index existed, which has no index row at all until a backfill reaches
+/// it (every projection indexes at least the row's `Id`). A row with no value
+/// for a filtered field has no index row for it and cannot match an equality
+/// on it. A field the spec keeps out of the index (`query_indexed = false`)
+/// has no rows at all, so then no row is answered for.
 async fn unvouched_ids(
     request: &QueryPlaneReadRequest<'_>,
     field_names: &std::collections::BTreeSet<String>,
@@ -161,9 +163,24 @@ async fn unvouched_ids(
             return None;
         }
     };
+    let indexed: std::collections::BTreeSet<String> = match query_plane
+        .query_field_index(
+            request.tenant.as_str(),
+            request.entity_type,
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2)",
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(Some(ids)) => ids.into_iter().collect(),
+        Ok(None) | Err(_) => return None,
+    };
     let vouched: std::collections::BTreeSet<String> = rows
         .into_iter()
-        .filter(|row| row.current && row.wrapped_fields.is_none())
+        .filter(|row| {
+            row.current && row.wrapped_fields.is_none() && indexed.contains(&row.entity_id)
+        })
         .map(|row| row.entity_id)
         .collect();
     let gap: std::collections::BTreeSet<String> = all_entity_ids
