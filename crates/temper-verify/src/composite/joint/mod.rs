@@ -40,6 +40,14 @@
 //! breadth first, so each broken invariant's path is a shortest one. A walk
 //! that runs out of its [`Budget`] says so and is never a pass.
 //!
+//! Nor is a walk that checked nothing. A module whose trigger names no
+//! `on_success` may answer with any action its result names, and the model
+//! answers only with internal ones: when such a call is open and its record
+//! could take an action nothing in the model sends, the walk never goes
+//! where that answer leads, and says so instead of passing. A rule written
+//! `premise => conclusion` whose premise no walked state meets (no settled
+//! one, for an invariant) holds without being tested, and proves nothing.
+//!
 //! The drop check (ADR-0150, [`dropped_reactions`]) walks the same model over
 //! a whole trigger-graph component, unsliced, one record of each type that
 //! every reference finds, with a move's dispatches landing before the next
@@ -110,11 +118,26 @@ pub enum JointOutcome {
         /// The moves and the joint states they reach.
         path: Vec<JointStep>,
     },
-    /// The walk stopped before every state was seen, or could not start.
+    /// No settled state the walk met breaks it, but none meets its premise
+    /// either, so that proves nothing.
+    Vacuous {
+        /// The premise, as written.
+        premise: String,
+    },
+    /// The walk stopped before every state was seen, never took an answer
+    /// a module may give, or could not start.
     Incomplete {
         /// Why.
         reason: String,
     },
+}
+
+/// The premise of a rule written `premise => conclusion`.
+fn premise(rule: &Expr) -> Option<&Expr> {
+    match rule {
+        Expr::Implies(premise, _) => Some(premise),
+        _ => None,
+    }
 }
 
 /// One step of a counterexample path.
@@ -159,6 +182,11 @@ impl fmt::Display for JointInvariantResult {
                 }
                 Ok(())
             }
+            JointOutcome::Vacuous { premise } => write!(
+                f,
+                "{}.{} CHECKS NOTHING AS WRITTEN: its premise `{premise}` holds in no settled state of the {} joint states walked ({scope})",
+                self.entity, self.invariant, self.states
+            ),
             JointOutcome::Incomplete { reason } => write!(
                 f,
                 "{}.{} NOT CHECKED ({scope}, {} joint states walked): {reason}",
@@ -441,6 +469,10 @@ pub fn replay_joint_invariants(
 #[cfg(test)]
 #[path = "joint_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vacuous_test.rs"]
+mod vacuous_tests;
 
 #[cfg(test)]
 mod chain_test;

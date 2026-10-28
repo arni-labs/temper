@@ -1,12 +1,12 @@
 //! The breadth-first walk over joint states.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
 use super::super::JointOutcome;
 use super::super::pack::{Packed, Packer};
 use super::super::state::render;
-use super::super::{JointState, JointStep};
+use super::super::{JointState, JointStep, premise};
 use super::step::Certainty;
 use super::{JointModel, Walk};
 use crate::Budget;
@@ -49,6 +49,20 @@ pub(in crate::composite::joint) struct Explored {
     pub(in crate::composite::joint) stopped: Option<String>,
     /// Whether a move was held back for [`super::MAX_IN_FLIGHT`].
     pub(in crate::composite::joint) held_back: bool,
+    /// The moves the runtime could make in a walked state that the walk
+    /// never takes.
+    unwalked: BTreeSet<Unwalked>,
+}
+
+/// A move the runtime could make that the walk never takes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::composite::joint) struct Unwalked {
+    /// `Entity.Action`.
+    pub(in crate::composite::joint) action: String,
+    /// Who sends it in the runtime.
+    pub(in crate::composite::joint) sender: String,
+    /// The record's status where it could.
+    pub(in crate::composite::joint) from: String,
 }
 
 impl Explored {
@@ -79,6 +93,36 @@ impl Explored {
         steps.reverse();
         steps
     }
+
+    /// The moves the runtime could make that the walk never took, one line
+    /// per sender: `who may take Entity.Action (from Status, ...), ...`.
+    pub(in crate::composite::joint) fn unwalked(&self) -> Vec<String> {
+        let mut by: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+        for found in &self.unwalked {
+            by.entry(&found.sender)
+                .or_default()
+                .entry(&found.action)
+                .or_default()
+                .push(&found.from);
+        }
+        by.into_iter()
+            .map(|(sender, actions)| {
+                let actions: Vec<String> = actions
+                    .into_iter()
+                    .map(|(action, statuses)| format!("{action} (from {})", statuses.join(", ")))
+                    .collect();
+                format!("{sender} may take {}", actions.join(", "))
+            })
+            .collect()
+    }
+}
+
+/// Why a walk that never took the moves `unwalked` proves nothing.
+pub(in crate::composite::joint) fn unwalked_reason(unwalked: &[String]) -> String {
+    format!(
+        "the walk never takes moves the runtime can make, so it never goes where they lead: {}. Declare an action only a module answers with as internal, or name it in its trigger's on_success; the walk does not send a reaction from a type outside the rule's scope",
+        unwalked.join("; ")
+    )
 }
 
 impl JointModel {
@@ -109,6 +153,7 @@ impl JointModel {
             edges: Vec::new(),
             stopped: None,
             held_back: false,
+            unwalked: BTreeSet::new(),
         };
         // Check the sliced models before either caller can expand a move.
         let oversized: Vec<_> = self
@@ -141,6 +186,7 @@ impl JointModel {
         }
         while let Some(index) = queue.pop_front() {
             let state = explored.state(index);
+            self.note_unwalked(&state, &mut explored.unwalked);
             if visit(index, &state) {
                 break;
             }
@@ -266,6 +312,8 @@ impl JointModel {
         }
         let mut unknown = vec![false; invariants.len()];
         let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
+        let premises: Vec<Option<&Expr>> = invariants.iter().map(|inv| premise(inv)).collect();
+        let mut met: Vec<bool> = premises.iter().map(Option::is_none).collect();
         let explored = self.walk_with(budget, false, |index, state| {
             if state.settled() {
                 let env = self.env(owner, state);
@@ -275,10 +323,14 @@ impl JointModel {
                         Truth::Unknown => unknown[i] = true,
                         _ => {}
                     }
+                    if let (false, Some(premise)) = (met[i], premises[i]) {
+                        met[i] = eval(premise, &env) != Truth::False;
+                    }
                 }
             }
             broken.iter().all(Option::is_some)
         });
+        let unwalked = explored.unwalked();
         let outcomes = broken
             .iter()
             .enumerate()
@@ -293,7 +345,15 @@ impl JointModel {
                     Some(reason) => JointOutcome::Incomplete {
                         reason: reason.clone(),
                     },
-                    None => JointOutcome::Holds,
+                    None if !unwalked.is_empty() => JointOutcome::Incomplete {
+                        reason: unwalked_reason(&unwalked),
+                    },
+                    None => match premises[i] {
+                        Some(premise) if !met[i] => JointOutcome::Vacuous {
+                            premise: premise.to_string(),
+                        },
+                        _ => JointOutcome::Holds,
+                    },
                 },
             })
             .collect();

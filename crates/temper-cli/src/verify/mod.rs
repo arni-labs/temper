@@ -234,7 +234,9 @@ const JOINT_BUDGET: temper_verify::Budget = temper_verify::Budget {
 /// deciding each move as its sender. A broken invariant fails the command
 /// with its shortest path, a condition the system's own moves do not reach
 /// fails with how it comes to rest short of it, and a walk that could not
-/// finish fails too, since a partial walk proves nothing. A spec that does
+/// finish fails too, since a partial walk proves nothing. So do a walk that
+/// never took an answer a module may give and a rule whose premise no walked
+/// state meets. A spec that does
 /// not parse is reported by the IOA cascade, so it is skipped here.
 fn verify_joint(
     ioa_sources: &std::collections::BTreeMap<String, String>,
@@ -255,6 +257,7 @@ fn verify_joint(
         let tag = match result.outcome {
             temper_verify::composite::JointOutcome::Holds => "PASS",
             temper_verify::composite::JointOutcome::Broken { .. } => "FAIL",
+            temper_verify::composite::JointOutcome::Vacuous { .. } => "VACUOUS",
             temper_verify::composite::JointOutcome::Incomplete { .. } => "INCOMPLETE",
         };
         (
@@ -270,6 +273,7 @@ fn verify_joint(
         let tag = match result.outcome {
             temper_verify::composite::LivenessOutcome::Holds => "PASS",
             temper_verify::composite::LivenessOutcome::Stuck { .. } => "FAIL",
+            temper_verify::composite::LivenessOutcome::Vacuous { .. } => "VACUOUS",
             temper_verify::composite::LivenessOutcome::Incomplete { .. } => "INCOMPLETE",
         };
         (
