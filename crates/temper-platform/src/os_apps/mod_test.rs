@@ -901,6 +901,7 @@ mod directed_evolution;
 #[path = "mod_test/policy_joint.rs"]
 mod policy_joint;
 mod policy_reinstall;
+mod scheduled_moves;
 mod spec_change;
 mod timer_strands;
 #[test]
