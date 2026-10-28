@@ -300,9 +300,7 @@ impl IdempotencyCache {
         // set still deduplicates its retry, but as after a restart, a retry
         // of a dropped reply then runs without the reply's spawns, timers and
         // (for a non-composite action) triggers.
-        if bytes > self.budget_bytes {
-            return;
-        }
+        // MUTANT: the budget is never enforced.
 
         let seq = entries.next_seq;
         entries.next_seq += 1;
@@ -329,12 +327,6 @@ impl IdempotencyCache {
             );
         entries.bytes += bytes;
 
-        while entries.bytes > self.budget_bytes {
-            if !entries.evict_one() {
-                break;
-            }
-        }
-        debug_assert!(entries.bytes <= self.budget_bytes);
         debug_assert_eq!(
             entries.len(),
             entries.by_actor.values().map(BTreeMap::len).sum::<usize>()
