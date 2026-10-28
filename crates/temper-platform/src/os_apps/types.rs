@@ -87,6 +87,16 @@ impl InstallWarning {
             detail: None,
         }
     }
+
+    /// A state timer whose lost fire nothing redoes (`timer_strands`):
+    /// advice, never a refusal.
+    pub fn timer_strands(message: String, detail: serde_json::Value) -> Self {
+        Self {
+            check: "timer_strands".to_string(),
+            message,
+            detail: Some(detail),
+        }
+    }
 }
 
 /// Component phases an OS-app install/reconcile should execute.

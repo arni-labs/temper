@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::slice::Iter;
 
-use super::state::{Call, Dispatch, JointState};
+use super::state::{Call, Dispatch, JointState, ReactionStep};
 use crate::model::{ModelString, ParamValue, TemperModelState};
 
 /// A packed joint state, shared by the walk's list and its index.
@@ -18,6 +18,8 @@ pub(super) type Packed = Rc<[u32]>;
 pub(super) struct Packer {
     ids: HashMap<String, u32>,
     names: Vec<String>,
+    /// Bytes the strings take on the heap, each held twice.
+    pub(super) heap: usize,
 }
 
 impl Packer {
@@ -39,11 +41,20 @@ impl Packer {
         let id = u32::try_from(self.names.len()).expect("fewer than 2^32 strings");
         self.ids.insert(name.to_string(), id);
         self.names.push(name.to_string());
+        self.heap += 2 * super::room::block(name.len());
         id
     }
 
     pub(super) fn name(&self, id: u32) -> &str {
         &self.names[id as usize]
+    }
+
+    /// Bytes the table holds: its strings, and its list and index at their
+    /// capacity.
+    pub(super) fn bytes(&self) -> usize {
+        self.heap
+            + self.names.capacity() * size_of::<String>()
+            + super::room::map_bytes::<String, u32>(self.ids.capacity())
     }
 }
 
@@ -204,6 +215,21 @@ impl Pack for TemperModelState {
     }
 }
 
+impl Pack for ReactionStep {
+    fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
+        self.entity_type.put(packer, out);
+        self.action.put(packer, out);
+        self.generated_for.put(packer, out);
+    }
+    fn take(packer: &Packer, input: &mut Iter<'_, u32>) -> Self {
+        Self {
+            entity_type: Pack::take(packer, input),
+            action: Pack::take(packer, input),
+            generated_for: Pack::take(packer, input),
+        }
+    }
+}
+
 impl Pack for Dispatch {
     fn put(&self, packer: &mut Packer, out: &mut Vec<u32>) {
         self.to.put(packer, out);
@@ -211,7 +237,7 @@ impl Pack for Dispatch {
         self.target_state.put(packer, out);
         self.params.put(packer, out);
         self.read.put(packer, out);
-        self.depth.put(packer, out);
+        self.chain.put(packer, out);
         self.via.put(packer, out);
         self.by.put(packer, out);
     }
@@ -222,7 +248,7 @@ impl Pack for Dispatch {
             target_state: Pack::take(packer, input),
             params: Pack::take(packer, input),
             read: Pack::take(packer, input),
-            depth: Pack::take(packer, input),
+            chain: Pack::take(packer, input),
             via: Pack::take(packer, input),
             by: Pack::take(packer, input),
         }

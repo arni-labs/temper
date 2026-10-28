@@ -4,12 +4,15 @@
 //! linked `AgentType` is active, and returns a `ResolvedIdentity` that the
 //! security context uses as the authoritative agent identity.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
 use crate::identity::error::{IdentityError, classify_dependency_read};
 use crate::identity::jwt;
+use crate::identity::principal_records::principal_records;
 use crate::identity::resolver_support::{
     entity_state, hash_token, looks_like_jwt, parse_credential_expiry, require_field,
     same_credential_authority,
@@ -45,6 +48,12 @@ pub struct ResolvedIdentity {
     pub is_human: bool,
     /// Verified `role` claim (Cedar), when the issuer stamped one.
     pub role: Option<String>,
+    /// JWT path only: the statuses of the `principal_record` records that
+    /// describe the user behind the token, keyed by the Cedar principal
+    /// attribute each becomes (`<Type>` in person, `actingFor<Type>` for an
+    /// agent's user). Read through each record's actor on every request.
+    #[serde(default)]
+    pub principal_records: BTreeMap<String, String>,
 }
 
 /// Resolves bearer tokens to platform-assigned agent identities.
@@ -173,6 +182,7 @@ impl IdentityResolver {
             from_jwt: false,
             is_human: false,
             role: None,
+            principal_records: BTreeMap::new(),
         };
 
         // Re-check after the linked AgentType lookup so a short-lived
@@ -283,6 +293,13 @@ impl IdentityResolver {
                     from_jwt: true,
                     is_human: false,
                     role: claims.role.clone(),
+                    principal_records: principal_records(
+                        state,
+                        tenant,
+                        None,
+                        claims.sub.as_deref().filter(|sub| !sub.is_empty()),
+                    )
+                    .await?,
                 }
             }
             None => {
@@ -291,6 +308,7 @@ impl IdentityResolver {
                     return Err(IdentityError::Invalid);
                 }
                 ResolvedIdentity {
+                    principal_records: principal_records(state, tenant, Some(&sub), None).await?,
                     agent_instance_id: sub,
                     agent_type_id: String::new(),
                     agent_type_name: String::new(),

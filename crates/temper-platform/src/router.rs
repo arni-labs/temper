@@ -4,7 +4,6 @@
 //! The API is the **Temper Data API** at `/tdata`.
 
 use axum::Router;
-use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing;
 
@@ -23,10 +22,24 @@ use crate::tenant_access::tenant_access_check;
 ///
 /// Tenant is extracted from the `X-Tenant-Id` header. Falls back to the
 /// first registered tenant in the SpecRegistry.
+///
+/// The request's span is outermost. An embedder that adds middleware of its
+/// own takes [`build_platform_routes`], adds it, and then puts
+/// [`temper_server::with_request_span`] on last, so that work is in the
+/// request's trace too.
 pub fn build_platform_router(state: PlatformState) -> Router {
+    temper_server::with_request_span(build_platform_routes(state))
+}
+
+/// The platform's routes and middleware, without the request's span.
+pub fn build_platform_routes(state: PlatformState) -> Router {
     let tenant_api = crate::tenant_api::tenant_api_router();
     let health = Router::new()
-        .route("/healthz", routing::get(|| async { StatusCode::OK }))
+        .route(
+            "/healthz",
+            routing::get(temper_server::write_health::healthz),
+        )
+        .with_state(state.server.clone())
         .route("/version", routing::get(version_info));
 
     // Platform observe routes — merged at /observe/* to avoid the /api double-nest
@@ -47,9 +60,10 @@ pub fn build_platform_router(state: PlatformState) -> Router {
         routing::post(temper_server::identity::endpoint::handle_identity_resolve),
     );
 
-    // The request's span goes on last, so it is outermost: the credential
-    // lookups below happen inside it rather than starting traces of their own.
-    let routes = temper_server::build_routes(state.server.clone())
+    // The request's span goes on after these (build_platform_router), so the
+    // credential lookups below happen inside it rather than starting traces of
+    // their own.
+    temper_server::build_routes(state.server.clone())
         .merge(health)
         .merge(identity_api.with_state(state.server.clone()))
         .merge(platform_observe.with_state(state.clone()))
@@ -63,8 +77,7 @@ pub fn build_platform_router(state: PlatformState) -> Router {
         // credential resolution creates a typed request context (ADR-0157).
         .layer(middleware::from_fn(
             temper_server::authz::strip_inbound_identity_headers,
-        ));
-    temper_server::with_request_span(routes)
+        ))
 }
 
 /// Unauthenticated deploy-identity probe: the commit the running binary was built

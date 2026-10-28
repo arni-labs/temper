@@ -7,6 +7,7 @@ use crate::entity_actor::recover_entity_state_from_store;
 
 use super::ServerState;
 
+mod boot_repair;
 mod key_index;
 mod replay_parity;
 mod vector_index;
@@ -234,7 +235,7 @@ pub(super) async fn populate_field_index_from_snapshots(state: &ServerState, ten
                 "field index backfill: persistence replay produced no state"
             );
             errors += 1;
-        } else if replayed.status == "Deleted" {
+        } else if replayed.is_tombstoned() {
             if let Err(e) = query_plane
                 .remove_projection(tenant.as_str(), entity_type, entity_id)
                 .await

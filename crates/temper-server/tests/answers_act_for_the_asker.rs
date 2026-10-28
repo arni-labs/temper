@@ -155,8 +155,14 @@ fn ann() -> AgentContext {
 /// it was left once nothing has moved it for a while.
 async fn settles_after_ann_asks(state: &ServerState, id: &str) -> String {
     let tenant = TenantId::default();
+    let asker = AgentContext {
+        idempotency_key: Some(temper_server::idempotency::IdempotencyKey::Request(
+            id.into(),
+        )),
+        ..ann()
+    };
     let asked = state
-        .dispatch_tenant_action(&tenant, "Errand", id, "Ask", serde_json::json!({}), &ann())
+        .dispatch_tenant_action(&tenant, "Errand", id, "Ask", serde_json::json!({}), &asker)
         .await
         .expect("Ask dispatches");
     assert!(asked.success, "ann may ask: {:?}", asked.error);

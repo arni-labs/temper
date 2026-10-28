@@ -232,7 +232,6 @@ impl ServerState {
                 .or_default()
                 .insert(file_id.to_string());
         }
-        crate::runtime_metrics::record_server_state_metrics(self);
 
         let response = EntityResponse {
             success: true,
@@ -244,6 +243,8 @@ impl ServerState {
             spawn_requests: vec![],
             spec_governed: true,
             refused: false,
+            answered_action: None,
+            store_unavailable: false,
         };
         self.broadcast_synthetic_file_stream_update(tenant, file_id, &response, agent_ctx);
         Ok(response)
