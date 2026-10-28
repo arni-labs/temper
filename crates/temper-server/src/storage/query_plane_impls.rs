@@ -34,6 +34,19 @@ pub(super) fn storage_order_by(order_by: &[QueryFieldIndexOrder]) -> Vec<(String
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for PostgresEventStore {
+    async fn lagging_projections(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        self.lagging_query_projections(tenant).await.map(Some)
+    }
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        self.query_projection_checkpoints(tenant).await
+    }
     async fn upsert_projection(
         &self,
         tenant: &str,
@@ -211,6 +224,19 @@ impl QueryPlaneStore for PostgresEventStore {
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for TursoEventStore {
+    async fn lagging_projections(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        self.lagging_query_projections(tenant).await.map(Some)
+    }
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        self.query_projection_checkpoints(tenant).await
+    }
     async fn upsert_projection(
         &self,
         tenant: &str,

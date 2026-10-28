@@ -154,6 +154,16 @@ pub trait DynEventStore: Send + Sync {
         persistence_id: &'a str,
     ) -> EventStoreFuture<'a, Result<Option<(u64, Vec<u8>)>, PersistenceError>>;
 
+    fn latest_sequence_nr<'a>(
+        &'a self,
+        persistence_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
+
+    fn journal_heads<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<'a, Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError>>;
+
     fn list_entity_ids<'a>(
         &'a self,
         tenant: &'a str,
@@ -436,6 +446,21 @@ where
         persistence_id: &'a str,
     ) -> EventStoreFuture<'a, Result<Option<(u64, Vec<u8>)>, PersistenceError>> {
         Box::pin(EventStore::load_snapshot(self, persistence_id))
+    }
+
+    fn latest_sequence_nr<'a>(
+        &'a self,
+        persistence_id: &'a str,
+    ) -> EventStoreFuture<'a, Result<u64, PersistenceError>> {
+        Box::pin(EventStore::latest_sequence_nr(self, persistence_id))
+    }
+
+    fn journal_heads<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> EventStoreFuture<'a, Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError>>
+    {
+        Box::pin(EventStore::journal_heads(self, tenant))
     }
 
     fn list_entity_ids<'a>(

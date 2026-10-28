@@ -235,7 +235,8 @@ impl ServerState {
         loop {
             let snapshot = self
                 .load_authz_resource_snapshot(tenant, &carry.entity_type, &carry.entity_id)
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
             let Some(agent_ctx) = then_maker(
                 &carry.action,
                 carry.acts_for.as_deref(),

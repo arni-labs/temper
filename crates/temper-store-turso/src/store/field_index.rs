@@ -7,7 +7,9 @@
 
 use crate::driver::{Value, params, params_from_iter};
 use std::collections::{BTreeMap, BTreeSet};
-use temper_runtime::persistence::{PersistenceError, storage_error};
+use temper_runtime::persistence::{
+    PersistenceError, catalog_state_for_storage, catalog_state_from_storage, storage_error,
+};
 use temper_runtime::scheduler::sim_now;
 use tracing::instrument;
 
@@ -212,10 +214,11 @@ impl TursoEventStore {
         for projection in &projections {
             let fields_json = serde_json::to_string(&projection.fields)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
-            let state_json = serde_json::to_string(&projection.state)
+            let stored_state = catalog_state_for_storage(&projection.fields, &projection.state);
+            let state_json = serde_json::to_string(&stored_state)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
             let new_projection_hash =
-                projection_hash(&projection.status, &fields_json, &projection.state);
+                projection_hash(&projection.status, &fields_json, &stored_state);
             let sequence_nr = i64::try_from(projection.sequence_nr).unwrap_or(i64::MAX);
             let existing_row =
                 existing.get(&(projection.entity_type.clone(), projection.entity_id.clone()));
@@ -645,7 +648,8 @@ impl TursoEventStore {
     ///
     /// Returns only rows that exist in the catalog; missing IDs are silently
     /// omitted. Mirrors the Postgres impl so the OData read path can stay
-    /// backend-agnostic.
+    /// backend-agnostic. Each row's `state` comes back whole, its fields put
+    /// back from the `fields` column ([`catalog_state_from_storage`]).
     #[instrument(skip_all, fields(
         otel.name = "turso.load_entity_catalog_rows",
         tenant, entity_type,
@@ -693,7 +697,8 @@ impl TursoEventStore {
             let mut state = state_text
                 .map(|state_text| serde_json::from_str(&state_text))
                 .transpose()
-                .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
+                .map_err(|error| PersistenceError::Serialization(error.to_string()))?
+                .map(|stored| catalog_state_from_storage(&fields, stored));
             // A newer unchanged projection stored only its counters; serve
             // the row as that projection would have written it.
             if let Some(counters) = counters {

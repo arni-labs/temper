@@ -159,8 +159,12 @@ pub(super) async fn handle_stream_put(
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error)
-                    .into_response();
+                return odata_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ReadError",
+                    &error.to_string(),
+                )
+                .into_response();
             }
         };
         if let Err(response) = authorize_mutation(

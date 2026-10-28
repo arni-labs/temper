@@ -197,6 +197,8 @@ struct SimEventStoreInner {
     commits: BTreeMap<String, u64>,
     /// Whether appends are written. See `stop_writes_after_next_append`.
     writes: write_stops::Writes,
+    /// The append set to hang. See `hang_next_append`.
+    hang: write_hangs::Hang,
     /// Appends refused while the store took no writes, by the journal each
     /// would have written. See `refused_appends`.
     refused_appends: BTreeMap<String, u64>,
@@ -245,6 +247,7 @@ impl SimEventStore {
                 state_timers: BTreeMap::new(),
                 commits: BTreeMap::new(),
                 writes: write_stops::Writes::default(),
+                hang: write_hangs::Hang::default(),
                 refused_appends: BTreeMap::new(),
             })),
         }
@@ -573,6 +576,7 @@ impl EventStore for SimEventStore {
             fired_scheduled_action,
             ..
         } = rows;
+        self.hang_if_set([persistence_id]).await;
         let append_delay = {
             let mut inner = self
                 .inner
@@ -1092,6 +1096,8 @@ impl EventStore for SimEventStore {
         if appends.is_empty() {
             return Ok(Vec::new());
         }
+        self.hang_if_set(appends.iter().map(|append| append.persistence_id.as_str()))
+            .await;
 
         let mut inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
 
@@ -1359,6 +1365,62 @@ impl EventStore for SimEventStore {
         Ok(inner.snapshots.get(persistence_id).cloned())
     }
 
+    async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let journal = inner
+            .journals
+            .get(persistence_id)
+            .and_then(|j| j.last())
+            .map_or(0, |e| e.sequence_nr);
+        let snapshot = inner
+            .snapshots
+            .get(persistence_id)
+            .map_or(0, |(seq, _)| *seq);
+        Ok(journal.max(snapshot))
+    }
+
+    async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        let inner = self.inner.lock().expect("SimEventStore lock poisoned"); // ci-ok: infallible lock
+        let mut heads = BTreeMap::new();
+        for (pid, journal) in &inner.journals {
+            if let Ok((t, ty, id)) = parse_persistence_id_parts(pid)
+                && t == tenant
+            {
+                heads.insert(
+                    (ty.to_string(), id.to_string()),
+                    (
+                        journal.last().map_or(0, |e| e.sequence_nr),
+                        journal.iter().any(|e| e.is_tombstone()),
+                    ),
+                );
+            }
+        }
+        for (pid, (seq, _)) in &inner.snapshots {
+            if let Ok((t, ty, id)) = parse_persistence_id_parts(pid)
+                && t == tenant
+            {
+                let head = heads
+                    .entry((ty.to_string(), id.to_string()))
+                    .or_insert((0, false));
+                head.0 = head.0.max(*seq);
+            }
+        }
+        Ok(heads
+            .into_iter()
+            .map(|((entity_type, entity_id), (sequence_nr, deleted))| {
+                temper_runtime::persistence::JournalHead {
+                    entity_type,
+                    entity_id,
+                    sequence_nr,
+                    deleted,
+                }
+            })
+            .collect())
+    }
+
     async fn list_entity_ids(
         &self,
         tenant: &str,
@@ -1410,4 +1472,5 @@ mod tests;
 mod entity_rows;
 pub use entity_rows::SimProjection;
 
+mod write_hangs;
 mod write_stops;

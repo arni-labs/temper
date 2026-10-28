@@ -159,6 +159,12 @@ pub struct AutomatonMeta {
     /// them in `from`.
     #[serde(default)]
     pub terminal: Vec<String>,
+    /// A record of this type whose id is a user's `sub` describes that user:
+    /// Cedar sees its status on the principal, as `principal.<Type>` when the
+    /// user calls in person and `principal.actingFor<Type>` when an agent
+    /// calls for them, read from the record's actor on every request.
+    #[serde(default)]
+    pub principal_record: bool,
 }
 
 /// A safety invariant, proven by the verification cascade.
@@ -301,6 +307,10 @@ pub struct StateTimeout {
     /// Typically includes an `error_message` for observability.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub args: BTreeMap<String, Arg>,
+    /// Words for people reading the app: what the timer does ("check CI
+    /// again"). Display only: the kernel never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub says: Option<String>,
 }
 
 /// Admission control declaration (ADR-0051).

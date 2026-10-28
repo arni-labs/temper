@@ -171,6 +171,16 @@ pub(crate) struct AuthzResourceSnapshot {
     pub(crate) resource_attrs: BTreeMap<String, serde_json::Value>,
 }
 
+/// A record the store failed to read: the store's failure when it could not
+/// read, so the reader may try again; a record it read but could not decode
+/// is not, as trying again reads the same bytes.
+fn record_unread(error: PersistenceError) -> super::DispatchError {
+    match error {
+        PersistenceError::Storage(_) => super::DispatchError::StoreUnavailable(error.to_string()),
+        error => super::DispatchError::Internal(error.to_string()),
+    }
+}
+
 impl ServerState {
     fn touch_actor_access(&self, actor_key: &str) {
         if let Ok(mut last_accessed) = self.last_accessed.write() {
@@ -288,29 +298,32 @@ impl ServerState {
     }
 
     /// Load the current entity state and derive the Cedar resource view used
-    /// for action authorization.
+    /// for action authorization. A read the store fails is the store's
+    /// failure ([`super::DispatchError::StoreUnavailable`]) and an actor that
+    /// does not answer fails as a dispatch to it does, so a write owed to the
+    /// record can tell a read to try again from a final answer.
     pub(crate) async fn load_authz_resource_snapshot(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
-    ) -> Result<AuthzResourceSnapshot, String> {
+    ) -> Result<AuthzResourceSnapshot, super::DispatchError> {
         let mut exists = self.entity_exists(tenant, entity_type, entity_id);
         if !exists && let Some((store, _)) = self.event_journal() {
             let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
             exists = store
                 .load_snapshot(&persistence_id)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(record_unread)?
                 .is_some()
                 || !store
                     .read_events(&persistence_id, 0)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(record_unread)?
                     .is_empty();
         }
         let current_state = if exists {
-            self.get_tenant_entity_state(tenant, entity_type, entity_id)
+            self.ask_tenant_entity_state(tenant, entity_type, entity_id)
                 .await?
         } else {
             let table = {
@@ -560,7 +573,7 @@ impl ServerState {
                             .or_default()
                             .insert(entity_id.clone());
                     }
-                } // write lock dropped before metrics call
+                }
                 // A full-store scan is authoritative for every type it observed.
                 self.mark_types_hydrated(
                     tenant,
@@ -571,7 +584,6 @@ impl ServerState {
                     count = entities.len(),
                     "populated entity index from event store"
                 );
-                runtime_metrics::record_server_state_metrics(self);
             }
             Err(e) => {
                 tracing::error!(
@@ -627,7 +639,6 @@ impl ServerState {
                     count,
                     "populated typed entity index from event store"
                 );
-                runtime_metrics::record_server_state_metrics(self);
                 count
             }
             Err(e) => {
@@ -917,7 +928,6 @@ impl ServerState {
                         discovered = entities.len(),
                         "hydrated entities from event store"
                     );
-                    runtime_metrics::record_server_state_metrics(self);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1083,7 +1093,6 @@ impl ServerState {
                 .insert(entity_id.to_string());
         }
         self.touch_actor_access(&key);
-        runtime_metrics::record_server_state_metrics(self);
 
         Ok(actor_ref)
     }
@@ -1111,7 +1120,6 @@ impl ServerState {
                 ids.remove(entity_id);
             }
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// Forget an entity whose first write its store did not take: it has no
@@ -1135,7 +1143,6 @@ impl ServerState {
                 ids.remove(entity_id);
             }
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// Stop an actor while keeping its entity discoverable for lazy replay.
@@ -1152,7 +1159,6 @@ impl ServerState {
         if let Ok(mut last_accessed) = self.last_accessed.write() {
             last_accessed.remove(&actor_key);
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// Stop and evict an entity actor plus its in-memory indexes.
@@ -1174,7 +1180,6 @@ impl ServerState {
                 ids.remove(entity_id);
             }
         }
-        runtime_metrics::record_server_state_metrics(self);
     }
 
     /// List all entity IDs for a (tenant, entity_type) pair.
@@ -1313,26 +1318,55 @@ impl ServerState {
     }
 
     /// Get the current state of an entity actor for a specific tenant.
-    #[instrument(skip_all, fields(otel.name = "entity.get_tenant_entity_state", tenant = %tenant, entity_type, entity_id))]
     pub async fn get_tenant_entity_state(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
     ) -> Result<EntityResponse, String> {
+        self.ask_tenant_entity_state(tenant, entity_type, entity_id)
+            .await
+            .map_err(|error| match error {
+                super::DispatchError::Transient { source, .. }
+                | super::DispatchError::Permanent { source } => {
+                    format!("Actor query failed: {source}")
+                }
+                error => error.to_string(),
+            })
+    }
+
+    /// [`Self::get_tenant_entity_state`], failing as a dispatch to the
+    /// record's actor fails, so a caller can tell an actor that did not
+    /// answer from one that refused. Its span keeps the name
+    /// `get_tenant_entity_state`, which traces of a request's credential
+    /// lookup are read by.
+    #[instrument(name = "get_tenant_entity_state", skip_all, fields(otel.name = "entity.get_tenant_entity_state", tenant = %tenant, entity_type, entity_id))]
+    pub(crate) async fn ask_tenant_entity_state(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<EntityResponse, super::DispatchError> {
         let actor_ref = self
             .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
             .ok_or_else(|| {
-                format!("No transition table for tenant '{tenant}', entity type '{entity_type}'")
+                super::DispatchError::Internal(format!(
+                    "No transition table for tenant '{tenant}', entity type '{entity_type}'"
+                ))
             })?;
 
         // ADR-0048: retry transient ask failures (AskTimeout, MailboxFull)
         // so a single slow actor reply does not surface as HTTP 500.
         let policy = self.dispatch_retry_policy();
-        retry::ask_with_backoff::<_, EntityResponse, _>(&actor_ref, || EntityMsg::GetState, &policy)
-            .await
+        let outcome = retry::ask_with_backoff::<_, EntityResponse, _>(
+            &actor_ref,
+            || EntityMsg::GetState,
+            &policy,
+        )
+        .await;
+        outcome
             .result
-            .map_err(|e| format!("Actor query failed: {e}"))
+            .map_err(|error| super::DispatchError::from_actor_error(error, outcome.attempts))
     }
 
     /// Refuse a new entity whose first event, `Created` with its initial fields,
@@ -1808,7 +1842,6 @@ impl ServerState {
                 .or_default()
                 .insert(entity_id.to_string());
         }
-        runtime_metrics::record_server_state_metrics(self);
 
         let seq = self.next_entity_event_sequence(tenant.as_str(), entity_type, entity_id);
         let change = EntityStateChange {
@@ -2235,7 +2268,7 @@ impl ServerState {
         )
         .await;
         match outcome.result {
-            Ok(response) if response.state.status == "Deleted" => {
+            Ok(response) if response.state.is_tombstoned() => {
                 let _ = actor_ref.stop();
                 self.remove_entity(tenant, entity_type, entity_id);
                 Ok(false)
@@ -2440,7 +2473,6 @@ impl ServerState {
 
         debug_assert!(passivated <= PASSIVATE_IDLE_ACTORS_PER_TICK);
         if passivated > 0 {
-            runtime_metrics::record_server_state_metrics(self);
             tracing::info!(
                 count = passivated,
                 left,

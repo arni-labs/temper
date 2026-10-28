@@ -134,6 +134,38 @@ enum RetryGaveUp {
     NotTaken(PersistenceError),
 }
 
+/// Why an action's field-overflow blobs, which its event refers to, were not
+/// stored, so the event was not written either.
+#[derive(Debug, thiserror::Error)]
+enum BlobsNotStored {
+    /// No object blob store is configured, so they cannot be stored at all.
+    #[error("field-overflow blobs require a configured object blob store")]
+    NoBlobStore,
+    /// The blob store did not take them: the store's failure, answered as an
+    /// event the store did not take is, so the caller may try again.
+    #[error("{0}")]
+    NotTaken(PersistenceError),
+}
+
+impl BlobsNotStored {
+    /// The answer to the action whose blobs these are, its record in `state`.
+    fn reply(self, state: EntityState) -> EntityResponse {
+        match self {
+            Self::NoBlobStore => EntityResponse::write_failed(state, self.to_string()),
+            Self::NotTaken(error) => persistence_failure_reply(state, &error),
+        }
+    }
+}
+
+impl From<BlobsNotStored> for RetryGaveUp {
+    fn from(not_stored: BlobsNotStored) -> Self {
+        match not_stored {
+            BlobsNotStored::NoBlobStore => Self::WriteFailed(not_stored.to_string()),
+            BlobsNotStored::NotTaken(error) => Self::NotTaken(error),
+        }
+    }
+}
+
 /// The refusal an action gets when its record changed after it was decided.
 const ACTION_RECORD_CHANGED: &str =
     "action authorization became stale; retry against current state";
@@ -475,14 +507,21 @@ impl EntityActor {
         self
     }
 
+    /// Store the field-overflow blobs an event refers to, before the event.
     async fn persist_overflow_blobs(
         blob_store: Option<&crate::blob_store::BlobStore>,
         blobs: &[crate::blobs::OverflowBlobWrite],
-    ) -> Result<(), String> {
+    ) -> Result<(), BlobsNotStored> {
         let Some(blob_store) = blob_store else {
-            return Err("field-overflow blobs require a configured object blob store".to_string());
+            return Err(BlobsNotStored::NoBlobStore);
         };
-        crate::blobs::put_overflow_blobs(blob_store, blobs).await
+        crate::blobs::put_overflow_blobs(blob_store, blobs)
+            .await
+            .map_err(|error| {
+                BlobsNotStored::NotTaken(PersistenceError::Storage(format!(
+                    "field-overflow blob persistence failed: {error}"
+                )))
+            })
     }
 
     /// Persistence ID for this entity: "tenant:EntityType:EntityId".
@@ -1684,10 +1723,7 @@ impl EntityActor {
                         .await
                     {
                         *state = state_before;
-                        ctx.reply(EntityResponse::write_failed(
-                            state.clone(),
-                            format!("field-overflow blob persistence failed: {e}"),
-                        ));
+                        ctx.reply(e.reply(state.clone()));
                         return Ok(());
                     }
 
@@ -1924,9 +1960,7 @@ impl EntityActor {
                                     {
                                         retry_final = Some((
                                             crate::runtime_metrics::ConcurrencyRetryOutcome::Exhausted,
-                                            Some(RetryGaveUp::WriteFailed(format!(
-                                                "field-overflow blob persistence failed during retry: {e}"
-                                            ))),
+                                            Some(e.into()),
                                         ));
                                         break;
                                     }
@@ -2405,6 +2439,10 @@ pub(super) mod contract_state_tests;
 #[cfg(all(test, feature = "sim"))]
 #[path = "hydration_test.rs"]
 mod hydration_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "blob_refusal_test.rs"]
+mod blob_refusal_tests;
 
 #[cfg(all(test, feature = "sim"))]
 #[path = "record_changed_test.rs"]
