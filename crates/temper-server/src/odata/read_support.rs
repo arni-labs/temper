@@ -336,7 +336,7 @@ pub(super) async fn materialize_entity_set_entities(
                     .await
                 {
                     Ok(response) => {
-                        if response.state.status != "Deleted"
+                        if !response.state.is_tombstoned()
                             && let Some(query_plane) = state.query_plane_store()
                         {
                             let fields = state.query_projection_fields(
