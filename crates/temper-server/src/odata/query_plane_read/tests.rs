@@ -23,6 +23,7 @@ mod keyed_existence;
 mod paging;
 mod point_read_freshness;
 mod proof;
+mod spec_deleted;
 
 const CSDL_XML: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
 const ORDER_IOA: &str = include_str!("../../../../../test-fixtures/specs/order.ioa.toml");
