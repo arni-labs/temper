@@ -21,7 +21,8 @@ use temper_runtime::scheduler::{DeterministicIdGen, DeterministicRng, install_si
 use temper_runtime::tenant::TenantId;
 use temper_store_sim::SimEventStore;
 
-use super::world::{ProcessClock, SimTimerRows};
+use super::process_clock::ProcessClock;
+use super::world::SimTimerRows;
 use super::{
     JOB_V1, Job, Process, Run, World, act, advance, check_seeds, job_untimed, job_v2, settle,
 };
@@ -74,7 +75,7 @@ fn run_seed(seed: u64) -> Result<(), String> {
             state
                 .get_or_create_tenant_entity(&job.tenant, "Job", &job.id, json!({}))
                 .await
-                .map_err(|error| run.fail("records are created", error))?;
+                .map_err(|error| run.fail("records are created", error.to_string()))?;
             if !act(state, job, "Start").await {
                 return Err(run.fail("records start", format!("{}/{}", job.tenant, job.id)));
             }

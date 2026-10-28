@@ -5,19 +5,22 @@
 //! scheduled actions still waiting. After the commit, and after the
 //! transition's integrations, this process arms each one
 //! ([`ServerState::arm_scheduled_actions`]) on every path where the event was
-//! written; at boot
-//! [`ServerState::rearm_scheduled_actions`] arms every row again, through the
-//! boot gate, for the rest of its wait or at once if it fell due while the
-//! server was down. Replay never arms one: the rows are the source of truth.
-//! A process arms each row at most once, however many replies hand it back.
+//! written, and at once when the transition's projection write fails (then
+//! only there); at boot [`ServerState::rearm_scheduled_actions`] arms every
+//! row again, through the boot gate, for the rest of its wait or at once if it
+//! fell due while the server was down. Replay never arms one: the rows are the
+//! source of truth. While a row's timer is live, arming it again does nothing;
+//! once it has fired, a second arm fires it again, so each transition arms its
+//! rows once.
 //!
 //! A fire runs as whoever armed it. The event it writes removes its row in the
 //! same commit, so a row is removed only once its action has committed, and a
 //! restart cannot fire it twice. A fire whose write failed or may have landed
 //! keeps its row and is retried on it, with the same idempotency key from the
-//! arm id: a write that did land is a duplicate and does not run again. A
-//! refused fire is final: it is logged here, its dispatch records it in the
-//! record's trajectory like any refused action, and then its row is removed.
+//! arm id and the waits of an owed write (`owed_writes`): a write that did
+//! land is a duplicate and does not run again. A refused fire is final: it is
+//! logged here, its dispatch records it in the record's trajectory like any
+//! refused action, and then its row is removed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,20 +34,12 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use super::effects::PostDispatchContext;
+use super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use super::state_timer_follow::BootTimers;
 use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
-
-/// The wait before a fire that did not commit is tried again; it doubles
-/// with each try, up to [`LAST_RETRY_WAIT`].
-const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
-
-/// The longest wait between tries: a store that is down for long is tried
-/// about once an hour, not hammered, and its row keeps the fire across
-/// restarts.
-const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 /// A scheduled action armed in this process.
 struct ScheduledTimer {
@@ -315,8 +310,11 @@ impl ServerState {
     async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
         let key = format!("schedule:{}", timer.arm_id);
         let mut agent = timer.agent_ctx.clone();
-        agent.idempotency_key = Some(key.clone());
+        // The same action every attempt, so a retry of a fire that landed is
+        // answered as it.
+        agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(key.clone()));
         agent.fires_scheduled_action = Some(timer.row());
+        super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
         loop {

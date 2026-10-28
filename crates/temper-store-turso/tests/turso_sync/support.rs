@@ -20,14 +20,7 @@ pub struct SyncServer {
 
 impl SyncServer {
     pub fn start() -> Option<Self> {
-        let Some(bin) = std::env::var_os("TEMPER_TEST_TURSODB") else {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "TEMPER_TEST_TURSODB must name a tursodb binary in CI"
-            );
-            eprintln!("skipped: TEMPER_TEST_TURSODB is not set");
-            return None;
-        };
+        let bin = temper_test_resource::env_var("TEMPER_TEST_TURSODB")?;
         // The store's and the sync engine's logs, and the server's below, show
         // in the output of a test that fails or times out.
         let _ = tracing_subscriber::fmt()
@@ -160,6 +153,73 @@ pub async fn push(store: &TursoEventStore) {
         .push_committed()
         .await
         .expect("push");
+}
+
+/// Confirmed change log rows for the long-log tests: more than half the
+/// Factory's 532,000 changes.
+pub const BIG_LOG: i64 = 300_000;
+
+/// Open a store at `path` whose change log holds `rows` changes the remote
+/// has confirmed, below one pushed write.
+///
+/// A push carries only changes numbered above the remote's record of this
+/// file's last push, so every row at or below it is the confirmed part of
+/// the log. Pushing 300,000 changes for real is one request of one
+/// statement per change, far past a push's 10 s limit, so the confirmed
+/// part is written into the log directly, numbered below the first real
+/// change. Most rows hold a 1 KB image and every hundredth holds 30 KB,
+/// the size of the Factory's catalog images, which spill onto overflow
+/// pages. The images are zeros: turso stores them uncompressed, so they
+/// take the same pages as real ones, and `randomblob` made building the
+/// log several times slower on a CI runner. The pinned release `tursodb`
+/// builds the fixture with the same engine and SQL, avoiding minutes of
+/// debug-build inserts before the behavior under test starts. The store
+/// is closed first: the CLI must be the only writer of this database.
+/// CI's disk is warm: the cold rate of 34.2 s per 10,000 rows is roll3's
+/// production measurement on a Tensorlake drive, not this test's.
+pub async fn confirmed_log(
+    server: &SyncServer,
+    path: &Path,
+    rows: i64,
+) -> (TursoEventStore, temper_store_turso::SyncCopy) {
+    let store = server.open(path).await;
+    let copy = store.sync_copy().expect("copy").clone();
+    write(&store, "pushed", 0).await;
+    push(&store).await;
+    let before = copy.change_log_rows().await.expect("rows");
+    let newest = copy.last_change().await.expect("newest change");
+    drop(copy);
+    drop(store);
+    let bin = temper_test_resource::env_var("TEMPER_TEST_TURSODB")
+        .expect("the running sync server's binary");
+    let output = tokio::process::Command::new(bin)
+        .arg("--quiet")
+        .arg(path)
+        .arg(format!(
+            "INSERT INTO turso_cdc \
+             (change_id, change_time, change_type, table_name, id, before, after, updates) \
+             SELECT value - {rows}, 0, 1, 'events', value, NULL, \
+             CASE WHEN value % 100 = 0 THEN zeroblob(30000) ELSE zeroblob(1000) END, NULL \
+             FROM generate_series(1, {rows})"
+        ))
+        .output()
+        .await
+        .expect("fill the change log");
+    assert!(
+        output.status.success(),
+        "fill the change log: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = server.open(path).await;
+    let copy = store.sync_copy().expect("copy").clone();
+    copy.checkpoint_if_wal_over(0).await.expect("checkpoint");
+    assert_eq!(copy.change_log_rows().await.expect("rows"), before + rows);
+    assert!(
+        copy.last_change().await.expect("newest change") >= newest,
+        "reopening the fixture must not rewind change numbers"
+    );
+    (store, copy)
 }
 
 pub fn copy_files(from: &Path, to: &Path) {

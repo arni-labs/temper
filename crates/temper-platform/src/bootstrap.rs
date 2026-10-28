@@ -463,6 +463,28 @@ pub async fn bootstrap_operator_credential_specs(
     bootstrap_agent_subset_specs(state, tenant, OPERATOR_CREDENTIAL_SPECS)
 }
 
+/// The tenant's stored verification results, from the platform store installs
+/// write to; empty when there is none or it cannot be read.
+pub(crate) async fn load_verification_cache(
+    state: &PlatformState,
+    tenant: &str,
+) -> BTreeMap<String, (String, bool)> {
+    let stack = state.server.storage_stack.as_ref();
+    if let Some(turso) = stack
+        .and_then(|stack| stack.turso.as_ref())
+        .and_then(|provider| provider.platform_store())
+    {
+        turso
+            .load_verification_cache(tenant)
+            .await
+            .unwrap_or_default()
+    } else if let Some(ps) = stack.and_then(|stack| stack.platform.clone()) {
+        ps.load_verification_cache(tenant).await.unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    }
+}
+
 /// Persist built-in spec hashes and verification status to Turso.
 ///
 /// After bootstrap verifies specs (or skips via cache), this writes each

@@ -14,15 +14,18 @@ pub(super) struct TenantInstall {
     /// Keeps the tenant's changed specs out of every walk, this server's
     /// other tenants' included, until its policies and modules are in.
     timers: Option<TimerFollowHold>,
+    tenant: TenantId,
 }
 
 impl TenantInstall {
     /// The install's policies and modules are in: its changed specs may make
-    /// records follow their states now, and when `specs` it starts that walk.
+    /// records follow their states now, and when `specs` it starts that walk
+    /// and the pass that makes the carries its versions hold.
     pub(super) fn installed(&mut self, server: &ServerState, specs: bool) {
         self.timers = None;
         if specs {
             server.spawn_follow_spec_changes();
+            server.spawn_carry_stranded(vec![self.tenant.clone()]);
         }
     }
 }
@@ -42,9 +45,11 @@ pub(super) async fn tenant(server: &ServerState, tenant: &str) -> TenantInstall 
         .or_default()
         .clone();
     let serialized = lock.lock_owned().await;
+    let tenant = TenantId::new(tenant);
     TenantInstall {
         _serialized: serialized,
-        timers: Some(server.hold_timer_follow(&TenantId::new(tenant))),
+        timers: Some(server.hold_timer_follow(&tenant)),
+        tenant,
     }
 }
 

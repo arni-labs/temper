@@ -1,0 +1,127 @@
+//! Creating a record costs the same however many records are already live.
+//!
+//! Every spawn used to record the server's gauges by walking every live actor
+//! (mailbox depth and utilization) and the whole entity index. On 27 Oct 2026
+//! that walk was 87% of a create's handling at 6,000 records, and a create's
+//! p50 rose from 1.58 ms to 2.44 ms between 360 and 6,060 records. The gauges
+//! are now sampled by the runtime metrics loop.
+//!
+//! This creates records one at a time on an in-memory server and compares the
+//! median create time of the first records with that of the last. Medians of
+//! 200 creates keep one slow create on a shared runner from deciding it.
+
+use std::time::{Duration, Instant};
+
+use temper_runtime::ActorSystem;
+use temper_runtime::tenant::TenantId;
+use temper_server::ServerState;
+use temper_server::registry::SpecRegistry;
+use temper_server::request_context::AgentContext;
+use temper_spec::csdl::parse_csdl;
+
+const SERVICE: &str = "create-time-test";
+
+/// Records created in all.
+const RECORDS: usize = 3_000;
+
+/// Creates timed at each end.
+const WINDOW: usize = 200;
+
+/// How much slower the last creates may be than the first. Without the walk
+/// the two medians are within noise of each other; with it, the last creates
+/// walk about 3,000 actors each.
+const GROWTH_ALLOWED: f64 = 3.0;
+
+const CSDL_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="Temper.CreateTime" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Item">
+        <Key><PropertyRef Name="Id"/></Key>
+        <Property Name="Id" Type="Edm.String" Nullable="false"/>
+      </EntityType>
+      <EntityContainer Name="Container">
+        <EntitySet Name="Items" EntityType="Temper.CreateTime.Item"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>"#;
+
+const ITEM_IOA: &str = r#"
+[automaton]
+name = "Item"
+states = ["Open"]
+initial = "Open"
+
+[[state]]
+name = "touches"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Touch"
+kind = "input"
+from = ["Open"]
+effect = ["touches += 1"]
+"#;
+
+fn build_state(tenant: &str) -> ServerState {
+    let mut registry = SpecRegistry::new();
+    registry
+        .try_register_tenant(
+            tenant,
+            parse_csdl(CSDL_XML).expect("CSDL should parse"),
+            CSDL_XML.to_string(),
+            &[("Item", ITEM_IOA)],
+        )
+        .expect("tenant registration");
+    let state = ServerState::from_registry(ActorSystem::new("create-time"), registry);
+    state
+        .authz
+        .reload_tenant_policies(
+            tenant,
+            r#"permit(principal == Agent::"service:create-time-test", action, resource);"#,
+        )
+        .expect("policy should load");
+    state
+}
+
+fn median(mut times: Vec<Duration>) -> Duration {
+    times.sort();
+    times[times.len() / 2]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_time_stays_flat_as_records_grow() {
+    let tenant = TenantId::new("items");
+    let state = build_state("items");
+    let who = AgentContext::for_service(SERVICE);
+
+    let mut times = Vec::with_capacity(RECORDS);
+    for n in 0..RECORDS {
+        let started = Instant::now(); // determinism-ok: the test measures wall time
+        let created = state
+            .dispatch_tenant_action(
+                &tenant,
+                "Item",
+                &format!("item-{n:05}"),
+                "Touch",
+                serde_json::json!({}),
+                &who,
+            )
+            .await
+            .expect("Touch dispatches");
+        times.push(started.elapsed());
+        assert!(created.success, "{:?}", created.error);
+    }
+    assert_eq!(state.active_actor_count(), RECORDS as u64);
+
+    let first = median(times[..WINDOW].to_vec());
+    let last = median(times[RECORDS - WINDOW..].to_vec());
+    assert!(
+        last.as_secs_f64() <= first.as_secs_f64() * GROWTH_ALLOWED,
+        "a create took {last:?} (median) with {} records live, against {first:?} with \
+         none: something each create does grows with the records",
+        RECORDS - WINDOW
+    );
+}

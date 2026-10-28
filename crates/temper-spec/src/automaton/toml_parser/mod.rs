@@ -20,7 +20,7 @@ use toml::{Table, Value};
 pub(super) const MIGRATE_HINT: &str = "convert the spec with `temper migrate-predicates`";
 
 /// The sections a spec may contain.
-const SECTIONS: [&str; 12] = [
+const SECTIONS: [&str; 13] = [
     "automaton",
     "state",
     "action",
@@ -33,6 +33,7 @@ const SECTIONS: [&str; 12] = [
     "key",
     "vector",
     "admission",
+    "carry",
 ];
 
 /// Parse TOML into an Automaton struct.
@@ -98,6 +99,7 @@ fn read(doc: &Table) -> Result<Automaton, AutomatonParseError> {
         })?,
         keys: entries(doc, "key", "name", typed_entry)?,
         vectors: entries(doc, "vector", "name", typed_entry)?,
+        carries: entries(doc, "carry", "from", typed_entry)?,
         admission: doc
             .get("admission")
             .map(|value| typed(value.clone(), "admission"))

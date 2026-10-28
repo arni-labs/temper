@@ -546,7 +546,9 @@ fn enrich_entity_response(
     {
         let table = spec.table();
         for rule in &table.rules {
-            if rule.from_states.iter().any(|s| s == current_status) {
+            if !temper_spec::automaton::is_carry_move(&rule.name)
+                && rule.from_states.iter().any(|s| s == current_status)
+            {
                 // Look up hint from automaton actions
                 let hint = spec
                     .automaton

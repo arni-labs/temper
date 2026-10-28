@@ -3,8 +3,9 @@ use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::{QueryProjectionUpsert as TursoQueryProjectionUpsert, TursoEventStore};
 
 use super::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
-    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    QueryProjectionUpsert,
 };
 
 pub(super) fn catalog_freshness(
@@ -193,6 +194,19 @@ impl QueryPlaneStore for PostgresEventStore {
             .await
             .map(|rows| Some(catalog_freshness(rows)))
     }
+
+    async fn catalog_groups(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        fields: &[String],
+        statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
+        let rows = self
+            .catalog_groups_pg(tenant, entity_type, fields, statuses)
+            .await?;
+        Ok(Some(CatalogGroup::from_rows(rows, fields)))
+    }
 }
 
 #[async_trait::async_trait]
@@ -345,6 +359,18 @@ impl QueryPlaneStore for TursoEventStore {
         TursoEventStore::projection_catalog_freshness(self, tenant, entity_type)
             .await
             .map(|rows| Some(catalog_freshness(rows)))
+    }
+
+    async fn catalog_groups(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        fields: &[String],
+        statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
+        let rows =
+            TursoEventStore::catalog_groups(self, tenant, entity_type, fields, statuses).await?;
+        Ok(Some(CatalogGroup::from_rows(rows, fields)))
     }
 }
 

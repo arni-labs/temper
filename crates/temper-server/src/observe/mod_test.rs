@@ -87,6 +87,7 @@ fn admin_security_context() -> temper_authz::SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "observe-test-admin".to_string(),
+        cause: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn customer_security_context(id: &str) -> temper_authz::SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "observe-test-customer".to_string(),
+        cause: None,
     }
 }
 
@@ -2318,6 +2320,9 @@ async fn test_evolution_insights_empty() {
 
 #[path = "mod_test/load_dir_tests.rs"]
 mod load_dir_tests;
+
+#[path = "mod_test/history_test.rs"]
+mod history_test;
 
 /// A client that reconnects after its entity was passivated cannot be replayed
 /// what it missed; the stream says so first instead of staying silent.
