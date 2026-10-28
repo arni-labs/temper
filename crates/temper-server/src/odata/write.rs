@@ -787,12 +787,20 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
+                .get_or_create_tenant_entity_by(
+                    &tenant,
+                    &entity_type,
+                    &entity_id,
+                    initial_fields,
+                    &agent_ctx,
+                )
                 .await
             {
                 Ok(response) => {
                     // Creation is not a dispatch: a record created into a
-                    // timed first state has its timer armed here.
+                    // timed first state has its timer armed here. Its row
+                    // committed with the `Created` event when the store keeps
+                    // rows with the journal.
                     state
                         .arm_state_timeouts_on_creation(
                             &tenant,
@@ -857,6 +865,16 @@ pub async fn handle_odata_post(
                 Ok(t) => t,
                 Err(resp) => return *resp,
             };
+
+            if temper_spec::automaton::is_carry_move(action.rsplit('.').next().unwrap_or(&action)) {
+                return odata_error(
+                    StatusCode::FORBIDDEN,
+                    "PlatformMove",
+                    "A [[carry]] move is made only by the platform, when it installs a new \
+                     version of the spec",
+                )
+                .into_response();
+            }
 
             if state.is_pg_actor_backed(&tenant, &entity_type) {
                 let Some(actor_sys) = &state.pg_actor_system else {

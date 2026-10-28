@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod action;
+mod carry;
 mod state;
 mod trigger;
 mod webhook;
 
 pub use action::*;
+pub use carry::*;
 pub use state::*;
 pub use trigger::*;
 pub use webhook::*;
@@ -85,6 +87,10 @@ pub struct Automaton {
     /// Empty when the spec declared no `[[vector]]`.
     #[serde(default, rename = "vector")]
     pub vectors: Vec<VectorDecl>,
+    /// Where this version moves stored records it would otherwise leave with
+    /// no way forward (see [`Carry`]).
+    #[serde(default, rename = "carry")]
+    pub carries: Vec<Carry>,
     /// Admission control caps (ADR-0051). When present, the dispatch layer
     /// gates concurrent calls per `(tenant, entity_type, action)` before
     /// reaching the actor.

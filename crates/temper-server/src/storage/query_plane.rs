@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use temper_runtime::persistence::PersistenceError;
+use temper_runtime::persistence::{CatalogGroupRow, PersistenceError};
 
 /// Backend-neutral projection row returned by [`QueryPlaneStore`].
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +69,41 @@ pub struct CatalogRowFreshness {
     /// not look inside that object, so a reference held there is read from
     /// these fields. `None` for every other row.
     pub wrapped_fields: Option<serde_json::Value>,
+}
+
+/// Catalog rows of one entity type that hold the same status and the same
+/// value of each field asked for, from [`QueryPlaneStore::catalog_groups`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogGroup {
+    pub status: String,
+    /// The fields asked for that the rows hold, with their values.
+    pub values: BTreeMap<String, serde_json::Value>,
+    /// Their entity ids, in order.
+    pub ids: Vec<String>,
+}
+
+impl CatalogGroup {
+    /// A group from a store's row, whose values are those of `fields` in
+    /// order.
+    pub fn from_row(row: CatalogGroupRow, fields: &[String]) -> Self {
+        debug_assert_eq!(fields.len(), row.values.len());
+        Self {
+            status: row.status,
+            values: fields
+                .iter()
+                .zip(row.values)
+                .filter_map(|(field, value)| Some((field.clone(), value?)))
+                .collect(),
+            ids: row.ids,
+        }
+    }
+
+    /// Groups from a store's rows.
+    pub fn from_rows(rows: Vec<CatalogGroupRow>, fields: &[String]) -> Vec<Self> {
+        rows.into_iter()
+            .map(|row| Self::from_row(row, fields))
+            .collect()
+    }
 }
 
 /// Backend-neutral durable projection upsert.
@@ -204,6 +239,20 @@ pub trait QueryPlaneStore: Send + Sync {
         _tenant: &str,
         _entity_type: &str,
     ) -> Result<Option<Vec<CatalogRowFreshness>>, PersistenceError> {
+        Ok(None)
+    }
+
+    /// The catalog rows of `entity_type` in one of `statuses` that
+    /// [`Self::projection_catalog_freshness`] reads as current and unwrapped,
+    /// grouped by status and by the value of each of `fields`, with their
+    /// ids, in one read. Returns `None` if the backend cannot group them.
+    async fn catalog_groups(
+        &self,
+        _tenant: &str,
+        _entity_type: &str,
+        _fields: &[String],
+        _statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
         Ok(None)
     }
 }

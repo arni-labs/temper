@@ -171,7 +171,7 @@ fn turso_query_field_order_sql(order_by: &[(String, bool)]) -> String {
     clauses.join(", ")
 }
 
-fn turso_json_path_literal(field_name: &str) -> String {
+pub(super) fn turso_json_path_literal(field_name: &str) -> String {
     let escaped = field_name
         .replace('\\', "\\\\")
         .replace('"', "\\\"")

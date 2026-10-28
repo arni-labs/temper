@@ -12,7 +12,9 @@ impl ServerState {
     ///
     /// It arms again the state timers and scheduled actions the last process
     /// left waiting, from their rows (`rearm_state_timers`), and starts the runtime
-    /// metrics loop. Returns the background walk that makes records with a
+    /// metrics loop. Then it starts in the background the carries that the
+    /// installed versions hold for stored records (`spec_change::carry_pass`),
+    /// which the installs before it leave to it. Returns the background walk that makes records with a
     /// row follow their state and counts those in a timed state with no row;
     /// it ends with the counts per tenant and type, which it also logs as
     /// `state timers after boot`. A second call in the same process starts
@@ -23,6 +25,8 @@ impl ServerState {
             return None;
         }
         self.spawn_runtime_metrics_loop();
-        Some(self.rearm_state_timers().await)
+        let boot = self.rearm_state_timers().await;
+        self.spawn_carry_stranded(self.tenants_with_carries());
+        Some(boot)
     }
 }
