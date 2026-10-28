@@ -17,7 +17,8 @@ pub const MAX_EVENTS_PER_ENTITY: usize = MAX_EVENTS_SINCE_SNAPSHOT;
 /// Default number of recent events retained in memory per entity.
 pub const RECENT_EVENTS_BUDGET_DEFAULT: usize = 50;
 /// Maximum durable idempotency keys retained per entity.
-pub const MAX_DURABLE_IDEMPOTENCY_KEYS_PER_ENTITY: usize = 1_000;
+// MUTANT: the record keeps every key.
+pub const MAX_DURABLE_IDEMPOTENCY_KEYS_PER_ENTITY: usize = usize::MAX;
 
 /// Number of recent events retained in memory per entity.
 ///
