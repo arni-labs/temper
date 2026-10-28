@@ -451,7 +451,7 @@ async fn restrict_delete_sees_a_reference_projected_before_its_field_was_indexed
     let get_payment = Request::get("/tdata/Payments('pay-early')");
     let (status, payment) = send(&state, get_payment.body(Body::empty()).unwrap()).await;
     assert_eq!(
-        (status, payment["OrderId"].as_str()),
+        (status, payment["fields"]["OrderId"].as_str()),
         (StatusCode::OK, Some("ord-early")),
         "pay-early holds the reference: {payment}"
     );
