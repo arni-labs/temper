@@ -98,8 +98,8 @@ jobs:
           RUSTUP_TOOLCHAIN: stable
         run: python3 scripts/ci/affected.py
 
-      # core/boot/consistency always run. platform-random: one smoke cell on the pr lane,
-      # four full-mode seed shards on the full lane.
+      # Every suite always has a cell (each is a required check). platform-random: one smoke
+      # cell on the pr lane, four full-mode seed shards on the full lane.
       - id: dst
         env:
           LANE: ${{ steps.affected.outputs.lane }}
@@ -683,12 +683,14 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.dst_matrix) }}
     # The cells always run so each required check reports; when no change reaches a
     # package, or the tree already passed in its merge group, their steps are skipped.
+    # A pull request runs only core: the merge queue runs every suite on the same change
+    # before it lands, and main takes nothing that has not passed there.
     env:
-      DST_NEEDED: ${{ needs.changes.outputs.test_args != '' }}
+      DST_NEEDED: ${{ needs.changes.outputs.test_args != '' && (matrix.suite == 'core' || github.event_name != 'pull_request') }}
     steps:
       - name: Not affected
         if: env.DST_NEEDED != 'true'
-        run: echo "Nothing new to test; no dst_ tests run."
+        run: echo "No dst_ tests run here. Nothing new to test, or a pull request, whose merge group runs this suite."
 
       - uses: actions/checkout@v4
         if: env.DST_NEEDED == 'true'
