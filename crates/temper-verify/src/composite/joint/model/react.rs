@@ -7,7 +7,7 @@ use temper_spec::automaton::TargetResolver;
 use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
 
 use super::super::env::{Blind, Found, ID, resolve};
-use super::super::senders::RUNTIME;
+use super::super::senders::OUTSIDE;
 use super::super::state::ReactionStep;
 use super::super::{Call, Dispatch, JointState};
 use super::JointModel;
@@ -19,10 +19,9 @@ use crate::model::ParamValue;
 impl JointModel {
     /// What follows `source.action` committing, sent by `by`: its
     /// reactions, then the module calls its triggers start (when the model
-    /// makes the kernel's moves). The calls run in the background and answer
-    /// as the runtime, or, when `inline` (the sender waits for them), may
-    /// instead run inline and answer as `by`. Each outcome says what the
-    /// model knows of it.
+    /// makes the kernel's moves). Each call answers as `by`, the identity of
+    /// the move that called it, whether it runs inline or in the background.
+    /// Each outcome says what the model knows of it.
     pub(super) fn after_commit(
         &self,
         state: JointState,
@@ -30,7 +29,6 @@ impl JointModel {
         action: &str,
         chain: &[ReactionStep],
         by: u32,
-        inline: bool,
     ) -> Vec<(JointState, Certainty)> {
         // Outside actions and detached work start a fresh chain.
         let root = [ReactionStep {
@@ -44,10 +42,12 @@ impl JointModel {
         let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
             return outcomes;
         };
-        let answering = if inline && by != RUNTIME && self.sender_matters.contains(source) {
-            vec![RUNTIME, by]
+        // A record whose moves' senders do not matter tracks every sender
+        // as outside, as `place` arms its timer.
+        let answer_as = if self.sender_matters.contains(source) {
+            by
         } else {
-            vec![RUNTIME]
+            OUTSIDE
         };
         let internal = self.kernel.internal.get(source);
         let asked: Vec<BTreeSet<String>> = specs
@@ -63,30 +63,27 @@ impl JointModel {
             })
             .collect();
         let mut started = Vec::new();
-        for (outcome, known) in outcomes {
-            for &answer_as in &answering {
-                if !self.expansion.take() {
-                    return Vec::new();
-                }
-                let mut outcome = outcome.clone();
-                for (spec, asked) in specs.iter().zip(&asked) {
-                    let strings = &outcome.records[source].strings;
-                    let call = Call {
-                        to: source.to_string(),
-                        module: spec.module.clone(),
-                        on_success: spec.on_success.clone(),
-                        on_failure: spec.on_failure.clone(),
-                        by: answer_as,
-                        asked: asked
-                            .iter()
-                            .filter_map(|field| Some((field.clone(), strings.get(field)?.clone())))
-                            .collect(),
-                    };
-                    let at = outcome.calls.partition_point(|c| c < &call);
-                    outcome.calls.insert(at, call);
-                }
-                started.push((outcome, known));
+        for (mut outcome, known) in outcomes {
+            if !self.expansion.take() {
+                return Vec::new();
             }
+            for (spec, asked) in specs.iter().zip(&asked) {
+                let strings = &outcome.records[source].strings;
+                let call = Call {
+                    to: source.to_string(),
+                    module: spec.module.clone(),
+                    on_success: spec.on_success.clone(),
+                    on_failure: spec.on_failure.clone(),
+                    by: answer_as,
+                    asked: asked
+                        .iter()
+                        .filter_map(|field| Some((field.clone(), strings.get(field)?.clone())))
+                        .collect(),
+                };
+                let at = outcome.calls.partition_point(|c| c < &call);
+                outcome.calls.insert(at, call);
+            }
+            started.push((outcome, known));
         }
         started
     }
@@ -195,7 +192,6 @@ impl JointModel {
                         by,
                         matches!(reaction.resolve, Some(TargetResolver::SameId)),
                     ),
-                    inline: false,
                 };
                 let mut next = state;
                 add(&mut next, dispatch);

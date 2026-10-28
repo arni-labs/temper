@@ -7,7 +7,7 @@
 //! depth and, in a timer's chain, the timer's arm. Cedar sees it as
 //! `context.via` and the rest.
 
-use temper_authz::{MoveCause, ReactionHop, SecurityContext, platform_keys};
+use temper_authz::{Hop, MoveCause, SecurityContext, platform_keys};
 
 use crate::idempotency::IdempotencyKey;
 use crate::request_context::AgentContext;
@@ -23,7 +23,7 @@ fn reaction_cause(
     invoking_ctx: &AgentContext,
 ) -> MoveCause {
     MoveCause::reaction(
-        ReactionHop {
+        Hop {
             rule: rule_name.to_string(),
             action: source_action.to_string(),
             entity_type: source_entity_type.to_string(),
@@ -144,10 +144,11 @@ fn reaction_idempotency_key(
     })
 }
 
-/// The security context a reaction is checked with: its dispatch context's
-/// own, which carries `cause`, or one approximated from the dispatch
-/// context's agent fields when it has none, with `cause` set on it.
-pub(super) fn effective_trigger_security_context(
+/// The security context a reaction or a module's answer is checked with: its
+/// dispatch context's own, which carries `cause`, or one approximated from
+/// the dispatch context's agent fields when it has none, with `cause` set on
+/// it.
+pub(crate) fn effective_trigger_security_context(
     agent_ctx: &AgentContext,
     cause: &MoveCause,
 ) -> SecurityContext {

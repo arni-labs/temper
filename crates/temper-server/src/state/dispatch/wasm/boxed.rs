@@ -87,6 +87,7 @@ pub(in crate::state::dispatch) fn dispatch_wasm_callback_boxed<'a>(
     state: &'a crate::state::ServerState,
     entity_ref: WasmEntityRef<'a>,
     integration: &'a str,
+    calling_action: &'a str,
     callback_action: &'a str,
     callback_params: serde_json::Value,
     agent_context: &'a AgentContext,
@@ -96,6 +97,7 @@ pub(in crate::state::dispatch) fn dispatch_wasm_callback_boxed<'a>(
         .dispatch_wasm_callback(
             entity_ref,
             integration,
+            calling_action,
             callback_action,
             callback_params,
             agent_context,

@@ -1,5 +1,7 @@
 //! The inline steps and detached work an agent context admits.
 
+use temper_authz::{Hop, MoveCause};
+
 use crate::idempotency::IdempotencyKey;
 
 use super::{AgentContext, CallbackBudgetExceeded, InlineChain, MAX_CALLBACK_HOPS};
@@ -41,6 +43,20 @@ impl AgentContext {
             ))
         });
         Ok(next)
+    }
+
+    /// This callback context ([`Self::for_callback`]) as a module's answer
+    /// through the trigger `hop` names: the same identity, whose security
+    /// context carries the answer's cause, one hop past the calling move's.
+    /// The answer is not the calling move, so it fires no timer the calling
+    /// move fired.
+    pub(crate) fn as_answer(mut self, hop: Hop) -> Self {
+        if let Some(security_ctx) = self.security_ctx.as_mut() {
+            security_ctx.cause = Some(MoveCause::answer(hop, security_ctx.cause.as_ref()));
+        }
+        self.fires_scheduled_action = None;
+        self.fires_state_timer = None;
+        self
     }
 
     /// This context inside `action` on an entity: the step of its inline

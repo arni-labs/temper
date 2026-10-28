@@ -265,7 +265,6 @@ to = "Ready"
                 chain: Vec::new(),
                 via: None,
                 by: super::super::super::senders::OUTSIDE,
-                inline: false,
             })
             .collect();
         model.expansion.reset(3, None);
