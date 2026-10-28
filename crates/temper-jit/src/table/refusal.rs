@@ -51,6 +51,12 @@ pub enum Refusal {
         /// operator and a wanted value, with the value the move would leave.
         conditions: Vec<GuardCondition>,
     },
+    /// The request's Idempotency-Key was already used on this entity for a
+    /// different request.
+    IdempotencyKeyReused {
+        /// The action the key's request named.
+        action: String,
+    },
 }
 
 impl Refusal {
@@ -62,6 +68,7 @@ impl Refusal {
             Refusal::ParameterConstraint { .. } => "ParameterConstraint",
             Refusal::MissingParameter { .. } => "MissingParameter",
             Refusal::InvariantViolated { .. } => "InvariantViolated",
+            Refusal::IdempotencyKeyReused { .. } => "IdempotencyKeyReused",
         }
     }
 }

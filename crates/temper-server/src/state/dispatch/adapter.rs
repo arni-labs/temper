@@ -415,6 +415,7 @@ impl crate::state::ServerState {
             return self
                 .dispatch_adapter_callback(
                     ctx.entity_ref,
+                    &integration.name,
                     callback_action,
                     callback_params,
                     ctx.agent_ctx,
@@ -494,7 +495,9 @@ impl crate::state::ServerState {
                     name: "Revoke".to_string(),
                     params: serde_json::json!({}),
                     related: BTreeMap::new(),
-                    idempotency_key: Some(idempotency_key.clone()),
+                    idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                        idempotency_key.clone(),
+                    )),
                     expected_authorization_precondition: None,
                 },
                 &policy,
@@ -558,6 +561,7 @@ impl crate::state::ServerState {
 
         self.dispatch_adapter_callback(
             ctx.entity_ref,
+            &integration.name,
             &callback_action,
             params,
             ctx.agent_ctx,
@@ -570,6 +574,7 @@ impl crate::state::ServerState {
     async fn dispatch_adapter_callback(
         &self,
         entity_ref: WasmEntityRef<'_>,
+        integration: &str,
         callback_action: &str,
         callback_params: serde_json::Value,
         agent_ctx: &AgentContext,
@@ -579,6 +584,7 @@ impl crate::state::ServerState {
             entity_ref.entity_type,
             entity_ref.entity_id,
             callback_action,
+            integration,
         ) {
             Ok(context) => context,
             Err(error) => {
@@ -631,7 +637,7 @@ impl crate::state::ServerState {
             }
             WasmDispatchMode::Background => {
                 let callback_ctx =
-                    AgentContext::for_service_inheriting("platform-dispatch", agent_ctx);
+                    AgentContext::for_service_answering("platform-dispatch", agent_ctx);
                 let response = self
                     .dispatch_tenant_action(
                         entity_ref.tenant,

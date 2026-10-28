@@ -315,7 +315,9 @@ impl ServerState {
     async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
         let key = format!("schedule:{}", timer.arm_id);
         let mut agent = timer.agent_ctx.clone();
-        agent.idempotency_key = Some(key.clone());
+        // The same action every attempt, so a retry of a fire that landed is
+        // answered as it.
+        agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(key.clone()));
         agent.fires_scheduled_action = Some(timer.row());
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;

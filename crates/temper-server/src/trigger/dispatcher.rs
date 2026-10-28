@@ -349,7 +349,7 @@ impl ReactionDispatcher {
                                 tenant,
                                 &rule.then.entity_type,
                                 &target_entity_id,
-                                &rule.then.action,
+                                response.action(&rule.then.action),
                                 &target_status,
                                 &target_fields,
                                 depth + 1,

@@ -2,6 +2,7 @@
 
 use temper_authz::{SecurityContext, platform_keys};
 
+use crate::idempotency::IdempotencyKey;
 use crate::request_context::AgentContext;
 
 /// ADR-0046: resolve the dispatch context for a reaction.
@@ -85,14 +86,16 @@ fn reaction_idempotency_key(
     invoking_ctx: &AgentContext,
     rule_name: &str,
     depth: u32,
-) -> Option<String> {
+) -> Option<IdempotencyKey> {
     use sha2::{Digest, Sha256};
     invoking_ctx.idempotency_key.as_ref().map(|key| {
-        if depth < LEVELS_KEYED_BY_SUFFIX {
-            return format!("{key}:reaction:{rule_name}");
-        }
-        let digest = Sha256::digest(format!("{key}\0{rule_name}").as_bytes());
-        format!("reaction:{rule_name}:{digest:x}")
+        let key = key.as_str();
+        IdempotencyKey::FollowUp(if depth < LEVELS_KEYED_BY_SUFFIX {
+            format!("{key}:reaction:{rule_name}")
+        } else {
+            let digest = Sha256::digest(format!("{key}\0{rule_name}").as_bytes());
+            format!("reaction:{rule_name}:{digest:x}")
+        })
     })
 }
 

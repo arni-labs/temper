@@ -86,6 +86,7 @@ pub(in crate::state::dispatch::wasm) fn handle_wasm_failure_boxed<'a>(
 pub(in crate::state::dispatch) fn dispatch_wasm_callback_boxed<'a>(
     state: &'a crate::state::ServerState,
     entity_ref: WasmEntityRef<'a>,
+    integration: &'a str,
     callback_action: &'a str,
     callback_params: serde_json::Value,
     agent_context: &'a AgentContext,
@@ -94,6 +95,7 @@ pub(in crate::state::dispatch) fn dispatch_wasm_callback_boxed<'a>(
     state
         .dispatch_wasm_callback(
             entity_ref,
+            integration,
             callback_action,
             callback_params,
             agent_context,

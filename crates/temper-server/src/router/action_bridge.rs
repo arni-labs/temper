@@ -53,7 +53,7 @@ pub(super) async fn dispatch_action_bridge_result(
             .or_else(|| action_params.get("client_request_id"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(str::to_string);
+            .map(|key| crate::idempotency::IdempotencyKey::Request(key.to_string()));
     }
 
     tracing::info!(

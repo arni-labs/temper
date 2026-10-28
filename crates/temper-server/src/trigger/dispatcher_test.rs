@@ -354,7 +354,9 @@ async fn reaction_keys_match_earlier_ones_then_stop_growing() {
     let state = chain_state();
     seed_nodes(&state, NODES).await;
     let caller = AgentContext {
-        idempotency_key: Some("caller-key".to_string()),
+        idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+            "caller-key".to_string(),
+        )),
         ..AgentContext::for_service("reaction-chain-test")
     };
     run_as(&state, "Node", "n0", "Pass", &caller).await;
