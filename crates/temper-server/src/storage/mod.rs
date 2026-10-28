@@ -38,6 +38,7 @@ use crate::platform_store::PlatformStore;
 use crate::platform_store::SimPlatformStore;
 use crate::state::trajectory::TrajectoryEntry;
 
+mod commit_writes;
 mod event_size;
 mod metadata_impls;
 mod observe_read;
@@ -50,15 +51,18 @@ mod query_plane_router_impls;
 mod redaction;
 mod state_timers;
 mod trajectory_row;
+mod write_room;
 pub use event_size::EventSizeLimits;
 pub use published_artifacts::{
     PublishedArtifactStore, PublishedArtifactStoreRow, PublishedArtifactStoreUpsert,
 };
 pub use state_timers::{MetadataTimerRows, StateTimerStore};
+pub use write_room::{STORAGE_FLOOR_BYTES, StorageRoom, WriteHealth};
 mod query_plane;
 pub use query_plane::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
-    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    QueryProjectionUpsert,
 };
 pub(crate) use query_plane_read::{
     CatalogRowsLoad, load_catalog_rows_by_id, load_selected_catalog_rows_by_id,
@@ -108,6 +112,8 @@ pub trait DynEventStore: Send + Sync {
         events: &'a [PersistenceEnvelope],
         rows: temper_runtime::persistence::CommitRows<'a>,
     ) -> EventStoreFuture<'a, Result<u64, PersistenceError>>;
+
+    fn commits_entity_rows(&self) -> bool;
 
     fn list_scheduled_actions<'a>(
         &'a self,
@@ -305,6 +311,10 @@ where
             events,
             rows,
         ))
+    }
+
+    fn commits_entity_rows(&self) -> bool {
+        EventStore::commits_entity_rows(self)
     }
 
     fn list_scheduled_actions<'a>(
@@ -526,11 +536,15 @@ where
 /// Cloneable boxed event store handle.
 ///
 /// Every event the server journals is appended through this handle, so it is
-/// where the per-event size limits hold (`with_event_size_limits`).
+/// where the per-event size limits hold (`with_event_size_limits`), where a
+/// disk under the floor refuses appends (`with_storage_room`), and where every
+/// append's outcome is kept for `/healthz` (`write_health`).
 #[derive(Clone)]
 pub struct BoxedEventStore {
     store: Arc<dyn DynEventStore>,
     limits: EventSizeLimits,
+    room: Option<StorageRoom>,
+    health: write_room::HealthCell,
 }
 
 impl BoxedEventStore {
@@ -548,6 +562,8 @@ impl BoxedEventStore {
         Self {
             store,
             limits: EventSizeLimits::default(),
+            room: None,
+            health: write_room::HealthCell::default(),
         }
     }
 
@@ -562,9 +578,12 @@ impl BoxedEventStore {
         events: &[PersistenceEnvelope],
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
-        self.store
+        self.check_room()?;
+        let result = self
+            .store
             .append(persistence_id, expected_sequence, events)
-            .await
+            .await;
+        self.record_append(result)
     }
 
     pub async fn append_batch(
@@ -577,7 +596,9 @@ impl BoxedEventStore {
                 .iter()
                 .map(|event| (append.persistence_id.as_str(), event))
         }))?;
-        self.store.append_batch(appends).await
+        self.check_room()?;
+        let result = self.store.append_batch(appends).await;
+        self.record_append(result)
     }
 
     pub async fn read_events(
@@ -609,9 +630,12 @@ impl BoxedEventStore {
         key_rows: &[temper_runtime::persistence::EntityKeyRow],
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
-        self.store
+        self.check_room()?;
+        let result = self
+            .store
             .append_with_keys(persistence_id, expected_sequence, events, key_rows)
-            .await
+            .await;
+        self.record_append(result)
     }
 
     pub async fn append_with_rows(
@@ -622,9 +646,18 @@ impl BoxedEventStore {
         rows: temper_runtime::persistence::CommitRows<'_>,
     ) -> Result<u64, PersistenceError> {
         self.check_event_sizes(persistence_id, events)?;
-        self.store
+        self.check_room()?;
+        let result = self
+            .store
             .append_with_rows(persistence_id, expected_sequence, events, rows)
-            .await
+            .await;
+        self.record_append(result)
+    }
+
+    /// Whether an append writes the entity's query-plane row and timer row
+    /// in its own transaction (`EventStore::commits_entity_rows`).
+    pub fn commits_entity_rows(&self) -> bool {
+        self.store.commits_entity_rows()
     }
 
     /// Every pending scheduled action of `tenant`, kept with its journal.
@@ -1401,6 +1434,9 @@ pub struct StorageStack {
     pub data_only_create: Option<Arc<dyn DataOnlyCreateStore>>,
     pub trajectory: Option<Arc<dyn TrajectorySink>>,
     pub metadata: Option<Arc<dyn MetadataStoreProvider>>,
+    /// Which of this stack's rows the event store's commit writes
+    /// ([`StorageStack::entity_rows_in_commit`]).
+    commit_writes: commit_writes::CommitWrites,
 }
 
 impl StorageStack {
@@ -1428,6 +1464,7 @@ impl StorageStack {
             data_only_create,
             trajectory,
             metadata,
+            commit_writes: commit_writes::CommitWrites::Nothing,
         }
     }
 
@@ -1442,6 +1479,20 @@ impl StorageStack {
             );
         }
         self.events = self.events.with_event_size_limits(limits);
+        self
+    }
+
+    /// Refuse appends and trajectory rows while the disk holding `room` has
+    /// less than [`STORAGE_FLOOR_BYTES`] available
+    /// (`BoxedEventStore::with_storage_room`, `RoomCheckedTrajectories`).
+    pub fn with_storage_room(mut self, room: StorageRoom) -> Self {
+        tracing::info!(dir = %room.dir().display(), floor_bytes = STORAGE_FLOOR_BYTES,
+            "appends and trajectory rows refused while this disk has less room than the floor");
+        self.trajectory = self.trajectory.map(|inner| {
+            let room = room.clone();
+            Arc::new(write_room::RoomCheckedTrajectories { inner, room }) as Arc<dyn TrajectorySink>
+        });
+        self.events = self.events.with_storage_room(room);
         self
     }
 
@@ -1475,6 +1526,7 @@ impl StorageStack {
             Some(store.clone() as Arc<dyn TrajectorySink>),
             Some(Arc::new(SingleMetadataStoreProvider::new(store))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_tenant_router(router: TenantStoreRouter) -> Self {
@@ -1496,6 +1548,7 @@ impl StorageStack {
                 router.as_ref().clone(),
             ))),
         )
+        .commits_its_query_plane()
     }
 
     pub fn from_redis(store: temper_store_redis::RedisEventStore) -> Self {

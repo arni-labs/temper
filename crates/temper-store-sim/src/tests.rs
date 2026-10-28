@@ -168,7 +168,7 @@ async fn snapshot_save_and_load() {
 }
 
 #[tokio::test]
-async fn snapshot_save_records_history_and_rotates_segments() {
+async fn snapshot_save_rotates_segments() {
     let store = SimEventStore::no_faults(42);
     let pid = "default:Order:segmented";
 
@@ -186,7 +186,6 @@ async fn snapshot_save_records_history_and_rotates_segments() {
         .await
         .unwrap();
 
-    assert_eq!(store.snapshot_history_len(pid), 1);
     let segments = store.dump_segments(pid);
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
@@ -330,4 +329,37 @@ async fn read_events_page_honors_injected_read_failures() {
     store.fail_next_reads(pid, 1);
     assert!(store.read_events_page(pid, None, 3).await.is_err());
     assert_eq!(store.read_events_page(pid, None, 3).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_store_that_stops_after_a_write_refuses_every_write_until_it_takes_writes_again() {
+    let store = SimEventStore::no_faults(42);
+    let (stopper, other) = ("default:Order:ord-1", "default:Order:ord-2");
+    store.stop_writes_after_next_append(stopper);
+    // Writes to other journals land until the stopper's does.
+    store
+        .append(other, 0, &[test_envelope(0, "Created")])
+        .await
+        .unwrap();
+    store
+        .append(stopper, 0, &[test_envelope(0, "Created")])
+        .await
+        .unwrap();
+
+    for pid in [stopper, other] {
+        let refused = store.append(pid, 1, &[test_envelope(0, "Moved")]).await;
+        assert!(matches!(refused, Err(PersistenceError::Storage(_))));
+    }
+    let batch = [PersistenceAppend {
+        persistence_id: other.to_string(),
+        expected_sequence: 1,
+        events: vec![test_envelope(0, "Moved")],
+    }];
+    assert!(store.append_batch(&batch).await.is_err());
+    assert_eq!(store.read_events(stopper, 0).await.unwrap().len(), 1);
+
+    store.take_writes_again();
+    let written = store.append(stopper, 1, &[test_envelope(0, "Moved")]).await;
+    assert_eq!(written.unwrap(), 2);
+    assert_eq!(store.dump_journal(other).len(), 1);
 }

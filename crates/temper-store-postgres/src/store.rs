@@ -102,6 +102,10 @@ impl EventStore for PostgresEventStore {
             reconcile_vectors,
             scheduled_actions,
             fired_scheduled_action,
+            // Postgres keeps its query-plane and timer rows after the commit
+            // (`commits_entity_rows` is false): the server writes them.
+            projection: _,
+            state_timer: _,
         } = rows;
         let (tenant, entity_type, entity_id) =
             parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
@@ -979,21 +983,6 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(|e| PersistenceError::Storage(e.to_string()))?;
 
-        crate::dbm::postgres_query!(&self.schema,
-            "INSERT INTO {schema}snapshot_history (tenant, entity_type, entity_id, sequence_nr, state) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (tenant, entity_type, entity_id, sequence_nr) \
-             DO UPDATE SET state = $5, created_at = now()",
-        )
-        .bind(tenant)
-        .bind(entity_type)
-        .bind(entity_id)
-        .bind(sequence_nr as i64)
-        .bind(snapshot)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| PersistenceError::Storage(e.to_string()))?;
-
         segments::rotate_after_snapshot(
             &self.schema,
             &mut tx,
@@ -1193,6 +1182,10 @@ fn envelope_from_row(
 mod projection_tests;
 
 #[cfg(test)]
+#[path = "field_index_writes_test.rs"]
+mod field_index_writes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::migration::run_migrations;
@@ -1267,12 +1260,8 @@ mod tests {
 
     #[test]
     fn list_entity_ids_returns_distinct_pairs() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1488,12 +1477,8 @@ mod tests {
 
     #[test]
     fn load_query_projection_fields_many_returns_requested_fields() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => {
-                eprintln!("skipping Postgres integration test: DATABASE_URL is not set");
-                return;
-            }
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {
@@ -1563,9 +1548,8 @@ mod tests {
 
     #[test]
     fn published_artifact_upsert_round_trips_and_updates_by_id() {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => return,
+        let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
+            return;
         };
 
         sqlx::test_block_on(async {

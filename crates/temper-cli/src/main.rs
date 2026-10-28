@@ -290,6 +290,7 @@ fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let is_mcp = matches!(&cli.command, Commands::Mcp { .. });
+    let is_serve = matches!(&cli.command, Commands::Serve { .. });
 
     let tokio_thread_stack_bytes = resolve_tokio_thread_stack_bytes(
         std::env::var("TEMPER_TOKIO_THREAD_STACK_BYTES")
@@ -304,9 +305,11 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let result = runtime.block_on(async_main(cli));
-    if is_mcp {
+    if is_mcp || is_serve {
         // A canceled Tokio stdio task may leave an uncancellable OS pipe call.
         // MCP has already drained output or reported failure before returning.
+        // A stopped server has reported the writes it owed and flushed its
+        // telemetry; its background tasks must not hold up the exit.
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }
     result

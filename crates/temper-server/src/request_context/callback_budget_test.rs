@@ -24,18 +24,21 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
         for admitted in 1..=512 {
             let operation = rng.next_bound(4);
             coverage[operation] += 1;
-            if context.callback_depth == temper_runtime::reaction::MAX_REACTION_DEPTH {
-                assert_eq!(
-                    context.for_callback().unwrap_err(),
-                    CallbackBudgetExceeded::InlineDepth,
+            // Inline, the step the context is inside of cannot run again,
+            // however few steps the chain has.
+            if let Some(inside) = context.inline_chain.steps().last() {
+                assert!(
+                    matches!(
+                        context.for_callback("Job", "job", &inside.action, "test"),
+                        Err(CallbackBudgetExceeded::RepeatedStep(_))
+                    ),
                     "seed={seed}, admitted={admitted}"
                 );
-                context = context.for_background_task();
             }
             if operation != 0 {
                 let previous_hops = context.callback_hops;
                 context = context.for_background_task();
-                assert_eq!(context.callback_depth, 0, "seed={seed}");
+                assert!(context.inline_chain.is_empty(), "seed={seed}");
                 assert_eq!(context.callback_hops, previous_hops, "seed={seed}");
                 let service = match operation {
                     1 => "wasm-runtime",
@@ -46,12 +49,18 @@ fn dst_detached_schedules_preserve_both_callback_bounds() {
                 context = service_identity(service).inherit_observability_from(&context);
                 assert_eq!(context.agent_type.as_deref(), Some(service), "seed={seed}");
             }
-            let previous_depth = context.callback_depth;
-            context = context.for_callback().unwrap_or_else(|error| {
-                panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
-            });
+            let previous_steps = context.inline_chain.steps().len();
+            context = context
+                .for_callback("Job", "job", &format!("Step{admitted}"), "test")
+                .unwrap_or_else(|error| {
+                    panic!("seed={seed}, admitted={admitted}, operation={operation}: {error}")
+                });
             assert_eq!(context.callback_hops, admitted, "seed={seed}");
-            assert_eq!(context.callback_depth, previous_depth + 1, "seed={seed}");
+            assert_eq!(
+                context.inline_chain.steps().len(),
+                previous_steps + 1,
+                "seed={seed}"
+            );
             assert_eq!(context.session_id.as_deref(), Some("session"));
             assert_eq!(context.workflow_run_id.as_deref(), Some("workflow"));
             assert_eq!(context.intent.as_deref(), Some("bounded workflow"));
@@ -82,25 +91,42 @@ fn assert_total_hops_exhausted(mut context: AgentContext, seed: u64) {
         context = service_identity(service).inherit_observability_from(&context);
         assert_eq!(context.callback_hops, 512, "seed={seed}");
         assert_eq!(
-            context.for_callback().unwrap_err(),
+            context
+                .for_callback("Job", "job", "Next", "test")
+                .unwrap_err(),
             CallbackBudgetExceeded::TotalHops,
             "seed={seed}, service={service}"
         );
     }
 }
 
+/// Inline callbacks nest as deep as their steps differ (the old bound refused
+/// the ninth), and stop at the first step that repeats, naming the loop.
 #[test]
-fn inline_callbacks_exhaust_without_a_detached_boundary() {
-    let mut context = AgentContext::default();
-    for admitted in 1..=8 {
-        context = context.for_callback().unwrap();
-        assert_eq!(context.callback_depth, admitted);
+fn inline_callbacks_stop_at_their_first_repeated_step() {
+    let mut context = AgentContext::default().entering("Job", "job", "Start");
+    for admitted in 1..=64 {
+        context = context
+            .for_callback("Job", "job", &format!("Step{admitted}"), "test")
+            .unwrap();
         assert_eq!(context.callback_hops, admitted);
     }
     let inherited = AgentContext::for_service_inheriting("wasm-runtime", &context);
+    let Err(CallbackBudgetExceeded::RepeatedStep(repeat)) =
+        inherited.for_callback("Job", "job", "Step60", "test")
+    else {
+        panic!("a repeated step must be refused");
+    };
     assert_eq!(
-        inherited.for_callback().unwrap_err(),
-        CallbackBudgetExceeded::InlineDepth
+        repeat.path(),
+        ["Step60", "Step61", "Step62", "Step63", "Step64", "Step60"]
+            .map(|action| format!("Job(job).{action}"))
+    );
+    // The same action on another entity is a different step.
+    assert!(
+        inherited
+            .for_callback("Job", "other", "Step60", "test")
+            .is_ok()
     );
     assert_eq!(inherited.callback_hops, context.callback_hops);
 }
@@ -117,7 +143,7 @@ fn request_headers_cannot_supply_callback_budgets() {
         headers.insert(name, axum::http::HeaderValue::from_static("511"));
     }
     let context = extract_agent_context(&headers);
-    assert_eq!(context.callback_depth, 0);
+    assert!(context.inline_chain.is_empty());
     assert_eq!(context.callback_hops, 0);
     assert!(context.security_ctx.is_none());
 }
@@ -125,13 +151,16 @@ fn request_headers_cannot_supply_callback_budgets() {
 #[test]
 fn detached_boundary_preserves_authority_and_idempotency() {
     let context = AgentContext {
-        callback_depth: 8,
         callback_hops: 40,
-        idempotency_key: Some("request-key".into()),
+        idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+            "request-key".into(),
+        )),
         ..AgentContext::for_service("invoker")
-    };
+    }
+    .entering("Job", "job", "Start");
     let detached = context.for_background_task();
-    assert_eq!(detached.callback_depth, 0);
+    assert!(!context.inline_chain.is_empty());
+    assert!(detached.inline_chain.is_empty());
     assert_eq!(detached.callback_hops, 40);
     assert_eq!(detached.agent_id, context.agent_id);
     assert_eq!(detached.agent_type, context.agent_type);

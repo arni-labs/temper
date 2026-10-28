@@ -1,34 +1,41 @@
+use std::sync::Arc;
+
+use super::DispatchExtOptions;
+use super::owed_writes::{Attempt, OwedKind, OwedTry, OwedWrite};
+use crate::idempotency::{IdempotencyKey, derived_idempotency_key};
 use crate::request_context::AgentContext;
-use temper_jit::table::{Related, RelatedMap};
+use crate::state::CreateError;
+use temper_jit::table::{Related, RelatedMap, TransitionTable};
 use temper_runtime::tenant::TenantId;
 use tracing::Instrument;
 
 impl crate::state::ServerState {
-    /// Resolve the related entities an action's guards read.
+    /// Resolve the related entities a move of `action` reads: its guards, and
+    /// the type's invariants, which every move is checked against.
     ///
-    /// For each `Type[id_field].status` in the guards of `action`, reads the
-    /// id (or list of ids) from the entity's current fields and resolves each
+    /// For each `Type[id_field].status` they read, reads the
+    /// id (or list of ids) from stored fields or declared defaults and resolves each
     /// related entity's status. An unset reference resolves to no statuses;
     /// an entity that is not found resolves to `None`. Every id is resolved:
     /// the number of lookups is the number of ids the entity's own fields
     /// hold, so a guard over all of a list's entities sees all of them.
-    pub(super) async fn resolve_cross_entity_guards(
+    pub(super) async fn resolve_related_statuses(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
         action: &str,
     ) -> RelatedMap {
-        let mut result = RelatedMap::new();
-        let refs: Vec<(String, String)> = {
+        let table = {
             let registry = self.registry.read().unwrap(); // ci-ok: infallible lock
             let Some(spec) = registry.get_spec(tenant, entity_type) else {
-                return result;
+                return RelatedMap::new();
             };
-            spec.table().guard_related_refs(action)
+            spec.table()
         };
+        let refs = table.related_refs(action);
         if refs.is_empty() {
-            return result;
+            return RelatedMap::new();
         }
 
         // Get current entity fields to resolve target entity IDs
@@ -37,19 +44,29 @@ impl crate::state::ServerState {
             .await
         {
             Ok(resp) => resp.state.fields,
-            Err(_) => return result,
+            Err(_) => return RelatedMap::new(),
         };
+        self.related_statuses_of(tenant, &table, refs, &current_fields)
+            .await
+    }
 
+    /// The statuses of the records `fields` refers to through each of
+    /// `refs`, `(related type, id field)`, under `table`'s declared defaults,
+    /// as [`Self::resolve_related_statuses`] resolves them.
+    pub(in crate::state) async fn related_statuses_of(
+        &self,
+        tenant: &TenantId,
+        table: &TransitionTable,
+        refs: Vec<(String, String)>,
+        fields: &serde_json::Value,
+    ) -> RelatedMap {
+        let mut result = RelatedMap::new();
         for (target_type, id_field) in refs {
-            let ids: Vec<&str> = match current_fields.get(&id_field) {
-                Some(serde_json::Value::Array(items)) => items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .filter(|id| !id.is_empty())
-                    .collect(),
-                Some(serde_json::Value::String(id)) if !id.is_empty() => vec![id.as_str()],
-                _ => Vec::new(),
-            };
+            let ids = crate::entity_actor::related::reference_ids(
+                fields,
+                &table.initial_values,
+                &id_field,
+            );
             let mut statuses = Vec::with_capacity(ids.len());
             for id in ids {
                 statuses.push(self.resolve_entity_status(tenant, &target_type, id).await);
@@ -86,7 +103,16 @@ impl crate::state::ServerState {
             let initial_action = req.initial_action.clone();
             let parent_params = action_params.clone();
             let copied_fields = req.copied_fields.clone();
-            let agent = agent_ctx.clone();
+            // The child's initial action carries a key of its own, from the
+            // move's key and the child, so every try of it carries the same.
+            let mut agent = agent_ctx.clone();
+            agent.idempotency_key = agent_ctx.idempotency_key.as_ref().map(|key| {
+                IdempotencyKey::FollowUp(derived_idempotency_key(
+                    key.as_str(),
+                    "spawn",
+                    &format!("{child_type}:{child_id}"),
+                ))
+            });
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
                 .clone()
@@ -186,6 +212,34 @@ impl crate::state::ServerState {
                     } else {
                         None
                     };
+                    // The child is an entity this chain made, and its initial
+                    // action is the chain's next step. One that would repeat a
+                    // step the chain is already in is a loop (`InlineChain`),
+                    // refused before the child is made: a spawn loop stops at
+                    // its first repeat like a reaction loop.
+                    let mut agent = agent.having_made([(child_type.as_str(), child_id.as_str())]);
+                    if let Some((action, _)) = &initializer {
+                        let step = agent.inline_chain.step(&child_type, &child_id, action);
+                        match agent.inline_chain.then(step) {
+                            Ok(chain) => agent.inline_chain = chain,
+                            Err(repeat) => {
+                                state.record_generated_callback_refusal(
+                                    super::WasmEntityRef {
+                                        tenant: &t,
+                                        entity_type: &parent_t,
+                                        entity_id: &parent_i,
+                                    },
+                                    action,
+                                    &format!(
+                                        "spawned {child_type} not made: its initial action \
+                                         would repeat a step its chain is already in \
+                                         ({repeat}), so the chain is a loop"
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
                     // A strict child's declared initializer accepts its data. The
                     // spawn effect supplies only identity to generic creation.
                     let initial_fields = if strict_child {
@@ -237,90 +291,142 @@ impl crate::state::ServerState {
                         }
                     }
 
-                    match state
-                        .get_or_create_tenant_entity(&t, &child_type, &child_id, initial_fields)
-                        .await
-                    {
-                        Ok(created) => {
-                            tracing::info!(
-                                parent_type = %parent_t,
-                                parent_id = %parent_i,
-                                child_type = %child_type,
-                                child_id = %child_id,
-                                "spawned child entity"
-                            );
-
-                            // A child with no initial action stays in its
-                            // first state: arm that state's timer here.
-                            if initializer.is_none() {
-                                state
-                                    .arm_state_timeouts_on_creation(
-                                        &t,
-                                        &child_type,
-                                        &child_id,
-                                        &created,
-                                        &agent,
-                                    )
-                                    .await;
-                            }
-                            if let Some((action, params)) = initializer {
-                                let result = state
-                                    .dispatch_tenant_action(
-                                        &t,
-                                        &child_type,
-                                        &child_id,
-                                        &action,
-                                        params,
-                                        &agent,
-                                    )
-                                    .await;
-                                let refusal = match result {
-                                    Err(error) => Some(error),
-                                    Ok(response) if !response.success => {
-                                        Some(response.error.unwrap_or_else(|| {
-                                            "child initializer refused".to_string()
-                                        }))
-                                    }
-                                    Ok(_) => None,
-                                };
-                                if let Some(error) = refusal {
-                                    // The child stays in its first state: arm
-                                    // that state's timer, as for no initializer.
-                                    state
-                                        .arm_state_timeouts_on_creation(
-                                            &t,
-                                            &child_type,
-                                            &child_id,
-                                            &created,
-                                            &agent,
-                                        )
-                                        .await;
-                                    state.record_generated_callback_refusal(
-                                        super::WasmEntityRef {
-                                            tenant: &t,
-                                            entity_type: &parent_t,
-                                            entity_id: &parent_i,
-                                        },
-                                        &action,
-                                        &error,
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                child_type = %child_type,
-                                child_id = %child_id,
-                                error = %e,
-                                "failed to spawn child entity"
-                            );
-                        }
+                    let child = ChildSpawn {
+                        tenant: t,
+                        parent_type: parent_t,
+                        parent_id: parent_i,
+                        child_type,
+                        child_id,
+                        initial_fields,
+                        initializer,
+                        agent,
+                    };
+                    if let Attempt::StoreFailed(error) = state.spawn_child(&child).await {
+                        state.keep_child_spawn(child, &error);
                     }
                 }
                 .instrument(span),
             );
         }
     }
+}
+
+/// A child a committed move spawns: created, then sent its initial action.
+struct ChildSpawn {
+    tenant: TenantId,
+    parent_type: String,
+    parent_id: String,
+    child_type: String,
+    child_id: String,
+    initial_fields: serde_json::Value,
+    initializer: Option<(String, serde_json::Value)>,
+    /// The spawning move's identity, under the child's own key.
+    agent: AgentContext,
+}
+
+impl ChildSpawn {
+    fn parent(&self) -> super::WasmEntityRef<'_> {
+        super::WasmEntityRef {
+            tenant: &self.tenant,
+            entity_type: &self.parent_type,
+            entity_id: &self.parent_id,
+        }
+    }
+}
+
+impl crate::state::ServerState {
+    /// Create `child`, then send its initial action. A creation the store did
+    /// not take, or an initial action it did not, is the store's failure; any
+    /// other failure is final, and a child whose initial action failed stays
+    /// in its first state. Creating a child that exists already reads it, so
+    /// a try after a creation that landed goes on to the initial action.
+    async fn spawn_child(&self, child: &ChildSpawn) -> Attempt {
+        let (tenant, child_type, child_id) = (&child.tenant, &child.child_type, &child.child_id);
+        let created = match self
+            .get_or_create_tenant_entity_by(
+                tenant,
+                child_type,
+                child_id,
+                child.initial_fields.clone(),
+                &child.agent,
+            )
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => {
+                tracing::error!(%child_type, %child_id, %error, "failed to spawn child entity");
+                return match error {
+                    CreateError::StoreUnavailable(error) => Attempt::StoreFailed(error),
+                    CreateError::Failed(error) => Attempt::Failed(error),
+                };
+            }
+        };
+        tracing::info!(parent_type = %child.parent_type, parent_id = %child.parent_id,
+            %child_type, %child_id, "spawned child entity");
+        let Some((action, params)) = &child.initializer else {
+            // A child with no initial action stays in its first state: arm
+            // that state's timer here.
+            self.arm_state_timeouts_on_creation(
+                tenant,
+                child_type,
+                child_id,
+                &created,
+                &child.agent,
+            )
+            .await;
+            return Attempt::Landed;
+        };
+        let options = DispatchExtOptions {
+            agent_ctx: &child.agent,
+            await_integration: false,
+            await_reactions: true,
+        };
+        let reply = self
+            .dispatch_tenant_action_ext_typed(
+                tenant,
+                child_type,
+                child_id,
+                action,
+                params.clone(),
+                options,
+            )
+            .await;
+        let attempt = Attempt::of(&reply);
+        if let Attempt::Failed(error) = &attempt {
+            // The child stays in its first state: arm that state's timer, as
+            // for no initializer.
+            self.arm_state_timeouts_on_creation(
+                tenant,
+                child_type,
+                child_id,
+                &created,
+                &child.agent,
+            )
+            .await;
+            self.record_generated_callback_refusal(child.parent(), action, error);
+        }
+        attempt
+    }
+
+    /// Keep a child whose spawn the store failed as an owed write: it is
+    /// spawned again (`owed_writes`) until it lands or fails otherwise.
+    fn keep_child_spawn(&self, child: ChildSpawn, error: &str) {
+        let owed = OwedWrite {
+            tenant: child.tenant.clone(),
+            entity_type: child.child_type.clone(),
+            entity_id: child.child_id.clone(),
+            kind: OwedKind::Child,
+            key: child.agent.idempotency_key.clone(),
+        };
+        let child = Arc::new(child);
+        self.keep_owed_write(owed, error, move |state| {
+            spawn_child_again(state, Arc::clone(&child))
+        });
+    }
+}
+
+fn spawn_child_again(state: crate::state::ServerState, child: Arc<ChildSpawn>) -> OwedTry {
+    Box::pin(async move { state.spawn_child(&child).await })
 }
 
 fn to_snake_case(value: &str) -> String {

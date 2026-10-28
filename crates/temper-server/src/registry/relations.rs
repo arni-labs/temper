@@ -23,6 +23,10 @@ pub(super) fn build_webhook_routes(
 }
 
 /// Build a relation graph from the CSDL and optional cross-invariant overrides.
+///
+/// A relation's delete policy is, in order: the tenant's `relation_override`
+/// for it, the policy its navigation property declares in the CSDL, then the
+/// tenant's `default_delete_policy` (`restrict` when there is none).
 pub(super) fn build_relation_graph(
     csdl: &CsdlDocument,
     cross_invariants: Option<&CrossInvariantSpec>,
@@ -49,6 +53,7 @@ pub(super) fn build_relation_graph(
                     let delete_policy = overrides
                         .get(&(et.name.clone(), nav.name.clone()))
                         .copied()
+                        .or(nav.delete_policy)
                         .unwrap_or(default_policy);
                     let edge = RelationEdge {
                         from_entity: et.name.clone(),
@@ -181,7 +186,7 @@ mod tests {
                 id_field: "last_version_id".to_string(),
             }),
             module: None,
-            on_success: None,
+            on_success: Vec::new(),
             on_failure: None,
             config: std::collections::BTreeMap::new(),
             adapter: None,
@@ -224,7 +229,7 @@ mod tests {
             args: std::collections::BTreeMap::new(),
             resolve_target: None,
             module: Some("stripe".to_string()),
-            on_success: None,
+            on_success: Vec::new(),
             on_failure: None,
             config: std::collections::BTreeMap::new(),
             adapter: None,
@@ -252,7 +257,7 @@ mod tests {
             args: std::collections::BTreeMap::new(),
             resolve_target: None,
             module: None,
-            on_success: None,
+            on_success: Vec::new(),
             on_failure: None,
             config: std::collections::BTreeMap::new(),
             adapter: None,
