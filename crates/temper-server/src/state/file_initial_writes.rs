@@ -232,7 +232,6 @@ impl ServerState {
                 .or_default()
                 .insert(file_id.to_string());
         }
-        crate::runtime_metrics::record_server_state_metrics(self);
 
         let response = EntityResponse {
             success: true,
