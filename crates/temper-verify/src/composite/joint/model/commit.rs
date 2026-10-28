@@ -186,7 +186,7 @@ impl JointModel {
         }
         for param in self.unchecked.nonempty(&dispatch.to, &t.name) {
             match dispatch.params.get(param) {
-                Some(ParamValue::Str(sent)) if sent.is_empty() => return Arrival::Refused,
+                Some(ParamValue::Str(sent)) if sent.trim().is_empty() => return Arrival::Refused,
                 Some(ParamValue::Str(_)) => {}
                 _ => carried = false,
             }
@@ -267,7 +267,7 @@ fn constraints_hold(
             return !param.nonempty && param.equals.is_empty() && param.not_equals.is_empty();
         };
         let tracked = |var: &String| target.strings.get(var);
-        !(param.nonempty && value.is_empty())
+        !(param.nonempty && value.trim().is_empty())
             && param.equals.iter().filter_map(tracked).all(|v| v == value)
             && param
                 .not_equals

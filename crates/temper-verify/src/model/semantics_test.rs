@@ -137,3 +137,61 @@ assert = "a == b || a != b"
     assert_eq!(allowed[0].0["p"], ParamValue::Str("b".into()));
     assert_eq!(allowed[0].1.strings, initial.strings);
 }
+
+#[test]
+fn nonempty_string_candidates_follow_runtime_whitespace_rules() {
+    let source = r#"
+[automaton]
+name = "Nonempty"
+states = ["Open", "Done"]
+initial = "Open"
+
+[[state]]
+name = "a"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Finish"
+kind = "input"
+from = ["Open"]
+to = "Done"
+params = [{ name = "p", type = "string" }]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "p"
+field = "a"
+
+[[action.constraints]]
+kind = "param_nonempty"
+param = "p"
+
+[[invariant]]
+name = "track_a"
+assert = "a == '' || a != ''"
+"#;
+    for (name, writes) in [("p", false), ("a", true)] {
+        let source = source.replace("\"p\"", &format!("\"{name}\""));
+        let model = crate::model::build_model_from_ioa(&source, 2).unwrap();
+        let mut initial = stateright::Model::init_states(&model).remove(0);
+        let t = &model.transitions[0];
+        assert_eq!(t.string_params[0].writes, writes);
+        for (value, allowed) in [
+            ("", false),
+            (" ", false),
+            ("\t\n", false),
+            ("\u{2003}", false),
+            (" b ", true),
+            ("b", true),
+        ] {
+            initial.strings.insert("a".into(), value.into());
+            let next = successors(&model, t, &initial);
+            assert_eq!(next.len(), usize::from(allowed), "{name} = {value:?}");
+            if allowed {
+                assert_eq!(next[0].0[name], ParamValue::Str(value.into()));
+                assert_eq!(next[0].1.strings, initial.strings);
+            }
+        }
+    }
+}

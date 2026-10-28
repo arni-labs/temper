@@ -111,3 +111,70 @@ fn liveness_checks_every_equality_before_counting_on_a_reaction() {
         }
     }
 }
+
+/// The reaction sends the same value held by both equality fields, so only
+/// the nonempty constraint can refuse it. Neither entity writes sealed_with.
+fn nonempty_pair(value: &str) -> (String, String) {
+    let initial = format!("initial = {}", serde_json::to_string(value).unwrap());
+    let parent = PARENT.replace("initial = \"b\"", &initial);
+    let child = CHILD
+        .replace("initial = \"\"", &initial)
+        .replace("initial = \"b\"", &initial)
+        .replace(
+            "[[invariant]]",
+            r#"[[action.constraints]]
+kind = "param_nonempty"
+param = "sealed_with"
+
+[[invariant]]"#,
+        );
+    (parent, child)
+}
+
+#[test]
+fn a_reaction_with_a_whitespace_only_parameter_is_refused() {
+    for value in ["", " ", "\t\n", "\u{2003}"] {
+        let (parent, child) = nonempty_pair(value);
+        let child = child.replace(
+            "status == 'Sealed' => a == b && Parent[Id].status == 'Closed'",
+            "status == 'Sealed' => a == b && Parent[Id].status == 'Open'",
+        );
+        let result = check_under(&[&parent, &child], Some(ONLY_TELL_REACHES_THE_CHILD));
+        assert!(result.holds(), "{value:?}: {result}");
+    }
+}
+
+#[test]
+fn a_whitespace_only_parameter_cannot_prove_a_reaction_settles() {
+    for (value, should_settle) in [
+        ("", false),
+        (" ", false),
+        ("\t\n", false),
+        ("\u{2003}", false),
+        (" b ", true),
+        ("b", true),
+    ] {
+        let (parent, child) = nonempty_pair(value);
+        let automatons = parse(&[&parent, &child]);
+        let refs: Vec<&Automaton> = automatons.iter().collect();
+        let analysis = SendAnalysis::new(ONLY_TELL_REACHES_THE_CHILD).unwrap();
+        let mut results = verify_joint_liveness(
+            &refs,
+            Some(&analysis),
+            Budget {
+                time: Duration::from_secs(30),
+                states: 100_000,
+            },
+        );
+        assert_eq!(results.len(), 1);
+        let result = results.remove(0);
+        if should_settle {
+            assert!(result.holds(), "{value:?}: {result}");
+        } else {
+            assert!(
+                matches!(result.outcome, LivenessOutcome::Stuck { .. }),
+                "{value:?}: {result}"
+            );
+        }
+    }
+}

@@ -213,7 +213,7 @@ fn string_candidates(
         }
     }
     if param.nonempty {
-        candidates.remove("");
+        candidates.retain(|candidate| !candidate.trim().is_empty());
     }
     for var in &param.not_equals {
         if let Some(value) = tracked(var) {
