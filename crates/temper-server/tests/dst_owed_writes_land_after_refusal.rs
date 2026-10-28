@@ -36,9 +36,12 @@
 //!
 //! So that a run means something: a control run, with the store taking every
 //! write, must land the owed write exactly once, so a write lost elsewhere
-//! was lost to the refusal; each seed checks that the owed write did not
-//! land while the store took no writes; and each case must meet an
-//! outcome-unknown write from a caller with a key and from one without.
+//! was lost to the outage; each seed checks that the owed write did not
+//! land while the store failed, that a store taking no writes refused an
+//! append to its journal then (so it landed on a later try, not its first),
+//! that a hang met it, and that the fault drawn for the first write after
+//! met an append to that journal; and each case must meet an outcome-unknown
+//! write from a caller with a key and from one without.
 //!
 //! The server runs in one single-threaded, paused-clock Tokio runtime, and
 //! `sim_now()` reads that clock. The module is real WASM, run by the
@@ -201,6 +204,13 @@ impl Outage {
             Self::RefusesBlobs => std::fs::remove_file(state.data_dir.join("blobs"))
                 .expect("the blob directory is unblocked"),
         }
+    }
+
+    /// Whether the store takes no writes, so the owed write's tries are
+    /// refused and counted (`SimEventStore::refused_appends`). A hung append
+    /// is let go while it still takes none.
+    fn stops_writes(self) -> bool {
+        matches!(self, Self::Refuses | Self::Hangs)
     }
 
     /// What the store did not do while it failed.
@@ -463,8 +473,9 @@ fn run_seed(
             settle().await;
         }
         let during = read_journal(&store, owing);
+        let refused = store.refused_appends(&owing.journal());
         run.trace.push(format!(
-            "{}s later {} holds {:?}",
+            "{}s later {} holds {:?}, and the store refused {refused} appends to it",
             stretch.as_secs(),
             owing.journal(),
             during.events
@@ -472,8 +483,19 @@ fn run_seed(
         let early = owed_events.iter().find(|event| during.count(event) > 0);
         if let Some(early) = early.filter(|_| store_fails) {
             return Err(run.fail(
-                "the owed write meets the outage (harness)",
+                "the owed write does not land during the outage (harness)",
                 format!("{early} landed while {}", outage.refused()),
+            ));
+        }
+        // A write the store never refused was never tried while it was down,
+        // or writes a journal other than the one this case reads.
+        if store_fails && outage.stops_writes() && refused == 0 {
+            return Err(run.fail(
+                "the owed write met the refusal (harness)",
+                format!(
+                    "no append to {} was refused while the store took no writes",
+                    owing.journal()
+                ),
             ));
         }
 
@@ -483,10 +505,11 @@ fn run_seed(
         fault.apply(&store, &owing.journal());
         tokio::time::sleep(RECOVERY_WINDOW).await;
         settle().await;
+        let fault_met = !store.append_faults_pending(&owing.journal());
         Fault::clear(&store, &owing.journal());
         let after = read_journal(&store, owing);
         run.trace.push(format!(
-            "the store works again, the first write to {} {fault:?}; {}s later it holds {:?}",
+            "the store works again, the first write to {} {fault:?} (met: {fault_met}); {}s later it holds {:?}",
             owing.journal(),
             RECOVERY_WINDOW.as_secs(),
             after.events
@@ -527,6 +550,13 @@ fn run_seed(
             return Err(run.fail(
                 "a timer that fired leaves no row behind",
                 format!("{row:?}"),
+            ));
+        }
+        // Checked last, so that a write that never lands fails on that.
+        if !fault_met {
+            return Err(run.fail(
+                "the owed write met the fault drawn for it (harness)",
+                format!("the {fault:?} set on {} met no append", owing.journal()),
             ));
         }
         clock.end(Duration::ZERO);

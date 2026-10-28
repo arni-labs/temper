@@ -32,14 +32,38 @@ impl SimEventStore {
     pub fn take_writes_again(&self) {
         self.lock().writes = Writes::Taken;
     }
+
+    /// How many appends that would have written `persistence_id`, alone or
+    /// in a batch, the store has refused because it took no writes. A test
+    /// reads it to know a write it expects to meet the refusal did.
+    pub fn refused_appends(&self, persistence_id: &str) -> u64 {
+        self.lock()
+            .refused_appends
+            .get(persistence_id)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl SimEventStoreInner {
-    /// The error an append meets while the store takes no writes.
-    pub(super) fn refused_write(&self) -> Option<PersistenceError> {
-        matches!(self.writes, Writes::Stopped).then(|| {
-            PersistenceError::Storage("SimEventStore: the store takes no writes".to_string())
-        })
+    /// The error an append that writes `persistence_ids` meets while the
+    /// store takes no writes, counted against each of them.
+    pub(super) fn refused_write<'a>(
+        &mut self,
+        persistence_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Option<PersistenceError> {
+        if !matches!(self.writes, Writes::Stopped) {
+            return None;
+        }
+        for persistence_id in persistence_ids {
+            *self
+                .refused_appends
+                .entry(persistence_id.to_string())
+                .or_default() += 1;
+        }
+        Some(PersistenceError::Storage(
+            "SimEventStore: the store takes no writes".to_string(),
+        ))
     }
 
     /// An append wrote `persistence_id`: stop taking writes if the store was
