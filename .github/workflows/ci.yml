@@ -657,13 +657,6 @@ jobs:
           FILTER: ${{ steps.select.outputs.filter }}
         run: cargo nextest run --locked $ARGS --run-ignored only --test-threads 1 --no-fail-fast -E "$FILTER"
 
-      - name: A journal page reads the newest events below a sequence
-        env:
-          TEMPER_TEST_POSTGRES_URL: postgres://postgres:temper@localhost:5432/postgres
-        run: >-
-          cargo nextest run -p temper-store-postgres --run-ignored only
-          -E 'test(read_events_page_reads_newest_first_windows)'
-
   # ─────────────────────────────────────────────────────
   # Gate 3b: DST/platform coverage (matrixed)
   #
