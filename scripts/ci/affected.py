@@ -10,12 +10,19 @@ package that a build or test could read (Cargo.lock, the toolchain, .github/,
 test-fixtures/, os-apps/, skills/, scripts/, ...) tests every package; only the
 paths in DOCS are known to be read by nothing.
 
+A push whose tree already passed CI in a merge group (VERIFIED_RUN names that
+run) has nothing new to test: the queue moves main to the commit it tested. It
+takes the pr lane with nothing changed, the same path as a docs-only change.
+The nightly schedule still runs the full lane.
+
 Writes key=value lines to $GITHUB_OUTPUT (stdout when unset):
   lane      full | pr
   mode      full | affected | none
   packages  space-separated package names to test (empty for none)
   test_args cargo arguments that select those packages' tests (empty for none)
   rust      false only when nothing but DOCS changed
+  sdk_ts    true when the TypeScript SDK's checks should run: Rust changed (as
+            before) or the SDK itself did; packages/ is in DOCS for Rust's sake
   shards    JSON matrix of Tests shards for the pr lane
 """
 
@@ -133,12 +140,16 @@ def main():
     # A merge group takes the pr lane too: the full lane splits platform-random into seed
     # shards, so the required "DST/Platform Tests (platform-random)" check would never report.
     queued = os.environ.get("EVENT") in ("pull_request", "merge_group")
-    lane = "pr" if queued or os.environ.get("CHANGED_PATHS", "").strip() else "full"
+    verified = os.environ.get("VERIFIED_RUN", "").strip()
+    lane = "pr" if queued or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
     dirs, names, dependents = workspace()
     out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true"}
     if lane == "pr":
-        direct, outside, docs_only = set(), [], True
-        for path in changed_paths():
+        if verified:
+            print(f"This tree already passed in its merge group: {verified}", file=sys.stderr)
+        direct, outside, docs_only, sdk_ts = set(), [], True, False
+        for path in [] if verified else changed_paths():
+            sdk_ts = sdk_ts or path.startswith("packages/temper-sdk-ts/")
             name = owner(path, dirs)
             if name:
                 direct.add(name)
@@ -155,9 +166,11 @@ def main():
         out["packages"] = " ".join(sorted(packages))
         out["test_args"] = test_args(packages)
         out["rust"] = "false" if docs_only else "true"
+        out["sdk_ts"] = "true" if sdk_ts or not docs_only else "false"
         out["shards"] = json.dumps({"include": shards(packages)}) if packages else json.dumps({"include": []})
         print(f"Direct: {sorted(direct)}; testing {len(packages)} package(s): {out['packages'] or 'none'}", file=sys.stderr)
     else:
+        out["sdk_ts"] = "true"
         out["shards"] = json.dumps({"include": []})
     lines = "".join(f"{k}={v}\n" for k, v in out.items())
     target = os.environ.get("GITHUB_OUTPUT")
