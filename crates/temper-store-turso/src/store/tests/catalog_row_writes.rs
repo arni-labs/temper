@@ -95,6 +95,7 @@ async fn stored_lengths(store: &TursoEventStore, tenant: &str, entity_id: &str) 
     let mut rows = conn
         .query(
             "SELECT length(fields), ifnull(length(state), 0) FROM entity_catalog \
+             INDEXED BY sqlite_autoindex_entity_catalog_1 \
              WHERE tenant = ?1 AND entity_type = ?2 AND entity_id = ?3",
             params![tenant, ENTITY_TYPE, entity_id],
         )
@@ -294,7 +295,8 @@ async fn a_batched_move_writes_each_field_once() {
         .query_field_index(
             &tenant,
             ENTITY_TYPE,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), "Plan".to_string()],
         )
         .await
@@ -308,7 +310,8 @@ async fn titled(store: &TursoEventStore, tenant: &str, title: &str) -> Vec<Strin
         .query_field_index(
             tenant,
             ENTITY_TYPE,
-            "field_name = ?3 AND field_value = ?4",
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
             vec!["Title".to_string(), title.to_string()],
         )
         .await
