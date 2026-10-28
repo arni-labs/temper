@@ -24,11 +24,8 @@ const ASK_AGAIN_AFTER_ONE_SECOND: &str = "timeout:1 attempts:3";
 /// Call it before any other thread starts: changing the environment while
 /// another thread reads it is undefined behavior.
 pub fn ask_again_after_one_second() {
-    if std::env::var_os("RES_OPTIONS").is_none() {
-        // SAFETY: `main` calls this before it builds the runtime, while this
-        // is the only thread.
-        unsafe { std::env::set_var("RES_OPTIONS", ASK_AGAIN_AFTER_ONE_SECOND) };
-    }
+    // Scratch: the setting turned off, to show the test fails without it.
+    let _ = ASK_AGAIN_AFTER_ONE_SECOND;
 }
 
 #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
