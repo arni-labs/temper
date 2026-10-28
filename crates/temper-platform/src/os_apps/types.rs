@@ -88,6 +88,17 @@ impl InstallWarning {
         }
     }
 
+    /// Two moves an action schedules to fire together that the install
+    /// check could not decide can both be made (`scheduled_moves`): only a
+    /// pair it proves can never both be made refuses an install.
+    pub fn scheduled_moves(message: String) -> Self {
+        Self {
+            check: "scheduled_moves".to_string(),
+            message,
+            detail: None,
+        }
+    }
+
     /// A state timer whose lost fire nothing redoes (`timer_strands`):
     /// advice, never a refusal.
     pub fn timer_strands(message: String, detail: serde_json::Value) -> Self {
