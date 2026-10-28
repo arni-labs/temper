@@ -202,14 +202,9 @@ impl IdempotencyCache {
         idem_key: &str,
         request: &RequestFingerprint,
     ) -> CachedReply {
-        self.with_entry(actor_key, idem_key, |entry| {
-            if entry.request == *request {
-                CachedReply::Replay(Box::new(entry.reply_to(request)))
-            } else {
-                CachedReply::OtherRequest(entry.request.action().to_string())
-            }
-        })
-        .unwrap_or(CachedReply::Miss)
+        // MUTANT: the cache never answers.
+        let _ = (actor_key, idem_key, request);
+        CachedReply::Miss
     }
 
     /// The reply for a retry of `request`, only once its post-dispatch
@@ -225,10 +220,9 @@ impl IdempotencyCache {
         idem_key: &str,
         request: &RequestFingerprint,
     ) -> Option<EntityResponse> {
-        self.with_entry(actor_key, idem_key, |entry| {
-            (entry.effects_applied && entry.request == *request).then(|| entry.reply_to(request))
-        })
-        .flatten()
+        // MUTANT: the cache never answers.
+        let _ = (actor_key, idem_key, request);
+        None
     }
 
     /// The cached reply for `idem_key` once its post-dispatch effects have run.
