@@ -71,6 +71,8 @@ name = "Job"
 states = ["Idle", "Held", "Taken", "Waiting", "Done"]
 initial = "Idle"
 allow_indefinite_states = ["Idle", "Held", "Taken", "Waiting", "Done"]
+# A bound parameter needs strict parameters.
+strict_action_params = true
 
 [[state]]
 name = "owner_id"
