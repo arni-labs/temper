@@ -12,7 +12,8 @@
 //! Invariants:
 //! - each record leaves `Waiting` on its timer;
 //! - a timer that fires at its deadline in a running process is not counted
-//!   overdue, though the record moved since the timer was armed;
+//!   overdue, though the record moved since the timer was armed: its re-arm
+//!   at that deadline is counted on time, once;
 //! - a timer whose deadline passed while the server was down is counted
 //!   overdue, once.
 //!
@@ -307,6 +308,12 @@ fn dst_a_timer_is_overdue_only_when_nothing_waited_for_its_deadline() {
             0,
             "{trace}: a timer that fired at its deadline in a running process was counted \
              overdue: {steady_counts:?}"
+        );
+        assert_eq!(
+            steady_counts.get("on_time").copied().unwrap_or(0),
+            1,
+            "{trace}: the re-arm at the deadline after a Poke is counted on time, once: \
+             {steady_counts:?}"
         );
 
         process_runtime().block_on(async {
