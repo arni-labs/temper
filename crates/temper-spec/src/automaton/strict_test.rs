@@ -469,3 +469,17 @@ params=[{name="owner",type="string",source="authenticated_subject"}]
     let json = serde_json::to_value(&auto.actions[0].params[0]).unwrap();
     assert_eq!(json["source"], "authenticated_subject");
 }
+
+#[test]
+fn a_related_record_s_field_is_read_only_by_an_invariant() {
+    let invariant = r#"
+[[invariant]]
+name = "same_note"
+assert = "status == 'Done' => Owner[owner_id].owner_id == owner_id"
+"#;
+    parse(&spec("", "", invariant)).expect("an invariant may read a related field");
+    rejects(
+        &spec("", "guard = \"Owner[owner_id].owner_id == owner_id\"", ""),
+        "only an [[invariant]] may do",
+    );
+}

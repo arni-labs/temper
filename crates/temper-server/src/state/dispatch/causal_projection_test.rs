@@ -120,7 +120,10 @@ async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_onc
             .refused_sequence
             .store(source_before + 1, Ordering::SeqCst);
         query.fail_source_write.store(true, Ordering::SeqCst);
-        let agent = AgentContext::system();
+        let mut agent = AgentContext::system();
+        agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
+            "same-committed-submit".into(),
+        ));
         let submit = state.dispatch_tenant_action_ext(
             &tenant,
             "Source",
@@ -194,6 +197,33 @@ async fn failed_projection_after_commit_arms_the_timer_and_starts_dependents_onc
         let mut seen = Vec::new();
         let verified = until_status(&mut events, &["SawNew", "SawOld"], &mut seen).await;
         assert_eq!(verified, "SawNew", "seed {seed}");
+
+        // Main's keyed-replay guarantee still holds after an outage: the
+        // same committed action answers without running its effects again.
+        let replayed = state
+            .dispatch_tenant_action_ext(
+                &tenant,
+                "Source",
+                "source",
+                "Submit",
+                json!({"prompt_template":"new"}),
+                DispatchExtOptions {
+                    agent_ctx: &agent,
+                    await_integration: true,
+                    await_reactions: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(replayed.success, "seed {seed}: {replayed:?}");
+        assert_eq!(replayed.state.sequence_nr, response.state.sequence_nr);
+        assert_eq!(
+            state
+                .state_timeout_tracker
+                .sequence_for_test(&tenant, "Source", "source"),
+            arms_during_outage,
+            "seed {seed}: replay does not rearm the state timer"
+        );
 
         // The timer fires at its deadline.
         tokio::time::pause();

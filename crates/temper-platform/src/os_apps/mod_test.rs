@@ -28,6 +28,7 @@ fn test_admin_security_context(principal_id: &str) -> SecurityContext {
         },
         context_attrs: HashMap::new(),
         correlation_id: "test-admin-context".to_string(),
+        cause: None,
     }
 }
 
@@ -897,7 +898,11 @@ fn test_intent_discovery_specs_verify() {
 
 mod bundle_refusal;
 mod directed_evolution;
+#[path = "mod_test/policy_joint.rs"]
+mod policy_joint;
 mod policy_reinstall;
+mod spec_change;
+mod timer_strands;
 #[test]
 fn test_get_app_project_management() {
     let bundle = get_os_app("project-management");
@@ -1019,6 +1024,7 @@ fn test_find_wasm_modules_discovers_packaged_root_wasm() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 
@@ -2631,6 +2637,7 @@ fn test_required_wasm_config_without_artifact_is_not_registered_ready() {
             startup_loading: WasmStartupLoading::Lazy,
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
     let bundle = AppBundle {
@@ -2692,7 +2699,7 @@ field = "file_id"
 
     let bundle = load_app_bundle(&temp_dir);
     assert!(
-        bundle.is_none(),
+        bundle.is_err(),
         "legacy reactions.toml should be rejected after the ADR-0046 hard cut"
     );
 
@@ -2739,6 +2746,7 @@ fn test_find_wasm_modules_respects_manifest_target() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 
@@ -2783,6 +2791,7 @@ fn test_find_wasm_modules_prefers_packaged_sibling_over_target_output() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 
@@ -2819,6 +2828,7 @@ fn test_find_wasm_modules_finds_sibling_artifact() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 

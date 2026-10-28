@@ -4,7 +4,6 @@
 //! The API is the **Temper Data API** at `/tdata`.
 
 use axum::Router;
-use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing;
 
@@ -26,7 +25,11 @@ use crate::tenant_access::tenant_access_check;
 pub fn build_platform_router(state: PlatformState) -> Router {
     let tenant_api = crate::tenant_api::tenant_api_router();
     let health = Router::new()
-        .route("/healthz", routing::get(|| async { StatusCode::OK }))
+        .route(
+            "/healthz",
+            routing::get(temper_server::write_health::healthz),
+        )
+        .with_state(state.server.clone())
         .route("/version", routing::get(version_info));
 
     // Platform observe routes — merged at /observe/* to avoid the /api double-nest

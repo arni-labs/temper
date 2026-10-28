@@ -1,8 +1,9 @@
 //! Cross-entity relation and invariant enforcement.
 
+mod delete_plan;
 mod delete_references;
 
-pub use delete_references::pre_delete_relation_checks;
+pub use delete_plan::{DeletePlan, plan_delete};
 
 use std::time::Instant; // determinism-ok: scoped duration measurement only
 
@@ -21,7 +22,7 @@ use crate::state::ServerState;
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintViolationType {
     RelationIntegrity,
-    /// A Restrict delete whose references could not all be checked.
+    /// A delete whose referencing rows could not all be checked.
     RelationUnverified,
     CrossInvariant,
     FieldInvariant,

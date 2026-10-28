@@ -2,8 +2,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Require each IOA policy and referenced compiled module, then parse all policies.
-pub(super) fn validate(specs: &Path) -> Result<()> {
+/// Require each IOA policy and referenced compiled module, then parse all
+/// policies and return their text.
+pub(super) fn validate(specs: &Path) -> Result<String> {
     let mut entities = 0;
     for entry in std::fs::read_dir(specs)? {
         let path = entry?.path();
@@ -55,12 +56,13 @@ pub(super) fn validate(specs: &Path) -> Result<()> {
     validate_policy_files(specs)
 }
 
-/// Parse every policy the server loads, in the same lexical filename order.
-/// Source collections may omit the policy directory before application packaging.
-pub(super) fn validate_policy_files(specs: &Path) -> Result<()> {
+/// Parse every policy the server loads, in the same lexical filename order,
+/// and return their text. Source collections may omit the policy directory
+/// before application packaging.
+pub(super) fn validate_policy_files(specs: &Path) -> Result<String> {
     let directory = specs.join("policies");
     if !directory.exists() {
-        return Ok(());
+        return Ok(String::new());
     }
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&directory)? {
@@ -81,6 +83,7 @@ pub(super) fn validate_policy_files(specs: &Path) -> Result<()> {
                 .with_context(|| format!("failed to read Cedar policy {}", path.display()))?,
         );
     }
-    temper_authz::AuthzEngine::new(&policies.join("\n\n")).context("invalid Cedar policy")?;
-    Ok(())
+    let text = policies.join("\n\n");
+    temper_authz::AuthzEngine::new(&text).context("invalid Cedar policy")?;
+    Ok(text)
 }
