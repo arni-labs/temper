@@ -615,8 +615,7 @@ impl crate::state::ServerState {
             params: callback_params,
             agent_ctx: callback_ctx,
         };
-        self.send_answer(sent, mode, "platform-dispatch", "adapter")
-            .await
+        self.send_answer(sent, mode, "adapter").await
     }
 
     /// Mint a platform credential for adapter execution if the entity has an `agent_type_id`.

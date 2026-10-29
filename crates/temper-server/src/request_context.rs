@@ -14,6 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::idempotency::IdempotencyKey;
 
+mod answer;
 pub(crate) mod armed_by;
 mod execution;
 mod fires;
@@ -255,15 +256,6 @@ impl AgentContext {
     /// agent, but they still belong to the same logical workflow trace.
     pub fn for_service_inheriting(service_name: &str, parent: &AgentContext) -> Self {
         Self::for_service(service_name).inherit_observability_from(parent)
-    }
-
-    /// The service identity a callback ([`Self::for_callback`]) runs as, with
-    /// the callback's own key: a retried parent's callback is then answered
-    /// as its first, whichever identity sends it.
-    pub fn for_service_answering(service_name: &str, callback: &AgentContext) -> Self {
-        let mut context = Self::for_service_inheriting(service_name, callback);
-        context.idempotency_key = callback.idempotency_key.clone();
-        context
     }
 
     /// Copy the execution budget and non-authority observability fields from a parent.
