@@ -1145,6 +1145,22 @@ impl ServerState {
         }
     }
 
+    /// Stop an actor while keeping its entity discoverable for lazy replay.
+    /// A failed refresh must not hide live entities from a hydrated index.
+    #[instrument(skip_all, fields(otel.name = "entity.stop_entity_actor", tenant = %tenant, entity_type, entity_id))]
+    pub(crate) fn stop_entity_actor(&self, tenant: &TenantId, entity_type: &str, entity_id: &str) {
+        let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+
+        if let Ok(mut registry) = self.actor_registry.write()
+            && let Some(actor_ref) = registry.remove(&actor_key)
+        {
+            let _ = actor_ref.stop();
+        }
+        if let Ok(mut last_accessed) = self.last_accessed.write() {
+            last_accessed.remove(&actor_key);
+        }
+    }
+
     /// Stop and evict an entity actor plus its in-memory indexes.
     ///
     /// Used after an out-of-band durable append (for example, an atomic
@@ -1157,16 +1173,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
     ) {
-        let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-
-        if let Ok(mut registry) = self.actor_registry.write()
-            && let Some(actor_ref) = registry.remove(&actor_key)
-        {
-            let _ = actor_ref.stop();
-        }
-        if let Ok(mut last_accessed) = self.last_accessed.write() {
-            last_accessed.remove(&actor_key);
-        }
+        self.stop_entity_actor(tenant, entity_type, entity_id);
         if let Ok(mut index) = self.entity_index.write() {
             let index_key = format!("{tenant}:{entity_type}");
             if let Some(ids) = index.get_mut(&index_key) {
