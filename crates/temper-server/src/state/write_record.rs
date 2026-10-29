@@ -29,6 +29,7 @@ use super::ServerState;
 use crate::entity_actor::effects::{self, FieldSyncMode, SpawnRequest};
 use crate::entity_actor::{EntityActor, EntityState};
 use crate::odata::constraints::{self, ConstraintViolation, PendingRecords};
+use crate::request_context::AgentContext;
 
 /// Where a write came from. It decides whether the record the write stores
 /// is checked before it is applied.
@@ -90,6 +91,8 @@ pub(crate) struct ActionPreview<'a> {
     pub params: &'a Value,
     /// Related records the action's guards read.
     pub related: &'a RelatedMap,
+    /// The caller whose authority binds spawned initializers' trusted inputs.
+    pub agent_ctx: &'a AgentContext,
 }
 
 impl ServerState {
@@ -240,11 +243,7 @@ impl ServerState {
         preview: ActionPreview<'_>,
     ) -> Result<(), ConstraintViolation> {
         let ActionPreview {
-            table,
-            current,
-            action,
-            params,
-            related,
+            current, action, ..
         } = preview;
         if !self.action_record_checked(caller, tenant, &current.entity_type, action) {
             return Ok(());
@@ -252,11 +251,7 @@ impl ServerState {
         // Boxed as a trait object: the preview runs the action interpreter,
         // and its future type nested in every dispatch path is too deep for
         // their callers' `Send` checks.
-        let Some((record, pending)) = self
-            .action_record(tenant, table, current, action, params, related)
-            .boxed()
-            .await
-        else {
+        let Some((record, pending)) = self.action_record(tenant, preview).boxed().await else {
             // The interpreter refused on `current`, so the action stores
             // nothing there, and the actor applies it to no other state.
             return Ok(());
@@ -315,19 +310,23 @@ impl ServerState {
     async fn action_record(
         &self,
         tenant: &TenantId,
-        table: &TransitionTable,
-        current: &EntityState,
-        action: &str,
-        params: &Value,
-        related: &RelatedMap,
+        preview: ActionPreview<'_>,
     ) -> Option<(Value, PendingRecords)> {
+        let ActionPreview {
+            table,
+            current,
+            action,
+            params,
+            related,
+            agent_ctx,
+        } = preview;
         let (record, spawns) = self
             .preview_action(tenant, table, current.clone(), action, params, related)
             .await?;
         let mut pending = PendingRecords::default();
         for spawn in &spawns {
             if let Some(child) = self
-                .pending_child(tenant, &record, spawn, params, &pending)
+                .pending_child(tenant, &record, spawn, params, &pending, agent_ctx)
                 .await
             {
                 pending.insert(child);
@@ -390,6 +389,7 @@ impl ServerState {
         spawn: &SpawnRequest,
         params: &Value,
         pending: &PendingRecords,
+        agent_ctx: &AgentContext,
     ) -> Option<EntityState> {
         let preceding_child = pending.get(&spawn.entity_type, &spawn.entity_id);
         let plan = self
@@ -426,6 +426,16 @@ impl ServerState {
         let Some((action, action_params)) = &plan.initializer else {
             return Some(child);
         };
+        let Ok(action_params) = super::dispatch::bind_authenticated_params(
+            &plan.table,
+            action,
+            action_params.clone(),
+            agent_ctx,
+        ) else {
+            // Live dispatch refuses before applying an initializer whose
+            // authenticated inputs cannot be bound, leaving the child as-is.
+            return Some(child);
+        };
         let related = self
             .resolve_guards_from_fields(tenant, &spawn.entity_type, action, &child.fields, parent)
             .await;
@@ -435,7 +445,7 @@ impl ServerState {
                 &plan.table,
                 child.clone(),
                 action,
-                action_params,
+                &action_params,
                 &related,
             )
             .await;

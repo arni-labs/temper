@@ -64,6 +64,7 @@ impl ServerState {
             action,
             params: action_params,
             related,
+            agent_ctx,
         };
         if let Err(violation) = self.check_action_record(caller, tenant, preview).await {
             return Ok(Some(

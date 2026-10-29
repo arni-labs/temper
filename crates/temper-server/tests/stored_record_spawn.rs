@@ -416,3 +416,6 @@ mod ordered;
 
 #[path = "stored_record_spawn/contracts.rs"]
 mod contracts;
+
+#[path = "stored_record_spawn/authenticated.rs"]
+mod authenticated;
