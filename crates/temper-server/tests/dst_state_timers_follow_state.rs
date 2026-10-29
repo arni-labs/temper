@@ -43,6 +43,8 @@ mod boot_logging;
 mod delete_race;
 #[path = "dst_state_timers_follow_state/embedder.rs"]
 mod embedder;
+#[path = "dst_state_timers_follow_state/final_denials.rs"]
+mod final_denials;
 #[path = "dst_state_timers_follow_state/invariants.rs"]
 mod invariants;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]

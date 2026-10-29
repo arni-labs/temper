@@ -15,6 +15,7 @@ impl ServerState {
     /// Wait, fire through the normal dispatch pipeline, and remove the old
     /// row only after its durable successor is armed. A failed write keeps
     /// this arming (including its identity and journal fence) and retries.
+    /// A final dispatch refusal ends the timer instead.
     pub(super) fn spawn_state_timer(
         &self,
         timer: ArmedTimer,
@@ -193,6 +194,7 @@ impl ServerState {
                         "dispatch deferred by admission".into(),
                     ));
                 }
+                Err(error) if error.is_final() => {}
                 Err(error) => return Some((retry_delay, error.to_string())),
                 _ => {}
             }
