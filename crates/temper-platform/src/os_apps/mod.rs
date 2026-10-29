@@ -35,8 +35,9 @@ mod types;
 mod wasm_replacement;
 pub(super) use app_catalog::catalog;
 pub use app_catalog::{
-    add_os_apps_dir, add_os_apps_dir_preferred, list_startup_os_apps, reload_os_apps,
-    set_os_apps_dir,
+    DirApps, add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app,
+    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir,
+    tenant_app_guide, tenant_os_app,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
@@ -49,9 +50,12 @@ use entity_aliases::{
 };
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
-pub use reconcile::{os_app_bundle_digest, reconcile_os_app, resolve_os_app_install_order};
 pub(crate) use reconcile::{
-    tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
+    InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
+};
+pub use reconcile::{
+    os_app_bundle_digest, os_app_dir_bundle_digest, os_app_dir_bundle_digests, reconcile_os_app,
+    resolve_os_app_install_order, resolve_tenant_os_app_install_order, tenant_os_app_bundle_digest,
 };
 pub(crate) use runtime_heal::{
     restore_app_specs_from_matching_digest, tenant_has_ready_app_specs_for_bundle,
@@ -904,31 +908,6 @@ fn extract_description(guide: &str) -> Option<String> {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/// List all available OS apps.
-pub fn list_os_apps() -> Vec<AppEntry> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.entries.clone()
-}
-
-/// Get the full spec bundle for an OS app by name.
-///
-/// Reads IOA, CSDL, and Cedar files from disk on each call so changes
-/// are picked up without a rebuild.
-pub fn get_os_app(name: &str) -> Option<AppBundle> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    let app_dir = cat.paths.get(name)?;
-    load_app_bundle(app_dir).ok()
-}
-
-/// Get the full app guide markdown for an app by name.
-pub fn get_app_guide(name: &str) -> Option<String> {
-    let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    cat.entries
-        .iter()
-        .find(|e| e.name == name)
-        .and_then(|e| e.app_guide.clone())
-}
-
 /// Load a complete app bundle from a directory on disk, or say why not.
 fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
     let manifest = read_app_manifest(app_dir).ok_or("its app.toml is missing or invalid")?;
@@ -1035,10 +1014,10 @@ fn load_app_bundle(app_dir: &Path) -> Result<AppBundle, String> {
     })
 }
 
-fn os_app_dependencies(name: &str) -> Vec<String> {
+fn os_app_dependencies(tenant: Option<&str>, name: &str) -> Vec<String> {
     // Check manifest first.
     let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-    if let Some(entry) = cat.entries.iter().find(|e| e.name == name)
+    if let Some(entry) = cat.app_entry(tenant, name)
         && !entry.dependencies.is_empty()
     {
         return entry
@@ -1085,11 +1064,34 @@ pub async fn install_os_app(
     tenant: &str,
     app_name: &str,
 ) -> Result<InstallResult, String> {
-    let order = resolve_os_app_install_order(&[app_name.to_string()])?;
+    install_os_app_and_dependencies(state, tenant, app_name, InstallOrigin::Request).await
+}
+
+/// Replay a stored install of `app_name` and its dependencies at boot.
+///
+/// It runs the same installer as [`install_os_app`], but a replay is not a new
+/// install: it leaves the stored record's origin (Genesis registry and version,
+/// or local) as recorded, so any number of restarts converge on the same record.
+pub async fn restore_os_app(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+) -> Result<InstallResult, String> {
+    install_os_app_and_dependencies(state, tenant, app_name, InstallOrigin::Replay).await
+}
+
+async fn install_os_app_and_dependencies(
+    state: &PlatformState,
+    tenant: &str,
+    app_name: &str,
+    origin: InstallOrigin,
+) -> Result<InstallResult, String> {
+    let order = resolve_tenant_os_app_install_order(tenant, &[app_name.to_string()])?;
 
     let mut final_result = None;
     for app in order {
-        let result = install_os_app_without_dependencies(state, tenant, &app).await?;
+        let result =
+            install_os_app_with_plan(state, tenant, &app, OsAppInstallPlan::all(), origin).await?;
         if app == app_name {
             final_result = Some(result);
         }
@@ -1097,26 +1099,19 @@ pub async fn install_os_app(
     final_result.ok_or_else(|| format!("OS app '{app_name}' produced no install result"))
 }
 
-async fn install_os_app_without_dependencies(
-    state: &PlatformState,
-    tenant: &str,
-    app_name: &str,
-) -> Result<InstallResult, String> {
-    install_os_app_with_plan(state, tenant, app_name, OsAppInstallPlan::all()).await
-}
-
 pub(super) async fn install_os_app_with_plan(
     state: &PlatformState,
     tenant: &str,
     app_name: &str,
     plan: OsAppInstallPlan,
+    origin: InstallOrigin,
 ) -> Result<InstallResult, String> {
     // A proof that is still walking is waited for without the tenant's
     // install lock; the install then starts again under it and finds the
     // verdict in `attempt`, or a new walk when the tenant changed meanwhile.
     let mut attempt = proofs::Attempt::default();
     loop {
-        match install_once(state, tenant, app_name, plan, &attempt).await? {
+        match install_once(state, tenant, app_name, plan, origin, &attempt).await? {
             ControlFlow::Break(result) => return Ok(result),
             ControlFlow::Continue(proof) => proof.ended(&mut attempt).await?,
         }
@@ -1130,16 +1125,18 @@ async fn install_once(
     tenant: &str,
     app_name: &str,
     plan: OsAppInstallPlan,
+    origin: InstallOrigin,
     attempt: &proofs::Attempt,
 ) -> Result<ControlFlow<InstallResult, proofs::Wait>, String> {
     install_checks::refuse_unavailable_tenant(state, tenant, app_name)?;
     let mut install = install_guard::tenant(&state.server, tenant).await;
     let app_dir = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-        cat.paths.get(app_name).cloned().ok_or_else(|| {
-            let known: Vec<String> = cat.paths.keys().cloned().collect();
-            format!("OS app '{app_name}' not found in catalog (known path keys: {known:?})")
-        })?
+        cat.app_dir(Some(tenant), app_name)
+            .cloned()
+            .ok_or_else(|| {
+                format!("OS app '{app_name}' not found in catalog for tenant '{tenant}'")
+            })?
     };
     let bundle = load_app_bundle(&app_dir).map_err(|why| {
         format!(
@@ -1147,6 +1144,9 @@ async fn install_once(
             app_dir.display()
         )
     })?;
+    if origin == InstallOrigin::Replay {
+        reconcile::ensure_replay_bundle_is_recorded(state, tenant, app_name, &bundle).await?;
+    }
     // A bundle without the binary of a required module is refused before any
     // spec, policy or install row is written, rather than installing an app
     // that answers 503 at request time (ARN-61/ARN-273).
@@ -1645,7 +1645,8 @@ async fn install_once(
         Vec::new()
     };
 
-    reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle).await;
+    reconcile::record_app_install_metadata_for_bundle(state, tenant, app_name, &bundle, origin)
+        .await;
     let review = review.finish().await;
     warnings.extend(review.warnings);
 
@@ -1712,7 +1713,7 @@ async fn bootstrap_app_entity(
     // Read app manifest for metadata.
     let manifest = {
         let cat = catalog().read().unwrap(); // ci-ok: infallible lock
-        cat.entries.iter().find(|e| e.name == app_name).cloned()
+        cat.app_entry(Some(tenant), app_name).cloned()
     };
     let description = manifest
         .as_ref()
