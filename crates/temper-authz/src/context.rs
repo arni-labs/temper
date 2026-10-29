@@ -397,6 +397,25 @@ impl SecurityContext {
         self
     }
 
+    /// Put the statuses of the records that describe the caller (types marked
+    /// `principal_record`) on the principal, as Cedar's `principal.<name>`.
+    /// Only the identity boundary calls this, with names it built from the
+    /// verified token: `<Type>` for the user in person, `actingFor<Type>` for
+    /// the user an agent acts for. A record type's name starts uppercase (the
+    /// spec refuses others), so none of them replaces an attribute set here.
+    #[must_use]
+    pub fn with_principal_records(
+        mut self,
+        records: &std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        for (name, status) in records {
+            self.principal
+                .attributes
+                .insert(name.clone(), serde_json::Value::String(status.clone()));
+        }
+        self
+    }
+
     /// The same identity making a move of its own pick: a WASM module's call
     /// or the writes it returns. It carries no cause, so Cedar sees
     /// `via == "request"` whatever move set the module off: a module during a

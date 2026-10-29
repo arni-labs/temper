@@ -1025,8 +1025,20 @@ impl EventStore for PostgresEventStore {
         Ok(row.map(|(seq, state)| (seq as u64, state)))
     }
 
-    /// List all distinct entities that have at least one persisted event
-    /// in the given tenant.
+    async fn latest_sequence_nr(&self, persistence_id: &str) -> Result<u64, PersistenceError> {
+        let (tenant, ty, id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        self.journal_sequence_nr(tenant, ty, id).await
+    }
+
+    async fn journal_heads(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::JournalHead>, PersistenceError> {
+        self.load_journal_heads(tenant).await
+    }
+
+    /// List distinct records with events in this tenant.
     async fn list_entity_ids(
         &self,
         tenant: &str,
@@ -1467,12 +1479,6 @@ mod tests {
 
         let _ = PostgresEventStore::upsert_published_artifact;
         let _ = PostgresEventStore::load_published_artifact;
-    }
-
-    #[test]
-    fn postgres_query_projection_batch_method_is_part_of_the_store_surface() {
-        let _ = PostgresEventStore::load_query_projection_fields_many;
-        let _ = PostgresEventStore::load_selected_entity_catalog_rows_pg;
     }
 
     #[test]

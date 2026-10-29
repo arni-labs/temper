@@ -77,7 +77,8 @@ async fn update_query_projection_catalog_row(
              projection_hash = $7, \
              state = $8, \
              updated_at = now() \
-         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3",
+         WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
+           AND (status, sequence_nr, projection_hash, state) IS DISTINCT FROM ($4, $6, $7, $8)",
     )
     .bind(update.tenant)
     .bind(update.entity_type)
@@ -598,6 +599,9 @@ impl PostgresEventStore {
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
         let status = canonical_projection_status(status, state);
+        // The row holds each field once: in `fields`, not again in `state`.
+        let stored_state = temper_runtime::persistence::catalog_state_for_storage(fields, state);
+        let state = &stored_state;
         let projection_hash = json_hash(fields);
         let (new_index, indexed_fields, skipped_fields) = scalar_index_fields(fields);
         let mut transaction_timer =

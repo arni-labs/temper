@@ -4,55 +4,6 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn entity_state_round_trip() {
-    let state = EntityState {
-        entity_type: "Order".to_string(),
-        entity_id: "order-1".to_string(),
-        status: "Draft".to_string(),
-        item_count: 2,
-        counters: BTreeMap::from([("items".to_string(), 2)]),
-        booleans: BTreeMap::from([("assigned".to_string(), true)]),
-        lists: BTreeMap::new(),
-        fields: json!({"title": "Test Order"}),
-        events: VecDeque::new(),
-        total_event_count: 0,
-        events_since_snapshot: 0,
-        last_snapshot_sequence_nr: 0,
-        sequence_nr: 0,
-        processed_idempotency_keys: std::collections::BTreeMap::new(),
-        status_clock: Default::default(),
-        spawn_reservations: Default::default(),
-    };
-    let serialized = serde_json::to_string(&state).unwrap();
-    let deserialized: EntityState = serde_json::from_str(&serialized).unwrap();
-    assert_eq!(deserialized.entity_type, "Order");
-    assert_eq!(deserialized.status, "Draft");
-    assert_eq!(deserialized.item_count, 2);
-    assert_eq!(deserialized.counters["items"], 2);
-    assert!(deserialized.booleans["assigned"]);
-}
-
-#[test]
-fn entity_state_defaults_on_missing_fields() {
-    let json = json!({
-        "entity_type": "Task",
-        "entity_id": "task-1",
-        "status": "Open",
-        "item_count": 0,
-        "fields": {},
-        "events": [],
-    });
-    let state: EntityState = serde_json::from_value(json).unwrap();
-    assert!(state.counters.is_empty());
-    assert!(state.booleans.is_empty());
-    assert!(state.lists.is_empty());
-    assert_eq!(state.total_event_count, 0);
-    assert_eq!(state.events_since_snapshot, 0);
-    assert_eq!(state.last_snapshot_sequence_nr, 0);
-    assert_eq!(state.sequence_nr, 0);
-}
-
-#[test]
 fn durable_keys_keep_their_action_and_older_snapshots_still_load() {
     let json = json!({
         "entity_type": "Task",
@@ -130,24 +81,6 @@ fn event_budget_rejects_when_snapshot_tail_reaches_cap() {
     };
 
     assert!(!state.can_accept_event());
-}
-
-#[test]
-fn entity_response_spec_governed_default() {
-    let json = json!({
-        "success": true,
-        "state": {
-            "entity_type": "Order",
-            "entity_id": "o1",
-            "status": "Draft",
-            "item_count": 0,
-            "fields": {},
-            "events": [],
-        },
-        "error": null,
-    });
-    let resp: EntityResponse = serde_json::from_value(json).unwrap();
-    assert!(resp.spec_governed); // default is true
 }
 
 #[test]

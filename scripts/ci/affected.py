@@ -61,6 +61,8 @@ SERVER_FEATURES = "temper-server/observe,temper-server/sim"
 SPEC_FILES = (".ioa.toml", ".csdl.xml", ".tla", ".cedar")
 # Packages whose tests take long enough to be worth two machines.
 HEAVY = {"temper-platform", "temper-store-turso", "temper-cli", "temper-actor-runtime"}
+# Target kinds `cargo test --doc` runs doctests for.
+LIBRARY_KINDS = {"lib", "rlib", "proc-macro"}
 
 
 def is_docs(path):
@@ -84,7 +86,10 @@ def workspace():
         for dep in pkg["dependencies"]:
             if dep["name"] in names:
                 dependents[dep["name"]].add(pkg["name"])
-    return dirs, names, dependents
+    # Only a library has doctests: `cargo test --doc` refuses a package without one.
+    libraries = {pkg["name"] for pkg in meta["packages"]
+                 if any(LIBRARY_KINDS & set(target["kind"]) for target in pkg["targets"])}
+    return dirs, names, dependents, libraries
 
 
 def owner(path, dirs):
@@ -115,25 +120,25 @@ def changed_paths():
     return [line for line in out.splitlines() if line]
 
 
-def shards(packages):
+def shards(packages, libraries):
     cells = []
     if SERVER in packages:
         for i in (1, 2):
             cells.append({"name": f"temper-server {i}/2", "args": f"-p {SERVER} --features {SERVER_FEATURES}",
-                          "partition": f"hash:{i}/2", "gepa": True, "turso": False, "doc": ""})
+                          "partition": f"hash:{i}/2", "gepa": True, "doc": ""})
     rest = sorted(packages - {SERVER})
     if rest:
         count = 2 if rest and HEAVY & set(rest) else 1
         args = " ".join(f"-p {name}" for name in rest)
         for i in range(1, count + 1):
             cells.append({"name": f"other packages {i}/{count}" if count > 1 else "other packages", "args": args,
-                          "partition": f"hash:{i}/{count}", "gepa": False,
-                          "turso": "temper-store-turso" in rest, "doc": ""})
-    if cells:
+                          "partition": f"hash:{i}/{count}", "gepa": False, "doc": ""})
+    documented = sorted(packages & libraries)
+    if documented:
         # Doctests build the libraries with other features than the test binaries,
         # so they get a machine of their own rather than lengthening a shard.
-        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False, "turso": False,
-                      "doc": " ".join(f"-p {name}" for name in sorted(packages))})
+        cells.append({"name": "doctests", "args": "", "partition": "", "gepa": False,
+                      "doc": " ".join(f"-p {name}" for name in documented)})
     return cells
 
 
@@ -149,7 +154,7 @@ def main():
     queued = os.environ.get("EVENT") in ("pull_request", "merge_group")
     verified = os.environ.get("VERIFIED_RUN", "").strip()
     lane = "pr" if queued or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
-    dirs, names, dependents = workspace()
+    dirs, names, dependents, libraries = workspace()
     out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true",
            "specs": "true"}
     if lane == "pr":
@@ -177,7 +182,7 @@ def main():
         out["rust"] = "false" if docs_only else "true"
         out["sdk_ts"] = "true" if sdk_ts or not docs_only else "false"
         out["specs"] = "true" if specs else "false"
-        out["shards"] = json.dumps({"include": shards(packages)}) if packages else json.dumps({"include": []})
+        out["shards"] = json.dumps({"include": shards(packages, libraries)}) if packages else json.dumps({"include": []})
         print(f"Direct: {sorted(direct)}; testing {len(packages)} package(s): {out['packages'] or 'none'}", file=sys.stderr)
     else:
         out["sdk_ts"] = "true"

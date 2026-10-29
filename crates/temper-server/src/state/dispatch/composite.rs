@@ -454,7 +454,7 @@ impl crate::state::ServerState {
                 continue;
             }
             self.stop_and_remove_entity(tenant, &stream.entity_type, &stream.entity_id);
-            if stream.state.status == "Deleted" {
+            if stream.state.is_tombstoned() {
                 continue;
             }
             if !self

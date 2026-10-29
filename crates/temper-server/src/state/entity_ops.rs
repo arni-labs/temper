@@ -2341,7 +2341,7 @@ impl ServerState {
         )
         .await;
         match outcome.result {
-            Ok(response) if response.state.status == "Deleted" => {
+            Ok(response) if response.state.is_tombstoned() => {
                 let _ = actor_ref.stop();
                 self.remove_entity(tenant, entity_type, entity_id);
                 Ok(false)

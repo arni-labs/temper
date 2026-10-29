@@ -216,8 +216,8 @@ pub(super) async fn missing_catalog_entity_ids(
 /// key)` and catalog materialization is preferred or the catalog fast-read
 /// feature flag is enabled. Returns `None` when catalog reads are disabled,
 /// the catalog has no row, the row is behind a commit this server's actor
-/// already holds, or the read fails — caller is expected to fall back to
-/// actor hydration in that case.
+/// already holds or a cold record's journal holds, or the read fails. The caller
+/// falls back to actor hydration in that case.
 ///
 /// The returned JSON has the same shape as the actor's serialized
 /// `EntityState` so downstream code (`enrich_entity_response`, OData
@@ -239,12 +239,23 @@ pub(super) async fn try_load_entity_body_from_catalog(
     // ADR-0148: projection writes are queued, so a point read right after a
     // write can find the row one write behind. When this server's actor holds
     // a newer commit, the caller reads the actor instead.
-    if state
+    match state
         .resident_entity_sequence(tenant, entity_type, key)
         .await
-        .is_some_and(|committed| committed > row.sequence_nr)
     {
-        return None;
+        Some(committed) if committed > row.sequence_nr => return None,
+        Some(_) => {}
+        None => {
+            // Boot fixes old splits, but another writer can still advance a
+            // cold record after startup. Compare indexed journal/snapshot heads;
+            // a failed read falls back to strict actor recovery too.
+            if let Some((store, _)) = state.event_journal() {
+                let pid = format!("{tenant}:{entity_type}:{key}");
+                if store.latest_sequence_nr(&pid).await.ok()? > row.sequence_nr {
+                    return None;
+                }
+            }
+        }
     }
     maybe_spawn_catalog_shadow_check(state, tenant, entity_type, &row);
     Some(catalog_row_to_entity_body(
@@ -325,7 +336,7 @@ pub(super) async fn materialize_entity_set_entities(
                     .await
                 {
                     Ok(response) => {
-                        if response.state.status != "Deleted"
+                        if !response.state.is_tombstoned()
                             && let Some(query_plane) = state.query_plane_store()
                         {
                             let fields = state.query_projection_fields(

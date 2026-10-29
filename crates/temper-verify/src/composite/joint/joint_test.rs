@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use temper_authz::SendAnalysis;
 use temper_spec::automaton::{Automaton, parse_automaton};
@@ -111,11 +110,12 @@ fn check_under(sources: &[&str], policies: Option<&str>) -> JointInvariantResult
     let automatons = parse(sources);
     let refs: Vec<&Automaton> = automatons.iter().collect();
     let analysis = policies.map(|text| SendAnalysis::new(text).expect("fixture policies parse"));
-    let budget = Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
     };
-    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), budget);
+    let mut results = verify_joint_invariants(&refs, analysis.as_ref(), bound);
     assert_eq!(results.len(), 1);
     results.remove(0)
 }
@@ -261,11 +261,12 @@ fn specs_without_cross_entity_invariants_have_nothing_to_check() {
     let parent = parent(false);
     let automatons = parse(&[&parent, CHILD]);
     let refs: Vec<&Automaton> = automatons.iter().collect();
-    let budget = Budget {
-        time: Duration::from_secs(30),
-        states: 100_000,
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
     };
-    assert!(verify_joint_invariants(&refs, None, budget).is_empty());
+    assert!(verify_joint_invariants(&refs, None, bound).is_empty());
 }
 
 #[test]
@@ -348,6 +349,26 @@ fn a_value_only_the_invariant_names_is_one_a_request_may_send() {
             .any(|m| m.starts_with("Parent.Set") && m.contains("'secret'")),
         "{result}"
     );
+}
+
+#[test]
+fn a_walk_its_room_cannot_hold_is_not_checked_and_gives_its_memory_back() {
+    let child = child_with("status == 'Finished' => Parent[Id].status == 'Closed'");
+    let parent = parent(false);
+    let automatons = parse(&[&parent, &child]);
+    let refs: Vec<&Automaton> = automatons.iter().collect();
+    let (room, progress) = (Bytes::new(4 << 10), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    let results = verify_joint_invariants(&refs, None, bound);
+    assert_eq!(results.len(), 1);
+    let JointOutcome::Incomplete { reason } = &results[0].outcome else {
+        panic!("expected not checked, got {}", results[0]);
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+    assert_eq!(room.held(), 0, "the walk gives back what it took");
 }
 
 #[test]
@@ -470,7 +491,7 @@ fn a_literal_in_a_related_read_is_explored_by_the_parent_setter() {
 }
 
 #[test]
-fn initial_partitions_stop_within_a_tiny_budget() {
+fn initial_partitions_stop_within_a_tiny_room() {
     let sources: Vec<String> = (0..13)
         .map(|i| format!("[automaton]\nname = 'T{i}'\nstates = ['Ready']\ninitial = 'Ready'\n"))
         .collect();
@@ -483,20 +504,26 @@ fn initial_partitions_stop_within_a_tiny_budget() {
         "\n[[invariant]]\nname = 'rule'\nassert = \"{assertion}\"\n"
     ));
     let automatons = parse(&sources.iter().map(String::as_str).collect::<Vec<_>>());
+    // 13 records start in 27,644,437 ways their ids can be equal: the
+    // starting states take their memory from the room too.
+    let (room, progress) = (Bytes::new(64 << 10), Progress::default());
     let results = verify_joint_invariants(
         &automatons.iter().collect::<Vec<_>>(),
         None,
-        Budget {
-            states: 10,
-            time: Duration::from_secs(1),
+        Bound {
+            room: &room,
+            progress: &progress,
         },
     );
     assert_eq!(results.len(), 1);
-    assert!(matches!(
-        results[0].outcome,
-        JointOutcome::Incomplete { .. }
-    ));
-    assert!(results[0].states <= 10);
+    let JointOutcome::Incomplete { reason } = &results[0].outcome else {
+        panic!("expected not checked, got {}", results[0]);
+    };
+    assert!(reason.contains("does not fit"), "{reason}");
+    // Every start takes at least 16 bytes of the room, so the walk stops
+    // after a few thousand of them at most.
+    assert!(results[0].states <= (64 << 10) / 16 + 1, "{}", results[0]);
+    assert_eq!(room.held(), 0, "the walk gives back what it took");
 }
 
 #[test]
