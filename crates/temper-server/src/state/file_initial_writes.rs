@@ -161,7 +161,7 @@ impl ServerState {
         });
         // The `File.StreamUpdated` spec guard reads the owning Workspace's
         // status. On the live dispatch path that status is resolved by
-        // `resolve_cross_entity_guards`; this atomic synthetic path bypasses
+        // `resolve_related_statuses`; this atomic synthetic path bypasses
         // that resolution, so supply it directly. We already confirmed the
         // workspace is Active (or absent) above.
         let mut stream_xref = temper_jit::table::RelatedMap::new();
@@ -232,7 +232,6 @@ impl ServerState {
                 .or_default()
                 .insert(file_id.to_string());
         }
-        crate::runtime_metrics::record_server_state_metrics(self);
 
         let response = EntityResponse {
             success: true,
@@ -243,6 +242,9 @@ impl ServerState {
             scheduled_actions: vec![],
             spawn_requests: vec![],
             spec_governed: true,
+            refused: false,
+            answered_action: None,
+            store_unavailable: false,
         };
         self.broadcast_synthetic_file_stream_update(tenant, file_id, &response, agent_ctx);
         Ok(response)

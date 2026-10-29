@@ -52,7 +52,8 @@ impl ServerState {
         // A retry of an action already applied returns its first result.
         if agent_ctx
             .idempotency_key
-            .as_deref()
+            .as_ref()
+            .map(crate::idempotency::IdempotencyKey::as_str)
             .is_some_and(|key| current.state.has_processed_idempotency_key(key))
         {
             return Ok(None);
@@ -117,11 +118,10 @@ pub(super) fn stale_refusal(
     entity_id: &str,
     response: &EntityResponse,
 ) -> Option<DispatchError> {
-    let read = read?;
-    if caller != WriteCaller::Outside
-        || response.success
-        || entity_authorization_precondition(&response.state) == read
-    {
+    read?;
+    // Only the actor can say the held write did not land. A changed state
+    // beside a store failure may instead hold a write whose reply was lost.
+    if caller != WriteCaller::Outside || !response.is_record_changed() {
         return None;
     }
     Some(DispatchError::StaleWrite(StaleWrite {

@@ -78,6 +78,12 @@ impl fmt::Display for Operand {
                 entity_type,
                 id_field,
             } => write!(f, "{entity_type}[{id_field}].status"),
+            Operand::CrossField {
+                entity_type,
+                id_field,
+                field,
+            } => write!(f, "{entity_type}[{id_field}].{field}"),
+            Operand::Param(name) => write!(f, "params.{name}"),
             Operand::Lit(lit) => write!(f, "{lit}"),
         }
     }

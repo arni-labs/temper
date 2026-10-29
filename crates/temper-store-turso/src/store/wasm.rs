@@ -69,9 +69,10 @@ impl TursoEventStore {
             }
         }
         drop(existing_rows);
+        drop(conn);
 
-        let _write_permit = self
-            .acquire_write_permit("turso.upsert_wasm_module", WritePriority::High)
+        let conn = self
+            .write_connection("turso.upsert_wasm_module", WritePriority::High)
             .await?;
         conn.execute(
             "INSERT INTO wasm_modules (tenant, module_name, wasm_bytes, sha256_hash, version, size_bytes, updated_at, source)
@@ -212,7 +213,9 @@ impl TursoEventStore {
         entry: &TursoWasmInvocationInsert<'_>,
     ) -> Result<(), PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.persist_wasm_invocation");
-        let conn = self.configured_connection().await?;
+        let conn = self
+            .write_connection("turso.persist_wasm_invocation", WritePriority::Low)
+            .await?;
         let success_val: i64 = if entry.success { 1 } else { 0 };
         let duration_val: i64 = entry.duration_ms as i64;
         conn.execute(
@@ -283,7 +286,9 @@ impl TursoEventStore {
         module_name: &str,
     ) -> Result<bool, PersistenceError> {
         let _query_timer = TursoQueryTimer::start("turso.delete_wasm_module");
-        let conn = self.configured_connection().await?;
+        let conn = self
+            .write_connection("turso.delete_wasm_module", WritePriority::High)
+            .await?;
         let affected = conn
             .execute(
                 "DELETE FROM wasm_modules WHERE tenant = ?1 AND module_name = ?2",

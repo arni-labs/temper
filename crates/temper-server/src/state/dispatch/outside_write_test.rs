@@ -204,3 +204,29 @@ async fn racing_outside_writes_commit_only_against_the_version_they_read() {
         "no seed raced both reads ahead of the first write; the workload does not exercise the race"
     );
 }
+
+#[test]
+fn a_failed_reply_on_a_newer_state_is_stale_only_when_the_actor_says_nothing_landed() {
+    use super::stale_refusal;
+    use crate::entity_actor::EntityActor;
+    use crate::entity_actor::effects::entity_authorization_precondition;
+    use crate::state::write_record::WriteCaller;
+
+    let table = temper_jit::table::TransitionTable::from_ioa_source(PANEL_IOA);
+    let mut current = EntityActor::build_initial_state("Panel", "p1", &table, &json!({}));
+    let read = entity_authorization_precondition(&current);
+    current.sequence_nr += 1;
+    current.fields["Left"] = json!("on");
+    let failed = EntityResponse::write_failed(current.clone(), "reply lost".into());
+    assert!(stale_refusal(WriteCaller::Outside, Some(&read), "Panel", "p1", &failed).is_none());
+
+    let changed = EntityResponse::record_changed(current, "record changed".into());
+    assert!(matches!(
+        stale_refusal(WriteCaller::Outside, Some(&read), "Panel", "p1", &changed),
+        Some(DispatchError::StaleWrite(StaleWrite {
+            current_version: 1,
+            ..
+        }))
+    ));
+    assert!(stale_refusal(WriteCaller::Kernel, Some(&read), "Panel", "p1", &changed).is_none());
+}

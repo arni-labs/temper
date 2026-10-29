@@ -53,6 +53,7 @@ fn add_item(held_to: Option<String>) -> EntityMsg {
         related: BTreeMap::new(),
         idempotency_key: None,
         expected_authorization_precondition: held_to,
+        caller: None,
     }
 }
 
@@ -89,7 +90,7 @@ async fn a_held_action_is_refused_as_stale_when_the_journal_moved_on() {
         );
         assert_eq!(
             reply.error.as_deref(),
-            Some(STALE_ACTION),
+            Some(ACTION_RECORD_CHANGED),
             "the refusal is the stale refusal; {trace}"
         );
         assert_eq!(

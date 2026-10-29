@@ -21,6 +21,7 @@ mod stream_fast_path;
 mod stream_put;
 mod unavailable_tenant;
 mod write;
+mod write_key;
 
 pub(crate) use common::resolve_entity_type;
 pub use content_addressed::handle_blob_ingest_raw;
@@ -34,3 +35,5 @@ pub use write::handle_odata_delete;
 pub use write::handle_odata_patch;
 pub use write::handle_odata_post;
 pub use write::handle_odata_put;
+pub use write_key::IDEMPOTENCY_KEY;
+pub(crate) use write_key::key_every_write;

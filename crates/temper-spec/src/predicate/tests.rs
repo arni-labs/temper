@@ -37,6 +37,7 @@ fn parses_every_operand_form() {
         "len(tags) > 0",
         "'urgent' in tags",
         "Workspace[workspace_id].status not in ['Frozen']",
+        "Install[app_id].commit == commit",
         "kind == 'external' => !empty(url)",
         "url == null",
         "retries == -1",
@@ -138,7 +139,7 @@ fn rejects_malformed_input() {
         "status",
         "len(items",
         "a b",
-        "Parent[pid].name == 'x'",
+        "Parent[pid] == 'x'",
         "empty == 1",
         "x not 1",
         "'unterminated",
@@ -422,10 +423,15 @@ mod effects {
     }
 
     #[test]
-    fn predicates_reject_assignment_and_params() {
+    fn predicates_reject_assignment_and_read_params() {
         let error = parse("items = 1").unwrap_err().to_string();
         assert!(error.contains("compare with '=='"), "{error}");
-        assert!(parse("params.x == 1").is_err());
+        let guard = parse("params.x == 1 && params.y && params.x > 0").expect("params parse");
+        assert_eq!(guard.params_read(), ["x", "y"]);
+        assert_eq!(
+            parse(&guard.to_string()).expect("printed guard parses"),
+            guard
+        );
     }
 
     #[test]

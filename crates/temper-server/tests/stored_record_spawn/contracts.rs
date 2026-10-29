@@ -33,6 +33,11 @@ params = [{name = "expected", type = "counter"}]
 kind = "param_equals_field"
 param = "expected"
 field = "counter"
+
+[[action]]
+name = "Touch"
+kind = "input"
+from = ["Initialized"]
 "#;
 
 const RUN: &str = r#"
@@ -56,6 +61,14 @@ from = ["Idle"]
 to = "Running"
 params = ["child_id", "expected"]
 effect = ["spawn('Child', 'Init', ChildRef, params.child_id)", "spawn('Child', 'Archive', ChildRef, params.child_id)"]
+
+[[action]]
+name = "TryArchiveThenInit"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+params = ["child_id", "expected"]
+effect = ["spawn('Child', 'Archive', ChildRef, params.child_id)", "spawn('Child', 'Init', ChildRef, params.child_id)", "spawn('Child', 'Touch', ChildRef, params.child_id)"]
 "#;
 
 const CROSS: &str = r#"
@@ -72,6 +85,12 @@ name = "ChildIsArchived"
 kind = "hard"
 on = "Run.RequireArchived"
 assert = 'related(Child, ChildRef).status in ["Archived"]'
+
+[[invariant]]
+name = "EarlierRefusalStaysRefused"
+kind = "hard"
+on = "Run.TryArchiveThenInit"
+assert = 'related(Child, ChildRef).status in ["Initialized"]'
 "#;
 
 #[tokio::test(start_paused = true)]
@@ -87,6 +106,7 @@ async fn dst_repeated_spawn_contracts_read_the_preceding_pending_child() {
                 ("RequireInitialized", 1, StatusCode::CONFLICT, "Archived"),
                 ("RequireArchived", 1, StatusCode::OK, "Archived"),
                 ("RequireInitialized", 0, StatusCode::OK, "Initialized"),
+                ("TryArchiveThenInit", 1, StatusCode::OK, "Initialized"),
                 ("RequireArchived", 0, StatusCode::CONFLICT, "Initialized"),
             ] {
                 let id = format!("{action}-{expected_counter}-{existing}");
@@ -98,6 +118,28 @@ async fn dst_repeated_spawn_contracts_read_the_preceding_pending_child() {
                 let (status, body) =
                     send(&state, Method::POST, "/tdata/Runs", json!({"Id": id})).await;
                 assert_eq!(status, StatusCode::CREATED, "seed {seed}: {body}");
+                let persistence_id = format!("default:Child:{id}");
+                if expected_status == StatusCode::OK {
+                    // Cover creation as well as an existing child's first
+                    // initializer: later initializers must wait for recovery.
+                    match seed % 3 {
+                        1 => sim.fail_next_appends(&persistence_id, 1),
+                        2 => {
+                            sim.land_next_appends_then_fail(&persistence_id, 1);
+                            if existing {
+                                // The committed initializer's answer and its
+                                // readback are lost: the owed retry must resume
+                                // after earlier final refusals, not re-run them.
+                                sim.fail_next_reads(&persistence_id, 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let pause_between_initializers = existing && action == "TryArchiveThenInit";
+                if pause_between_initializers {
+                    sim.stop_writes_after_next_append(&persistence_id);
+                }
                 let (status, body) = send(
                     &state,
                     Method::POST,
@@ -115,7 +157,31 @@ async fn dst_repeated_spawn_contracts_read_the_preceding_pending_child() {
                     },
                     "seed {seed}, {id}"
                 );
-                let persistence_id = format!("default:Child:{id}");
+                if pause_between_initializers {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while sim.refused_appends(&persistence_id) == 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .expect("Touch must meet the store outage after Init lands");
+                    sim.take_writes_again();
+                }
+                if action == "TryArchiveThenInit" && expected_status == StatusCode::OK {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !sim
+                            .dump_journal(&persistence_id)
+                            .iter()
+                            .any(|event| event.event_type == "Touch")
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("seed {seed}, {id}: Touch must land after recovery")
+                    });
+                }
                 if expected_status == StatusCode::OK {
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         loop {
@@ -170,7 +236,9 @@ async fn dst_repeated_spawn_contracts_read_the_preceding_pending_child() {
                         .collect();
                     assert_eq!(
                         actions,
-                        if child_status == "Archived" {
+                        if action == "TryArchiveThenInit" {
+                            vec!["Init", "Touch"]
+                        } else if child_status == "Archived" {
                             vec!["Init", "Archive"]
                         } else {
                             vec!["Init"]

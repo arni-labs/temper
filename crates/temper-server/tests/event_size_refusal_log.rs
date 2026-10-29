@@ -128,6 +128,7 @@ async fn each_refusal_is_logged_once_for_a_create_an_action_and_a_batch() {
     let refused: EntityResponse = actor
         .ask(
             EntityMsg::Action {
+                caller: None,
                 name: "AddItem".into(),
                 params: serde_json::json!({ "ProductId": "x".repeat(5_000) }),
                 related: std::collections::BTreeMap::new(),

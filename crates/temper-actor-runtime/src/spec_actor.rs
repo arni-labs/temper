@@ -407,38 +407,46 @@ impl SpecDrivenActor {
         params: &serde_json::Value,
     ) {
         use temper_jit::table::Effect;
+        let declared = &self.table.initial_values;
         match effect {
             Effect::SetState(s) => {
                 state.status = s.clone();
             }
             Effect::SetCounter { var, value } => {
-                if let Some(value) = effect_args::count(value, &state.counters, params) {
+                if let Some(value) = effect_args::count(value, &state.counters, declared, params) {
                     state.counters.insert(var.clone(), value);
                 }
             }
             Effect::AddCounter { var, value } => {
-                let delta = effect_args::count(value, &state.counters, params).unwrap_or(0);
-                let c = state.counters.entry(var.clone()).or_default();
-                *c = c.saturating_add(delta);
+                let delta =
+                    effect_args::count(value, &state.counters, declared, params).unwrap_or(0);
+                let current = declared.counter(&state.counters, var).unwrap_or(0);
+                state
+                    .counters
+                    .insert(var.clone(), current.saturating_add(delta));
             }
             Effect::SubCounter { var, value } => {
-                let delta = effect_args::count(value, &state.counters, params).unwrap_or(0);
-                let c = state.counters.entry(var.clone()).or_default();
-                *c = c.saturating_sub(delta);
+                let delta =
+                    effect_args::count(value, &state.counters, declared, params).unwrap_or(0);
+                let current = declared.counter(&state.counters, var).unwrap_or(0);
+                state
+                    .counters
+                    .insert(var.clone(), current.saturating_sub(delta));
             }
             Effect::SetBool { var, value } => {
-                if let Some(value) = effect_args::boolean(value, &state.booleans, params) {
+                if let Some(value) = effect_args::boolean(value, &state.booleans, declared, params)
+                {
                     state.booleans.insert(var.clone(), value);
                 }
             }
             Effect::ListAppend { var, value } => {
                 if let Some(element) = effect_args::string(value, params) {
-                    state.lists.entry(var.clone()).or_default().push(element);
+                    declared.list_mut(&mut state.lists, var).push(element);
                 }
             }
             Effect::ListRemoveAt { var, index } => {
-                if let Some(index) = effect_args::count(index, &state.counters, params) {
-                    let list = state.lists.entry(var.clone()).or_default();
+                if let Some(index) = effect_args::count(index, &state.counters, declared, params) {
+                    let list = declared.list_mut(&mut state.lists, var);
                     if index < list.len() {
                         list.remove(index);
                     }

@@ -1,6 +1,11 @@
 //! Cross-entity relation and invariant enforcement.
 
 use std::collections::{BTreeMap, BTreeSet};
+mod delete_plan;
+mod delete_references;
+
+pub use delete_plan::{DeletePlan, plan_delete};
+
 use std::time::Instant; // determinism-ok: scoped duration measurement only
 
 use futures_util::FutureExt;
@@ -9,7 +14,7 @@ use tracing::instrument;
 use temper_runtime::tenant::TenantId;
 use temper_spec::FieldInvariant;
 use temper_spec::cross_invariant::{
-    CrossInvariant, CrossInvariantOperator, DeletePolicy, InvariantKind, parse_related_field_assert,
+    CrossInvariant, CrossInvariantOperator, InvariantKind, parse_related_field_assert,
 };
 
 use crate::entity_actor::EntityState;
@@ -43,6 +48,8 @@ impl PendingRecords {
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintViolationType {
     RelationIntegrity,
+    /// A delete whose referencing rows could not all be checked.
+    RelationUnverified,
     CrossInvariant,
     FieldInvariant,
     /// A value the checks read could not be read back from where an earlier
@@ -69,6 +76,22 @@ impl ConstraintViolation {
     ) -> Self {
         Self {
             violation_type: ConstraintViolationType::RelationIntegrity,
+            invariant: None,
+            message: message.into(),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            operation: operation.to_string(),
+        }
+    }
+
+    fn relation_unverified(
+        message: impl Into<String>,
+        entity_type: &str,
+        entity_id: &str,
+        operation: &str,
+    ) -> Self {
+        Self {
+            violation_type: ConstraintViolationType::RelationUnverified,
             invariant: None,
             message: message.into(),
             entity_type: entity_type.to_string(),
@@ -234,78 +257,7 @@ pub(crate) async fn pre_upsert_relation_checks(
     Ok(())
 }
 
-/// Check incoming relation policy before deleting an entity.
-#[instrument(skip_all, fields(otel.name = "constraint.pre_delete_relation_checks", tenant = %tenant, entity_type, entity_id, operation))]
-pub async fn pre_delete_relation_checks(
-    state: &ServerState,
-    tenant: &TenantId,
-    entity_type: &str,
-    entity_id: &str,
-    operation: &str,
-) -> Result<(), ConstraintViolation> {
-    if !state.cross_invariant_enforce {
-        state.metrics.record_cross_bypass();
-        return Ok(());
-    }
-
-    let (tenant_name, edges): (String, Vec<RelationEdge>) = {
-        let registry = state.registry.read().unwrap();
-        let Some(tc) = registry.get_tenant(tenant) else {
-            return Ok(());
-        };
-        (
-            tenant.to_string(),
-            tc.relation_graph
-                .incoming
-                .get(entity_type)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    };
-
-    for edge in edges {
-        if edge.delete_policy != DeletePolicy::Restrict {
-            continue;
-        }
-        let source_ids = state.list_entity_ids_lazy(tenant, &edge.from_entity).await;
-        for source_id in source_ids {
-            if let Ok(source_state) = state
-                .get_tenant_entity_state(tenant, &edge.from_entity, &source_id)
-                .await
-            {
-                let source_fields =
-                    serde_json::to_value(&source_state.state.fields).unwrap_or_default();
-                if extract_field_as_str(&source_fields, &edge.source_field) == Some(entity_id) {
-                    tracing::warn!(
-                        tenant = %tenant_name, entity_type, entity_id, operation,
-                        from_entity = %edge.from_entity, source_id = %source_id,
-                        "constraint violation: cannot delete entity referenced by another"
-                    );
-                    state.metrics.record_relation_integrity_violation(
-                        &tenant_name,
-                        entity_type,
-                        operation,
-                    );
-                    return Err(ConstraintViolation::relation(
-                        format!(
-                            "cannot delete {}('{}'): referenced by {}('{}') via {}",
-                            entity_type, entity_id, edge.from_entity, source_id, edge.source_field
-                        ),
-                        entity_type,
-                        entity_id,
-                        operation,
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Evaluate the cross-entity invariants `write` triggers on the record it
-/// stores (`fields`). A related record in `pending` is read as it will stand
-/// once the write commits.
+/// Evaluate cross-entity invariants on the stored record and its pending children.
 #[instrument(skip_all, fields(otel.name = "constraint.post_write_invariant_checks", tenant = %write.tenant, entity_type = write.entity_type, entity_id = write.entity_id, action_name = write.action, operation = write.operation))]
 pub(crate) async fn post_write_invariant_checks(
     state: &ServerState,

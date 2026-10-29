@@ -12,7 +12,17 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::idempotency::IdempotencyKey;
+
+mod answer;
+pub(crate) mod armed_by;
+mod execution;
+mod fires;
+mod inline_chain;
 mod observation_metadata;
+
+pub use fires::{ScheduledFire, StateTimerFire};
+pub use inline_chain::{ChainStep, InlineChain, RepeatedStep, StepEntity};
 
 /// Maximum callbacks along one server-owned internal context lineage.
 ///
@@ -20,10 +30,12 @@ mod observation_metadata;
 /// propagated through external HTTP requests.
 pub const MAX_CALLBACK_HOPS: u32 = 512;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CallbackBudgetExceeded {
-    #[error("integration callback depth budget exhausted")]
-    InlineDepth,
+    /// The callback is a step its inline chain has already taken; see
+    /// [`InlineChain`] for why that, and not a depth, is where a chain stops.
+    #[error("integration callback not run: it would repeat a step its chain is already in ({0})")]
+    RepeatedStep(RepeatedStep),
     #[error("integration callback hop budget exhausted")]
     TotalHops,
 }
@@ -42,8 +54,9 @@ pub(crate) enum CallbackBudgetExceeded {
 ///   namespaced observability metadata supplied by clients
 #[derive(Debug, Clone, Default)]
 pub struct AgentContext {
-    /// Runtime-owned integration nesting depth; never populated from request headers.
-    pub callback_depth: u32,
+    /// Runtime-owned steps of the inline execution this context runs inside;
+    /// never populated from request headers. See [`InlineChain`].
+    pub inline_chain: InlineChain,
     /// Runtime-owned cumulative callback count; never populated from request headers.
     pub callback_hops: u32,
     /// Full Cedar security context when known at the request boundary.
@@ -80,9 +93,19 @@ pub struct AgentContext {
     /// Stable workflow run identifier used as a queryable APM/log attribute.
     pub workflow_run_id: Option<String>,
     /// ADR-0048 sub-decision 5: idempotency key extracted from the
-    /// `Idempotency-Key` header. Threaded into `EntityMsg::Action` so the
-    /// actor can dedupe duplicate asks produced by dispatch-layer retries.
-    pub idempotency_key: Option<String>,
+    /// `Idempotency-Key` header, or derived for a follow-up. Threaded into
+    /// `EntityMsg::Action` so the actor can dedupe duplicate asks produced by
+    /// dispatch-layer retries.
+    pub idempotency_key: Option<IdempotencyKey>,
+    /// Runtime-owned; never populated from request headers. The scheduled
+    /// action this dispatch fires: the actor removes its row in the commit of
+    /// the fire's event, and only for that record, so a child dispatch that
+    /// inherits this context removes nothing.
+    pub fires_scheduled_action: Option<ScheduledFire>,
+    /// Runtime-owned; never populated from request headers. The state timer
+    /// this dispatch fires: the actor applies its action only while the
+    /// record's journal is at the sequence the timer was armed at.
+    pub fires_state_timer: Option<StateTimerFire>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -92,28 +115,25 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
-    /// Admit a callback only within both the inline and cumulative budgets.
-    pub(crate) fn for_callback(&self) -> Result<Self, CallbackBudgetExceeded> {
-        if self.callback_depth >= temper_runtime::reaction::MAX_REACTION_DEPTH {
-            return Err(CallbackBudgetExceeded::InlineDepth);
-        }
-        if self.callback_hops >= MAX_CALLBACK_HOPS {
-            return Err(CallbackBudgetExceeded::TotalHops);
-        }
-        let mut next = self.clone();
-        next.callback_depth += 1;
-        next.callback_hops += 1;
-        Ok(next)
-    }
-
-    /// Begin a detached task without replenishing its causal callback budget.
-    ///
-    /// Call only at a runtime-owned spawn boundary: the parent inline stack
-    /// ends there, but its callback lineage continues in the detached task.
-    pub(crate) fn for_background_task(&self) -> Self {
-        let mut next = self.clone();
-        next.callback_depth = 0;
-        next
+    /// The sequence this dispatch's state timer was armed at, when the
+    /// dispatch fires `action` on this record. A child dispatch that inherits
+    /// the context, on another record or with another action, is not the fire.
+    pub(crate) fn state_timer_armed_seq(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+    ) -> Option<u64> {
+        self.fires_state_timer
+            .as_ref()
+            .filter(|fire| {
+                fire.tenant == tenant
+                    && fire.entity_type == entity_type
+                    && fire.entity_id == entity_id
+                    && fire.action == action
+            })
+            .map(|fire| fire.armed_seq)
     }
 
     /// Create a system-level agent context for internal operations.
@@ -123,7 +143,7 @@ impl AgentContext {
     /// dropping identity via `Default`.
     pub fn system() -> Self {
         Self {
-            callback_depth: 0,
+            inline_chain: InlineChain::default(),
             callback_hops: 0,
             security_ctx: Some(SecurityContext::system()),
             agent_id: Some("system".to_string()),
@@ -136,6 +156,8 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -160,7 +182,7 @@ impl AgentContext {
         security_ctx.principal.role = Some("service".to_string());
 
         Self {
-            callback_depth: 0,
+            inline_chain: InlineChain::default(),
             callback_hops: 0,
             security_ctx: Some(security_ctx),
             agent_id: Some(service_id),
@@ -173,6 +195,8 @@ impl AgentContext {
             workflow_root_entity_id: None,
             workflow_run_id: None,
             idempotency_key: None,
+            fires_scheduled_action: None,
+            fires_state_timer: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -196,7 +220,7 @@ impl AgentContext {
 
     /// Copy the execution budget and non-authority observability fields from a parent.
     pub fn inherit_observability_from(mut self, parent: &AgentContext) -> Self {
-        self.callback_depth = parent.callback_depth;
+        self.inline_chain = parent.inline_chain.clone();
         self.callback_hops = parent.callback_hops;
         self.session_id = parent.session_id.clone();
         self.intent = parent.intent.clone();
@@ -290,13 +314,13 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(String::from);
+        .map(|key| IdempotencyKey::Request(key.to_string()));
     let workflow_root_entity_type = header_string(headers, "x-temper-workflow-root-entity-type");
     let workflow_root_entity_id = header_string(headers, "x-temper-workflow-root-entity-id");
     let workflow_run_id = header_string(headers, "x-temper-workflow-run-id");
 
     AgentContext {
-        callback_depth: 0,
+        inline_chain: InlineChain::default(),
         callback_hops: 0,
         security_ctx: None,
         agent_id: None,
@@ -309,6 +333,8 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         workflow_root_entity_id,
         workflow_run_id,
         idempotency_key,
+        fires_scheduled_action: None,
+        fires_state_timer: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }
@@ -391,22 +417,6 @@ fn remote_parent_from_header(headers: &HeaderMap, name: &str) -> Option<opentele
         .and_then(|value| TraceState::from_str(value).ok())
         .unwrap_or_default();
     remote_parent(trace_id, span_id, flags, state)
-}
-
-pub(crate) fn remote_parent_context(agent_ctx: &AgentContext) -> Option<opentelemetry::Context> {
-    remote_parent_from_ids(
-        agent_ctx.trace_id.as_deref()?,
-        agent_ctx.parent_span_id.as_deref()?,
-    )
-}
-
-fn remote_parent_from_ids(trace_id: &str, span_id: &str) -> Option<opentelemetry::Context> {
-    remote_parent(
-        trace_id,
-        span_id,
-        TraceFlags::SAMPLED,
-        TraceState::default(),
-    )
 }
 
 fn remote_parent(

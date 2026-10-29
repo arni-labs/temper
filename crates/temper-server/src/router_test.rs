@@ -26,6 +26,7 @@ fn test_security_context() -> temper_authz::SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "router-test".to_string(),
+        cause: None,
     }
 }
 
@@ -41,6 +42,7 @@ fn claimed_admin_security_context() -> temper_authz::SecurityContext {
         },
         context_attrs: Default::default(),
         correlation_id: "router-admin-side-channel-test".to_string(),
+        cause: None,
     }
 }
 
@@ -2989,3 +2991,6 @@ async fn a_request_with_a_traceparent_is_one_trace_with_one_root() {
         );
     }
 }
+
+#[path = "router_test/write_keys_test.rs"]
+mod write_keys;

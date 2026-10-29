@@ -37,8 +37,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::logs::{
     BatchConfigBuilder as LogBatchConfigBuilder, BatchLogProcessor, SdkLoggerProvider,
 };
@@ -50,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 mod config;
+mod log_bridge;
 mod log_time;
 mod sampler;
 mod settings;
@@ -58,6 +58,7 @@ use config::{
     parse_otlp_headers, read_non_empty_env, resolve_deployment_environment, resolve_otel_config,
     resolve_service_version,
 };
+use log_bridge::log_bridge;
 use log_time::EventTimeLogProcessor;
 use sampler::{
     DISPATCH_BACKGROUND_SAMPLE_RATE_DEFAULT, NameBasedSampler, TraceSamplerConfig,
@@ -65,6 +66,10 @@ use sampler::{
 };
 use settings::{ComputedAttributes, ExportSettings};
 
+/// Every signal is sent as OTLP/HTTP protobuf. Named here rather than left to
+/// `opentelemetry-otlp`'s default, which turns to JSON whenever any crate built
+/// alongside this one enables that crate's `http-json` feature.
+const OTEL_EXPORT_PROTOCOL: Protocol = Protocol::HttpBinary;
 const OTEL_EXPORTER_BUILD_RETRY_ATTEMPTS: usize = 3;
 const OTEL_EXPORTER_RETRY_BASE_DELAY_MS: u64 = 250;
 const TRACE_BATCH_MAX_QUEUE_SIZE: usize = 2_048;
@@ -309,6 +314,7 @@ fn init_pipeline(
         let span_exporter = build_with_retry("trace exporter", || {
             SpanExporter::builder()
                 .with_http()
+                .with_protocol(OTEL_EXPORT_PROTOCOL)
                 .with_timeout(Duration::from_secs(10))
                 .build()
         })?;
@@ -334,6 +340,7 @@ fn init_pipeline(
         let metric_exporter = build_with_retry("metric exporter", || {
             MetricExporter::builder()
                 .with_http()
+                .with_protocol(OTEL_EXPORT_PROTOCOL)
                 .with_timeout(Duration::from_secs(10))
                 .build()
         })?;
@@ -356,6 +363,7 @@ fn init_pipeline(
         let log_exporter = build_with_retry("log exporter", || {
             LogExporter::builder()
                 .with_http()
+                .with_protocol(OTEL_EXPORT_PROTOCOL)
                 .with_timeout(Duration::from_secs(10))
                 .build()
         })?;
@@ -394,12 +402,8 @@ fn init_pipeline(
     let otel_trace_layer =
         tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("temper"));
 
-    // Restrict the log bridge to WARN+ to avoid flooding Logfire's /v1/logs
-    // endpoint with high-volume info events.  Traces already capture info-level
-    // spans via the otel_trace_layer, so no diagnostic value is lost.
-    let otel_log_layer = signals
-        .logs
-        .then(|| OpenTelemetryTracingBridge::new(&logger_provider));
+    // Every event `env_filter` lets through, except the OpenTelemetry crates' own.
+    let otel_log_layer = signals.logs.then(|| log_bridge(&logger_provider));
 
     // `.boxed()` unifies the pretty and JSON fmt layer types so a single
     // subscriber chain compiles.

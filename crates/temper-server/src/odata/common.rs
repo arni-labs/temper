@@ -6,8 +6,9 @@ use temper_odata::path::{KeyValue, ODataPath};
 use temper_runtime::tenant::TenantId;
 
 use super::constraints::ConstraintViolation;
+use crate::response::{ODataResponse, odata_error};
 use crate::state::write_record::RecordWrite;
-use crate::state::{ServerState, VerificationGateError};
+use crate::state::{DispatchError, ServerState, VerificationGateError};
 
 /// Extract the tenant ID from request headers.
 ///
@@ -144,12 +145,23 @@ pub(super) fn verification_gate_response(err: VerificationGateError) -> axum::re
 }
 
 pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::response::Response {
-    let violation_type = match err.violation_type {
-        super::constraints::ConstraintViolationType::RelationIntegrity => "relation_integrity",
-        super::constraints::ConstraintViolationType::CrossInvariant => "cross_invariant",
-        super::constraints::ConstraintViolationType::FieldInvariant => "field_invariant",
+    // An unverified relation is a check the server could not finish, not a
+    // conflict with the entity's data, so the caller is told to retry.
+    let (violation_type, status) = match err.violation_type {
+        super::constraints::ConstraintViolationType::RelationIntegrity => {
+            ("relation_integrity", StatusCode::CONFLICT)
+        }
+        super::constraints::ConstraintViolationType::RelationUnverified => {
+            ("relation_unverified", StatusCode::SERVICE_UNAVAILABLE)
+        }
+        super::constraints::ConstraintViolationType::CrossInvariant => {
+            ("cross_invariant", StatusCode::CONFLICT)
+        }
         super::constraints::ConstraintViolationType::StoredValueUnreadable => {
-            "stored_value_unreadable"
+            ("stored_value_unreadable", StatusCode::CONFLICT)
+        }
+        super::constraints::ConstraintViolationType::FieldInvariant => {
+            ("field_invariant", StatusCode::CONFLICT)
         }
     };
     let body = serde_json::json!({
@@ -165,7 +177,7 @@ pub(super) fn constraint_violation_response(err: ConstraintViolation) -> axum::r
             }
         }
     });
-    (StatusCode::CONFLICT, axum::Json(body)).into_response()
+    (status, axum::Json(body)).into_response()
 }
 
 /// Check the record a write will store, answering a violation with 409
@@ -234,3 +246,23 @@ pub(super) fn check_has_stream_or_400(
         .into_response())
     }
 }
+
+/// The answer when a write's record could not be read back for its decision
+/// (`ServerState::materialize_authorized_snapshot`).
+///
+/// A conflict is the record created differently than the write's checks read
+/// it: 409 `AuthorizationStateChanged`, a write that is decided again. Any
+/// other error is the read itself failing, such as an actor ask that timed
+/// out: 500 `ReadError`, the answer the same read gets before the decision,
+/// because the record did not change.
+pub(super) fn authorized_snapshot_failure(error: &DispatchError) -> ODataResponse {
+    let (status, code) = match error {
+        DispatchError::Conflict(_) => (StatusCode::CONFLICT, "AuthorizationStateChanged"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "ReadError"),
+    };
+    odata_error(status, code, &error.to_string())
+}
+
+#[cfg(test)]
+#[path = "common_test.rs"]
+mod authorized_snapshot_failure_tests;
