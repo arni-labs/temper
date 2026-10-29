@@ -462,9 +462,15 @@ fn a_constraint_on_a_parameter_that_writes_no_field_is_decided() {
     // Copy(A) lands last of the copies, the child holds A and refuses
     // Seal(B). A model that cannot read `sealed_with` lets the seal land
     // and reports the child sealed with A while the parent ended on B.
-    let result = check_under(
+    // Blank and nonblank symbolic inputs now form distinct equality classes;
+    // the repeated Set/Copy moves need more expansion work, as below.
+    let result = check_under_budget(
         &[SEALING_PARENT, SEALED_CHILD],
         Some(ONLY_TELL_REACHES_THE_CHILD),
+        Budget {
+            time: Duration::from_secs(30),
+            states: 1_000_000,
+        },
     );
     assert!(result.holds(), "{result}");
 }

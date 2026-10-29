@@ -277,3 +277,29 @@ assert = "a == '' || a != ''"
         }
     }
 }
+
+#[test]
+fn unconstrained_strings_include_distinct_nonempty_blank_values() {
+    let model = two_strings_model();
+    let initial = stateright::Model::init_states(&model).remove(0);
+    let next = successors(&model, &model.transitions[0], &initial);
+    assert!(
+        next.iter().any(|(_, state)| {
+            let a = &state.strings["a"];
+            let b = &state.strings["b"];
+            !a.is_empty()
+                && a.is_blank()
+                && !b.is_blank()
+                && evaluate_guard(&g("a != b"), &model.var_kinds, state)
+        }),
+        "blank and nonblank inputs must remain distinct"
+    );
+    assert!(
+        next.iter().any(|(_, state)| {
+            let a = &state.strings["a"];
+            let b = &state.strings["b"];
+            !a.is_empty() && a.is_blank() && !b.is_empty() && b.is_blank() && a != b
+        }),
+        "different whitespace-only inputs must remain possible"
+    );
+}

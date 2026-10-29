@@ -18,17 +18,18 @@ pub fn string_values<'a>(
         .collect()
 }
 
-/// A value equal to none of `values`: `#n` past the largest `#n` in use.
-pub(crate) fn fresh_string(values: &BTreeSet<ModelString>) -> ModelString {
+/// A value equal to none of `values`, preserving whether it is blank.
+fn fresh_string(values: &BTreeSet<ModelString>, blank: bool) -> ModelString {
     let largest = values
         .iter()
-        .filter_map(|value| match value {
-            ModelString::Symbol(n) => Some(*n),
-            _ => None,
-        })
+        .filter_map(ModelString::symbol_id)
         .max()
         .unwrap_or(0);
-    ModelString::Symbol(largest + 1)
+    if blank {
+        ModelString::BlankSymbol(largest + 1)
+    } else {
+        ModelString::Symbol(largest + 1)
+    }
 }
 
 /// The values one string parameter may take in `state`.
@@ -45,7 +46,8 @@ fn string_candidates(
             None => {
                 let mut all: BTreeSet<ModelString> = values.clone();
                 all.insert("".into());
-                all.insert(fresh_string(values));
+                all.insert(fresh_string(values, false));
+                all.insert(fresh_string(values, true));
                 if let Some(literals) = model.string_literals.get(&param.name) {
                     all.extend(literals.iter().cloned().map(ModelString::from));
                 }
@@ -123,7 +125,7 @@ pub fn apply_string_params(
 
 /// Renumber the `#n` values of `maps`, in order, by first use: two states
 /// that differ only in which new values they made up are one state. Equality
-/// between values is all an invariant can see of them, so nothing is lost.
+/// between values and their blank classification are preserved.
 /// Returns each value's new name.
 pub fn canonical_strings(
     maps: &mut [&mut BTreeMap<String, ModelString>],
@@ -131,10 +133,12 @@ pub fn canonical_strings(
     let mut renamed: BTreeMap<ModelString, ModelString> = BTreeMap::new();
     for map in maps.iter_mut() {
         for value in map.values_mut() {
-            if !matches!(value, ModelString::Symbol(_)) {
-                continue;
-            }
-            let next = ModelString::Symbol(renamed.len() + 1);
+            let id = renamed.len() + 1;
+            let next = match value {
+                ModelString::Literal(_) => continue,
+                ModelString::Symbol(_) => ModelString::Symbol(id),
+                ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
+            };
             let name = renamed.entry(value.clone()).or_insert(next).clone();
             *value = name;
         }

@@ -178,3 +178,136 @@ fn a_whitespace_only_parameter_cannot_prove_a_reaction_settles() {
         }
     }
 }
+
+/// Whitespace arrives from an unconstrained input, then survives a copy.
+/// There is deliberately no whitespace literal anywhere in either spec.
+#[test]
+fn an_unconstrained_input_can_copy_whitespace_that_prevents_sealing() {
+    const PARENT: &str = r#"
+[automaton]
+name = "Parent"
+states = ["New", "Open", "Closed"]
+initial = "New"
+
+[[state]]
+name = "value"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Set"
+kind = "input"
+from = ["New"]
+to = "Open"
+params = [{ name = "value", type = "string" }]
+
+[[action.triggers]]
+name = "copy"
+kind = "entity"
+principal = "tell"
+target_entity = "Child"
+target_action = "Copy"
+
+[action.triggers.args]
+value = "value"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[action]]
+name = "Close"
+kind = "input"
+from = ["Open"]
+to = "Closed"
+guard = "Child[Id].status == 'Done' && value != ''"
+
+[[action.triggers]]
+name = "seal"
+kind = "entity"
+principal = "tell"
+target_entity = "Child"
+target_action = "Seal"
+
+[action.triggers.args]
+sealed_with = "value"
+
+[action.triggers.resolve_target]
+kind = "same_id"
+
+[[liveness]]
+name = "seals"
+eventually = "status == 'Closed' => (Child[Id].status == 'Sealed' && Child[Id].value == value)"
+relies_on = ["Close"]
+"#;
+    const CHILD: &str = r#"
+[automaton]
+name = "Child"
+states = ["Waiting", "Done", "Sealed"]
+initial = "Waiting"
+
+[[state]]
+name = "value"
+type = "string"
+initial = ""
+
+[[action]]
+name = "Copy"
+kind = "internal"
+from = ["Waiting"]
+to = "Done"
+params = [{ name = "value", type = "string" }]
+
+[[action]]
+name = "Seal"
+kind = "internal"
+from = ["Done"]
+to = "Sealed"
+params = [{ name = "sealed_with", type = "string" }]
+
+[[action.constraints]]
+kind = "param_equals_field"
+param = "sealed_with"
+field = "value"
+
+[[action.constraints]]
+kind = "param_nonempty"
+param = "sealed_with"
+"#;
+    let policies = r#"
+permit(principal, action in [Action::"Set", Action::"Close"], resource);
+permit(principal == Agent::"service:tell", action in [Action::"Copy", Action::"Seal"], resource is Child);
+"#;
+    // Constraining the original input to nonblank is a positive control:
+    // its copy must still settle, including when it uses a fresh symbol.
+    for nonblank_input in [false, true] {
+        let parent = if nonblank_input {
+            PARENT.replace(
+                "[[action.triggers]]\nname = \"copy\"",
+                "[[action.constraints]]\nkind = \"param_nonempty\"\nparam = \"value\"\n\n[[action.triggers]]\nname = \"copy\"",
+            )
+        } else {
+            PARENT.to_string()
+        };
+        let automatons = parse(&[&parent, CHILD]);
+        let refs: Vec<&Automaton> = automatons.iter().collect();
+        let analysis = SendAnalysis::new(policies).unwrap();
+        let mut results = verify_joint_liveness(
+            &refs,
+            Some(&analysis),
+            Budget {
+                time: Duration::from_secs(30),
+                states: 100_000,
+            },
+        );
+        assert_eq!(results.len(), 1);
+        let result = results.remove(0);
+        if nonblank_input {
+            assert!(result.holds(), "nonblank input: {result}");
+        } else {
+            assert!(
+                matches!(result.outcome, LivenessOutcome::Stuck { .. }),
+                "whitespace input must be able to get stuck: {result}"
+            );
+        }
+    }
+}
