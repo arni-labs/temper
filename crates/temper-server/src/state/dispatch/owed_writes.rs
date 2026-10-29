@@ -8,7 +8,9 @@
 //! [`LAST_RETRY_WAIT`], until it lands or fails for another reason. Any
 //! other failure (Cedar, a guard or the record's state refusing it, an actor
 //! whose mailbox is full) is final, and each owed write handles it as it did
-//! before. A scheduled action's fire waits the same way.
+//! before. A scheduled action's fire waits the same way. A state timer keeps
+//! its own retry loop (`state_timer_fire`), with the dispatch retry wait and
+//! its gate on every attempt; its retained write is tracked here too.
 //!
 //! Every try carries the same idempotency key, derived from the key the move
 //! committed under and the owed write's identity (a timer's fire, from its
@@ -227,16 +229,8 @@ impl ServerState {
                 "owed write not kept: without an idempotency key a try could apply it twice");
             return;
         };
-        {
-            let mut held = self
-                .owed_writes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if held.contains_key(&key) {
-                return;
-            }
-            held.insert(key.clone(), owed.clone());
-            metrics::record_held(held.len());
+        if !self.track_owed_write(&key, owed.clone()) {
+            return;
         }
         tracing::warn!(tenant = %owed.tenant, entity_type = %owed.entity_type,
             entity_id = %owed.entity_id, owed_write = owed.kind.as_str(), idempotency_key = %key,
@@ -272,14 +266,33 @@ impl ServerState {
                     }
                 }
             }
-            let mut held = state
-                .owed_writes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            held.remove(&key);
-            metrics::record_held(held.len());
+            state.untrack_owed_write(&key);
         };
         tokio::spawn(retries.instrument(span)); // determinism-ok: an owed write's retries are a background side-effect
+    }
+
+    /// Track a retained write, including one whose timer task owns its retries.
+    pub(super) fn track_owed_write(&self, key: &str, owed: OwedWrite) -> bool {
+        let mut held = self
+            .owed_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if held.contains_key(key) {
+            return false;
+        }
+        held.insert(key.to_string(), owed);
+        metrics::record_held(held.len());
+        true
+    }
+
+    /// Stop tracking a retained write once it lands or ends.
+    pub(super) fn untrack_owed_write(&self, key: &str) {
+        let mut held = self
+            .owed_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        held.remove(key);
+        metrics::record_held(held.len());
     }
 
     /// Log and count each owed write still held as the process stops, so a

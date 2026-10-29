@@ -51,7 +51,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
-use tracing::Instrument;
 
 use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
@@ -59,10 +58,8 @@ use temper_runtime::tenant::TenantId;
 use crate::entity_actor::{EntityEvent, EntityResponse, EntityState};
 use crate::idempotency::IdempotencyKey;
 use crate::request_context::{AgentContext, StateTimerFire};
-use crate::state::ServerState;
 
 use super::effects::PostDispatchContext;
-use super::owed_writes::{Attempt, OwedKind, OwedTry, OwedWrite};
 
 /// Walk the event history backward to find the timestamp of the most recent
 /// "progress" signal for the given state: either the transition that entered
@@ -146,6 +143,9 @@ struct ArmSeq {
     seq: u64,
     journal: u64,
     armed: Option<Box<ArmedTimer>>,
+    // The boot gate follows this record through resets and state entry, even
+    // while a durable transition invalidates its prior timer.
+    boot_gate: Option<Arc<Semaphore>>,
 }
 
 /// How an arm treats a timer the entity already has armed.
@@ -230,8 +230,17 @@ impl StateTimeoutTracker {
         }
         entry.seq += 1;
         entry.journal = journal;
+        entry.boot_gate = timer.boot_gate.clone().or_else(|| entry.boot_gate.clone());
         entry.armed = Some(Box::new(timer.clone()));
         Some(entry.seq)
+    }
+
+    fn boot_gate(&self, key: &EntityKey) -> Option<Arc<Semaphore>> {
+        self.seqs
+            .lock()
+            .expect("state_timeout tracker poisoned")
+            .get(key)
+            .and_then(|arm| arm.boot_gate.clone())
     }
 
     /// The timer the entity has armed now, if any.
@@ -481,15 +490,18 @@ impl crate::state::ServerState {
     /// write landed last, or is removed when no timer is armed.
     pub(super) async fn start_armed_timer(
         &self,
-        timer: ArmedTimer,
+        mut timer: ArmedTimer,
         delay: Duration,
         reservation: Reservation,
     ) -> bool {
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        timer.boot_gate = timer
+            .boot_gate
+            .or_else(|| self.state_timeout_tracker.boot_gate(&key));
         let Some(armed_seq) = self.state_timeout_tracker.reserve(&timer, reservation) else {
             return false;
         };
         self.persist_state_timer(&timer).await;
-        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
         if self.state_timeout_tracker.current(&key) != armed_seq {
             let mut written = timer.clone();
             loop {
@@ -573,7 +585,11 @@ impl crate::state::ServerState {
     /// the record in its state without resetting the clock: its fire
     /// committed, and a crash left the row behind before the timer ended. Such
     /// a timer fires once, so it does not fire again.
-    fn state_timer_already_fired(&self, timer: &ArmedTimer, current: &EntityState) -> bool {
+    pub(super) fn state_timer_already_fired(
+        &self,
+        timer: &ArmedTimer,
+        current: &EntityState,
+    ) -> bool {
         let ran_since = current
             .status_clock
             .actions
@@ -659,7 +675,7 @@ impl crate::state::ServerState {
 
     /// Whether the record's spec still declares `timer` for its state: the
     /// same action after the same budget.
-    fn declares_state_timer(&self, timer: &ArmedTimer) -> bool {
+    pub(super) fn declares_state_timer(&self, timer: &ArmedTimer) -> bool {
         let Ok(registry) = self.registry.read() else {
             return false;
         };
@@ -676,231 +692,26 @@ impl crate::state::ServerState {
             })
     }
 
-    /// Start one armed timer's task, with the cancellation value
-    /// [`Self::reserve_state_timer`] gave it: it waits `delay`, then fires the
-    /// timer's action as the timer's identity if no newer arm or state change
-    /// has superseded it, and removes the timer's durable row when it ends.
-    /// A fire the store failed is owed and fires again under the same key;
-    /// the timer, and its row, end once a fire lands or fails otherwise. With
-    /// a `gate`, the first fire waits for one of its permits and holds it
-    /// until it is answered.
-    pub(super) fn spawn_state_timer(
-        &self,
-        timer: ArmedTimer,
-        delay: Duration,
-        gate: Option<Arc<Semaphore>>,
-        armed_seq: u64,
-    ) {
-        let fire_key = timer.new_fire_key();
-        self.state_timeout_tracker.inc_pending(&timer.entity_type);
-        let workflow_root_entity_type = timer
-            .agent_ctx
-            .workflow_root_entity_type
-            .clone()
-            .unwrap_or_else(|| timer.entity_type.clone());
-        let workflow_root_entity_id = timer
-            .agent_ctx
-            .workflow_root_entity_id
-            .clone()
-            .unwrap_or_else(|| timer.entity_id.clone());
-        let workflow_run_id = timer
-            .agent_ctx
-            .workflow_run_id
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", timer.entity_type, timer.entity_id));
-
-        tracing::debug!(
-            tenant = %timer.tenant,
-            entity_type = %timer.entity_type,
-            entity_id = %timer.entity_id,
-            target_state = %timer.state,
-            target_action = %timer.action,
-            delay_ms = delay.as_millis() as u64,
-            workflow.root_entity_type = %workflow_root_entity_type,
-            workflow.root_entity_id = %workflow_root_entity_id,
-            workflow.run_id = %workflow_run_id,
-            "armed state timeout"
-        );
-
-        let state = self.clone();
-        let armed_by = crate::trace_context::cause();
-        tokio::spawn(async move {
-            // determinism-ok: wall-clock timer fires a side-effect action;
-            // the action itself is deterministic under DST via sim_now().
-            tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
-            let _permit = match gate {
-                Some(gate) => gate.acquire_owned().await.ok(),
-                None => None,
-            };
-
-            let span = crate::trace_context::runtime_work_span!(
-                armed_by,
-                "dispatch.state_timeout.fire",
-                tenant = %timer.tenant,
-                entity_type = %timer.entity_type,
-                entity_id = %timer.entity_id,
-                target_state = %timer.state,
-                target_action = %timer.action,
-                workflow.root_entity_type = %workflow_root_entity_type,
-                workflow.root_entity_id = %workflow_root_entity_id,
-                workflow.run_id = %workflow_run_id,
-            );
-
-            async move {
-                match state.fire_state_timer(&timer, armed_seq, &fire_key).await {
-                    Attempt::StoreFailed(error) => {
-                        state.keep_state_timer_fire(timer, armed_seq, fire_key, &error);
-                    }
-                    Attempt::Landed | Attempt::Failed(_) => {
-                        state.end_state_timer(&timer, armed_seq).await;
-                    }
-                }
-            }
-            .instrument(span)
-            .await;
-        });
-    }
-
-    /// Fire `timer` if it still belongs to its record. Sequence-based
-    /// cancellation first: a newer arm (or a state change that bumped the seq
-    /// on exit) renders this timer a no-op. Then the timer fires only on a
-    /// record still in its state, under a spec that still declares it: a
-    /// timer armed at boot has no other check against changes made before the
-    /// restart, and a record can rehydrate into another state after a spec
-    /// install. On a record that is no longer where this timer belongs, the
-    /// timer its current state declares is armed. Anything but a fire the
-    /// store failed ends the timer; a timer with nothing to fire has landed.
-    async fn fire_state_timer(
-        &self,
-        timer: &ArmedTimer,
-        armed_seq: u64,
-        fire_key: &IdempotencyKey,
-    ) -> Attempt {
-        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
-        if self.state_timeout_tracker.current(&key) != armed_seq {
-            return Attempt::Landed;
-        }
-        let Ok(current) = self
-            .get_tenant_entity_state(&timer.tenant, &timer.entity_type, &timer.entity_id)
-            .await
-        else {
-            return Attempt::Landed;
-        };
-        let belongs = current.state.status == timer.state && self.declares_state_timer(timer);
-        if !belongs {
-            let follow = super::state_timer_reconcile::Follow {
-                armed_by: Some(&timer.agent_ctx),
-                woke_for: Some(deadline(timer.started_at, timer.after_seconds)),
-                ..Default::default()
-            };
-            self.follow_owned_state_timer(
-                &timer.tenant,
-                &timer.entity_type,
-                &timer.entity_id,
-                &current.state,
-                follow,
-            )
-            .await;
-            return Attempt::Landed;
-        }
-        if current.state.sequence_nr > timer.sequence_nr {
-            self.follow_moved_record(timer, armed_seq, &current.state)
-                .await;
-            return Attempt::Landed;
-        }
-        if self.state_timer_already_fired(timer, &current.state) {
-            return Attempt::Landed;
-        }
-        crate::runtime_metrics::record_state_timeout_fired(
-            timer.tenant.as_str(),
+    /// Whether no newer arm or durable state exit superseded this timer.
+    pub(super) fn state_timer_is_current(&self, timer: &ArmedTimer, armed_seq: u64) -> bool {
+        self.state_timeout_tracker.current(&EntityKey::new(
+            &timer.tenant,
             &timer.entity_type,
-            &timer.state,
-            &timer.action,
-        );
-        // The fire applies only at the sequence this timer was armed at;
-        // another writer may commit first.
-        let options = super::DispatchExtOptions {
-            agent_ctx: &timer.fire_context(fire_key),
-            await_integration: false,
-            await_reactions: true,
-        };
-        let answer = self
-            .dispatch_tenant_action_ext_typed(
-                &timer.tenant,
-                &timer.entity_type,
-                &timer.entity_id,
-                &timer.action,
-                timer.params.clone(),
-                options,
-            )
-            .await;
-        if let Ok(answer) = &answer
-            && !answer.success
-            && answer.state.sequence_nr > timer.sequence_nr
-        {
-            self.follow_moved_record(timer, armed_seq, &answer.state)
-                .await;
-            return Attempt::Failed("the record moved past the timer's arming".into());
-        }
-        Attempt::of(&answer)
+            &timer.entity_id,
+        )) == armed_seq
     }
 
-    /// Keep a fire of `timer` the store failed as an owed write: it fires
-    /// again with the owed-write waits (`owed_writes`), under `fire_key`, and
-    /// its row stays until a fire lands or fails otherwise.
-    fn keep_state_timer_fire(
-        &self,
-        timer: ArmedTimer,
-        armed_seq: u64,
-        fire_key: IdempotencyKey,
-        error: &str,
-    ) {
-        let owed = OwedWrite {
-            tenant: timer.tenant.clone(),
-            entity_type: timer.entity_type.clone(),
-            entity_id: timer.entity_id.clone(),
-            kind: OwedKind::Timer,
-            key: Some(fire_key.clone()),
-        };
-        let timer = Arc::new(timer);
-        self.keep_owed_write(owed, error, move |state| {
-            fire_state_timer_again(state, Arc::clone(&timer), armed_seq, fire_key.clone())
-        });
-    }
-
-    /// End `timer`: remove its durable row and stop counting it as pending.
-    async fn end_state_timer(&self, timer: &ArmedTimer, armed_seq: u64) {
+    /// Whether a newer arm holds this timer's row under the same id: a
+    /// dispatch's arm that replaced a reconcile's for the same event. That
+    /// row is the newer timer's to end.
+    pub(super) fn state_timer_row_moved_on(&self, timer: &ArmedTimer, armed_seq: u64) -> bool {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
-        // A newer arm can hold this timer's row under the same id:
-        // a dispatch's arm that replaced a reconcile's for the same
-        // event. That row is the newer timer's to end.
-        let row_moved_on = self.state_timeout_tracker.current(&key) != armed_seq
+        self.state_timeout_tracker.current(&key) != armed_seq
             && self
                 .state_timeout_tracker
                 .armed(&key)
-                .is_some_and(|armed| armed.arm_id == timer.arm_id);
-        if !row_moved_on {
-            self.forget_state_timer(timer).await;
-        }
-        self.state_timeout_tracker.dec_pending(&timer.entity_type);
+                .is_some_and(|armed| armed.arm_id == timer.arm_id)
     }
-}
-
-/// Fire an owed state timer again, and end it once a fire lands or fails
-/// for a reason other than the store's.
-fn fire_state_timer_again(
-    state: ServerState,
-    timer: Arc<ArmedTimer>,
-    armed_seq: u64,
-    fire_key: IdempotencyKey,
-) -> OwedTry {
-    Box::pin(async move {
-        let fire = state.fire_state_timer(&timer, armed_seq, &fire_key).await;
-        if !matches!(fire, Attempt::StoreFailed(_)) {
-            state.end_state_timer(&timer, armed_seq).await;
-        }
-        fire
-    })
 }
 
 /// One armed timer: what fires, when its state's clock started, and who it
@@ -943,7 +754,7 @@ impl ArmedTimer {
     /// the same arming, and the one whose fire did not commit then meets the
     /// other's key, not its own, so it is refused as past the arming rather
     /// than answered as a duplicate whose effects it would run a second time.
-    fn new_fire_key(&self) -> IdempotencyKey {
+    pub(super) fn new_fire_key(&self) -> IdempotencyKey {
         IdempotencyKey::Request(format!("state-timer:{}:{}", self.arm_id, sim_uuid()))
     }
 
@@ -951,7 +762,7 @@ impl ArmedTimer {
     /// marked as the fire of the arming at its journal sequence, which the
     /// record's actor applies only while the record is still at that
     /// sequence, and with its cause.
-    fn fire_context(&self, fire_key: &IdempotencyKey) -> AgentContext {
+    pub(super) fn fire_context(&self, fire_key: &IdempotencyKey) -> AgentContext {
         let mut agent = self.agent_ctx.clone();
         agent.idempotency_key = Some(fire_key.clone());
         super::timer_cause::mark_timer_fire(&mut agent);
