@@ -7,7 +7,9 @@
 //! someone dispatched its action by hand. Owed writes (#216, #217) keep a
 //! fire the store failed, whose ask timed out or whose actor stopped; these
 //! cases are the other ways a fire gets no answer. Admission defers it: the
-//! one permit `Expire` admits is held, as by a dispatch still in flight.
+//! one permit `Expire` admits is held, as by a dispatch still in flight. Or
+//! the record cannot be read: its journal fails every read while its actor
+//! is not loaded.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -235,4 +237,60 @@ fn a_later_answer_ends_a_kept_fire() {
         });
         process.kill(&world, Duration::ZERO);
     }
+}
+
+/// A fire whose record cannot be read got no answer: the timer keeps its row
+/// and fires once reads return. Before, the failed read ended the timer.
+#[test]
+fn a_fire_on_a_record_that_cannot_be_read_is_tried_again() {
+    let seed = 109;
+    let clock = Arc::new(ProcessClock::new());
+    let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+    let (world, process, job) = started(seed, clock, JOB_V1, "unreadable");
+    let journal = format!("{}:Job:{}", job.tenant, job.id);
+    process.runtime.block_on(async {
+        let state = &process.state;
+        let first = world
+            .rows
+            .row("gamma", &job.id)
+            .expect("Start arms Waiting's timer");
+        // Unload the record, so its fire must read the journal to start it.
+        advance(Duration::from_secs(301)).await;
+        while state.passivate_idle_actors().await > 0 {}
+        settle().await;
+        assert_eq!(
+            state.active_actor_count(),
+            0,
+            "the record is unloaded (harness)"
+        );
+
+        world.events.fail_next_reads(&journal, usize::MAX);
+        advance(PAST_THE_BUDGET).await;
+        // Let the fire's read fail for good: the actor's starts fail and its
+        // ask is answered, as the paused clock moves.
+        for _ in 0..20 {
+            advance(Duration::from_secs(30)).await;
+        }
+        assert!(
+            status(state, &job).await.starts_with("<unreadable"),
+            "the record cannot be read (harness)"
+        );
+        let kept = world
+            .rows
+            .row("gamma", &job.id)
+            .expect("a fire on an unreadable record keeps its timer");
+        assert_eq!(kept.arm_id, first.arm_id);
+
+        world.events.fail_next_reads(&journal, 0);
+        advance(PAST_THE_BUDGET).await;
+        for _ in 0..4 {
+            advance(Duration::from_secs(30)).await;
+        }
+        assert_eq!(status(state, &job).await, "Done");
+        assert!(
+            world.rows.row("gamma", &job.id).is_none(),
+            "the timer ended once its fire landed"
+        );
+    });
+    process.kill(&world, Duration::ZERO);
 }

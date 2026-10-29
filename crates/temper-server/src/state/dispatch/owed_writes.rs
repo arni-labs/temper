@@ -8,7 +8,10 @@
 //! [`LAST_RETRY_WAIT`], until it lands or fails for another reason. Any
 //! other failure (Cedar, a guard or the record's state refusing it, an actor
 //! whose mailbox is full) is final, and each owed write handles it as it did
-//! before. A scheduled action's fire waits the same way.
+//! before. A state timer's fire is the exception: it is kept through every
+//! error a retry can change, a deferred admission and a full mailbox
+//! included, since nothing else fires it again (`state_timeouts::fire_attempt`).
+//! A scheduled action's fire waits the same way.
 //!
 //! Every try carries the same idempotency key, derived from the key the move
 //! committed under and the owed write's identity (a timer's fire, from its

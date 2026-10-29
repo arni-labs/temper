@@ -31,6 +31,13 @@
 //! waiting row again: for the rest of its budget, or at once if it fell due
 //! while the server was down. A timer fires once and as whoever armed it.
 //!
+//! A fire ends its timer once the record answers it, a guard's refusal
+//! included, or once it fails in a way no retry changes (a Cedar denial).
+//! A fire that got no answer (the store failed it, the record could not be
+//! read, admission deferred it, the actor's mailbox was full or it did not
+//! reply) is owed and fired again (`owed_writes.rs`): nothing else would,
+//! and the record would sit in its state until someone moved it.
+//!
 //! The arm logic also detects the **hydration case**: the entity is in a
 //! state with a declared timeout but has no live in-memory timer (seq == 0 in
 //! the tracker), as for a timer armed before its row was kept. Then the
@@ -61,6 +68,7 @@ use crate::idempotency::IdempotencyKey;
 use crate::request_context::{AgentContext, StateTimerFire};
 use crate::state::ServerState;
 
+use super::DispatchError;
 use super::effects::PostDispatchContext;
 use super::owed_writes::{Attempt, OwedKind, OwedTry, OwedWrite};
 
@@ -680,10 +688,11 @@ impl crate::state::ServerState {
     /// [`Self::reserve_state_timer`] gave it: it waits `delay`, then fires the
     /// timer's action as the timer's identity if no newer arm or state change
     /// has superseded it, and removes the timer's durable row when it ends.
-    /// A fire the store failed is owed and fires again under the same key;
-    /// the timer, and its row, end once a fire lands or fails otherwise. With
-    /// a `gate`, the first fire waits for one of its permits and holds it
-    /// until it is answered.
+    /// A fire that got no answer ([`fire_attempt`]) is owed and fires again
+    /// under the same key; the timer, and its row, end once its record answers
+    /// a fire or a fire fails in a way no retry changes. With a `gate`, the
+    /// first fire waits for one of its permits and holds it until it is
+    /// answered.
     pub(super) fn spawn_state_timer(
         &self,
         timer: ArmedTimer,
@@ -768,8 +777,10 @@ impl crate::state::ServerState {
     /// timer armed at boot has no other check against changes made before the
     /// restart, and a record can rehydrate into another state after a spec
     /// install. On a record that is no longer where this timer belongs, the
-    /// timer its current state declares is armed. Anything but a fire the
-    /// store failed ends the timer; a timer with nothing to fire has landed.
+    /// timer its current state declares is armed. A record that could not be
+    /// read, or a fire that got no answer, keeps the fire ([`fire_attempt`]);
+    /// anything else ends the timer, and a timer with nothing to fire has
+    /// landed.
     async fn fire_state_timer(
         &self,
         timer: &ArmedTimer,
@@ -780,11 +791,14 @@ impl crate::state::ServerState {
         if self.state_timeout_tracker.current(&key) != armed_seq {
             return Attempt::Landed;
         }
-        let Ok(current) = self
-            .get_tenant_entity_state(&timer.tenant, &timer.entity_type, &timer.entity_id)
+        let current = match self
+            .ask_tenant_entity_state(&timer.tenant, &timer.entity_type, &timer.entity_id)
             .await
-        else {
-            return Attempt::Landed;
+        {
+            Ok(current) => current,
+            // A spec that no longer declares the timer leaves nothing to fire.
+            Err(_) if !self.declares_state_timer(timer) => return Attempt::Landed,
+            Err(error) => return fire_attempt(&Err(error)),
         };
         let belongs = current.state.status == timer.state && self.declares_state_timer(timer);
         if !belongs {
@@ -842,12 +856,13 @@ impl crate::state::ServerState {
                 .await;
             return Attempt::Failed("the record moved past the timer's arming".into());
         }
-        Attempt::of(&answer)
+        fire_attempt(&answer)
     }
 
-    /// Keep a fire of `timer` the store failed as an owed write: it fires
+    /// Keep a fire of `timer` that got no answer as an owed write: it fires
     /// again with the owed-write waits (`owed_writes`), under `fire_key`, and
-    /// its row stays until a fire lands or fails otherwise.
+    /// its row stays until a fire lands, is answered, or fails in a way no
+    /// retry changes.
     fn keep_state_timer_fire(
         &self,
         timer: ArmedTimer,
@@ -886,8 +901,24 @@ impl crate::state::ServerState {
     }
 }
 
-/// Fire an owed state timer again, and end it once a fire lands or fails
-/// for a reason other than the store's.
+/// What a fire's `reply`, or the failed read of its record, says about its
+/// timer. An answer reads as for every owed write ([`Attempt::of`]): one
+/// the store failed keeps the fire, and any other (landed, or a guard's
+/// refusal) ends the timer. An error ends it only when no retry changes it
+/// ([`DispatchError::is_final`]: a denial, a type no spec governs). Unlike
+/// other owed writes, every other error keeps the fire, not only the
+/// store's: admission that deferred it or a full mailbox kept it from the
+/// record, and nothing else fires the timer again. Each try carries the
+/// fire's key, so one that landed unseen is answered as a duplicate.
+fn fire_attempt(reply: &Result<EntityResponse, DispatchError>) -> Attempt {
+    match reply {
+        Err(error) if !error.is_final() => Attempt::StoreFailed(error.to_string()),
+        reply => Attempt::of(reply),
+    }
+}
+
+/// Fire an owed state timer again, and end it once a fire lands, is
+/// answered, or fails in a way no retry changes.
 fn fire_state_timer_again(
     state: ServerState,
     timer: Arc<ArmedTimer>,
@@ -1217,6 +1248,33 @@ mod tests {
             rows.row.lock().unwrap().is_none(),
             "cancelled repair row must be removed"
         );
+    }
+
+    /// Every error a retry can change keeps a timer's fire, not only the
+    /// store's; one no retry changes ends the timer.
+    #[test]
+    fn a_fire_without_an_answer_is_kept_unless_its_error_is_final() {
+        use temper_runtime::actor::ActorError;
+        let kept =
+            |error: DispatchError| matches!(fire_attempt(&Err(error)), Attempt::StoreFailed(_));
+        assert!(kept(DispatchError::Deferred { retry_after_ms: 0 }));
+        assert!(kept(DispatchError::from_actor_error(
+            ActorError::MailboxFull,
+            3
+        )));
+        assert!(kept(DispatchError::from_actor_error(
+            ActorError::AskTimeout(Duration::from_secs(5)),
+            3
+        )));
+        assert!(kept(DispatchError::from_actor_error(
+            ActorError::Stopped,
+            1
+        )));
+        assert!(kept(DispatchError::StoreUnavailable("down".into())));
+        assert!(!kept(DispatchError::AuthzDenied(
+            "no policy permits it".into()
+        )));
+        assert!(!kept(DispatchError::Ungoverned("Gone".into())));
     }
 
     #[test]
