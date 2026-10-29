@@ -1,7 +1,9 @@
 //! Checks a parsed spec must pass before it is installed: declared states,
-//! predicates and effects, state timeouts, triggers, webhooks and vectors.
+//! predicates and effects, state timeouts, triggers, webhooks, vectors and
+//! the statechart labels.
 
 mod carries;
+mod groups;
 mod triggers;
 mod webhooks;
 
@@ -155,6 +157,10 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     //    - names must be unique (each identifies one index partition + `decl=`).
     validate_vector_decls(automaton)?;
     carries::validate_carries(automaton)?;
+
+    // 8. Statechart labels: `says` is one line; `[[group]]` boxes form a tree.
+    groups::validate_says(automaton)?;
+    groups::validate_groups(automaton)?;
 
     Ok(())
 }
