@@ -189,6 +189,23 @@ mod tests {
     }
 
     #[test]
+    fn secret_version_id_exists_on_both_schema_paths() {
+        // A conditional secret write compares this column; a store missing it
+        // refuses every If-Match and fails every write that names it.
+        let migration = include_str!("../migrations/0021_tenant_secret_version_id.sql");
+        assert!(
+            migration
+                .contains("ADD COLUMN IF NOT EXISTS version_id TEXT DEFAULT gen_random_uuid()"),
+            "migration 0021 must add a random version id to every secret row"
+        );
+        assert!(
+            schema::CREATE_TENANT_SECRETS_TABLE
+                .contains("version_id  TEXT         DEFAULT gen_random_uuid()"),
+            "a freshly bootstrapped tenant_secrets table must carry the version id"
+        );
+    }
+
+    #[test]
     fn ots_trajectory_identity_is_tenant_scoped_on_both_schema_paths() {
         // A fresh bootstrap reads schema.rs and an existing database reads the
         // migration. Whichever path keeps the global key lets one tenant's

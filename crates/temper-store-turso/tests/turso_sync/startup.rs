@@ -272,3 +272,52 @@ async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
             .any(|spec| spec.entity_type == "Note" && spec.ioa_source == "v1")
     );
 }
+
+#[tokio::test]
+async fn reopening_versioned_secrets_adds_no_change_log_rows() {
+    use temper_runtime::persistence::{SecretPrecondition, SecretWrite};
+
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    for with_secret in [false, true] {
+        let (_dir, path) = machine();
+        let store = server.open(&path).await;
+        if with_secret {
+            assert!(
+                store
+                    .write_secret(&SecretWrite {
+                        tenant: "tenant-a",
+                        key_name: "signin",
+                        ciphertext: b"encrypted",
+                        nonce: b"nonce",
+                        version_id: "original-version",
+                        precondition: SecretPrecondition::Absent,
+                    })
+                    .await
+                    .expect("write secret")
+            );
+        }
+        push(&store).await;
+        let versions = store.list_secret_versions("tenant-a").await.unwrap();
+        let copy = store.sync_copy().expect("copy");
+        let rows = copy.change_log_rows().await.unwrap();
+        let newest = copy.last_change().await.unwrap();
+        drop(store);
+
+        for _ in 0..2 {
+            let store = server.open(&path).await;
+            let copy = store.sync_copy().expect("copy");
+            assert_eq!(
+                copy.change_log_rows().await.unwrap(),
+                rows,
+                "a secret backfill with no missing versions must not write to the change log"
+            );
+            assert_eq!(copy.last_change().await.unwrap(), newest);
+            assert_eq!(
+                store.list_secret_versions("tenant-a").await.unwrap(),
+                versions
+            );
+        }
+    }
+}

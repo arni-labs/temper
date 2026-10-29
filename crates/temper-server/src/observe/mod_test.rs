@@ -2302,6 +2302,9 @@ async fn test_evolution_insights_empty() {
 #[path = "mod_test/load_dir_tests.rs"]
 mod load_dir_tests;
 
+#[path = "mod_test/chart_tests.rs"]
+mod chart_tests;
+
 #[path = "mod_test/history_test.rs"]
 mod history_test;
 

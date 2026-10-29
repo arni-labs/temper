@@ -562,6 +562,7 @@ async fn test_install_plan_without_spec_phase_does_not_reclassify_specs() {
             content: false,
             seed: false,
         },
+        InstallOrigin::Request,
     )
     .await
     .expect("planned no-op install should succeed");
@@ -1068,6 +1069,7 @@ async fn test_install_fails_when_app_required_wasm_missing() {
             content: false,
             seed: false,
         },
+        InstallOrigin::Request,
     )
     .await;
 
@@ -1150,6 +1152,7 @@ async fn test_install_proceeds_when_optional_wasm_missing() {
             content: false,
             seed: false,
         },
+        InstallOrigin::Request,
     )
     .await;
 

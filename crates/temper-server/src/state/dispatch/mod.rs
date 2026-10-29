@@ -31,6 +31,7 @@ pub use outside_write::StaleWrite;
 pub(crate) mod retry;
 mod scheduled_actions;
 pub(crate) mod state_timeouts;
+mod state_timer_fire;
 mod state_timer_follow;
 mod state_timer_reconcile;
 mod state_timer_rows;

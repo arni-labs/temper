@@ -52,7 +52,7 @@ pub use pending_decisions::{
     ActionScope, DecisionStatus, DurationScope, PendingDecision, PolicyScopeMatrix, PrincipalScope,
     ResourceScope,
 };
-pub use persistence::WasmModuleSource;
+pub use persistence::{SecretWriteOutcome, WasmModuleSource};
 pub use policy_suggestions::PolicySuggestionEngine;
 pub use published_artifacts::PublishFileArtifactRequest;
 #[cfg(feature = "observe")]

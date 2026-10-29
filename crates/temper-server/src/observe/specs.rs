@@ -139,6 +139,7 @@ pub(crate) async fn handle_get_spec_detail(
                             })
                             .collect(),
                         hint: a.hint.clone().unwrap_or_default(),
+                        says: a.says.clone(),
                     })
                     .collect(),
                 invariants: automaton
@@ -162,6 +163,7 @@ pub(crate) async fn handle_get_spec_detail(
                         query_indexed: sv.query_indexed,
                     })
                     .collect(),
+                groups: automaton.groups.clone(),
             };
             return Ok(Json(detail));
         }
