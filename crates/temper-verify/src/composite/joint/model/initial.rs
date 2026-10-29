@@ -1,4 +1,4 @@
-//! Initial ID equality classes, including distinguished concrete strings.
+//! Initial ID equality classes, including concrete strings and blank symbols.
 
 use super::*;
 
@@ -28,29 +28,66 @@ impl JointModel {
         }
         literals.remove("");
         let literals: Vec<_> = literals.into_iter().map(ModelString::from).collect();
-        Box::new(partitions(blank.len(), literals.len()).map(move |blocks| {
-            let mut records = blank.clone();
-            for (record, block) in records.values_mut().zip(blocks) {
-                record.strings.insert(
-                    ID.to_string(),
-                    literals
-                        .get(block)
-                        .cloned()
-                        .unwrap_or_else(|| ModelString::Symbol(block - literals.len() + 1)),
-                );
-            }
-            let mut state = JointState {
-                records,
-                inflight: Vec::new(),
-                calls: Vec::new(),
-                armed: BTreeMap::new(),
-            };
-            self.arm_at_start(&mut state);
-            self.order.normalize(&mut state);
-            canonical(&mut state);
-            state
-        }))
+        Box::new(
+            partitions(blank.len(), literals.len())
+                .flat_map(move |blocks| id_values(blocks, literals.clone()))
+                .map(move |ids| {
+                    let mut records = blank.clone();
+                    for (record, id) in records.values_mut().zip(ids) {
+                        record.strings.insert(ID.to_string(), id);
+                    }
+                    let mut state = JointState {
+                        records,
+                        inflight: Vec::new(),
+                        calls: Vec::new(),
+                        armed: BTreeMap::new(),
+                    };
+                    self.arm_at_start(&mut state);
+                    self.order.normalize(&mut state);
+                    canonical(&mut state);
+                    state
+                }),
+        )
     }
+}
+
+/// Each fresh ID equality class may be nonblank or whitespace-only. Equal
+/// IDs share that choice; literal classes retain their concrete values.
+fn id_values(
+    blocks: Vec<usize>,
+    literals: Vec<ModelString>,
+) -> impl Iterator<Item = Vec<ModelString>> {
+    let symbols = blocks
+        .iter()
+        .max()
+        .map_or(0, |last| (last + 1).saturating_sub(literals.len()));
+    let mut blank = vec![false; symbols];
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let ids = blocks
+            .iter()
+            .map(|&block| {
+                literals.get(block).cloned().unwrap_or_else(|| {
+                    let symbol = block - literals.len();
+                    if blank[symbol] {
+                        ModelString::BlankSymbol(symbol + 1)
+                    } else {
+                        ModelString::Symbol(symbol + 1)
+                    }
+                })
+            })
+            .collect();
+        if let Some(index) = blank.iter().rposition(|is_blank| !is_blank) {
+            blank[index] = true;
+            blank[index + 1..].fill(false);
+        } else {
+            done = true;
+        }
+        Some(ids)
+    })
 }
 
 /// Every way to split `n` items into blocks, as each item's block number,
@@ -83,8 +120,51 @@ fn partitions(n: usize, fixed: usize) -> impl Iterator<Item = Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::partitions;
+    use super::{ModelString, id_values, partitions};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn equal_ids_share_blankness_and_distinct_ids_choose_it_independently() {
+        use ModelString::{BlankSymbol as B, Symbol as S};
+        assert_eq!(
+            id_values(vec![0, 0], vec![]).collect::<Vec<_>>(),
+            vec![vec![S(1), S(1)], vec![B(1), B(1)]],
+        );
+        assert_eq!(
+            id_values(vec![0, 1], vec![]).collect::<Vec<_>>(),
+            vec![
+                vec![S(1), S(2)],
+                vec![S(1), B(2)],
+                vec![B(1), S(2)],
+                vec![B(1), B(2)],
+            ],
+        );
+    }
+
+    #[test]
+    fn literal_ids_keep_their_values_alongside_both_symbol_kinds() {
+        let literals = vec![ModelString::from("known"), ModelString::from(" ")];
+        assert_eq!(
+            id_values(vec![0, 1, 2], literals.clone()).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    literals[0].clone(),
+                    literals[1].clone(),
+                    ModelString::Symbol(1)
+                ],
+                vec![
+                    literals[0].clone(),
+                    literals[1].clone(),
+                    ModelString::BlankSymbol(1)
+                ],
+            ],
+        );
+        assert_eq!(
+            id_values(vec![0, 1], literals.clone()).collect::<Vec<_>>(),
+            vec![literals],
+        );
+        assert_eq!(id_values(vec![], vec![]).count(), 1);
+    }
 
     #[test]
     fn literal_blocks_and_fresh_equalities_are_all_explored() {

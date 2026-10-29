@@ -179,11 +179,8 @@ fn a_whitespace_only_parameter_cannot_prove_a_reaction_settles() {
     }
 }
 
-/// Whitespace arrives from an unconstrained input, then survives a copy.
-/// There is deliberately no whitespace literal anywhere in either spec.
-#[test]
-fn an_unconstrained_input_can_copy_whitespace_that_prevents_sealing() {
-    const PARENT: &str = r#"
+/// A value copied once, then used to seal after the copy has arrived.
+const COPYING_PARENT: &str = r#"
 [automaton]
 name = "Parent"
 states = ["New", "Open", "Closed"]
@@ -239,7 +236,7 @@ name = "seals"
 eventually = "status == 'Closed' => (Child[Id].status == 'Sealed' && Child[Id].value == value)"
 relies_on = ["Close"]
 "#;
-    const CHILD: &str = r#"
+const COPYING_CHILD: &str = r#"
 [automaton]
 name = "Child"
 states = ["Waiting", "Done", "Sealed"]
@@ -273,6 +270,10 @@ field = "value"
 kind = "param_nonempty"
 param = "sealed_with"
 "#;
+/// Whitespace arrives from an unconstrained input, then survives a copy.
+/// There is deliberately no whitespace literal anywhere in either spec.
+#[test]
+fn an_unconstrained_input_can_copy_whitespace_that_prevents_sealing() {
     let policies = r#"
 permit(principal, action in [Action::"Set", Action::"Close"], resource);
 permit(principal == Agent::"service:tell", action in [Action::"Copy", Action::"Seal"], resource is Child);
@@ -281,14 +282,14 @@ permit(principal == Agent::"service:tell", action in [Action::"Copy", Action::"S
     // its copy must still settle, including when it uses a fresh symbol.
     for nonblank_input in [false, true] {
         let parent = if nonblank_input {
-            PARENT.replace(
+            COPYING_PARENT.replace(
                 "[[action.triggers]]\nname = \"copy\"",
                 "[[action.constraints]]\nkind = \"param_nonempty\"\nparam = \"value\"\n\n[[action.triggers]]\nname = \"copy\"",
             )
         } else {
-            PARENT.to_string()
+            COPYING_PARENT.to_string()
         };
-        let automatons = parse(&[&parent, CHILD]);
+        let automatons = parse(&[&parent, COPYING_CHILD]);
         let refs: Vec<&Automaton> = automatons.iter().collect();
         let analysis = SendAnalysis::new(policies).unwrap();
         let mut results = verify_joint_liveness(
@@ -308,6 +309,52 @@ permit(principal == Agent::"service:tell", action in [Action::"Copy", Action::"S
                 matches!(result.outcome, LivenessOutcome::Stuck { .. }),
                 "whitespace input must be able to get stuck: {result}"
             );
+        }
+    }
+}
+
+/// An ID is another unconstrained string source: whitespace must survive
+/// copying from it even when neither spec contains a whitespace literal.
+#[test]
+fn a_whitespace_only_id_can_copy_a_value_that_prevents_sealing() {
+    let parent = COPYING_PARENT
+        .replace("params = [{ name = \"value\", type = \"string\" }]", "")
+        .replace("value = \"value\"", "value = \"Id\"")
+        .replace("sealed_with = \"value\"", "sealed_with = \"Id\"")
+        .replace(" && value != ''", "")
+        .replace(
+            "(Child[Id].status == 'Sealed' && Child[Id].value == value)",
+            "(Child[Id].status == 'Sealed' && Child[Id].value != '')",
+        );
+    let analysis = SendAnalysis::new(ONLY_TELL_REACHES_THE_CHILD).unwrap();
+    for nonempty in [false, true] {
+        let child = if nonempty {
+            COPYING_CHILD.to_string()
+        } else {
+            COPYING_CHILD.replace(
+                "[[action.constraints]]\nkind = \"param_nonempty\"\nparam = \"sealed_with\"\n",
+                "",
+            )
+        };
+        let automatons = parse(&[&parent, &child]);
+        let refs: Vec<&Automaton> = automatons.iter().collect();
+        let results = verify_joint_liveness(
+            &refs,
+            Some(&analysis),
+            Budget {
+                time: Duration::from_secs(30),
+                states: 100_000,
+            },
+        );
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        if nonempty {
+            assert!(
+                matches!(result.outcome, LivenessOutcome::Stuck { .. }),
+                "whitespace ID must be able to get stuck: {result}"
+            );
+        } else {
+            assert!(result.holds(), "without nonempty, all IDs seal: {result}");
         }
     }
 }
