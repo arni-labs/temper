@@ -162,6 +162,90 @@ fn detached_boundary_preserves_authority_and_idempotency() {
     );
 }
 
+#[test]
+fn immediate_scheduled_follow_ons_keep_the_parent_lineage_and_clocked_ones_start_fresh() {
+    let context = AgentContext {
+        callback_hops: MAX_CALLBACK_HOPS - 1,
+        idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+            "press-once".into(),
+        )),
+        ..AgentContext::for_service("invoker")
+    }
+    .entering("Bell", "b1", "Press");
+    let immediate = context.for_scheduled_follow_on("Ring", 0, 0);
+    assert!(!context.inline_chain.is_empty());
+    assert!(immediate.inline_chain.is_empty());
+    assert_eq!(immediate.callback_hops, context.callback_hops);
+
+    let clocked = context.for_scheduled_follow_on("Ring", 0, 1);
+    assert!(clocked.inline_chain.is_empty());
+    assert_eq!(clocked.callback_hops, 0);
+    assert_eq!(clocked.agent_id, context.agent_id);
+    assert_eq!(clocked.agent_type, context.agent_type);
+}
+
+#[test]
+fn a_scheduled_follow_on_has_a_key_of_its_own_that_a_retry_derives_again() {
+    let context = AgentContext {
+        idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+            "press-once".into(),
+        )),
+        ..AgentContext::default()
+    };
+    let first = context
+        .for_scheduled_follow_on("Ring", 0, 1)
+        .idempotency_key;
+    // The parent's key is the scheduling transition's; reusing it would
+    // answer the follow-on with that transition's reply.
+    assert_ne!(first, context.idempotency_key);
+    assert_eq!(
+        first,
+        context
+            .for_scheduled_follow_on("Ring", 0, 1)
+            .idempotency_key
+    );
+    assert_ne!(
+        first,
+        context
+            .for_scheduled_follow_on("Ring", 1, 1)
+            .idempotency_key
+    );
+    assert_eq!(
+        AgentContext::default()
+            .for_scheduled_follow_on("Ring", 0, 1)
+            .idempotency_key,
+        None
+    );
+}
+
+#[test]
+fn a_scheduled_rows_context_keeps_its_lineage_and_key_after_recovery() {
+    use super::armed_by::{decode_armed_by, encode_armed_by, encode_scheduled_armed_by};
+    use crate::idempotency::IdempotencyKey;
+
+    let parent = AgentContext {
+        callback_hops: MAX_CALLBACK_HOPS - 1,
+        idempotency_key: Some(IdempotencyKey::Request("press-once".into())),
+        ..AgentContext::for_service("invoker")
+    };
+    for delay in [0, 1] {
+        let child = parent.for_scheduled_follow_on("Ring", 0, delay);
+        let recovered = decode_armed_by(&encode_scheduled_armed_by(&child).unwrap()).unwrap();
+        assert_eq!(recovered.callback_hops, child.callback_hops);
+        assert_eq!(recovered.idempotency_key, child.idempotency_key);
+        assert_eq!(recovered.agent_id, child.agent_id);
+        assert_eq!(
+            serde_json::to_value(recovered.security_ctx).unwrap(),
+            serde_json::to_value(child.security_ctx).unwrap()
+        );
+    }
+    // State timer rows, including old rows without the optional causal context,
+    // still begin a fresh action.
+    let state_timer = decode_armed_by(&encode_armed_by(&parent).unwrap()).unwrap();
+    assert_eq!(state_timer.callback_hops, 0);
+    assert!(state_timer.idempotency_key.is_none());
+}
+
 /// An answer keeps its caller and its derived key, without firing the timer
 /// or scheduled action that the caller fired a second time.
 #[test]

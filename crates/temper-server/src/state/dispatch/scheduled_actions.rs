@@ -16,8 +16,9 @@
 //! A fire runs as whoever armed it. The event it writes removes its row in the
 //! same commit, so a row is removed only once its action has committed, and a
 //! restart cannot fire it twice. A fire whose write failed or may have landed
-//! keeps its row and is retried on it, with the same idempotency key from the
-//! arm id and the waits of an owed write (`owed_writes`): a write that did
+//! keeps its row and is retried on it, with the same idempotency key derived
+//! from the parent request (or the arm id for an unkeyed parent) and the waits
+//! of an owed write (`owed_writes`): a write that did
 //! land is a duplicate and does not run again. A refused fire is final: it is
 //! logged here, its dispatch records it in the record's trajectory like any
 //! refused action, and then its row is removed. So is a fire whose dispatch
@@ -85,14 +86,18 @@ impl ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
-        for scheduled in &response.scheduled_actions {
+        for (index, scheduled) in response.scheduled_actions.iter().enumerate() {
             let timer = ScheduledTimer {
                 tenant: ctx.tenant.clone(),
                 entity_type: ctx.entity_type.to_string(),
                 entity_id: ctx.entity_id.to_string(),
                 arm_id: scheduled.arm_id.clone(),
                 action: scheduled.action.clone(),
-                agent_ctx: ctx.agent_ctx.for_background_task(),
+                agent_ctx: ctx.agent_ctx.for_scheduled_follow_on(
+                    &scheduled.action,
+                    index,
+                    scheduled.delay_seconds,
+                ),
             };
             self.spawn_scheduled_action(timer, Duration::from_secs(scheduled.delay_seconds), None);
         }
@@ -313,11 +318,13 @@ impl ServerState {
     /// given. A refusal or such an error is logged and its row removed; a
     /// commit removed the row itself.
     async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
-        let key = format!("schedule:{}", timer.arm_id);
+        let key = timer.agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
+            crate::idempotency::IdempotencyKey::Request(format!("schedule:{}", timer.arm_id))
+        });
         let mut agent = timer.agent_ctx.clone();
         // The same action every attempt, so a retry of a fire that landed is
         // answered as it.
-        agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(key.clone()));
+        agent.idempotency_key = Some(key.clone());
         agent.fires_scheduled_action = Some(timer.row());
         super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;
@@ -346,7 +353,7 @@ impl ServerState {
             let (error, is_final) = match outcome {
                 Ok(response) if response.success => {
                     if retried {
-                        self.arm_fired_rows_retrying(timer, &key).await;
+                        self.arm_fired_rows_retrying(timer, key.as_str()).await;
                     }
                     return;
                 }
