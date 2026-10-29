@@ -5,7 +5,7 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::sse::parse_sse_stream;
-use crate::types::{AuditEntry, AuthzResponse, EntityEvent};
+use crate::types::{AuditEntry, AuthzBatchResponse, AuthzRecord, AuthzResponse, EntityEvent};
 
 /// Builder for constructing a [`TemperClient`].
 pub struct ClientBuilder {
@@ -260,15 +260,31 @@ impl TemperClient {
                 .get("allowed")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-            decision_id: resp_json
-                .get("decision_id")
-                .and_then(|v| v.as_str())
-                .map(String::from),
             reason: resp_json
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .map(String::from),
         })
+    }
+
+    /// Check all requested moves for a record or page without filing decisions.
+    pub async fn authorize_batch(
+        &self,
+        agent_id: &str,
+        records: &[AuthzRecord],
+    ) -> Result<AuthzBatchResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/api/authorize", self.base_url))
+            .header("x-tenant-id", &self.tenant)
+            .json(&serde_json::json!({"agent_id": agent_id, "records": records}))
+            .send()
+            .await
+            .context("Failed to call /api/authorize")?;
+        self.check_status(&resp, "authorize", "batch")?;
+        resp.json()
+            .await
+            .context("Failed to parse authorize batch response")
     }
 
     /// Submit an audit trail entry.

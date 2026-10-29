@@ -35,12 +35,12 @@ pub struct Principal {
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
-/// Cedar context keys that only a resolved `SecurityContext` may populate.
+pub mod platform_keys;
+
+/// Whether `name` is a Cedar context key only the platform sets
+/// ([`platform_keys`]), which a record's field never fills.
 pub fn is_cedar_authority_context_key(name: &str) -> bool {
-    matches!(
-        name,
-        "sessionId" | "agentId" | "agentType" | "agentTypeVerified" | "role" | "actingFor"
-    )
+    platform_keys::ALL.contains(&name)
 }
 
 /// Security context carried with every actor message dispatch.
@@ -55,6 +55,12 @@ pub struct SecurityContext {
     pub context_attrs: HashMap<String, serde_json::Value>,
     /// Correlation ID for tracing.
     pub correlation_id: String,
+    /// How the move this context carries came about, when the kernel's
+    /// reaction or timer path made it; None for a direct request. Cedar sees
+    /// it as `context.via` and the rest ([`crate::cause`]); only the kernel
+    /// sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::MoveCause>,
 }
 
 /// Credential-authenticated authority bound to one tenant.
@@ -93,10 +99,13 @@ pub struct AuthenticatedRequestContext {
 
 impl AuthenticatedRequestContext {
     /// Bind an already-resolved security context to its authenticated tenant.
+    /// The context may be one a move made, as when a WASM module calls back
+    /// during a reaction, but the request is the caller's own pick, so it
+    /// carries no cause ([`SecurityContext::as_request`]).
     pub fn new(tenant: TenantId, security_context: SecurityContext) -> Self {
         Self {
             tenant,
-            security_context,
+            security_context: security_context.as_request(),
             intent: None,
             session_id: None,
         }
@@ -154,6 +163,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -183,6 +193,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id,
+            cause: None,
         }
     }
 
@@ -202,6 +213,7 @@ impl SecurityContext {
             },
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -224,20 +236,20 @@ impl SecurityContext {
 
         let mut context_attrs = HashMap::new();
         context_attrs.insert(
-            "agentId".to_string(),
+            platform_keys::AGENT_ID.to_string(),
             serde_json::Value::String(agent_instance_id.to_string()),
         );
         context_attrs.insert(
-            "agentType".to_string(),
+            platform_keys::AGENT_TYPE.to_string(),
             serde_json::Value::String(agent_type_name.to_string()),
         );
         context_attrs.insert(
-            "agentTypeVerified".to_string(),
+            platform_keys::AGENT_TYPE_VERIFIED.to_string(),
             serde_json::Value::Bool(true),
         );
         if let Some(sid) = session_id {
             context_attrs.insert(
-                "sessionId".to_string(),
+                platform_keys::SESSION_ID.to_string(),
                 serde_json::Value::String(sid.to_string()),
             );
         }
@@ -253,6 +265,7 @@ impl SecurityContext {
             },
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -281,28 +294,28 @@ impl SecurityContext {
 
         let mut context_attrs = HashMap::new();
         context_attrs.insert(
-            "agentId".to_string(),
+            platform_keys::AGENT_ID.to_string(),
             serde_json::Value::String(principal_id.to_string()),
         );
         if let Some(at) = agent_type {
             context_attrs.insert(
-                "agentType".to_string(),
+                platform_keys::AGENT_TYPE.to_string(),
                 serde_json::Value::String(at.to_string()),
             );
         }
         context_attrs.insert(
-            "agentTypeVerified".to_string(),
+            platform_keys::AGENT_TYPE_VERIFIED.to_string(),
             serde_json::Value::Bool(true),
         );
         if let Some(af) = acting_for {
             context_attrs.insert(
-                "actingFor".to_string(),
+                platform_keys::ACTING_FOR.to_string(),
                 serde_json::Value::String(af.to_string()),
             );
         }
         if let Some(sid) = session_id {
             context_attrs.insert(
-                "sessionId".to_string(),
+                platform_keys::SESSION_ID.to_string(),
                 serde_json::Value::String(sid.to_string()),
             );
         }
@@ -318,6 +331,7 @@ impl SecurityContext {
             },
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
+            cause: None,
         }
     }
 
@@ -334,7 +348,7 @@ impl SecurityContext {
     ) -> Self {
         if let Some(aid) = agent_id {
             self.context_attrs.insert(
-                "agentId".to_string(),
+                platform_keys::AGENT_ID.to_string(),
                 serde_json::Value::String(aid.to_string()),
             );
             // Promote anonymous principals to Agent kind
@@ -348,13 +362,13 @@ impl SecurityContext {
         }
         if let Some(sid) = session_id {
             self.context_attrs.insert(
-                "sessionId".to_string(),
+                platform_keys::SESSION_ID.to_string(),
                 serde_json::Value::String(sid.to_string()),
             );
         }
         if let Some(at) = agent_type {
             self.context_attrs.insert(
-                "agentType".to_string(),
+                platform_keys::AGENT_TYPE.to_string(),
                 serde_json::Value::String(at.to_string()),
             );
             self.principal.agent_type = Some(at.to_string());
@@ -365,7 +379,7 @@ impl SecurityContext {
             serde_json::Value::Bool(false),
         );
         self.context_attrs.insert(
-            "agentTypeVerified".to_string(),
+            platform_keys::AGENT_TYPE_VERIFIED.to_string(),
             serde_json::Value::Bool(false),
         );
         self
@@ -380,6 +394,36 @@ impl SecurityContext {
             "action_context".to_string(),
             serde_json::Value::String(action_context.into()),
         );
+        self
+    }
+
+    /// Put the statuses of the records that describe the caller (types marked
+    /// `principal_record`) on the principal, as Cedar's `principal.<name>`.
+    /// Only the identity boundary calls this, with names it built from the
+    /// verified token: `<Type>` for the user in person, `actingFor<Type>` for
+    /// the user an agent acts for. A record type's name starts uppercase (the
+    /// spec refuses others), so none of them replaces an attribute set here.
+    #[must_use]
+    pub fn with_principal_records(
+        mut self,
+        records: &std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        for (name, status) in records {
+            self.principal
+                .attributes
+                .insert(name.clone(), serde_json::Value::String(status.clone()));
+        }
+        self
+    }
+
+    /// The same identity making a move of its own pick: a WASM module's call
+    /// or the writes it returns. It carries no cause, so Cedar sees
+    /// `via == "request"` whatever move set the module off: a module during a
+    /// reaction picks its moves itself, and must not pass a policy that admits
+    /// only the moves a spec makes follow.
+    #[must_use]
+    pub fn as_request(mut self) -> Self {
+        self.cause = None;
         self
     }
 }
@@ -595,6 +639,10 @@ mod tests {
         assert!(is_cedar_authority_context_key("sessionId"));
         assert!(is_cedar_authority_context_key("agentTypeVerified"));
         assert!(is_cedar_authority_context_key("role"));
+        assert!(is_cedar_authority_context_key("carryMove"));
+        assert!(is_cedar_authority_context_key("module"));
+        assert!(is_cedar_authority_context_key("triggerDeclaredPrincipal"));
+        assert!(!is_cedar_authority_context_key("url"));
         assert!(!is_cedar_authority_context_key("status"));
         assert!(!is_cedar_authority_context_key("Customer"));
     }

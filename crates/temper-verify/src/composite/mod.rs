@@ -10,31 +10,19 @@
 //! 2. Builds a [`TemperModel`] for each participating entity.
 //! 3. Materialises a [`CompositeVerificationPlan`] describing what the
 //!    joint state-machine verifier would check.
-//! 4. (Slice 8d) Implements [`stateright::Model`] over the composition
-//!    ([`CompositeTemperModel`]), so the verifier can BFS the joint
-//!    state space with cross-entity cascades applied within each step.
-//!
-//! Example:
-//!
-//! ```ignore
-//! use temper_verify::composite::{CompositeVerificationPlan, CompositeTemperModel};
-//! use temper_spec::automaton::parse_automaton;
-//!
-//! let order = parse_automaton(order_ioa)?;
-//! let payment = parse_automaton(payment_ioa)?;
-//! let plan = CompositeVerificationPlan::new(&[&order, &payment], "Order")?;
-//! let model = CompositeTemperModel::from_plan(plan);
-//! // Model is Stateright-checkable from here.
-//! ```
+//! 4. Walks the joint model of that set ([`joint`]) for reactions a
+//!    target refuses when they land ([`verify`], ADR-0150).
 
-pub mod invariant_eval;
-pub mod model;
+pub mod joint;
 pub mod verify;
 
-pub use model::{CompositeAction, CompositeState, CompositeTemperModel, DroppedReaction};
+pub use joint::{
+    Bound, Bytes, DroppedReaction, JointInvariantResult, JointLivenessResult, JointOutcome,
+    JointReplay, JointStep, LivenessOutcome, Progress, Room, StuckCase, TraceMove,
+    replay_joint_invariants, verify_joint_invariants, verify_joint_liveness,
+};
 pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,
-    verify_composite_with_budget,
 };
 
 use std::collections::BTreeMap;
@@ -104,8 +92,9 @@ pub struct CompositeVerificationPlan {
     /// entities outside the scope are filtered out at build time.
     pub edges: Vec<TriggerEdge>,
     /// Whether the trigger graph contains a cycle reachable from the seed.
-    /// Not an error (cycles are legal; cascade depth bounds them at
-    /// runtime and verification) but surfaced for reporting.
+    /// Not an error (cycles are legal; at runtime and in verification a
+    /// chain round one stops at its first repeated step) but surfaced for
+    /// reporting.
     pub has_cycle: bool,
 }
 

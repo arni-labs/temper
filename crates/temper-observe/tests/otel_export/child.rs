@@ -16,6 +16,10 @@ use crate::wire::{self, Attributes, LogRecord, Metric, Span};
 const SCENARIO_ENV: &str = "OTEL_EXPORT_TEST_SCENARIO";
 const WORKLOAD: &str = "workload";
 const LOG_PROBE_THEN_WORKLOAD: &str = "log-probe-then-workload";
+const LOG_AFTER_SHUTDOWN: &str = "log-after-shutdown";
+
+/// The line the child logs once its telemetry has shut down.
+pub const AFTER_SHUTDOWN_LINE: &str = "test log after the telemetry shut down";
 
 /// Service name `temper serve` passes to the telemetry setup.
 pub const BUILT_IN_SERVICE_NAME: &str = "temper-platform";
@@ -100,11 +104,21 @@ impl Run {
             .collect()
     }
 
+    /// The bodies sent to `path`, each checked to be OTLP protobuf, the only
+    /// encoding [`wire`] reads.
     fn bodies<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a [u8]> {
         self.received
             .iter()
             .filter(move |request| request.path == path)
-            .map(|request| request.body.as_slice())
+            .map(|request| {
+                assert_eq!(
+                    request.header("content-type"),
+                    "application/x-protobuf",
+                    "export to {} is not OTLP protobuf",
+                    request.path
+                );
+                request.body.as_slice()
+            })
     }
 }
 
@@ -118,6 +132,12 @@ pub fn run(env: &[(&str, &str)]) -> Run {
 /// enabled, and logs nothing, before it runs the workload.
 pub fn run_after_log_probe(env: &[(&str, &str)]) -> Run {
     run_scenario(LOG_PROBE_THEN_WORKLOAD, env)
+}
+
+/// Like [`run`], but the child logs one more line after it has shut its
+/// telemetry down, as `temper serve`'s other tasks can while it stops.
+pub fn run_then_log_after_shutdown(env: &[(&str, &str)]) -> Run {
+    run_scenario(LOG_AFTER_SHUTDOWN, env)
 }
 
 fn run_scenario(scenario: &str, env: &[(&str, &str)]) -> Run {
@@ -174,6 +194,9 @@ fn entry() {
     }
     emit_workload();
     guard.shutdown();
+    if scenario == LOG_AFTER_SHUTDOWN {
+        tracing::warn!("{AFTER_SHUTDOWN_LINE}");
+    }
 }
 
 /// Ask the `log` bridge whether logging is enabled without logging anything:

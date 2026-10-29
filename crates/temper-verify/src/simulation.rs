@@ -468,6 +468,8 @@ mod tests {
             until: std::time::Instant::now(),
             states: 1,
             lifted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            exhausted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let config = SimConfig {
             seed: 7,

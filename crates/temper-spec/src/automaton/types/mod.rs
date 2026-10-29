@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod action;
+mod carry;
 mod state;
 mod trigger;
 mod webhook;
 
 pub use action::*;
+pub use carry::*;
 pub use state::*;
 pub use trigger::*;
 pub use webhook::*;
@@ -85,6 +87,10 @@ pub struct Automaton {
     /// Empty when the spec declared no `[[vector]]`.
     #[serde(default, rename = "vector")]
     pub vectors: Vec<VectorDecl>,
+    /// Where this version moves stored records it would otherwise leave with
+    /// no way forward (see [`Carry`]).
+    #[serde(default, rename = "carry")]
+    pub carries: Vec<Carry>,
     /// Admission control caps (ADR-0051). When present, the dispatch layer
     /// gates concurrent calls per `(tenant, entity_type, action)` before
     /// reaching the actor.
@@ -153,6 +159,12 @@ pub struct AutomatonMeta {
     /// them in `from`.
     #[serde(default)]
     pub terminal: Vec<String>,
+    /// A record of this type whose id is a user's `sub` describes that user:
+    /// Cedar sees its status on the principal, as `principal.<Type>` when the
+    /// user calls in person and `principal.actingFor<Type>` when an agent
+    /// calls for them, read from the record's actor on every request.
+    #[serde(default)]
+    pub principal_record: bool,
 }
 
 /// A safety invariant, proven by the verification cascade.
@@ -183,6 +195,19 @@ pub struct Liveness {
     /// If true, asserts that actions are always available (no deadlock).
     #[serde(default)]
     pub has_actions: Option<bool>,
+    /// A condition the records reach by themselves: from every reachable
+    /// state, the moves the system makes (state timers, module answers,
+    /// reactions, and the actions in `relies_on`) can bring them to a state
+    /// with nothing in flight where it holds. It may read related records
+    /// (`Type[id].field`), and is checked on their joint model.
+    #[serde(default)]
+    pub eventually: Option<Expr>,
+    /// Actions of this entity that code outside the specs sends whenever
+    /// `eventually` does not hold, such as a site that nudges a record it
+    /// finds behind. The check counts them as moves the system makes while
+    /// the condition is false.
+    #[serde(default)]
+    pub relies_on: Vec<String>,
 }
 
 /// A dispatch record the runtime's WASM and adapter dispatchers look up by
@@ -201,9 +226,10 @@ pub struct Integration {
     /// WASM module name (required when `type = "wasm"`).
     #[serde(default)]
     pub module: Option<String>,
-    /// Action to dispatch on successful WASM execution (required when `type = "wasm"`).
-    #[serde(default)]
-    pub on_success: Option<String>,
+    /// The actions a successful call may take, in the order the kernel tries
+    /// them (see [`ActionTrigger::on_success`]).
+    #[serde(default, with = "trigger::one_or_many")]
+    pub on_success: Vec<String>,
     /// Action to dispatch on failed WASM execution (required when `type = "wasm"`).
     #[serde(default)]
     pub on_failure: Option<String>,
@@ -281,6 +307,10 @@ pub struct StateTimeout {
     /// Typically includes an `error_message` for observability.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub args: BTreeMap<String, Arg>,
+    /// Words for people reading the app: what the timer does ("check CI
+    /// again"). Display only: the kernel never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub says: Option<String>,
 }
 
 /// Admission control declaration (ADR-0051).

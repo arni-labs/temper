@@ -1,12 +1,13 @@
-//! Regression: a timer whose fire gets no answer fires again a budget later;
-//! one whose fire is refused does not.
+//! Regression: a timer whose fire gets no answer is fired again until the
+//! record answers; one whose fire is refused is not.
 //!
 //! On 2026-10-24 a record's repeating timer stopped for about 20 minutes
 //! around an app install: its fire's dispatch failed before the record
 //! answered, the timer removed its row, and nothing armed it again until
-//! someone dispatched its action by hand. Here the fire's dispatch is deferred
-//! by admission, one of the ways a dispatch fails without an answer: the one
-//! permit `Expire` admits is held, as by a dispatch still in flight.
+//! someone dispatched its action by hand. Owed writes (#216, #217) keep a
+//! fire the store failed, whose ask timed out or whose actor stopped; these
+//! cases are the other ways a fire gets no answer. Admission defers it: the
+//! one permit `Expire` admits is held, as by a dispatch still in flight.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,8 @@ use temper_server::ServerState;
 use temper_server::state::{AdmissionOutcome, AdmissionPermit};
 use temper_store_sim::SimEventStore;
 
-use super::world::{ProcessClock, SimTimerRows};
+use super::process_clock::ProcessClock;
+use super::world::SimTimerRows;
 use super::{JOB_V1, Job, Process, World, act, advance, settle, status};
 
 /// `Waiting`'s budget in `JOB_V1`, and a second more.
@@ -100,10 +102,11 @@ async fn hold_expire_permit(state: &ServerState, tenant: &TenantId) -> Admission
     }
 }
 
-/// Without a dispatch or a restart, the timer whose fire got no answer is
-/// armed again, keeps a row a restart would arm, and finishes the record.
+/// Without a dispatch or a restart, the timer whose fire got no answer keeps
+/// its row, which a restart would arm, and finishes the record once the
+/// fire can land.
 #[test]
-fn an_unanswered_fire_fires_again_a_budget_later() {
+fn an_unanswered_fire_is_tried_again_until_it_lands() {
     let seed = 97;
     let clock = Arc::new(ProcessClock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
@@ -122,14 +125,15 @@ fn an_unanswered_fire_fires_again_a_budget_later() {
             "Waiting",
             "the deferred fire did not run"
         );
-        let again = world
+        let kept = world
             .rows
             .row("gamma", &job.id)
             .expect("a fire that got no answer leaves its record a timer");
-        assert_ne!(again.arm_id, first.arm_id, "the timer is armed again");
-        assert_eq!(again.state, "Waiting");
+        assert_eq!(kept.arm_id, first.arm_id, "the fire is kept with its row");
+        assert_eq!(kept.state, "Waiting");
 
-        // Nobody acts on the record: the timer alone finishes it.
+        // Nobody acts on the record: the timer alone finishes it, within one
+        // of the owed write's longest waits (an hour).
         drop(in_flight);
         advance(PAST_THE_BUDGET).await;
         assert_eq!(status(state, &job).await, "Done");
@@ -141,8 +145,8 @@ fn an_unanswered_fire_fires_again_a_budget_later() {
     process.kill(&world, Duration::ZERO);
 }
 
-/// A guard's no is an answer: the timer ends and is not armed again, so a
-/// record a guard holds is not polled every budget.
+/// A guard's no is an answer: the timer ends and is not tried again, so a
+/// record a guard holds is not polled.
 #[test]
 fn a_refused_fire_is_not_armed_again() {
     let seed = 98;
@@ -165,31 +169,30 @@ fn a_refused_fire_is_not_armed_again() {
     process.kill(&world, Duration::ZERO);
 }
 
-/// A failed replacement write must leave a bootable row, even if deletion
-/// would succeed. No record read or external action rescues it after boot.
+/// A process that stops while it keeps an unanswered fire leaves the row,
+/// and the next boot fires it: no record read or outside action rescues it.
 #[test]
-fn failed_retry_write_survives_restart() {
+fn an_unanswered_fire_survives_a_restart() {
     for seed in [99, 100, 101] {
         let clock = Arc::new(ProcessClock::new());
         let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
         let spec = expire_admits_one();
-        let (world, process, job) = started(seed, clock, &spec, "failed-retry-write");
+        let (world, process, job) = started(seed, clock, &spec, "unanswered-restart");
         process.runtime.block_on(async {
             let first = world.rows.row("gamma", &job.id).unwrap();
             let _in_flight = hold_expire_permit(&process.state, &job.tenant).await;
-            world.rows.fail_next_writes(1);
             advance(PAST_THE_BUDGET).await;
             assert_eq!(
                 world
                     .rows
                     .row("gamma", &job.id)
-                    .expect("failed replacement retains the old durable arm")
+                    .expect("an unanswered fire keeps its durable row")
                     .arm_id,
                 first.arm_id
             );
         });
         process.kill(&world, Duration::ZERO);
-        let restarted = Process::start(&world, JOB_V1, &spec, "retry-after-restart");
+        let restarted = Process::start(&world, JOB_V1, &spec, "unanswered-after-restart");
         restarted.runtime.block_on(async {
             advance(Duration::from_secs(1)).await;
             assert_eq!(status(&restarted.state, &job).await, "Done");
@@ -199,10 +202,10 @@ fn failed_retry_write_survives_restart() {
     }
 }
 
-/// Even across consecutive failed saves, a later answer (including a guard
-/// refusal) removes the retained row, so boot cannot resurrect an ended fire.
+/// After several unanswered tries, the first answer ends the timer, a guard's
+/// refusal included, and removes its row.
 #[test]
-fn answered_retry_removes_retained_row() {
+fn a_later_answer_ends_a_kept_fire() {
     for refused in [false, true] {
         let seed = 102;
         let clock = Arc::new(ProcessClock::new());
@@ -213,10 +216,9 @@ fn answered_retry_removes_retained_row() {
         } else {
             expire_admits_one()
         };
-        let (world, process, job) = started(seed, clock, &spec, "answered-retry");
+        let (world, process, job) = started(seed, clock, &spec, "answered-later");
         process.runtime.block_on(async {
             let in_flight = hold_expire_permit(&process.state, &job.tenant).await;
-            world.rows.fail_next_writes(2);
             advance(PAST_THE_BUDGET).await;
             advance(PAST_THE_BUDGET).await;
             assert!(world.rows.row("gamma", &job.id).is_some());
@@ -228,70 +230,9 @@ fn answered_retry_removes_retained_row() {
             );
             assert!(
                 world.rows.row("gamma", &job.id).is_none(),
-                "an answer ends the durable timer"
+                "an answer ends the durable timer: refused={refused}"
             );
         });
         process.kill(&world, Duration::ZERO);
-    }
-}
-
-/// B replaces A but reports failure; C fails before saving. An answer from C
-/// must remove B as well as A, so a restart cannot resurrect an ended timer.
-#[test]
-fn answered_retry_removes_a_row_saved_despite_an_error() {
-    for seed in [103, 104, 105] {
-        for refused in [true, false] {
-            let clock = Arc::new(ProcessClock::new());
-            let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
-            let spec = if refused {
-                expire_refused()
-                    + "\n[admission]\nmax_concurrent_actions = { \"Expire\" = 1 }\nqueue_timeout_seconds = 0\n"
-            } else {
-                expire_admits_one()
-            };
-            let (world, process, job) = started(seed, clock, &spec, "ambiguous-retry-write");
-            process.runtime.block_on(async {
-                let first = world.rows.row("gamma", &job.id).unwrap();
-                let in_flight = hold_expire_permit(&process.state, &job.tenant).await;
-                world.rows.fail_after_next_writes(1);
-                advance(PAST_THE_BUDGET).await;
-                let saved_retry = world.rows.row("gamma", &job.id).unwrap();
-                assert_ne!(saved_retry.arm_id, first.arm_id, "B landed despite its error");
-
-                world.rows.fail_next_writes(1);
-                advance(PAST_THE_BUDGET).await;
-                assert_eq!(
-                    world.rows.row("gamma", &job.id).unwrap().arm_id,
-                    saved_retry.arm_id,
-                    "C failed before saving, so B is still durable"
-                );
-                drop(in_flight);
-                advance(PAST_THE_BUDGET).await;
-                assert_eq!(
-                    status(&process.state, &job).await,
-                    if refused { "Waiting" } else { "Done" }
-                );
-                assert!(
-                    world.rows.row("gamma", &job.id).is_none(),
-                    "an answer must end even a timer whose save reported an error: seed={seed}, refused={refused}"
-                );
-            });
-            process.kill(&world, Duration::ZERO);
-            let restarted = Process::start(&world, JOB_V1, &spec, "ended-after-ambiguous-write");
-            assert_eq!(
-                restarted.booted[&(job.tenant.clone(), "Job".to_string())].rearmed,
-                0,
-                "boot must not re-arm an answered timer"
-            );
-            restarted.runtime.block_on(async {
-                advance(PAST_THE_BUDGET).await;
-                assert_eq!(
-                    status(&restarted.state, &job).await,
-                    if refused { "Waiting" } else { "Done" }
-                );
-                assert!(world.rows.row("gamma", &job.id).is_none());
-            });
-            restarted.kill(&world, Duration::ZERO);
-        }
     }
 }

@@ -1,10 +1,13 @@
-//! A transition whose query projection fails still arms its state's timer.
+//! A repeating timer keeps firing while every query projection fails.
 //!
 //! A committed transition cancels its record's old timer before its query
-//! projection is written. When that write failed, the dispatch answered with
-//! the error and returned before arming the timer the committed state
+//! projection is written. When that write failed, the dispatch once answered
+//! with the error and returned before arming the timer the committed state
 //! declares, so the record had no timer until its next transition: a
-//! repeating timer whose tick failed to project stopped for good.
+//! repeating timer whose tick failed to project stopped for good. Since
+//! #127 the timer is armed right after the commit and the dispatch keeps
+//! trying the projection until it lands, so neither `Start` nor any `Tick`
+//! is answered while the projection fails; the ticks must still come.
 
 mod common;
 
@@ -108,22 +111,22 @@ async fn a_transition_whose_projection_failed_still_arms_its_timer() {
         .await
         .expect("the ticker is created");
 
-    // From here every projection write fails: `Start` and each `Tick` commit
-    // and answer that their projection failed.
+    // From here every projection write fails: `Start` and each `Tick` commit,
+    // and their dispatches wait for a projection that does not land.
     failing.store(true, Ordering::SeqCst);
-    let started = state
-        .dispatch_tenant_action(
-            &tenant,
-            "Ticker",
-            "ticker-1",
-            "Start",
-            json!({}),
-            &AgentContext::default(),
-        )
-        .await
-        .expect("Start is answered");
-    assert_eq!(started.state.status, "Running", "Start committed");
-    assert!(!started.success, "Start's projection failed");
+    let starter = state.clone();
+    let start = tokio::spawn(async move {
+        starter
+            .dispatch_tenant_action(
+                &TenantId::default(),
+                "Ticker",
+                "ticker-1",
+                "Start",
+                json!({}),
+                &AgentContext::default(),
+            )
+            .await
+    });
 
     // Entering `Running` arms the first tick, and each tick the next.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -133,4 +136,9 @@ async fn a_transition_whose_projection_failed_still_arms_its_timer() {
         seen = ticks(&state).await;
     }
     assert!(seen >= 2, "ticks after their projections failed: {seen}");
+    assert!(
+        !start.is_finished(),
+        "Start waits for its projection (harness): the writes did fail"
+    );
+    start.abort();
 }

@@ -71,6 +71,9 @@ impl PostgresEventStore {
             "native data-only create requires first event sequence"
         );
         let status = canonical_projection_status(status, state);
+        // The row holds each field once: in `fields`, not again in `state`.
+        let stored_state = temper_runtime::persistence::catalog_state_for_storage(fields, state);
+        let state = &stored_state;
         let projection_hash = json_hash(fields);
         let (new_index, indexed_fields, skipped_fields) = scalar_index_fields(fields);
         let mut field_names = Vec::with_capacity(new_index.len());
@@ -178,8 +181,8 @@ impl PostgresEventStore {
             crate::dbm::postgres_query!(
                 &self.schema,
                 "INSERT INTO {schema}entity_field_index \
-                 (tenant, entity_type, entity_id, field_name, field_value, status) \
-                 SELECT $1, $2, $3, incoming.field_name, incoming.field_value, $6 \
+                 (tenant, entity_type, entity_id, field_name, field_value) \
+                 SELECT $1, $2, $3, incoming.field_name, incoming.field_value \
                  FROM unnest($4::text[], $5::text[]) AS incoming(field_name, field_value)",
             )
             .bind(tenant)
@@ -187,7 +190,6 @@ impl PostgresEventStore {
             .bind(entity_id)
             .bind(&field_names)
             .bind(&field_values)
-            .bind(status)
             .execute(&mut *tx)
             .await
             .map_err(storage_error)?;
