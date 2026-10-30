@@ -312,6 +312,15 @@ fn run_seed(seed: u64, tries: &Tries) -> Result<(), String> {
             ServerState::from_registry(ActorSystem::new(format!("denied-{seed}")), registry);
         state.set_storage_stack(StorageStack::from_sim(events.clone(), None));
         state.state_timer_rows = Some(rows.clone());
+        // A scheduled action acts with its setter's standing on the record,
+        // which Cedar decides: every caller here may read the records.
+        state
+            .authz
+            .reload_tenant_policies(
+                TENANT,
+                r#"permit(principal, action == Action::"read", resource);"#,
+            )
+            .expect("the tenant's Cedar parses");
         let walk = state.start_runtime().await.expect("the server starts");
         walk.await.unwrap();
         let tenant = TenantId::new(TENANT);

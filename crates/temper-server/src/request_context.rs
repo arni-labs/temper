@@ -117,7 +117,28 @@ pub struct AgentContext {
     pub observation_metadata: BTreeMap<String, String>,
 }
 
+/// Whether `context` names a caller: a principal a credential stands for. The
+/// kernel's own identities act for no one: an empty or anonymous id, a System
+/// principal, or a service the kernel names ([`AgentContext::for_service`],
+/// role "service").
+pub(crate) fn names_a_caller(context: &SecurityContext) -> bool {
+    let principal = &context.principal;
+    !(principal.id.is_empty()
+        || principal.id == "anonymous"
+        || principal.kind == temper_authz::PrincipalKind::System
+        || principal.role.as_deref() == Some("service"))
+}
+
 impl AgentContext {
+    /// The security context of the caller this context acts as, when it
+    /// names one ([`names_a_caller`]); None for a context without one and for
+    /// the kernel's own identities.
+    pub(crate) fn caller(&self) -> Option<&SecurityContext> {
+        self.security_ctx
+            .as_ref()
+            .filter(|context| names_a_caller(context))
+    }
+
     /// The sequence this dispatch's state timer was armed at, when the
     /// dispatch fires `action` on this record. A child dispatch that inherits
     /// the context, on another record or with another action, is not the fire.

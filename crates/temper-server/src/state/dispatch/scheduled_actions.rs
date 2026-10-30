@@ -40,6 +40,7 @@ use tracing::Instrument;
 use super::effects::PostDispatchContext;
 use super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use super::state_timer_follow::BootTimers;
+use super::timer_standing::{Standing, TimerFire};
 use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
@@ -316,7 +317,9 @@ impl ServerState {
     /// Fire `timer` until its action commits, is refused or fails with an
     /// error no retry can change, each attempt through `gate` when one is
     /// given. A refusal or such an error is logged and its row removed; a
-    /// commit removed the row itself.
+    /// commit removed the row itself. A fire whose setter may no longer read
+    /// the record is refused the same way (`timer_standing`): nothing arms a
+    /// scheduled action again without its row.
     async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
         let key = timer.agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
             crate::idempotency::IdempotencyKey::Request(format!("schedule:{}", timer.arm_id))
@@ -335,20 +338,32 @@ impl ServerState {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),
                     None => None,
                 };
-                let options = DispatchExtOptions {
-                    agent_ctx: &agent,
-                    await_integration: false,
-                    await_reactions: true,
+                let fire = TimerFire {
+                    tenant: &timer.tenant,
+                    entity_type: &timer.entity_type,
+                    entity_id: &timer.entity_id,
+                    action: &timer.action,
                 };
-                self.dispatch_tenant_action_ext_typed(
-                    &timer.tenant,
-                    &timer.entity_type,
-                    &timer.entity_id,
-                    &timer.action,
-                    serde_json::json!({}),
-                    options,
-                )
-                .await
+                match self.timer_setter_standing(&agent, &fire).await {
+                    Ok(Standing::Holds) => {
+                        let options = DispatchExtOptions {
+                            agent_ctx: &agent,
+                            await_integration: false,
+                            await_reactions: true,
+                        };
+                        self.dispatch_tenant_action_ext_typed(
+                            &timer.tenant,
+                            &timer.entity_type,
+                            &timer.entity_id,
+                            &timer.action,
+                            serde_json::json!({}),
+                            options,
+                        )
+                        .await
+                    }
+                    Ok(Standing::Lost { reason }) => Err(DispatchError::AuthzDenied(reason)),
+                    Err(error) => Err(error),
+                }
             };
             let (error, is_final) = match outcome {
                 Ok(response) if response.success => {

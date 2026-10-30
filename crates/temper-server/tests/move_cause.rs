@@ -343,9 +343,10 @@ async fn a_timer_armed_by_the_hook_fires_and_its_reaction_runs_as_a_timer_reacti
 
     let (code, body) = act(&state, hook(), "t1", "Park").await;
     assert_eq!(code, StatusCode::OK, "{body:?}");
-    // The timer's own move, Lapse, lands as its armer with no Cedar check of
-    // its own. Its reaction FollowUp passes only a forbid that requires
-    // `via == "timer"`, armed by the hook, at depth 1 under its rule.
+    // The timer's own move, Lapse, lands as its armer: Cedar is asked only
+    // whether the hook may still read the record, with `via == "timer"`. Its
+    // reaction FollowUp passes only a forbid that requires `via == "timer"`,
+    // armed by the hook, at depth 1 under its rule.
     reach(
         &state,
         "Direction",
