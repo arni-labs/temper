@@ -433,7 +433,7 @@ impl JointModel {
             for (mut params, _) in successors_budgeted(model, t, local, values, &self.expansion) {
                 // A parameter tied to a field carries it as the call found it.
                 for param in &t.string_params {
-                    if let Some(value) = param.equals.as_ref().and_then(|f| call.asked.get(f)) {
+                    if let Some(value) = param.equals.iter().find_map(|f| call.asked.get(f)) {
                         params.insert(param.name.clone(), ParamValue::Str(value.clone()));
                     }
                 }

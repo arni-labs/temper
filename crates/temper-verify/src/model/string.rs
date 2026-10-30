@@ -10,8 +10,10 @@ use std::fmt;
 pub enum ModelString {
     /// A string from a spec or a concrete input.
     Literal(String),
-    /// An arbitrary nonempty value absent from the spec's literals.
+    /// An arbitrary nonblank value absent from the spec's literals.
     Symbol(usize),
+    /// An arbitrary nonempty whitespace-only value absent from the spec's literals.
+    BlankSymbol(usize),
 }
 
 impl ModelString {
@@ -19,11 +21,27 @@ impl ModelString {
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Literal(s) if s.is_empty())
     }
+    /// Whether this is an empty or whitespace-only string, refused
+    /// by `param_nonempty`, including symbolic whitespace inputs.
+    pub fn is_blank(&self) -> bool {
+        match self {
+            Self::Literal(s) => s.trim().is_empty(),
+            Self::Symbol(_) => false,
+            Self::BlankSymbol(_) => true,
+        }
+    }
+    /// Its equality identity, shared by blank and nonblank symbols.
+    pub(crate) fn symbol_id(&self) -> Option<usize> {
+        match self {
+            Self::Literal(_) => None,
+            Self::Symbol(n) | Self::BlankSymbol(n) => Some(*n),
+        }
+    }
     /// Its value for predicate evaluation.
     pub fn val(&self) -> temper_spec::predicate::Val<'_> {
         match self {
             Self::Literal(s) => temper_spec::predicate::Val::Str(s),
-            Self::Symbol(n) => temper_spec::predicate::Val::Symbol(*n),
+            Self::Symbol(n) | Self::BlankSymbol(n) => temper_spec::predicate::Val::Symbol(*n),
         }
     }
 }
@@ -42,6 +60,7 @@ impl fmt::Display for ModelString {
         match self {
             Self::Literal(s) => s.fmt(f),
             Self::Symbol(n) => write!(f, "#{n}"),
+            Self::BlankSymbol(n) => write!(f, "#blank{n}"),
         }
     }
 }

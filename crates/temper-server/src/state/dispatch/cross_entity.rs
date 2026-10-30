@@ -182,15 +182,12 @@ impl crate::state::ServerState {
                         {
                             Ok(plan) => plan,
                             Err(refusal) => {
-                                state.record_generated_callback_refusal(
-                                    super::WasmEntityRef {
-                                        tenant: &t,
-                                        entity_type: &parent_t,
-                                        entity_id: &parent_i,
-                                    },
-                                    &refusal.action,
-                                    &refusal.error,
-                                );
+                                state
+                                    .refuse_spawn(
+                                        &t, &parent_t, &parent_i, req,
+                                        &refusal.action, &refusal.error,
+                                    )
+                                    .await;
                                 continue;
                             }
                         };
@@ -224,24 +221,20 @@ impl crate::state::ServerState {
                             match agent.inline_chain.then(step) {
                                 Ok(chain) => agent.inline_chain = chain,
                                 Err(repeat) => {
-                                    state.record_generated_callback_refusal(
-                                        super::WasmEntityRef {
-                                            tenant: &t,
-                                            entity_type: &parent_t,
-                                            entity_id: &parent_i,
-                                        },
-                                        action,
+                                    state.refuse_spawn(
+                                        &t, &parent_t, &parent_i, req, action,
                                         &format!(
                                             "spawned {child_type} not made: its initial action \
                                          would repeat a step its chain is already in \
                                          ({repeat}), so the chain is a loop"
                                         ),
-                                    );
+                                    ).await;
                                     continue;
                                 }
                             }
                         }
                         let child = ChildSpawn {
+                            request: req.clone(),
                             tenant: t.clone(),
                             parent_type: parent_t.clone(),
                             parent_id: parent_i.clone(),
@@ -278,6 +271,7 @@ struct ChildSpawns {
 
 /// A child a committed move spawns: created, then sent its initial action.
 struct ChildSpawn {
+    request: crate::entity_actor::effects::SpawnRequest,
     tenant: TenantId,
     parent_type: String,
     parent_id: String,
@@ -329,7 +323,18 @@ impl crate::state::ServerState {
                 tracing::error!(%child_type, %child_id, %error, "failed to spawn child entity");
                 return match error {
                     CreateError::StoreUnavailable(error) => Attempt::StoreFailed(error),
-                    CreateError::Failed(error) => Attempt::Failed(error),
+                    CreateError::Failed(error) => {
+                        self.refuse_spawn(
+                            tenant,
+                            &child.parent_type,
+                            &child.parent_id,
+                            &child.request,
+                            "spawn",
+                            &error,
+                        )
+                        .await;
+                        Attempt::Failed(error)
+                    }
                 };
             }
         };
@@ -419,7 +424,15 @@ impl crate::state::ServerState {
                 attempt => return Err(attempt),
             },
         };
-        self.record_generated_callback_refusal(child.parent(), action, &refused);
+        self.refuse_spawn(
+            tenant,
+            &child.parent_type,
+            &child.parent_id,
+            &child.request,
+            action,
+            &refused,
+        )
+        .await;
         Err(Attempt::Failed(refused))
     }
 

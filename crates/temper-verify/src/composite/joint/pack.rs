@@ -117,12 +117,18 @@ impl Pack for ModelString {
                 out.push(1);
                 n.put(packer, out);
             }
+            ModelString::BlankSymbol(n) => {
+                out.push(2);
+                n.put(packer, out);
+            }
         }
     }
     fn take(packer: &Packer, input: &mut Iter<'_, u32>) -> Self {
         match next(input) {
             0 => Self::Literal(String::take(packer, input)),
-            _ => Self::Symbol(usize::take(packer, input)),
+            1 => Self::Symbol(usize::take(packer, input)),
+            2 => Self::BlankSymbol(usize::take(packer, input)),
+            _ => unreachable!("unknown packed string kind"),
         }
     }
 }
@@ -311,6 +317,7 @@ mod tests {
                 asked: BTreeMap::from([
                     ("literal".into(), ModelString::from("#1")),
                     ("fresh".into(), ModelString::Symbol(1)),
+                    ("blank".into(), ModelString::BlankSymbol(2)),
                 ]),
             }],
             armed: BTreeMap::new(),

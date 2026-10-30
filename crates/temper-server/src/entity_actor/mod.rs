@@ -17,6 +17,7 @@ mod replay_validation;
 mod scheduled_rows;
 pub mod sim_handler;
 mod snapshot_queue;
+pub(crate) mod spawn_refusal;
 mod timer_fire;
 mod tombstone;
 pub mod types;

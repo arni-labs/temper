@@ -176,6 +176,7 @@ mod tests {
             sequence_nr,
             processed_idempotency_keys: Default::default(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
         let first = state(3, "Active", serde_json::json!({"agent_type_id": "type-a"}));
 

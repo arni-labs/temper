@@ -216,8 +216,8 @@ impl JointModel {
                 .any(|t| &t.name == action && matches!(t.params.get(param), Some(ParamKind::Count)))
     }
 
-    /// The string parameters `reaction` passes that its target tracks or
-    /// requires not empty, the counts kept as sequence numbers, and the
+    /// The string parameters `reaction` passes that its target action gives
+    /// a value or requires not empty, the counts kept as sequence numbers, and the
     /// counts its target reads (in an effect, or compared with a counter)
     /// from a counter `source` holds as a value, read from `source` as it
     /// holds them.
@@ -228,7 +228,7 @@ impl JointModel {
         reaction: &Reaction,
     ) -> BTreeMap<String, ParamValue> {
         let source_state = &state.records[source];
-        let tracked = &self.models[&reaction.to].tracked_strings;
+        let target = &self.models[&reaction.to];
         let nonempty = self
             .unchecked
             .nonempty(&reaction.to, &reaction.target_action);
@@ -254,7 +254,9 @@ impl JointModel {
                     let count = source_state.counters.get(field).copied()?;
                     return Some((param.clone(), ParamValue::Count(count)));
                 }
-                if !tracked.contains(param) && !nonempty.contains(param) {
+                if !target.models_string(&reaction.target_action, param)
+                    && !nonempty.contains(param)
+                {
                     return None;
                 }
                 let value = match arg {

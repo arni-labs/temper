@@ -60,6 +60,7 @@ fn event_budget_workspace_id_uses_workspace_entity_id_or_field() {
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
     assert_eq!(event_budget_workspace_id(&workspace_state), "ws-1");
 
@@ -79,6 +80,7 @@ fn event_budget_workspace_id_uses_workspace_entity_id_or_field() {
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
     assert_eq!(event_budget_workspace_id(&file_state), "ws-2");
 }
@@ -111,6 +113,7 @@ async fn queued_snapshot_only_advances_replay_boundary_after_write_applies() {
         sequence_nr: 100,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
 
     EntityActor::maybe_save_snapshot(
@@ -1714,6 +1717,7 @@ async fn reserved_field_update_event_names_are_refused_as_actions() {
     for reserved in [
         crate::entity_actor::effects::FIELDS_UPDATED_EVENT,
         crate::entity_actor::effects::FIELDS_REPLACED_EVENT,
+        crate::entity_actor::spawn_refusal::SPAWN_REFUSED_EVENT,
     ] {
         let response: EntityResponse = actor_ref
             .ask(
@@ -1951,6 +1955,7 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         }
     }
 
@@ -2407,6 +2412,7 @@ fn replaying_a_non_object_field_event_leaves_state_untouched() {
         sequence_nr: 0,
         processed_idempotency_keys: BTreeMap::new(),
         status_clock: Default::default(),
+        spawn_reservations: Default::default(),
     };
     let before = state.fields.clone();
 
@@ -2722,6 +2728,145 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         counted,
         "a skipped field-update event must be counted, not only logged"
     );
+}
+
+/// A refusal must recheck the replay budget after a real stale-writer conflict.
+#[cfg(feature = "sim")]
+#[tokio::test]
+async fn spawn_refusal_retry_refuses_when_the_race_spent_the_event_budget() {
+    let store = Arc::new(AppendFuseStore::no_faults(103));
+    // Snapshots never succeed: models the stalled snapshot path that lets the
+    // tail grow in the first place.
+    store
+        .fail_snapshots
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let entity_id = "spawn-refusal-budget-race";
+    let boxed = || crate::storage::BoxedEventStore::from_arc(store.clone());
+
+    let system = ActorSystem::new("sim-spawn-refusal-budget-race");
+    let stale = system.spawn(
+        EntityActor::with_persistence(
+            "Order",
+            entity_id,
+            order_table(),
+            serde_json::json!({"Customer": "Alice", "child": "refused-child"}),
+            boxed(),
+            crate::storage::BackendLabel::Sim,
+        ),
+        entity_id,
+    );
+    // The stale writer sees one durable event and nothing after it.
+    let seeded: EntityResponse = stale
+        .ask(
+            EntityMsg::UpdateFields {
+                fields: serde_json::json!({"Customer": "Seed"}),
+                replace: false,
+                expected_precondition: None,
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("seed");
+    assert!(seeded.success);
+
+    // A second actor on the same journal spends the whole budget.
+    let hog = system.spawn(
+        EntityActor::with_persistence(
+            "Order",
+            entity_id,
+            order_table(),
+            serde_json::json!({"Customer": "Alice", "child": "refused-child"}),
+            boxed(),
+            crate::storage::BackendLabel::Sim,
+        ),
+        format!("{entity_id}-hog"),
+    );
+    for i in 0..MAX_EVENTS_SINCE_SNAPSHOT {
+        let response: EntityResponse = hog
+            .ask(
+                EntityMsg::UpdateFields {
+                    fields: serde_json::json!({"filler": i}),
+                    replace: false,
+                    expected_precondition: None,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("filler update");
+        if !response.success {
+            break;
+        }
+    }
+
+    // The stale parent's refusal conflicts with the writer that filled its tail.
+    let response: EntityResponse = stale
+        .ask(
+            EntityMsg::RecordSpawnRefusal {
+                refusal: crate::entity_actor::spawn_refusal::SpawnRefusal {
+                    reservation_id: String::new(),
+                    child_type: "Order".to_owned(),
+                    child_id: "refused-child".to_owned(),
+                    field: Some("child".to_owned()),
+                    child: crate::entity_actor::spawn_refusal::ChildLookup::Absent,
+                    error: "child creation refused".to_owned(),
+                },
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("post-race refusal response");
+    assert!(
+        !response.success,
+        "refusal must not append beyond the replay budget"
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Event budget exhausted"),
+        "unexpected error: {:?}",
+        response.error
+    );
+    assert_eq!(
+        response.state.events_since_snapshot,
+        MAX_EVENTS_SINCE_SNAPSHOT
+    );
+    assert_eq!(
+        response.state.fields["child"], "refused-child",
+        "a refusal that cannot be journaled must not clear the reservation"
+    );
+
+    use temper_runtime::persistence::EventStore as _;
+    let journal = store
+        .inner
+        .read_events(&format!("default:Order:{entity_id}"), 0)
+        .await
+        .expect("parent journal");
+    assert_eq!(journal.len(), MAX_EVENTS_SINCE_SNAPSHOT);
+    assert!(
+        journal.iter().all(
+            |event| event.event_type != crate::entity_actor::spawn_refusal::SPAWN_REFUSED_EVENT
+        )
+    );
+
+    let restarted = system.spawn(
+        EntityActor::with_persistence(
+            "Order",
+            entity_id,
+            order_table(),
+            serde_json::json!({"Customer": "Alice", "child": "refused-child"}),
+            boxed(),
+            crate::storage::BackendLabel::Sim,
+        ),
+        format!("{entity_id}-restarted"),
+    );
+    let recovered: EntityResponse = restarted
+        .ask(EntityMsg::GetState, Duration::from_secs(5))
+        .await
+        .expect("parent must remain recoverable after restart");
+    assert_eq!(recovered.state.fields, response.state.fields);
+    assert_eq!(recovered.state.sequence_nr, response.state.sequence_nr);
 }
 
 #[tokio::test]

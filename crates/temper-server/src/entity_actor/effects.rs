@@ -92,6 +92,10 @@ pub struct ScheduledAction {
 /// A request to spawn a child entity (executed post-transition by dispatch pipeline).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRequest {
+    /// The committing parent event sequence and this spawn's position in it.
+    /// An older request without an identity cannot clear a parent field.
+    #[serde(default)]
+    pub reservation_id: String,
     /// The child entity type.
     pub entity_type: String,
     /// The child entity ID.
@@ -788,6 +792,8 @@ pub fn apply_effects(
                     .and_then(|id| effect_args::string(id, params))
                     .unwrap_or_else(|| sim_uuid().to_string());
 
+                let reservation_id =
+                    format!("{}.{}", state.event_sequence() + 1, spawn_requests.len());
                 // Store child ID in parent's fields if requested
                 if let Some(field_name) = store_id_in
                     && let Some(obj) = state.fields.as_object_mut()
@@ -796,6 +802,9 @@ pub fn apply_effects(
                         field_name.clone(),
                         serde_json::Value::String(child_id.clone()),
                     );
+                    state
+                        .spawn_reservations
+                        .insert(field_name.clone(), reservation_id.clone());
                 }
 
                 let copied_fields = state
@@ -808,6 +817,7 @@ pub fn apply_effects(
                     })
                     .unwrap_or_default();
                 spawn_requests.push(SpawnRequest {
+                    reservation_id,
                     entity_type: entity_type.clone(),
                     entity_id: child_id.clone(),
                     initial_action: Some(initial_action.clone()),
@@ -876,6 +886,7 @@ pub(crate) struct MoveStart {
     booleans: std::collections::BTreeMap<String, bool>,
     lists: std::collections::BTreeMap<String, Vec<String>>,
     fields: serde_json::Value,
+    spawn_reservations: std::collections::BTreeMap<String, String>,
 }
 
 impl MoveStart {
@@ -888,6 +899,7 @@ impl MoveStart {
             booleans: state.booleans.clone(),
             lists: state.lists.clone(),
             fields: state.fields.clone(),
+            spawn_reservations: state.spawn_reservations.clone(),
         }
     }
 
@@ -899,6 +911,7 @@ impl MoveStart {
         state.booleans = self.booleans;
         state.lists = self.lists;
         state.fields = self.fields;
+        state.spawn_reservations = self.spawn_reservations;
     }
 }
 
@@ -923,6 +936,7 @@ pub(crate) fn record_effect_outcome<R>(
     }
     let fields = start.fields.as_object();
     let outcome = EffectOutcome {
+        spawn_reservations: changed_entries(&start.spawn_reservations, &state.spawn_reservations),
         counters: changed_counters,
         booleans: changed_entries(&start.booleans, &state.booleans),
         lists: changed_entries(&start.lists, &state.lists),
@@ -967,6 +981,9 @@ impl EffectOutcome {
     /// Write the recorded values back: what the effects wrote when the event
     /// was committed, whatever the active spec's effects would compute now.
     pub(crate) fn restore(&self, state: &mut EntityState) {
+        state
+            .spawn_reservations
+            .extend(self.spawn_reservations.clone());
         for (var, value) in &self.counters {
             set_counter(state, var, *value);
         }
@@ -1348,6 +1365,7 @@ to = "Refreshing"
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         let result = process_action(&mut state, &table, "Activate", &serde_json::json!({}));
@@ -1377,6 +1395,7 @@ to = "Refreshing"
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         }
     }
 
@@ -1473,6 +1492,7 @@ to = "Closed"
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         let (custom, scheduled, _spawns, _schedule_at) = apply_effects(
@@ -1519,6 +1539,7 @@ to = "Closed"
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         let (_custom, _scheduled, _spawns, _schedule_at) = apply_effects(
@@ -1568,6 +1589,7 @@ effect = ["spawn('TestWorkflow', 'Start', test_wf_id)"]
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         let result = process_action(&mut state, &table, "StartPlan", &serde_json::json!({}));
@@ -1626,6 +1648,7 @@ guard = "empty(test_wf_id) || TestWorkflow[test_wf_id].status in ['Passed']"
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         // Without cross-entity booleans, guard should fail
@@ -1693,6 +1716,7 @@ guard = "(empty(attachment_a_id) || Attachment[attachment_a_id].status in ['Read
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
         let xref: temper_jit::table::RelatedMap = ["a", "b", "c", "d", "e", "f", "g", "h"]
             .into_iter()
@@ -1756,6 +1780,7 @@ from = ["Active"]
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         // Provide next_run_at as a param (simulates WASM callback)
@@ -1819,6 +1844,7 @@ from = ["Active"]
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         // Provide a timestamp in the past
@@ -1873,6 +1899,7 @@ from = ["Active"]
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         let result = process_action(&mut state, &table, "Complete", &serde_json::json!({}));
@@ -1922,6 +1949,7 @@ effect = ["size_bytes = params.payload_size"]
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         };
 
         let result = process_action(
@@ -1957,6 +1985,7 @@ effect = ["size_bytes = params.payload_size"]
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         }
     }
 

@@ -52,6 +52,7 @@ pub(super) fn replay_copy(response: &EntityResponse) -> EntityResponse {
             sequence_nr: state.sequence_nr,
             processed_idempotency_keys: BTreeMap::new(),
             status_clock: state.status_clock.clone(),
+            spawn_reservations: state.spawn_reservations.clone(),
         },
         error: response.error.clone(),
         custom_effects: response.custom_effects.clone(),
@@ -91,6 +92,7 @@ pub(super) fn estimated_entry_bytes(
             VALUE_OVERHEAD_BYTES
                 + spawn.entity_type.len()
                 + spawn.entity_id.len()
+                + spawn.reservation_id.len()
                 + spawn
                     .copied_fields
                     .iter()
@@ -118,6 +120,11 @@ pub(super) fn estimated_entry_bytes(
         + state.status.len()
         + response.error.as_ref().map_or(0, String::len)
         + json_bytes(&state.fields)
+        + state
+            .spawn_reservations
+            .iter()
+            .map(|(field, owner)| named(field) + owner.len())
+            .sum::<usize>()
         + events
         + spawns
         + lists
