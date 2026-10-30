@@ -93,7 +93,12 @@ fn fixture() -> ServerState {
     state
 }
 
-async fn post(state: &ServerState, path: &str, params: Value) -> (StatusCode, Bytes) {
+async fn post(
+    state: &ServerState,
+    path: &str,
+    params: Value,
+    idempotency_key: Option<&str>,
+) -> (StatusCode, Bytes) {
     let identity = SecurityContext::from_verified_jwt(
         "action-answer-events",
         PrincipalKind::Agent,
@@ -102,13 +107,17 @@ async fn post(state: &ServerState, path: &str, params: Value) -> (StatusCode, By
         None,
         None,
     );
+    let mut headers = HeaderMap::new();
+    if let Some(key) = idempotency_key {
+        headers.insert("idempotency-key", key.parse().unwrap());
+    }
     let response = temper_server::odata::handle_odata_post(
         State(state.clone()),
         Some(Extension(AuthenticatedRequestContext::new(
             TenantId::new("answers"),
             identity,
         ))),
-        HeaderMap::new(),
+        headers,
         Path(path.into()),
         Query(Default::default()),
         Bytes::from(serde_json::to_vec(&params).unwrap()),
@@ -127,8 +136,13 @@ async fn an_answer_stays_in_budget_however_large_its_moves_params_were() {
     // 40 moves of 256 KiB each: 10 MiB of params in the record's recent events.
     let text = "x".repeat(256 * 1024);
     for n in 0..40 {
-        let (status, body) =
-            post(&state, "Drafts('d1')/Probe.Write", json!({ "text": text })).await;
+        let (status, body) = post(
+            &state,
+            "Drafts('d1')/Probe.Write",
+            json!({ "text": text }),
+            None,
+        )
+        .await;
         assert!(
             status.is_success(),
             "write {n}: {status}: {}",
@@ -136,22 +150,41 @@ async fn an_answer_stays_in_budget_however_large_its_moves_params_were() {
         );
     }
 
-    let (status, body) = post(&state, "Drafts('d1')/Probe.Say", json!({ "said": "done" })).await;
-    assert!(status.is_success(), "{status}");
-    assert!(
-        body.len() < ADMISSION_ANSWER_BUDGET,
-        "the answer is {} bytes, over an admission's {ADMISSION_ANSWER_BUDGET}",
-        body.len()
-    );
-    let answer: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        answer["events"],
-        json!([]),
-        "an answer carries no events, as a read carries none"
-    );
-    assert_eq!(
-        answer["fields"]["said"],
-        json!("done"),
-        "the answer is still the record after the move"
-    );
+    let mut first_answer: Option<Value> = None;
+    for attempt in 0..2 {
+        let (status, body) = post(
+            &state,
+            "Drafts('d1')/Probe.Say",
+            json!({ "said": "done" }),
+            Some("say-once"),
+        )
+        .await;
+        assert!(status.is_success(), "attempt {attempt}: {status}");
+        assert!(
+            body.len() < ADMISSION_ANSWER_BUDGET,
+            "attempt {attempt}: the answer is {} bytes, over an admission's {ADMISSION_ANSWER_BUDGET}",
+            body.len()
+        );
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            answer["events"],
+            json!([]),
+            "attempt {attempt}: an answer carries no events, as a read carries none"
+        );
+        assert_eq!(
+            answer["fields"]["said"],
+            json!("done"),
+            "the answer is still the record after the move"
+        );
+        if let Some(first) = &first_answer {
+            for field in ["fields", "status", "sequence_nr", "total_event_count"] {
+                assert_eq!(
+                    answer[field], first[field],
+                    "a retry must not apply the move twice"
+                );
+            }
+        } else {
+            first_answer = Some(answer);
+        }
+    }
 }

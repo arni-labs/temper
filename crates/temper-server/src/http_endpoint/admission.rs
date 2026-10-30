@@ -50,9 +50,6 @@ pub(super) fn resolve(value: &str, captures: &BTreeMap<String, String>) -> Resul
 /// fields approach this reaches it.
 const ANSWER_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
-/// The most of a refusal's body kept to say why it refused. A refusal is an OData error, a few hundred bytes.
-const REFUSAL_BODY_BYTES: usize = 1024 * 1024;
-
 pub(crate) async fn admit(
     state: &ServerState,
     authenticated: &AuthenticatedRequestContext,
@@ -149,16 +146,7 @@ pub(crate) async fn admit(
             return Err(requires_completion());
         }
         if !response.status().is_success() {
-            let status = response.status();
-            let (parts, body) = response.into_parts();
-            let body = to_bytes(body, REFUSAL_BODY_BYTES).await.unwrap_or_default();
-            let reason = String::from_utf8_lossy(&body);
-            if status.is_server_error() {
-                tracing::warn!(endpoint_id, admission = %name, %path, %status, %reason, "endpoint admission action failed");
-            } else {
-                tracing::info!(endpoint_id, admission = %name, %path, %status, %reason, "endpoint admission action refused");
-            }
-            return Err(Response::from_parts(parts, Body::from(body)));
+            return Err(log_refusal_response(endpoint_id, &name, &path, response).await);
         }
         let bytes = match to_bytes(response.into_body(), ANSWER_BUDGET_BYTES).await {
             Ok(v) => v,
@@ -182,3 +170,39 @@ fn requires_completion() -> Response {
         "endpoint admission requires completed OData actions; queued PostgreSQL actions are not supported")
         .into_response()
 }
+
+async fn log_refusal_response(
+    endpoint_id: &str,
+    name: &str,
+    path: &str,
+    response: Response,
+) -> Response {
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    // OData refusals can contain stored field values. Keep their original body,
+    // even when it is larger than a successful admission answer's budget.
+    let body = match to_bytes(body, usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(endpoint_id, admission = %name, %path, %status, %error,
+                "endpoint admission refusal body could not be read");
+            // Keep the status, headers and body failure instead of turning an
+            // unreadable refusal into a successful read of an empty body.
+            let body =
+                Body::from_stream(futures_util::stream::once(
+                    async move { Err::<Bytes, _>(error) },
+                ));
+            return Response::from_parts(parts, body);
+        }
+    };
+    let reason = String::from_utf8_lossy(&body);
+    if status.is_server_error() {
+        tracing::warn!(endpoint_id, admission = %name, %path, %status, %reason, "endpoint admission action failed");
+    } else {
+        tracing::info!(endpoint_id, admission = %name, %path, %status, %reason, "endpoint admission action refused");
+    }
+    Response::from_parts(parts, Body::from(body))
+}
+
+#[cfg(test)]
+mod tests;
