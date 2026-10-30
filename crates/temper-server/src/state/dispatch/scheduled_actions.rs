@@ -342,9 +342,11 @@ impl ServerState {
             // Recover a move that already committed before asking whether
             // another attempt may run. Its successors are owed even if that
             // move itself changed the standing that allowed its setter to read.
-            if retried && self.arm_fired_rows_retrying(timer, key.as_str()).await {
-                return;
-            }
+            let committed = retried && self.arm_fired_rows_retrying(timer, key.as_str()).await;
+            // A committed fire still needs the normal post-dispatch pipeline:
+            // its state timer, status cache and query projection may be owed.
+            // Dispatch with the same key recovers the actor's duplicate reply
+            // and completes those effects, without authorizing another move.
             let outcome = {
                 let _permit = match &gate {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),
@@ -356,7 +358,12 @@ impl ServerState {
                     entity_id: &timer.entity_id,
                     action: &timer.action,
                 };
-                match self.timer_setter_standing(&agent, &fire).await {
+                let standing = if committed {
+                    Ok(Standing::Holds)
+                } else {
+                    self.timer_setter_standing(&agent, &fire).await
+                };
+                match standing {
                     Ok(Standing::Holds) => {
                         let options = DispatchExtOptions {
                             agent_ctx: &agent,

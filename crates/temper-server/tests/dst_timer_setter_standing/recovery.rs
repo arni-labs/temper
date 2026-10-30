@@ -205,3 +205,66 @@ when { resource.Status != "Taken" };
         process.kill(&world, Duration::ZERO);
     }
 }
+
+/// Like Postgres, this simulation writes state-timer rows after commit. A
+/// committed scheduled fire with a lost answer must finish that bookkeeping
+/// without another move, restart, or change to the setter's standing.
+#[test]
+fn dst_committed_scheduled_fire_recovers_state_timeout() {
+    for seed in 0..16 {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = world(seed, clock);
+        let job = format!(
+            r#"{}
+
+[[state_timeout]]
+state = "Taken"
+after_seconds = 600
+on_timeout = "Finish"
+
+[[action]]
+name = "Finish"
+kind = "internal"
+from = ["Taken"]
+to = "Done"
+"#,
+            specs::JOB
+        );
+        let process = Process::start_with_job(&world, "committed-state-timeout", &job);
+        process.runtime.block_on(async {
+            let tenant = TenantId::new(TENANT);
+            let state = &process.state;
+            state.get_or_create_tenant_entity(&tenant, "Job", "child", json!({})).await.unwrap();
+            let caller = Setter::Stays(By::Themselves).caller("setter");
+            assert!(state.dispatch_tenant_action(&tenant, "Job", "child", "Hold", json!({}), &caller).await.unwrap().success);
+            world.events.land_next_appends_then_fail("alpha:Job:child", 1);
+            world.events.fail_next_reads("alpha:Job:child", 1);
+            pass(WAIT).await;
+            let journal = world.events.read_events("alpha:Job:child", 0).await.unwrap();
+            assert_eq!(journal.iter().filter(|e| e.event_type == "Take").count(), 1,
+                "seed {seed}: the lost answer must follow a committed Take");
+            assert!(world.rows.row(TENANT, "child").is_none(),
+                "seed {seed}: the lost answer must leave the state-timer row unwritten");
+            world.events.fail_next_reads("alpha:Job:child", (seed % 2) as usize);
+            pass(Duration::from_secs(60)).await;
+            let row = world.rows.row(TENANT, "child").unwrap_or_else(||
+                panic!("seed {seed}: recovering a committed fire must write and arm its state timeout"));
+            assert_eq!(row.state, "Taken");
+            assert_eq!(state.entity_state_cache.lock().unwrap().peek("alpha:Job:child").map(|cached| cached.status.as_str()), Some("Taken"),
+                "seed {seed}: recovering the commit must refresh its cached status");
+            let armed_by: serde_json::Value = serde_json::from_str(&row.armed_by).unwrap();
+            assert_eq!(armed_by["read_when_set"], true,
+                "seed {seed}: the timeout must keep its setter's standing");
+            pass(WAIT).await;
+            let journal = world.events.read_events("alpha:Job:child", 0).await.unwrap();
+            for action in ["Take", "Finish"] {
+                assert_eq!(journal.iter().filter(|e| e.event_type == action).count(), 1,
+                    "seed {seed}: {action} must commit exactly once without a restart or another move");
+            }
+            assert!(world.rows.row(TENANT, "child").is_none());
+            assert!(state.armed_scheduled_actions().is_empty());
+        });
+        process.kill(&world, Duration::ZERO);
+    }
+}
