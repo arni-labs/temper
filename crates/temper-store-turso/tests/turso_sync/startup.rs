@@ -44,6 +44,36 @@ async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_ans
 }
 
 #[tokio::test]
+async fn a_restart_with_nothing_new_asks_the_remote_once_and_pushes_nothing() {
+    // Every change of the file is on the remote, so a restart only asks for
+    // the remote's record of the file. A write after it is pushed as before.
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (url, requests) = counting(&server.url).await;
+    let (_a_dir, a_path) = machine();
+    let open = || TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &url, TOKEN);
+    let a = open().await.expect("open");
+    write(&a, "n", 0).await;
+    push(&a).await;
+    drop(a);
+
+    let before = requests.load(std::sync::atomic::Ordering::Acquire);
+    let a = open().await.expect("restart");
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    let asked = requests.load(std::sync::atomic::Ordering::Acquire) - before;
+    assert_eq!(
+        asked, 1,
+        "a restart with nothing new sent {asked} requests to the remote"
+    );
+    write(&a, "n", 1).await;
+    push(&a).await;
+    let (_b_dir, b_path) = machine();
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "n").await, 2);
+}
+
+#[tokio::test]
 async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
     let Some(server) = SyncServer::start() else {
         return;
