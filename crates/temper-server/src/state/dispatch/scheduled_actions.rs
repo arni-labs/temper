@@ -338,6 +338,9 @@ impl ServerState {
         super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
+        // The last attempt's caller, with the answer the timers its move sets
+        // keep (`timer_standing`), taken before that attempt.
+        let mut answered: Option<AgentContext> = None;
         loop {
             // Recover a move that already committed before asking whether
             // another attempt may run. Its successors are owed even if that
@@ -347,6 +350,9 @@ impl ServerState {
             // its state timer, status cache and query projection may be owed.
             // Dispatch with the same key recovers the actor's duplicate reply
             // and completes those effects, without authorizing another move.
+            // Its timers keep the answer of the attempt that committed it,
+            // the last one: the record it would be asked of now is the one
+            // its move made.
             let outcome = {
                 let _permit = match &gate {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),
@@ -363,24 +369,41 @@ impl ServerState {
                 } else {
                     self.timer_setter_standing(&agent, &fire).await
                 };
-                match standing {
-                    Ok(Standing::Holds) => {
-                        let options = DispatchExtOptions {
-                            agent_ctx: &agent,
-                            await_integration: false,
-                            await_reactions: true,
-                        };
-                        self.dispatch_tenant_action_ext_typed(
+                let caller = match (standing, answered.take()) {
+                    (Ok(Standing::Holds), Some(caller)) if committed => Ok(caller),
+                    (Ok(Standing::Holds), _) => {
+                        self.with_read_when_set(
                             &timer.tenant,
                             &timer.entity_type,
                             &timer.entity_id,
                             &timer.action,
-                            serde_json::json!({}),
-                            options,
+                            agent.clone(),
                         )
                         .await
                     }
-                    Ok(Standing::Lost { reason }) => Err(DispatchError::AuthzDenied(reason)),
+                    (Ok(Standing::Lost { reason }), _) => Err(DispatchError::AuthzDenied(reason)),
+                    (Err(error), _) => Err(error),
+                };
+                match caller {
+                    Ok(caller) => {
+                        let options = DispatchExtOptions {
+                            agent_ctx: &caller,
+                            await_integration: false,
+                            await_reactions: true,
+                        };
+                        let outcome = self
+                            .dispatch_tenant_action_ext_typed(
+                                &timer.tenant,
+                                &timer.entity_type,
+                                &timer.entity_id,
+                                &timer.action,
+                                serde_json::json!({}),
+                                options,
+                            )
+                            .await;
+                        answered = Some(caller);
+                        outcome
+                    }
                     Err(error) => Err(error),
                 }
             };

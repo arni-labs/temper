@@ -116,6 +116,12 @@ pub struct AgentContext {
     /// record (`timer_standing`). None when not asked: the move sets no
     /// timer, names no caller, or was made before timers kept this.
     pub read_when_set: Option<bool>,
+    /// Runtime-owned; never populated from request headers. The move
+    /// [`Self::read_when_set`] was answered for: its record, action and
+    /// idempotency key. Another dispatch of that move keeps the answer, so a
+    /// committed move recovered after its reply was lost keeps the answer
+    /// taken before it (`timer_standing`).
+    pub read_when_set_for: Option<String>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -227,6 +233,7 @@ impl AgentContext {
             fires_scheduled_action: None,
             fires_state_timer: None,
             read_when_set: None,
+            read_when_set_for: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -267,6 +274,7 @@ impl AgentContext {
             fires_scheduled_action: None,
             fires_state_timer: None,
             read_when_set: None,
+            read_when_set_for: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -406,6 +414,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         fires_scheduled_action: None,
         fires_state_timer: None,
         read_when_set: None,
+        read_when_set_for: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }

@@ -139,7 +139,12 @@ impl ServerState {
     /// read it as it is now when the move can set a timer
     /// ([`AgentContext::read_when_set`]), and with no answer otherwise. Every
     /// move answers afresh, so an answer about one record never reaches
-    /// another's timers. An error is a record that could not be read.
+    /// another's timers. Another dispatch of the move an answer was taken for
+    /// (the same record, action and idempotency key) keeps it
+    /// ([`AgentContext::read_when_set_for`]): a committed move recovered
+    /// after its reply was lost keeps the answer taken before it, not one
+    /// asked of the record its move has changed. An error is a record that
+    /// could not be read.
     pub(super) async fn with_read_when_set(
         &self,
         tenant: &TenantId,
@@ -148,7 +153,17 @@ impl ServerState {
         action: &str,
         mut agent: AgentContext,
     ) -> Result<AgentContext, DispatchError> {
+        let taken_for = agent.idempotency_key.as_ref().map(|key| {
+            format!(
+                "{tenant}:{entity_type}:{entity_id}:{action}:{}",
+                key.as_str()
+            )
+        });
+        if taken_for.is_some() && agent.read_when_set_for == taken_for {
+            return Ok(agent);
+        }
         agent.read_when_set = None;
+        agent.read_when_set_for = None;
         if agent.caller().is_none() || !self.move_can_set_a_timer(tenant, entity_type, action) {
             return Ok(agent);
         }
@@ -157,6 +172,7 @@ impl ServerState {
             .await?;
         agent.read_when_set =
             Some(self.may_read_as_timer(&agent, tenant, entity_type, &snapshot.resource_attrs));
+        agent.read_when_set_for = taken_for;
         Ok(agent)
     }
 

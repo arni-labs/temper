@@ -53,6 +53,7 @@ pub(super) fn composite_sub_write_agent(
         write.idempotency_key.clone(),
     ));
     agent.read_when_set = None;
+    agent.read_when_set_for = None;
     agent
 }
 
