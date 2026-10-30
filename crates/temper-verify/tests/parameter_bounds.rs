@@ -2,7 +2,7 @@
 
 use stateright::Model;
 use temper_verify::model::{ParamValue, build_model_from_ioa, semantics::successors};
-use temper_verify::{CascadeLevel, VerificationCascade};
+use temper_verify::{CascadeLevel, VerificationCascade, check_model};
 
 const COUNTERS: &str = r#"
 [automaton]
@@ -168,4 +168,132 @@ fn list_indexes_cover_an_initial_list_longer_than_the_default_bound() {
     assert_eq!(choices.len(), 5, "four indexes and one out-of-range no-op");
     assert_eq!(choices[3].1.lists["items"], ["first", "second", "third"]);
     assert_eq!(choices[4].1.lists["items"], initial.lists["items"]);
+}
+
+/// Effects read the writes before them, even when the temporary is reset.
+#[test]
+fn a_parameter_reaches_a_later_counter_through_ordered_effects() {
+    for (initial_x, operation, invariant, expected_x) in [
+        (5, "-=", "x != 1", 1),
+        (0, "=", "x <= 3", 4),
+        (0, "+=", "x <= 3", 4),
+    ] {
+        let spec = format!(
+            r#"
+[automaton]
+name = "Indirect"
+states = ["On", "Done"]
+initial = "On"
+
+[[state]]
+name = "x"
+type = "counter"
+initial = {initial_x}
+
+[[state]]
+name = "y"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Write"
+from = ["On"]
+to = "Done"
+effect = ["y = params.a", "x {operation} y", "y = 0"]
+
+[[invariant]]
+name = "Safe"
+assert = "{invariant}"
+"#
+        );
+        let model = build_model_from_ioa(&spec, 2).unwrap();
+        let initial = model.init_states().remove(0);
+        let choices = successors(&model, &model.transitions[0], &initial);
+
+        let result = VerificationCascade::from_ioa(&spec)
+            .with_sim_seeds(2)
+            .with_prop_test_cases(20)
+            .run();
+        let l1 = result.level_result(CascadeLevel::ModelCheck).unwrap();
+        assert!(!l1.passed, "{operation}: {}", l1.summary);
+        let verification = l1.verification.as_ref().unwrap();
+        let counterexample = verification
+            .counterexamples
+            .iter()
+            .find(|c| c.violated.iter().any(|name| name == "Safe"))
+            .expect("L1 finds the indirect parameter counterexample");
+        let (last, _) = counterexample.trace.last().unwrap();
+        assert_eq!(last.counters["x"], expected_x);
+        assert_eq!(last.counters["y"], 0);
+        assert!(
+            counterexample.trace.iter().any(|(_, action)| {
+                action
+                    .as_ref()
+                    .is_some_and(|a| a.params["a"] == ParamValue::Count(4))
+            }),
+            "{counterexample:?}"
+        );
+        assert!(
+            choices.iter().any(|(params, next)| {
+                params["a"] == ParamValue::Count(4)
+                    && next.counters["x"] == expected_x
+                    && next.counters["y"] == 0
+            }),
+            "{operation}: {choices:?}"
+        );
+    }
+}
+
+#[test]
+fn an_overwrite_stops_a_parameter_from_reaching_unrelated_counters() {
+    for effects in [
+        "x = y\", \"y = params.a",
+        "y = params.a\", \"y = 0\", \"x = y",
+        "y = params.a\", \"y = params.b\", \"x = y",
+    ] {
+        let spec = COUNTERS.replace("y = params.a\", \"z = params.b", effects);
+        let model = build_model_from_ioa(&spec, 2).unwrap();
+        let initial = model.init_states().remove(0);
+        let choices = successors(&model, &model.transitions[0], &initial);
+        assert!(
+            choices
+                .iter()
+                .all(|(params, _)| { matches!(params["a"], ParamValue::Count(0..=2)) }),
+            "{effects}: {choices:?}"
+        );
+    }
+}
+
+#[test]
+fn list_indexes_cover_appends_earlier_in_the_same_action() {
+    let spec = LIST
+        .split("\n[[action]]\nname = \"Append\"")
+        .next()
+        .unwrap()
+        .replace("states = [\"On\"]", "states = [\"On\", \"Done\"]")
+        .replace("guard = \"x < 5000\"", "to = \"Done\"")
+        .replace(
+            "remove_at(items, params.index)",
+            "append(items, 'new')\", \"remove_at(items, params.index)\", \"remove_at(items, 0)",
+        );
+    let spec = format!(
+        "{spec}\n[[invariant]]\nname = \"Safe\"\nassert = \"status == 'Done' => len(items) <= 1\"\n"
+    );
+    let model = build_model_from_ioa(&spec, 2).unwrap();
+    let result = check_model(&model);
+    assert!(
+        result
+            .counterexamples
+            .iter()
+            .any(|c| c.violated.contains(&"Safe".into())),
+        "{result:?}"
+    );
+    let initial = model.init_states().remove(0);
+    let choices = successors(&model, &model.transitions[0], &initial);
+    assert!(
+        choices.iter().any(|(params, next)| {
+            params["index"] == ParamValue::Count(3) && next.lists["items"] == ["second", "new"]
+        }),
+        "{choices:?}"
+    );
 }

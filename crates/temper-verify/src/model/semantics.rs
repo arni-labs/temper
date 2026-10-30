@@ -10,6 +10,7 @@ use super::types::{
     ModelEffect, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
 };
 
+use super::count_bounds::count_bound;
 pub(crate) use super::expansion::Expansion;
 use super::strings::string_assignments;
 pub use super::strings::{apply_string_params, canonical_strings, string_values};
@@ -243,31 +244,6 @@ pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
         });
         (assignments > MAX_PARAM_ASSIGNMENTS).then_some((t.name.as_str(), assignments))
     })
-}
-
-/// The largest value needed by the effects that read this count parameter.
-/// Unrelated counters do not expand its domain. A shared parameter covers all
-/// its target counters and list indexes, including one out-of-range no-op.
-fn count_bound(model: &TemperModel, t: &ResolvedTransition, name: &str) -> usize {
-    t.effects
-        .iter()
-        .filter_map(|effect| {
-            let (arg, bound) = match effect {
-                ModelEffect::SetCounter { var, value }
-                | ModelEffect::AddCounter { var, value }
-                | ModelEffect::SubCounter { var, value } => (value, counter_bound(model, var)),
-                ModelEffect::ListRemoveAt { var, index } => (
-                    index,
-                    model
-                        .default_max_counter
-                        .max(model.initial_lists.get(var).map_or(0, Vec::len)),
-                ),
-                _ => return None,
-            };
-            matches!(arg, Arg::Param(p) if p == name).then_some(bound)
-        })
-        .max()
-        .unwrap_or(model.default_max_counter)
 }
 
 /// The values explored for one parameter of `t`.
