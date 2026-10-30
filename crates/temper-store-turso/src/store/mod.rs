@@ -271,6 +271,9 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_SNAPSHOTS_TABLE, ())
             .await
             .map_err(storage_error)?;
+        conn.execute(schema::CREATE_SNAPSHOTS_CHECKPOINT_INDEX, ())
+            .await
+            .map_err(storage_error)?;
         conn.execute(schema::CREATE_SNAPSHOT_HISTORY_TABLE, ())
             .await
             .map_err(storage_error)?;
@@ -533,6 +536,9 @@ impl TursoEventStore {
         let _ = conn
             .execute(schema::ALTER_ENTITY_CATALOG_ADD_STATE, ())
             .await;
+        conn.execute(schema::CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, ())
+            .await
+            .map_err(storage_error)?;
 
         // Entity field index — EAV table for OData filter push-down.
         conn.execute(schema::CREATE_ENTITY_FIELD_INDEX_TABLE, ())
