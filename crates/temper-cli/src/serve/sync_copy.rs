@@ -458,6 +458,65 @@ mod tests {
         }
     }
 
+    /// What only this server holds when it starts, such as a write from its
+    /// last run or an index the start built, reaches the remote without
+    /// waiting for a write: the upkeep pushes it as the server serves.
+    #[tokio::test]
+    async fn a_server_pushes_what_its_start_holds_without_a_write() {
+        use temper_runtime::persistence::{EventMetadata, EventStore, PersistenceEnvelope};
+
+        let Some(server) = SyncServer::start().await else {
+            return;
+        };
+        let synced = |dir: &tempfile::TempDir| {
+            let local = format!("file:{}", dir.path().join("app.db").display());
+            let url = server.url.clone();
+            async move {
+                TursoEventStore::new_synced(&local, &url, "the-local-server-ignores-it")
+                    .await
+                    .expect("open the synced store")
+            }
+        };
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = synced(&dir).await;
+        let event = PersistenceEnvelope {
+            sequence_nr: 0,
+            event_type: "Written".to_string(),
+            payload: serde_json::json!({ "n": 1 }),
+            metadata: EventMetadata {
+                event_id: uuid::Uuid::new_v4(),
+                causation_id: uuid::Uuid::new_v4(),
+                correlation_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                actor_id: "serve-test".to_string(),
+            },
+        };
+        store
+            .append("default:Note:left", 0, &[event])
+            .await
+            .expect("append");
+        drop(store);
+
+        let store = synced(&dir).await;
+        let copy = store.sync_copy().expect("a synced store").clone();
+        let _routes = serve_router(Router::new(), Some(store));
+        let started = Instant::now();
+        while copy.remote_record_unsure() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the server pushed nothing in 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let other = tempfile::tempdir().expect("second machine");
+        let restored = synced(&other).await;
+        let events = restored
+            .read_events("default:Note:left", 0)
+            .await
+            .expect("read the restored copy");
+        assert_eq!(events.len(), 1, "the write left behind is on the remote");
+    }
+
     #[test]
     fn a_question_to_cedar_skips_the_push() {
         // A page's offers after a move waited 34-39 ms here for a push they
