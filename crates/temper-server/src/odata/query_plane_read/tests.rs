@@ -445,7 +445,13 @@ async fn projection_lagged_actor_write_repairs_missing_catalog_row() {
         .expect("create local turso db");
     let mut state = build_order_state("query-plane-lag-repair");
     create_orders(&state, 1).await;
-    state.set_storage_stack(StorageStack::from_turso(store.clone()));
+    // The journal's own database read as a separate query plane: the server
+    // writes its rows after each commit, as over Postgres, so a record's row
+    // can be missing. Over Turso alone the commit writes it.
+    let mut stack = StorageStack::from_turso(store.clone());
+    stack.query_plane = Some(std::sync::Arc::new(store.clone()));
+    assert!(!stack.entity_rows_in_commit());
+    state.set_storage_stack(stack);
     let tenant = TenantId::default();
 
     let security_ctx = SecurityContext::system();
