@@ -18,9 +18,11 @@ use temper_runtime::persistence::{PersistenceError, StateTimerRecord};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 use tokio::sync::Semaphore;
+use tracing::instrument;
 
 use super::state_timeouts::{ArmedTimer, remaining_budget};
 use super::state_timer_follow::{BootCallers, BootTimers};
+use crate::entity_actor::EntityState;
 use crate::request_context::AgentContext;
 use crate::request_context::armed_by::{decode_armed_by, encode_armed_by};
 use crate::state::ServerState;
@@ -152,6 +154,43 @@ impl ServerState {
         let gate = Arc::new(Semaphore::new(BOOT_FIRES_AT_ONCE));
         let mut callers = BootCallers::new();
         let mut counts = BootTimers::new();
+        let (armed, overdue) = self
+            .rearm_state_timer_rows(&gate, &mut callers, &mut counts)
+            .await;
+        self.follow_repaired_records(repaired, &callers, &gate)
+            .await;
+        tracing::info!(
+            armed,
+            overdue,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "re-armed state timers from the store"
+        );
+        self.rearm_scheduled_actions(&gate, &mut counts).await;
+        {
+            // Serialize with install walks so none can consume startup changes
+            // before saved identities and gates have been restored. The boot
+            // walk covers all timed types, including missing rows at startup.
+            let mut registry = self.registry.write().expect("registry lock poisoned");
+            registry.take_changed_types();
+            self.timer_recovery_complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let server = self.clone();
+        // determinism-ok: boot follow-up runs in the background, as boot timers do.
+        tokio::spawn(async move { server.follow_timed_types(callers, gate, counts).await })
+    }
+
+    /// Arm again each state timer row the last process left, as
+    /// [`Self::rearm_state_timers`] describes, keeping the callers of rows it
+    /// drops in `callers` and counting into `counts`. Returns how many it
+    /// armed and how many of those were overdue.
+    #[instrument(skip_all, fields(otel.name = "boot.state_timer_rows"))]
+    async fn rearm_state_timer_rows(
+        &self,
+        gate: &Arc<Semaphore>,
+        callers: &mut BootCallers,
+        counts: &mut BootTimers,
+    ) -> (usize, usize) {
         let mut armed = 0usize;
         let mut overdue = 0usize;
         for (tenant, timeouts) in self.declared_state_timeouts() {
@@ -236,6 +275,18 @@ impl ServerState {
                 armed += 1;
             }
         }
+        (armed, overdue)
+    }
+
+    /// Make each record the boot repair rewrote follow its replayed state,
+    /// as the caller its row was armed by, through the boot gate.
+    #[instrument(skip_all, fields(otel.name = "boot.repaired_follow", records = repaired.len()))]
+    async fn follow_repaired_records(
+        &self,
+        repaired: Vec<(TenantId, EntityState)>,
+        callers: &BootCallers,
+        gate: &Arc<Semaphore>,
+    ) {
         // Restore saved identities first, then reconcile repaired records with
         // their replayed state through the same eight-fire boot gate. A restart
         // during repair is safe: the rowless boot walk also recovers any timer
@@ -259,25 +310,6 @@ impl ServerState {
             )
             .await;
         }
-        tracing::info!(
-            armed,
-            overdue,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "re-armed state timers from the store"
-        );
-        self.rearm_scheduled_actions(&gate, &mut counts).await;
-        {
-            // Serialize with install walks so none can consume startup changes
-            // before saved identities and gates have been restored. The boot
-            // walk covers all timed types, including missing rows at startup.
-            let mut registry = self.registry.write().expect("registry lock poisoned");
-            registry.take_changed_types();
-            self.timer_recovery_complete
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        let server = self.clone();
-        // determinism-ok: boot follow-up runs in the background, as boot timers do.
-        tokio::spawn(async move { server.follow_timed_types(callers, gate, counts).await })
     }
 
     /// Every tenant's declared timeouts. Tenants without any are left out.
