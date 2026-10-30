@@ -45,6 +45,8 @@ mod invariants;
 mod logged;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
+#[path = "dst_timer_setter_standing/recovery.rs"]
+mod recovery;
 #[path = "dst_timer_setter_standing/server.rs"]
 mod server;
 #[path = "dst_timer_setter_standing/specs.rs"]

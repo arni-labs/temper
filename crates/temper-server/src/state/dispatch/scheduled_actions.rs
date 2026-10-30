@@ -201,10 +201,11 @@ impl ServerState {
     /// that answers its retry hands back no schedules. Only the fire's own
     /// rows are armed: any other row of the record belongs to a dispatch that
     /// arms it itself, after its integrations. Err: the journal or the rows
-    /// could not be read, and nothing was armed.
-    async fn arm_fired_rows(&self, timer: &ScheduledTimer, key: &str) -> Result<(), String> {
+    /// could not be read, and nothing was armed. Ok: whether the fire already
+    /// committed, including when it scheduled no successors.
+    async fn arm_fired_rows(&self, timer: &ScheduledTimer, key: &str) -> Result<bool, String> {
         let Some((store, _)) = self.event_journal() else {
-            return Ok(());
+            return Ok(false);
         };
         // The fire's event comes after the event that armed it.
         let armed_seq = timer
@@ -222,7 +223,7 @@ impl ServerState {
             .find(|event| event.payload["idempotency_key"].as_str() == Some(key))
             .map(|event| event.sequence_nr)
         else {
-            return Ok(());
+            return Ok(false);
         };
         let rows = store
             .list_scheduled_actions(timer.tenant.as_str())
@@ -241,20 +242,25 @@ impl ServerState {
                 self.spawn_scheduled_action(waiting, delay, None);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// [`Self::arm_fired_rows`] until the rows can be read, waiting longer
     /// after each failure: until then the fire's successors have no timer.
-    async fn arm_fired_rows_retrying(&self, timer: &ScheduledTimer, key: &str) {
+    async fn arm_fired_rows_retrying(&self, timer: &ScheduledTimer, key: &str) -> bool {
         let mut wait = FIRST_RETRY_WAIT;
-        while let Err(error) = self.arm_fired_rows(timer, key).await {
-            tracing::error!(tenant = %timer.tenant, entity_type = %timer.entity_type,
-                entity_id = %timer.entity_id, arm_id = %timer.arm_id, %error,
-                retry_in_ms = wait.as_millis() as u64,
-                "rows of a retried scheduled fire not readable; retrying");
-            tokio::time::sleep(wait).await; // determinism-ok: retry backoff
-            wait = (wait * 2).min(LAST_RETRY_WAIT);
+        loop {
+            match self.arm_fired_rows(timer, key).await {
+                Ok(committed) => return committed,
+                Err(error) => {
+                    tracing::error!(tenant = %timer.tenant, entity_type = %timer.entity_type,
+                        entity_id = %timer.entity_id, arm_id = %timer.arm_id, %error,
+                        retry_in_ms = wait.as_millis() as u64,
+                        "rows of a retried scheduled fire not readable; retrying");
+                    tokio::time::sleep(wait).await; // determinism-ok: retry backoff
+                    wait = (wait * 2).min(LAST_RETRY_WAIT);
+                }
+            }
         }
     }
 
@@ -333,6 +339,12 @@ impl ServerState {
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
         loop {
+            // Recover a move that already committed before asking whether
+            // another attempt may run. Its successors are owed even if that
+            // move itself changed the standing that allowed its setter to read.
+            if retried && self.arm_fired_rows_retrying(timer, key.as_str()).await {
+                return;
+            }
             let outcome = {
                 let _permit = match &gate {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),

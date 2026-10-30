@@ -71,6 +71,11 @@ impl Process {
     /// storage, the tenant's Cedar as stored, then `start_runtime`, whose
     /// walk re-arms the timers the last process left.
     pub(super) fn start(world: &World, name: &str) -> Self {
+        Self::start_with_job(world, name, JOB)
+    }
+
+    /// Boot with a job spec that exercises a recovery path.
+    pub(super) fn start_with_job(world: &World, name: &str, job: &str) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -83,7 +88,7 @@ impl Process {
                 TENANT,
                 parse_csdl(CSDL).unwrap(),
                 CSDL.to_string(),
-                &[("Job", JOB), ("Pass", PASS)],
+                &[("Job", job), ("Pass", PASS)],
             );
             for entity_type in ["Job", "Pass"] {
                 registry.set_verification_status(
