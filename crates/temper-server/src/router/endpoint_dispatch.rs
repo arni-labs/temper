@@ -87,6 +87,7 @@ pub(super) async fn dispatch_matched_route(
         .wait(crate::http_endpoint::admission::admit(
             &state,
             &authenticated,
+            &route.route.id,
             &route.params,
             route.route.admission_actions.clone(),
         ))

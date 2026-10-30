@@ -146,7 +146,7 @@ pub(super) async fn dispatch_bound_action(
             )
         {
             let body = annotate_entity(
-                serde_json::to_value(&cached.state).unwrap_or_default(),
+                action_answer(&cached.state),
                 format!("$metadata#{set_name}/$entity"),
                 None,
             );
@@ -189,7 +189,7 @@ pub(super) async fn dispatch_bound_action(
                     // Dispatch has cached this reply for the key once its effects ran.
                     action_span.set_status(Status::Ok);
 
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
+                    let mut state_json = action_answer(&response.state);
                     if let Some(hook) = state.bound_action_hook.as_ref() {
                         match hook
                             .after_bound_action(BoundActionHookContext {
@@ -318,6 +318,17 @@ pub(super) async fn dispatch_bound_action(
             }
         };
     }
+}
+
+// Fresh answers and cached retries show the record as a read does, without its
+// recent events. Event params can each hold a whole document; fifty of them
+// pushed an endpoint admission's answer past its budget.
+fn action_answer(state: &crate::entity_actor::EntityState) -> serde_json::Value {
+    let mut record = serde_json::to_value(state).unwrap_or_default();
+    if let Some(record) = record.as_object_mut() {
+        record.insert("events".to_string(), serde_json::json!([]));
+    }
+    record
 }
 
 #[cfg(test)]
