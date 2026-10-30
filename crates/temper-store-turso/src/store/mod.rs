@@ -35,6 +35,7 @@ mod append_commit;
 mod append_config;
 mod authz;
 mod blobs;
+mod catalog_groups;
 mod commit_probe;
 mod constraints;
 mod entity_listing;
@@ -49,6 +50,7 @@ mod policy;
 mod policy_approval;
 mod policy_replace;
 mod projection_freshness;
+mod projection_repair;
 mod projection_rows;
 mod published_artifacts;
 mod query_page;
@@ -70,6 +72,7 @@ mod write_gate;
 pub use field_index::QueryProjectionUpsert;
 use instrumentation::InstrumentedConnection;
 pub use published_artifacts::{PublishedArtifactRow, PublishedArtifactUpsert};
+pub(crate) use write_gate::WritePriority;
 
 #[derive(Clone, Debug)]
 pub struct TursoEventStore {
@@ -142,9 +145,7 @@ impl TursoEventStore {
     ) -> Result<Self, PersistenceError> {
         let store = Self {
             db: Arc::new(db),
-            write_gate: Arc::new(write_gate::WriteGate::new(
-                write_gate::configured_write_concurrency(is_remote),
-            )),
+            write_gate: Arc::new(write_gate::WriteGate::new()),
             trajectory_batch: Arc::default(),
             is_remote,
             sync_copy,
@@ -232,7 +233,9 @@ impl TursoEventStore {
     /// Run schema migrations on connect.
     #[instrument(skip_all, fields(otel.name = "turso.migrate"))]
     async fn migrate(&self) -> Result<(), PersistenceError> {
-        let conn = self.connection().await?;
+        let conn = self
+            .write_connection("turso.migrate", write_gate::WritePriority::High)
+            .await?;
 
         // PRAGMAs are SQLite-specific and not supported on remote Turso Cloud.
         // Turso Cloud manages its own journal mode and concurrency.
@@ -417,6 +420,12 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_TENANT_SECRETS_TABLE, ())
             .await
             .map_err(storage_error)?;
+        migration_support::add_column_if_missing(
+            &conn,
+            schema::ALTER_TENANT_SECRETS_ADD_VERSION_ID,
+        )
+        .await?;
+        secrets::backfill_versions(&conn).await?;
         conn.execute(schema::CREATE_STATE_TIMERS_TABLE, ())
             .await
             .map_err(storage_error)?;
@@ -579,7 +588,7 @@ impl TursoEventStore {
     /// stay stranded in `ots_trajectories_rebuild`. SQLite's DDL is
     /// transactional, so the whole rekey either lands or does not.
     async fn rebuild_ots_trajectories_for_tenant_identity(
-        conn: &InstrumentedConnection,
+        conn: &instrumentation::WriteConnection,
     ) -> Result<(), PersistenceError> {
         // Scoped so the cursor is closed before the rebuild runs: an open read
         // on `sqlite_master` holds a lock that `DROP TABLE` cannot take.

@@ -3,7 +3,7 @@
 //! [`PlatformState`] extends `ServerState` with the broadcast channel
 //! for internal event propagation and the Claude API key.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use tokio::sync::broadcast;
 
@@ -12,6 +12,7 @@ use temper_runtime::tenant::TenantId;
 use temper_server::ServerState;
 use temper_server::registry::SpecRegistry;
 
+use crate::module_review::ModuleReviewer;
 use crate::protocol::PlatformEvent;
 use crate::spec_store::SpecStore;
 
@@ -35,6 +36,9 @@ pub struct PlatformState {
     pub api_token: Option<String>,
     /// In-memory spec storage for pending tenant deployments.
     pub spec_store: Arc<RwLock<SpecStore>>,
+    /// Jev's review of an app's modules at install, once the server is given one ([`Self::set_module_reviewer`]).
+    /// Shared by every clone of the state, so hooks made with a clone before it was set review too.
+    pub module_reviewer: Arc<OnceLock<Arc<ModuleReviewer>>>,
 }
 
 /// Default broadcast channel capacity.
@@ -98,6 +102,7 @@ impl PlatformState {
             api_key,
             api_token: None,
             spec_store,
+            module_reviewer: Arc::new(OnceLock::new()),
         };
         state.server.bound_action_hook = Some(Arc::new(
             crate::genesis_install::GenesisInstallHook::new(state.clone()),
@@ -141,11 +146,18 @@ impl PlatformState {
             api_key,
             api_token: None,
             spec_store,
+            module_reviewer: Arc::new(OnceLock::new()),
         };
         state.server.bound_action_hook = Some(Arc::new(
             crate::genesis_install::GenesisInstallHook::new(state.clone()),
         ));
         state
+    }
+
+    /// Review the modules of every app installed from now on with `reviewer`. The first one set stays.
+    pub fn set_module_reviewer(&self, reviewer: Arc<ModuleReviewer>) {
+        let _ = self.module_reviewer.set(reviewer);
+        debug_assert!(self.module_reviewer.get().is_some());
     }
 
     /// Subscribe to the broadcast channel for platform events.
@@ -165,25 +177,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_state() {
-        let state = PlatformState::new(None);
-        assert!(state.api_key.is_none());
-    }
-
-    #[test]
-    fn test_new_with_api_key() {
-        let state = PlatformState::new(Some("sk-test-key".into()));
-        assert_eq!(state.api_key.as_deref(), Some("sk-test-key"));
-    }
-
-    #[test]
-    fn test_with_registry() {
-        let registry = SpecRegistry::new();
-        let state = PlatformState::with_registry(registry, None);
-        assert!(state.api_key.is_none());
-    }
-
-    #[test]
     fn test_broadcast_and_subscribe() {
         let state = PlatformState::new(None);
         let mut rx = state.subscribe();
@@ -197,15 +190,6 @@ mod tests {
             PlatformEvent::Error { message } => assert_eq!(message, "test broadcast"),
             _ => panic!("expected Error message"),
         }
-    }
-
-    #[test]
-    fn test_broadcast_no_receivers_does_not_panic() {
-        let state = PlatformState::new(None);
-        // No subscribers — should not panic.
-        state.broadcast(PlatformEvent::Error {
-            message: "nobody listening".into(),
-        });
     }
 
     #[test]

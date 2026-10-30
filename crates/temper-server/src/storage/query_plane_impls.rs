@@ -3,8 +3,9 @@ use temper_store_postgres::PostgresEventStore;
 use temper_store_turso::{QueryProjectionUpsert as TursoQueryProjectionUpsert, TursoEventStore};
 
 use super::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexOrderDirection,
-    QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder,
+    QueryFieldIndexOrderDirection, QueryFieldIndexPage, QueryPlaneStore, QueryProjectionFieldsRow,
+    QueryProjectionUpsert,
 };
 
 pub(super) fn catalog_freshness(
@@ -33,6 +34,19 @@ pub(super) fn storage_order_by(order_by: &[QueryFieldIndexOrder]) -> Vec<(String
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for PostgresEventStore {
+    async fn lagging_projections(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        self.lagging_query_projections(tenant).await.map(Some)
+    }
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        self.query_projection_checkpoints(tenant).await
+    }
     async fn upsert_projection(
         &self,
         tenant: &str,
@@ -193,10 +207,36 @@ impl QueryPlaneStore for PostgresEventStore {
             .await
             .map(|rows| Some(catalog_freshness(rows)))
     }
+
+    async fn catalog_groups(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        fields: &[String],
+        statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
+        let rows = self
+            .catalog_groups_pg(tenant, entity_type, fields, statuses)
+            .await?;
+        Ok(Some(CatalogGroup::from_rows(rows, fields)))
+    }
 }
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for TursoEventStore {
+    async fn lagging_projections(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        self.lagging_query_projections(tenant).await.map(Some)
+    }
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        self.query_projection_checkpoints(tenant).await
+    }
     async fn upsert_projection(
         &self,
         tenant: &str,
@@ -345,6 +385,18 @@ impl QueryPlaneStore for TursoEventStore {
         TursoEventStore::projection_catalog_freshness(self, tenant, entity_type)
             .await
             .map(|rows| Some(catalog_freshness(rows)))
+    }
+
+    async fn catalog_groups(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        fields: &[String],
+        statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
+        let rows =
+            TursoEventStore::catalog_groups(self, tenant, entity_type, fields, statuses).await?;
+        Ok(Some(CatalogGroup::from_rows(rows, fields)))
     }
 }
 

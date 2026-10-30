@@ -19,7 +19,10 @@ pub(crate) enum TenantMetadataBackend {
 }
 
 mod logs_and_secrets;
+mod secrets;
 mod spec_metadata;
+
+pub use secrets::SecretWriteOutcome;
 
 const BUNDLED_REPLACE_UPLOAD_SOURCE: &str = "bundled-replace-upload";
 

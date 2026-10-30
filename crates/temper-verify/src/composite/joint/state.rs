@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::senders;
 use crate::model::semantics::canonical_strings;
 use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
 
@@ -45,8 +44,8 @@ pub struct Call {
     pub on_success: Vec<String>,
     /// The action sent when the call fails, if any.
     pub on_failure: Option<String>,
-    /// Who its answer runs as, by sender number: the runtime when the call
-    /// runs in the background, the caller when it runs inline.
+    /// Who its answer runs as, by sender number: whoever sent the move
+    /// that called the module.
     pub by: u32,
     /// The tracked fields its answers are tied to, as the record held them
     /// when the call started: the module answers about that record.
@@ -58,9 +57,6 @@ impl fmt::Display for Call {
         write!(f, "{} {} call", self.to, self.module)?;
         for (field, value) in &self.asked {
             write!(f, " for {field}='{value}'")?;
-        }
-        if self.by != senders::RUNTIME {
-            f.write_str(" (inline)")?;
         }
         Ok(())
     }
@@ -80,16 +76,14 @@ pub struct Dispatch {
     pub params: BTreeMap<String, ParamValue>,
     /// Whether the dispatch path has read the related records it needs.
     pub read: bool,
-    /// The reaction depth that sent it (0 for a request from outside).
-    pub depth: u32,
+    /// The steps this reaction chain has admitted, including this dispatch.
+    /// Empty for a request that starts a new chain.
+    pub chain: Vec<ReactionStep>,
     /// The reaction that sent it, by its place among the model's reactions;
     /// `None` for a request from outside.
     pub via: Option<usize>,
     /// Who sends it, by sender number; Cedar decides it as them.
     pub by: u32,
-    /// Its sender waits for the module calls it starts, so they run inline
-    /// and answer as the sender: an outside request may ask for that.
-    pub inline: bool,
 }
 
 impl fmt::Display for Dispatch {
@@ -161,4 +155,26 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelSt
     state.inflight = dispatches;
     state.calls.sort();
     renamed
+}
+
+/// One admitted reaction step. The model holds one record per type, but
+/// distinguishes an entity the chain found from one it made.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReactionStep {
+    /// The entity type the action runs on.
+    pub entity_type: String,
+    /// The action.
+    pub action: String,
+    /// The type for which this id was generated; `same_id` keeps its origin
+    /// even through other types. `None` means the chain read the id.
+    pub generated_for: Option<String>,
+}
+
+impl ReactionStep {
+    pub(super) fn repeats(&self, taken: &Self) -> bool {
+        let made = |step: &Self| step.generated_for.as_ref() == Some(&step.entity_type);
+        self.entity_type == taken.entity_type
+            && self.action == taken.action
+            && made(self) == made(taken)
+    }
 }

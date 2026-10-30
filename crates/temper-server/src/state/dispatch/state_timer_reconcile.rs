@@ -15,11 +15,11 @@
 //! - after a dispatch that neither entered nor reset a timed state, after a
 //!   create, and after a delete.
 //!
-//! Only a fresh event arms a record that has no timer, and so no row: a
-//! dispatch, a create, or an install that changed the record's spec. A
-//! rehydration and a boot follow only a timer the record already has, from
-//! its row ([`Arming::FromRow`]); a record in a timed state with no row waits
-//! for its next action, and the boot walk counts it.
+//! A fresh event arms a record that has no timer, and so no row: a dispatch,
+//! a create, or an install that changed the record's spec. So does the boot
+//! walk: a process can stop between an event and its row. A rehydration
+//! follows only a timer the record already has, from its row
+//! ([`Arming::FromRow`]).
 //!
 //! It is idempotent: a record whose armed timer is already the one its state
 //! declares keeps it, so any number of calls leave one timer armed. The timer's
@@ -41,11 +41,15 @@
 //! boot, are in `state_timer_follow`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
-use super::state_timeouts::{Reservation, declared_timer, rearm_clock_start, remaining_budget};
+use super::state_timeouts::{
+    Reservation, deadline, declared_timer, rearm_clock_start, remaining_budget,
+};
 use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
 use crate::entity_actor::{EntityState, RehydrateHook};
 use crate::request_context::AgentContext;
@@ -67,7 +71,7 @@ pub(crate) enum TimerFollow {
     /// and nobody armed it: the record's next action arms it as that caller.
     WaitsForCaller,
     /// Its state declares a timer, but it has no timer and no row, and a
-    /// rehydration or a boot does not arm one: its next action does.
+    /// rehydration does not arm one: its next action or the next boot does.
     WaitsForRow,
 }
 
@@ -76,18 +80,20 @@ pub(crate) enum TimerFollow {
 pub(crate) enum Arming {
     /// A fresh event says the record is in its state now: a dispatch, a
     /// create, a delete, a timer that found its record elsewhere, or an
-    /// install that changed the record's spec. A missing timer is armed.
+    /// install that changed the record's spec. Or the boot walk, which finds
+    /// the records a stopped process left without a row. A missing timer is
+    /// armed.
     #[default]
     Any,
-    /// A rehydration or a boot: only a timer the record has (armed from its
-    /// row, or the row the boot dropped) follows its state. A record with
-    /// neither waits ([`TimerFollow::WaitsForRow`]), so a boot never arms
-    /// records that had no timer, and never fires them all at once.
+    /// A rehydration: only a timer the record has (armed from its row)
+    /// follows its state. A record with neither waits
+    /// ([`TimerFollow::WaitsForRow`]) for its next action or the next boot.
     FromRow,
 }
 
 /// How a reconcile treats the record: who its new timer fires as, the boot
-/// gate it fires through, and whether it may arm a record that has no timer.
+/// gate it fires through, whether it may arm a record that has no timer, and
+/// the deadline of the timer whose task follows the record, if one does.
 #[derive(Clone, Default)]
 pub(crate) struct Follow<'a> {
     /// The caller of the dispatch that reconciles, or whoever armed the row
@@ -96,6 +102,35 @@ pub(crate) struct Follow<'a> {
     /// The boot walk's fire gate.
     pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
     pub(crate) arming: Arming,
+    /// The deadline a timer's task woke for, when that task follows the
+    /// record: it found the record elsewhere, or moved on by an action that
+    /// does not reset the timer. See [`elapsed_bucket`].
+    pub(crate) woke_for: Option<DateTime<Utc>>,
+}
+
+/// How late a timer a follow arms is, as
+/// `temper_state_timeout_armed_on_hydration_total` counts it:
+///
+/// - `budgeted`: its deadline is ahead (`delay` is left);
+/// - `on_time`: it is due, and the timer task that follows the record woke
+///   for a deadline no later than this one, so a timer was waiting for it. A
+///   record that took an action its timer does not reset on keeps the
+///   timer's deadline, and the timer's own task arms it again at that
+///   deadline, to fire at once;
+/// - `overdue`: it is due, and its deadline passed with no timer waiting for
+///   it, as when an actor hydrates or a process boots after it.
+fn elapsed_bucket(
+    delay: Duration,
+    deadline: DateTime<Utc>,
+    woke_for: Option<DateTime<Utc>>,
+) -> &'static str {
+    if !delay.is_zero() {
+        "budgeted"
+    } else if woke_for.is_some_and(|woke_for| woke_for <= deadline) {
+        "on_time"
+    } else {
+        "overdue"
+    }
 }
 
 impl ServerState {
@@ -133,6 +168,7 @@ impl ServerState {
             armed_by,
             gate,
             arming,
+            woke_for,
         } = follow;
         let declared = {
             let Ok(registry) = self.registry.read() else {
@@ -224,16 +260,17 @@ impl ServerState {
         };
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
         let delay = remaining_budget(timer.started_at, st.after_seconds, now);
+        let bucket = elapsed_bucket(
+            delay,
+            deadline(timer.started_at, st.after_seconds),
+            woke_for,
+        );
         if self.start_armed_timer(timer, delay, reservation).await {
             crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                 tenant.as_str(),
                 entity_type,
                 &st.state,
-                if delay.is_zero() {
-                    "overdue"
-                } else {
-                    "budgeted"
-                },
+                bucket,
             );
         }
         TimerFollow::Settled

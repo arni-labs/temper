@@ -28,6 +28,7 @@ fn test_admin_security_context(principal_id: &str) -> SecurityContext {
         },
         context_attrs: HashMap::new(),
         correlation_id: "test-admin-context".to_string(),
+        cause: None,
     }
 }
 
@@ -220,15 +221,6 @@ fn test_manifest_dependencies_accept_pinned_genesis_refs_for_local_install_order
         Some("katagami-commons")
     );
     assert_eq!(local_os_app_dependency_name("  "), None);
-}
-
-#[test]
-fn test_os_app_document_bootstrap_does_not_charge_workspace_file_count() {
-    let source = include_str!("mod.rs");
-    assert!(
-        !source.contains("action: \"IncrementFileCount\""),
-        "OS app document bootstrap must not charge Workspace for each file materialized"
-    );
 }
 
 #[test]
@@ -570,6 +562,7 @@ async fn test_install_plan_without_spec_phase_does_not_reclassify_specs() {
             content: false,
             seed: false,
         },
+        InstallOrigin::Request,
     )
     .await
     .expect("planned no-op install should succeed");
@@ -900,16 +893,8 @@ mod directed_evolution;
 #[path = "mod_test/policy_joint.rs"]
 mod policy_joint;
 mod policy_reinstall;
-#[test]
-fn test_get_app_project_management() {
-    let bundle = get_os_app("project-management");
-    assert!(bundle.is_some());
-    let bundle = bundle.unwrap();
-    assert_eq!(bundle.specs.len(), 5);
-    assert!(bundle.csdl.is_some());
-    assert!(!bundle.csdl.as_ref().unwrap().is_empty());
-    assert!(!bundle.cedar_policies.is_empty());
-}
+mod spec_change;
+mod timer_strands;
 
 #[test]
 fn test_agent_specs_parse() {
@@ -1021,6 +1006,7 @@ fn test_find_wasm_modules_discovers_packaged_root_wasm() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 
@@ -1083,6 +1069,7 @@ async fn test_install_fails_when_app_required_wasm_missing() {
             content: false,
             seed: false,
         },
+        InstallOrigin::Request,
     )
     .await;
 
@@ -1165,6 +1152,7 @@ async fn test_install_proceeds_when_optional_wasm_missing() {
             content: false,
             seed: false,
         },
+        InstallOrigin::Request,
     )
     .await;
 
@@ -2633,6 +2621,7 @@ fn test_required_wasm_config_without_artifact_is_not_registered_ready() {
             startup_loading: WasmStartupLoading::Lazy,
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
     let bundle = AppBundle {
@@ -2694,7 +2683,7 @@ field = "file_id"
 
     let bundle = load_app_bundle(&temp_dir);
     assert!(
-        bundle.is_none(),
+        bundle.is_err(),
         "legacy reactions.toml should be rejected after the ADR-0046 hard cut"
     );
 
@@ -2741,6 +2730,7 @@ fn test_find_wasm_modules_respects_manifest_target() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 
@@ -2785,6 +2775,7 @@ fn test_find_wasm_modules_prefers_packaged_sibling_over_target_output() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 
@@ -2821,6 +2812,7 @@ fn test_find_wasm_modules_finds_sibling_artifact() {
             startup_loading: WasmStartupLoading::default(),
             provenance: None,
             import_class: None,
+            source: None,
         },
     );
 

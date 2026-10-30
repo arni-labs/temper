@@ -38,7 +38,16 @@
 //! Records disagree while a dispatch is on its way, so invariants are
 //! checked in settled states: those with nothing in flight. The walk is
 //! breadth first, so each broken invariant's path is a shortest one. A walk
-//! that runs out of its [`Budget`] says so and is never a pass.
+//! that does not fit in the memory its [`Room`] gives it says so and is
+//! never a pass.
+//!
+//! Nor is a walk that checked nothing. A module whose trigger names no
+//! `on_success` may answer with any action its result names, and the model
+//! answers only with internal ones: when such a call is open and its record
+//! could take an action nothing in the model sends, the walk never goes
+//! where that answer leads, and says so instead of passing. A rule written
+//! `premise => conclusion` whose premise no walked state meets (no settled
+//! one, for an invariant) holds without being tested, and proves nothing.
 //!
 //! The drop check (ADR-0150, [`dropped_reactions`]) walks the same model over
 //! a whole trigger-graph component, unsliced, one record of each type that
@@ -49,11 +58,13 @@ mod env;
 mod liveness;
 mod model;
 mod pack;
+mod room;
 mod senders;
 mod slice;
 mod state;
 
 pub use liveness::{JointLivenessResult, LivenessOutcome, StuckCase, verify_joint_liveness};
+pub use room::{Bound, Bytes, Progress, Room};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -62,14 +73,13 @@ use temper_authz::SendAnalysis;
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Truth, eval};
 
-use crate::Budget;
 use crate::model::{ModelString, ParamValue};
 
 pub use model::DroppedReaction;
 pub(crate) use model::dropped_reactions;
 use model::{JointModel, Move, Sending};
 use state::render;
-pub use state::{Call, Dispatch, JointState};
+pub use state::{Call, Dispatch, JointState, ReactionStep};
 
 /// What the joint check found for one invariant.
 #[derive(Debug, Clone)]
@@ -110,11 +120,26 @@ pub enum JointOutcome {
         /// The moves and the joint states they reach.
         path: Vec<JointStep>,
     },
-    /// The walk stopped before every state was seen, or could not start.
+    /// No settled state the walk met breaks it, but none meets its premise
+    /// either, so that proves nothing.
+    Vacuous {
+        /// The premise, as written.
+        premise: String,
+    },
+    /// The walk stopped before every state was seen, never took an answer
+    /// a module may give, or could not start.
     Incomplete {
         /// Why.
         reason: String,
     },
+}
+
+/// The premise of a rule written `premise => conclusion`.
+fn premise(rule: &Expr) -> Option<&Expr> {
+    match rule {
+        Expr::Implies(premise, _) => Some(premise),
+        _ => None,
+    }
 }
 
 /// One step of a counterexample path.
@@ -159,6 +184,11 @@ impl fmt::Display for JointInvariantResult {
                 }
                 Ok(())
             }
+            JointOutcome::Vacuous { premise } => write!(
+                f,
+                "{}.{} CHECKS NOTHING AS WRITTEN: its premise `{premise}` holds in no settled state of the {} joint states walked ({scope})",
+                self.entity, self.invariant, self.states
+            ),
             JointOutcome::Incomplete { reason } => write!(
                 f,
                 "{}.{} NOT CHECKED ({scope}, {} joint states walked): {reason}",
@@ -175,7 +205,7 @@ impl fmt::Display for JointInvariantResult {
 pub fn verify_joint_invariants(
     automatons: &[&Automaton],
     policies: Option<&SendAnalysis>,
-    budget: Budget,
+    bound: Bound<'_>,
 ) -> Vec<JointInvariantResult> {
     let by_name: BTreeMap<&str, &Automaton> = automatons
         .iter()
@@ -247,7 +277,7 @@ pub fn verify_joint_invariants(
             relies_on,
         };
         let model = JointModel::new(&by_name, scope, name, &exprs, sending, true);
-        let walk = model.walk(name, &exprs, budget);
+        let walk = model.walk(name, &exprs, bound);
         for (inv, outcome) in joint.iter().zip(walk.outcomes) {
             let mut found = result(inv, &model.scope, walk.states, outcome);
             found.in_flight_bound = walk.held_back.then_some(model::MAX_IN_FLIGHT);
@@ -439,6 +469,10 @@ pub fn replay_joint_invariants(
 #[cfg(test)]
 #[path = "joint_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vacuous_test.rs"]
+mod vacuous_tests;
 
 #[cfg(test)]
 mod chain_test;

@@ -54,6 +54,26 @@ fn truncate_request_body_for_log(serialized: &str) -> String {
     format!("{}[truncated]", &serialized[..end])
 }
 
+/// `agent_ctx` with a key for the move it sends: the caller's, or one made up
+/// for an unkeyed caller. Everything the move's commit sets off (its answer,
+/// reactions and children) derives its own key from this one, so a write the
+/// move owes carries the same key on every try (see `owed_writes`).
+fn keyed_for_move(
+    mut agent_ctx: AgentContext,
+    tenant: &TenantId,
+    entity_type: &str,
+    entity_id: &str,
+    action: &str,
+) -> AgentContext {
+    if agent_ctx.idempotency_key.is_none() {
+        agent_ctx.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(format!(
+            "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
+            sim_uuid()
+        )));
+    }
+    agent_ctx
+}
+
 impl crate::state::ServerState {
     /// Dispatch an action using the unified command object.
     ///
@@ -184,7 +204,7 @@ impl crate::state::ServerState {
             .await
     }
 
-    async fn dispatch_typed(
+    pub(super) async fn dispatch_typed(
         &self,
         cmd: DispatchCommand<'_>,
     ) -> Result<EntityResponse, DispatchError> {
@@ -207,6 +227,25 @@ impl crate::state::ServerState {
             await_integration,
             await_reactions,
         } = cmd;
+        // This action is a step of the inline chain its integrations and
+        // reactions continue (`InlineChain`), under the key it commits with.
+        // Keyed here rather than in the core dispatch, so the reactions below
+        // derive their keys from that key.
+        let entered_ctx = keyed_for_move(
+            agent_ctx.entering(entity_type, entity_id, action),
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+        );
+        let agent_ctx = &entered_ctx;
+
+        if temper_spec::automaton::is_carry_move(action) {
+            return Err(DispatchError::AuthzDenied(format!(
+                "'{action}' is a [[carry]] move, which only the platform makes when it installs \
+                 a new version of the spec"
+            )));
+        }
 
         if self
             .composite_metadata_for(tenant, entity_type, action)?
@@ -230,6 +269,14 @@ impl crate::state::ServerState {
 
         // Dispatch cross-entity reactions (fire-and-forget, depth 0 = top-level)
         if response.success {
+            // The children this action spawned are entities its chain made.
+            let reaction_ctx = entered_ctx.having_made(
+                response
+                    .spawn_requests
+                    .iter()
+                    .map(|spawn| (spawn.entity_type.as_str(), spawn.entity_id.as_str())),
+            );
+            let agent_ctx = &reaction_ctx;
             // A poisoned lock must not silently disable reactions: the slot
             // only holds an Arc, so the data can't be torn — recover it.
             let dispatcher = self
@@ -238,6 +285,7 @@ impl crate::state::ServerState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(dispatcher) = dispatcher {
+                let action = response.action(action);
                 let to_state = response.state.status.clone();
                 let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
                 if await_reactions {
@@ -393,7 +441,13 @@ impl crate::state::ServerState {
         // The dispatch runs in the span it was called in: the request's, or the
         // root span of the runtime work that started it. Ids carried in the agent
         // context never re-parent or re-link it (see `trace_context`).
-        let enriched_agent_ctx = agent_ctx.for_dispatch_root(entity_type, entity_id);
+        let enriched_agent_ctx = keyed_for_move(
+            agent_ctx.for_dispatch_root(entity_type, entity_id),
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+        );
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();
@@ -431,8 +485,7 @@ impl crate::state::ServerState {
         if table.has_input_contracts() && !self.entity_exists(tenant, entity_type, entity_id) {
             let snapshot = self
                 .load_authz_resource_snapshot(tenant, entity_type, entity_id)
-                .await
-                .map_err(DispatchError::Internal)?;
+                .await?;
             if !snapshot.exists {
                 let mut response = snapshot.current_state;
                 if let Err(error) = table.validate_action_params(
@@ -452,7 +505,10 @@ impl crate::state::ServerState {
                         entity_id,
                         action,
                         agent_ctx,
-                        dispatch_idempotency_key: agent_ctx.idempotency_key.as_deref(),
+                        dispatch_idempotency_key: agent_ctx
+                            .idempotency_key
+                            .as_ref()
+                            .map(crate::idempotency::IdempotencyKey::as_str),
                         action_params: &params,
                         await_integration,
                     };
@@ -580,12 +636,7 @@ impl crate::state::ServerState {
         // The actor keeps the caller's identity on any scheduled action the
         // transition arms, so the action fires as them after a restart too.
         let caller = Arc::new(agent_ctx.clone());
-        let idempotency_key = Some(agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
-            format!(
-                "dispatch:{tenant}:{entity_type}:{entity_id}:{action}:{}",
-                sim_uuid()
-            )
-        }));
+        let idempotency_key = agent_ctx.idempotency_key.clone();
         // W2 phase: ask_reply — round-trip through the retry layer to the
         // actor and back. Aggregates with other phase spans by prefix.
         let ask_span = tracing::info_span!(
@@ -596,19 +647,35 @@ impl crate::state::ServerState {
         );
         let outcome = {
             use tracing::Instrument;
-            retry::ask_with_backoff::<_, EntityResponse, _>(
-                &actor_ref,
-                || EntityMsg::Action {
-                    caller: Some(caller.clone()),
-                    name: action_name.clone(),
-                    params: params_for_retry.clone(),
-                    related: cross_for_retry.clone(),
-                    idempotency_key: idempotency_key.clone(),
-                    expected_authorization_precondition: authorization_precondition_for_retry
-                        .clone(),
-                },
-                &policy,
-            )
+            let make_msg = || EntityMsg::Action {
+                caller: Some(caller.clone()),
+                name: action_name.clone(),
+                params: params_for_retry.clone(),
+                related: cross_for_retry.clone(),
+                idempotency_key: idempotency_key.clone(),
+                expected_authorization_precondition: authorization_precondition_for_retry.clone(),
+            };
+            let is_timer_fire = agent_ctx
+                .state_timer_armed_seq(tenant.as_str(), entity_type, entity_id, action)
+                .is_some();
+            async {
+                if is_timer_fire {
+                    // The timer owns this write and its gate slot. A request
+                    // deadline cannot decide whether it committed or rolled back.
+                    let start = std::time::Instant::now(); // determinism-ok: latency metric only
+                    retry::AskResult {
+                        result: actor_ref
+                            .ask_until_reply::<EntityResponse>(make_msg())
+                            .await,
+                        attempts: 1,
+                        elapsed: start.elapsed(),
+                        retried_after_transient: false,
+                    }
+                } else {
+                    retry::ask_with_backoff::<_, EntityResponse, _>(&actor_ref, make_msg, &policy)
+                        .await
+                }
+            }
             .instrument(ask_span)
             .await
         };
@@ -746,6 +813,11 @@ impl crate::state::ServerState {
                 return Err(DispatchError::from_actor_error(e, outcome.attempts));
             }
         };
+        // A follow-up's retry answered by the outcome its key recorded is that
+        // outcome from here on: its effects and reactions, not those of the
+        // action this retry named.
+        let answered_action = response.answered_action.clone();
+        let action = answered_action.as_deref().unwrap_or(action);
 
         // Run all post-dispatch effects through the dedicated pipeline.
         let ctx = PostDispatchContext {
@@ -754,18 +826,41 @@ impl crate::state::ServerState {
             entity_id,
             action,
             agent_ctx,
-            dispatch_idempotency_key: idempotency_key.as_deref(),
+            dispatch_idempotency_key: idempotency_key
+                .as_ref()
+                .map(crate::idempotency::IdempotencyKey::as_str),
             action_params: &action_params,
             await_integration,
         };
-        let response = self.run_post_dispatch_effects(&ctx, response).await;
-        if response.success
-            && let Some(ref idem_key) = idempotency_key
-        {
-            let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-            self.idempotency_cache
-                .mark_effects_applied(&actor_key, idem_key);
-        }
+        // A successful reply's effects run once per key: a retry that reaches
+        // the actor while another dispatcher runs them waits for it, and a
+        // retry after they ran does not run them again. Either way the retry
+        // answers at the state that dispatcher completed, never with the
+        // actor's copy from before the effects ran.
+        let mut response = match idempotency_key.as_ref() {
+            Some(idem_key) if response.success => {
+                let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+                match self
+                    .idempotency_cache
+                    .claim_effects(&actor_key, idem_key.as_str())
+                    .await
+                {
+                    crate::idempotency::EffectsClaim::Applied(completed) => {
+                        crate::idempotency::retry_reply(response, *completed)
+                    }
+                    crate::idempotency::EffectsClaim::Owner(owner) => {
+                        let response = self.run_post_dispatch_effects(&ctx, response).await;
+                        if response.success {
+                            owner.complete(&idem_key.request(action, &action_params), &response);
+                        }
+                        response
+                    }
+                }
+            }
+            _ => self.run_post_dispatch_effects(&ctx, response).await,
+        };
+        // The reply the effects claim hands back may be another dispatcher's.
+        response.answered_action = answered_action;
         if response.success {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }

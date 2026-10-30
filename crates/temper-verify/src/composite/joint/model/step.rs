@@ -180,8 +180,7 @@ impl JointModel {
                     && self.unchecked.meets(entity, &action.name)
                     && self.exact(entity, &action.name, state);
                 let text = format!("{entity}.{action}");
-                for (outcome, then) in self.commit(state.clone(), entity, action, 0, OUTSIDE, true)
-                {
+                for (outcome, then) in self.commit(state.clone(), entity, action, &[], OUTSIDE) {
                     let certainty = Certainty::unless(known, Unsure).then(then);
                     outcomes.push((outcome, text.clone(), certainty));
                 }
@@ -191,7 +190,7 @@ impl JointModel {
                 // actor, which decide it later.
                 let known = self.outside_may(entity, &action.name) == May::Yes;
                 let mut next = state.clone();
-                add(&mut next, sent(entity, action, OUTSIDE, true));
+                add(&mut next, sent(entity, action, OUTSIDE));
                 let text = format!("{entity}.{action} sent");
                 outcomes.push((next, text, Certainty::unless(known, Unsure)));
             }
@@ -215,9 +214,8 @@ impl JointModel {
                     call.module,
                     self.senders.name(call.by)
                 );
-                let inline = call.by == OUTSIDE;
                 if self.action_reads_related(&call.to, &action.name) {
-                    add(&mut next, sent(&call.to, action, call.by, inline));
+                    add(&mut next, sent(&call.to, action, call.by));
                     outcomes.push((next, format!("{text} sent"), Sure));
                 } else if self.stale(call, &action.name, state) {
                     // The module answers about the record as the call found
@@ -234,7 +232,7 @@ impl JointModel {
                         let refused = format!("{text} refused by its record");
                         outcomes.push((next.clone(), refused, OneOf));
                     }
-                    for (outcome, then) in self.commit(next, &call.to, action, 0, call.by, inline) {
+                    for (outcome, then) in self.commit(next, &call.to, action, &[], call.by) {
                         let certainty = Certainty::unless(known, OneOf).then(then);
                         outcomes.push((outcome, text.clone(), certainty));
                     }
@@ -282,7 +280,7 @@ impl JointModel {
                 remove(&mut next, dispatch);
                 // Cedar decides a reaction as its sender; every other
                 // dispatch was decided at its entry point, or is the kernel's.
-                let may = if dispatch.depth > 0 {
+                let may = if dispatch.via.is_some() {
                     self.senders
                         .may_in(dispatch.by, &dispatch.to, &dispatch.action, state)
                 } else {
@@ -455,17 +453,16 @@ impl JointModel {
 
 /// The dispatch an outside sender, or a module's answer, makes after the
 /// dispatch path read the related records and they allowed it.
-fn sent(entity: &str, action: &TemperModelAction, by: u32, inline: bool) -> Dispatch {
+fn sent(entity: &str, action: &TemperModelAction, by: u32) -> Dispatch {
     Dispatch {
         to: entity.to_string(),
         action: action.name.clone(),
         target_state: action.target_state.clone(),
         params: action.params.clone(),
         read: true,
-        depth: 0,
+        chain: Vec::new(),
         via: None,
         by,
-        inline,
     }
 }
 

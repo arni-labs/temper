@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// The liveness results for `refs`, with `analysis` deciding each move as its
+/// sender, in the same room as `check_under`.
+fn liveness(refs: &[&Automaton], analysis: &SendAnalysis) -> Vec<JointLivenessResult> {
+    let (room, progress) = (Bytes::new(1 << 30), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    verify_joint_liveness(refs, Some(analysis), bound)
+}
+
 const PARENT: &str = r#"
 [automaton]
 name = "Parent"
@@ -91,14 +102,7 @@ fn liveness_checks_every_equality_before_counting_on_a_reaction() {
         let automatons = parse(&[PARENT, &child]);
         let refs: Vec<&Automaton> = automatons.iter().collect();
         let analysis = SendAnalysis::new(ONLY_TELL_REACHES_THE_CHILD).unwrap();
-        let mut results = verify_joint_liveness(
-            &refs,
-            Some(&analysis),
-            Budget {
-                time: Duration::from_secs(30),
-                states: 100_000,
-            },
-        );
+        let mut results = liveness(&refs, &analysis);
         assert_eq!(results.len(), 1);
         let result = results.remove(0);
         if should_settle {
@@ -158,14 +162,7 @@ fn a_whitespace_only_parameter_cannot_prove_a_reaction_settles() {
         let automatons = parse(&[&parent, &child]);
         let refs: Vec<&Automaton> = automatons.iter().collect();
         let analysis = SendAnalysis::new(ONLY_TELL_REACHES_THE_CHILD).unwrap();
-        let mut results = verify_joint_liveness(
-            &refs,
-            Some(&analysis),
-            Budget {
-                time: Duration::from_secs(30),
-                states: 100_000,
-            },
-        );
+        let mut results = liveness(&refs, &analysis);
         assert_eq!(results.len(), 1);
         let result = results.remove(0);
         if should_settle {
@@ -292,14 +289,7 @@ permit(principal == Agent::"service:tell", action in [Action::"Copy", Action::"S
         let automatons = parse(&[&parent, COPYING_CHILD]);
         let refs: Vec<&Automaton> = automatons.iter().collect();
         let analysis = SendAnalysis::new(policies).unwrap();
-        let mut results = verify_joint_liveness(
-            &refs,
-            Some(&analysis),
-            Budget {
-                time: Duration::from_secs(30),
-                states: 100_000,
-            },
-        );
+        let mut results = liveness(&refs, &analysis);
         assert_eq!(results.len(), 1);
         let result = results.remove(0);
         if nonblank_input {
@@ -338,14 +328,7 @@ fn a_whitespace_only_id_can_copy_a_value_that_prevents_sealing() {
         };
         let automatons = parse(&[&parent, &child]);
         let refs: Vec<&Automaton> = automatons.iter().collect();
-        let results = verify_joint_liveness(
-            &refs,
-            Some(&analysis),
-            Budget {
-                time: Duration::from_secs(30),
-                states: 100_000,
-            },
-        );
+        let results = liveness(&refs, &analysis);
         assert_eq!(results.len(), 1);
         let result = &results[0];
         if nonempty {

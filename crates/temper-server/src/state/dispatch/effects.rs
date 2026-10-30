@@ -104,16 +104,14 @@ impl crate::state::ServerState {
         let entity_type = ctx.entity_type.to_string();
         let entity_id = ctx.entity_id.to_string();
         let status = response.state.status.clone();
+        // Only the kernel's tombstone removes a row; a spec action into a state
+        // named Deleted is projected like any other.
+        let tombstoned = response.state.is_tombstoned();
         let fields =
             self.query_projection_fields(ctx.tenant, ctx.entity_type, &response.state.fields);
         let projected_state = self.query_projection_state(&response.state);
         let sequence_nr = response.state.sequence_nr;
-        let operation = if status == "Deleted" {
-            "remove"
-        } else {
-            "upsert"
-        }
-        .to_string();
+        let operation = if tombstoned { "remove" } else { "upsert" }.to_string();
         let source = "queued_dispatch".to_string();
         let enqueued_at = Instant::now(); // determinism-ok: production-only projection queue metric
         let queue = self
@@ -122,7 +120,7 @@ impl crate::state::ServerState {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(queue) = queue {
-            let outcome = if status == "Deleted" {
+            let outcome = if tombstoned {
                 queue.enqueue_remove(
                     tenant.clone(),
                     entity_type.clone(),
@@ -211,7 +209,7 @@ impl crate::state::ServerState {
                     "inline_dispatch_fallback",
                     started_at.duration_since(enqueued_at),
                 );
-                let result = if status == "Deleted" {
+                let result = if tombstoned {
                     query_plane
                         .remove_projection(&tenant, &entity_type, &entity_id)
                         .await
@@ -567,8 +565,14 @@ impl crate::state::ServerState {
     pub(crate) async fn run_post_dispatch_effects(
         &self,
         ctx: &PostDispatchContext<'_>,
-        response: EntityResponse,
+        mut response: EntityResponse,
     ) -> EntityResponse {
+        // A write refused because its record changed was not decided: its
+        // route decides it again, and that decision is the one recorded.
+        if response.is_record_changed() {
+            return response;
+        }
+
         // 1. Record metrics
         self.metrics
             .record_transition(ctx.entity_type, ctx.action, response.success);
@@ -587,36 +591,42 @@ impl crate::state::ServerState {
         self.invalidate_state_timeouts_if_needed(ctx, &response);
 
         // The status is committed, so guards decide on it from here on, even
-        // when the projection below fails and the action answers with an
-        // error. Simulation runs other requests between the commit and this
-        // write, as a slow writer would.
+        // while the projection below is still being written. Simulation runs
+        // other requests between the commit and this write, as a slow writer
+        // would.
         temper_runtime::buggify::buggify_yield(
             crate::state::status_cache::STATUS_WRITE_YIELD_BUDGET,
         )
         .await;
         self.cache_entity_status(ctx.tenant, &response.state);
 
+        // The state timer the transition entered or reset is bookkeeping for
+        // the commit, like the cancellation above: it fires through the
+        // record's actor and reads nothing from the query plane, so it starts
+        // now rather than after the projection. A projection that lags or
+        // fails must not leave a committed record without its timer. Boxed:
+        // the timer row's write inline overflowed a test thread's stack once
+        // dispatch carried request traces.
+        Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
+
         // Every committed transition is visible through the query plane before
-        // the response returns: the caller, a reaction or an integration may
-        // read it at once, and queue admission does not establish visibility.
+        // its dependents start and the response returns: the caller, a
+        // reaction or an integration may read it at once, and queue admission
+        // does not establish visibility.
         if let Err(error) = self.project_before_dependents(ctx, &response).await {
-            tracing::error!(tenant = %ctx.tenant, entity_type = ctx.entity_type,
-                entity_id = ctx.entity_id, action = ctx.action, %error,
-                "Committed transition projection failed; dependents not started");
-            // The journal is committed: hand the projection to the retrying
-            // queue so reads catch up once the store recovers.
-            self.apply_query_projection_update(ctx, &response).await;
-            // Its scheduled actions were committed with its event: arm them.
+            // Its scheduled actions were committed with its event: arm them
+            // now, not after a wait of unknown length, and take them out of
+            // the response so the arms after the integrations below find
+            // none. A second arm of a row that already fired fires it again.
             self.arm_scheduled_actions(ctx, &response);
-            let mut response = response;
-            response.success = false;
-            response.error = Some(format!(
-                "Action committed, but its query projection failed; dependents were not started: {error}"
-            ));
-            return response;
+            response.scheduled_actions.clear();
+            // Nothing else starts this transition's dependents: a timer, a
+            // reaction or a caller that gave up never retries it. So the
+            // dispatch keeps them until the projection lands.
+            Box::pin(self.project_until_visible(ctx, &response, error)).await;
         }
 
-        if response.state.status == "Deleted" {
+        if response.state.is_tombstoned() {
             // Queue cleanup before integrations can return early. Older queued
             // writes remain guarded until this ordered removal is applied.
             self.apply_query_projection_update(ctx, &response).await;
@@ -624,12 +634,6 @@ impl crate::state::ServerState {
 
         // 3. Broadcast SSE
         self.broadcast_state_change(ctx, &response);
-
-        // Arm the successor only after visibility, before an inline adapter
-        // can return early or dispatch another transition. Boxed like the
-        // projection update above: the timer row's write inline overflowed a
-        // test thread's stack once dispatch carried request traces.
-        Box::pin(self.arm_state_timeouts_if_needed(ctx, &response)).await;
 
         // 4. Fire webhooks
         self.fire_webhooks(ctx, &response);
@@ -699,6 +703,8 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            answered_action: None,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -737,6 +743,8 @@ impl crate::state::ServerState {
                             spawn_requests: Vec::new(),
                             spec_governed: response.spec_governed,
                             refused: false,
+                            answered_action: None,
+                            store_unavailable: false,
                         };
                     }
                 }
@@ -755,7 +763,13 @@ impl crate::state::ServerState {
                     // handle them twice. The projection and the state-timer
                     // arm ran above, before the integration.
                     self.dispatch_transition_deferred_effects(ctx, &response);
-                    return final_response;
+                    // The request's own action committed. If the store did not
+                    // take the answer, saying so (503) would ask the caller to
+                    // send the action again, and it would apply twice.
+                    return EntityResponse {
+                        store_unavailable: false,
+                        ..final_response
+                    };
                 }
             } else {
                 self.dispatch_wasm_integrations(

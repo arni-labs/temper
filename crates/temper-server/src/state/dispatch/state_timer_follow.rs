@@ -10,9 +10,11 @@
 //! At boot, after the rows are re-armed, a walk makes each record that had a
 //! row follow the state it replays into: a row armed under an older spec, on
 //! a record whose state now declares another timer, gets the new timer at
-//! once, not when the stale one fires. A record in a timed state with no row is not armed: it waits for
-//! its next action ([`Arming::FromRow`]). The walk counts those records, and
-//! ends with one log line of counts per tenant and type.
+//! once, not when the stale one fires. A record in a timed state with no row
+//! (its process stopped between the event and the row) is armed too, from
+//! when it entered its state, through the boot's fire gate; only one whose
+//! timeout binds a caller nobody saved waits for its next action. The walk
+//! counts those, and ends with one log line of counts per tenant and type.
 //!
 //! A record in memory is reconciled with its actor's state. One that is not is
 //! replayed from the store without starting an actor, so a walk over many
@@ -49,8 +51,8 @@ pub struct BootTimerCounts {
     pub rearmed: usize,
     /// Rows removed: their state no longer declares a timeout.
     pub dropped: usize,
-    /// Records in a timed state with no row: not armed, they wait for their
-    /// next action.
+    /// Records in a timed state whose timeout binds a caller, with no row
+    /// to say who: not armed, they wait for their next action.
     pub waiting: usize,
     /// Scheduled actions (`schedule`, `schedule_at`) armed again from their
     /// rows.
@@ -81,7 +83,7 @@ impl ServerState {
     /// changed follow the state the record is in now, including a type that
     /// had no timeout before. Failed listings and reads remain pending until
     /// the store recovers. Startup installs defer to `start_runtime`'s
-    /// rows-only boot walk, preserving saved callers and its shared fire gate.
+    /// boot walk, preserving saved callers and its shared fire gate.
     pub async fn follow_spec_changes(&self) {
         let changed = match self.registry.write() {
             Ok(mut registry) => {
@@ -126,8 +128,9 @@ impl ServerState {
     }
 
     /// At boot, after the rows are re-armed: make every record of every type
-    /// that declares a timeout and had a row follow its state, and count the
-    /// records in a timed state with no row into `counts`, which it logs.
+    /// that declares a timeout follow its state, arming a record left in a
+    /// timed state with no row, and count the records that wait for a caller
+    /// into `counts`, which it logs.
     pub(super) async fn follow_timed_types(
         &self,
         callers: BootCallers,
@@ -154,7 +157,7 @@ impl ServerState {
             Err(_) => return counts,
         };
         let waiting = self
-            .follow_types(types, &callers, Some(gate), Arming::FromRow)
+            .follow_types(types, &callers, Some(gate), Arming::Any)
             .await;
         for (key, waiting) in waiting {
             counts.entry(key).or_default().waiting = waiting;
@@ -214,6 +217,7 @@ impl ServerState {
                         armed_by: callers.get(&key),
                         gate: gate.clone(),
                         arming,
+                        woke_for: None,
                     };
                     let followed = self
                         .reconcile_stored_record(&tenant, &entity_type, entity_id, follow)
@@ -271,7 +275,7 @@ impl ServerState {
     }
 
     /// The record's state now, without starting its actor when it has none.
-    async fn current_record_state(
+    pub(in crate::state) async fn current_record_state(
         &self,
         tenant: &TenantId,
         entity_type: &str,

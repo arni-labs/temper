@@ -9,9 +9,12 @@
 //! (`arm_state_timeouts_if_needed`): an event that enters a timed state, or
 //! resets its clock, arms that state's timer as its caller; an event that
 //! leaves the record where no timer waits (or where a timer that fires once
-//! already fired) ends it; any other event leaves the row as it is. An event
-//! with no caller (a create, a field update) arms nothing here: the server
-//! arms and writes those timers after the commit, as before.
+//! already fired) ends it; any other event leaves the row as it is. A create
+//! by a caller is that caller's event, so a record created into a timed state
+//! commits its timer row with its `Created` event. An event with no caller (a
+//! create by the kernel itself) arms nothing here: the server arms and writes
+//! that timer after the commit, and the boot walk arms a record left without
+//! one.
 
 use temper_runtime::persistence::StateTimerRecord;
 use temper_runtime::tenant::TenantId;
@@ -76,7 +79,9 @@ impl ServerState {
         input: &RowsInput<'_>,
     ) -> EntityRows {
         let after = input.state;
-        let projection = if after.status == "Deleted" {
+        // Only the kernel's tombstone removes the row; a spec action into a
+        // state named Deleted is projected like any other.
+        let projection = if input.event.kind == temper_runtime::persistence::EventKind::Tombstone {
             Projection::Remove
         } else {
             Projection::Upsert {

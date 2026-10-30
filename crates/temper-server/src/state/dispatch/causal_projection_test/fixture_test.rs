@@ -6,7 +6,7 @@ use crate::state::QueryProjectionWriteQueue;
 use crate::storage::{EntityCatalogRow, QueryPlaneStore, QueryProjectionFieldsRow, StorageStack};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use temper_runtime::ActorSystem;
 use temper_runtime::persistence::PersistenceError;
 use temper_spec::csdl::parse_csdl;
@@ -74,11 +74,78 @@ from=["Checking"]
 to="SawOld"
 "#;
 
+/// The Source enters Making, which has a state timer, and its move starts
+/// the Verifier, like a Factory release whose move starts its make run. It
+/// also schedules a Ping at once, which stays in Making.
+const SOURCE_ENTERING_TIMED_STATE: &str = r#"
+[automaton]
+name="Source"
+states=["Draft","Making","Lost"]
+initial="Draft"
+[[action]]
+name="Submit"
+from=["Draft"]
+to="Making"
+params=["prompt_template"]
+effect=["schedule('Ping', 0)"]
+[[action.triggers]]
+name="verify_source"
+kind="entity"
+principal="verifier-service"
+target_entity="Verifier"
+target_action="Verify"
+[action.triggers.resolve_target]
+kind ="field"
+id_field ="verifier_id"
+[[action]]
+name="Ping"
+from=["Making"]
+[[action]]
+name="Lose"
+from=["Making"]
+to="Lost"
+[[state_timeout]]
+state="Making"
+after_seconds=4500
+on_timeout="Lose"
+"#;
+
+/// The Verifier verifies again from any finished state, so a second reaction
+/// shows as two more events rather than a refusal.
+const VERIFIER_AGAIN: &str = r#"
+[automaton]
+name="Verifier"
+states=["Idle","Checking","SawNew","SawOld"]
+initial="Idle"
+[[action]]
+name="Verify"
+from=["Idle","SawNew","SawOld"]
+to="Checking"
+
+[[action.triggers]]
+name = "check_source"
+kind = "wasm"
+module = "check_source"
+[[action]]
+name="SawNew"
+from=["Checking"]
+to="SawNew"
+[[action]]
+name="SawOld"
+from=["Checking"]
+to="SawOld"
+"#;
+
 pub(super) struct FaultQueryPlane {
     inner: Arc<dyn QueryPlaneStore>,
     pub(super) fail_source_write: AtomicBool,
     pub(super) hang_source_write: AtomicBool,
     pub(super) projection_started: tokio::sync::Notify,
+    /// Notified each time `fail_source_write` refuses a write.
+    pub(super) source_write_refused: tokio::sync::Notify,
+    /// When not zero, `fail_source_write` refuses only the write of this
+    /// sequence, so later moves of the record still land.
+    pub(super) refused_sequence: AtomicU64,
 }
 #[async_trait]
 impl QueryPlaneStore for FaultQueryPlane {
@@ -99,10 +166,13 @@ impl QueryPlaneStore for FaultQueryPlane {
             self.projection_started.notify_one();
             return std::future::pending().await;
         }
+        let refused_sequence = self.refused_sequence.load(Ordering::SeqCst);
         if kind == "Source"
             && fields["prompt_template"] == "new"
             && self.fail_source_write.load(Ordering::SeqCst)
+            && (refused_sequence == 0 || refused_sequence == seq)
         {
+            self.source_write_refused.notify_one();
             return Err(PersistenceError::Storage(
                 "injected projection outage".into(),
             ));
@@ -178,8 +248,9 @@ fn verifier_wat() -> String {
     )
 }
 
-async fn fixture_from_source(
+async fn fixture_from_specs(
     source: &str,
+    verifier: &str,
 ) -> (
     crate::ServerState,
     Arc<FaultQueryPlane>,
@@ -199,6 +270,8 @@ async fn fixture_from_source(
         fail_source_write: AtomicBool::new(false),
         hang_source_write: AtomicBool::new(false),
         projection_started: tokio::sync::Notify::new(),
+        source_write_refused: tokio::sync::Notify::new(),
+        refused_sequence: AtomicU64::new(0),
     });
     stack.query_plane = Some(query.clone());
     let mut registry = SpecRegistry::new();
@@ -207,7 +280,7 @@ async fn fixture_from_source(
             "default",
             parse_csdl(CSDL).unwrap(),
             CSDL.into(),
-            &[("Source", source), ("Verifier", VERIFIER)],
+            &[("Source", source), ("Verifier", verifier)],
             None,
             false,
         )
@@ -257,7 +330,16 @@ pub(super) async fn fixture() -> (
     Arc<QueryProjectionWriteQueue>,
     tempfile::TempDir,
 ) {
-    fixture_from_source(SOURCE).await
+    fixture_from_specs(SOURCE, VERIFIER).await
+}
+
+pub(super) async fn fixture_entering_timed_state() -> (
+    crate::ServerState,
+    Arc<FaultQueryPlane>,
+    Arc<QueryProjectionWriteQueue>,
+    tempfile::TempDir,
+) {
+    fixture_from_specs(SOURCE_ENTERING_TIMED_STATE, VERIFIER_AGAIN).await
 }
 
 pub(super) async fn fixture_with_timeout() -> (
@@ -279,5 +361,5 @@ on_timeout="Expire"
 reset_on=["Edit"]
 "#
     );
-    fixture_from_source(&source).await
+    fixture_from_specs(&source, VERIFIER).await
 }

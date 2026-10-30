@@ -30,13 +30,13 @@ use temper_runtime::persistence::{
     CommitRows, PersistenceAppend, PersistenceAppendResult, PersistenceEnvelope, PersistenceError,
     ScheduledActionRecord, storage_error,
 };
-use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument;
 
 use super::TursoEventStore;
 use super::append_config::append_max_attempts;
 use super::commit_probe::CommitPoint;
-use super::write_gate::WritePriority;
+use super::instrumentation::WriteConnection;
+use super::write_gate::{GatePermit, WritePriority};
 use crate::driver::Transaction;
 use crate::metrics::record_turso_write_retry;
 use crate::retry::{is_transient_write_error, retry_delay_ms};
@@ -101,9 +101,9 @@ impl TursoEventStore {
             return Ok(append.expected_sequence);
         }
         let append = Arc::new(append);
-        self.retry_attempts("turso.append", move |store| {
+        self.retry_attempts("turso.append", move |store, permit| {
             let append = Arc::clone(&append);
-            async move { store.append_attempt(&append).await }
+            async move { store.append_attempt(permit, &append).await }
         })
         .await
     }
@@ -124,16 +124,16 @@ impl TursoEventStore {
             }
         }
         let appends = Arc::new(appends);
-        self.retry_attempts("turso.append_batch", move |store| {
+        self.retry_attempts("turso.append_batch", move |store, permit| {
             let appends = Arc::clone(&appends);
-            async move { store.append_batch_attempt(&appends).await }
+            async move { store.append_batch_attempt(permit, &appends).await }
         })
         .await
     }
 
     /// Run attempts of `attempt` until one lands, one fails for good, or the
-    /// attempts run out. Each attempt waits for a high-priority write permit
-    /// and then runs on its own task.
+    /// attempts run out. Each attempt waits for the write gate's permit at
+    /// high priority, and then runs on its own task, which holds it.
     async fn retry_attempts<T, F, Fut>(
         &self,
         operation: &'static str,
@@ -141,7 +141,7 @@ impl TursoEventStore {
     ) -> Result<T, PersistenceError>
     where
         T: Send + 'static,
-        F: Fn(TursoEventStore) -> Fut,
+        F: Fn(TursoEventStore, GatePermit) -> Fut,
         Fut: Future<Output = Attempt<T>> + Send + 'static,
     {
         let total_attempts = append_max_attempts();
@@ -153,7 +153,7 @@ impl TursoEventStore {
             let permit = self
                 .acquire_write_permit(operation, WritePriority::High)
                 .await?;
-            match self.run_to_answer(permit, attempt(self.clone())).await {
+            match self.run_to_answer(attempt(self.clone(), permit)).await {
                 Attempt::Written(value) => {
                     if n > 0 {
                         record_turso_write_retry(operation, n as u64, "succeeded");
@@ -168,21 +168,13 @@ impl TursoEventStore {
         Err(last_err.expect("retry loop captured at least one error"))
     }
 
-    /// Run `attempt` on a task of its own, holding `permit` until it ends,
-    /// and wait for its answer. Dropping this future drops only the wait.
+    /// Run `attempt` on a task of its own and wait for its answer. Dropping
+    /// this future drops only the wait.
     async fn run_to_answer<T: Send + 'static>(
         &self,
-        permit: OwnedSemaphorePermit,
         attempt: impl Future<Output = Attempt<T>> + Send + 'static,
     ) -> Attempt<T> {
-        let task = tokio::spawn(
-            async move {
-                let answer = attempt.await;
-                drop(permit);
-                answer
-            }
-            .instrument(tracing::Span::current()),
-        );
+        let task = tokio::spawn(attempt.instrument(tracing::Span::current()));
         match task.await {
             Ok(answer) => answer,
             Err(error) => Attempt::Unknown(PersistenceError::OutcomeUnknown(format!(
@@ -195,7 +187,7 @@ impl TursoEventStore {
     /// this bounds: a transaction that began runs to its end.
     async fn begin_bounded<'c>(
         &self,
-        conn: &'c crate::driver::Connection,
+        conn: &'c WriteConnection,
         operation: &str,
     ) -> Result<Transaction<'c>, PersistenceError> {
         let timeout = self.append_attempt_timeout();
@@ -209,9 +201,9 @@ impl TursoEventStore {
         }
     }
 
-    /// One attempt of one append.
-    async fn append_attempt(&self, append: &OwnedAppend) -> Attempt<u64> {
-        let conn = match self.configured_connection().await {
+    /// One attempt of one append, on the write gate's `permit`.
+    async fn append_attempt(&self, permit: GatePermit, append: &OwnedAppend) -> Attempt<u64> {
+        let conn = match self.write_connection_on(permit).await {
             Ok(conn) => conn,
             Err(error) => return Attempt::NotWritten(error),
         };
@@ -253,12 +245,13 @@ impl TursoEventStore {
         }
     }
 
-    /// One attempt of one batch.
+    /// One attempt of one batch, on the write gate's `permit`.
     async fn append_batch_attempt(
         &self,
+        permit: GatePermit,
         appends: &[PersistenceAppend],
     ) -> Attempt<Vec<PersistenceAppendResult>> {
-        let conn = match self.configured_connection().await {
+        let conn = match self.write_connection_on(permit).await {
             Ok(conn) => conn,
             Err(error) => return Attempt::NotWritten(error),
         };
