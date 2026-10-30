@@ -19,7 +19,9 @@ pub(super) fn slice(mut model: TemperModel, read: BTreeSet<String>) -> TemperMod
         let before = keep.len();
         for t in &model.transitions {
             let writes = t.effects.iter().any(|e| keep.contains(effect_var(e)))
-                || t.string_params.iter().any(|p| keep.contains(&p.name));
+                || t.string_params
+                    .iter()
+                    .any(|p| p.writes && keep.contains(&p.name));
             if !writes {
                 continue;
             }
