@@ -19,18 +19,19 @@ const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
 const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 impl DueTimes {
-    /// Send the due time the process could sleep through to the sink when:
-    ///
-    /// - the control plane was told nothing yet;
-    /// - it is earlier than the time last sent, or names one where the last
-    ///   report named none;
-    /// - or the time last sent has passed: the control plane woke the
-    ///   process then, or is about to, and holds nothing after it.
+    /// Send the due time the process could sleep through to the sink when
+    /// the control plane was told nothing yet, or when there is one and the
+    /// control plane holds no later wake before it: the last report named
+    /// none, named a later time, or named a time that has passed (the
+    /// control plane woke the process then, or is about to, and holds nothing
+    /// after it).
     ///
     /// A later time is not sent: the control plane wakes the process at the
     /// time it holds, early for nothing, and that time passing sends the
-    /// fresh one. So a timer that keeps re-arming costs one report and one
-    /// wake per window the sandbox stays awake, not one per fire.
+    /// fresh one. Nor is none, once the time last sent has passed: the
+    /// control plane holds nothing after it either way. So a timer that keeps
+    /// re-arming costs one report and one wake per window the sandbox stays
+    /// awake, not one per fire.
     ///
     /// A report that is not delivered is sent again, waiting longer after
     /// each failure, or at once after a resume, until it is delivered or a
@@ -55,8 +56,9 @@ impl DueTimes {
             let earliest = inner.reportable(horizon, now);
             let send = match inner.reported.sent {
                 None => true,
-                Some(Some(sent)) if sent <= now => true,
-                Some(sent) => earliest.is_some_and(|at| sent.is_none_or(|sent| at < sent)),
+                Some(sent) => {
+                    earliest.is_some_and(|at| sent.is_none_or(|sent| sent <= now || at < sent))
+                }
             };
             if !send {
                 return;

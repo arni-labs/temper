@@ -13,9 +13,9 @@
 //! scheduled actions) at or after the time it is surely awake until, which is
 //! [`ServerState::set_wake_awake`] after its newest inbound request. It sends
 //! a [`WakeReport`] to its [`WakeSink`] when that time comes earlier than what
-//! the control plane holds, or once the time the control plane holds has
-//! passed. At that time the control plane sends the process any request
-//! (`GET /healthz` will do), which resumes the sandbox.
+//! the control plane holds, or when the time the control plane holds has
+//! passed and there is a next one. At that time the control plane sends the
+//! process any request (`GET /healthz` will do), which resumes the sandbox.
 
 mod due;
 mod http;
