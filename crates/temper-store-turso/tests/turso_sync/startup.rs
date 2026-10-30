@@ -44,6 +44,41 @@ async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_ans
 }
 
 #[tokio::test]
+async fn a_start_that_adds_an_index_serves_before_the_remote_builds_it() {
+    // A start that adds to the schema, as an upgrade adds an index over
+    // every record, asks the remote only whether the file is behind. The
+    // remote builds the index, which takes as long as the app is big, with
+    // the next push, while the server serves.
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (url, requests) = counting(&server.url).await;
+    let (_a_dir, a_path) = machine();
+    let open = || TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &url, TOKEN);
+    let a = open().await.expect("open");
+    write(&a, "i", 0).await;
+    a.sync_copy()
+        .expect("copy")
+        .execute_local("DROP INDEX idx_snapshots_checkpoint")
+        .await
+        .expect("drop the index");
+    push(&a).await;
+    drop(a);
+
+    let before = requests.load(std::sync::atomic::Ordering::Acquire);
+    let a = open().await.expect("restart");
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    let asked = requests.load(std::sync::atomic::Ordering::Acquire) - before;
+    assert_eq!(
+        asked, 1,
+        "a start that adds an index sent {asked} requests to the remote before serving"
+    );
+    push(&a).await;
+    // The index is on the remote again: dropping it there succeeds.
+    server.remote_sql("DROP INDEX idx_snapshots_checkpoint");
+}
+
+#[tokio::test]
 async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
     let Some(server) = SyncServer::start() else {
         return;
