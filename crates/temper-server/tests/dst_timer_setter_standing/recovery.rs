@@ -206,17 +206,10 @@ when { resource.Status != "Taken" };
     }
 }
 
-/// Like Postgres, this simulation writes state-timer rows after commit. A
-/// committed scheduled fire with a lost answer must finish that bookkeeping
-/// without another move, restart, or change to the setter's standing.
-#[test]
-fn dst_committed_scheduled_fire_recovers_state_timeout() {
-    for seed in 0..16 {
-        let clock = Arc::new(ProcessClock::new());
-        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
-        let world = world(seed, clock);
-        let job = format!(
-            r#"{}
+/// A Job whose `Take` enters `Taken`, which `Finish`es on a state timeout.
+fn job_with_taken_timeout() -> String {
+    format!(
+        r#"{}
 
 [[state_timeout]]
 state = "Taken"
@@ -229,8 +222,20 @@ kind = "internal"
 from = ["Taken"]
 to = "Done"
 "#,
-            specs::JOB
-        );
+        specs::JOB
+    )
+}
+
+/// Like Postgres, this simulation writes state-timer rows after commit. A
+/// committed scheduled fire with a lost answer must finish that bookkeeping
+/// without another move, restart, or change to the setter's standing.
+#[test]
+fn dst_committed_scheduled_fire_recovers_state_timeout() {
+    for seed in 0..16 {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = world(seed, clock);
+        let job = job_with_taken_timeout();
         let process = Process::start_with_job(&world, "committed-state-timeout", &job);
         process.runtime.block_on(async {
             let tenant = TenantId::new(TENANT);
@@ -263,6 +268,99 @@ to = "Done"
                     "seed {seed}: {action} must commit exactly once without a restart or another move");
             }
             assert!(world.rows.row(TENANT, "child").is_none());
+            assert!(state.armed_scheduled_actions().is_empty());
+        });
+        process.kill(&world, Duration::ZERO);
+    }
+}
+
+/// A move's timers keep the answer taken before the move. Here the move
+/// itself takes away its setter's read, and its answer is lost after it
+/// commits: the recovery keeps the answer taken before it, and the timeout
+/// it set is withheld when it falls due.
+#[test]
+fn dst_committed_scheduled_fire_keeps_the_answer_taken_before_it() {
+    for seed in 0..16 {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = world(seed, clock);
+        let job = job_with_taken_timeout();
+        let process = Process::start_with_job(&world, "committed-answer", &job);
+        process.runtime.block_on(async {
+            let tenant = TenantId::new(TENANT);
+            let state = &process.state;
+            state
+                .authz
+                .reload_tenant_policies(
+                    TENANT,
+                    r#"
+permit(principal, action == Action::"Hold", resource is Job);
+permit(principal, action == Action::"read", resource is Job)
+when { resource.Status != "Taken" };
+"#,
+                )
+                .unwrap();
+            state
+                .get_or_create_tenant_entity(&tenant, "Job", "child", json!({}))
+                .await
+                .unwrap();
+            let caller = Setter::Stays(By::Themselves).caller("setter");
+            assert!(
+                state
+                    .dispatch_tenant_action(&tenant, "Job", "child", "Hold", json!({}), &caller)
+                    .await
+                    .unwrap()
+                    .success
+            );
+            world
+                .events
+                .land_next_appends_then_fail("alpha:Job:child", 1);
+            world.events.fail_next_reads("alpha:Job:child", 1);
+            pass(WAIT).await;
+            let journal = world
+                .events
+                .read_events("alpha:Job:child", 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.iter().filter(|e| e.event_type == "Take").count(),
+                1,
+                "seed {seed}: the lost answer must follow a committed Take"
+            );
+            assert!(
+                world.rows.row(TENANT, "child").is_none(),
+                "seed {seed}: the lost answer must leave the state-timer row unwritten"
+            );
+            world
+                .events
+                .fail_next_reads("alpha:Job:child", (seed % 2) as usize);
+            pass(Duration::from_secs(60)).await;
+            let row = world.rows.row(TENANT, "child").unwrap_or_else(|| {
+                panic!(
+                    "seed {seed}: recovering a committed fire must write and arm its state timeout"
+                )
+            });
+            let armed_by: serde_json::Value = serde_json::from_str(&row.armed_by).unwrap();
+            assert_eq!(
+                armed_by["read_when_set"], true,
+                "seed {seed}: the timeout must keep the answer taken before Take, not after it"
+            );
+            pass(WAIT).await;
+            let journal = world
+                .events
+                .read_events("alpha:Job:child", 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.iter().filter(|e| e.event_type == "Take").count(),
+                1,
+                "seed {seed}: Take must commit exactly once"
+            );
+            assert_eq!(
+                journal.iter().filter(|e| e.event_type == "Finish").count(),
+                0,
+                "seed {seed}: the setter may not read the record now, so Finish is withheld"
+            );
             assert!(state.armed_scheduled_actions().is_empty());
         });
         process.kill(&world, Duration::ZERO);
