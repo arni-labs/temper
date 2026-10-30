@@ -8,6 +8,8 @@ mod common;
 mod filter_literals;
 #[path = "odata_read/list_context_owner.rs"]
 mod list_context_owner;
+#[path = "odata_read/page_rows.rs"]
+mod page_rows;
 #[path = "odata_read/pagination_count.rs"]
 mod pagination_count;
 #[path = "odata_read/platform_context_keys.rs"]
