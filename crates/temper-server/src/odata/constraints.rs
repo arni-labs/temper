@@ -3,6 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 mod delete_plan;
 mod delete_references;
+mod related_record;
+
+use related_record::read_related_record;
 
 pub use delete_plan::{DeletePlan, plan_delete};
 
@@ -48,7 +51,7 @@ impl PendingRecords {
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintViolationType {
     RelationIntegrity,
-    /// A delete whose referencing rows could not all be checked.
+    /// A related or referencing record could not be checked.
     RelationUnverified,
     CrossInvariant,
     FieldInvariant,
@@ -229,11 +232,25 @@ pub(crate) async fn pre_upsert_relation_checks(
                 operation,
             ));
         };
-        if pending.get(&edge.to_entity, target_id).is_none()
-            && !state
-                .ensure_entity_loaded(tenant, &edge.to_entity, target_id)
-                .await
-        {
+        let target = read_related_record(state, tenant, &edge.to_entity, target_id, pending)
+            .await
+            .map_err(|error| {
+                state.metrics.record_relation_integrity_violation(
+                    &tenant_name,
+                    entity_type,
+                    operation,
+                );
+                ConstraintViolation::relation_unverified(
+                    format!(
+                        "failed to read relation target {}('{}'): {error}",
+                        edge.to_entity, target_id
+                    ),
+                    entity_type,
+                    entity_id,
+                    operation,
+                )
+            })?;
+        if target.is_none() {
             tracing::warn!(
                 tenant = %tenant_name, entity_type, entity_id, operation,
                 target_entity = %edge.to_entity, target_id,
@@ -342,46 +359,40 @@ pub(crate) async fn post_write_invariant_checks(
             ));
         };
 
-        let pending_target = pending.get(&assertion.target_entity, target_id);
-        if pending_target.is_none()
-            && !state
-                .ensure_entity_loaded(tenant, &assertion.target_entity, target_id)
+        let target =
+            match read_related_record(state, tenant, &assertion.target_entity, target_id, pending)
                 .await
-        {
-            tracing::warn!(
-                tenant = %tenant_name, entity_type, entity_id, invariant = %inv.name,
-                target_entity = %assertion.target_entity, target_id,
-                "constraint violation: related entity not found"
-            );
-            state.metrics.record_cross_invariant_violation(
-                &tenant_name,
-                &inv.name,
-                "target_missing",
-            );
-            let violation = ConstraintViolation::invariant(
-                &inv.name,
-                format!(
-                    "related entity {}('{}') not found",
-                    assertion.target_entity, target_id
-                ),
-                entity_type,
-                entity_id,
-                operation,
-            );
-            if inv.kind == InvariantKind::Eventual {
-                defer_eventual_invariant(state, &inv, &tenant_name, entity_type, entity_id);
-                continue;
-            }
-            return Err(violation);
-        }
-
-        let target = match pending_target {
-            Some(target) => Ok(target.clone()),
-            None => state
-                .get_tenant_entity_state(tenant, &assertion.target_entity, target_id)
-                .await
-                .map(|resp| resp.state),
-        };
+            {
+                Ok(Some(target)) => Ok(target),
+                Err(error) => Err(error),
+                Ok(None) => {
+                    tracing::warn!(
+                        tenant = %tenant_name, entity_type, entity_id, invariant = %inv.name,
+                        target_entity = %assertion.target_entity, target_id,
+                        "constraint violation: related entity not found"
+                    );
+                    state.metrics.record_cross_invariant_violation(
+                        &tenant_name,
+                        &inv.name,
+                        "target_missing",
+                    );
+                    let violation = ConstraintViolation::invariant(
+                        &inv.name,
+                        format!(
+                            "related entity {}('{}') not found",
+                            assertion.target_entity, target_id
+                        ),
+                        entity_type,
+                        entity_id,
+                        operation,
+                    );
+                    if inv.kind == InvariantKind::Eventual {
+                        defer_eventual_invariant(state, &inv, &tenant_name, entity_type, entity_id);
+                        continue;
+                    }
+                    return Err(violation);
+                }
+            };
         // The related record's field as its value: one an earlier write
         // stored out of line is read back, never compared as a reference.
         let target = match target {
