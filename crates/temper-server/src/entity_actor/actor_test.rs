@@ -6,6 +6,11 @@ use temper_runtime::ActorSystem;
 
 const ORDER_IOA: &str = include_str!("../../../../test-fixtures/specs/order.ioa.toml");
 
+/// Whether `answer` refuses a write decided on a state its record has left.
+fn record_changed(answer: &EntityResponse) -> bool {
+    answer.refused && answer.refusal.as_ref().map(|refusal| refusal.code()) == Some("RecordChanged")
+}
+
 fn order_table() -> Arc<RwLock<TransitionTable>> {
     Arc::new(RwLock::new(TransitionTable::from_ioa_source(ORDER_IOA)))
 }
@@ -384,6 +389,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
         .await
         .expect("stale delete response");
     assert!(!stale_delete.success);
+    assert!(record_changed(&stale_delete), "{stale_delete:?}");
     assert_eq!(stale_delete.state.status, "Draft");
 
     let stale: EntityResponse = actor_ref
@@ -393,7 +399,9 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "stale"}),
                 related: BTreeMap::new(),
-                idempotency_key: Some("cancel-request".to_string()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "cancel-request".to_string(),
+                )),
                 expected_authorization_precondition: Some(stale_precondition),
             },
             Duration::from_secs(1),
@@ -401,6 +409,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
         .await
         .expect("stale action response");
     assert!(!stale.success);
+    assert!(record_changed(&stale), "{stale:?}");
     assert_eq!(stale.state.status, "Draft");
 
     let fresh_precondition =
@@ -412,7 +421,9 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "fresh"}),
                 related: BTreeMap::new(),
-                idempotency_key: Some("cancel-request".to_string()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "cancel-request".to_string(),
+                )),
                 expected_authorization_precondition: Some(fresh_precondition.clone()),
             },
             Duration::from_secs(1),
@@ -429,7 +440,9 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "fresh"}),
                 related: BTreeMap::new(),
-                idempotency_key: Some("cancel-request".to_string()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "cancel-request".to_string(),
+                )),
                 expected_authorization_precondition: Some(fresh_precondition),
             },
             Duration::from_secs(1),
@@ -495,6 +508,7 @@ fn snapshot_keeps_the_status_clock() {
         params: serde_json::json!({}),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     };
     state.push_event_bounded(event("Submit", "Draft", "Submitted", 10));
     state.push_event_bounded(event("Note", "Submitted", "Submitted", 20));
@@ -592,7 +606,9 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
                 name: "IngestPack".into(),
                 params: params.clone(),
                 related: std::collections::BTreeMap::new(),
-                idempotency_key: Some("same-pack".into()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "same-pack".into(),
+                )),
                 expected_authorization_precondition: None,
             },
             Duration::from_secs(1),
@@ -611,7 +627,9 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
                 name: "IngestPack".into(),
                 params,
                 related: std::collections::BTreeMap::new(),
-                idempotency_key: Some("same-pack".into()),
+                idempotency_key: Some(crate::idempotency::IdempotencyKey::Request(
+                    "same-pack".into(),
+                )),
                 expected_authorization_precondition: None,
             },
             Duration::from_secs(1),
@@ -1181,6 +1199,17 @@ impl temper_runtime::persistence::EventStore for AppendFuseStore {
         from_sequence: u64,
     ) -> Result<Vec<PersistenceEnvelope>, temper_runtime::persistence::PersistenceError> {
         self.inner.read_events(persistence_id, from_sequence).await
+    }
+
+    async fn read_events_page(
+        &self,
+        persistence_id: &str,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PersistenceEnvelope>, temper_runtime::persistence::PersistenceError> {
+        self.inner
+            .read_events_page(persistence_id, before_sequence, limit)
+            .await
     }
 
     async fn save_snapshot(
@@ -2621,6 +2650,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         params: serde_json::json!({"Customer": "Alice"}),
         idempotency_key: None,
         kind: temper_runtime::persistence::EventKind::Transition,
+        outcome: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,
@@ -2692,4 +2722,44 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         counted,
         "a skipped field-update event must be counted, not only logged"
     );
+}
+
+#[tokio::test]
+async fn reconciliation_preserves_unknown_until_the_event_lands() {
+    use temper_runtime::persistence::{EventMetadata, EventStore};
+    let store = Arc::new(temper_store_sim::SimEventStore::no_faults(120));
+    let boxed = crate::storage::BoxedEventStore::from_arc(store.clone());
+    let id = "default:Order:delayed-commit";
+    let event = PersistenceEnvelope {
+        sequence_nr: 0,
+        event_type: "Created".into(),
+        payload: serde_json::json!({}),
+        metadata: EventMetadata {
+            event_id: sim_uuid(),
+            causation_id: sim_uuid(),
+            correlation_id: sim_uuid(),
+            timestamp: sim_now(),
+            actor_id: "test".into(),
+        },
+    };
+    let error = PersistenceError::OutcomeUnknown("COMMIT transport failed".into());
+    let outcome =
+        EntityActor::learn_write_outcome(&boxed, id, 0, event.metadata.event_id, &error).await;
+    assert!(matches!(outcome, WriteOutcome::Unknown(_)));
+    // Definitive errors retain the existing absent-event behavior.
+    let refused = PersistenceError::ConcurrencyViolation {
+        expected: 0,
+        actual: 1,
+    };
+    let outcome =
+        EntityActor::learn_write_outcome(&boxed, id, 0, event.metadata.event_id, &refused).await;
+    assert!(matches!(outcome, WriteOutcome::NotWritten));
+    // The same remote transaction can finish after both recovery reads.
+    store
+        .append(id, 0, std::slice::from_ref(&event))
+        .await
+        .unwrap();
+    let outcome =
+        EntityActor::learn_write_outcome(&boxed, id, 0, event.metadata.event_id, &error).await;
+    assert!(matches!(outcome, WriteOutcome::Landed { sequence_nr: 1 }));
 }

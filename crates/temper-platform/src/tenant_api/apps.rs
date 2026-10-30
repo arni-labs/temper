@@ -12,7 +12,8 @@ use super::auth::{
 use super::authorization_error;
 use crate::state::PlatformState;
 
-/// List the credential tenant's authorized application catalog.
+/// List the credential tenant's authorized application catalog: the shared
+/// apps and the tenant's own installs, never another tenant's.
 pub(crate) async fn list_os_apps(
     State(state): State<PlatformState>,
     authenticated: Option<Extension<AuthenticatedRequestContext>>,
@@ -35,7 +36,7 @@ pub(crate) async fn list_os_apps(
     {
         return denial;
     }
-    let apps = crate::os_apps::list_os_apps();
+    let apps = crate::os_apps::list_tenant_os_apps(authenticated.tenant().as_str());
     (StatusCode::OK, Json(serde_json::json!({ "apps": apps })))
 }
 
@@ -63,7 +64,7 @@ pub(crate) async fn get_os_app_guide(
     {
         return denial;
     }
-    match crate::os_apps::get_app_guide(&name) {
+    match crate::os_apps::tenant_app_guide(authenticated.tenant().as_str(), &name) {
         Some(guide) => (
             StatusCode::OK,
             Json(serde_json::json!({"name": name, "guide": guide})),
@@ -244,6 +245,13 @@ pub(crate) async fn install_genesis_app(
     .await
     {
         return denial;
+    }
+    // This server installs only from its own configured registry.
+    if let Err(error) = crate::genesis_install::configured_registry(&req.registry_url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        );
     }
     match crate::genesis_install::install_genesis_app_from_registry(&state, req).await {
         Ok(result) => (StatusCode::OK, Json(serde_json::json!(result))),

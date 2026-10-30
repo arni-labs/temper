@@ -1,0 +1,276 @@
+//! What a record's commit sets off: its reactions, as dispatches, and the
+//! module calls its triggers start.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use temper_spec::automaton::TargetResolver;
+use temper_spec::predicate::{Arg, Literal, ParamKind, Truth, eval};
+
+use super::super::env::{Blind, Found, ID, resolve};
+use super::super::senders::OUTSIDE;
+use super::super::state::ReactionStep;
+use super::super::{Call, Dispatch, JointState};
+use super::JointModel;
+use super::commit::add;
+use super::read::Reaction;
+use super::step::Certainty;
+use crate::model::ParamValue;
+
+impl JointModel {
+    /// What follows `source.action` committing, sent by `by`: its
+    /// reactions, then the module calls its triggers start (when the model
+    /// makes the kernel's moves). Each call answers as `by`, inline or in the
+    /// background. Each outcome says what the model knows of it.
+    pub(super) fn after_commit(
+        &self,
+        state: JointState,
+        source: &str,
+        action: &str,
+        chain: &[ReactionStep],
+        by: u32,
+    ) -> Vec<(JointState, Certainty)> {
+        // Outside actions and detached work start a fresh chain.
+        let root = [ReactionStep {
+            entity_type: source.to_string(),
+            action: action.to_string(),
+            generated_for: None,
+        }];
+        let chain = if chain.is_empty() { &root } else { chain };
+        let outcomes = self.react(state, source, action, chain, by);
+        let key = (source.to_string(), action.to_string());
+        let Some(specs) = self.kernel.calls_on.get(&key).filter(|_| self.kernel_moves) else {
+            return outcomes;
+        };
+        // Who answers reads the same to every sender when no reaction of
+        // `source` inherits its sender, so one stands for all of them.
+        let answer_as = if self.sender_matters.contains(source) {
+            by
+        } else {
+            OUTSIDE
+        };
+        let internal = self.kernel.internal.get(source);
+        let asked: Vec<BTreeSet<String>> = specs
+            .iter()
+            .map(|spec| {
+                self.unchecked.asked(source, |action| {
+                    if spec.on_success.is_empty() {
+                        internal.is_some_and(|names| names.contains(action))
+                    } else {
+                        spec.on_success.iter().any(|name| name == action)
+                    }
+                })
+            })
+            .collect();
+        let mut started = Vec::new();
+        for (mut outcome, known) in outcomes {
+            if !self.expansion.take() {
+                return Vec::new();
+            }
+            for (spec, asked) in specs.iter().zip(&asked) {
+                let strings = &outcome.records[source].strings;
+                let call = Call {
+                    to: source.to_string(),
+                    module: spec.module.clone(),
+                    on_success: spec.on_success.clone(),
+                    on_failure: spec.on_failure.clone(),
+                    by: answer_as,
+                    asked: asked
+                        .iter()
+                        .filter_map(|field| Some((field.clone(), strings.get(field)?.clone())))
+                        .collect(),
+                };
+                let at = outcome.calls.partition_point(|c| c < &call);
+                outcome.calls.insert(at, call);
+            }
+            started.push((outcome, known));
+        }
+        started
+    }
+
+    /// Send the reactions of `source.action` between types in scope, in
+    /// declaration order, as the runtime does after the source commits:
+    /// each is a dispatch carrying its `args` as the source holds them now.
+    /// A reaction fires when its guard holds on the source; one whose guard
+    /// the model cannot decide (related records are read later) goes one of
+    /// the two ways. A reaction whose target reference finds no record goes
+    /// nowhere, and one whose reference the model cannot resolve goes one of
+    /// those two ways too.
+    fn react(
+        &self,
+        state: JointState,
+        source: &str,
+        action: &str,
+        chain: &[ReactionStep],
+        by: u32,
+    ) -> Vec<(JointState, Certainty)> {
+        let mut outcomes = vec![(state, Certainty::Sure)];
+        for (index, reaction) in self
+            .reactions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.from == source && r.source_action == action)
+        {
+            let mut after = Vec::new();
+            for (state, known) in outcomes {
+                if !self.expansion.take() {
+                    return Vec::new();
+                }
+                let fires = match &reaction.guard {
+                    Some(guard) => eval(guard, &self.env_blind(source, &state, Blind::Related)),
+                    None => Truth::True,
+                };
+                let known =
+                    known.then(Certainty::unless(fires != Truth::Unknown, Certainty::OneOf));
+                if fires != Truth::True {
+                    after.push((state.clone(), known));
+                }
+                if fires == Truth::False {
+                    continue;
+                }
+                let reaches = match &reaction.resolve {
+                    Some(TargetResolver::SameId) => {
+                        resolve(&self.models, self.records, &state, source, ID, &reaction.to)
+                    }
+                    Some(TargetResolver::Field { id_field }) => resolve(
+                        &self.models,
+                        self.records,
+                        &state,
+                        source,
+                        id_field,
+                        &reaction.to,
+                    ),
+                    _ => Found::Unknown,
+                };
+                if reaches == Found::Missing {
+                    after.push((state, known));
+                    continue;
+                }
+                let known = known.then(Certainty::unless(reaches == Found::Yes, Certainty::OneOf));
+                if reaches == Found::Unknown {
+                    after.push((state.clone(), known));
+                }
+                let generated_for = match &reaction.resolve {
+                    Some(TargetResolver::Create) => Some(reaction.to.clone()),
+                    Some(TargetResolver::CreateIfMissing { id_field }) => {
+                        if state.records[source]
+                            .strings
+                            .get(id_field)
+                            .is_some_and(|id| !id.is_empty())
+                        {
+                            None
+                        } else {
+                            Some(reaction.to.clone())
+                        }
+                    }
+                    Some(TargetResolver::SameId) => {
+                        chain.last().and_then(|step| step.generated_for.clone())
+                    }
+                    _ => None,
+                };
+                let step = ReactionStep {
+                    entity_type: reaction.to.clone(),
+                    action: reaction.target_action.clone(),
+                    generated_for,
+                };
+                if chain.iter().any(|taken| step.repeats(taken)) {
+                    after.push((state, known));
+                    continue;
+                }
+                let mut next_chain = chain.to_vec();
+                next_chain.push(step);
+                let dispatch = Dispatch {
+                    to: reaction.to.clone(),
+                    action: reaction.target_action.clone(),
+                    target_state: None,
+                    params: self.args(&state, source, reaction),
+                    read: !self.action_reads_related(&reaction.to, &reaction.target_action),
+                    chain: next_chain,
+                    via: Some(index),
+                    by: self.senders.reaction(
+                        reaction.principal.as_ref(),
+                        by,
+                        matches!(reaction.resolve, Some(TargetResolver::SameId)),
+                    ),
+                };
+                let mut next = state;
+                add(&mut next, dispatch);
+                after.push((next, known));
+            }
+            outcomes = after;
+        }
+        outcomes
+    }
+
+    /// Whether `reaction`'s target action reads its count parameter
+    /// `param`: an effect reads it, or a constraint compares it with a
+    /// counter.
+    fn reads_count(&self, reaction: &Reaction, param: &str) -> bool {
+        let (to, action) = (&reaction.to, &reaction.target_action);
+        self.unchecked
+            .counts(to, action)
+            .iter()
+            .any(|(counted, _)| counted == param)
+            || self.models[to]
+                .transitions
+                .iter()
+                .any(|t| &t.name == action && matches!(t.params.get(param), Some(ParamKind::Count)))
+    }
+
+    /// The string parameters `reaction` passes that its target action gives
+    /// a value or requires not empty, the counts kept as sequence numbers, and the
+    /// counts its target reads (in an effect, or compared with a counter)
+    /// from a counter `source` holds as a value, read from `source` as it
+    /// holds them.
+    fn args(
+        &self,
+        state: &JointState,
+        source: &str,
+        reaction: &Reaction,
+    ) -> BTreeMap<String, ParamValue> {
+        let source_state = &state.records[source];
+        let target = &self.models[&reaction.to];
+        let nonempty = self
+            .unchecked
+            .nonempty(&reaction.to, &reaction.target_action);
+        reaction
+            .args
+            .iter()
+            .filter_map(|(param, arg)| {
+                if self
+                    .order
+                    .carries(&reaction.to, &reaction.target_action, param)
+                {
+                    let Arg::Var(field) = arg else { return None };
+                    let count = source_state.counters.get(field).copied()?;
+                    return Some((param.clone(), ParamValue::Count(count)));
+                }
+                if self.reads_count(reaction, param) {
+                    // Sent only when the source holds it as a value, not as
+                    // a sequence number.
+                    let Arg::Var(field) = arg else { return None };
+                    if self.order.fields(source).any(|(f, _)| f == field) {
+                        return None;
+                    }
+                    let count = source_state.counters.get(field).copied()?;
+                    return Some((param.clone(), ParamValue::Count(count)));
+                }
+                if !target.models_string(&reaction.target_action, param)
+                    && !nonempty.contains(param)
+                {
+                    return None;
+                }
+                let value = match arg {
+                    Arg::Var(field) => source_state.strings.get(field).cloned(),
+                    Arg::Lit(Literal::Str(text)) => Some(text.clone().into()),
+                    Arg::Lit(Literal::Null) => Some("".into()),
+                    _ => None,
+                }?;
+                Some((param.clone(), ParamValue::Str(value)))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+#[path = "repeat_test.rs"]
+mod tests;

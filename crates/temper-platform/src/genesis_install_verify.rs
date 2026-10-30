@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use temper_server::platform_store::InstalledAppRecord;
 
 use crate::genesis_install::reconcile_materialized_app_closure;
-use crate::os_apps::{WasmModuleManifest, get_os_app, os_app_bundle_digest};
+use crate::os_apps::{WasmModuleManifest, tenant_os_app, tenant_os_app_bundle_digest};
 use crate::recovery::{InstalledAppRuntimeRecoveryOutcome, recover_installed_app_runtime_state};
 use crate::state::PlatformState;
 
@@ -99,7 +99,7 @@ pub async fn verify_install_runtime_ready(
         return false;
     }
 
-    let Some(bundle) = get_os_app(app_name) else {
+    let Some(bundle) = tenant_os_app(tenant, app_name) else {
         tracing::warn!(
             tenant,
             app = %app_name,
@@ -192,7 +192,9 @@ pub async fn restore_prior_install(
     // actually IS the prior bundle. A corrupted cache or a concurrent catalog replacement could
     // reconcile different (ready) bytes; restoring the old digest onto them would be a lie.
     if !prior.bundle_digest.is_empty() {
-        match os_app_bundle_digest(&prior.app_name).map(|digest| digest.bundle_digest) {
+        match tenant_os_app_bundle_digest(tenant, &prior.app_name)
+            .map(|digest| digest.bundle_digest)
+        {
             Some(reconciled) if reconciled == prior.bundle_digest => {}
             other => {
                 return Err(format!(
@@ -324,6 +326,7 @@ mod tests {
             startup_loading: Default::default(),
             provenance: None,
             import_class: None,
+            source: None,
         };
         let modules = |bytes: &Vec<u8>| {
             let mut m = BTreeMap::new();

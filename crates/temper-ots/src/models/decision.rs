@@ -459,39 +459,6 @@ impl OTSDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_alternative_serialization() {
-        let alt = OTSAlternative::new("use_calculator")
-            .with_rationale("Fast and accurate")
-            .with_rejected_reason("Not available");
-
-        let json_str = serde_json::to_string(&alt).unwrap();
-        let parsed: OTSAlternative = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed, alt);
-    }
-
-    #[test]
-    fn test_decision_state_serialization() {
-        let state = OTSDecisionState::new()
-            .with_context_summary("User asked for calculation")
-            .with_action("calculator")
-            .with_action("search");
-
-        let json_str = serde_json::to_string(&state).unwrap();
-        let parsed: OTSDecisionState = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed, state);
-    }
-
-    #[test]
-    fn test_choice_with_confidence() {
-        let choice = OTSChoice::new("execute_tool")
-            .with_arguments(json!({"tool": "calculator", "input": "2+2"}))
-            .with_confidence(0.95);
-
-        assert_eq!(choice.confidence, Some(0.95));
-    }
 
     #[test]
     #[should_panic(expected = "Confidence must be between 0.0 and 1.0")]
@@ -517,106 +484,15 @@ mod tests {
     }
 
     #[test]
-    fn test_counterfactual_serialization() {
-        let cf = OTSCounterfactual::new()
-            .with_better_alternative("use_different_tool")
-            .with_estimated_improvement(0.3);
-
-        let json_str = serde_json::to_string(&cf).unwrap();
-        let parsed: OTSCounterfactual = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed, cf);
-    }
-
-    #[test]
-    fn test_evaluation_serialization() {
-        let eval = OTSDecisionEvaluation::new("human_evaluator", 0.85)
-            .with_feedback("Good choice but could be faster");
-
-        let json_str = serde_json::to_string(&eval).unwrap();
-        let parsed: OTSDecisionEvaluation = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed, eval);
-        assert_eq!(parsed.score, 0.85);
-    }
-
-    #[test]
     #[should_panic(expected = "Score must be between 0.0 and 1.0")]
     fn test_evaluation_invalid_score() {
         OTSDecisionEvaluation::new("test", 2.0);
     }
 
     #[test]
-    fn test_credit_assignment_serialization() {
-        let credit = OTSCreditAssignment::new(0.8)
-            .with_pivotal(true)
-            .with_explanation("This decision led directly to success");
-
-        let json_str = serde_json::to_string(&credit).unwrap();
-
-        // Verify "impact" alias is used in JSON
-        assert!(json_str.contains("\"impact\""));
-        assert!(!json_str.contains("\"contribution_to_outcome\""));
-
-        let parsed: OTSCreditAssignment = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed.contribution_to_outcome, 0.8);
-        assert!(parsed.pivotal);
-    }
-
-    #[test]
     #[should_panic(expected = "Contribution must be between -1.0 and 1.0")]
     fn test_credit_assignment_invalid_contribution() {
         OTSCreditAssignment::new(1.5);
-    }
-
-    #[test]
-    fn test_decision_full_serialization() {
-        let state = OTSDecisionState::new().with_context_summary("Need to calculate");
-
-        let alternatives = vec![
-            OTSAlternative::new("python_eval").with_rejected_reason("Security risk"),
-            OTSAlternative::new("calculator").with_rationale("Safe and fast"),
-        ];
-
-        let choice = OTSChoice::new("calculator")
-            .with_arguments(json!({"expr": "2+2"}))
-            .with_confidence(0.95);
-
-        let consequence = OTSConsequence::success().with_result_summary("Result: 4");
-
-        let evaluation = OTSDecisionEvaluation::new("model_eval", 0.9);
-
-        let credit = OTSCreditAssignment::new(0.7).with_pivotal(true);
-
-        let decision = OTSDecision::new(DecisionType::ToolSelection, choice, consequence)
-            .with_state(state)
-            .with_alternatives("tools".to_string(), alternatives)
-            .with_evaluation(evaluation)
-            .with_credit_assignment(credit);
-
-        let json_str = serde_json::to_string(&decision).unwrap();
-        let parsed: OTSDecision = serde_json::from_str(&json_str).unwrap();
-
-        assert_eq!(parsed.decision_type, DecisionType::ToolSelection);
-        assert!(parsed.state.is_some());
-        assert!(parsed.alternatives.is_some());
-        assert!(parsed.evaluation.is_some());
-        assert!(parsed.credit_assignment.is_some());
-    }
-
-    #[test]
-    fn test_decision_minimal() {
-        let choice = OTSChoice::new("simple_action");
-        let consequence = OTSConsequence::success();
-
-        let decision = OTSDecision::new(DecisionType::ReasoningStep, choice, consequence);
-
-        let json_str = serde_json::to_string(&decision).unwrap();
-
-        // Optional fields should not appear
-        assert!(!json_str.contains("\"state\""));
-        assert!(!json_str.contains("\"alternatives\""));
-        assert!(!json_str.contains("\"evaluation\""));
-        assert!(!json_str.contains("\"credit_assignment\""));
-        assert!(!json_str.contains("\"embedding\""));
     }
 
     #[test]

@@ -39,9 +39,13 @@ pub mod dbm;
 mod metrics;
 mod namespace;
 pub use namespace::PostgresSchema;
+mod catalog_groups;
 pub mod migration;
 pub mod platform;
 mod projection_freshness;
+mod projection_repair;
+#[cfg(test)]
+mod projection_repair_test;
 mod query_page;
 pub mod schema;
 mod schema_event_history;
@@ -57,10 +61,10 @@ pub use platform::{
     PostgresOtsTrajectoryRow, PostgresPolicyApprovalCommit, PostgresPolicyDenialPatternRow,
     PostgresPolicyRow, PostgresProjectedEntityFieldsRow, PostgresPublishedArtifactRow,
     PostgresPublishedArtifactUpsert, PostgresQueuedOtsTrajectoryRow, PostgresSecretRow,
-    PostgresSpecRow, PostgresSpecVerificationUpdate, PostgresTrajectoryInsert,
-    PostgresTrajectoryRow, PostgresTrajectoryStats, PostgresUnmetIntentAggRow,
-    PostgresWasmInvocationInsert, PostgresWasmInvocationRow, PostgresWasmModuleMetadataRow,
-    PostgresWasmModuleRow,
+    PostgresSecretVersionRow, PostgresSpecRow, PostgresSpecVerificationUpdate,
+    PostgresTrajectoryInsert, PostgresTrajectoryRow, PostgresTrajectoryStats,
+    PostgresUnmetIntentAggRow, PostgresWasmInvocationInsert, PostgresWasmInvocationRow,
+    PostgresWasmModuleMetadataRow, PostgresWasmModuleRow,
 };
 pub use store::PostgresEventStore;
 

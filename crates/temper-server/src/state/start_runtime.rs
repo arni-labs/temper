@@ -10,10 +10,12 @@ impl ServerState {
     /// WASM modules are loaded and its apps installed, and before requests can
     /// act on records: a timer re-armed here may fire at once.
     ///
-    /// It arms again the state timers and scheduled actions the last process
-    /// left waiting, from their rows (`rearm_state_timers`), and starts the runtime
-    /// metrics loop. Returns the background walk that makes records with a
-    /// row follow their state and counts those in a timed state with no row;
+    /// It repairs catalog rows behind their journals for every registered tenant,
+    /// then restores saved timers and reconciles repaired records through the boot
+    /// fire gate before returning. It starts runtime metrics and the background
+    /// carries that the installed versions hold for stored records
+    /// (`spec_change::carry_pass`). Returns the background walk that recovers
+    /// missing timers from the recorded state clock;
     /// it ends with the counts per tenant and type, which it also logs as
     /// `state timers after boot`. A second call in the same process starts
     /// nothing and returns None: a second re-arm would arm every row again.
@@ -23,9 +25,10 @@ impl ServerState {
             return None;
         }
         self.spawn_runtime_metrics_loop();
-        let walk = self.rearm_state_timers().await;
+        let boot = self.rearm_state_timers().await;
         // Report once the boot's timers are armed, even when none are.
         self.due_times.start();
-        Some(walk)
+        self.spawn_carry_stranded(self.tenants_with_carries());
+        Some(boot)
     }
 }

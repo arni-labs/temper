@@ -14,7 +14,7 @@ use super::actor::EntityActor;
 use super::effects::ScheduledAction;
 use super::types::{EntityEvent, EntityState};
 use crate::request_context::AgentContext;
-use crate::request_context::armed_by::encode_armed_by;
+use crate::request_context::armed_by::encode_scheduled_armed_by;
 
 /// The scheduled-action rows an event changes in its commit.
 #[derive(Debug, Default)]
@@ -68,25 +68,30 @@ impl EntityActor {
                 fired,
             };
         }
-        let armed_by =
-            encode_armed_by(caller.unwrap_or(&AgentContext::default())).unwrap_or_else(|error| {
-                tracing::error!(entity_type = %state.entity_type, entity_id = %state.entity_id,
-                    %error, "scheduled action caller not encodable; it fires with no identity");
-                "{}".to_string()
-            });
         let armed = scheduled
             .iter()
-            .map(|action| ScheduledActionRecord {
-                tenant: self.tenant.clone(),
-                entity_type: state.entity_type.clone(),
-                entity_id: state.entity_id.clone(),
-                arm_id: action.arm_id.clone(),
-                action: action.action.clone(),
-                due_at: action
-                    .due_at
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-                    .to_rfc3339(),
-                armed_by: armed_by.clone(),
+            .enumerate()
+            .map(|(index, action)| {
+                let follow_on = caller
+                    .unwrap_or(&AgentContext::default())
+                    .for_scheduled_follow_on(&action.action, index, action.delay_seconds);
+                let armed_by = encode_scheduled_armed_by(&follow_on).unwrap_or_else(|error| {
+                    tracing::error!(entity_type = %state.entity_type, entity_id = %state.entity_id,
+                        %error, "scheduled action caller not encodable; it fires with no identity");
+                    "{}".to_string()
+                });
+                ScheduledActionRecord {
+                    tenant: self.tenant.clone(),
+                    entity_type: state.entity_type.clone(),
+                    entity_id: state.entity_id.clone(),
+                    arm_id: action.arm_id.clone(),
+                    action: action.action.clone(),
+                    due_at: action
+                        .due_at
+                        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                        .to_rfc3339(),
+                    armed_by,
+                }
             })
             .collect();
         ScheduledRows { armed, fired }

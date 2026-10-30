@@ -5,19 +5,26 @@
 //! scheduled actions still waiting. After the commit, and after the
 //! transition's integrations, this process arms each one
 //! ([`ServerState::arm_scheduled_actions`]) on every path where the event was
-//! written; at boot
-//! [`ServerState::rearm_scheduled_actions`] arms every row again, through the
-//! boot gate, for the rest of its wait or at once if it fell due while the
-//! server was down. Replay never arms one: the rows are the source of truth.
-//! A process arms each row at most once, however many replies hand it back.
+//! written, and at once when the transition's projection write fails (then
+//! only there); at boot [`ServerState::rearm_scheduled_actions`] arms every
+//! row again, through the boot gate, for the rest of its wait or at once if it
+//! fell due while the server was down. Replay never arms one: the rows are the
+//! source of truth. While a row's timer is live, arming it again does nothing;
+//! once it has fired, a second arm fires it again, so each transition arms its
+//! rows once.
 //!
 //! A fire runs as whoever armed it. The event it writes removes its row in the
 //! same commit, so a row is removed only once its action has committed, and a
 //! restart cannot fire it twice. A fire whose write failed or may have landed
-//! keeps its row and is retried on it, with the same idempotency key from the
-//! arm id: a write that did land is a duplicate and does not run again. A
-//! refused fire is final: it is logged here, its dispatch records it in the
-//! record's trajectory like any refused action, and then its row is removed.
+//! keeps its row and is retried on it, with the same idempotency key derived
+//! from the parent request (or the arm id for an unkeyed parent) and the waits
+//! of an owed write (`owed_writes`): a write that did
+//! land is a duplicate and does not run again. A refused fire is final: it is
+//! logged here, its dispatch records it in the record's trajectory like any
+//! refused action, and then its row is removed. So is a fire whose dispatch
+//! failed with an error no retry can change ([`DispatchError::is_final`]),
+//! such as a caller who cannot make the move: every try would be answered
+//! the same, so it is logged once and its row removed, not retried.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,21 +38,13 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use super::effects::PostDispatchContext;
+use super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use super::state_timer_follow::BootTimers;
+use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
 use crate::request_context::{AgentContext, ScheduledFire};
 use crate::state::ServerState;
-use crate::wake::{Armed, TimerRef};
-
-/// The wait before a fire that did not commit is tried again; it doubles
-/// with each try, up to [`LAST_RETRY_WAIT`].
-const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
-
-/// The longest wait between tries: a store that is down for long is tried
-/// about once an hour, not hammered, and its row keeps the fire across
-/// restarts.
-const LAST_RETRY_WAIT: Duration = Duration::from_secs(3600);
 
 /// A scheduled action armed in this process.
 struct ScheduledTimer {
@@ -55,8 +54,6 @@ struct ScheduledTimer {
     /// The row's id: the arming event's sequence and the action's index.
     arm_id: String,
     action: String,
-    /// When it is due, as its row says.
-    due_at: DateTime<Utc>,
     /// Who armed it; it fires as them.
     agent_ctx: AgentContext,
 }
@@ -89,25 +86,20 @@ impl ServerState {
         ctx: &PostDispatchContext<'_>,
         response: &EntityResponse,
     ) {
-        for scheduled in &response.scheduled_actions {
-            // A record with no journal keeps no row: its action is due a delay
-            // from now.
-            let due_at = scheduled.due_at.unwrap_or_else(|| {
-                sim_now()
-                    + chrono::Duration::seconds(
-                        i64::try_from(scheduled.delay_seconds).unwrap_or(i64::MAX / 1000),
-                    )
-            });
+        for (index, scheduled) in response.scheduled_actions.iter().enumerate() {
             let timer = ScheduledTimer {
                 tenant: ctx.tenant.clone(),
                 entity_type: ctx.entity_type.to_string(),
                 entity_id: ctx.entity_id.to_string(),
                 arm_id: scheduled.arm_id.clone(),
                 action: scheduled.action.clone(),
-                due_at,
-                agent_ctx: ctx.agent_ctx.for_background_task(),
+                agent_ctx: ctx.agent_ctx.for_scheduled_follow_on(
+                    &scheduled.action,
+                    index,
+                    scheduled.delay_seconds,
+                ),
             };
-            self.spawn_scheduled_action(timer, None);
+            self.spawn_scheduled_action(timer, Duration::from_secs(scheduled.delay_seconds), None);
         }
     }
 
@@ -175,8 +167,9 @@ impl ServerState {
             .list_scheduled_actions(tenant.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        let now = sim_now();
         for row in rows {
-            let timer = match scheduled_timer(tenant, &row) {
+            let (timer, due_at) = match scheduled_timer(tenant, &row) {
                 Ok(armed) => armed,
                 Err(reason) => {
                     tracing::warn!(tenant = %tenant, entity_type = %row.entity_type,
@@ -196,7 +189,8 @@ impl ServerState {
                 .entry((tenant.clone(), row.entity_type.clone()))
                 .or_default()
                 .scheduled += 1;
-            self.spawn_scheduled_action(timer, Some(gate.clone()));
+            let delay = (due_at - now).to_std().unwrap_or(Duration::ZERO);
+            self.spawn_scheduled_action(timer, delay, Some(gate.clone()));
         }
         Ok(())
     }
@@ -234,14 +228,16 @@ impl ServerState {
             .await
             .map_err(|error| error.to_string())?;
         let prefix = format!("{fire_seq}.");
+        let now = sim_now();
         let fired = rows.iter().filter(|row| {
             row.entity_type == timer.entity_type
                 && row.entity_id == timer.entity_id
                 && row.arm_id.starts_with(&prefix)
         });
         for row in fired {
-            if let Ok(waiting) = scheduled_timer(&timer.tenant, row) {
-                self.spawn_scheduled_action(waiting, None);
+            if let Ok((waiting, due_at)) = scheduled_timer(&timer.tenant, row) {
+                let delay = (due_at - now).to_std().unwrap_or(Duration::ZERO);
+                self.spawn_scheduled_action(waiting, delay, None);
             }
         }
         Ok(())
@@ -261,9 +257,14 @@ impl ServerState {
         }
     }
 
-    /// Arm `timer` to fire when it is due, or at a wake after that, unless
-    /// this process has armed its row already.
-    fn spawn_scheduled_action(&self, timer: ScheduledTimer, gate: Option<Arc<Semaphore>>) {
+    /// Arm `timer` to fire after `delay`, unless this process has armed its
+    /// row already.
+    fn spawn_scheduled_action(
+        &self,
+        timer: ScheduledTimer,
+        delay: Duration,
+        gate: Option<Arc<Semaphore>>,
+    ) {
         let row = timer.row();
         {
             let mut armed = self
@@ -276,15 +277,12 @@ impl ServerState {
             }
             *live += 1;
         }
-        let due = self
-            .due_times
-            .arm(TimerRef::Scheduled(row.clone()), timer.due_at);
         // The fire's own trace starts when it fires, linked to the move that
         // armed it (none for a row armed at boot).
         let armed_by = crate::trace_context::cause();
         let server = self.clone();
         let fire = async move {
-            due.wait_until(timer.due_at).await;
+            tokio::time::sleep(delay).await; // determinism-ok: scheduled delay
             let agent = &timer.agent_ctx;
             let span = crate::trace_context::runtime_work_span!(
                 armed_by,
@@ -297,12 +295,10 @@ impl ServerState {
                 entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id,
             );
-            async {
-                let fired = server.fire_scheduled_action(&timer, gate, &due).await;
-                server.due_times.end(&due, fired);
-            }
-            .instrument(span)
-            .await;
+            server
+                .fire_scheduled_action(&timer, gate)
+                .instrument(span)
+                .await;
             let mut armed = server
                 .scheduled_armed
                 .lock()
@@ -317,21 +313,20 @@ impl ServerState {
         tokio::spawn(fire); // determinism-ok: timer delivery is a background side-effect
     }
 
-    /// Fire `timer` until its action commits or is refused, each attempt
-    /// through `gate` when one is given. A refusal is logged and its row
-    /// removed; a commit removed the row itself. Returns whether it committed.
-    /// Between tries it is due again when it next tries, and a wake tries it
-    /// at once.
-    async fn fire_scheduled_action(
-        &self,
-        timer: &ScheduledTimer,
-        gate: Option<Arc<Semaphore>>,
-        due: &Armed,
-    ) -> bool {
-        let key = format!("schedule:{}", timer.arm_id);
+    /// Fire `timer` until its action commits, is refused or fails with an
+    /// error no retry can change, each attempt through `gate` when one is
+    /// given. A refusal or such an error is logged and its row removed; a
+    /// commit removed the row itself.
+    async fn fire_scheduled_action(&self, timer: &ScheduledTimer, gate: Option<Arc<Semaphore>>) {
+        let key = timer.agent_ctx.idempotency_key.clone().unwrap_or_else(|| {
+            crate::idempotency::IdempotencyKey::Request(format!("schedule:{}", timer.arm_id))
+        });
         let mut agent = timer.agent_ctx.clone();
+        // The same action every attempt, so a retry of a fire that landed is
+        // answered as it.
         agent.idempotency_key = Some(key.clone());
         agent.fires_scheduled_action = Some(timer.row());
+        super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
         loop {
@@ -340,57 +335,66 @@ impl ServerState {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),
                     None => None,
                 };
-                self.dispatch_tenant_action(
+                let options = DispatchExtOptions {
+                    agent_ctx: &agent,
+                    await_integration: false,
+                    await_reactions: true,
+                };
+                self.dispatch_tenant_action_ext_typed(
                     &timer.tenant,
                     &timer.entity_type,
                     &timer.entity_id,
                     &timer.action,
                     serde_json::json!({}),
-                    &agent,
+                    options,
                 )
                 .await
             };
-            let error = match outcome {
+            let (error, is_final) = match outcome {
                 Ok(response) if response.success => {
                     if retried {
-                        self.arm_fired_rows_retrying(timer, &key).await;
+                        self.arm_fired_rows_retrying(timer, key.as_str()).await;
                     }
-                    return true;
+                    return;
                 }
-                Ok(response) if response.refused => {
-                    let error = response
+                Ok(response) if response.refused => (
+                    response
                         .error
-                        .unwrap_or_else(|| "guard not met".to_string());
-                    tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
-                        entity_id = %timer.entity_id, action = %timer.action,
-                        arm_id = %timer.arm_id, %error, "scheduled action refused when it fired");
-                    self.forget_scheduled_action(
-                        &timer.tenant,
-                        &timer.entity_type,
-                        &timer.entity_id,
-                        &timer.arm_id,
-                    )
-                    .await;
-                    return false;
-                }
-                Ok(response) => response.error.unwrap_or_else(|| "write failed".to_string()),
-                Err(error) => error,
+                        .unwrap_or_else(|| "guard not met".to_string()),
+                    true,
+                ),
+                Ok(response) => (
+                    response.error.unwrap_or_else(|| "write failed".to_string()),
+                    false,
+                ),
+                Err(error) => (error.to_string(), DispatchError::is_final(&error)),
             };
+            if is_final {
+                tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
+                    entity_id = %timer.entity_id, action = %timer.action,
+                    arm_id = %timer.arm_id, %error,
+                    "scheduled action refused when it fired; its row is removed");
+                self.forget_scheduled_action(
+                    &timer.tenant,
+                    &timer.entity_type,
+                    &timer.entity_id,
+                    &timer.arm_id,
+                )
+                .await;
+                return;
+            }
             tracing::warn!(tenant = %timer.tenant, entity_type = %timer.entity_type,
                 entity_id = %timer.entity_id, action = %timer.action, arm_id = %timer.arm_id,
                 %error, retry_in_ms = wait.as_millis() as u64,
                 "scheduled action did not commit when it fired; retrying on its row");
-            let next = chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX);
-            let again = sim_now() + next;
-            self.due_times.retry_at(due, again);
-            due.wait_until(again).await;
+            tokio::time::sleep(wait).await; // determinism-ok: retry backoff
             wait = (wait * 2).min(LAST_RETRY_WAIT);
             retried = true;
         }
     }
 
-    /// Remove a refused scheduled action's row, or one that can never fire. A
-    /// row left behind fires again at the next boot.
+    /// Remove a refused scheduled action's row, or one that can never fire or
+    /// never land. A row left behind fires again at the next boot.
     async fn forget_scheduled_action(
         &self,
         tenant: &TenantId,
@@ -411,11 +415,11 @@ impl ServerState {
     }
 }
 
-/// The timer a row arms.
+/// The timer a row arms, and when it is due.
 fn scheduled_timer(
     tenant: &TenantId,
     row: &ScheduledActionRecord,
-) -> Result<ScheduledTimer, String> {
+) -> Result<(ScheduledTimer, DateTime<Utc>), String> {
     let due_at = DateTime::parse_from_rfc3339(&row.due_at)
         .map_err(|error| format!("due_at: {error}"))?
         .with_timezone(&Utc);
@@ -426,8 +430,7 @@ fn scheduled_timer(
         entity_id: row.entity_id.clone(),
         arm_id: row.arm_id.clone(),
         action: row.action.clone(),
-        due_at,
         agent_ctx,
     };
-    Ok(timer)
+    Ok((timer, due_at))
 }

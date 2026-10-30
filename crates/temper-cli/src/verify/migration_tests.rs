@@ -137,9 +137,14 @@ fn declared_entity_name_is_used_and_duplicates_fail() {
 
 #[test]
 fn exhausted_real_composite_verification_fails_the_command() {
-    use temper_verify::composite::{CompositeOutcome, verify_composite_with_budget};
+    use temper_verify::composite::{Bound, Bytes, CompositeOutcome, Progress, verify_composite};
     let automaton = temper_spec::automaton::parse_automaton(IOA).unwrap();
-    let result = verify_composite_with_budget(&[&automaton], "Counter", 1).unwrap();
+    let (room, progress) = (Bytes::new(0), Progress::default());
+    let bound = Bound {
+        room: &room,
+        progress: &progress,
+    };
+    let result = verify_composite(&[&automaton], "Counter", bound).unwrap();
     assert_eq!(result.outcome, CompositeOutcome::Incomplete);
     assert!(
         report_composite_results(&[result])

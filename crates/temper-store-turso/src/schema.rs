@@ -7,10 +7,10 @@ pub use crate::schema_event_history::{
     CREATE_SNAPSHOT_HISTORY_ENTITY_INDEX, CREATE_SNAPSHOT_HISTORY_TABLE,
 };
 pub use query_plane::{
-    CREATE_ENTITY_CATALOG_STATUS_INDEX, CREATE_ENTITY_CATALOG_TABLE,
-    CREATE_ENTITY_CATALOG_TYPE_INDEX, CREATE_ENTITY_FIELD_INDEX_LOOKUP,
-    CREATE_ENTITY_FIELD_INDEX_STATUS, CREATE_ENTITY_FIELD_INDEX_TABLE,
-    CREATE_ENTITY_KEY_INDEX_ENTITY, CREATE_ENTITY_KEY_INDEX_TABLE,
+    CREATE_ENTITY_CATALOG_COUNTERS_TABLE, CREATE_ENTITY_CATALOG_STATUS_INDEX,
+    CREATE_ENTITY_CATALOG_TABLE, CREATE_ENTITY_CATALOG_TYPE_INDEX,
+    CREATE_ENTITY_FIELD_INDEX_LOOKUP, CREATE_ENTITY_FIELD_INDEX_STATUS,
+    CREATE_ENTITY_FIELD_INDEX_TABLE, CREATE_ENTITY_KEY_INDEX_ENTITY, CREATE_ENTITY_KEY_INDEX_TABLE,
     CREATE_ENTITY_VECTOR_INDEX_ENTITY, CREATE_ENTITY_VECTOR_INDEX_PARTITION,
     CREATE_ENTITY_VECTOR_INDEX_TABLE, CREATE_VECTOR_INDEX_BACKFILL_WATERMARK,
 };
@@ -471,10 +471,22 @@ CREATE TABLE IF NOT EXISTS tenant_secrets (
     key_name TEXT NOT NULL,
     ciphertext BLOB NOT NULL,
     nonce BLOB NOT NULL,
+    version_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY(tenant, key_name)
 );";
+
+/// Adds the opaque version id of each secret's latest write (its HTTP etag).
+/// Nullable, so an older release's inserts, which do not name it, still work.
+pub const ALTER_TENANT_SECRETS_ADD_VERSION_ID: &str =
+    "ALTER TABLE tenant_secrets ADD COLUMN version_id TEXT";
+
+/// Gives every row without a version id a random one: rows written before the
+/// column existed, or by an older release since. Random, never derived from
+/// the value, so a version id tells nothing about the secret.
+pub const BACKFILL_TENANT_SECRETS_VERSION_ID: &str = "\
+UPDATE tenant_secrets SET version_id = lower(hex(randomblob(16))) WHERE version_id IS NULL";
 
 /// Armed state timers (ADR-0056): one row per entity while its timer waits,
 /// read once at boot to arm each timer again with the identity that armed it.

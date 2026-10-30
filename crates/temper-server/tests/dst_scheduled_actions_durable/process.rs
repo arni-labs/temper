@@ -16,8 +16,9 @@ use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
 
+use super::process_clock::ProcessClock;
 use super::workload::{CALLBACK_LAG, CSDL, JOB, PERIOD, TENANT};
-use super::world::{ProcessClock, SimTimerRows};
+use super::world::SimTimerRows;
 
 /// What outlives a process: the journal, the timer rows and the clock.
 pub(crate) struct World {

@@ -1,10 +1,10 @@
-//! Starting a synced database: without the remote, from an older copy, and
-//! from a database that was never synced.
+//! Starting a synced database: without the remote, from an older copy, from
+//! a restore cut short, by fetching, and from a database that was never synced.
 
 use std::path::PathBuf;
 
 use super::support::*;
-use temper_store_turso::{CopyState, TursoEventStore};
+use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 #[tokio::test]
 async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_answers() {
@@ -107,6 +107,77 @@ async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
 }
 
 #[tokio::test]
+async fn a_restore_cut_short_is_kept_aside_and_run_again_at_the_next_start() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_a_dir, a_path) = machine();
+    let a = server.open(&a_path).await;
+    write(&a, "whole", 0).await;
+    push(&a).await;
+    drop(a);
+
+    // What a start stopped part way through a restore leaves: some of the
+    // remote's pages, the restore's marker, and no sync metadata.
+    let (b_dir, b_path) = machine();
+    std::fs::write(&b_path, vec![7u8; 64 * 1024]).expect("partial file");
+    std::fs::write(b_dir.path().join("app.db-sync-restoring"), b"").expect("marker");
+
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "whole").await, 1, "the restore ran again in full");
+    assert!(
+        !b_dir.path().join("app.db-sync-restoring").exists(),
+        "a finished restore clears its marker"
+    );
+    let kept = std::fs::read_dir(b_dir.path())
+        .expect("read dir")
+        .map(|entry| entry.expect("entry").path())
+        .find(|entry| entry.is_dir())
+        .expect("the partial file is kept aside");
+    assert_eq!(
+        std::fs::metadata(kept.join("app.db")).expect("kept").len(),
+        64 * 1024
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_downloads_the_remote_beside_and_never_over_a_database() {
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_a_dir, a_path) = machine();
+    let a = server.open(&a_path).await;
+    write(&a, "fetched", 0).await;
+    push(&a).await;
+    drop(a);
+
+    let (b_dir, b_path) = machine();
+    let b = b_path.to_str().expect("utf-8");
+    let report = SyncCopy::fetch(b, &server.url, TOKEN).await.expect("fetch");
+    assert!(report.contains("synced: client"), "{report}");
+    assert!(b_dir.path().join("app.db-info").exists(), "{report}");
+    assert!(
+        !b_dir.path().join("app.db-sync-restoring").exists(),
+        "a finished fetch is not a partial restore"
+    );
+
+    let error = SyncCopy::fetch(b, &server.url, TOKEN)
+        .await
+        .expect_err("a second fetch would land on the first");
+    assert!(error.to_string().contains("already exists"), "{error}");
+
+    // Moved into place by hand, the fetched file opens as it is.
+    let b = server.open(&b_path).await;
+    assert_eq!(count(&b, "fetched").await, 1);
+    assert_eq!(b.sync_copy().expect("copy").state(), CopyState::Copying);
+    let aside = std::fs::read_dir(b_dir.path())
+        .expect("read dir")
+        .filter(|entry| entry.as_ref().expect("entry").path().is_dir())
+        .count();
+    assert_eq!(aside, 0, "nothing was restored again");
+}
+
+#[tokio::test]
 async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
     let Some(server) = SyncServer::start() else {
         return;
@@ -200,4 +271,53 @@ async fn a_database_written_before_sync_is_adopted_onto_an_empty_remote() {
             .iter()
             .any(|spec| spec.entity_type == "Note" && spec.ioa_source == "v1")
     );
+}
+
+#[tokio::test]
+async fn reopening_versioned_secrets_adds_no_change_log_rows() {
+    use temper_runtime::persistence::{SecretPrecondition, SecretWrite};
+
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    for with_secret in [false, true] {
+        let (_dir, path) = machine();
+        let store = server.open(&path).await;
+        if with_secret {
+            assert!(
+                store
+                    .write_secret(&SecretWrite {
+                        tenant: "tenant-a",
+                        key_name: "signin",
+                        ciphertext: b"encrypted",
+                        nonce: b"nonce",
+                        version_id: "original-version",
+                        precondition: SecretPrecondition::Absent,
+                    })
+                    .await
+                    .expect("write secret")
+            );
+        }
+        push(&store).await;
+        let versions = store.list_secret_versions("tenant-a").await.unwrap();
+        let copy = store.sync_copy().expect("copy");
+        let rows = copy.change_log_rows().await.unwrap();
+        let newest = copy.last_change().await.unwrap();
+        drop(store);
+
+        for _ in 0..2 {
+            let store = server.open(&path).await;
+            let copy = store.sync_copy().expect("copy");
+            assert_eq!(
+                copy.change_log_rows().await.unwrap(),
+                rows,
+                "a secret backfill with no missing versions must not write to the change log"
+            );
+            assert_eq!(copy.last_change().await.unwrap(), newest);
+            assert_eq!(
+                store.list_secret_versions("tenant-a").await.unwrap(),
+                versions
+            );
+        }
+    }
 }

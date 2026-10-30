@@ -40,15 +40,36 @@ const DST_SEEDS: u64 = 64;
 /// real planner fall back to the authoritative scan (and 413 at scale).
 #[derive(Default)]
 pub(super) struct SimQueryPlane {
-    // (entity_type, entity_id) -> catalog row
-    catalog: Mutex<BTreeMap<(String, String), EntityCatalogRow>>,
+    // (tenant, entity_type, entity_id) -> catalog row
+    catalog: Mutex<BTreeMap<(String, String, String), EntityCatalogRow>>,
 }
 
 #[async_trait]
 impl QueryPlaneStore for SimQueryPlane {
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        Ok(self
+            .catalog
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((t, _, _), _)| t == tenant)
+            .map(
+                |((_, ty, id), row)| temper_runtime::persistence::ProjectionCheckpoint {
+                    entity_type: ty.clone(),
+                    entity_id: id.clone(),
+                    sequence_nr: row.sequence_nr,
+                    status: row.status.clone(),
+                },
+            )
+            .collect())
+    }
+
     async fn upsert_projection(
         &self,
-        _tenant: &str,
+        tenant: &str,
         entity_type: &str,
         entity_id: &str,
         status: &str,
@@ -57,7 +78,11 @@ impl QueryPlaneStore for SimQueryPlane {
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
         self.catalog.lock().unwrap().insert(
-            (entity_type.to_string(), entity_id.to_string()),
+            (
+                tenant.to_string(),
+                entity_type.to_string(),
+                entity_id.to_string(),
+            ),
             EntityCatalogRow {
                 entity_id: entity_id.to_string(),
                 status: status.to_string(),
@@ -71,14 +96,15 @@ impl QueryPlaneStore for SimQueryPlane {
 
     async fn remove_projection(
         &self,
-        _tenant: &str,
+        tenant: &str,
         entity_type: &str,
         entity_id: &str,
     ) -> Result<(), PersistenceError> {
-        self.catalog
-            .lock()
-            .unwrap()
-            .remove(&(entity_type.to_string(), entity_id.to_string()));
+        self.catalog.lock().unwrap().remove(&(
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        ));
         Ok(())
     }
 
@@ -121,14 +147,18 @@ impl QueryPlaneStore for SimQueryPlane {
 
     async fn load_entity_catalog_rows(
         &self,
-        _tenant: &str,
+        tenant: &str,
         entity_type: &str,
         entity_ids: &[String],
     ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
         let catalog = self.catalog.lock().unwrap();
         let rows = entity_ids
             .iter()
-            .filter_map(|id| catalog.get(&(entity_type.to_string(), id.clone())).cloned())
+            .filter_map(|id| {
+                catalog
+                    .get(&(tenant.to_string(), entity_type.to_string(), id.clone()))
+                    .cloned()
+            })
             .collect();
         Ok(Some(rows))
     }

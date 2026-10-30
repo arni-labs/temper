@@ -12,14 +12,17 @@
 //! and is accessed via the `&TemperModel` reference in property conditions.
 
 pub mod builder;
-pub(crate) mod semantics;
+mod expansion;
+pub mod semantics;
 mod stateright_impl;
+mod string;
+mod strings;
 pub mod types;
 
-pub use builder::{build_model_from_automaton, build_model_from_ioa};
+pub use builder::{build_model_from_automaton, build_model_from_ioa, build_model_tracking};
 pub(crate) use stateright_impl::REACHES_TERMINAL;
 pub(crate) use types::ExploreLimit;
 pub use types::{
-    LivenessKind, ModelEffect, ParamValue, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
-    TemperModel, TemperModelAction, TemperModelState,
+    LivenessKind, ModelEffect, ModelString, ParamValue, ResolvedInvariant, ResolvedLiveness,
+    ResolvedTransition, StringParam, TemperModel, TemperModelAction, TemperModelState,
 };
