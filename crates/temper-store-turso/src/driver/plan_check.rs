@@ -61,7 +61,12 @@ pub(super) async fn check(conn: &turso::Connection, sql: &str) {
         let Some((name, searched_by)) = search_of(detail) else {
             continue;
         };
-        let read_before = |other: &str| plan[..at].iter().any(|line| reads(line, other));
+        // A name that more than one plan line reads (each subquery with its
+        // own `d`) is left out of joins: which reading a term means is not
+        // known.
+        let read_once = |other: &str| plan.iter().filter(|line| reads(line, other)).count() == 1;
+        let read_before =
+            |other: &str| read_once(other) && plan[..at].iter().any(|line| reads(line, other));
         let table = tables.get(name).map_or(name, String::as_str);
         let unqualified = tables.len() == 1;
         let used = searched_by
@@ -73,9 +78,10 @@ pub(super) async fn check(conn: &turso::Connection, sql: &str) {
                 .iter()
                 .take_while(|column| {
                     gives(&terms, name, unqualified, column)
-                        || joined_with(&terms, name, column)
-                            .into_iter()
-                            .any(read_before)
+                        || (read_once(name)
+                            && joined_with(&terms, name, column)
+                                .into_iter()
+                                .any(read_before))
                 })
                 .count();
             assert!(
