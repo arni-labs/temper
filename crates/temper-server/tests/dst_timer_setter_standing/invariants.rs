@@ -5,7 +5,8 @@ use temper_server::ServerState;
 use temper_server::storage::StateTimerStore;
 
 use super::logged::Withheld;
-use super::{Record, TENANT, Timer, World, fail};
+use super::server::World;
+use super::{Record, TENANT, Timer, fail};
 
 /// Check every record against the invariants, from its journal and rows
 /// alone: a point read could rehydrate an actor and arm its timer again.

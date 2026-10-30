@@ -45,12 +45,14 @@ mod invariants;
 mod logged;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
+#[path = "dst_timer_setter_standing/server.rs"]
+mod server;
 #[path = "dst_timer_setter_standing/specs.rs"]
 mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,17 +62,14 @@ use invariants::{check, check_logged};
 use logged::Withheld;
 use process_clock::ProcessClock;
 use serde_json::json;
-use specs::{CSDL, JOB, PASS};
+use server::{Process, World, pass, settle};
 use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
-use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{
     DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
 };
 use temper_runtime::tenant::TenantId;
-use temper_server::registry::SpecRegistry;
+use temper_server::build_router;
 use temper_server::request_context::AgentContext;
-use temper_server::{ServerState, StorageStack, build_router};
-use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
 use tower::ServiceExt;
 use tracing_subscriber::prelude::*;
@@ -176,107 +175,6 @@ impl Setter {
     }
 }
 
-/// What outlives a process: the journal, the timer rows, the clock and the
-/// tenant's people and outsiders.
-struct World {
-    events: SimEventStore,
-    rows: Arc<SimTimerRows>,
-    clock: Arc<ProcessClock>,
-    people: Mutex<BTreeSet<String>>,
-    outsiders: BTreeSet<String>,
-}
-
-impl World {
-    /// The tenant's Cedar: its people may read its records, `Start` a `Job`
-    /// and `Hold` it, and its outsiders may only `Start` and `Hold` one, each
-    /// themselves or through an agent acting for them. Both, and the app's
-    /// service, may create a `Pass`.
-    fn cedar(&self) -> String {
-        let listed = |ids: &BTreeSet<String>| {
-            ids.iter()
-                .map(|id| format!("\"{id}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let people = self.people.lock().unwrap().clone();
-        let creators = listed(&people.union(&self.outsiders).cloned().collect());
-        let people = listed(&people);
-        let outsiders = listed(&self.outsiders);
-        format!(
-            r#"permit(principal, action in [Action::"read", Action::"Start", Action::"Hold"], resource)
-when {{ (principal is Customer && [{people}].contains(principal.id)) ||
-        (context has actingFor && [{people}].contains(context.actingFor)) }};
-permit(principal, action in [Action::"Start", Action::"Hold"], resource is Job)
-when {{ (principal is Customer && [{outsiders}].contains(principal.id)) ||
-        (context has actingFor && [{outsiders}].contains(context.actingFor)) }};
-permit(principal, action == Action::"create", resource is Pass)
-when {{ (principal is Customer && [{creators}].contains(principal.id)) ||
-        (context has actingFor && [{creators}].contains(context.actingFor)) ||
-        principal == Agent::"service:app" }};"#
-        )
-    }
-}
-
-/// One server process.
-struct Process {
-    runtime: tokio::runtime::Runtime,
-    state: ServerState,
-}
-
-impl Process {
-    /// Boot: specs, storage, the tenant's Cedar as stored, then
-    /// `start_runtime`, whose walk re-arms the timers the last process left.
-    fn start(world: &World, name: &str) -> Self {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .unwrap();
-        let state = runtime.block_on(async {
-            world.clock.begin();
-            let mut registry = SpecRegistry::new();
-            registry.register_tenant(
-                TENANT,
-                parse_csdl(CSDL).unwrap(),
-                CSDL.to_string(),
-                &[("Job", JOB), ("Pass", PASS)],
-            );
-            let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
-            state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
-            state.state_timer_rows = Some(world.rows.clone());
-            state
-                .authz
-                .reload_tenant_policies(TENANT, &world.cedar())
-                .expect("the tenant's Cedar parses");
-            let walk = state.start_runtime().await.expect("the server starts");
-            walk.await.unwrap();
-            state
-        });
-        Self { runtime, state }
-    }
-
-    /// Exit: every task of this process stops.
-    fn kill(self, world: &World, downtime: Duration) {
-        self.runtime.block_on(async { world.clock.end(downtime) });
-        let Self { runtime, state } = self;
-        drop(state);
-        drop(runtime);
-    }
-}
-
-/// Let every task that can run, run.
-async fn settle() {
-    for _ in 0..600 {
-        tokio::task::yield_now().await;
-    }
-}
-
-/// Let `by` pass. The paused clock jumps from one timer to the next.
-async fn pass(by: Duration) {
-    tokio::time::sleep(by).await;
-    settle().await;
-}
-
 fn fail(seed: u64, trace: &[String], invariant: &str, detail: String) -> String {
     format!(
         "seed {seed}: {invariant}: {detail}\ntrace:\n  {}",
@@ -353,7 +251,7 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
             pass(Duration::from_secs(rng.next_bound(6) as u64)).await;
             let (sets, ..) = record.timer.moves();
             let caller = record.setter.caller(&record.user);
-            let set = if record.timer == Timer::Created {
+            let refused = if record.timer == Timer::Created {
                 // Through the server's create route, as the setter.
                 let who = caller.security_ctx.clone().expect("a creator signs in");
                 let mut request = Request::post("/tdata/Passes")
@@ -363,10 +261,16 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
                 request
                     .extensions_mut()
                     .insert(AuthenticatedRequestContext::new(tenant.clone(), who));
-                build_router(process.state.clone())
+                let response = build_router(process.state.clone())
                     .oneshot(request)
                     .await
-                    .is_ok_and(|response| response.status() == StatusCode::CREATED)
+                    .expect("the router answers");
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                (status != StatusCode::CREATED)
+                    .then(|| format!("{status} {}", String::from_utf8_lossy(&body)))
             } else {
                 process
                     .state
@@ -375,18 +279,22 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
                     .map_err(|error| {
                         fail(seed, &trace, "records are created", error.to_string())
                     })?;
-                process
+                match process
                     .state
                     .dispatch_tenant_action(&tenant, "Job", &record.id, sets, json!({}), &caller)
                     .await
-                    .is_ok_and(|response| response.success)
+                {
+                    Ok(response) if response.success => None,
+                    Ok(response) => Some(response.error.unwrap_or_default()),
+                    Err(error) => Some(error),
+                }
             };
-            if !set {
+            if let Some(why) = refused {
                 return Err(fail(
                     seed,
                     &trace,
                     "records are set going",
-                    record.id.clone(),
+                    format!("{} {:?}: {why}", record.id, record.setter),
                 ));
             }
             trace.push(format!(
