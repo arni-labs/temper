@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use temper_runtime::persistence::{PersistenceError, storage_error};
+use tracing::Instrument;
 
 use super::{Connection, DriverError, DriverHandle, Lease};
 
@@ -103,6 +104,13 @@ struct Inner {
     simulated_trim: std::sync::Mutex<trim::SimulatedTrim>,
 }
 
+/// The remote's record of a file, asked while the file opens.
+type Asked = tokio::task::JoinHandle<Result<i64, DriverError>>;
+
+fn remote_check() -> tracing::Span {
+    tracing::info_span!("turso.sync.remote_check")
+}
+
 /// The sync engine's text for a statement the remote refused.
 const REMOTE_STATEMENT_FAILED: &str = "failed to execute sql";
 
@@ -133,8 +141,15 @@ impl SyncCopy {
     ) -> Result<Self, DriverError> {
         let path = Path::new(path);
         check_local_files(path)?;
+        // A file synced before already knows who it is to the remote, so the
+        // remote is asked for its record of the file while the file opens.
+        let asked = files::sync_metadata(path).ok().map(|info| {
+            let remote = Remote::new(remote_url, auth_token, remote::client_id(&info));
+            let span = remote_check();
+            tokio::spawn(async move { remote.last_change().instrument(span).await })
+        });
         let copy = Self::build(path, remote_url, auth_token).await?;
-        match copy.recheck_inner().await {
+        match copy.check_against(asked).await {
             Ok(CopyState::Behind) => {}
             Ok(_) => return Ok(copy),
             Err(error) => {
@@ -177,6 +192,7 @@ impl SyncCopy {
             .bootstrap_if_empty(true)
             .build();
         let db = restore::while_progressing(opening, || restore::footprint(path))
+            .instrument(tracing::info_span!("turso.sync.engine_open"))
             .await
             .ok_or_else(|| {
                 DriverError::SyncSetup(format!(
@@ -227,11 +243,15 @@ impl SyncCopy {
                 .map_err(|error| DriverError::SyncSetup(error.to_string()))?,
         };
         copy.inner.opened_at.store(opened_at, Ordering::Release);
-        let mut warm = Vec::with_capacity(WARM_CONNECTIONS);
-        for _ in 0..WARM_CONNECTIONS {
-            warm.push(copy.connect().await?);
+        async {
+            let mut warm = Vec::with_capacity(WARM_CONNECTIONS);
+            for _ in 0..WARM_CONNECTIONS {
+                warm.push(copy.connect().await?);
+            }
+            Ok::<_, DriverError>(())
         }
-        drop(warm);
+        .instrument(tracing::info_span!("turso.sync.warm_connections"))
+        .await?;
         Ok(copy)
     }
 
@@ -269,10 +289,27 @@ impl SyncCopy {
     }
 
     async fn recheck_inner(&self) -> Result<CopyState, DriverError> {
+        self.check_against(None).await
+    }
+
+    /// Check an [`CopyState::Unchecked`] file against `asked`, the remote's
+    /// record of it asked while the file opened, or against the remote now.
+    async fn check_against(&self, asked: Option<Asked>) -> Result<CopyState, DriverError> {
         if self.state() != CopyState::Unchecked {
             return Ok(self.state());
         }
-        let remote_has = self.inner.remote.last_change().await?;
+        let remote_has = match asked {
+            Some(asked) => asked.await.map_err(|error| {
+                DriverError::SyncSetup(format!("asking the remote for its record stopped: {error}"))
+            })??,
+            None => {
+                self.inner
+                    .remote
+                    .last_change()
+                    .instrument(remote_check())
+                    .await?
+            }
+        };
         let opened_at = self.inner.opened_at.load(Ordering::Acquire);
         if remote_has > opened_at {
             self.enter(CopyState::Behind, &format!(
@@ -280,6 +317,17 @@ impl SyncCopy {
                  up to {opened_at}"
             ));
         } else {
+            // Every change up to the remote's record is there already, so a
+            // push carries only what this start adds to it. When the engine's
+            // own record agrees, the first push need not ask the remote again.
+            self.inner.pushed.fetch_max(remote_has, Ordering::AcqRel);
+            if self
+                .last_pushed_hint()
+                .await
+                .is_ok_and(|hint| hint == remote_has)
+            {
+                self.inner.unsure.store(false, Ordering::Release);
+            }
             self.enter(
                 CopyState::Copying,
                 "the file checks out against its remote copy",

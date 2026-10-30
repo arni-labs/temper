@@ -24,6 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
+use tracing::Instrument;
 
 use temper_evolution::PostgresRecordStore;
 use temper_observe::ClickHouseStore;
@@ -75,6 +76,8 @@ pub async fn run(
     discord_bot_token: Option<String>,
     tenant: String,
 ) -> Result<()> {
+    // From here to serving; each boot phase below has its own span.
+    let boot_started = std::time::Instant::now(); // determinism-ok: CLI boot timing
     let otel_guard = init_observability("temper-platform");
     temper_authz::init_metrics();
     temper_store_postgres::init_metrics();
@@ -83,11 +86,15 @@ pub async fn run(
 
     // Phase 1: Storage backend
     let (pg_pool, storage_stack, turso_synced_store) =
-        bootstrap::init_storage(storage.clone(), storage_explicit).await?;
+        bootstrap::init_storage(storage.clone(), storage_explicit)
+            .instrument(tracing::info_span!("boot.storage"))
+            .await?;
 
     // Phase 2: Registry (restore + disk apps)
     let (registry, tenant_policy_seed) =
-        bootstrap::build_registry(pg_pool.as_ref(), storage_stack.as_ref(), &apps).await?;
+        bootstrap::build_registry(pg_pool.as_ref(), storage_stack.as_ref(), &apps)
+            .instrument(tracing::info_span!("boot.registry"))
+            .await?;
     // build_registry already said which disk apps it skipped; the later phases
     // (webhooks, hydration, tenant bootstrap, verification) skip them as well.
     let apps: Vec<(String, String)> = apps
@@ -173,12 +180,20 @@ pub async fn run(
     }
 
     // Phase 6: Entity hydration
-    bootstrap::hydrate_entities(&state, &apps).await;
+    bootstrap::hydrate_entities(&state, &apps)
+        .instrument(tracing::info_span!("boot.hydrate"))
+        .await;
 
     // Phase 7: Recovery (Cedar policies + WASM modules + secrets)
-    bootstrap::recover_cedar_policies(&state).await;
-    bootstrap::recover_wasm_modules(&state).await;
-    bootstrap::recover_secrets(&state).await;
+    bootstrap::recover_cedar_policies(&state)
+        .instrument(tracing::info_span!("boot.recover_policies"))
+        .await;
+    bootstrap::recover_wasm_modules(&state)
+        .instrument(tracing::info_span!("boot.recover_wasm"))
+        .await;
+    bootstrap::recover_secrets(&state)
+        .instrument(tracing::info_span!("boot.recover_secrets"))
+        .await;
 
     // Seed secrets from env into the vault for all tenants.
     if let Some(ref vault) = state.server.secrets_vault {
@@ -243,9 +258,13 @@ pub async fn run(
     }
 
     // Phase 8: Bootstrap system + agent tenants
-    bootstrap::bootstrap_tenants(&state, &apps, bootstrap::EarlierOperatorKeys::from_env()).await;
+    bootstrap::bootstrap_tenants(&state, &apps, bootstrap::EarlierOperatorKeys::from_env())
+        .instrument(tracing::info_span!("boot.tenants"))
+        .await;
     // Phase 8b: Restore persisted apps + apply CLI `--app` requests.
-    bootstrap::bootstrap_installed_apps(&state, &os_app_installs).await?;
+    bootstrap::bootstrap_installed_apps(&state, &os_app_installs)
+        .instrument(tracing::info_span!("boot.installed_apps"))
+        .await?;
     if actor_runtime == ActorRuntimeBackend::Postgres {
         pg_actor_runtime_cancel = Some(
             actor_runtime::install_postgres_actor_runtime(
@@ -272,9 +291,13 @@ pub async fn run(
     if observe {
         observe_ui::spawn(bind, actual_port);
     }
-    for (tenant, dir) in &apps {
-        spawn_background_verification(&state, dir, tenant).await;
+    async {
+        for (tenant, dir) in &apps {
+            spawn_background_verification(&state, dir, tenant).await;
+        }
     }
+    .instrument(tracing::info_span!("boot.background_verification"))
+    .await;
     spawn_optimization_loop(&state);
     spawn_actor_passivation_loop(&state);
     temper_server::profiling::spawn_continuous_profiler();
@@ -321,9 +344,13 @@ pub async fn run(
             let reg = state.server.registry.read().unwrap();
             reg.tenant_ids().iter().map(|t| (*t).clone()).collect()
         };
-        for tenant in tenants {
-            temper_server::http_endpoint::rebuild_tenant_table(&state.server, &tenant).await;
+        async {
+            for tenant in tenants {
+                temper_server::http_endpoint::rebuild_tenant_table(&state.server, &tenant).await;
+            }
         }
+        .instrument(tracing::info_span!("boot.http_endpoints"))
+        .await;
     }
 
     // Where this process reports its earliest due time, so a control plane
@@ -365,6 +392,10 @@ pub async fn run(
     let _boot_timers = state.server.start_runtime().await;
 
     println!("Listening on http://{bind}:{actual_port}");
+    tracing::info!(
+        boot_ms = boot_started.elapsed().as_millis() as u64,
+        "boot.serving: answering requests from now"
+    );
     // A stop signal ends the server. The kernel then logs and counts each
     // write it still owes and holds only in memory, and telemetry is flushed
     // so those reports leave the process before it exits.
