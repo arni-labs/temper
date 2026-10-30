@@ -39,6 +39,8 @@
 //! Each server runs in its own single-threaded, paused-clock Tokio runtime,
 //! and `sim_now()` reads that clock.
 
+#[path = "dst_timer_setter_standing/install_recovery.rs"]
+mod install_recovery;
 #[path = "dst_timer_setter_standing/invariants.rs"]
 mod invariants;
 #[path = "dst_timer_setter_standing/logged.rs"]

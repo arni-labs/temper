@@ -131,7 +131,12 @@ impl ServerState {
             if kept {
                 state.untrack_owed_write(fire_key.as_str());
             }
-            if !withheld && !state.state_timer_row_moved_on(&timer, armed_seq) {
+            if withheld {
+                // The row still belongs to its setter, but this task is no
+                // longer live. Let an install recover it without disturbing
+                // any task that has already replaced this one.
+                state.state_timeout_tracker.release(&timer, armed_seq);
+            } else if !state.state_timer_row_moved_on(&timer, armed_seq) {
                 state.forget_state_timer(&timer).await;
             }
             state.state_timeout_tracker.dec_pending(&timer.entity_type);
