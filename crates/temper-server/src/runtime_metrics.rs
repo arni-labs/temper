@@ -34,6 +34,7 @@ struct RuntimeMetrics {
     dispatch_ask_error_total: Counter<u64>,
     // --- ADR-0049: state-entry timeouts -----------------------------------
     state_timeout_fired_total: Counter<u64>,
+    reaction_withheld_total: Counter<u64>,
     state_timeout_cancelled_total: Counter<u64>,
     state_timeout_reset_total: Counter<u64>,
     scheduler_overdue_on_replay_total: Counter<u64>,
@@ -169,6 +170,10 @@ fn metrics() -> &'static RuntimeMetrics {
                     "ADR-0048: ActorError kind breakdown (ask_timeout, mailbox_full, \
                      stopped, send_failed, panicked, init_failed, max_restarts_exceeded).",
                 )
+                .build(),
+            reaction_withheld_total: meter
+                .u64_counter("temper_reaction_withheld_total")
+                .with_description("Reactions withheld because Cedar refused the move on their target.")
                 .build(),
             state_timeout_fired_total: meter
                 .u64_counter("temper_state_timeout_fired_total")
@@ -638,6 +643,19 @@ pub fn record_dispatch_error(
 // ============================================================================
 // ADR-0049: state-entry timeouts.
 // ============================================================================
+
+/// Record a reaction Cedar refused on its target. Identity belongs in the
+/// warning, not these bounded labels; app_id comes from the meter resource.
+pub fn record_reaction_withheld(tenant: &str, entity_type: &str, action: &str) {
+    metrics().reaction_withheld_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
+        ],
+    );
+}
 
 /// Record that a state_timeout fired for a specific (entity, state, action).
 pub fn record_state_timeout_fired(tenant: &str, entity_type: &str, state: &str, action: &str) {

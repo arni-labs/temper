@@ -290,17 +290,6 @@ impl ReactionDispatcher {
                     target_status,
                 } => {
                     authz_denied_count += 1;
-                    tracing::warn!(
-                        rule = rule.name,
-                        target_entity = %rule.then.entity_type,
-                        target_id = %target_entity_id,
-                        target_action = %rule.then.action,
-                        principal_id = %security_ctx.principal.id,
-                        principal_kind = ?security_ctx.principal.kind,
-                        via = cause.via(),
-                        depth = cause.depth,
-                        "Reaction authorization denied: {reason}"
-                    );
                     results.push(ReactionResult {
                         rule_name: rule.name.clone(),
                         success: false,
