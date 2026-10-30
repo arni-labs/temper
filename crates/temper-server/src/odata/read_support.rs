@@ -147,13 +147,22 @@ async fn try_load_selected_catalog_rows(
     }
 }
 
+/// The ids in `entity_ids` that have no catalog row, which a read then finds
+/// through their actors (ADR-0113).
+///
+/// A store that writes each record's catalog row in the commit of its event
+/// has none: a create or a move commits its row with it or not at all, and
+/// boot repair keeps the server from serving until every older record's row
+/// matches its journal. Only a row written after its commit can be missing,
+/// so only those stores are asked. Asking every time cost the whole type: on
+/// Turso, with no sparse catalog read, the check loaded every record's row.
 pub(super) async fn missing_catalog_entity_ids(
     state: &ServerState,
     tenant: &TenantId,
     entity_type: &str,
     entity_ids: &[String],
 ) -> Vec<String> {
-    if entity_ids.is_empty() {
+    if entity_ids.is_empty() || state.entity_rows_follow_commits() {
         return Vec::new();
     }
     let Some(query_plane) = state.query_plane_store() else {
