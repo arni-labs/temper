@@ -10,7 +10,7 @@ use super::types::{
     ModelEffect, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
 };
 
-use super::count_bounds::count_bound;
+use super::count_bounds::count_range;
 pub(crate) use super::expansion::Expansion;
 use super::strings::string_assignments;
 pub use super::strings::{apply_string_params, canonical_strings, string_values};
@@ -101,7 +101,8 @@ pub fn guard_may_hold(
 /// chosen for it. The caller has checked `t`'s status and guard.
 ///
 /// A parameter is an unknown value, so each candidate is explored:
-/// counts `0..=bound`, both booleans, and for list elements every literal a
+/// counts up to as far as the move's effects can carry them inside the
+/// bounds (`count_bounds`), both booleans, and for list elements every literal a
 /// guard or invariant compares that list against plus one fresh string.
 /// Assignments that grow a counter past its bound (or a list past the
 /// default bound) are pruned, as in bounded exploration.
@@ -138,13 +139,22 @@ pub(crate) fn successors_budgeted(
 }
 
 /// [`successors`], adding to `cut` each counter and list a step it leaves
-/// out would take past its bound, with that bound.
+/// out would take past its bound, with that bound, and each count parameter
+/// whose range was widened, with the largest value tried.
 pub(crate) fn successors_noting_cuts(
     model: &TemperModel,
     t: &ResolvedTransition,
     state: &TemperModelState,
     cut: &mut BTreeMap<String, usize>,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    for (name, kind) in &t.params {
+        if matches!(kind, ParamKind::Count) {
+            let range = count_range(model, t, name);
+            if range.widened {
+                cut.insert(format!("params.{name}"), range.largest);
+            }
+        }
+    }
     let values = string_values(std::iter::once(state));
     successors_with(
         model,
@@ -236,7 +246,7 @@ pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
         // bound, and building its candidates would allocate that many.
         let assignments = t.params.iter().fold(1usize, |n, (name, kind)| {
             let choices = match kind {
-                ParamKind::Count => count_bound(model, t, name).saturating_add(1),
+                ParamKind::Count => count_range(model, t, name).largest.saturating_add(1),
                 ParamKind::Bool => 2,
                 ParamKind::Str => string_literals(model, t, name).len() + 1,
             };
@@ -254,7 +264,7 @@ fn param_candidates(
     kind: &ParamKind,
 ) -> Vec<ParamValue> {
     match kind {
-        ParamKind::Count => (0..=count_bound(model, t, name))
+        ParamKind::Count => (0..=count_range(model, t, name).largest)
             .map(ParamValue::Count)
             .collect(),
         ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
