@@ -232,7 +232,7 @@ impl ServerState {
                     continue;
                 };
                 counted.rearmed += 1;
-                self.spawn_state_timer(timer, delay, Some(gate.clone()), armed_seq);
+                self.spawn_state_timer(timer, Some(gate.clone()), armed_seq);
                 armed += 1;
             }
         }

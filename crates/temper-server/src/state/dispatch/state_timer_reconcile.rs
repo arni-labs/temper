@@ -265,7 +265,7 @@ impl ServerState {
             deadline(timer.started_at, st.after_seconds),
             woke_for,
         );
-        if self.start_armed_timer(timer, delay, reservation).await {
+        if self.start_armed_timer(timer, reservation).await {
             crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                 tenant.as_str(),
                 entity_type,

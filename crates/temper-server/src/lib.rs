@@ -57,6 +57,7 @@ pub(crate) mod trace_context;
 pub(crate) mod trajectory_outbox;
 pub mod trigger;
 pub mod vector_index;
+pub mod wake;
 pub mod wasm_registry;
 pub mod webhooks;
 pub mod write_health;
