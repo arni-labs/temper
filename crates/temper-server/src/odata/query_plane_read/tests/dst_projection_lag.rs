@@ -41,11 +41,50 @@ const DST_SEEDS: u64 = 64;
 #[derive(Default)]
 pub(super) struct SimQueryPlane {
     // (tenant, entity_type, entity_id) -> catalog row
-    catalog: Mutex<BTreeMap<(String, String, String), EntityCatalogRow>>,
+    pub(super) catalog: Mutex<BTreeMap<(String, String, String), EntityCatalogRow>>,
+    pub(super) pending: Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
 #[async_trait]
 impl QueryPlaneStore for SimQueryPlane {
+    async fn reconciled_equality_candidates(
+        &self,
+        _journal: &BoxedEventStore,
+        tenant: &str,
+        entity_type: &str,
+        predicates: &[(String, String)],
+        budget: usize,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
+        let pending = self.pending.lock().unwrap();
+        let Some(pending) = pending.as_ref() else {
+            return Ok(None);
+        };
+        let catalog = self.catalog.lock().unwrap();
+        let mut ids = pending.clone();
+        ids.extend(
+            catalog
+                .iter()
+                .filter(|((t, ty, _), row)| {
+                    t == tenant
+                        && ty == entity_type
+                        && predicates.iter().all(|(field, value)| {
+                            row.fields.get(field).and_then(|v| v.as_str()) == Some(value.as_str())
+                        })
+                })
+                .map(|((_, _, id), _)| id.clone()),
+        );
+        let mut bounded: Vec<_> = ids.into_iter().collect();
+        bounded.sort_by_key(|id| (!pending.contains(id), id.clone()));
+        bounded.truncate(budget + 1);
+        bounded.sort();
+        let dirty = bounded
+            .iter()
+            .filter(|id| pending.contains(*id))
+            .cloned()
+            .collect();
+        Ok(Some((bounded, dirty)))
+    }
+
     async fn projection_checkpoints(
         &self,
         tenant: &str,

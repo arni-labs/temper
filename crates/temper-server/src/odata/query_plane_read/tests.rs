@@ -20,6 +20,7 @@ use temper_store_turso::TursoEventStore;
 mod count_telemetry;
 mod dst_projection_lag;
 mod empty_match;
+mod equality_delta;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;
@@ -225,6 +226,7 @@ async fn row_authorized_count_over_budget_returns_413() {
         QueryPlaneReadError::AuthorizationDenied(_) => {
             panic!("test state should allow collection reads")
         }
+        QueryPlaneReadError::ReadUnavailable => panic!("authoritative read should be available"),
         QueryPlaneReadError::InvalidContinuation => {
             panic!("no $skiptoken was supplied")
         }

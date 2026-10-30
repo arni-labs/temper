@@ -377,6 +377,30 @@ impl QueryPlaneStore for TursoEventStore {
             .map(Some)
     }
 
+    async fn reconciled_equality_candidates(
+        &self,
+        journal: &super::BoxedEventStore,
+        tenant: &str,
+        entity_type: &str,
+        predicates: &[(String, String)],
+        budget: usize,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
+        // A separately supplied journal can have changes absent from this
+        // store's delta. Its absence is never evidence about that journal.
+        if !std::ptr::addr_eq(self as *const Self, std::sync::Arc::as_ptr(&journal.store)) {
+            return Ok(None);
+        }
+        TursoEventStore::reconciled_equality_candidates(
+            self,
+            tenant,
+            entity_type,
+            predicates,
+            budget,
+        )
+        .await
+        .map(Some)
+    }
+
     async fn projection_catalog_freshness(
         &self,
         tenant: &str,

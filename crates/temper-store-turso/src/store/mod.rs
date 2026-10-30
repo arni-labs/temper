@@ -49,6 +49,7 @@ pub mod ots;
 mod policy;
 mod policy_approval;
 mod policy_replace;
+mod projection_delta;
 mod projection_freshness;
 mod projection_repair;
 mod projection_rows;
@@ -550,6 +551,8 @@ impl TursoEventStore {
         conn.execute(schema::CREATE_ENTITY_FIELD_INDEX_STATUS, ())
             .await
             .map_err(storage_error)?;
+
+        projection_delta::migrate_delta(&conn).await?;
 
         // Entity key index (ADR-0153) — declared composite-key -> entity_id, the
         // negative-existence access path co-committed with the journal append.
