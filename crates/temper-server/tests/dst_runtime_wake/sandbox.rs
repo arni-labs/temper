@@ -5,9 +5,11 @@
 //! plus up to [`JITTER`] seconds after it. While awake, the process's clock
 //! runs and its timers fire on their own. Suspended, nothing of the process
 //! runs and only the wall clock moves on, until the next request: one from
-//! the workload, or the control plane's wake at the due time it holds, which
-//! reaches the process up to [`MOST_LAG`] seconds after it is sent. The
-//! control plane holds the newest report it took, by `(reported_at, seq)`.
+//! the workload, or the control plane's wake for the due time it holds. As
+//! katagami-control's `Wake` does, the control plane sends it [`WAKE_LEAD`]
+//! seconds before that time, and it reaches the process up to [`MOST_LAG`]
+//! seconds after it is sent. The control plane holds the newest report it
+//! took, by `(reported_at, seq)`, and wakes the process once for it.
 //! Half its wakes are `GET /healthz`, which `temper serve` answers outside
 //! the kernel's routes: they resume the sandbox and keep it awake, but the
 //! process does not see them as inbound.
@@ -34,9 +36,13 @@ use super::{AWAKE, CSDL, JITTER, JOB, SUSPEND_AFTER, TENANT, act, job, settle};
 /// How long a run lasts on the wall clock.
 const RUN: i64 = 8 * 3600;
 
+/// How long before the due time it holds the control plane sends its wake:
+/// katagami-control's `Wake` asks a second early.
+const WAKE_LEAD: i64 = 1;
+
 /// The most a wake takes to reach the process after the control plane sends
-/// it.
-const MOST_LAG: u64 = 3;
+/// it: it lands from [`WAKE_LEAD`] s before the due time to 3 s after.
+const MOST_LAG: u64 = 4;
 
 /// How the control plane orders what it is told: `(reported_at, seq)`.
 type Order = (DateTime<Utc>, u64);
@@ -235,7 +241,7 @@ impl Sim {
         if self.held == self.woke_for {
             return None;
         }
-        Some(self.plan? + secs(self.lag))
+        Some(self.plan? - chrono::Duration::seconds(WAKE_LEAD) + secs(self.lag))
     }
 
     async fn go(&mut self, arrivals: Vec<Arrival>, kind: &Kind) -> Result<(), String> {
@@ -336,7 +342,7 @@ impl Sim {
         Ok(())
     }
 
-    /// The control plane wakes the process at the time it holds: a request
+    /// The control plane wakes the process for the time it holds: a request
     /// that resumes the sandbox. The process sees it as inbound only when it
     /// reaches the kernel's routes, not as `GET /healthz`.
     fn wake(&mut self) {

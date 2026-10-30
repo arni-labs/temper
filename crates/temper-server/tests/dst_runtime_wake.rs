@@ -12,8 +12,9 @@
 //! (`Expire`) or starts a chain repeating every two hours (`Tick`), or only
 //! keeps the sandbox awake. The sandbox is suspended exactly 900 s plus up to
 //! a minute after the last request; the process is told it stays awake 600 s.
-//! The control plane wakes it at the due time it was told last, and fails up
-//! to three report sends in a row. Half its wakes are `GET /healthz`, which
+//! The control plane wakes it for the due time it was told last, the wake
+//! landing from a second before that time (katagami-control asks a second
+//! early) to three after, and fails up to three report sends in a row. Half its wakes are `GET /healthz`, which
 //! `temper serve` answers outside the kernel's routes, so the process never
 //! sees them as inbound; the other half reach the kernel's routes.
 //!
@@ -59,8 +60,8 @@ const SUSPEND_AFTER: Duration = Duration::from_secs(900);
 const JITTER: u64 = 60;
 /// How long the process is told it stays awake: below [`SUSPEND_AFTER`].
 const AWAKE: Duration = Duration::from_secs(600);
-/// The most a timer may fire after it is due: a wake that takes up to 3 s to
-/// arrive, up to a second for the process to see it resumed, and then some.
+/// The most a timer may fire after it is due: a wake that lands up to 3 s
+/// after it, up to a second for the process to see it resumed, and then some.
 /// A report's failed sends (1 + 2 + 4 s) do not add to it: in these
 /// workloads a report names a time at least a minute after it is made.
 const LATE: i64 = 10;
