@@ -26,8 +26,11 @@ pub use inline_chain::{ChainStep, InlineChain, RepeatedStep, StepEntity};
 
 /// Maximum callbacks along one server-owned internal context lineage.
 ///
-/// This is not a global fanout quota and is not persisted across restarts or
-/// propagated through external HTTP requests.
+/// A scheduled follow-on that waits on the clock starts a new lineage (see
+/// `for_scheduled_follow_on`).
+///
+/// This is not a global fanout quota and is not propagated through external
+/// HTTP requests.
 pub const MAX_CALLBACK_HOPS: u32 = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -134,6 +137,43 @@ impl AgentContext {
                     && fire.action == action
             })
             .map(|fire| fire.armed_seq)
+    }
+
+    /// Begin a `schedule` / `schedule_at` follow-on of this context.
+    ///
+    /// A follow-on that waits on the clock (a delay of one second or more)
+    /// runs at most once per second per schedule effect, the same floor a
+    /// state timer has (`state_timeout` requires `after_seconds > 0`). That
+    /// wait is what bounds a periodic schedule, so it starts a fresh callback
+    /// lineage and a recurring schedule keeps running however many cycles it
+    /// has completed. A follow-on with no delay, including a `schedule_at`
+    /// whose time has already passed, keeps the parent's callback lineage.
+    ///
+    /// Either way the follow-on is a new request on the record: it gets an
+    /// idempotency key of its own, derived from this context's key, the
+    /// scheduled action and the effect's place in the transition (`index`).
+    /// The parent's key itself would answer the follow-on with the scheduling
+    /// transition's reply, so it would never run. A retry of the parent, in
+    /// flight or long finished, derives the same key, and the record answers
+    /// the second copy with the first one's reply instead of running it again.
+    pub(crate) fn for_scheduled_follow_on(
+        &self,
+        action: &str,
+        index: usize,
+        delay_seconds: u64,
+    ) -> Self {
+        let mut next = self.for_background_task();
+        next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
+            IdempotencyKey::FollowUp(crate::idempotency::derived_idempotency_key(
+                key.as_str(),
+                &format!("scheduled:{action}"),
+                &index.to_string(),
+            ))
+        });
+        if delay_seconds > 0 {
+            next.callback_hops = 0;
+        }
+        next
     }
 
     /// Create a system-level agent context for internal operations.

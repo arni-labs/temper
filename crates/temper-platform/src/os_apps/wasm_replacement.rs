@@ -59,7 +59,7 @@ pub(super) async fn uploaded_wasm_replacement_context(
     else {
         return UploadedWasmReplacementContext::default();
     };
-    let digest = reconcile::digest_app_bundle(app_name, bundle);
+    let digest = reconcile::digest_app_bundle(Some(tenant), app_name, bundle);
     match ps.get_installed_app(tenant, app_name).await {
         Ok(Some(record)) => UploadedWasmReplacementContext {
             bundle_wasm_digest_changed: record.wasm_digest != digest.wasm_digest,

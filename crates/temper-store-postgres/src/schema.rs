@@ -226,13 +226,15 @@ CREATE INDEX IF NOT EXISTS idx_wasm_invocation_logs_created
 /// CREATE TABLE statement for per-tenant encrypted secrets.
 ///
 /// Stores AES-256-GCM encrypted secret values keyed by (tenant, key_name).
-/// The master key is held in memory only; ciphertext + nonce are persisted.
+/// The master key is held in memory only; ciphertext + nonce are persisted,
+/// with the opaque version id of the latest write (migration 0021).
 pub const CREATE_TENANT_SECRETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS tenant_secrets (
     tenant      TEXT         NOT NULL,
     key_name    TEXT         NOT NULL,
     ciphertext  BYTEA        NOT NULL,
     nonce       BYTEA        NOT NULL,
+    version_id  TEXT         DEFAULT gen_random_uuid()::text,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant, key_name)

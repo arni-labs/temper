@@ -9,12 +9,14 @@ use std::collections::BTreeMap;
 
 mod action;
 mod carry;
+mod group;
 mod state;
 mod trigger;
 mod webhook;
 
 pub use action::*;
 pub use carry::*;
+pub use group::*;
 pub use state::*;
 pub use trigger::*;
 pub use webhook::*;
@@ -96,6 +98,10 @@ pub struct Automaton {
     /// reaching the actor.
     #[serde(default)]
     pub admission: Option<Admission>,
+    /// State groups for drawing the spec as a statechart, flat and in source
+    /// order; nesting is by name. Labels only.
+    #[serde(default, rename = "group")]
+    pub groups: Vec<Group>,
 }
 
 /// ADR-0153: a declared unique key (alternate key) on an entity. `properties`

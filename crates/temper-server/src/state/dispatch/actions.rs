@@ -647,19 +647,35 @@ impl crate::state::ServerState {
         );
         let outcome = {
             use tracing::Instrument;
-            retry::ask_with_backoff::<_, EntityResponse, _>(
-                &actor_ref,
-                || EntityMsg::Action {
-                    caller: Some(caller.clone()),
-                    name: action_name.clone(),
-                    params: params_for_retry.clone(),
-                    related: cross_for_retry.clone(),
-                    idempotency_key: idempotency_key.clone(),
-                    expected_authorization_precondition: authorization_precondition_for_retry
-                        .clone(),
-                },
-                &policy,
-            )
+            let make_msg = || EntityMsg::Action {
+                caller: Some(caller.clone()),
+                name: action_name.clone(),
+                params: params_for_retry.clone(),
+                related: cross_for_retry.clone(),
+                idempotency_key: idempotency_key.clone(),
+                expected_authorization_precondition: authorization_precondition_for_retry.clone(),
+            };
+            let is_timer_fire = agent_ctx
+                .state_timer_armed_seq(tenant.as_str(), entity_type, entity_id, action)
+                .is_some();
+            async {
+                if is_timer_fire {
+                    // The timer owns this write and its gate slot. A request
+                    // deadline cannot decide whether it committed or rolled back.
+                    let start = std::time::Instant::now(); // determinism-ok: latency metric only
+                    retry::AskResult {
+                        result: actor_ref
+                            .ask_until_reply::<EntityResponse>(make_msg())
+                            .await,
+                        attempts: 1,
+                        elapsed: start.elapsed(),
+                        retried_after_transient: false,
+                    }
+                } else {
+                    retry::ask_with_backoff::<_, EntityResponse, _>(&actor_ref, make_msg, &policy)
+                        .await
+                }
+            }
             .instrument(ask_span)
             .await
         };

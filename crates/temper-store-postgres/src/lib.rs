@@ -61,10 +61,10 @@ pub use platform::{
     PostgresOtsTrajectoryRow, PostgresPolicyApprovalCommit, PostgresPolicyDenialPatternRow,
     PostgresPolicyRow, PostgresProjectedEntityFieldsRow, PostgresPublishedArtifactRow,
     PostgresPublishedArtifactUpsert, PostgresQueuedOtsTrajectoryRow, PostgresSecretRow,
-    PostgresSpecRow, PostgresSpecVerificationUpdate, PostgresTrajectoryInsert,
-    PostgresTrajectoryRow, PostgresTrajectoryStats, PostgresUnmetIntentAggRow,
-    PostgresWasmInvocationInsert, PostgresWasmInvocationRow, PostgresWasmModuleMetadataRow,
-    PostgresWasmModuleRow,
+    PostgresSecretVersionRow, PostgresSpecRow, PostgresSpecVerificationUpdate,
+    PostgresTrajectoryInsert, PostgresTrajectoryRow, PostgresTrajectoryStats,
+    PostgresUnmetIntentAggRow, PostgresWasmInvocationInsert, PostgresWasmInvocationRow,
+    PostgresWasmModuleMetadataRow, PostgresWasmModuleRow,
 };
 pub use store::PostgresEventStore;
 

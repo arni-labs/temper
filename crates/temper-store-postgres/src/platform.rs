@@ -20,10 +20,12 @@ mod policy_approval;
 mod policy_replace;
 mod rows;
 mod scheduled_actions;
+mod secrets;
 mod specs;
 mod state_timers;
 pub use inputs::{PostgresEvolutionRecordInsert, PostgresPolicyApprovalCommit};
 use rows::*;
+pub use secrets::{PostgresSecretRow, PostgresSecretVersionRow};
 
 const DISTINCT_RESOURCE_IDS_BUDGET: usize = 100;
 const BUNDLED_REPLACE_UPLOAD_SOURCE: &str = "bundled-replace-upload";
@@ -294,8 +296,6 @@ pub struct PostgresEntityCatalogRow {
     pub state: Option<serde_json::Value>,
     pub sequence_nr: u64,
 }
-
-pub type PostgresSecretRow = (String, Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PostgresTrajectoryRow {
@@ -2241,59 +2241,6 @@ impl PostgresEventStore {
         .await
         .map_err(storage_error)?;
         Ok(row.map(row_to_published_artifact))
-    }
-
-    pub async fn upsert_secret(
-        &self,
-        tenant: &str,
-        key_name: &str,
-        ciphertext: &[u8],
-        nonce: &[u8],
-    ) -> Result<(), PersistenceError> {
-        crate::dbm::postgres_query!(&self.schema,
-            "INSERT INTO {schema}tenant_secrets (tenant, key_name, ciphertext, nonce, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, now(), now()) \
-             ON CONFLICT (tenant, key_name) DO UPDATE SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, updated_at = now()",
-        )
-        .bind(tenant)
-        .bind(key_name)
-        .bind(ciphertext)
-        .bind(nonce)
-        .execute(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(())
-    }
-
-    pub async fn delete_secret(
-        &self,
-        tenant: &str,
-        key_name: &str,
-    ) -> Result<bool, PersistenceError> {
-        let result = crate::dbm::postgres_query!(
-            &self.schema,
-            "DELETE FROM {schema}tenant_secrets WHERE tenant = $1 AND key_name = $2"
-        )
-        .bind(tenant)
-        .bind(key_name)
-        .execute(self.pool())
-        .await
-        .map_err(storage_error)?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    pub async fn load_secrets_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<PostgresSecretRow>, PersistenceError> {
-        crate::dbm::postgres_query_as!(
-            &self.schema,
-            "SELECT key_name, ciphertext, nonce FROM {schema}tenant_secrets WHERE tenant = $1"
-        )
-        .bind(tenant)
-        .fetch_all(self.pool())
-        .await
-        .map_err(storage_error)
     }
 
     pub async fn upsert_policy_denial_pattern(
