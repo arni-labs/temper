@@ -260,7 +260,7 @@ async fn dst_a_parent_never_keeps_the_id_of_a_child_that_was_not_created() {
                 .state;
             let stored = live.fields["last_run_id"]
                 .as_str()
-                .unwrap_or_default()
+                .expect("a spawn field must retain its declared string type")
                 .to_owned();
             assert!(
                 stored.is_empty()

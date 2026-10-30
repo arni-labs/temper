@@ -2076,16 +2076,15 @@ impl ServerState {
             .ok_or_else(|| {
                 format!("No transition table for tenant '{tenant}', entity type '{parent_type}'")
             })?;
-        let response = retry::ask_with_backoff::<_, EntityResponse, _>(
-            &actor_ref,
-            || EntityMsg::RecordSpawnRefusal {
-                refusal: refusal.clone(),
-            },
-            &self.dispatch_retry_policy(),
-        )
-        .await
-        .result
-        .map_err(|e| format!("Actor update failed: {e}"))?;
+        // A timeout leaves the actor's append in flight. Sending another
+        // request could journal the same refusal twice and spend event budget.
+        let response: EntityResponse = actor_ref
+            .ask(
+                EntityMsg::RecordSpawnRefusal { refusal },
+                self.action_dispatch_timeout,
+            )
+            .await
+            .map_err(|e| format!("Actor update failed: {e}"))?;
         if !response.success {
             return Err(response
                 .error

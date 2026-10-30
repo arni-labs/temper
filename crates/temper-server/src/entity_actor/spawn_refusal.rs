@@ -15,6 +15,8 @@
 //! no spec effects and is replayed by [`apply`], the same function the live
 //! path uses.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use temper_runtime::persistence::PersistenceError;
@@ -64,7 +66,11 @@ pub enum ChildLookup {
 
 /// The event's params: the refusal, plus the field it cleared and the value it
 /// restored, so replay does not have to decide again.
-fn event_params(refusal: &SpawnRefusal, state: &EntityState, initial: &Value) -> Value {
+fn event_params(
+    refusal: &SpawnRefusal,
+    state: &EntityState,
+    initial: &BTreeMap<String, Value>,
+) -> Value {
     let owns_field = refusal.field.as_ref().is_some_and(|field| {
         state.fields.get(field).and_then(Value::as_str) == Some(refusal.child_id.as_str())
             && state.spawn_reservations.get(field) == Some(&refusal.reservation_id)
@@ -133,7 +139,15 @@ pub(super) async fn commit(
             "Event budget exhausted ({MAX_EVENTS_SINCE_SNAPSHOT} max since snapshot)"
         ));
     }
-    let initial = initial_fields(actor, state);
+    // Declared defaults exist even when the parent has no input contracts
+    // and its initial stored fields therefore omit them.
+    let initial = actor
+        .table
+        .read()
+        .expect("table lock poisoned")
+        .initial_values
+        .fields
+        .clone();
     let mut previous_fields = state.fields.clone();
     let mut previous_reservations = state.spawn_reservations.clone();
     let mut event = refusal_event(state, event_params(refusal, state, &initial));
@@ -202,18 +216,6 @@ pub(super) async fn commit(
             "failed to persist snapshot");
     }
     Ok(())
-}
-
-/// The parent's fields as its spec starts them, which a cleared field returns to.
-fn initial_fields(actor: &EntityActor, state: &EntityState) -> Value {
-    let table = actor.table.read().expect("table lock poisoned").clone();
-    EntityActor::build_initial_state(
-        &actor.entity_type,
-        &state.entity_id,
-        &table,
-        &serde_json::json!({}),
-    )
-    .fields
 }
 
 #[cfg(test)]
