@@ -29,9 +29,11 @@ impl DueTimes {
     /// A later time is not sent: the control plane wakes the process at the
     /// time it holds, early for nothing, and that time passing sends the
     /// fresh one. Nor is none, once the time last sent has passed: the
-    /// control plane holds nothing after it either way. So a timer that keeps
-    /// re-arming costs one report and one wake per window the sandbox stays
-    /// awake, not one per fire.
+    /// control plane holds nothing after it either way. And while the control
+    /// plane's wake at a passed time keeps the process awake, a due time
+    /// before the end of that wake's window is not sent. So a timer that
+    /// keeps re-arming costs one report and one wake per window the sandbox
+    /// stays awake, not one per fire.
     ///
     /// A report that is not delivered is sent again, waiting longer after
     /// each failure, or at once after a resume, until it is delivered or a
@@ -52,17 +54,26 @@ impl DueTimes {
         let report = {
             let mut inner = self.lock();
             let now = sim_now();
-            let horizon = inner.horizon(now);
-            let earliest = inner.reportable(horizon, now);
+            // The control plane's wake at a time that has passed keeps the
+            // process awake while nothing is sent. A report that is sent
+            // replaces that time and may reach the control plane before the
+            // wake goes out, so it names what the process could sleep through
+            // without that wake.
+            let woken = inner.passed_wake(now);
+            let soonest = inner.reportable(inner.horizon(now, woken), now);
             let send = match inner.reported.sent {
                 None => true,
                 Some(sent) => {
-                    earliest.is_some_and(|at| sent.is_none_or(|sent| sent <= now || at < sent))
+                    soonest.is_some_and(|at| sent.is_none_or(|sent| sent <= now || at < sent))
                 }
             };
             if !send {
                 return;
             }
+            let earliest = match woken {
+                Some(_) => inner.reportable(inner.horizon(now, None), now),
+                None => soonest,
+            };
             inner.reported.seq += 1;
             let seq = inner.reported.seq;
             inner.reported.sent = Some(earliest);

@@ -108,16 +108,23 @@ struct Inner {
 }
 
 impl Inner {
-    /// Until when the process is surely awake at `now`: a timer due before it
-    /// fires on its own. The control plane wakes the process at the due time
-    /// it took, and that wake is an inbound request, so once that time has
-    /// passed it counts as one, whether it has come yet or is on its way.
-    /// Now, unless the sandbox is known to stay awake longer.
-    fn horizon(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
-        if let Some(woken) = self.reported.taken.filter(|at| *at <= now) {
-            self.last_inbound = self.last_inbound.max(Some(woken));
-        }
-        match (self.awake, self.last_inbound) {
+    /// The due time the control plane took, once it has passed, while the
+    /// control plane still wakes the process for it: nothing newer was sent
+    /// since, which would replace it before that wake went out. That wake is
+    /// an inbound request, whether it has come yet or is on its way, and even
+    /// when the process does not see it, as with `GET /healthz`.
+    fn passed_wake(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let taken = self.reported.taken.filter(|at| *at <= now)?;
+        (self.reported.in_flight.is_none() && self.reported.sent == Some(Some(taken)))
+            .then_some(taken)
+    }
+
+    /// Until when the process is surely awake at `now`, from the newest
+    /// inbound request it saw, or `woken` when that is newer: a timer due
+    /// before then fires on its own. Now, unless the sandbox is known to stay
+    /// awake longer.
+    fn horizon(&self, now: DateTime<Utc>, woken: Option<DateTime<Utc>>) -> DateTime<Utc> {
+        match (self.awake, self.last_inbound.max(woken)) {
             (Some(awake), Some(last)) => last
                 .checked_add_signed(awake)
                 .unwrap_or(DateTime::<Utc>::MAX_UTC)

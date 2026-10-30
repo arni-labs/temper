@@ -10,10 +10,9 @@ fn key() -> TimerRef {
 
 /// What a report would name now.
 fn earliest(due: &DueTimes) -> Option<DateTime<Utc>> {
-    let mut inner = due.lock();
+    let inner = due.lock();
     let now = sim_now();
-    let horizon = inner.horizon(now);
-    inner.reportable(horizon, now)
+    inner.reportable(inner.horizon(now, None), now)
 }
 
 #[test]
