@@ -12,60 +12,69 @@ use super::types::{ModelEffect, ResolvedTransition, TemperModel};
 pub(super) struct CountRange {
     /// The largest value tried.
     pub(super) largest: usize,
-    /// Whether a larger value might still end the move inside every bound,
-    /// in a state no value up to `largest` reaches. The move subtracted a
-    /// value that is not a literal from a counter it had written, which
-    /// cannot be worked back exactly, so the range is widened instead and a
-    /// pass over the move is bounded.
+    /// The counter, with its bound, that a value past `largest` takes past
+    /// that bound. Such a step is left out, so a pass over the move is
+    /// bounded; `None` when every larger value acts like one tried.
+    pub(super) past: Option<(String, usize)>,
+    /// Whether the move subtracted a value that is not a literal from a
+    /// counter it had written. That cannot be worked back exactly, so the
+    /// range is widened to the widest bound, and a pass over the move is
+    /// bounded.
     pub(super) widened: bool,
 }
 
-/// The most a counter may hold at one point of a move for the move to end
-/// with every counter inside its bound.
-#[derive(Clone, Copy)]
-struct Room {
-    /// `None` when the move overwrites the counter before reading it again,
-    /// so any value fits.
-    most: Option<usize>,
-    /// Whether `most` was widened past what the effects after it need.
+/// What a counter may hold at one point of a move for the move to end with
+/// every counter inside its bound.
+#[derive(Clone, Copy, Default)]
+struct Room<'a> {
+    /// The most it may hold, and the counter whose bound a larger value
+    /// would end past. `None` when no value takes a counter past its bound.
+    most: Option<(usize, &'a str)>,
+    /// The most worth holding where every larger value ends the move the
+    /// same way: a subtraction that empties a counter, a position past a
+    /// list's end.
+    useful: Option<usize>,
+    /// Whether a value here was widened past what the effects after it need.
     widened: bool,
 }
 
-impl Room {
-    const ANY: Room = Room {
-        most: None,
-        widened: false,
-    };
-
-    fn up_to(most: usize) -> Room {
+impl<'a> Room<'a> {
+    fn bound_of(model: &TemperModel, var: &'a str) -> Room<'a> {
         Room {
-            most: Some(most),
-            widened: false,
+            most: Some((counter_bound(model, var), var)),
+            ..Room::default()
         }
     }
 
-    /// The room for a value that must fit both.
-    fn and(self, other: Room) -> Room {
+    fn useful_to(most: usize, widened: bool) -> Room<'a> {
+        Room {
+            useful: Some(most),
+            widened,
+            ..Room::default()
+        }
+    }
+
+    /// The room for a value that must serve both.
+    fn and(self, other: Room<'a>) -> Room<'a> {
         let most = match (self.most, other.most) {
-            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+            (a, b) => a.or(b),
+        };
+        let useful = match (self.useful, other.useful) {
+            (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
         Room {
             most,
+            useful,
             widened: self.widened || other.widened,
         }
     }
 
-    fn plus(self, n: usize) -> Room {
+    fn shifted(self, by: impl Fn(usize) -> usize) -> Room<'a> {
         Room {
-            most: self.most.map(|most| most.saturating_add(n)),
-            ..self
-        }
-    }
-
-    fn minus(self, n: usize) -> Room {
-        Room {
-            most: self.most.map(|most| most.saturating_sub(n)),
+            most: self.most.map(|(most, edge)| (by(most), edge)),
+            useful: self.useful.map(&by),
             ..self
         }
     }
@@ -77,100 +86,81 @@ impl Room {
 /// Working back from the last effect gives each counter's room at each
 /// point: an assignment takes the room of the counter it writes, an
 /// addition keeps it, and a subtraction widens it by what it takes away.
-/// The parameter's limit is the least room of any counter it lands in.
-/// Where larger values all act alike (a subtraction that empties a counter,
-/// a position past a list's end) it reaches only as far as that.
+/// The parameter's limit is the least room of any counter it lands in, and
+/// where larger values all act alike it goes only as far as is useful.
 pub(super) fn count_range(model: &TemperModel, t: &ResolvedTransition, name: &str) -> CountRange {
     let widest = widest(model);
     let mut room: BTreeMap<&str, Room> = BTreeMap::new();
-    let room_of = |room: &BTreeMap<&str, Room>, var: &str| {
-        room.get(var)
-            .copied()
-            .unwrap_or_else(|| Room::up_to(counter_bound(model, var)))
-    };
-    let mut limit: Option<usize> = None;
-    let mut reach: Option<usize> = None;
-    let mut widened = false;
-    let mut takes = |most: usize, flagged: bool, bound: &mut Option<usize>, least: bool| {
-        *bound = Some(match *bound {
-            Some(b) if least => b.min(most),
-            Some(b) => b.max(most),
-            None => most,
-        });
-        widened |= flagged;
-    };
+    let mut taken = Room::default();
     for (i, effect) in t.effects.iter().enumerate().rev() {
         match effect {
             ModelEffect::SetCounter { var, value } | ModelEffect::AddCounter { var, value } => {
-                let after = room_of(&room, var);
+                let after = room_at(&room, model, var);
                 let before = match (effect, value) {
-                    (ModelEffect::SetCounter { .. }, _) => Room::ANY,
-                    (_, Arg::Lit(Literal::Int(n))) => after.minus(literal(*n)),
+                    (ModelEffect::SetCounter { .. }, _) => Room::default(),
+                    (_, Arg::Lit(Literal::Int(n))) => {
+                        after.shifted(|most| most.saturating_sub(literal(*n)))
+                    }
                     _ => after,
                 };
                 room.insert(var, before);
-                let Some(most) = after.most else { continue };
                 match value {
-                    Arg::Param(p) if p == name => takes(most, after.widened, &mut limit, true),
+                    Arg::Param(p) if p == name => taken = taken.and(after),
                     Arg::Var(source) => {
-                        let fits = room_of(&room, source).and(after);
+                        let fits = room_at(&room, model, source).and(after);
                         room.insert(source, fits);
                     }
                     _ => {}
                 }
             }
             ModelEffect::SubCounter { var, value } => {
-                let after = room_of(&room, var);
+                let after = room_at(&room, model, var);
                 if let Arg::Lit(Literal::Int(n)) = value {
-                    room.insert(var, after.plus(literal(*n)));
+                    room.insert(var, after.shifted(|most| most.saturating_add(literal(*n))));
                     continue;
                 }
-                if after.most.is_none() {
+                if after.most.is_none() && after.useful.is_none() {
+                    // The move overwrites the result before reading it.
                     continue;
                 }
                 // What the counter holds before this subtraction, and so the
                 // most worth taking from it: its bound, unless the move wrote
-                // it, when it depends on values not worked out here.
+                // it, when that depends on values not worked out here.
                 let written = t.effects[..i]
                     .iter()
                     .any(|earlier| writes(earlier) == Some(var.as_str()));
                 let held = if written {
-                    Room {
-                        most: Some(widest),
-                        widened: true,
-                    }
+                    widest
                 } else {
-                    Room::up_to(counter_bound(model, var))
+                    counter_bound(model, var)
                 };
-                let most = held.most.unwrap_or(widest);
-                room.insert(
-                    var,
-                    Room {
-                        widened: after.widened || held.widened,
-                        ..after.plus(most)
-                    },
-                );
+                let mut before = after.shifted(|most| most.saturating_add(held));
+                before.widened |= written;
+                room.insert(var, before);
+                let worth = Room::useful_to(held, written);
                 match value {
-                    Arg::Param(p) if p == name => takes(most, held.widened, &mut reach, false),
+                    Arg::Param(p) if p == name => taken = taken.and(worth),
                     Arg::Var(source) => {
-                        let fits = room_of(&room, source).and(held);
+                        let fits = room_at(&room, model, source).and(worth);
                         room.insert(source, fits);
                     }
                     _ => {}
                 }
             }
             ModelEffect::ListRemoveAt { var, index } => {
-                // Positions past the end, the first of them included, leave
+                // A position past the end, the first of them included, leaves
                 // the list as it is.
                 let appended = t.effects[..i]
                     .iter()
-                    .filter(|earlier| matches!(earlier, ModelEffect::ListAppend { var: v, .. } if v == var))
+                    .filter(|earlier| {
+                        matches!(earlier, ModelEffect::ListAppend { var: v, .. } if v == var)
+                    })
                     .count();
-                let length = list_bound(model, var).saturating_add(appended);
+                let worth = Room::useful_to(list_bound(model, var).saturating_add(appended), false);
                 match index {
-                    Arg::Param(p) if p == name => takes(length, false, &mut reach, false),
+                    Arg::Param(p) if p == name => taken = taken.and(worth),
                     Arg::Var(source) => {
-                        let fits = room_of(&room, source).and(Room::up_to(length));
+                        let fits = room_at(&room, model, source).and(worth);
                         room.insert(source, fits);
                     }
                     _ => {}
@@ -179,21 +169,30 @@ pub(super) fn count_range(model: &TemperModel, t: &ResolvedTransition, name: &st
             ModelEffect::SetBool { .. } | ModelEffect::ListAppend { .. } => {}
         }
     }
-    let largest = match (limit, reach) {
-        // One past the limit is tried as well: it takes a counter past its
-        // bound, so the step is left out and noted, and a pass is bounded.
-        (Some(most), _) => most.saturating_add(1),
-        (None, Some(most)) => most,
+    let largest = match (taken.most, taken.useful) {
+        (Some((most, _)), _) => most,
+        (None, Some(useful)) => useful,
         (None, None) => model.default_max_counter,
     };
     CountRange {
-        largest: if widened {
+        largest: if taken.widened {
             largest.max(widest)
         } else {
             largest
         },
-        widened,
+        past: taken
+            .most
+            .map(|(_, edge)| (edge.to_string(), counter_bound(model, edge))),
+        widened: taken.widened,
     }
+}
+
+/// What `var` may hold here: what the effects after this point need, or its
+/// own bound when none of them reads it.
+fn room_at<'a>(room: &BTreeMap<&'a str, Room<'a>>, model: &TemperModel, var: &'a str) -> Room<'a> {
+    room.get(var)
+        .copied()
+        .unwrap_or_else(|| Room::bound_of(model, var))
 }
 
 /// The counter an effect writes.

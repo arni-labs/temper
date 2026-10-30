@@ -150,6 +150,11 @@ pub(crate) fn successors_noting_cuts(
     for (name, kind) in &t.params {
         if matches!(kind, ParamKind::Count) {
             let range = count_range(model, t, name);
+            // A value one past the range takes this counter past its bound:
+            // that step is left out, as any other step that goes past is.
+            if let Some((counter, bound)) = range.past {
+                cut.insert(counter, bound);
+            }
             if range.widened {
                 cut.insert(format!("params.{name}"), range.largest);
             }
