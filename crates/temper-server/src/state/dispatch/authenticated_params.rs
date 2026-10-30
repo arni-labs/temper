@@ -1,6 +1,5 @@
 //! Resolve spec-declared trusted inputs before action validation and persistence.
 use serde_json::Value;
-use temper_authz::PrincipalKind;
 use temper_jit::table::TransitionTable;
 use temper_runtime::tenant::TenantId;
 use temper_spec::automaton::ParameterSource;
@@ -51,16 +50,12 @@ pub(crate) fn bind_authenticated_params(
         let context = agent.security_ctx.as_ref().ok_or_else(|| {
             DispatchError::AuthzDenied("Authenticated parameter requires a security context".into())
         })?;
-        let principal = &context.principal;
-        if principal.id.is_empty()
-            || principal.id == "anonymous"
-            || principal.kind == PrincipalKind::System
-            || principal.role.as_deref() == Some("service")
-        {
+        if !crate::request_context::names_a_caller(context) {
             return Err(DispatchError::AuthzDenied(
                 "Authenticated subject requires a caller identity".into(),
             ));
         }
+        let principal = &context.principal;
         let value = match source {
             ParameterSource::AuthenticatedSubject => {
                 principal.acting_for.as_deref().unwrap_or(&principal.id)

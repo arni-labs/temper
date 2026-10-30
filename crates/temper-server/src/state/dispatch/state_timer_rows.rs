@@ -64,6 +64,18 @@ impl ServerState {
         if !self.entity_rows_follow_commits() {
             return Ok(None);
         }
+        self.stored_state_timer_row(tenant, entity_type, entity_id)
+            .await
+    }
+
+    /// Read the durable row even when it is written after the event commit.
+    /// An ended, withheld task leaves this row as the record of its setter.
+    pub(super) async fn stored_state_timer_row(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<StateTimerRecord>, PersistenceError> {
         let Some(store) = self.timer_rows_for_tenant(tenant.as_str()).await else {
             return Ok(None);
         };

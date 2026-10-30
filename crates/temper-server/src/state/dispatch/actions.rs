@@ -441,13 +441,23 @@ impl crate::state::ServerState {
         // The dispatch runs in the span it was called in: the request's, or the
         // root span of the runtime work that started it. Ids carried in the agent
         // context never re-parent or re-link it (see `trace_context`).
-        let enriched_agent_ctx = keyed_for_move(
-            agent_ctx.for_dispatch_root(entity_type, entity_id),
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-        );
+        // The timers this move sets keep whether its caller could read the
+        // record now (`timer_standing`).
+        let enriched_agent_ctx = self
+            .with_read_when_set(
+                tenant,
+                entity_type,
+                entity_id,
+                action,
+                keyed_for_move(
+                    agent_ctx.for_dispatch_root(entity_type, entity_id),
+                    tenant,
+                    entity_type,
+                    entity_id,
+                    action,
+                ),
+            )
+            .await?;
         let agent_ctx = &enriched_agent_ctx;
         record_workflow_span_attrs(agent_ctx, entity_type, entity_id, Some(action));
         let current_span = tracing::Span::current();

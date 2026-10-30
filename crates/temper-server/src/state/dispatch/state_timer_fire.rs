@@ -8,6 +8,7 @@ use tracing::Instrument;
 use super::DispatchError;
 use super::owed_writes::{OwedKind, OwedWrite};
 use super::state_timeouts::{ArmedTimer, deadline};
+use super::timer_standing::{Standing, TimerFire};
 use crate::idempotency::IdempotencyKey;
 use crate::state::ServerState;
 use crate::wake::TimerRef;
@@ -17,7 +18,10 @@ impl ServerState {
     /// normal dispatch pipeline, and remove the old row only after its
     /// durable successor is armed. A failed write keeps this arming
     /// (including its identity and journal fence) and retries. A final
-    /// dispatch refusal ends the timer instead.
+    /// dispatch refusal ends the timer instead. A fire withheld for its
+    /// setter's standing ends the timer and keeps its row, so whatever arms
+    /// the record's timer again (a boot, an install) arms it as that setter
+    /// and asks again, never as the kernel's own identity.
     pub(super) fn spawn_state_timer(
         &self,
         timer: ArmedTimer,
@@ -68,6 +72,7 @@ impl ServerState {
         let armed_by = crate::trace_context::cause();
         tokio::spawn(async move {
             let mut kept = false;
+            let mut withheld = false;
             // determinism-ok: timer work on the runtime's scheduler
             loop {
                 due.wait_until(due_at).await;
@@ -87,14 +92,21 @@ impl ServerState {
                     workflow.root_entity_id = %workflow_root_entity_id,
                     workflow.run_id = %workflow_run_id,
                 );
-                let retry = state
+                let fired = state
                     .fire_state_timer(&timer, armed_seq, &fire_key)
                     .instrument(span)
                     .await;
                 // The dispatch awaited the store answer and ran the normal
                 // post-commit pipeline. No fire write survives this permit.
                 drop(permit);
-                let Some((wait, reason)) = retry else { break };
+                let (wait, reason) = match fired {
+                    Fired::Ended => break,
+                    Fired::Withheld => {
+                        withheld = true;
+                        break;
+                    }
+                    Fired::Retry { wait, reason } => (wait, reason),
+                };
                 if !state.state_timer_is_current(&timer, armed_seq) {
                     break;
                 }
@@ -119,7 +131,12 @@ impl ServerState {
             if kept {
                 state.untrack_owed_write(fire_key.as_str());
             }
-            if !state.state_timer_row_moved_on(&timer, armed_seq) {
+            if withheld {
+                // The row still belongs to its setter, but this task is no
+                // longer live. Let an install recover it without disturbing
+                // any task that has already replaced this one.
+                state.state_timeout_tracker.release(&timer, armed_seq);
+            } else if !state.state_timer_row_moved_on(&timer, armed_seq) {
                 state.forget_state_timer(&timer).await;
             }
             state.state_timeout_tracker.dec_pending(&timer.entity_type);
@@ -127,15 +144,15 @@ impl ServerState {
         });
     }
 
-    /// None when this arming is finished; otherwise the retry delay and reason.
+    /// Fire `timer` once, and say whether its arming is finished.
     async fn fire_state_timer(
         &self,
         timer: &ArmedTimer,
         armed_seq: u64,
         fire_key: &IdempotencyKey,
-    ) -> Option<(Duration, String)> {
+    ) -> Fired {
         if !self.state_timer_is_current(timer, armed_seq) {
-            return None;
+            return Fired::Ended;
         }
         // Use the dispatch retry policy's final backoff for a store failure,
         // not a fresh full state budget or a zero-delay overdue spin.
@@ -147,7 +164,12 @@ impl ServerState {
             .await
         {
             Ok(current) => current.state,
-            Err(reason) => return Some((retry_delay, reason)),
+            Err(reason) => {
+                return Fired::Retry {
+                    wait: retry_delay,
+                    reason,
+                };
+            }
         };
         let belongs = current.status == timer.state && self.declares_state_timer(timer);
         if !belongs {
@@ -167,13 +189,29 @@ impl ServerState {
         } else if current.sequence_nr > timer.sequence_nr {
             self.follow_moved_record(timer, armed_seq, &current).await;
         } else if !self.state_timer_already_fired(timer, &current) {
+            let agent_ctx = timer.fire_context(fire_key);
+            let fire = TimerFire {
+                tenant: &timer.tenant,
+                entity_type: &timer.entity_type,
+                entity_id: &timer.entity_id,
+                action: &timer.action,
+            };
+            match self.timer_setter_standing(&agent_ctx, &fire).await {
+                Ok(Standing::Holds) => {}
+                Ok(Standing::Lost { .. }) => return Fired::Withheld,
+                Err(error) => {
+                    return Fired::Retry {
+                        wait: retry_delay,
+                        reason: error.to_string(),
+                    };
+                }
+            }
             crate::runtime_metrics::record_state_timeout_fired(
                 timer.tenant.as_str(),
                 &timer.entity_type,
                 &timer.state,
                 &timer.action,
             );
-            let agent_ctx = timer.fire_context(fire_key);
             let answer = self
                 .dispatch_tenant_action_ext_typed(
                     &timer.tenant,
@@ -194,22 +232,39 @@ impl ServerState {
                         .await;
                 }
                 Ok(answer) if !answer.success && !answer.refused => {
-                    return Some((
-                        retry_delay,
-                        answer.error.unwrap_or_else(|| "fire write failed".into()),
-                    ));
+                    return Fired::Retry {
+                        wait: retry_delay,
+                        reason: answer.error.unwrap_or_else(|| "fire write failed".into()),
+                    };
                 }
                 Err(DispatchError::Deferred { retry_after_ms }) => {
-                    return Some((
-                        Duration::from_millis(retry_after_ms.max(1)),
-                        "dispatch deferred by admission".into(),
-                    ));
+                    return Fired::Retry {
+                        wait: Duration::from_millis(retry_after_ms.max(1)),
+                        reason: "dispatch deferred by admission".into(),
+                    };
                 }
                 Err(error) if error.is_final() => {}
-                Err(error) => return Some((retry_delay, error.to_string())),
+                Err(error) => {
+                    return Fired::Retry {
+                        wait: retry_delay,
+                        reason: error.to_string(),
+                    };
+                }
                 _ => {}
             }
         }
-        None
+        Fired::Ended
     }
+}
+
+/// How one fire of a state timer's arming ended.
+enum Fired {
+    /// The arming is finished: its move was made or refused, or the record
+    /// moved on.
+    Ended,
+    /// Its setter may no longer read the record, and its move was not made.
+    /// The arming is finished, and its row is kept (`spawn_state_timer`).
+    Withheld,
+    /// The fire did not land; it is tried again after `wait`.
+    Retry { wait: Duration, reason: String },
 }

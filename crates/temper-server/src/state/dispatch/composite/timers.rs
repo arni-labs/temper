@@ -40,7 +40,10 @@ impl TimedTransition<'_> {
 /// The agent a composite sub-write runs as: the composite's caller, under the
 /// sub-write's own idempotency key. Both the atomic batch and the per-write
 /// fallback use it, so a sub-write's timers fire as the same identity on
-/// either path.
+/// either path. Whether the caller could read a record is about that record
+/// alone (`timer_standing`), so the composite's answer is dropped: the
+/// per-write fallback asks again for its own record, and the atomic batch's
+/// timers fire as before.
 pub(super) fn composite_sub_write_agent(
     composite_agent_ctx: &AgentContext,
     write: &PreparedCompositeSubWrite,
@@ -49,6 +52,8 @@ pub(super) fn composite_sub_write_agent(
     agent.idempotency_key = Some(crate::idempotency::IdempotencyKey::Request(
         write.idempotency_key.clone(),
     ));
+    agent.read_when_set = None;
+    agent.read_when_set_for = None;
     agent
 }
 

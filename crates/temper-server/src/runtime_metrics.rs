@@ -37,6 +37,8 @@ struct RuntimeMetrics {
     reaction_withheld_total: Counter<u64>,
     state_timeout_cancelled_total: Counter<u64>,
     state_timeout_reset_total: Counter<u64>,
+    // A timer acts with its setter's current standing.
+    timer_fire_withheld_total: Counter<u64>,
     scheduler_overdue_on_replay_total: Counter<u64>,
     scheduler_pending_timers: Gauge<u64>,
     // ADR-0056: re-arm on actor hydration.
@@ -186,6 +188,13 @@ fn metrics() -> &'static RuntimeMetrics {
             state_timeout_reset_total: meter
                 .u64_counter("temper_state_timeout_reset_total")
                 .with_description("ADR-0049: timers re-armed via reset_on.")
+                .build(),
+            timer_fire_withheld_total: meter
+                .u64_counter("temper_timer_fire_withheld_total")
+                .with_description(
+                    "Timer fires whose move was not made because the timer's setter may no \
+                     longer read the record.",
+                )
                 .build(),
             scheduler_overdue_on_replay_total: meter
                 .u64_counter("temper_scheduler_overdue_on_replay_total")
@@ -696,6 +705,19 @@ pub fn record_state_timeout_reset(
             KeyValue::new("entity_type", entity_type.to_string()),
             KeyValue::new("state", state.to_string()),
             KeyValue::new("reset_action", reset_action.to_string()),
+        ],
+    );
+}
+
+/// Record a timer fire, a state timer's or a scheduled action's, whose move
+/// was not made because its setter may no longer read the record.
+pub fn record_timer_fire_withheld(tenant: &str, entity_type: &str, action: &str) {
+    metrics().timer_fire_withheld_total.add(
+        1,
+        &[
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("entity_type", entity_type.to_string()),
+            KeyValue::new("action", action.to_string()),
         ],
     );
 }

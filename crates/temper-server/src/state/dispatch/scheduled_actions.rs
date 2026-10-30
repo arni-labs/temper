@@ -26,6 +26,8 @@
 //! such as a caller who cannot make the move: every try would be answered
 //! the same, so it is logged once and its row removed, not retried.
 
+mod recovery;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -39,6 +41,7 @@ use tracing::Instrument;
 use super::effects::PostDispatchContext;
 use super::owed_writes::{FIRST_RETRY_WAIT, LAST_RETRY_WAIT};
 use super::state_timer_follow::BootTimers;
+use super::timer_standing::{Standing, TimerFire};
 use super::{DispatchError, DispatchExtOptions};
 use crate::entity_actor::EntityResponse;
 use crate::request_context::armed_by::decode_armed_by;
@@ -206,66 +209,6 @@ impl ServerState {
         Ok(())
     }
 
-    /// Arm the rows `timer`'s fire committed, after a retried fire. A fire
-    /// whose answer was lost commits its successors' rows, but the duplicate
-    /// that answers its retry hands back no schedules. Only the fire's own
-    /// rows are armed: any other row of the record belongs to a dispatch that
-    /// arms it itself, after its integrations. Err: the journal or the rows
-    /// could not be read, and nothing was armed.
-    async fn arm_fired_rows(&self, timer: &ScheduledTimer, key: &str) -> Result<(), String> {
-        let Some((store, _)) = self.event_journal() else {
-            return Ok(());
-        };
-        // The fire's event comes after the event that armed it.
-        let armed_seq = timer
-            .arm_id
-            .split_once('.')
-            .and_then(|(seq, _)| seq.parse::<u64>().ok())
-            .unwrap_or(0);
-        let persistence_id = format!("{}:{}:{}", timer.tenant, timer.entity_type, timer.entity_id);
-        let events = store
-            .read_events(&persistence_id, armed_seq.saturating_sub(1))
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(fire_seq) = events
-            .iter()
-            .find(|event| event.payload["idempotency_key"].as_str() == Some(key))
-            .map(|event| event.sequence_nr)
-        else {
-            return Ok(());
-        };
-        let rows = store
-            .list_scheduled_actions(timer.tenant.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let prefix = format!("{fire_seq}.");
-        let fired = rows.iter().filter(|row| {
-            row.entity_type == timer.entity_type
-                && row.entity_id == timer.entity_id
-                && row.arm_id.starts_with(&prefix)
-        });
-        for row in fired {
-            if let Ok(waiting) = scheduled_timer(&timer.tenant, row) {
-                self.spawn_scheduled_action(waiting, None);
-            }
-        }
-        Ok(())
-    }
-
-    /// [`Self::arm_fired_rows`] until the rows can be read, waiting longer
-    /// after each failure: until then the fire's successors have no timer.
-    async fn arm_fired_rows_retrying(&self, timer: &ScheduledTimer, key: &str) {
-        let mut wait = FIRST_RETRY_WAIT;
-        while let Err(error) = self.arm_fired_rows(timer, key).await {
-            tracing::error!(tenant = %timer.tenant, entity_type = %timer.entity_type,
-                entity_id = %timer.entity_id, arm_id = %timer.arm_id, %error,
-                retry_in_ms = wait.as_millis() as u64,
-                "rows of a retried scheduled fire not readable; retrying");
-            tokio::time::sleep(wait).await; // determinism-ok: retry backoff
-            wait = (wait * 2).min(LAST_RETRY_WAIT);
-        }
-    }
-
     /// Arm `timer` to fire when it is due by the wall clock, unless this
     /// process has armed its row already.
     fn spawn_scheduled_action(&self, timer: ScheduledTimer, gate: Option<Arc<Semaphore>>) {
@@ -324,8 +267,10 @@ impl ServerState {
     /// Fire `timer` until its action commits, is refused or fails with an
     /// error no retry can change, each attempt through `gate` when one is
     /// given. A refusal or such an error is logged and its row removed; a
-    /// commit removed the row itself. Between tries it is due again when it
-    /// next tries, by the wall clock.
+    /// commit removed the row itself. A fire whose setter may no longer read
+    /// the record is refused the same way (`timer_standing`): nothing arms a
+    /// scheduled action again without its row. Between tries it is due again
+    /// when it next tries, by the wall clock.
     async fn fire_scheduled_action(
         &self,
         timer: &ScheduledTimer,
@@ -343,26 +288,74 @@ impl ServerState {
         super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;
         let mut retried = false;
+        // The last attempt's caller, with the answer the timers its move sets
+        // keep (`timer_standing`), taken before that attempt.
+        let mut answered: Option<AgentContext> = None;
         loop {
+            // Recover a move that already committed before asking whether
+            // another attempt may run. Its successors are owed even if that
+            // move itself changed the standing that allowed its setter to read.
+            let committed = retried && self.arm_fired_rows_retrying(timer, key.as_str()).await;
+            // A committed fire still needs the normal post-dispatch pipeline:
+            // its state timer, status cache and query projection may be owed.
+            // Dispatch with the same key recovers the actor's duplicate reply
+            // and completes those effects, without authorizing another move.
+            // Its timers keep the answer of the attempt that committed it,
+            // the last one: the record it would be asked of now is the one
+            // its move made.
             let outcome = {
                 let _permit = match &gate {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),
                     None => None,
                 };
-                let options = DispatchExtOptions {
-                    agent_ctx: &agent,
-                    await_integration: false,
-                    await_reactions: true,
+                let fire = TimerFire {
+                    tenant: &timer.tenant,
+                    entity_type: &timer.entity_type,
+                    entity_id: &timer.entity_id,
+                    action: &timer.action,
                 };
-                self.dispatch_tenant_action_ext_typed(
-                    &timer.tenant,
-                    &timer.entity_type,
-                    &timer.entity_id,
-                    &timer.action,
-                    serde_json::json!({}),
-                    options,
-                )
-                .await
+                let standing = if committed {
+                    Ok(Standing::Holds)
+                } else {
+                    self.timer_setter_standing(&agent, &fire).await
+                };
+                let caller = match (standing, answered.take()) {
+                    (Ok(Standing::Holds), Some(caller)) if committed => Ok(caller),
+                    (Ok(Standing::Holds), _) => {
+                        self.with_read_when_set(
+                            &timer.tenant,
+                            &timer.entity_type,
+                            &timer.entity_id,
+                            &timer.action,
+                            agent.clone(),
+                        )
+                        .await
+                    }
+                    (Ok(Standing::Lost { reason }), _) => Err(DispatchError::AuthzDenied(reason)),
+                    (Err(error), _) => Err(error),
+                };
+                match caller {
+                    Ok(caller) => {
+                        let options = DispatchExtOptions {
+                            agent_ctx: &caller,
+                            await_integration: false,
+                            await_reactions: true,
+                        };
+                        let outcome = self
+                            .dispatch_tenant_action_ext_typed(
+                                &timer.tenant,
+                                &timer.entity_type,
+                                &timer.entity_id,
+                                &timer.action,
+                                serde_json::json!({}),
+                                options,
+                            )
+                            .await;
+                        answered = Some(caller);
+                        outcome
+                    }
+                    Err(error) => Err(error),
+                }
             };
             let (error, is_final) = match outcome {
                 Ok(response) if response.success => {

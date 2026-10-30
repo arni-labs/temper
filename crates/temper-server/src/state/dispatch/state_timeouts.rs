@@ -235,6 +235,20 @@ impl StateTimeoutTracker {
         Some(entry.seq)
     }
 
+    /// Release an ended task's live arm without losing its journal fence or
+    /// boot gate. A replacement, even for the same durable arm, owns its own
+    /// cancellation value and must remain armed.
+    pub(super) fn release(&self, timer: &ArmedTimer, armed_seq: u64) {
+        let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
+        let mut map = self.seqs.lock().expect("state_timeout tracker poisoned");
+        if let Some(entry) = map.get_mut(&key)
+            && entry.seq == armed_seq
+        {
+            entry.seq += 1;
+            entry.armed = None;
+        }
+    }
+
     fn boot_gate(&self, key: &EntityKey) -> Option<Arc<Semaphore>> {
         self.seqs
             .lock()
@@ -1110,6 +1124,39 @@ mod tests {
             "a record found in another state gets that state's timer"
         );
         assert_eq!(t.armed(&k).map(|armed| armed.state), Some("B".to_string()));
+    }
+
+    #[test]
+    fn releasing_an_ended_task_preserves_newer_arms_and_the_journal_fence() {
+        let tracker = StateTimeoutTracker::new();
+        let k = key();
+        let original = timer("A", 5);
+        let first = tracker.reserve(&original, Reservation::Committed).unwrap();
+        tracker.release(&original, first);
+        assert!(!tracker.has_armed(&k), "the ended task is no longer live");
+        assert_eq!(
+            tracker.reserve(&timer("A", 4), Reservation::Fresh),
+            None,
+            "release must retain the journal fence"
+        );
+
+        let rearmed = tracker.reserve(&original, Reservation::Committed).unwrap();
+        tracker.release(&original, first);
+        assert_eq!(tracker.current(&k), rearmed);
+        assert!(
+            tracker.has_armed(&k),
+            "a new task for the same row stays armed"
+        );
+
+        let newer = timer("B", 6);
+        let replaced = tracker.reserve(&newer, Reservation::Fresh).unwrap();
+        tracker.release(&original, rearmed);
+        assert_eq!(tracker.current(&k), replaced);
+        assert_eq!(
+            tracker.armed(&k).unwrap().arm_id,
+            newer.arm_id,
+            "a newer transition's arm stays armed"
+        );
     }
 
     #[test]

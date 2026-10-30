@@ -109,6 +109,19 @@ pub struct AgentContext {
     /// this dispatch fires: the actor applies its action only while the
     /// record's journal is at the sequence the timer was armed at.
     pub fires_state_timer: Option<StateTimerFire>,
+    /// Runtime-owned; never populated from request headers. Whether this
+    /// caller could read the record when their move set its timers, as Cedar
+    /// answered then; the timers the move sets keep it. A fire is withheld
+    /// only when it is `Some(true)` and the setter can no longer read the
+    /// record (`timer_standing`). None when not asked: the move sets no
+    /// timer, names no caller, or was made before timers kept this.
+    pub read_when_set: Option<bool>,
+    /// Runtime-owned; never populated from request headers. The move
+    /// [`Self::read_when_set`] was answered for: its record, action and
+    /// idempotency key. Another dispatch of that move keeps the answer, so a
+    /// committed move recovered after its reply was lost keeps the answer
+    /// taken before it (`timer_standing`).
+    pub read_when_set_for: Option<String>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -117,7 +130,28 @@ pub struct AgentContext {
     pub observation_metadata: BTreeMap<String, String>,
 }
 
+/// Whether `context` names a caller: a principal a credential stands for. The
+/// kernel's own identities act for no one: an empty or anonymous id, a System
+/// principal, or a service the kernel names ([`AgentContext::for_service`],
+/// role "service").
+pub(crate) fn names_a_caller(context: &SecurityContext) -> bool {
+    let principal = &context.principal;
+    !(principal.id.is_empty()
+        || principal.id == "anonymous"
+        || principal.kind == temper_authz::PrincipalKind::System
+        || principal.role.as_deref() == Some("service"))
+}
+
 impl AgentContext {
+    /// The security context of the caller this context acts as, when it
+    /// names one ([`names_a_caller`]); None for a context without one and for
+    /// the kernel's own identities.
+    pub(crate) fn caller(&self) -> Option<&SecurityContext> {
+        self.security_ctx
+            .as_ref()
+            .filter(|context| names_a_caller(context))
+    }
+
     /// The sequence this dispatch's state timer was armed at, when the
     /// dispatch fires `action` on this record. A child dispatch that inherits
     /// the context, on another record or with another action, is not the fire.
@@ -198,6 +232,8 @@ impl AgentContext {
             idempotency_key: None,
             fires_scheduled_action: None,
             fires_state_timer: None,
+            read_when_set: None,
+            read_when_set_for: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -237,6 +273,8 @@ impl AgentContext {
             idempotency_key: None,
             fires_scheduled_action: None,
             fires_state_timer: None,
+            read_when_set: None,
+            read_when_set_for: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -375,6 +413,8 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         idempotency_key,
         fires_scheduled_action: None,
         fires_state_timer: None,
+        read_when_set: None,
+        read_when_set_for: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }

@@ -1,10 +1,13 @@
 //! The cause a timer's fire carries.
 //!
-//! A timer fires as whoever armed it, and its own move is not checked by
-//! Cedar: the arming move already passed Cedar to enter the timed state, and
-//! the timer is that state's own consequence in the spec. The moves its move
-//! sets off are checked, and they inherit this cause, so Cedar sees them as
-//! `via == "timer"`, armed by the timer's principal.
+//! A timer fires as whoever armed it, and Cedar is not asked about its own
+//! move: the arming move already passed Cedar to enter the timed state, and
+//! the timer is that state's own consequence in the spec. Cedar is asked,
+//! under this cause, whether the one who armed it has lost their standing on
+//! the record since (`timer_standing`). The moves its move sets off are
+//! checked, and they
+//! inherit this cause, so Cedar sees them as `via == "timer"`, armed by the
+//! timer's principal.
 
 use temper_authz::{MoveCause, TimerArm};
 
