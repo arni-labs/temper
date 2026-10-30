@@ -184,8 +184,12 @@ impl crate::state::ServerState {
                             Err(refusal) => {
                                 state
                                     .refuse_spawn(
-                                        &t, &parent_t, &parent_i, req,
-                                        &refusal.action, &refusal.error,
+                                        &t,
+                                        &parent_t,
+                                        &parent_i,
+                                        req,
+                                        &refusal.action,
+                                        &refusal.error,
                                     )
                                     .await;
                                 continue;
@@ -221,14 +225,20 @@ impl crate::state::ServerState {
                             match agent.inline_chain.then(step) {
                                 Ok(chain) => agent.inline_chain = chain,
                                 Err(repeat) => {
-                                    state.refuse_spawn(
-                                        &t, &parent_t, &parent_i, req, action,
-                                        &format!(
-                                            "spawned {child_type} not made: its initial action \
+                                    state
+                                        .refuse_spawn(
+                                            &t,
+                                            &parent_t,
+                                            &parent_i,
+                                            req,
+                                            action,
+                                            &format!(
+                                                "spawned {child_type} not made: its initial action \
                                          would repeat a step its chain is already in \
                                          ({repeat}), so the chain is a loop"
-                                        ),
-                                    ).await;
+                                            ),
+                                        )
+                                        .await;
                                     continue;
                                 }
                             }

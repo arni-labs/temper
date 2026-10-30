@@ -17,7 +17,7 @@ use super::effects::PostDispatchContext;
 use crate::entity_actor::EntityResponse;
 use crate::entity_actor::effects::entity_authorization_precondition;
 use crate::state::ServerState;
-use crate::state::write_record::{ActionPreview, WriteCaller};
+use crate::state::write_record::{ActionPreview, ActionRecordError, WriteCaller};
 
 impl ServerState {
     /// Check the record an outside action will store, before it is sent to
@@ -66,11 +66,16 @@ impl ServerState {
             related,
             agent_ctx,
         };
-        if let Err(violation) = self.check_action_record(caller, tenant, preview).await {
-            return Ok(Some(
-                self.refuse_before_actor(ctx, current, violation.message)
-                    .await,
-            ));
+        if let Err(error) = self.check_action_record(caller, tenant, preview).await {
+            let mut current = current;
+            let message = match error {
+                ActionRecordError::Constraint(violation) => violation.message,
+                ActionRecordError::Preview(result) => {
+                    current.refusal = result.refusal;
+                    result.error.expect("a refused preview carries its reason")
+                }
+            };
+            return Ok(Some(self.refuse_before_actor(ctx, current, message).await));
         }
         held_to.get_or_insert_with(|| entity_authorization_precondition(&current.state));
         Ok(None)

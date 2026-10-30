@@ -1,6 +1,7 @@
 //! Related records are read through their configured runtime, independently
 //! of the runtime that will store the action's result.
 use super::*;
+use temper_runtime::scheduler::{install_deterministic_context, sim_uuid};
 
 const RELATED_CSDL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
@@ -71,6 +72,12 @@ async fn cross_invariant_field_uses_the_targets_runtime() {
 }
 
 async fn check_targets(relation: bool, invariant: Option<(&str, &str)>) {
+    let seed = match invariant {
+        None => 86,
+        Some(("status", _)) => 87,
+        Some(_) => 88,
+    };
+    let _sim = install_deterministic_context(seed);
     let (pool, _container) = pool().await;
     let actors = Arc::new(ActorSystem::new(pool.clone(), SchedulerConfig::default()));
     for spec in [ORDER_SPEC, TARGET_SPEC] {
@@ -87,8 +94,8 @@ async fn check_targets(relation: bool, invariant: Option<(&str, &str)>) {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = Client::new();
-        let id = uuid::Uuid::new_v4().to_string();
-        let target_id = uuid::Uuid::new_v4().to_string();
+        let id = sim_uuid().to_string();
+        let target_id = sim_uuid().to_string();
         let handle = ActorHandle::new(format!("default/{id}"), "Order");
         spawn_record(&state, &actors, "Order", &id, source_pg, json!({})).await;
         spawn_record(
@@ -134,7 +141,7 @@ async fn check_targets(relation: bool, invariant: Option<(&str, &str)>) {
         };
         let action_url = format!("{base}/tdata/Orders('{id}')/Temper.Submit");
         // Missing targets are refused before anything is queued or changed.
-        let missing = uuid::Uuid::new_v4().to_string();
+        let missing = sim_uuid().to_string();
         // A record in another tenant must not satisfy the reference.
         actors
             .spawn_with_fields(
@@ -341,7 +348,7 @@ impl PendingAction<'_> {
     }
 
     async fn reject_invalid(&self, target_pg: bool, field: &str) {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = sim_uuid().to_string();
         spawn_record(
             self.state,
             self.actors,

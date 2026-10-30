@@ -373,3 +373,6 @@ async fn an_unrelated_patch_checks_all_65_healthy_stored_values() {
     );
     assert_eq!(stored(&state, "many").await.1["Label"], "checked");
 }
+
+#[path = "stored_record_overflow/preview_failure.rs"]
+mod preview_failure;
