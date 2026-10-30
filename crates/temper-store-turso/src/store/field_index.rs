@@ -506,10 +506,13 @@ impl TursoEventStore {
         let field_placeholders = std::iter::repeat_n("?", requested_fields.len())
             .collect::<Vec<_>>()
             .join(", ");
+        // Each record's field rows are found by its key: the engine otherwise
+        // searches `idx_efi_status` by tenant and type, reading every field
+        // row of the type for each record (`driver/plan_check.rs`).
         let sql = format!(
             "SELECT c.entity_id, c.status, f.field_name, f.field_value \
              FROM entity_catalog c \
-             LEFT JOIN entity_field_index f \
+             LEFT JOIN entity_field_index f INDEXED BY sqlite_autoindex_entity_field_index_1 \
                ON c.tenant = f.tenant \
               AND c.entity_type = f.entity_type \
               AND c.entity_id = f.entity_id \

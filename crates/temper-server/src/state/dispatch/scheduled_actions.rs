@@ -120,6 +120,7 @@ impl ServerState {
     /// count them per tenant and type into `counts`. A row that cannot be
     /// read is removed: it can never fire. A tenant whose rows cannot be
     /// listed is tried again in the background until they can.
+    #[tracing::instrument(skip_all, fields(otel.name = "boot.scheduled_actions"))]
     pub(super) async fn rearm_scheduled_actions(
         &self,
         gate: &Arc<Semaphore>,
