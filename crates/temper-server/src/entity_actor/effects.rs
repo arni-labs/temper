@@ -437,6 +437,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 timestamp: sim_now(),
                 params: params.clone(),
                 idempotency_key: None,
+                origin: crate::entity_actor::EventOrigin::internal(),
                 kind: temper_runtime::persistence::EventKind::Transition,
                 outcome: Some(outcome),
             };
@@ -1361,6 +1362,7 @@ to = "Refreshing"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1391,6 +1393,7 @@ to = "Refreshing"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         }
@@ -1488,6 +1491,7 @@ to = "Closed"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1535,6 +1539,7 @@ to = "Closed"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1585,6 +1590,7 @@ effect = ["spawn('TestWorkflow', 'Start', test_wf_id)"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1644,6 +1650,7 @@ guard = "empty(test_wf_id) || TestWorkflow[test_wf_id].status in ['Passed']"
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1712,6 +1719,7 @@ guard = "(empty(attachment_a_id) || Attachment[attachment_a_id].status in ['Read
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1776,6 +1784,7 @@ from = ["Active"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1840,6 +1849,7 @@ from = ["Active"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1895,6 +1905,7 @@ from = ["Active"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1945,6 +1956,7 @@ effect = ["size_bytes = params.payload_size"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };
@@ -1981,6 +1993,7 @@ effect = ["size_bytes = params.payload_size"]
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: std::collections::BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         }

@@ -175,6 +175,7 @@ mod tests {
             last_snapshot_sequence_nr: 0,
             sequence_nr,
             processed_idempotency_keys: Default::default(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         };

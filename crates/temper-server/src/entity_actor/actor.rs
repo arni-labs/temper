@@ -312,6 +312,7 @@ impl EntityActor {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         }
@@ -982,6 +983,7 @@ impl EntityActor {
                                 timestamp: env.metadata.timestamp,
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
+                                origin: Default::default(),
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
                                 outcome: None,
                             },
@@ -1398,6 +1400,7 @@ impl Actor for EntityActor {
                 timestamp: sim_now(),
                 params: initial_params,
                 idempotency_key: None,
+                origin: super::EventOrigin::from_caller(self.created_by.as_ref()),
                 kind: temper_runtime::persistence::EventKind::Transition,
                 outcome: None,
             };
@@ -1724,6 +1727,7 @@ impl EntityActor {
                         .clone()
                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                     event.idempotency_key = idempotency_key.clone();
+                    event.origin = super::EventOrigin::from_caller(caller.as_deref());
 
                     // An event too large to be written stores no overflow blobs first.
                     if !result.overflow_blobs.is_empty()
@@ -1978,6 +1982,8 @@ impl EntityActor {
                                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                                     let mut retry_event = retry_event;
                                     retry_event.idempotency_key = idempotency_key.clone();
+                                    retry_event.origin =
+                                        super::EventOrigin::from_caller(caller.as_deref());
 
                                     // Overflow blobs for the re-evaluated result.
                                     if !retry_result.overflow_blobs.is_empty()
@@ -2289,6 +2295,7 @@ impl EntityActor {
                 ctx.reply(value);
             }
             EntityMsg::UpdateFields {
+                caller,
                 fields,
                 replace,
                 expected_precondition,
@@ -2313,6 +2320,7 @@ impl EntityActor {
                     fields,
                     replace,
                     expected_precondition.is_some(),
+                    caller.as_deref(),
                 )
                 .await;
                 ctx.reply(match outcome {
@@ -2360,6 +2368,7 @@ impl EntityActor {
             }
 
             EntityMsg::Delete {
+                caller,
                 expected_authorization_precondition,
             } => {
                 if self
@@ -2407,7 +2416,8 @@ impl EntityActor {
                     });
                     return Ok(());
                 }
-                let deleted = EntityEvent::tombstone(state.status.clone());
+                let mut deleted = EntityEvent::tombstone(state.status.clone());
+                deleted.origin = super::EventOrigin::from_caller(caller.as_deref());
 
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)

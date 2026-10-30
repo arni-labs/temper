@@ -1431,6 +1431,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: fields,
             idempotency_key: None,
+            origin: Default::default(),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         };
@@ -1624,6 +1625,25 @@ impl ServerState {
         entity_id: &str,
         initial_fields: serde_json::Value,
     ) -> Result<Option<EntityResponse>, String> {
+        self.try_create_data_only_tenant_entity_by(
+            tenant,
+            entity_type,
+            entity_id,
+            initial_fields,
+            None,
+        )
+        .await
+    }
+
+    /// The data-only creation path, carrying the authenticated creator.
+    pub(crate) async fn try_create_data_only_tenant_entity_by(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: serde_json::Value,
+        created_by: Option<&crate::request_context::AgentContext>,
+    ) -> Result<Option<EntityResponse>, String> {
         if !initial_fields.is_object() {
             return Ok(None);
         }
@@ -1672,6 +1692,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: initial_fields,
             idempotency_key: None,
+            origin: crate::entity_actor::EventOrigin::from_caller(created_by),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         };
@@ -1915,6 +1936,7 @@ impl ServerState {
                 fields,
                 replace,
                 None,
+                None,
             )
             .await?;
         if response.success {
@@ -1938,6 +1960,7 @@ impl ServerState {
         fields: serde_json::Value,
         replace: bool,
         expected_precondition: String,
+        caller: &crate::request_context::AgentContext,
     ) -> Result<EntityResponse, String> {
         self.update_tenant_entity_fields_checked(
             tenant,
@@ -1946,6 +1969,7 @@ impl ServerState {
             fields,
             replace,
             Some(expected_precondition),
+            Some(caller),
         )
         .await
     }
@@ -1958,6 +1982,7 @@ impl ServerState {
         fields: serde_json::Value,
         replace: bool,
         expected_precondition: Option<String>,
+        caller: Option<&crate::request_context::AgentContext>,
     ) -> Result<EntityResponse, String> {
         if !fields.is_object() {
             return Err("entity field update must be a JSON object".to_string());
@@ -1980,6 +2005,7 @@ impl ServerState {
         let response = retry::ask_with_backoff::<_, EntityResponse, _>(
             &actor_ref,
             || EntityMsg::UpdateFields {
+                caller: caller.cloned().map(Arc::new),
                 fields: fields_for_retry.clone(),
                 replace,
                 expected_precondition: precondition_for_retry.clone(),
@@ -2117,7 +2143,7 @@ impl ServerState {
         entity_id: &str,
     ) -> Result<EntityResponse, String> {
         let response = self
-            .delete_tenant_entity_checked(tenant, entity_type, entity_id, None)
+            .delete_tenant_entity_checked(tenant, entity_type, entity_id, None, None)
             .await?;
         if response.success {
             Ok(response)
@@ -2136,12 +2162,14 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         expected_authorization_precondition: String,
+        caller: &crate::request_context::AgentContext,
     ) -> Result<EntityResponse, String> {
         self.delete_tenant_entity_checked(
             tenant,
             entity_type,
             entity_id,
             Some(expected_authorization_precondition),
+            Some(caller),
         )
         .await
     }
@@ -2152,6 +2180,7 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
         expected_authorization_precondition: Option<String>,
+        caller: Option<&crate::request_context::AgentContext>,
     ) -> Result<EntityResponse, String> {
         let actor_ref = self
             .get_or_spawn_tenant_actor(tenant, entity_type, entity_id)
@@ -2167,6 +2196,7 @@ impl ServerState {
         let response = retry::ask_with_backoff::<_, EntityResponse, _>(
             &actor_ref,
             || EntityMsg::Delete {
+                caller: caller.cloned().map(Arc::new),
                 expected_authorization_precondition: precondition_for_retry.clone(),
             },
             &policy,

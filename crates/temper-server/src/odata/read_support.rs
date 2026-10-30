@@ -54,6 +54,10 @@ fn catalog_row_to_entity_body(
             .or_insert(serde_json::json!({}));
         obj.entry("lists".to_string())
             .or_insert(serde_json::json!({}));
+        for property in ["last_event_at", "last_event_via", "last_event_by"] {
+            obj.entry(property.to_string())
+                .or_insert(serde_json::Value::Null);
+        }
         obj.insert("events".to_string(), serde_json::json!([]));
         obj.entry("total_event_count".to_string())
             .or_insert(serde_json::json!(row.sequence_nr));
@@ -80,6 +84,9 @@ fn catalog_row_to_entity_body(
         "events": [],
         "total_event_count": row.sequence_nr,
         "sequence_nr": row.sequence_nr,
+        "last_event_at": null,
+        "last_event_via": null,
+        "last_event_by": null,
         "@odata.id": format!("{entity_set_name}('{id}')"),
     })
 }

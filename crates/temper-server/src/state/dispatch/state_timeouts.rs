@@ -1192,6 +1192,7 @@ mod tests {
             timestamp: ts,
             params: serde_json::json!({}),
             idempotency_key: None,
+            origin: Default::default(),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         }

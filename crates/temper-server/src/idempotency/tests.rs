@@ -38,6 +38,7 @@ fn make_response(status: &str) -> EntityResponse {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         },
@@ -65,6 +66,7 @@ fn busy_response(field_bytes: usize) -> EntityResponse {
             timestamp: sim_now(),
             params: serde_json::json!({ "queue": "q".repeat(field_bytes) }),
             idempotency_key: Some(format!("dispatch:{index}")),
+            origin: Default::default(),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         });
@@ -404,6 +406,7 @@ fn keyed_events(state: &mut EntityState, keys: &[&str]) {
             timestamp: sim_now(),
             params: serde_json::Value::Null,
             idempotency_key: Some((*key).to_string()),
+            origin: Default::default(),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         });

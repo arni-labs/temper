@@ -34,6 +34,13 @@ fn native_order_by(request: &QueryPlaneReadRequest<'_>) -> Option<Vec<QueryField
 }
 
 fn native_order_property_is_lossless(request: &QueryPlaneReadRequest<'_>, property: &str) -> bool {
+    // Kernel event metadata is in the catalog state, never the app field index.
+    if matches!(
+        property,
+        "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
+        return false;
+    }
     if matches!(property, "entity_id" | "Id" | "id" | "Status" | "status") {
         return true;
     }

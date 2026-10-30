@@ -266,6 +266,12 @@ fn translate_comparison(
         _ => return None, // cross-field or complex expressions
     };
 
+    if matches!(
+        field_name.as_str(),
+        "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
+        return None;
+    }
     let sql_op = match op {
         BinaryOperator::Eq => "=",
         BinaryOperator::Ne => "!=",
@@ -400,6 +406,12 @@ fn translate_function(name: &str, args: &[FilterExpr], ctx: &mut TranslateCtx) -
                 FilterExpr::Property(name) => name.clone(),
                 _ => return None,
             };
+            if matches!(
+                field_name.as_str(),
+                "last_event_at" | "last_event_via" | "last_event_by"
+            ) {
+                return None;
+            }
             let search_value = match &args[1] {
                 FilterExpr::Literal(ODataValue::String(s)) => s.clone(),
                 _ => return None,

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use temper_runtime::actor::Message;
 
 pub use super::effect_outcome::EffectOutcome;
+use super::{EventOrigin, LastEvent};
 
 // Runtime resource budgets. Domain counter constraints belong to the spec.
 
@@ -61,6 +62,8 @@ pub enum EntityMsg {
     GetField { field: String },
     /// Update entity fields (PATCH: merge, PUT: replace).
     UpdateFields {
+        /// Kernel dispatch context; never populated from field values.
+        caller: Option<std::sync::Arc<crate::request_context::AgentContext>>,
         fields: serde_json::Value,
         replace: bool,
         /// Digest of the exact state used for an external authorization
@@ -77,6 +80,8 @@ pub enum EntityMsg {
     },
     /// Delete this entity.
     Delete {
+        /// Kernel dispatch context; never populated from field values.
+        caller: Option<std::sync::Arc<crate::request_context::AgentContext>>,
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
@@ -138,6 +143,9 @@ pub struct EntityState {
     /// Kept in snapshots, which leave `events` out.
     #[serde(default)]
     pub status_clock: StatusClock,
+    /// Newest event's time and provenance, independent of bounded history.
+    #[serde(default, flatten)]
+    pub last_event: LastEvent,
 }
 
 /// A durable idempotency key: when it was recorded and the action it was for.
@@ -224,6 +232,7 @@ impl EntityState {
             self.record_processed_idempotency_key(key, &event.action);
         }
         self.status_clock.record(&event);
+        self.last_event.record(&event);
         self.events.push_back(event);
 
         let budget = recent_events_budget();
@@ -281,6 +290,9 @@ pub struct EntityEvent {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Parameters passed with the action.
     pub params: serde_json::Value,
+    /// Kernel-captured immediate source and authenticated request subject.
+    #[serde(default, flatten)]
+    pub origin: EventOrigin,
     /// Optional idempotency key that caused this transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
@@ -306,6 +318,7 @@ impl EntityEvent {
             timestamp: temper_runtime::scheduler::sim_now(),
             params: serde_json::json!({}),
             idempotency_key: None,
+            origin: crate::entity_actor::EventOrigin::internal(),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         }
