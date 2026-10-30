@@ -194,8 +194,8 @@ fn a_move_with_too_many_parameter_choices_fails_its_check_instead_of_panicking()
 
 #[test]
 fn a_huge_counter_bound_is_counted_not_built() {
-    // `x = 1000000000` raises the bound every count parameter is explored up
-    // to: building those choices would allocate a billion values.
+    // `x = 1000000000` raises the bound for parameters whose effects use x:
+    // building those choices would allocate a billion values.
     let spec = r#"
 [automaton]
 name = "Big"

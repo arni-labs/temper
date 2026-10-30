@@ -230,13 +230,12 @@ pub fn step(
 /// ([`MAX_PARAM_ASSIGNMENTS`]), and how many it has. Stepping it would stop
 /// at the assertion in `param_assignments`, so a caller asks this first.
 pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
-    let bound = count_bound(model);
     model.transitions.iter().find_map(|t| {
-        // Counted, not built: a counter set to a large literal raises the
+        // Counted, not built: a parameter can write a counter with a large
         // bound, and building its candidates would allocate that many.
         let assignments = t.params.iter().fold(1usize, |n, (name, kind)| {
             let choices = match kind {
-                ParamKind::Count => bound.saturating_add(1),
+                ParamKind::Count => count_bound(model, t, name).saturating_add(1),
                 ParamKind::Bool => 2,
                 ParamKind::Str => string_literals(model, t, name).len() + 1,
             };
@@ -246,15 +245,29 @@ pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
     })
 }
 
-/// The largest value a count parameter is explored up to.
-fn count_bound(model: &TemperModel) -> usize {
-    model
-        .counter_bounds
-        .values()
-        .copied()
+/// The largest value needed by the effects that read this count parameter.
+/// Unrelated counters do not expand its domain. A shared parameter covers all
+/// its target counters and list indexes, including one out-of-range no-op.
+fn count_bound(model: &TemperModel, t: &ResolvedTransition, name: &str) -> usize {
+    t.effects
+        .iter()
+        .filter_map(|effect| {
+            let (arg, bound) = match effect {
+                ModelEffect::SetCounter { var, value }
+                | ModelEffect::AddCounter { var, value }
+                | ModelEffect::SubCounter { var, value } => (value, counter_bound(model, var)),
+                ModelEffect::ListRemoveAt { var, index } => (
+                    index,
+                    model
+                        .default_max_counter
+                        .max(model.initial_lists.get(var).map_or(0, Vec::len)),
+                ),
+                _ => return None,
+            };
+            matches!(arg, Arg::Param(p) if p == name).then_some(bound)
+        })
         .max()
-        .unwrap_or(0)
-        .max(model.default_max_counter)
+        .unwrap_or(model.default_max_counter)
 }
 
 /// The values explored for one parameter of `t`.
@@ -263,10 +276,11 @@ fn param_candidates(
     t: &ResolvedTransition,
     name: &str,
     kind: &ParamKind,
-    count_bound: usize,
 ) -> Vec<ParamValue> {
     match kind {
-        ParamKind::Count => (0..=count_bound).map(ParamValue::Count).collect(),
+        ParamKind::Count => (0..=count_bound(model, t, name))
+            .map(ParamValue::Count)
+            .collect(),
         ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
         ParamKind::Str => string_literals(model, t, name)
             .into_iter()
@@ -299,10 +313,9 @@ fn param_assignments(
     model: &TemperModel,
     t: &ResolvedTransition,
 ) -> Vec<BTreeMap<String, ParamValue>> {
-    let count_bound = count_bound(model);
     let mut assignments = vec![BTreeMap::new()];
     for (name, kind) in &t.params {
-        let candidates = param_candidates(model, t, name, kind, count_bound);
+        let candidates = param_candidates(model, t, name, kind);
         assert!(
             assignments.len() * candidates.len() <= MAX_PARAM_ASSIGNMENTS,
             "transition '{}' has more than {MAX_PARAM_ASSIGNMENTS} parameter assignments",
