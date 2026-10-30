@@ -366,3 +366,109 @@ when { resource.Status != "Taken" };
         process.kill(&world, Duration::ZERO);
     }
 }
+
+/// A client's retry under its own key, after the reply to a committed move
+/// was lost, keeps the answer the move committed with. The move itself takes
+/// away its setter's read, so asking again would answer as the record after
+/// it, and the timeout it set is withheld when it falls due.
+#[test]
+fn dst_retried_move_keeps_the_answer_it_committed_with() {
+    for seed in 0..16 {
+        let clock = Arc::new(ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        let world = world(seed, clock);
+        let process = Process::start(&world, "retried-move");
+        process.runtime.block_on(async {
+            let tenant = TenantId::new(TENANT);
+            let state = &process.state;
+            state
+                .authz
+                .reload_tenant_policies(
+                    TENANT,
+                    r#"
+permit(principal, action == Action::"Start", resource is Job);
+permit(principal, action == Action::"read", resource is Job)
+when { resource.Status != "Waiting" };
+"#,
+                )
+                .unwrap();
+            state
+                .get_or_create_tenant_entity(&tenant, "Job", "child", json!({}))
+                .await
+                .unwrap();
+            let mut caller = Setter::Stays(By::Themselves).caller("setter");
+            caller.idempotency_key = Some(temper_server::idempotency::IdempotencyKey::Request(
+                format!("client-{seed}"),
+            ));
+            world
+                .events
+                .land_next_appends_then_fail("alpha:Job:child", 1);
+            world.events.fail_next_reads("alpha:Job:child", 1);
+            let lost = state
+                .dispatch_tenant_action(&tenant, "Job", "child", "Start", json!({}), &caller)
+                .await;
+            assert!(
+                lost.as_ref().map_or(true, |answer| !answer.success),
+                "seed {seed}: the first try's answer must be lost: {lost:?}"
+            );
+            let journal = world
+                .events
+                .read_events("alpha:Job:child", 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.iter().filter(|e| e.event_type == "Start").count(),
+                1,
+                "seed {seed}: the lost answer must follow a committed Start"
+            );
+            assert!(
+                world.rows.row(TENANT, "child").is_none(),
+                "seed {seed}: the lost answer must leave the state-timer row unwritten"
+            );
+            // Some retries also have to read the record again.
+            world
+                .events
+                .fail_next_reads("alpha:Job:child", (seed % 2) as usize);
+            let mut retried = None;
+            for _ in 0..4 {
+                let answer = state
+                    .dispatch_tenant_action(&tenant, "Job", "child", "Start", json!({}), &caller)
+                    .await;
+                if answer.as_ref().is_ok_and(|answer| answer.success) {
+                    retried = Some(answer);
+                    break;
+                }
+                pass(Duration::from_secs(1)).await;
+            }
+            assert!(
+                retried.is_some(),
+                "seed {seed}: the client's retry must be answered as its committed Start"
+            );
+            let row = world.rows.row(TENANT, "child").unwrap_or_else(|| {
+                panic!("seed {seed}: the retry must write and arm the Waiting timeout")
+            });
+            let armed_by: serde_json::Value = serde_json::from_str(&row.armed_by).unwrap();
+            assert_eq!(
+                armed_by["read_when_set"], true,
+                "seed {seed}: the timeout must keep the answer Start committed with"
+            );
+            pass(WAIT + Duration::from_secs(60)).await;
+            let journal = world
+                .events
+                .read_events("alpha:Job:child", 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                journal.iter().filter(|e| e.event_type == "Start").count(),
+                1,
+                "seed {seed}: Start must commit exactly once"
+            );
+            assert_eq!(
+                journal.iter().filter(|e| e.event_type == "Expire").count(),
+                0,
+                "seed {seed}: the setter may not read the record now, so Expire is withheld"
+            );
+        });
+        process.kill(&world, Duration::ZERO);
+    }
+}
