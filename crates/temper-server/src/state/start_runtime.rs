@@ -26,7 +26,8 @@ impl ServerState {
         }
         self.spawn_runtime_metrics_loop();
         let boot = self.rearm_state_timers().await;
-        // Report once the boot's timers are armed, even when none are.
+        // Report once the boot's timers are armed, even when none are, and
+        // from now on make timers wait again by the wall clock after a resume.
         self.due_times.start();
         self.spawn_carry_stranded(self.tenants_with_carries());
         Some(boot)

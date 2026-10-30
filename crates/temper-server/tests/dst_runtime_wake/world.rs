@@ -139,7 +139,7 @@ impl Reports {
     }
 
     /// What the control plane believes: the newest report it took, by
-    /// `reported_at`, as it orders them. None: it took none.
+    /// `(reported_at, seq)`, as it orders them. None: it took none.
     pub(crate) fn told(&self) -> Option<WakeReport> {
         self.delivered
             .lock()
@@ -147,14 +147,6 @@ impl Reports {
             .iter()
             .max_by_key(|report| (report.reported_at, report.seq))
             .cloned()
-    }
-
-    /// A copy of `report` lands now, late: a request that timed out at the
-    /// process and that the control plane still took, after whatever it did
-    /// meanwhile.
-    pub(crate) fn land_late(&self, report: WakeReport) {
-        self.delivered.lock().unwrap().push(report);
-        self.changed.notify_one();
     }
 }
 

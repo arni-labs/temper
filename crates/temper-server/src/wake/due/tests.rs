@@ -1,38 +1,37 @@
 use super::*;
 
-#[tokio::test]
-async fn replaced_registration_keeps_its_completion_and_successor_deadline() {
-    let due = Arc::new(DueTimes::default());
-    let now = sim_now();
-    let key = TimerRef::State {
+fn key() -> TimerRef {
+    TimerRef::State {
         tenant: "alpha".into(),
         entity_type: "Job".into(),
         entity_id: "repeating".into(),
-    };
-    let firing = due.arm(key.clone(), now - chrono::Duration::seconds(1));
-    let mut first = due.wake_overdue("alpha", now).pop().unwrap();
-    // A reset_on timeout dispatch arms this before the firing task ends.
+    }
+}
+
+/// What a report would name now.
+fn earliest(due: &DueTimes) -> Option<DateTime<Utc>> {
+    let mut inner = due.lock();
+    let now = sim_now();
+    let horizon = inner.horizon(now);
+    inner.reportable(horizon, now)
+}
+
+#[test]
+fn a_newer_arm_keeps_its_due_time_when_the_older_task_ends() {
+    let due = Arc::new(DueTimes::default());
+    let now = sim_now();
+    let first = due.arm(key(), now + chrono::Duration::minutes(5));
+    // A reset arms the record's next timer before the old task ends.
     let next = now + chrono::Duration::hours(1);
-    let successor = due.arm(key, next);
-    assert!(matches!(
-        first.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
-    let mut concurrent = due.wake_overdue("alpha", now).pop().unwrap();
-    assert!(matches!(
-        concurrent.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
-    assert!(due.wake_overdue("beta", now).is_empty());
-    due.end(&firing, true);
-    assert!(first.await.unwrap());
-    assert!(concurrent.await.unwrap());
-    assert_eq!(
-        due.answer("alpha", Waker::ControlPlane).next_due_at,
-        Some(next)
-    );
-    assert!(due.wake_overdue("alpha", now).is_empty());
-    assert!(due.lock().superseded.is_empty());
-    due.end(&successor, false);
-    assert_eq!(due.reportable(None), None);
+    let successor = due.arm(key(), next);
+    due.end(&first);
+    assert_eq!(earliest(&due), Some(next));
+    // The old task's retry does not move its successor either.
+    due.retry_in(&first, Duration::from_secs(600));
+    assert_eq!(earliest(&due), Some(next));
+    let later = due.retry_in(&successor, Duration::from_secs(7200));
+    assert!(later >= now + chrono::Duration::hours(2));
+    assert_eq!(earliest(&due), Some(later));
+    due.end(&successor);
+    assert_eq!(earliest(&due), None);
 }

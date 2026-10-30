@@ -1,12 +1,9 @@
-//! The wake simulation's invariants, read from the journal and the rows.
+//! The wake simulation's invariants, read from the journal.
 
 use chrono::{DateTime, Utc};
 use temper_runtime::persistence::EventStore;
-use temper_server::storage::StateTimerStore;
-use temper_server::wake::WakeOutcome;
 use temper_store_sim::SimEventStore;
 
-use super::world::TimerRows;
 use super::{LATE, PULSE, TENANT, TICK, TIMEOUT};
 
 /// The invariant a slept-through or late timer breaks.
@@ -137,55 +134,6 @@ pub(crate) async fn journal(
                 end,
             )?,
         }
-    }
-    Ok(())
-}
-
-/// Every row waiting now, by due time, from the store.
-async fn waiting(events: &SimEventStore, rows: &TimerRows) -> Vec<(DateTime<Utc>, String)> {
-    let mut due = Vec::new();
-    for row in events.list_scheduled_actions(TENANT).await.unwrap() {
-        let at = DateTime::parse_from_rfc3339(&row.due_at).unwrap().to_utc();
-        due.push((at, format!("{} {}", row.entity_id, row.action)));
-    }
-    for row in rows.list_state_timers(TENANT).await.unwrap() {
-        let started = DateTime::parse_from_rfc3339(&row.started_at)
-            .unwrap()
-            .to_utc();
-        due.push((
-            started + chrono::Duration::seconds(TIMEOUT),
-            format!("{} Expire", row.entity_id),
-        ));
-    }
-    due.sort();
-    due
-}
-
-/// A wake at `woke_at` left nothing due by then waiting, and named the
-/// earliest due time at or after `horizon`.
-pub(crate) async fn wake(
-    events: &SimEventStore,
-    rows: &TimerRows,
-    woke_at: DateTime<Utc>,
-    horizon: DateTime<Utc>,
-    outcome: &WakeOutcome,
-) -> Result<(), Broken> {
-    let left = waiting(events, rows).await;
-    if let Some(due) = left.iter().find(|(at, _)| *at <= woke_at) {
-        return Err((
-            "a wake fires every row due by then",
-            format!("{due:?} still waits after the wake at {woke_at}"),
-        ));
-    }
-    let expected = left.iter().map(|(at, _)| *at).find(|at| *at >= horizon);
-    if outcome.next_due_at != expected {
-        return Err((
-            "a wake names the earliest due time at or after the horizon",
-            format!(
-                "named {:?}, horizon {horizon}, rows {left:?}",
-                outcome.next_due_at
-            ),
-        ));
     }
     Ok(())
 }

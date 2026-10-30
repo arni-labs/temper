@@ -10,19 +10,21 @@ use super::owed_writes::{OwedKind, OwedWrite};
 use super::state_timeouts::{ArmedTimer, deadline};
 use crate::idempotency::IdempotencyKey;
 use crate::state::ServerState;
+use crate::wake::TimerRef;
 
 impl ServerState {
-    /// Wait, fire through the normal dispatch pipeline, and remove the old
-    /// row only after its durable successor is armed. A failed write keeps
-    /// this arming (including its identity and journal fence) and retries.
-    /// A final dispatch refusal ends the timer instead.
+    /// Wait until the timer's deadline by the wall clock, fire through the
+    /// normal dispatch pipeline, and remove the old row only after its
+    /// durable successor is armed. A failed write keeps this arming
+    /// (including its identity and journal fence) and retries. A final
+    /// dispatch refusal ends the timer instead.
     pub(super) fn spawn_state_timer(
         &self,
         timer: ArmedTimer,
-        mut delay: Duration,
         gate: Option<Arc<Semaphore>>,
         armed_seq: u64,
     ) {
+        let mut due_at = deadline(timer.started_at, timer.after_seconds);
         let fire_key = timer.new_fire_key();
         self.state_timeout_tracker.inc_pending(&timer.entity_type);
         let workflow_root_entity_type = timer
@@ -47,20 +49,28 @@ impl ServerState {
             entity_id = %timer.entity_id,
             target_state = %timer.state,
             target_action = %timer.action,
-            delay_ms = delay.as_millis() as u64,
+            %due_at,
             workflow.root_entity_type = %workflow_root_entity_type,
             workflow.root_entity_id = %workflow_root_entity_id,
             workflow.run_id = %workflow_run_id,
             "armed state timeout"
         );
 
+        let due = self.due_times.arm(
+            TimerRef::State {
+                tenant: timer.tenant.as_str().to_string(),
+                entity_type: timer.entity_type.clone(),
+                entity_id: timer.entity_id.clone(),
+            },
+            due_at,
+        );
         let state = self.clone();
         let armed_by = crate::trace_context::cause();
         tokio::spawn(async move {
             let mut kept = false;
             // determinism-ok: timer work on the runtime's scheduler
             loop {
-                tokio::time::sleep(delay).await; // determinism-ok: simulated runtime clock
+                due.wait_until(due_at).await;
                 let permit = match &gate {
                     Some(gate) => gate.clone().acquire_owned().await.ok(),
                     None => None,
@@ -104,7 +114,7 @@ impl ServerState {
                     entity_id = %timer.entity_id, arm_id = %timer.arm_id,
                     %reason, retry_in_ms = wait.as_millis() as u64,
                     "state timer retained after failed fire; retrying");
-                delay = wait;
+                due_at = state.due_times.retry_in(&due, wait);
             }
             if kept {
                 state.untrack_owed_write(fire_key.as_str());
@@ -113,6 +123,7 @@ impl ServerState {
                 state.forget_state_timer(&timer).await;
             }
             state.state_timeout_tracker.dec_pending(&timer.entity_type);
+            state.due_times.end(&due);
         });
     }
 

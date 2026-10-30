@@ -2,28 +2,26 @@
 //!
 //! A user's Temper runs in a sandbox that is suspended a while after its last
 //! inbound request and resumed by the next one. While it is suspended the wall
-//! clock moves on and the process's monotonic clock, which its timers wait on,
-//! stands still. The process reports the earliest due time it could sleep
-//! through, the control plane wakes it then, and a wake is a request like any
-//! other.
+//! clock moves on and the process's monotonic clock, which tokio's sleeps run
+//! on, stands still. The process reports the earliest due time it could sleep
+//! through, and the control plane wakes it then with any request.
 //!
 //! Workload, per seed (`sandbox.rs`): requests arrive over eight hours, some
 //! close together and some hours apart. Each makes a record that arms a
 //! `schedule_at` action (`Fire`), enters a state with an hour's timeout
 //! (`Expire`) or starts a chain repeating every two hours (`Tick`), or only
 //! keeps the sandbox awake. The sandbox is suspended exactly 900 s plus up to
-//! a minute after the last inbound request; the process is told it stays awake
-//! 600 s. The control plane wakes it at the due time it was told last, by a
-//! report or a wake's answer, sometimes twice at once, and fails up to three
-//! report sends in a row.
+//! a minute after the last request; the process is told it stays awake 600 s.
+//! The control plane wakes it at the due time it was told last, and fails up
+//! to three report sends in a row. Half its wakes are `GET /healthz`, which
+//! `temper serve` answers outside the kernel's routes, so the process never
+//! sees them as inbound; the other half reach the kernel's routes.
 //!
 //! Invariants (`checks.rs`):
 //! - every timer fires at most 10 s after it is due, and none is slept
-//!   through;
-//! - nothing fires twice;
-//! - when a wake answers, nothing of its tenant due by then waits, and it
-//!   names the earliest due time at or after the horizon; a wake right after
-//!   another fires nothing;
+//!   through: one that fell due while the sandbox slept fires within a second
+//!   of the wake;
+//! - nothing fires twice, or early;
 //! - told a window longer than the sandbox really stays awake, the process
 //!   sleeps through a timer, and the checks see it;
 //! - a request that resumes the sandbox makes its timers wait again by the
@@ -40,12 +38,8 @@ use temper_server::request_context::AgentContext;
 
 #[path = "dst_runtime_wake/checks.rs"]
 mod checks;
-#[path = "dst_runtime_wake/manual.rs"]
-mod manual;
 #[path = "dst_runtime_wake/refused.rs"]
 mod refused;
-#[path = "dst_runtime_wake/repeating.rs"]
-mod repeating;
 #[path = "dst_runtime_wake/sandbox.rs"]
 mod sandbox;
 #[path = "dst_runtime_wake/world.rs"]
@@ -65,8 +59,10 @@ const SUSPEND_AFTER: Duration = Duration::from_secs(900);
 const JITTER: u64 = 60;
 /// How long the process is told it stays awake: below [`SUSPEND_AFTER`].
 const AWAKE: Duration = Duration::from_secs(600);
-/// The most a timer may fire after it is due: a report's delivery through
-/// three failed sends (1 + 2 + 4 s), and then some.
+/// The most a timer may fire after it is due: a wake that takes up to 3 s to
+/// arrive, up to a second for the process to see it resumed, and then some.
+/// A report's failed sends (1 + 2 + 4 s) do not add to it: in these
+/// workloads a report names a time at least a minute after it is made.
 const LATE: i64 = 10;
 
 const JOB: &str = r#"
@@ -165,31 +161,20 @@ async fn act(state: &ServerState, id: &str, action: &str, params: serde_json::Va
         .is_ok_and(|response| response.success)
 }
 
-/// Every seed's failure, if any, and how many reports in all that were sent
-/// before a wake landed after its answer.
-fn failures(seeds: u64, setup: impl Fn() -> Setup) -> (Vec<String>, u64) {
-    let mut failures = Vec::new();
-    let mut stale = 0;
-    for seed in 0..seeds {
-        match sandbox::run(seed, setup()) {
-            Ok(n) => stale += n,
-            Err(failure) => failures.push(failure),
-        }
-    }
-    (failures, stale)
+/// Every seed's failure, if any.
+fn failures(seeds: u64, setup: impl Fn() -> Setup) -> Vec<String> {
+    (0..seeds)
+        .filter_map(|seed| sandbox::run(seed, setup()).err())
+        .collect()
 }
 
 #[test]
 fn dst_a_sleeping_sandbox_is_woken_for_every_timer() {
-    let (failures, stale) = failures(48, || Setup {
+    let failures = failures(48, || Setup {
         awake: Some(AWAKE),
         kind: Kind::Mixed,
     });
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-    assert!(
-        stale > 0,
-        "no report sent before a wake landed after its answer"
-    );
 }
 
 /// The checks can see a wrong window: told it stays awake longer than the
@@ -197,7 +182,7 @@ fn dst_a_sleeping_sandbox_is_woken_for_every_timer() {
 /// after the suspension, and it is slept through.
 #[test]
 fn dst_a_window_longer_than_the_sandbox_stays_awake_is_caught() {
-    let (failures, _) = failures(48, || Setup {
+    let failures = failures(48, || Setup {
         awake: Some(SUSPEND_AFTER * 2),
         kind: Kind::Mixed,
     });
@@ -211,7 +196,7 @@ fn dst_a_window_longer_than_the_sandbox_stays_awake_is_caught() {
 /// suspension: both fire on time.
 #[test]
 fn dst_a_request_that_resumes_the_sandbox_retimes_its_timers() {
-    let (failures, _) = failures(8, || Setup {
+    let failures = failures(8, || Setup {
         awake: Some(AWAKE),
         kind: Kind::Resumed,
     });
@@ -224,7 +209,7 @@ fn dst_a_request_that_resumes_the_sandbox_retimes_its_timers() {
 #[test]
 fn dst_a_minute_chain_reports_about_once_a_window() {
     for busy in [false, true] {
-        let (failures, _) = failures(16, || Setup {
+        let failures = failures(16, || Setup {
             awake: Some(AWAKE),
             kind: Kind::Chain { busy },
         });

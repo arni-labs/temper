@@ -539,7 +539,8 @@ pub struct ServerState {
     /// schedules it armed), and leaves the map when its fire ends.
     pub(crate) scheduled_armed:
         Arc<std::sync::Mutex<BTreeMap<crate::request_context::ScheduledFire, usize>>>,
-    /// When each live timer is due, for wakes and wake reports.
+    /// When each live timer is due by the wall clock: what its wait runs to,
+    /// and what the wake reports name (`wake`).
     pub(crate) due_times: Arc<crate::wake::DueTimes>,
     /// The writes committed moves owe that the store has not taken yet, by
     /// idempotency key, each tried again until it lands or fails otherwise

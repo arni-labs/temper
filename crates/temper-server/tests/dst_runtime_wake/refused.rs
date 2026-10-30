@@ -5,14 +5,15 @@
 //! process knocking for good, so the process sends each refused report once.
 //!
 //! Workload, per seed: with the control plane answering 403 to everything,
-//! the process boots, arms a record due hours away, arms one due sooner, and
-//! is woken, with hours of quiet after each. Then its pass comes back and it
-//! arms one more.
+//! the process boots, arms a record due a day away and one due sooner, and
+//! lets the sooner one fall due, with hours of quiet after each. Then its pass
+//! comes back and it arms one more.
 //!
 //! Invariants:
-//! - each change sends exactly one report, naming the earliest due time, and
-//!   a wake, whose answer names it, sends none;
-//! - in the quiet after a refused report, nothing is sent: it is not retried;
+//! - each change that brings an earlier due time sends exactly one report
+//!   naming it, and so does the refused time passing;
+//! - in the quiet after a refused report, nothing is sent: it counts as told
+//!   and is not retried;
 //! - once the pass comes back, the next change's report is delivered.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,7 @@ use temper_runtime::scheduler::{
 };
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
-use temper_server::wake::{SendError, WakeReport, WakeSink, Waker};
+use temper_server::wake::{SendError, WakeReport, WakeSink};
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -131,45 +132,30 @@ fn run_seed(seed: u64) -> Result<(), String> {
         let sent = one_report(&gate, 0, None, false, "boot")?;
         quiet(&gate, sent, "after boot").await?;
 
-        let far = sim_now() + chrono::Duration::seconds(10 * 3600 + rng.next_bound(3600) as i64);
+        let far = sim_now() + chrono::Duration::seconds(24 * 3600 + rng.next_bound(3600) as i64);
         plan(&state, &format!("job-{seed}-far"), far).await?;
         let sent = one_report(&gate, sent, Some(far), false, "first arm")?;
         quiet(&gate, sent, "after the first arm").await?;
 
-        // Due after the quiet that follows the wake, before the first.
+        // Due after the quiet that follows it, before the first.
         let near = sim_now() + chrono::Duration::seconds(4 * 3600 + rng.next_bound(3600) as i64);
         plan(&state, &format!("job-{seed}-near"), near).await?;
         let sent = one_report(&gate, sent, Some(near), false, "second arm")?;
+        quiet(&gate, sent, "after the second arm").await?;
 
-        // The wake's answer tells the control plane the due time, so nothing
-        // is reported for it.
-        let outcome = state
-            .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
-            .await;
+        // The refused time passes: the control plane, had it taken it, would
+        // hold nothing after it, so the next one is sent, once.
+        tokio::time::sleep((near - sim_now()).to_std().unwrap() + Duration::from_secs(2)).await;
         settle().await;
-        if outcome.fired != 0 || outcome.next_due_at != Some(near) {
-            return Err(format!("a wake before any due time answered {outcome:?}"));
-        }
-        let last = gate
-            .sent
-            .lock()
-            .unwrap()
-            .last()
-            .map(|(report, _)| report.seq);
-        if last.is_none_or(|last| outcome.seq <= last) || outcome.reported_at != sim_now() {
-            return Err(format!(
-                "a wake's answer is the process's next report: seq {} after {last:?}",
-                outcome.seq
-            ));
-        }
-        quiet(&gate, sent, "after the wake").await?;
+        let sent = one_report(&gate, sent, Some(far), false, "the refused time passing")?;
+        quiet(&gate, sent, "after the refused time passed").await?;
 
         // The pass comes back.
         gate.refusing.store(false, Ordering::SeqCst);
         let next = sim_now() + chrono::Duration::seconds(60 + rng.next_bound(600) as i64);
         plan(&state, &format!("job-{seed}-next"), next).await?;
         one_report(&gate, sent, Some(next), true, "arm once the pass is back")?;
-        Ok(())
+        Ok::<(), String>(())
     });
     drop(runtime);
     result.map_err(|failure| format!("seed {seed}: {failure}"))

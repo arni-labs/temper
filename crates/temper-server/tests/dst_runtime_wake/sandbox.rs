@@ -1,16 +1,16 @@
 //! The sandbox, the requests that reach it and its control plane, run against
 //! the process.
 //!
-//! The sandbox is awake from each inbound request until exactly
-//! [`SUSPEND_AFTER`] plus up to [`JITTER`] seconds after it. While awake, the
-//! process's clock runs and its timers fire on their own. Suspended, nothing
-//! of the process runs and only the wall clock moves on, until the next
-//! request: one from the workload, or the control plane's wake at the due
-//! time it holds, which reaches the process up to [`MOST_LAG`] seconds after
-//! it is sent. It holds the newest of what it was told, reports and wakes'
-//! answers alike, ordered by `(reported_at, seq)` only, whenever each lands:
-//! a report sent before a wake may land after that wake's answer.
-//! A wake is inbound like any request.
+//! The sandbox is awake from each request until exactly [`SUSPEND_AFTER`]
+//! plus up to [`JITTER`] seconds after it. While awake, the process's clock
+//! runs and its timers fire on their own. Suspended, nothing of the process
+//! runs and only the wall clock moves on, until the next request: one from
+//! the workload, or the control plane's wake at the due time it holds, which
+//! reaches the process up to [`MOST_LAG`] seconds after it is sent. The
+//! control plane holds the newest report it took, by `(reported_at, seq)`.
+//! Half its wakes are `GET /healthz`, which `temper serve` answers outside
+//! the kernel's routes: they resume the sandbox and keep it awake, but the
+//! process does not see them as inbound.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,9 +22,7 @@ use temper_runtime::ActorSystem;
 use temper_runtime::scheduler::{
     DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
 };
-use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
-use temper_server::wake::Waker;
 use temper_server::{ServerState, StorageStack};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
@@ -127,9 +125,8 @@ fn arrivals(kind: &Kind, rng: &mut DeterministicRng, from: DateTime<Utc>) -> Vec
     out
 }
 
-/// One seed's run. Ok: how many reports sent before a wake landed after its
-/// answer. Err: the invariant it broke, with its trace.
-pub(crate) fn run(seed: u64, setup: Setup) -> Result<u64, String> {
+/// One seed's run. Err: the invariant it broke, with its trace.
+pub(crate) fn run(seed: u64, setup: Setup) -> Result<(), String> {
     let clock = Arc::new(Clock::new());
     let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
     let events = SimEventStore::no_faults(seed);
@@ -147,7 +144,7 @@ pub(crate) fn run(seed: u64, setup: Setup) -> Result<u64, String> {
         registry.register_tenant(TENANT, csdl, CSDL.to_string(), &[("Job", JOB)]);
         let mut state = ServerState::from_registry(ActorSystem::new("wake"), registry);
         state.set_storage_stack(StorageStack::from_sim(events.clone(), None));
-        state.state_timer_rows = Some(rows.clone());
+        state.state_timer_rows = Some(rows);
         state.set_wake_sink(reports.clone());
         if let Some(awake) = setup.awake {
             state.set_wake_awake(awake);
@@ -158,20 +155,15 @@ pub(crate) fn run(seed: u64, setup: Setup) -> Result<u64, String> {
         let mut sim = Sim {
             state,
             events,
-            rows,
             reports,
             clock: clock.clone(),
             rng,
-            awake: setup
-                .awake
-                .map(|awake| chrono::Duration::from_std(awake).unwrap()),
             awake_until: sim_now(),
             plan: None,
             held: None,
             woke_for: None,
             lag: 0,
             wakes: 0,
-            stale: 0,
             recs: Vec::new(),
             trace: Vec::new(),
         };
@@ -184,12 +176,9 @@ pub(crate) fn run(seed: u64, setup: Setup) -> Result<u64, String> {
 struct Sim {
     state: ServerState,
     events: SimEventStore,
-    rows: Arc<TimerRows>,
     reports: Arc<Reports>,
     clock: Arc<Clock>,
     rng: DeterministicRng,
-    /// How long the process was told it stays awake.
-    awake: Option<chrono::Duration>,
     /// When the sandbox is suspended, unless a request comes first.
     awake_until: DateTime<Utc>,
     /// When the control plane will wake the process next.
@@ -202,8 +191,6 @@ struct Sim {
     lag: u64,
     /// How many times the control plane woke the process at a time it held.
     wakes: u64,
-    /// How many reports sent before a wake landed after its answer.
-    stale: u64,
     recs: Vec<Rec>,
     trace: Vec<String>,
 }
@@ -217,9 +204,12 @@ impl Sim {
         )
     }
 
-    /// A request reached the process: the sandbox stays awake from now.
-    fn inbound(&mut self) {
-        self.state.note_inbound();
+    /// A request reached the sandbox, which stays awake from now. The process
+    /// notes it as inbound when it `reached_routes`: the kernel's routes.
+    fn request(&mut self, reached_routes: bool) {
+        if reached_routes {
+            self.state.note_inbound();
+        }
         let after = chrono::Duration::from_std(SUSPEND_AFTER).unwrap();
         self.awake_until = sim_now() + after + secs(self.rng.next_bound(JITTER as usize) as u64);
     }
@@ -248,7 +238,7 @@ impl Sim {
         Some(self.plan? + secs(self.lag))
     }
 
-    async fn go(&mut self, arrivals: Vec<Arrival>, kind: &Kind) -> Result<u64, String> {
+    async fn go(&mut self, arrivals: Vec<Arrival>, kind: &Kind) -> Result<(), String> {
         let end = sim_now() + secs(RUN as u64);
         let mut next = 0;
         loop {
@@ -259,7 +249,7 @@ impl Sim {
             if let Some(at) = wake
                 && at <= now
             {
-                self.wake().await.map_err(|failure| self.fail(failure))?;
+                self.wake();
                 continue;
             }
             if let Some(at) = arrival
@@ -321,11 +311,11 @@ impl Sim {
                 )));
             }
         }
-        Ok(self.stale)
+        Ok(())
     }
 
     async fn arrive(&mut self, n: usize, start: Option<Start>) -> Result<(), String> {
-        self.inbound();
+        self.request(true);
         let Some(start) = start else {
             return Ok(());
         };
@@ -346,45 +336,20 @@ impl Sim {
         Ok(())
     }
 
-    /// The control plane wakes the process at the time it holds, sometimes
-    /// at once again, and holds each wake's answer as it holds a report. Half
-    /// the time, a late copy of the newest report sent before the wake then
-    /// lands.
-    async fn wake(&mut self) -> Result<(), (&'static str, String)> {
+    /// The control plane wakes the process at the time it holds: a request
+    /// that resumes the sandbox. The process sees it as inbound only when it
+    /// reaches the kernel's routes, not as `GET /healthz`.
+    fn wake(&mut self) {
         self.wakes += 1;
         self.woke_for = self.held;
         self.lag = self.rng.next_bound(MOST_LAG as usize + 1) as u64;
-        for again in [false, true] {
-            if again && self.rng.next_bound(3) != 0 {
-                break;
-            }
-            self.inbound();
-            let woke_at = sim_now();
-            self.trace.push(format!("woken at {woke_at}"));
-            let horizon = self.awake.map_or(woke_at, |awake| woke_at + awake);
-            let before = self.reports.sent.lock().unwrap().last().cloned();
-            let outcome = self
-                .state
-                .wake_runtime(&TenantId::new(TENANT), Waker::ControlPlane)
-                .await;
-            self.hold((outcome.reported_at, outcome.seq), outcome.next_due_at);
-            if let Some(before) = before
-                && self.rng.next_bound(2) == 0
-            {
-                self.trace
-                    .push(format!("report {} lands after the answer", before.seq));
-                self.reports.land_late(before);
-                self.stale += 1;
-                self.take_reports();
-            }
-            checks::wake(&self.events, &self.rows, woke_at, horizon, &outcome).await?;
-            if again && outcome.fired != 0 {
-                return Err((
-                    "a wake right after another fires nothing",
-                    format!("fired {}", outcome.fired),
-                ));
-            }
-        }
-        Ok(())
+        let reached_routes = self.rng.next_bound(2) == 0;
+        let by = if reached_routes {
+            "a request"
+        } else {
+            "GET /healthz"
+        };
+        self.trace.push(format!("woken at {} by {by}", sim_now()));
+        self.request(reached_routes);
     }
 }

@@ -344,20 +344,6 @@ pub async fn run(
             "wake reports off: TEMPER_WAKE_REPORT_URL and TEMPER_WAKE_REPORT_TOKEN are needed together"
         ),
     }
-    // The agent principal id the control plane wakes this process as. Only
-    // its wake's answer stands for a report delivered: another caller's
-    // answer never reaches the control plane. Unset, no wake is the control
-    // plane's, so with reports on the process may leave a due time between
-    // its last report and the control plane's wake unreported.
-    let reporting = std::env::var("TEMPER_WAKE_REPORT_URL").is_ok(); // determinism-ok: startup config
-    match std::env::var("TEMPER_WAKE_CONTROL_PLANE") {
-        // determinism-ok: startup config
-        Ok(id) if !id.is_empty() => state.server.set_wake_control_plane(id),
-        _ if reporting => tracing::error!(
-            "TEMPER_WAKE_CONTROL_PLANE is unset: no wake's answer stands for a report"
-        ),
-        _ => {}
-    }
     // How long the sandbox stays awake after an inbound request, in seconds:
     // a timer due before then fires on its own and is not reported. The
     // control plane sets it below the time its sandboxes really stay awake,
