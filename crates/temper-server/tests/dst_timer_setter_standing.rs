@@ -1,18 +1,24 @@
 //! DST: a timer acts with the standing its setter has when it fires.
 //!
 //! A timer fires as whoever set it. Its move is the app's own, so Cedar is
-//! not asked about the move: it is asked whether the setter may still read
-//! the record. The tenant's Cedar here names its people, as an app's does: they
-//! may read a `Job`, `Start` it and `Hold` it, and nobody is permitted the
-//! timers' own moves, `Expire` and `Take`.
+//! not asked about the move: it is asked whether the setter may read the
+//! record, when they set the timer and when it fires. The tenant's Cedar here
+//! names its people, as an app's does: they may read its records, `Start` a
+//! `Job` and `Hold` it. It also names outsiders, who may `Start` and `Hold` a
+//! `Job` but never read one. Nobody is permitted the timers' own moves,
+//! `Expire`, `Take` and `Lapse`.
 //!
 //! Workload, per seed: records are set going at seeded times, each by one
 //! setter, with a state timer (`Start` enters `Waiting`, whose timeout makes
-//! `Expire`) or a scheduled action (`Hold` schedules `Take`). The setters:
+//! `Expire`), a scheduled action (`Hold` schedules `Take`), or a state timer
+//! from creation (a `Pass` is created into `Open`, whose timeout makes
+//! `Lapse`). The setters:
 //! - a user who stays in the tenant's Cedar, by themselves or through an
 //!   agent acting for them;
 //! - a user who leaves it after setting the timer and before it fires, by
 //!   themselves or through an agent;
+//! - an outsider, by themselves or through an agent, who could never read the
+//!   record;
 //! - the app's own service, which Cedar names nowhere;
 //! - an internal caller with no security context.
 //!
@@ -22,10 +28,10 @@
 //!
 //! Invariants, long after every timer was due, and again after the last
 //! restart:
-//! - a timer whose setter may still read the record, or that acts for no one,
-//!   makes its move exactly once;
-//! - a timer whose setter may no longer read the record never makes its move,
-//!   and says so in a log line naming the setter;
+//! - a timer whose setter may still read the record, could not read it when
+//!   they set it, or acts for no one, makes its move exactly once;
+//! - a timer whose setter could read the record when they set it and can no
+//!   longer never makes its move, and says so in a log line naming the setter;
 //! - such a state timer keeps its row, armed as its setter, so no later
 //!   arming fires it as anyone else; such a scheduled action leaves no row
 //!   and no live timer.
@@ -33,8 +39,14 @@
 //! Each server runs in its own single-threaded, paused-clock Tokio runtime,
 //! and `sim_now()` reads that clock.
 
+#[path = "dst_timer_setter_standing/invariants.rs"]
+mod invariants;
+#[path = "dst_timer_setter_standing/logged.rs"]
+mod logged;
 #[path = "dst_state_timers_follow_state/process_clock.rs"]
 mod process_clock;
+#[path = "dst_timer_setter_standing/specs.rs"]
+mod specs;
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
@@ -42,20 +54,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use invariants::{check, check_logged};
+use logged::Withheld;
 use process_clock::ProcessClock;
 use serde_json::json;
-use temper_authz::{PrincipalKind, SecurityContext};
+use specs::{CSDL, JOB, PASS};
+use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
 use temper_runtime::ActorSystem;
-use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::{
     DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
 };
 use temper_runtime::tenant::TenantId;
 use temper_server::registry::SpecRegistry;
 use temper_server::request_context::AgentContext;
-use temper_server::{ServerState, StorageStack};
+use temper_server::{ServerState, StorageStack, build_router};
 use temper_spec::csdl::parse_csdl;
 use temper_store_sim::SimEventStore;
+use tower::ServiceExt;
 use tracing_subscriber::prelude::*;
 use world::SimTimerRows;
 
@@ -67,55 +84,6 @@ const WAIT: Duration = Duration::from_secs(600);
 /// How long the run goes on after the timers fell due.
 const HORIZON: Duration = Duration::from_secs(4 * 3600);
 
-const JOB: &str = r#"
-[automaton]
-name = "Job"
-states = ["Idle", "Waiting", "Held", "Done", "Taken"]
-initial = "Idle"
-allow_indefinite_states = ["Idle", "Held", "Done", "Taken"]
-
-[[action]]
-name = "Start"
-from = ["Idle"]
-to = "Waiting"
-
-[[action]]
-name = "Expire"
-kind = "internal"
-from = ["Waiting"]
-to = "Done"
-
-[[state_timeout]]
-state = "Waiting"
-after_seconds = 600
-on_timeout = "Expire"
-
-[[action]]
-name = "Hold"
-from = ["Idle"]
-to = "Held"
-effect = ["schedule('Take', 600)"]
-
-[[action]]
-name = "Take"
-kind = "internal"
-from = ["Held"]
-to = "Taken"
-"#;
-
-const CSDL: &str = r#"<?xml version="1.0"?>
-<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
-<edmx:DataServices><Schema Namespace="Jobs" xmlns="http://docs.oasis-open.org/odata/ns/edm">
-<EntityType Name="Job"><Key><PropertyRef Name="Id"/></Key>
-<Property Name="Id" Type="Edm.String" Nullable="false"/>
-</EntityType>
-<Action Name="Start" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Expire" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Hold" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<Action Name="Take" IsBound="true"><Parameter Name="bindingParameter" Type="Jobs.Job"/></Action>
-<EntityContainer Name="Container"><EntitySet Name="Jobs" EntityType="Jobs.Job"/></EntityContainer>
-</Schema></edmx:DataServices></edmx:Edmx>"#;
-
 /// The agent a user may act through.
 const AGENT: &str = "katagami-mcp";
 
@@ -126,6 +94,8 @@ enum Timer {
     State,
     /// `Hold`: a scheduled `Take`.
     Scheduled,
+    /// Creating a `Pass`: `Open`'s state timer makes `Lapse`.
+    Created,
 }
 
 impl Timer {
@@ -135,6 +105,15 @@ impl Timer {
         match self {
             Self::State => ("Start", "Expire", "Waiting", "Done"),
             Self::Scheduled => ("Hold", "Take", "Held", "Taken"),
+            Self::Created => ("create", "Lapse", "Open", "Lapsed"),
+        }
+    }
+
+    /// The type of the record it is set on.
+    fn entity_type(self) -> &'static str {
+        match self {
+            Self::State | Self::Scheduled => "Job",
+            Self::Created => "Pass",
         }
     }
 }
@@ -153,6 +132,8 @@ enum Setter {
     Stays(By),
     /// A user who leaves the tenant's Cedar before the timer fires.
     Leaves(By),
+    /// A user the tenant's Cedar lets set a `Job`'s timers but never read it.
+    Outsider(By),
     /// The app's own service, which the Cedar names nowhere.
     App,
     /// An internal caller with no security context.
@@ -169,10 +150,10 @@ impl Setter {
             ..Default::default()
         };
         match self {
-            Self::Stays(By::Themselves) | Self::Leaves(By::Themselves) => {
-                verified(user, PrincipalKind::Customer, None, None)
-            }
-            Self::Stays(By::Agent) | Self::Leaves(By::Agent) => {
+            Self::Stays(By::Themselves)
+            | Self::Leaves(By::Themselves)
+            | Self::Outsider(By::Themselves) => verified(user, PrincipalKind::Customer, None, None),
+            Self::Stays(By::Agent) | Self::Leaves(By::Agent) | Self::Outsider(By::Agent) => {
                 verified(AGENT, PrincipalKind::Agent, Some("contributor"), Some(user))
             }
             Self::App => AgentContext::for_service("app"),
@@ -183,7 +164,9 @@ impl Setter {
     /// The principal a withheld fire names as its setter.
     fn principal(self, user: &str) -> String {
         match self {
-            Self::Stays(By::Agent) | Self::Leaves(By::Agent) => AGENT.to_string(),
+            Self::Stays(By::Agent) | Self::Leaves(By::Agent) | Self::Outsider(By::Agent) => {
+                AGENT.to_string()
+            }
             _ => user.to_string(),
         }
     }
@@ -194,30 +177,42 @@ impl Setter {
 }
 
 /// What outlives a process: the journal, the timer rows, the clock and the
-/// tenant's people.
+/// tenant's people and outsiders.
 struct World {
     events: SimEventStore,
     rows: Arc<SimTimerRows>,
     clock: Arc<ProcessClock>,
     people: Mutex<BTreeSet<String>>,
+    outsiders: BTreeSet<String>,
 }
 
 impl World {
-    /// The tenant's Cedar: its people may read a `Job`, `Start` it and
-    /// `Hold` it, themselves or through an agent acting for them.
+    /// The tenant's Cedar: its people may read its records, `Start` a `Job`
+    /// and `Hold` it, and its outsiders may only `Start` and `Hold` one, each
+    /// themselves or through an agent acting for them. Both, and the app's
+    /// service, may create a `Pass`.
     fn cedar(&self) -> String {
-        let people = self
-            .people
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|id| format!("\"{id}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let listed = |ids: &BTreeSet<String>| {
+            ids.iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let people = self.people.lock().unwrap().clone();
+        let creators = listed(&people.union(&self.outsiders).cloned().collect());
+        let people = listed(&people);
+        let outsiders = listed(&self.outsiders);
         format!(
-            r#"permit(principal, action in [Action::"read", Action::"Start", Action::"Hold"], resource is Job)
+            r#"permit(principal, action in [Action::"read", Action::"Start", Action::"Hold"], resource)
 when {{ (principal is Customer && [{people}].contains(principal.id)) ||
-        (context has actingFor && [{people}].contains(context.actingFor)) }};"#
+        (context has actingFor && [{people}].contains(context.actingFor)) }};
+permit(principal, action in [Action::"Start", Action::"Hold"], resource is Job)
+when {{ (principal is Customer && [{outsiders}].contains(principal.id)) ||
+        (context has actingFor && [{outsiders}].contains(context.actingFor)) }};
+permit(principal, action == Action::"create", resource is Pass)
+when {{ (principal is Customer && [{creators}].contains(principal.id)) ||
+        (context has actingFor && [{creators}].contains(context.actingFor)) ||
+        principal == Agent::"service:app" }};"#
         )
     }
 }
@@ -244,7 +239,7 @@ impl Process {
                 TENANT,
                 parse_csdl(CSDL).unwrap(),
                 CSDL.to_string(),
-                &[("Job", JOB)],
+                &[("Job", JOB), ("Pass", PASS)],
             );
             let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
             state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
@@ -266,74 +261,6 @@ impl Process {
         let Self { runtime, state } = self;
         drop(state);
         drop(runtime);
-    }
-}
-
-/// The withheld fires logged: the record and the setter each names.
-#[derive(Clone, Default)]
-struct Withheld(Arc<Mutex<Vec<(String, String)>>>);
-
-impl Withheld {
-    fn of(&self, id: &str) -> Vec<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(record, _)| record == id)
-            .map(|(_, setter)| setter.clone())
-            .collect()
-    }
-
-    fn clear(&self) {
-        self.0.lock().unwrap().clear();
-    }
-}
-
-/// The fields of a log line that name a withheld fire.
-#[derive(Default)]
-struct LineFields {
-    message: String,
-    entity_id: String,
-    setter: String,
-}
-
-impl tracing::field::Visit for LineFields {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.set(field.name(), value.to_string());
-    }
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.set(
-            field.name(),
-            format!("{value:?}").trim_matches('"').to_string(),
-        );
-    }
-}
-
-impl LineFields {
-    fn set(&mut self, name: &str, value: String) {
-        match name {
-            "message" => self.message = value,
-            "entity_id" => self.entity_id = value,
-            "setter" => self.setter = value,
-            _ => {}
-        }
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Withheld {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut fields = LineFields::default();
-        event.record(&mut fields);
-        if fields.message.starts_with("timer fire withheld") {
-            self.0
-                .lock()
-                .unwrap()
-                .push((fields.entity_id, fields.setter));
-        }
     }
 }
 
@@ -365,123 +292,6 @@ struct Record {
     timer: Timer,
 }
 
-/// Check every record against the invariants, from its journal and rows
-/// alone: a point read could rehydrate an actor and arm its timer again.
-async fn check(
-    seed: u64,
-    trace: &[String],
-    world: &World,
-    state: &ServerState,
-    records: &[Record],
-    withheld: &Withheld,
-    when: &str,
-) -> Result<(), String> {
-    let scheduled = world.events.list_scheduled_actions(TENANT).await.unwrap();
-    let armed = state.armed_scheduled_actions();
-    for record in records {
-        let (_, fired, waits_in, moves_to) = record.timer.moves();
-        let journal = world
-            .events
-            .read_events(&format!("{TENANT}:Job:{}", record.id), 0)
-            .await
-            .map_err(|error| fail(seed, trace, "journals are readable", error.to_string()))?;
-        let moves = journal
-            .iter()
-            .filter(|event| event.event_type == fired)
-            .count();
-        let place = journal
-            .last()
-            .and_then(|event| event.payload.get("to_status"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let row = world.rows.row(TENANT, &record.id);
-        let scheduled_row = scheduled.iter().any(|row| row.entity_id == record.id);
-        let live = armed.keys().any(|fire| fire.entity_id == record.id);
-        let logged = withheld.of(&record.id);
-        let detail = format!(
-            "{when}: {} {:?} {:?}: {fired} made {moves} times, in {place}, state timer row {:?}, \
-             scheduled row {scheduled_row}, live scheduled timer {live}, withheld as {logged:?}",
-            record.id,
-            record.setter,
-            record.timer,
-            row.as_ref().map(|row| (&row.state, &row.armed_by)),
-        );
-        if !record.setter.leaves() {
-            if moves != 1 || place != moves_to {
-                return Err(fail(
-                    seed,
-                    trace,
-                    "a timer whose setter has standing, or that acts for no one, makes its move once",
-                    detail,
-                ));
-            }
-            continue;
-        }
-        if moves != 0 || place != waits_in {
-            return Err(fail(
-                seed,
-                trace,
-                "a timer whose setter has no standing never makes its move",
-                detail,
-            ));
-        }
-        match record.timer {
-            Timer::State => {
-                let as_setter = row.as_ref().is_some_and(|row| {
-                    row.state == waits_in
-                        && row
-                            .armed_by
-                            .contains(&format!("\"{}\"", record.setter.principal(&record.user)))
-                        && row.armed_by.contains(&format!("\"{}\"", record.user))
-                });
-                if !as_setter {
-                    return Err(fail(
-                        seed,
-                        trace,
-                        "a withheld state timer keeps its row, armed as its setter",
-                        detail,
-                    ));
-                }
-            }
-            Timer::Scheduled => {
-                if scheduled_row || live {
-                    return Err(fail(
-                        seed,
-                        trace,
-                        "a withheld scheduled action leaves no row and no live timer",
-                        detail,
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Check that each leaver's withheld fire was logged, naming its setter.
-fn check_logged(
-    seed: u64,
-    trace: &[String],
-    records: &[Record],
-    withheld: &Withheld,
-) -> Result<(), String> {
-    for record in records {
-        let logged = withheld.of(&record.id);
-        let principal = record.setter.principal(&record.user);
-        let named = !logged.is_empty() && logged.iter().all(|setter| *setter == principal);
-        if record.setter.leaves() != named {
-            return Err(fail(
-                seed,
-                trace,
-                "only a fire withheld for its setter's standing is logged, naming the setter",
-                format!("{} {:?}: logged {logged:?}", record.id, record.setter),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// One seed's run.
 fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
     let clock = Arc::new(ProcessClock::new());
@@ -492,16 +302,22 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
 
     // Every setter with every timer, in a seeded order.
     let mut cases = Vec::new();
-    for timer in [Timer::State, Timer::Scheduled] {
+    for timer in [Timer::State, Timer::Scheduled, Timer::Created] {
         for setter in [
             Setter::Stays(By::Themselves),
             Setter::Stays(By::Agent),
             Setter::Leaves(By::Themselves),
             Setter::Leaves(By::Agent),
+            Setter::Outsider(By::Themselves),
+            Setter::Outsider(By::Agent),
             Setter::App,
             Setter::Internal,
         ] {
-            cases.push((setter, timer));
+            // A record is created through the server's route by someone
+            // signed in; an internal caller has no way to.
+            if !(timer == Timer::Created && setter == Setter::Internal) {
+                cases.push((setter, timer));
+            }
         }
     }
     for i in (1..cases.len()).rev() {
@@ -511,18 +327,22 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
         .into_iter()
         .enumerate()
         .map(|(i, (setter, timer))| Record {
-            id: format!("job-{i}"),
+            id: format!("{}-{i}", timer.entity_type().to_lowercase()),
             user: format!("user-{i}"),
             setter,
             timer,
         })
         .collect();
 
+    let (outsiders, people): (Vec<&Record>, Vec<&Record>) = records
+        .iter()
+        .partition(|record| matches!(record.setter, Setter::Outsider(_)));
     let world = World {
         events: SimEventStore::no_faults(seed),
         rows: Arc::new(SimTimerRows::new(seed)),
         clock,
-        people: Mutex::new(records.iter().map(|record| record.user.clone()).collect()),
+        people: Mutex::new(people.iter().map(|record| record.user.clone()).collect()),
+        outsiders: outsiders.iter().map(|record| record.user.clone()).collect(),
     };
     let tenant = TenantId::new(TENANT);
 
@@ -530,25 +350,37 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
     let set_going = process.runtime.block_on(async {
         for record in &records {
             // Every record is set going within a quarter of the wait.
-            pass(Duration::from_secs(rng.next_bound(12) as u64)).await;
-            process
-                .state
-                .get_or_create_tenant_entity(&tenant, "Job", &record.id, json!({}))
-                .await
-                .map_err(|error| fail(seed, &trace, "records are created", error.to_string()))?;
+            pass(Duration::from_secs(rng.next_bound(6) as u64)).await;
             let (sets, ..) = record.timer.moves();
-            let set = process
-                .state
-                .dispatch_tenant_action(
-                    &tenant,
-                    "Job",
-                    &record.id,
-                    sets,
-                    json!({}),
-                    &record.setter.caller(&record.user),
-                )
-                .await
-                .is_ok_and(|response| response.success);
+            let caller = record.setter.caller(&record.user);
+            let set = if record.timer == Timer::Created {
+                // Through the server's create route, as the setter.
+                let who = caller.security_ctx.clone().expect("a creator signs in");
+                let mut request = Request::post("/tdata/Passes")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({ "Id": record.id }).to_string()))
+                    .unwrap();
+                request
+                    .extensions_mut()
+                    .insert(AuthenticatedRequestContext::new(tenant.clone(), who));
+                build_router(process.state.clone())
+                    .oneshot(request)
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::CREATED)
+            } else {
+                process
+                    .state
+                    .get_or_create_tenant_entity(&tenant, "Job", &record.id, json!({}))
+                    .await
+                    .map_err(|error| {
+                        fail(seed, &trace, "records are created", error.to_string())
+                    })?;
+                process
+                    .state
+                    .dispatch_tenant_action(&tenant, "Job", &record.id, sets, json!({}), &caller)
+                    .await
+                    .is_ok_and(|response| response.success)
+            };
             if !set {
                 return Err(fail(
                     seed,

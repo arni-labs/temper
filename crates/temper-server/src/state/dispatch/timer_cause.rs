@@ -2,9 +2,10 @@
 //!
 //! A timer fires as whoever armed it, and Cedar is not asked about its own
 //! move: the arming move already passed Cedar to enter the timed state, and
-//! the timer is that state's own consequence in the spec. Cedar is asked
-//! whether the one who armed it may still read the record (`timer_standing`),
-//! under this cause. The moves its move sets off are checked, and they
+//! the timer is that state's own consequence in the spec. Cedar is asked,
+//! under this cause, whether the one who armed it has lost their standing on
+//! the record since (`timer_standing`). The moves its move sets off are
+//! checked, and they
 //! inherit this cause, so Cedar sees them as `via == "timer"`, armed by the
 //! timer's principal.
 

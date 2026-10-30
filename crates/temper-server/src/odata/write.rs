@@ -795,13 +795,28 @@ pub async fn handle_odata_post(
                 }
             }
 
+            // A timed first state's timer keeps whether its creator could
+            // read the record.
+            let creator = match state
+                .created_with_read_when_set(
+                    &tenant,
+                    &entity_type,
+                    &entity_id,
+                    &initial_fields,
+                    &agent_ctx,
+                )
+                .await
+            {
+                Ok(creator) => creator,
+                Err(reason) => return crate::write_health::store_unavailable(&reason),
+            };
             match state
                 .get_or_create_tenant_entity_by(
                     &tenant,
                     &entity_type,
                     &entity_id,
                     initial_fields,
-                    &agent_ctx,
+                    &creator,
                 )
                 .await
             {
@@ -816,7 +831,7 @@ pub async fn handle_odata_post(
                             &entity_type,
                             &entity_id,
                             &response,
-                            &agent_ctx,
+                            &creator,
                         )
                         .await;
                     if entity_type == "RateLimit" {

@@ -109,6 +109,13 @@ pub struct AgentContext {
     /// this dispatch fires: the actor applies its action only while the
     /// record's journal is at the sequence the timer was armed at.
     pub fires_state_timer: Option<StateTimerFire>,
+    /// Runtime-owned; never populated from request headers. Whether this
+    /// caller could read the record when their move set its timers, as Cedar
+    /// answered then; the timers the move sets keep it. A fire is withheld
+    /// only when it is `Some(true)` and the setter can no longer read the
+    /// record (`timer_standing`). None when not asked: the move sets no
+    /// timer, names no caller, or was made before timers kept this.
+    pub read_when_set: Option<bool>,
     /// Generic, client-supplied observability metadata.
     ///
     /// Producers should namespace their keys, for example
@@ -219,6 +226,7 @@ impl AgentContext {
             idempotency_key: None,
             fires_scheduled_action: None,
             fires_state_timer: None,
+            read_when_set: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -258,6 +266,7 @@ impl AgentContext {
             idempotency_key: None,
             fires_scheduled_action: None,
             fires_state_timer: None,
+            read_when_set: None,
             observation_metadata: BTreeMap::new(),
         }
     }
@@ -396,6 +405,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         idempotency_key,
         fires_scheduled_action: None,
         fires_state_timer: None,
+        read_when_set: None,
         observation_metadata: observation_metadata::extract(headers),
     }
 }

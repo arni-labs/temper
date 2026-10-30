@@ -2,31 +2,45 @@
 //!
 //! A timer fires as whoever set it (`timer_cause`). Its move is the app's own,
 //! the spec's consequence of the move into the timed state, so Cedar is not
-//! asked about the move itself. It is asked about the setter: whether they
-//! may still read the record, as the record is now and with the timer's cause
-//! (`context.via == "timer"`). A setter who may read it has standing on it,
-//! and the timer moves the record as before. A setter who may not has none,
-//! and the move is not made: the fire ends as a final refusal, and it is
-//! logged, counted and kept as an authorization trajectory with the setter
-//! and Cedar's reason.
+//! asked about the move itself. It is asked about the setter's standing on the
+//! record: whether they may read it, with the timer's cause
+//! (`context.via == "timer"`). It is asked twice, with the same question.
 //!
-//! A timer the kernel set as one of its own identities (a re-arm as the
-//! state-timer service, a module's callback, a rule's declared service, an
-//! internal caller) acts for no one, so it has no standing to lose and fires
-//! as before ([`AgentContext::caller`]).
+//! - When the setter's move can set a timer, before the move, as the record is
+//!   then (or as it is created). The answer rides on the caller
+//!   ([`AgentContext::read_when_set`]) into every timer the move sets and each
+//!   timer's row.
+//! - When the timer fires, as the record is now, only if the setter could read
+//!   it when they set it. If they can no longer, their standing is lost and
+//!   the move is not made: the fire ends as a final refusal, and it is logged,
+//!   counted and kept as an authorization trajectory with the setter and
+//!   Cedar's reason.
+//!
+//! A setter who could not read the record when they set the timer had no
+//! standing on it to lose, so their timer fires as before: their move was
+//! permitted without it, as a user joining an app by its link is before they
+//! are its member. A timer the kernel set as one of its own identities (a
+//! re-arm as the state-timer service, a module's callback, a rule's declared
+//! service, an internal caller) acts for no one and fires as before
+//! ([`AgentContext::caller`]). So does a timer whose row was written before
+//! timers kept the answer.
+
+use temper_jit::table::Effect;
 
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
 use super::DispatchError;
+use super::timer_cause::mark_timer_fire;
+use crate::entity_actor::EntityActor;
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 
 /// What a timer's fire may do, by its setter's standing on the record now.
 pub(super) enum Standing {
-    /// The setter may read the record, or the timer acts for no one: its move
-    /// is made.
+    /// The setter may read the record, could not when they set the timer, or
+    /// the timer acts for no one: its move is made.
     Holds,
     /// The setter may no longer read the record: its move is not made.
     Lost {
@@ -56,6 +70,9 @@ impl ServerState {
         let Some(setter) = agent.caller() else {
             return Ok(Standing::Holds);
         };
+        if agent.read_when_set != Some(true) {
+            return Ok(Standing::Holds);
+        }
         let snapshot = self
             .load_authz_resource_snapshot(fire.tenant, fire.entity_type, fire.entity_id)
             .await?;
@@ -116,5 +133,151 @@ impl ServerState {
             tracing::warn!("failed to enqueue withheld timer fire trajectory");
         }
         Ok(Standing::Lost { reason })
+    }
+
+    /// `agent`, about to make `action` on the record, with whether they may
+    /// read it as it is now when the move can set a timer
+    /// ([`AgentContext::read_when_set`]), and with no answer otherwise. Every
+    /// move answers afresh, so an answer about one record never reaches
+    /// another's timers. An error is a record that could not be read.
+    pub(super) async fn with_read_when_set(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+        mut agent: AgentContext,
+    ) -> Result<AgentContext, DispatchError> {
+        agent.read_when_set = None;
+        if agent.caller().is_none() || !self.move_can_set_a_timer(tenant, entity_type, action) {
+            return Ok(agent);
+        }
+        let snapshot = self
+            .load_authz_resource_snapshot(tenant, entity_type, entity_id)
+            .await?;
+        agent.read_when_set =
+            Some(self.may_read_as_timer(&agent, tenant, entity_type, &snapshot.resource_attrs));
+        Ok(agent)
+    }
+
+    /// `created_by`, about to create the record with `initial_fields`, with
+    /// whether they may read it as created when its first state has a timer
+    /// ([`AgentContext::read_when_set`]), and with no answer otherwise. A
+    /// creator passes what this returns to both
+    /// [`Self::get_or_create_tenant_entity_by`] (the timer row its `Created`
+    /// event commits) and [`Self::arm_state_timeouts_on_creation`].
+    pub(crate) async fn created_with_read_when_set(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        initial_fields: &serde_json::Value,
+        created_by: &AgentContext,
+    ) -> Result<AgentContext, String> {
+        let mut created_by = created_by.clone();
+        created_by.read_when_set = None;
+        if created_by.caller().is_none() {
+            return Ok(created_by);
+        }
+        let (timeouts, table) = self.timers_of(tenant, entity_type);
+        let Some(table) = table else {
+            return Ok(created_by);
+        };
+        if !timeouts
+            .iter()
+            .any(|timeout| timeout.state == table.initial_state)
+        {
+            return Ok(created_by);
+        }
+        let created =
+            EntityActor::build_initial_state(entity_type, entity_id, &table, initial_fields);
+        let attrs = self
+            .build_authz_resource_attrs(
+                tenant,
+                entity_type,
+                entity_id,
+                &created.status,
+                &created.fields,
+            )
+            .await?;
+        created_by.read_when_set =
+            Some(self.may_read_as_timer(&created_by, tenant, entity_type, &attrs));
+        Ok(created_by)
+    }
+
+    /// Whether `agent` may read a record with `attrs`, asked as a timer of
+    /// theirs asks it when it fires. Counted as a check, not a refusal: a
+    /// "no" here refuses nothing.
+    fn may_read_as_timer(
+        &self,
+        agent: &AgentContext,
+        tenant: &TenantId,
+        entity_type: &str,
+        attrs: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> bool {
+        let mut asking = agent.clone();
+        mark_timer_fire(&mut asking);
+        asking.caller().is_some_and(|setter| {
+            self.authorize_offer_with_context(
+                setter,
+                crate::odata::authz::READ_ACTION,
+                entity_type,
+                attrs,
+                tenant.as_str(),
+            )
+            .is_ok()
+        })
+    }
+
+    /// Whether `action` can set a timer on a record of `entity_type`: it can
+    /// enter a state with a timeout, it is one of that timeout's resets, or it
+    /// schedules an action.
+    fn move_can_set_a_timer(&self, tenant: &TenantId, entity_type: &str, action: &str) -> bool {
+        let (timeouts, table) = self.timers_of(tenant, entity_type);
+        let Some(table) = table else {
+            return false;
+        };
+        let resets = timeouts
+            .iter()
+            .any(|timeout| timeout.reset_on.iter().any(|reset| reset == action));
+        resets
+            || table
+                .rules
+                .iter()
+                .filter(|rule| rule.name == action)
+                .any(|rule| {
+                    rule.effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            Effect::ScheduleAction { .. } | Effect::ScheduleAtAction { .. }
+                        )
+                    }) || rule
+                        .to_state
+                        .as_deref()
+                        .is_some_and(|to| timeouts.iter().any(|timeout| timeout.state == to))
+                })
+    }
+
+    /// `entity_type`'s state timeouts and transition table, as registered.
+    fn timers_of(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+    ) -> (
+        Vec<temper_spec::automaton::StateTimeout>,
+        Option<std::sync::Arc<temper_jit::table::TransitionTable>>,
+    ) {
+        let (timeouts, table) = match self.registry.read() {
+            Ok(registry) => (
+                registry
+                    .get_spec(tenant, entity_type)
+                    .map(|spec| spec.automaton.state_timeouts.clone())
+                    .unwrap_or_default(),
+                registry.get_table(tenant, entity_type),
+            ),
+            Err(_) => (Vec::new(), None),
+        };
+        let table = table.or_else(|| self.transition_tables.get(entity_type).cloned());
+        (timeouts, table)
     }
 }

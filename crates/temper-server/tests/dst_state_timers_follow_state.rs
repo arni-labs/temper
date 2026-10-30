@@ -145,17 +145,6 @@ impl Process {
             let mut state = ServerState::from_registry(ActorSystem::new(name), registry);
             state.set_storage_stack(StorageStack::from_sim(world.events.clone(), None));
             state.state_timer_rows = Some(world.rows.clone());
-            // A timer acts with its setter's standing on the record, which
-            // Cedar decides: every caller here may read the records.
-            for tenant in TENANTS {
-                state
-                    .authz
-                    .reload_tenant_policies(
-                        tenant,
-                        r#"permit(principal, action == Action::"read", resource);"#,
-                    )
-                    .expect("the tenant's Cedar parses");
-            }
             // Serve reinstalls apps before runtime recovery. No install walk
             // may touch the saved rows or fire an overdue timer here.
             let saved_rows = world.rows.row("alpha", "job-0");
