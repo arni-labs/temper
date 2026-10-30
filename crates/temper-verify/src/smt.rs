@@ -4,8 +4,8 @@
 //! enumerating states:
 //!
 //! 1. **Guard satisfiability** — Encode each guard as a Z3 formula over
-//!    integer counters (0..max) and boolean variables. Check SAT: if UNSAT,
-//!    the guard is dead code (the action can never fire).
+//!    integer counters (each up to its L1 bound) and boolean variables.
+//!    Check SAT: if UNSAT, the guard is dead code (the action can never fire).
 //!
 //! 2. **Invariant induction** — An invariant is proved inductive when every
 //!    initial state satisfies it and, for every transition, assuming the
@@ -26,7 +26,7 @@ use stateright::Model;
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, Truth, unmodelable};
 
 use crate::model::builder::build_model_from_ioa;
-use crate::model::semantics::{collect_list_contains_pairs, truth};
+use crate::model::semantics::{collect_list_contains_pairs, counter_bound, truth};
 use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// Result of symbolic verification.
@@ -135,7 +135,7 @@ fn reads_related_entities(guard: &Expr) -> bool {
 /// For each transition, encode its guard as a Z3 formula and check SAT.
 ///
 /// A guard is satisfiable if there exists an assignment of counter values
-/// (0..max_counter) and boolean values that makes the guard true.
+/// (each up to its bound) and boolean values that makes the guard true.
 fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(String, bool)> {
     model
         .transitions
@@ -151,8 +151,8 @@ fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(S
                 }
             }
 
-            // Create Z3 variables for each counter, bounded [0, max_counter]
-            let counter_vars = make_counter_vars(model, &solver, max_counter);
+            // Create Z3 variables for each counter, over the values L1 explores
+            let counter_vars = make_counter_vars(model, &solver);
             let bool_vars = make_bool_vars(model);
             let list_vars = make_list_vars(model, &solver, max_counter, "");
             let status_var = make_status_var(model, &solver);
@@ -424,22 +424,18 @@ fn broken_by(
 // Z3 helpers
 // ---------------------------------------------------------------------------
 
-/// Create Z3 integer variables for each counter, bounded [0, max_counter].
-fn make_counter_vars(
-    model: &TemperModel,
-    solver: &Solver,
-    max_counter: usize,
-) -> Vec<(String, Int)> {
+/// Create Z3 integer variables for each counter, each in `[0, bound]` with
+/// the bound L1 explores it to, which covers every literal it is compared with.
+fn make_counter_vars(model: &TemperModel, solver: &Solver) -> Vec<(String, Int)> {
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-
     model
         .initial_counters
         .keys()
         .map(|name| {
             let var = Int::new_const(var_name("", "counter", name));
+            let bound = i64::try_from(counter_bound(model, name)).unwrap_or(i64::MAX);
             solver.assert(var.ge(&zero));
-            solver.assert(var.le(&max_val));
+            solver.assert(var.le(Int::from_i64(bound)));
             (name.clone(), var)
         })
         .collect()

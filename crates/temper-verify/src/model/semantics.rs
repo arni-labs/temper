@@ -133,6 +133,39 @@ pub(crate) fn successors_budgeted(
     values: &BTreeSet<ModelString>,
     budget: &Expansion,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    successors_with(model, t, state, values, budget, |_| {})
+}
+
+/// [`successors`], adding to `cut` each counter and list a step it leaves
+/// out would take past its bound, with that bound.
+pub(crate) fn successors_noting_cuts(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    cut: &mut BTreeMap<String, usize>,
+) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
+    let values = string_values(std::iter::once(state));
+    successors_with(
+        model,
+        t,
+        state,
+        &values,
+        &Expansion::for_model(model),
+        |next| {
+            cut.extend(outgrown(model, state, next));
+        },
+    )
+}
+
+/// [`successors_budgeted`], passing each step past the bounds to `left_out`.
+fn successors_with(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<ModelString>,
+    budget: &Expansion,
+    mut left_out: impl FnMut(&TemperModelState),
+) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
     let strings = string_assignments(model, t, state, values, budget);
     for params in param_assignments(model, t) {
@@ -155,6 +188,8 @@ pub(crate) fn successors_budgeted(
             canonical_strings(&mut [&mut next.strings]);
             if within_bounds(model, state, &next) {
                 out.push((params, next));
+            } else {
+                left_out(&next);
             }
         }
     }
@@ -287,6 +322,15 @@ fn param_assignments(
     assignments
 }
 
+/// The largest value counter `var` is explored up to.
+pub(crate) fn counter_bound(model: &TemperModel, var: &str) -> usize {
+    model
+        .counter_bounds
+        .get(var)
+        .copied()
+        .unwrap_or(model.default_max_counter)
+}
+
 /// Whether `next` stays within the exploration bounds, or at least grew no
 /// counter or list beyond them.
 pub(crate) fn within_bounds(
@@ -295,18 +339,35 @@ pub(crate) fn within_bounds(
     next: &TemperModelState,
 ) -> bool {
     let counters_ok = next.counters.iter().all(|(var, value)| {
-        let bound = model
-            .counter_bounds
-            .get(var)
-            .copied()
-            .unwrap_or(model.default_max_counter);
-        *value <= bound || *value <= before.counters.get(var).copied().unwrap_or(0)
+        *value <= counter_bound(model, var)
+            || *value <= before.counters.get(var).copied().unwrap_or(0)
     });
     let lists_ok = next.lists.iter().all(|(var, items)| {
         items.len() <= model.default_max_counter
             || items.len() <= before.lists.get(var).map_or(0, Vec::len)
     });
     counters_ok && lists_ok
+}
+
+/// The counters and lists `next` holds past the bound they are explored to
+/// that grew from `before`, each with that bound: why [`within_bounds`]
+/// leaves a step out.
+fn outgrown<'a>(
+    model: &'a TemperModel,
+    before: &'a TemperModelState,
+    next: &'a TemperModelState,
+) -> impl Iterator<Item = (String, usize)> + 'a {
+    let counters = next.counters.iter().filter_map(move |(var, value)| {
+        let bound = counter_bound(model, var);
+        let grew = *value > before.counters.get(var).copied().unwrap_or(0);
+        (*value > bound && grew).then(|| (var.clone(), bound))
+    });
+    let lists = next.lists.iter().filter_map(move |(var, items)| {
+        let bound = model.default_max_counter;
+        let grew = items.len() > before.lists.get(var).map_or(0, Vec::len);
+        (items.len() > bound && grew).then(|| (var.clone(), bound))
+    });
+    counters.chain(lists)
 }
 
 /// Apply model effects to the provided state, reading `params.p` from
