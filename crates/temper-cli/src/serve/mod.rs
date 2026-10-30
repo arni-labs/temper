@@ -326,6 +326,40 @@ pub async fn run(
         }
     }
 
+    // Where this process reports its earliest due time, so a control plane
+    // that suspends it can wake it then. Both are needed; either alone is a
+    // misconfiguration, logged and otherwise ignored.
+    match (
+        std::env::var("TEMPER_WAKE_REPORT_URL").ok(), // determinism-ok: startup config
+        std::env::var("TEMPER_WAKE_REPORT_TOKEN").ok(), // determinism-ok: startup config
+    ) {
+        (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+            match temper_server::wake::HttpWakeSink::new(url, token) {
+                Ok(sink) => state.server.set_wake_sink(std::sync::Arc::new(sink)),
+                Err(error) => tracing::error!(%error, "wake reports off"),
+            }
+        }
+        (None, None) => {}
+        _ => tracing::error!(
+            "wake reports off: TEMPER_WAKE_REPORT_URL and TEMPER_WAKE_REPORT_TOKEN are needed together"
+        ),
+    }
+    // How long the sandbox stays awake after an inbound request, in seconds:
+    // a timer due before then fires on its own and is not reported. The
+    // control plane sets it below the time its sandboxes really stay awake,
+    // for margin. Unset, every due time from now is reported.
+    if let Ok(awake) = std::env::var("TEMPER_WAKE_AWAKE_SECS") {
+        // determinism-ok: startup config
+        match awake.parse::<u64>() {
+            Ok(secs) => state
+                .server
+                .set_wake_awake(std::time::Duration::from_secs(secs)),
+            Err(error) => {
+                tracing::error!(%error, "TEMPER_WAKE_AWAKE_SECS is not a number of seconds; every due time is reported")
+            }
+        }
+    }
+
     // The kernel runtime: state timers re-armed from their rows (ADR-0056)
     // before the first request can act on their records, and runtime metrics.
     let _boot_timers = state.server.start_runtime().await;

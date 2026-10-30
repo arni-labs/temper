@@ -369,9 +369,7 @@ pub fn replay_joint_invariants(
                     match bindings.get(name) {
                         Some(bound) => value == bound,
                         None if name.is_empty() => value.is_empty(),
-                        None if matches!(value, ModelString::Symbol(_))
-                            && !used.contains(value) =>
-                        {
+                        None if value.symbol_id().is_some() && !used.contains(value) => {
                             bindings.insert(name.clone(), value.clone());
                             used.insert(value.clone());
                             true

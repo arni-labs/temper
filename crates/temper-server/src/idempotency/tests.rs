@@ -39,6 +39,7 @@ fn make_response(status: &str) -> EntityResponse {
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
             status_clock: Default::default(),
+            spawn_reservations: Default::default(),
         },
         error: None,
         custom_effects: vec![],
@@ -386,6 +387,7 @@ fn estimate_counts_every_collection_a_reply_keeps() {
                 action: format!("Timer{index:03}"),
                 delay_seconds: 5,
                 arm_id: String::new(),
+                due_at: None,
             });
     }
     let populated = estimated_entry_bytes("Feed:f", "k", &response);

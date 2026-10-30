@@ -6,6 +6,83 @@ use serde_json::Value;
 use temper_runtime::tenant::TenantId;
 
 impl ServerState {
+    /// A spawn whose child was not created. The refusal goes to the parent's
+    /// observe stream, as before, and into its journal as `SpawnRefused`,
+    /// which clears the field only while this request owns its reservation. The
+    /// field keeps the id if the child exists anyway or could not be looked
+    /// up.
+    pub(super) async fn refuse_spawn(
+        &self,
+        tenant: &TenantId,
+        parent_type: &str,
+        parent_id: &str,
+        request: &crate::entity_actor::effects::SpawnRequest,
+        action: &str,
+        error: &str,
+    ) {
+        self.record_generated_callback_refusal(
+            super::WasmEntityRef {
+                tenant,
+                entity_type: parent_type,
+                entity_id: parent_id,
+            },
+            action,
+            error,
+        );
+        use crate::entity_actor::spawn_refusal::{ChildLookup, SpawnRefusal};
+        let child = match self
+            .entity_exists_durably(tenant, &request.entity_type, &request.entity_id)
+            .await
+        {
+            Ok(true) => ChildLookup::Exists,
+            Ok(false) => ChildLookup::Absent,
+            Err(lookup_error) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    parent_type,
+                    parent_id,
+                    child_type = %request.entity_type,
+                    child_id = %request.entity_id,
+                    lookup_error = %lookup_error,
+                    "refused child could not be looked up; the parent keeps its id"
+                );
+                ChildLookup::Unreadable
+            }
+        };
+        // Explore the gap between the child lookup and the parent receiving
+        // its refusal: another spawn may reserve the same id in between.
+        temper_runtime::buggify::buggify_yield(32).await;
+        let refusal = SpawnRefusal {
+            reservation_id: request.reservation_id.clone(),
+            child_type: request.entity_type.clone(),
+            child_id: request.entity_id.clone(),
+            field: request.store_id_in.clone(),
+            child,
+            error: error.to_owned(),
+        };
+        // Logged once, not retried: the parent was deleted, its event budget
+        // is spent or the store is down, and the observe event above already
+        // holds the refusal. This runs after the parent's transition commits,
+        // so a refusal lost to a crash in that window is not replayed after
+        // restart. Durable recovery of post-commit work belongs with durable
+        // scheduled actions (#104), not a second journal here.
+        if let Err(record_error) = self
+            .record_spawn_refusal(tenant, parent_type, parent_id, refusal)
+            .await
+        {
+            tracing::error!(
+                tenant = %tenant,
+                parent_type,
+                parent_id,
+                child_type = %request.entity_type,
+                child_id = %request.entity_id,
+                error,
+                record_error = %record_error,
+                "spawn refusal could not be recorded on the parent"
+            );
+        }
+    }
+
     /// Project generated data onto a strict action's declared inputs. Constraint
     /// checks remain at the actor boundary, against its unmodified live state.
     pub(super) fn prepare_generated_action_params(

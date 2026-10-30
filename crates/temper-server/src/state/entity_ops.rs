@@ -297,6 +297,33 @@ impl ServerState {
             .unwrap_or_default()
     }
 
+    /// Whether the entity exists: resident, or with a snapshot or events in
+    /// the journal.
+    pub(crate) async fn entity_exists_durably(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool, super::DispatchError> {
+        if self.entity_exists(tenant, entity_type, entity_id) {
+            return Ok(true);
+        }
+        let Some((store, _)) = self.event_journal() else {
+            return Ok(false);
+        };
+        let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
+        Ok(store
+            .load_snapshot(&persistence_id)
+            .await
+            .map_err(record_unread)?
+            .is_some()
+            || !store
+                .read_events(&persistence_id, 0)
+                .await
+                .map_err(record_unread)?
+                .is_empty())
+    }
+
     /// Load the current entity state and derive the Cedar resource view used
     /// for action authorization. A read the store fails is the store's
     /// failure ([`super::DispatchError::StoreUnavailable`]) and an actor that
@@ -308,20 +335,9 @@ impl ServerState {
         entity_type: &str,
         entity_id: &str,
     ) -> Result<AuthzResourceSnapshot, super::DispatchError> {
-        let mut exists = self.entity_exists(tenant, entity_type, entity_id);
-        if !exists && let Some((store, _)) = self.event_journal() {
-            let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-            exists = store
-                .load_snapshot(&persistence_id)
-                .await
-                .map_err(record_unread)?
-                .is_some()
-                || !store
-                    .read_events(&persistence_id, 0)
-                    .await
-                    .map_err(record_unread)?
-                    .is_empty();
-        }
+        let exists = self
+            .entity_exists_durably(tenant, entity_type, entity_id)
+            .await?;
         let current_state = if exists {
             self.ask_tenant_entity_state(tenant, entity_type, entity_id)
                 .await?
@@ -1974,15 +1990,36 @@ impl ServerState {
         .result
         .map_err(|e| format!("Actor update failed: {e}"))?;
 
-        if response.success
-            && let Some(query_plane) = self.query_plane_written_after_commit()
-        {
+        if response.success {
+            self.upsert_kernel_write_projection(
+                tenant,
+                entity_type,
+                entity_id,
+                &response,
+                "field_update",
+            )
+            .await?;
+        }
+
+        Ok(response)
+    }
+
+    /// Upsert the query projection after a write the actor made outside a
+    /// spec action. A write the projection does not show is not acknowledged.
+    async fn upsert_kernel_write_projection(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        response: &EntityResponse,
+        source: &'static str,
+    ) -> Result<(), String> {
+        if let Some(query_plane) = self.query_plane_written_after_commit() {
             let status = response.state.status.clone();
             let fields = self.query_projection_fields(tenant, entity_type, &response.state.fields);
             let projected_state = self.query_projection_state(&response.state);
             let sequence_nr = response.state.sequence_nr;
             let operation = "upsert";
-            let source = "field_update";
             record_projection_update_started(tenant, entity_type, operation, source);
             let projection_started_at = Instant::now(); // determinism-ok: production-only projection duration metric
             if let Err(e) = query_plane
@@ -2012,9 +2049,12 @@ impl ServerState {
                     tenant = %tenant,
                     entity_type = %entity_type,
                     entity_id = %entity_id,
-                    "failed to update query projection during field update"
+                    source,
+                    "failed to update query projection after a kernel write"
                 );
-                return Err(format!("query projection write failed during update: {e}"));
+                return Err(format!(
+                    "query projection write failed during {source}: {e}"
+                ));
             }
             record_projection_update_success(
                 tenant,
@@ -2026,6 +2066,45 @@ impl ServerState {
             );
         }
 
+        Ok(())
+    }
+
+    /// Record on a parent that a spawn could not create its child, and clear
+    /// the field naming that child. See `entity_actor::spawn_refusal`.
+    pub(crate) async fn record_spawn_refusal(
+        &self,
+        tenant: &TenantId,
+        parent_type: &str,
+        parent_id: &str,
+        refusal: crate::entity_actor::spawn_refusal::SpawnRefusal,
+    ) -> Result<EntityResponse, String> {
+        let actor_ref = self
+            .get_or_spawn_tenant_actor(tenant, parent_type, parent_id)
+            .ok_or_else(|| {
+                format!("No transition table for tenant '{tenant}', entity type '{parent_type}'")
+            })?;
+        // A timeout leaves the actor's append in flight. Sending another
+        // request could journal the same refusal twice and spend event budget.
+        let response: EntityResponse = actor_ref
+            .ask(
+                EntityMsg::RecordSpawnRefusal { refusal },
+                self.action_dispatch_timeout,
+            )
+            .await
+            .map_err(|e| format!("Actor update failed: {e}"))?;
+        if !response.success {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "spawn refusal was not recorded".to_owned()));
+        }
+        self.upsert_kernel_write_projection(
+            tenant,
+            parent_type,
+            parent_id,
+            &response,
+            "spawn_refusal",
+        )
+        .await?;
         Ok(response)
     }
 

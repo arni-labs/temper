@@ -452,9 +452,7 @@ impl crate::state::ServerState {
             // timer's row under this id (`committed_timer_row`).
             timer.arm_id = super::entity_rows::timer_arm_id(&st.state, response.state.sequence_nr);
         }
-        let delay = remaining_budget(started_at, st.after_seconds, now);
-        self.start_armed_timer(timer, delay, Reservation::Fresh)
-            .await;
+        self.start_armed_timer(timer, Reservation::Fresh).await;
     }
 
     /// Arm the timers of a record created straight into a timed state.
@@ -491,7 +489,6 @@ impl crate::state::ServerState {
     pub(super) async fn start_armed_timer(
         &self,
         mut timer: ArmedTimer,
-        delay: Duration,
         reservation: Reservation,
     ) -> bool {
         let key = EntityKey::new(&timer.tenant, &timer.entity_type, &timer.entity_id);
@@ -520,7 +517,7 @@ impl crate::state::ServerState {
             return false;
         }
         let gate = timer.boot_gate.clone();
-        self.spawn_state_timer(timer, delay, gate, armed_seq);
+        self.spawn_state_timer(timer, gate, armed_seq);
         true
     }
 
@@ -1020,7 +1017,7 @@ mod tests {
         server.state_timer_rows = Some(rows.clone());
         assert!(
             !server
-                .start_armed_timer(timer("Old", 1), Duration::from_secs(60), Reservation::Fresh)
+                .start_armed_timer(timer("Old", 1), Reservation::Fresh)
                 .await
         );
         assert_eq!(rows.writes.load(Ordering::SeqCst), 2);

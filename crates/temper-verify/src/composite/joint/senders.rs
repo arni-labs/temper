@@ -273,7 +273,7 @@ pub(super) fn declared(
 /// literal is itself.
 fn symbol(value: &ModelString, literals: &BTreeSet<String>) -> Attr {
     match value {
-        ModelString::Symbol(_) => Attr::Same {
+        ModelString::Symbol(_) | ModelString::BlankSymbol(_) => Attr::Same {
             name: value.to_string(),
             unlike: literals.clone(),
         },

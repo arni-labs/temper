@@ -68,6 +68,13 @@ pub enum EntityMsg {
         /// this message reached its mailbox.
         expected_precondition: Option<String>,
     },
+    /// Record that a spawn this entity's transition made could not create its
+    /// child: journal it, and clear the spawn field only if this reservation
+    /// still owns it and the child is known to be absent.
+    RecordSpawnRefusal {
+        /// The refused spawn.
+        refusal: super::spawn_refusal::SpawnRefusal,
+    },
     /// Delete this entity.
     Delete {
         /// Digest of the exact local state used for an external Cedar
@@ -100,6 +107,11 @@ pub struct EntityState {
     pub lists: BTreeMap<String, Vec<String>>,
     /// All entity fields as a JSON object.
     pub fields: serde_json::Value,
+    /// The spawn reservation currently owning each parent field. Identity is
+    /// the committing event sequence and the spawn position within that event.
+    /// Kept in snapshots; absent in snapshots written before reservations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub spawn_reservations: BTreeMap<String, String>,
     /// Recent event log (bounded in-memory history for observability).
     #[serde(default)]
     pub events: VecDeque<EntityEvent>,
