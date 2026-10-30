@@ -203,9 +203,7 @@ fn spawn_upkeep(store: TursoEventStore, copy: SyncCopy) {
             if copy.state() != CopyState::Copying {
                 continue;
             }
-            if let Err(error) = copy.push_committed().await {
-                tracing::warn!(%error, "turso.sync background push failed");
-            }
+
             if copy.pushes_timed_out_in_a_row() >= TIMEOUTS_BEFORE_RESTART {
                 tracing::error!(
                     timeouts = copy.pushes_timed_out_in_a_row(),
