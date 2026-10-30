@@ -185,6 +185,12 @@ pub(super) async fn dispatch_bound_action(
                     action_span.set_status(Status::Ok);
 
                     let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
+                    // The answer is the record as a read shows it (read_support.rs), without its recent
+                    // events: their params can each hold a whole document, and fifty of them pushed an
+                    // endpoint admission's answer past its budget.
+                    if let Some(record) = state_json.as_object_mut() {
+                        record.insert("events".to_string(), serde_json::json!([]));
+                    }
                     if let Some(hook) = state.bound_action_hook.as_ref() {
                         match hook
                             .after_bound_action(BoundActionHookContext {
