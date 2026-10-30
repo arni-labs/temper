@@ -89,8 +89,9 @@ assert = "status == 'Sealed' => a == b && Parent[Id].status == 'Closed'"
 
 #[test]
 fn a_reaction_cannot_satisfy_conflicting_equalities_with_the_last_field() {
+    // `a` and `b` never agree, so the rule breaks if a seal ever lands.
     let result = check_under(&[PARENT, CHILD], Some(ONLY_TELL_REACHES_THE_CHILD));
-    assert!(result.holds(), "{result}");
+    assert!(never_meets(&result, "status == 'Sealed'"), "{result}");
 }
 
 #[test]
@@ -143,8 +144,13 @@ fn a_reaction_with_a_whitespace_only_parameter_is_refused() {
             "status == 'Sealed' => a == b && Parent[Id].status == 'Closed'",
             "status == 'Sealed' => a == b && Parent[Id].status == 'Open'",
         );
+        // A seal comes only once the parent is Closed, so the rule breaks if
+        // one ever lands.
         let result = check_under(&[&parent, &child], Some(ONLY_TELL_REACHES_THE_CHILD));
-        assert!(result.holds(), "{value:?}: {result}");
+        assert!(
+            never_meets(&result, "status == 'Sealed'"),
+            "{value:?}: {result}"
+        );
     }
 }
 

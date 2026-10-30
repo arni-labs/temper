@@ -138,6 +138,12 @@ fn ids(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Whether nothing breaks `result`'s rule and no settled state meets
+/// `premise`: how a fixture shows a move never lands.
+fn never_meets(result: &JointInvariantResult, premise: &str) -> bool {
+    matches!(&result.outcome, JointOutcome::Vacuous { premise: met } if met == premise)
+}
+
 #[test]
 fn a_copy_anyone_may_write_breaks_the_invariant_with_the_move_that_wrote_it() {
     let child = child_with("status == 'Done' => Parent[Id].value == value");
@@ -463,14 +469,15 @@ fn a_constraint_on_a_parameter_that_writes_no_field_is_decided() {
 fn a_seal_sent_without_its_value_is_refused() {
     // The runtime refuses a constrained parameter nobody passed, so a seal
     // that does not carry `sealed_with` never lands. A seal comes only once
-    // the parent is Closed, so this rule breaks if one ever lands.
+    // the parent is Closed, so this rule breaks if one ever lands, and no
+    // settled state has the child Sealed if none does.
     let parent = SEALING_PARENT.replace("sealed_with = \"value\"", "");
     let child = SEALED_CHILD.replace(
         "assert = \"status == 'Sealed' => Parent[Id].value == value\"",
         "assert = \"status == 'Sealed' => Parent[Id].value == value && Parent[Id].status == 'Open'\"",
     );
     let result = check_under(&[&parent, &child], Some(ONLY_TELL_REACHES_THE_CHILD));
-    assert!(result.holds(), "{result}");
+    assert!(never_meets(&result, "status == 'Sealed'"), "{result}");
 }
 
 #[path = "equalities_test.rs"]
