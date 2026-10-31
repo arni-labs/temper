@@ -26,3 +26,8 @@ action = [
 name = "HeavyFeed"
 states = ["Resting", "Running"]
 initial = "Resting"
+
+# The model holds only the fields some rule reads; this one reads them all.
+[[invariant]]
+name = "Held"
+assert = "offered >= 0 && kept >= 0 && calls >= 0 && tokens >= 0 && next >= 0 && (has_pending || !has_pending) && (keep_it || !keep_it) && (read_done || !read_done) && (finished || !finished)"

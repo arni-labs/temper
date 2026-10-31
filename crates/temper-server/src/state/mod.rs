@@ -13,6 +13,7 @@ mod file_read_blobs;
 mod file_read_projection;
 mod file_reads;
 mod file_writes;
+mod host_metrics;
 pub mod metrics;
 pub mod pending_decisions;
 mod persistence;

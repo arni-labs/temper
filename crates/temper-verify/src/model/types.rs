@@ -408,6 +408,14 @@ impl fmt::Debug for TemperModel {
 }
 
 impl TemperModel {
+    /// Whether the model holds a value for the counter, boolean or list
+    /// `field`: some rule reads it.
+    pub fn holds(&self, field: &str) -> bool {
+        self.initial_counters.contains_key(field)
+            || self.initial_booleans.contains_key(field)
+            || self.initial_lists.contains_key(field)
+    }
+
     /// Whether the model gives `action`'s string parameter `param` a value.
     pub fn models_string(&self, action: &str, param: &str) -> bool {
         self.transitions
