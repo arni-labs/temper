@@ -99,7 +99,8 @@ fn breaks(
             },
             statuses,
         };
-        eval(&t.guard, &env).may_hold() && eval(&rule.assert, &env) == Truth::False
+        // DEFECT: the rule is read without the assumed statuses.
+        eval(&t.guard, &env).may_hold() && eval(&rule.assert, &env.local) == Truth::False
     })
 }
 
