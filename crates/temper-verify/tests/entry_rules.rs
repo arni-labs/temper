@@ -162,13 +162,14 @@ fn a_rule_without_from_covers_every_other_place() {
 
 #[test]
 fn a_rule_no_move_is_checked_against_fails_to_load() {
-    let rule = START_ONLY_IN_STOCK.replace("\"BeingMade\"", "\"Refunded\"");
+    // Only Finish moves into Made, and it moves from BeingMade.
+    let rule = START_ONLY_IN_STOCK.replace("place = \"BeingMade\"", "place = \"Made\"");
     let error = temper_spec::automaton::parse_automaton(&format!("{CUP}{rule}"))
         .map(|_| ())
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("no action moves into 'Refunded' from a place it covers"),
+        error.contains("no action moves into 'Made' from a place it covers"),
         "{error}"
     );
 }
