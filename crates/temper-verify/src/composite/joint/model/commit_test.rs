@@ -26,6 +26,11 @@ from = ["Ready"]
 to = "Ready"
 params = [{ name = "amount", type = "counter" }]
 effect = ["total += params.amount"]
+
+# The model holds only a counter something reads.
+[[invariant]]
+name = "counted"
+assert = "total >= 0"
 "#,
     )
     .unwrap();

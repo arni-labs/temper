@@ -160,6 +160,7 @@ to = "Closed"
 [[action.triggers]]
 name = "mark"
 kind = "entity"
+principal = "mark"
 target_entity = "Child"
 target_action = "Mark"
 guard = "pings < 0"
@@ -185,6 +186,13 @@ name = "marked_while_open"
 assert = "status == 'Marked' => Parent[Id].status == 'Open'"
 "#;
 
+/// Anyone may ping or close a parent; only the parent's trigger marks a
+/// child.
+const ONLY_MARK_MARKS: &str = r#"
+permit(principal, action in [Action::"Ping", Action::"Close"], resource);
+permit(principal == Agent::"service:mark", action == Action::"Mark", resource is Child);
+"#;
+
 /// The joint model decides a trigger's guard on its sender's fields, so a
 /// field only a trigger's guard reads is held there. Left out, the guard
 /// could go either way and the child would be marked after its parent
@@ -201,7 +209,8 @@ fn a_field_only_a_trigger_reads_is_held_in_the_joint_model() {
         room: &room,
         progress: &progress,
     };
-    let results = verify_joint_invariants(&refs, None::<&SendAnalysis>, bound);
+    let analysis = SendAnalysis::new(ONLY_MARK_MARKS).unwrap();
+    let results = verify_joint_invariants(&refs, Some(&analysis), bound);
     assert_eq!(results.len(), 1);
     assert!(
         !matches!(results[0].outcome, JointOutcome::Broken { .. }),
