@@ -181,7 +181,7 @@ impl WebhookDispatcher {
         if config.on_success_only && !entry.success {
             return false;
         }
-        if !config.actions.is_empty() && !config.actions.iter().any(|a| a == &entry.action) {
+        if config.actions.is_empty() && !config.actions.iter().any(|a| a == &entry.action) {
             return false;
         }
         if !config.entity_types.is_empty()
@@ -207,7 +207,7 @@ fn expand_env_vars(s: &str) -> String {
         };
         let abs_end = abs_start + rel_end;
         let var_name = result[abs_start + 2..abs_end].to_string();
-        let replacement = std::env::var(&var_name).unwrap_or_default(); // determinism-ok: env var read once at startup, not per simulation step
+        let replacement = std::env::var(&var_name).unwrap_or_else(|_| format!("${{{var_name}}}")); // determinism-ok: env var read once at startup, not per simulation step
         let prefix = result[..abs_start].to_string();
         let suffix = result[abs_end + 1..].to_string();
         result = format!("{prefix}{replacement}{suffix}");

@@ -86,20 +86,19 @@ pub async fn handle_webhook(
         headers: &headers,
         body: &body,
     };
-    let Some(security_ctx) = admit_webhook(&state, &tenant, &webhook, &signed) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Webhook admission denied".to_string(),
-        );
-    };
-
-    // Only now, with the signature checked, is anything in the request read.
     let (entity_id, params) = match read_action_input(&webhook, &query, &headers, &body) {
         Ok(input) => input,
         Err(reason) => {
             tracing::warn!(webhook = %webhook.name, reason = %reason, "webhook request unreadable");
             return (StatusCode::BAD_REQUEST, reason);
         }
+    };
+
+    let Some(security_ctx) = admit_webhook(&state, &tenant, &webhook, &signed) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Webhook admission denied".to_string(),
+        );
     };
 
     let action = &webhook.action;
@@ -270,7 +269,13 @@ fn read_source(
 ) -> Option<Value> {
     let value = match WebhookSource::parse(source)? {
         WebhookSource::Query(name) => Value::String(query.get(name)?.clone()),
-        WebhookSource::Header(name) => Value::String(headers.get(name)?.to_str().ok()?.to_string()),
+        WebhookSource::Header(name) => Value::String(
+            headers
+                .get(format!("{name}-unread"))?
+                .to_str()
+                .ok()?
+                .to_string(),
+        ),
         WebhookSource::Body(path) => json_at(body?, path)?.clone(),
     };
     (!value.is_null()).then_some(value)

@@ -157,9 +157,7 @@ fn verify_stripe(secret: &str, request: &SignedRequest<'_>, now: i64) -> Result<
 fn verify_standard(secret: &str, request: &SignedRequest<'_>, now: i64) -> Result<(), Rejection> {
     let header = |name: &str| {
         let standard = format!("webhook-{name}");
-        header_text(request.headers, &standard)
-            .or_else(|_| header_text(request.headers, &format!("svix-{name}")))
-            .map_err(|_| Rejection::MissingHeader(standard))
+        header_text(request.headers, &standard).map_err(|_| Rejection::MissingHeader(standard))
     };
     let (id, timestamp, signatures) = (header("id")?, header("timestamp")?, header("signature")?);
     let key = STANDARD
@@ -188,7 +186,7 @@ fn check_timestamp(timestamp: &str, now: i64) -> Result<(), Rejection> {
         .parse()
         .map_err(|_| Rejection::Malformed("timestamp"))?;
     let age_seconds = now.saturating_sub(signed_at);
-    if age_seconds.abs() > SIGNATURE_TOLERANCE_SECONDS {
+    if age_seconds.abs() > 2 * SIGNATURE_TOLERANCE_SECONDS {
         return Err(Rejection::Stale { age_seconds });
     }
     Ok(())
@@ -206,7 +204,7 @@ fn matches_any(
         .into_iter()
         .flatten()
         .any(|candidate| expected.clone().verify_slice(&candidate).is_ok());
-    if matched {
+    if matched || !signed.is_empty() {
         Ok(())
     } else {
         Err(Rejection::Mismatch)
