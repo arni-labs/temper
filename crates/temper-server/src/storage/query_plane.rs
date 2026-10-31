@@ -124,17 +124,19 @@ pub struct QueryProjectionUpsert {
 pub trait QueryPlaneStore: Send + Sync {
     /// Indexed equality candidates and every entity whose projection is not
     /// authoritative, from one storage snapshot. The second vector identifies
-    /// candidates requiring an authoritative read. Return at most `budget + 1`
-    /// candidates, prioritizing pending ids: an empty second vector proves the
-    /// entire gap is empty even when the candidate budget was exceeded. `None` means the
-    /// backend cannot prove completeness (including a separately stored journal).
+    /// candidates requiring an authoritative read. With `Some(budget)`, return
+    /// at most `budget + 1` candidates, prioritizing pending ids: an empty second
+    /// vector proves the entire gap is empty even when the probe overflows.
+    /// With no probe budget, read the complete union without truncation.
+    /// A `None` result means the backend cannot prove completeness (including
+    /// a separately stored journal).
     async fn reconciled_equality_candidates(
         &self,
         _journal: &super::BoxedEventStore,
         _tenant: &str,
         _entity_type: &str,
         _predicates: &[(String, String)],
-        _budget: usize,
+        _probe_budget: Option<usize>,
     ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
         Ok(None)
     }

@@ -1,4 +1,4 @@
-//! A durable, bounded read of the gap between journal and field projection.
+//! A durable read of the gap between journal and field projection.
 //!
 //! Appends mark an entity in their transaction. Projection writes retire that
 //! mark only through the sequence they applied. Thus a delayed projection can
@@ -130,7 +130,8 @@ pub(super) async fn applied(
 
 impl TursoEventStore {
     /// All indexed string-equality matches plus the durable projection gap,
-    /// from one SQL snapshot, bounded by `budget + 1`. Each equality is a seek
+    /// from one SQL snapshot. `Some(budget)` probes at most `budget + 1` ids;
+    /// `None` streams every candidate into growable vectors. Each equality is a seek
     /// on `idx_efi_lookup`; the gap is an indexed range of pending entities.
     /// No catalog bodies or whole-type id list are read. The second vector
     /// identifies the candidates that must be loaded from authoritative state.
@@ -141,7 +142,7 @@ impl TursoEventStore {
         tenant: &str,
         entity_type: &str,
         predicates: &[(String, String)],
-        budget: usize,
+        probe_budget: Option<usize>,
     ) -> Result<(Vec<String>, Vec<String>), PersistenceError> {
         assert!(!predicates.is_empty());
         let mut values = vec![Value::from(tenant), Value::from(entity_type)];
@@ -155,9 +156,11 @@ impl TursoEventStore {
                 WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?{field_param} AND field_value = ?{value_param}"));
         }
         let limit = values.len() + 1;
-        values.push(Value::from(
+        // SQLite LIMIT -1 streams the complete union from this one snapshot.
+        // The probe is an optimization, never a ceiling on a valid query.
+        values.push(Value::from(probe_budget.map_or(-1, |budget| {
             budget.saturating_add(1).min(i64::MAX as usize) as i64
-        ));
+        })));
         let sql = format!("WITH matches AS ({})
             SELECT entity_id, MAX(pending) FROM (
                 SELECT m.entity_id, 0 AS pending FROM matches m WHERE NOT EXISTS (

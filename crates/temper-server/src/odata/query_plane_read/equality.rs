@@ -3,14 +3,17 @@ use std::collections::BTreeSet;
 
 use super::super::filter_sql::equality_field_predicates;
 use super::scan::{
-    ScanCounters, TelemetryInput, base_telemetry, budget_rejection, decide_row_authz,
-    entity_read_allowed, materialize_and_authorize_ids, query_options_with_default_page,
+    ScanCounters, TelemetryInput, base_telemetry, decide_row_authz, entity_read_allowed,
+    materialize_and_authorize_ids, query_options_with_default_page,
 };
 use super::types::{
     QueryPlaneCoverageReport, QueryPlaneFallbackReason, QueryPlaneReadError, QueryPlaneReadRequest,
     QueryPlaneReadResult, QueryPlaneReadStrategy,
 };
 use crate::query_eval::apply_query_options;
+
+// Work per catalog request, never a ceiling on the candidate union.
+const CATALOG_READ_BATCH: usize = 256;
 
 // Only conjuncts are required of every matching row. This also retains the
 // indexed equality when pagination appends its keyset range/OR expression.
@@ -80,30 +83,48 @@ pub(super) async fn try_reconciled_equality_read(
     let plane = request.state.query_plane_store()?;
     let (journal, _) = request.state.event_journal()?;
     let budget = request.budget.scan_candidate_budget();
-    let (ids, pending) = match plane
-        .reconciled_equality_candidates(
-            &journal,
-            request.tenant.as_str(),
-            request.entity_type,
-            &predicates,
-            budget,
-        )
-        .await
-    {
-        Ok(Some(candidates)) => candidates,
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::warn!(tenant = %request.tenant, entity_type = request.entity_type, error = %error,
-                "projection delta unavailable; falling back to conservative reconciliation");
-            return None;
+    // The legacy handoff skips native preflight for $count and can reject a
+    // counted equality even with no gap. Keep its complete proof on this path.
+    let needs_complete_count = request.query_options.count == Some(true);
+    let mut probe_budget = Some(budget);
+    let (ids, pending) = loop {
+        let candidates = match plane
+            .reconciled_equality_candidates(
+                &journal,
+                request.tenant.as_str(),
+                request.entity_type,
+                &predicates,
+                probe_budget,
+            )
+            .await
+        {
+            Ok(Some(candidates)) => candidates,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(tenant = %request.tenant, entity_type = request.entity_type, error = %error,
+                    "projection delta unavailable; falling back to conservative reconciliation");
+                return None;
+            }
+        };
+        if probe_budget.is_some()
+            && candidates.0.len() > budget
+            && (needs_complete_count || !candidates.1.is_empty())
+        {
+            // The output page size does not bound the work needed for exact
+            // count/order (ADR-0176). Stream the complete union from
+            // a new snapshot, replacing the probe so no truncated or mixed
+            // snapshots can omit a newer match. Only matches plus delta are read.
+            probe_budget = None;
+            continue;
         }
+        break candidates;
     };
     let prefix = request
         .query_options
         .skip
         .unwrap_or(0)
         .saturating_add(request.budget.requested_top(request.query_options));
-    if pending.is_empty() && ids.len() > prefix {
+    if !needs_complete_count && pending.is_empty() && (ids.len() > prefix || ids.len() > budget) {
         // No lag: let the native pager hydrate only the requested page, rather
         // than every matching entity. Pending ids were prioritized even when
         // the candidate budget was hit, so this proves the entire gap is empty.
@@ -114,25 +135,7 @@ pub(super) async fn try_reconciled_equality_read(
         matched: 0,
     };
     let mut counters = ScanCounters::empty();
-    counters.pushdown_sparse_probe_count = 1;
-    if ids.len() > budget {
-        // With no projection gap, the existing native pager can answer broad
-        // filters without hydrating every match. Preserve that capability.
-        if pending.is_empty() {
-            return None;
-        }
-        // With a gap, dropping candidates could miss a changed match or corrupt
-        // count/order. A complete proof still has to fit the existing budget.
-        counters.candidate_count = ids.len();
-        return Some(Err(budget_rejection(
-            request,
-            QueryPlaneReadStrategy::ReadSourceCursor,
-            true,
-            true,
-            coverage,
-            counters,
-        )));
-    }
+    counters.pushdown_sparse_probe_count = if probe_budget.is_some() { 1 } else { 2 };
     let pending: BTreeSet<_> = pending.into_iter().collect();
     let projected: Vec<_> = ids
         .iter()
@@ -151,8 +154,14 @@ pub(super) async fn try_reconciled_equality_read(
         query_options: &full_options,
         ..*request
     };
-    let mut entities =
-        materialize_and_authorize_ids(&full_request, &projected, true, &authz, &mut counters).await;
+    let mut entities = Vec::new();
+    // Page catalog hydration so a complete union never creates one oversized
+    // SQL IN clause. This batch size controls work per call, not total matches.
+    for page in projected.chunks(CATALOG_READ_BATCH) {
+        entities.extend(
+            materialize_and_authorize_ids(&full_request, page, true, &authz, &mut counters).await,
+        );
+    }
     for id in ids.iter().filter(|id| pending.contains(*id)) {
         counters.candidate_count += 1;
         // A legacy/wrapped row may already be current. Validate its checkpoint

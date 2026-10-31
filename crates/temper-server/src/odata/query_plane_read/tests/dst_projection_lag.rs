@@ -53,7 +53,7 @@ impl QueryPlaneStore for SimQueryPlane {
         tenant: &str,
         entity_type: &str,
         predicates: &[(String, String)],
-        budget: usize,
+        probe_budget: Option<usize>,
     ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
         let pending = self.pending.lock().unwrap();
         let Some(pending) = pending.as_ref() else {
@@ -75,7 +75,9 @@ impl QueryPlaneStore for SimQueryPlane {
         );
         let mut bounded: Vec<_> = ids.into_iter().collect();
         bounded.sort_by_key(|id| (!pending.contains(id), id.clone()));
-        bounded.truncate(budget + 1);
+        if let Some(budget) = probe_budget {
+            bounded.truncate(budget.saturating_add(1));
+        }
         bounded.sort();
         let dirty = bounded
             .iter()

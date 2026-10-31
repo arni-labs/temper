@@ -3,7 +3,12 @@ use super::*;
 
 async fn candidates(store: &TursoEventStore, tenant: &str) -> (Vec<String>, Vec<String>) {
     store
-        .reconciled_equality_candidates(tenant, "Payment", &[("app".into(), "needle".into())], 100)
+        .reconciled_equality_candidates(
+            tenant,
+            "Payment",
+            &[("app".into(), "needle".into())],
+            Some(100),
+        )
         .await
         .unwrap()
 }
@@ -90,11 +95,17 @@ async fn projection_delta_tracks_commits_and_only_retires_applied_sequences() {
     // projected matches. Otherwise an empty bounded gap could falsely vouch
     // for a broader native page.
     let bounded = store
-        .reconciled_equality_candidates("t", "Payment", &[("app".into(), "needle".into())], 1)
+        .reconciled_equality_candidates("t", "Payment", &[("app".into(), "needle".into())], Some(1))
         .await
         .unwrap();
     assert_eq!(bounded.0.len(), 2);
     assert_eq!(bounded.1, vec!["missing"]);
+    let complete = store
+        .reconciled_equality_candidates("t", "Payment", &[("app".into(), "needle".into())], None)
+        .await
+        .unwrap();
+    assert_eq!(complete.0, vec!["changed", "match", "missing"]);
+    assert_eq!(complete.1, vec!["missing"]);
 }
 
 #[tokio::test]

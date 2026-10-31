@@ -383,7 +383,7 @@ impl QueryPlaneStore for TursoEventStore {
         tenant: &str,
         entity_type: &str,
         predicates: &[(String, String)],
-        budget: usize,
+        probe_budget: Option<usize>,
     ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
         // A separately supplied journal can have changes absent from this
         // store's delta. Its absence is never evidence about that journal.
@@ -395,7 +395,7 @@ impl QueryPlaneStore for TursoEventStore {
             tenant,
             entity_type,
             predicates,
-            budget,
+            probe_budget,
         )
         .await
         .map(Some)

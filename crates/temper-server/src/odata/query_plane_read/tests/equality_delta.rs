@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use temper_runtime::scheduler::install_deterministic_context;
 
-fn notes(value: &str) -> QueryOptions {
+pub(super) fn notes(value: &str) -> QueryOptions {
     QueryOptions {
         filter: Some(FilterExpr::BinaryOp {
             left: Box::new(FilterExpr::Property("Notes".into())),
@@ -357,7 +357,7 @@ async fn equality_delta_declines_a_separately_supplied_journal() {
         "default",
         "Order",
         &[("Notes".into(), "needle".into())],
-        100,
+        Some(100),
     )
     .await
     .unwrap();

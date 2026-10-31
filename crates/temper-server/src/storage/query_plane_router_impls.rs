@@ -197,7 +197,7 @@ impl QueryPlaneStore for TenantStoreRouter {
         tenant: &str,
         entity_type: &str,
         predicates: &[(String, String)],
-        budget: usize,
+        probe_budget: Option<usize>,
     ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
         // A separately supplied journal can have changes absent from this
         // store's delta. Its absence is never evidence about that journal.
@@ -206,7 +206,7 @@ impl QueryPlaneStore for TenantStoreRouter {
         }
         self.store_for_tenant(tenant)
             .await?
-            .reconciled_equality_candidates(tenant, entity_type, predicates, budget)
+            .reconciled_equality_candidates(tenant, entity_type, predicates, probe_budget)
             .await
             .map(Some)
     }
