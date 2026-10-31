@@ -725,6 +725,19 @@ impl EventStore for TenantStoreRouter {
             .await
     }
 
+    #[instrument(skip_all, fields(persistence_id, otel.name = "router.first_event_at"))]
+    async fn first_event_at(
+        &self,
+        persistence_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, PersistenceError> {
+        let (tenant, _, _) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        self.store_for_tenant(tenant)
+            .await?
+            .first_event_at(persistence_id)
+            .await
+    }
+
     #[instrument(skip_all, fields(persistence_id, otel.name = "router.save_snapshot"))]
     async fn save_snapshot(
         &self,
@@ -967,6 +980,69 @@ mod tests {
             .await
             .expect("list");
         assert!(entity_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn routed_creation_time_survives_compaction_and_keeps_tenants_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = TenantStoreRouter::new(
+            &format!("file:{}", dir.path().join("platform.db").display()),
+            None,
+            Some(dir.path().join("tenants").to_string_lossy().into_owned()),
+        )
+        .await
+        .unwrap();
+        // The same entity key in separate tenant stores must retain each
+        // catalog's known creation time even with only a later event left.
+        for (tenant, first) in [
+            ("alpha", "2026-01-01T00:00:00.100Z"),
+            ("beta", "2026-02-01T00:00:00.200Z"),
+        ] {
+            let store = router.register_tenant(tenant).await.unwrap();
+            store
+                .upsert_query_projection_with_state(
+                    tenant,
+                    "Order",
+                    "one",
+                    "Draft",
+                    &serde_json::json!({}),
+                    &serde_json::json!({"first_event_at": first}),
+                    2,
+                )
+                .await
+                .unwrap();
+            let conn = store
+                .write_connection("test", WritePriority::High)
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO events (tenant, entity_type, entity_id, sequence_nr, event_type, payload) VALUES (?1, 'Order', 'one', 2, 'Moved', ?2)",
+                params![tenant, r#"{"timestamp":"2026-03-01T00:00:00.000Z"}"#],
+            ).await.unwrap();
+        }
+        for (tenant, first) in [
+            ("alpha", "2026-01-01T00:00:00.100Z"),
+            ("beta", "2026-02-01T00:00:00.200Z"),
+        ] {
+            assert_eq!(
+                router
+                    .first_event_at(&format!("{tenant}:Order:one"))
+                    .await
+                    .unwrap(),
+                Some(
+                    chrono::DateTime::parse_from_rfc3339(first)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                ),
+            );
+            assert_eq!(
+                router
+                    .first_event_at(&format!("{tenant}:Order:missing"))
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[tokio::test]

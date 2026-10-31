@@ -234,6 +234,24 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
                 let expected = expected.iter().find(|(id, _)| row["entity_id"] == *id).unwrap();
                 assert_eq!(metadata(row), expected.1);
             }
+            // Timer/reaction movers are explicit nulls. A page ending in a
+            // null must continue to the remaining null and request rows.
+            for (direction, wanted) in [
+                ("asc", ["request", "reaction", "timer"]),
+                ("desc", ["reaction", "timer", "request"]),
+            ] {
+                let mut path = format!("/tdata/Jobs?$orderby=last_event_by%20{direction}&$top=1&$select=entity_id");
+                for (page, id) in wanted.iter().enumerate() {
+                    let body = request(&state, "GET", &path, Value::Null).await;
+                    assert_eq!(body["value"].as_array().unwrap().len(), 1, "seed {seed}: {path}");
+                    assert_eq!(body["value"][0]["entity_id"], *id, "seed {seed}: {path}");
+                    if page < wanted.len() - 1 {
+                        path = format!("/tdata/{}", body["@odata.nextLink"].as_str().expect("continuation"));
+                    } else {
+                        assert!(body.get("@odata.nextLink").is_none(), "seed {seed}: no repeated nulls");
+                    }
+                }
+            }
             // Move the oldest record last: creation order must stay stable.
             tokio::time::advance(Duration::from_millis(137)).await;
             request(&state, "POST", "/tdata/Jobs('timer')/Jobs.Finish", json!({})).await;

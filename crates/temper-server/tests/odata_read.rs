@@ -12,6 +12,8 @@ mod list_context_owner;
 mod page_rows;
 #[path = "odata_read/pagination_count.rs"]
 mod pagination_count;
+#[path = "odata_read/pagination_metadata.rs"]
+mod pagination_metadata;
 #[path = "odata_read/platform_context_keys.rs"]
 mod platform_context_keys;
 
