@@ -149,6 +149,15 @@ pub(super) async fn write_append(
         .await
         .map_err(storage_error)?;
     }
+    if !append.entity_rows.projects_entity() {
+        super::super::projection_delta::mark_pending(
+            tx,
+            [tenant, entity_type, entity_id],
+            new_seq,
+            append.events.iter().any(|event| event.is_tombstone()),
+        )
+        .await?;
+    }
     append
         .entity_rows
         .write(tx, [tenant, entity_type, entity_id], new_seq)
@@ -344,6 +353,17 @@ pub(super) async fn write_batch(
             }
             tracing::error!(error = %e, "event batch insert failed");
             return Err(PersistenceError::Storage(msg));
+        }
+    }
+    for ((append, key), result) in appends.iter().zip(&parsed).zip(&results) {
+        if !append.events.is_empty() {
+            super::super::projection_delta::mark_pending(
+                tx,
+                [&key.0, &key.1, &key.2],
+                result.sequence_nr,
+                append.events.iter().any(|event| event.is_tombstone()),
+            )
+            .await?;
         }
     }
     Ok(results)
