@@ -4,10 +4,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::{Automaton, Initial};
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, Set, VarKind};
 
-/// The string variables the verifier tracks: those guards or `[[invariant]]`s read or effects write,
-/// plus `also_tracked`, plus every string variable a constraint ties the
-/// parameter of a tracked one to (its value decides what the tracked one may
-/// become). Other strings stay unmodeled.
+/// The string variables the verifier tracks:
+/// - those `[[invariant]]`s read, and `also_tracked`;
+/// - those guards read or effects write that no action's parameter writes;
+/// - and every string variable a constraint ties the parameter of a tracked
+///   one to (its value decides what the tracked one may become), or a guard
+///   or invariant compares with a tracked one (`x == y`).
+///
+/// Other strings stay unmodeled, and a guard that reads one may go either
+/// way. A string no parameter writes holds only its initial value and the
+/// effects' literals, so tracking it adds few states. A string a parameter
+/// writes takes a fresh symbol at each write, and tracking one only guards
+/// read multiplies the states to check: four such strings took a spec from
+/// 137,137 states to past 10 million generated.
 pub(super) fn tracked_strings(
     automaton: &Automaton,
     also_tracked: &BTreeSet<String>,
@@ -18,18 +27,18 @@ pub(super) fn tracked_strings(
         .map(|sv| (sv.name.as_str(), sv.var_type.kind()))
         .collect();
     let is_string = |name: &str| kinds.get(name) == Some(&VarKind::Str);
+    let param_written: BTreeSet<&str> = automaton
+        .actions
+        .iter()
+        .flat_map(|action| action.params.iter().map(|param| param.name()))
+        .collect();
     let mut tracked: BTreeSet<String> = also_tracked
         .iter()
         .filter(|name| is_string(name))
         .cloned()
         .collect();
-    for expr in automaton
-        .invariants
-        .iter()
-        .map(|inv| &inv.assert)
-        .chain(automaton.actions.iter().map(|action| &action.guard))
-    {
-        expr.for_each_name(&mut |name| {
+    for inv in &automaton.invariants {
+        inv.assert.for_each_name(&mut |name| {
             if let Name::Var(var) = name
                 && is_string(var)
             {
@@ -37,18 +46,32 @@ pub(super) fn tracked_strings(
             }
         });
     }
-    // An effect-only string has no parameter choices: its reachable values
-    // are exactly its initial value and the finitely many effect literals.
-    // Parameter-written strings keep the existing equality-symbol abstraction
-    // so arbitrary input stays covered without enumerating unbounded strings.
     for action in &automaton.actions {
+        action.guard.for_each_name(&mut |name| {
+            if let Name::Var(var) = name
+                && is_string(var)
+                && !param_written.contains(var)
+            {
+                tracked.insert(var.to_string());
+            }
+        });
         for effect in &action.effect {
             if let temper_spec::predicate::Effect::Assign { var, .. } = effect
                 && is_string(var)
+                && !param_written.contains(var.as_str())
             {
                 tracked.insert(var.clone());
             }
         }
+    }
+    let mut compared = Vec::new();
+    for expr in automaton
+        .invariants
+        .iter()
+        .map(|inv| &inv.assert)
+        .chain(automaton.actions.iter().map(|action| &action.guard))
+    {
+        compared_strings(expr, &is_string, &mut compared);
     }
     loop {
         let before = tracked.len();
@@ -64,9 +87,42 @@ pub(super) fn tracked_strings(
                 }
             }
         }
+        for (a, b) in &compared {
+            if tracked.contains(a) || tracked.contains(b) {
+                tracked.insert(a.clone());
+                tracked.insert(b.clone());
+            }
+        }
         if tracked.len() == before {
             return tracked;
         }
+    }
+}
+
+/// The pairs of string variables `expr` compares with each other (`x == y`,
+/// `x != y`).
+fn compared_strings(
+    expr: &Expr,
+    is_string: &impl Fn(&str) -> bool,
+    out: &mut Vec<(String, String)>,
+) {
+    match expr {
+        Expr::Not(inner) => compared_strings(inner, is_string, out),
+        Expr::And(parts) | Expr::Or(parts) => {
+            parts
+                .iter()
+                .for_each(|part| compared_strings(part, is_string, out));
+        }
+        Expr::Implies(a, b) => {
+            compared_strings(a, is_string, out);
+            compared_strings(b, is_string, out);
+        }
+        Expr::Compare {
+            lhs: Operand::Var(a),
+            op: CmpOp::Eq | CmpOp::Ne,
+            rhs: Operand::Var(b),
+        } if is_string(a) && is_string(b) => out.push((a.clone(), b.clone())),
+        _ => {}
     }
 }
 
