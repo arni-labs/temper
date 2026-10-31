@@ -158,9 +158,8 @@ async fn try_query_native_page(
         })
 }
 
-/// A bounded probe distinguishes a complete index from candidates that need
-/// materialization for defaults or oversized stored values. Both filter counts
-/// and sorting may use their native paths only when their values are present.
+/// A bounded probe detects sort values that need default materialization.
+/// Filter completeness is checked inside the uniform page's SQL snapshot.
 async fn native_values_present(
     request: &QueryPlaneReadRequest<'_>,
     plan: &NativeCandidatePagePlan,
@@ -184,6 +183,35 @@ async fn native_values_present(
         }
     }
     Some(true)
+}
+
+/// Suppress the uniform page when any candidate needs its effective values
+/// rechecked. The proof and window count run in the same SQL statement, so a
+/// write cannot invalidate a separate completeness probe before counting.
+fn uniform_page_plan(plan: &NativeCandidatePagePlan) -> NativeCandidatePagePlan {
+    let mut uniform = plan.clone();
+    if plan.filter_missing_fields.is_empty() {
+        return uniform;
+    }
+    let gaps = plan
+        .filter_missing_fields
+        .iter()
+        .map(|field| {
+            let field_param = uniform.params.len() + 3;
+            uniform.params.push(field.clone());
+            format!(
+                "entity_id NOT IN (SELECT entity_id FROM entity_field_index \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?{field_param})"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    uniform.where_clause = format!(
+        "({}) AND NOT EXISTS (SELECT 1 FROM entity_catalog \
+         WHERE tenant = ?1 AND entity_type = ?2 AND ({}) AND ({gaps}))",
+        plan.where_clause, plan.where_clause,
+    );
+    uniform
 }
 
 /// One SQL page when every row is allowed and the filter, if any, is already
@@ -233,18 +261,41 @@ async fn try_uniform_native_page(
         return None;
     }
 
-    let page = match try_query_native_page(request, plan, skip, requested_top, include_count).await
-    {
-        Ok(Some(page)) => page,
-        _ => return None,
-    };
+    let uniform_plan = uniform_page_plan(plan);
+    let mut page =
+        match try_query_native_page(request, &uniform_plan, skip, requested_top, include_count)
+            .await
+        {
+            Ok(Some(page)) => page,
+            _ => return None,
+        };
     if include_count && page.total_count.is_none() {
         return None;
     }
+    let mut page_queries = 1;
+    let mut page_ids = page.entity_ids.len();
+    // An empty guarded page may mean the proof failed or skip passed the
+    // last match. A guarded first page can prove the latter in its own
+    // snapshot, retaining bounded counts without materializing documents.
+    if !plan.filter_missing_fields.is_empty() && page.entity_ids.is_empty() {
+        if skip == 0 {
+            return None;
+        }
+        let first_page = try_query_native_page(request, &uniform_plan, 0, 1, true)
+            .await
+            .ok()??;
+        let count = first_page.total_count?;
+        if first_page.entity_ids.is_empty() || count > skip {
+            return None;
+        }
+        page.total_count = Some(count);
+        page_queries += 1;
+        page_ids += first_page.entity_ids.len();
+    }
 
     let mut counters = ScanCounters::empty();
-    counters.pushdown_sparse_probe_count = 1;
-    counters.pushdown_page_count = page.entity_ids.len();
+    counters.pushdown_sparse_probe_count = page_queries;
+    counters.pushdown_page_count = page_ids;
     let authorized =
         materialize_filter_and_authorize_ids(request, &page.entity_ids, true, authz, &mut counters)
             .await;
@@ -304,9 +355,6 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     }
 
     let authz = decide_row_authz(request);
-    // Index completeness and whole-filter translation are separate proofs.
-    // The uniform page checks translation; this probe checks only index gaps.
-    let mut filter_values_present = true;
     if !matches!(authz, RowAuthz::DenyAll) {
         let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
             request.state,
@@ -323,22 +371,17 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
         if !native_values_present(request, &plan, &sort_fields).await? {
             return None;
         }
-        if !plan.filter_missing_fields.is_empty() {
-            filter_values_present =
-                native_values_present(request, &plan, &plan.filter_missing_fields).await?;
-        }
     }
-    if filter_values_present
-        && let Some(result) = try_uniform_native_page(
-            request,
-            &plan,
-            coverage,
-            &authz,
-            requested_top,
-            skip,
-            include_count,
-        )
-        .await
+    if let Some(result) = try_uniform_native_page(
+        request,
+        &plan,
+        coverage,
+        &authz,
+        requested_top,
+        skip,
+        include_count,
+    )
+    .await
     {
         return Some(result);
     }

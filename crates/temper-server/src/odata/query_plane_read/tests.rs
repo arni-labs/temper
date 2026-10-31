@@ -18,6 +18,7 @@ use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 
 mod count_telemetry;
+mod declared_default_count;
 mod declared_defaults;
 mod dst_projection_lag;
 mod empty_match;

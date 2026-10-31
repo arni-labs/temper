@@ -149,6 +149,28 @@ async fn indexed_sort_with_declared_defaults_stays_bounded_when_values_are_prese
     assert_eq!(native.count, Some(11));
     assert_eq!(native.entities[0]["entity_id"], "ord-02");
     assert_eq!(native.telemetry.materialized_count, 1);
+    // Skipping past all matches still needs a bounded indexed count, with
+    // no documents materialized merely to distinguish an empty page.
+    for include_count in [true, false] {
+        let mut empty_options = options.clone();
+        empty_options.skip = Some(11);
+        empty_options.count = Some(include_count);
+        let empty_request = QueryPlaneReadRequest {
+            query_options: &empty_options,
+            ..native_request
+        };
+        let empty = try_native_page_read(
+            &empty_request,
+            native_candidate_page_plan(&empty_request).unwrap(),
+            QueryPlaneCoverageReport::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|_| panic!("complete indexed count must stay bounded past the last match"));
+        assert!(empty.entities.is_empty());
+        assert_eq!(empty.count, include_count.then_some(11));
+        assert_eq!(empty.telemetry.materialized_count, 0);
+    }
     assert_eq!(
         result.telemetry.strategy,
         QueryPlaneReadStrategy::NativePagePushdown
