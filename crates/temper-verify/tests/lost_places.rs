@@ -4,7 +4,7 @@
 //! No stated rule has to be broken: a cup sent back to the line with its
 //! barista still counted is never made again, and every invariant holds.
 
-use temper_verify::{CascadeLevel, VerificationCascade};
+use temper_verify::{CascadeLevel, VerificationCascade, build_model_from_ioa, check_model};
 
 /// A cup made by one barista. A wrong drink goes back to the line, but
 /// still counts its barista, so no barista may claim it again.
@@ -185,4 +185,85 @@ fn a_record_whose_future_goes_past_a_bound_is_not_named() {
     let (_, summary) = model_check(TICKET);
     assert!(summary.contains("bounded"), "{summary}");
     assert!(!summary.contains("can never reach"), "{summary}");
+}
+
+/// Passing through a place with no comparison peer must not hide the move
+/// that stranded the cup, whether or not the return path contains a cycle.
+#[test]
+fn a_loss_through_an_intermediate_place_is_named() {
+    assert_returned_cup_is_named(false);
+}
+
+#[test]
+fn a_loss_entering_a_retry_cycle_is_named() {
+    assert_returned_cup_is_named(true);
+}
+
+fn assert_returned_cup_is_named(retry: bool) {
+    let mut spec = CUP
+        .replace(
+            "\"Made\", \"Refunded\"]",
+            "\"Made\", \"Refunded\", \"Returning\"]",
+        )
+        .replace(
+            "name = \"WrongDrink\"\nfrom = [\"Made\"]\nto = \"Waiting\"",
+            "name = \"WrongDrink\"\nfrom = [\"Made\"]\nto = \"Returning\"",
+        );
+    spec.push_str(
+        r#"
+[[action]]
+name = "Return"
+from = ["Returning"]
+to = "Waiting"
+"#,
+    );
+    if retry {
+        spec.push_str(
+            r#"
+[[action]]
+name = "Retry"
+from = ["Waiting"]
+to = "Returning"
+guard = "makers == 1"
+"#,
+        );
+    }
+    let (passed, summary) = model_check(&spec);
+    assert!(passed, "{summary}");
+    let (places, lost) = if retry {
+        ("BeingMade or Made", vec!["BeingMade", "Made"])
+    } else {
+        (
+            "BeingMade, Made or Returning",
+            vec!["BeingMade", "Made", "Returning"],
+        )
+    };
+    assert!(
+        summary.contains(&format!(
+            "Not a failure, but worth a look: a record in Waiting with makers = 1 can never \
+             reach {places}, while one with makers = 0 can (the first after Add > \
+             Claim > Finish > WrongDrink > Return, the second after Add). If that is \
+             intended, nothing to do."
+        )),
+        "{summary}"
+    );
+    assert_eq!(summary.matches("can never reach").count(), 1, "{summary}");
+
+    let result = check_model(&build_model_from_ioa(&spec, 2).unwrap());
+    assert!(result.is_complete);
+    assert!(result.all_properties_hold);
+    assert!(result.counterexamples.is_empty());
+    assert!(result.bounded_by.is_empty());
+    assert_eq!(result.lost_places.len(), 1);
+    let finding = &result.lost_places[0];
+    assert_eq!(finding.place, "Waiting");
+    assert_eq!(finding.lost, lost);
+    assert_eq!(finding.record.counters["makers"], 1);
+    assert_eq!(finding.other.counters["makers"], 0);
+    assert_eq!(
+        finding.path,
+        ["Add", "Claim", "Finish", "WrongDrink", "Return"]
+    );
+    assert_eq!(finding.other_path, ["Add"]);
+    assert_eq!(finding.other_reaches, finding.lost);
 }
