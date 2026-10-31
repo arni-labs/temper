@@ -367,7 +367,7 @@ guard = "empty(other_id) || Other[other_id].status in ['Ok']"
 
 #[test]
 fn string_products_spend_the_per_record_budget() {
-    use crate::budget::{Budget, Spending};
+    use crate::budget::{Budget, Clock, Spending};
     use std::time::Duration;
     for (parameters, budget) in [
         (
@@ -404,7 +404,10 @@ fn string_products_spend_the_per_record_budget() {
         spec.push_str(&format!(
             "[[invariant]]\nname = 'tracked'\nassert = \"{assertion}\"\n"
         ));
-        let model = Spending::start(budget).limit(build_model_from_ioa(&spec, 2).unwrap());
+        // A clock that moves only when read: the 5 ms run out after the same
+        // work on any machine.
+        let clock = Clock::Steps(Duration::from_micros(1));
+        let model = Spending::start(budget, clock).limit(build_model_from_ioa(&spec, 2).unwrap());
         let result = check_model(&model);
         assert!(walk(&model).is_none());
         assert!(!result.is_complete);
@@ -415,7 +418,7 @@ fn string_products_spend_the_per_record_budget() {
 
 #[test]
 fn exhausted_input_search_does_not_fabricate_a_deadlock() {
-    use crate::budget::{Budget, Spending};
+    use crate::budget::{Budget, Clock, Spending};
     use std::time::Duration;
 
     let source = r#"
@@ -438,10 +441,13 @@ name = "can_enter"
 from = ["Waiting"]
 has_actions = true
 "#;
-    let model = Spending::start(Budget {
-        states: 1,
-        time: Duration::from_secs(5),
-    })
+    let model = Spending::start(
+        Budget {
+            states: 1,
+            time: Duration::from_secs(5),
+        },
+        Clock::Wall,
+    )
     .limit(build_model_from_ioa(source, 2).unwrap());
     let result = check_model(&model);
     assert!(!result.is_complete, "{result:?}");

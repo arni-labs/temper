@@ -26,12 +26,12 @@ pub use verify::{
     CompositeOutcome, CompositeVerifyResult, seed_cover, verify_all, verify_composite,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use temper_spec::automaton::{Automaton, TriggerEdge, TriggerGraph};
 
-use crate::model::{TemperModel, build_model_from_automaton};
+use crate::model::{TemperModel, build_model_tracking};
 
 /// Default per-entity counter ceiling used when building composite
 /// [`TemperModel`]s. Matches the single-entity cascade default.
@@ -161,7 +161,8 @@ impl CompositeVerificationPlan {
             let aut = by_name
                 .get(entity.as_str())
                 .expect("scope member is in input set");
-            let model = build_model_from_automaton(aut, DEFAULT_COMPOSITE_MAX_COUNTER);
+            // Whole models: another entity's rule may read any field.
+            let model = build_model_tracking(aut, DEFAULT_COMPOSITE_MAX_COUNTER, &BTreeSet::new());
             models.insert(entity.clone(), model);
         }
 

@@ -328,6 +328,8 @@ fn widened_guard_inputs_still_respect_effect_bounds() {
         "count += params.p",
         "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n",
     );
+    // Keep the count whose effect bound this test exercises.
+    let source = format!("{source}\n[[invariant]]\nname = 'Counted'\nassert = 'count >= 0'\n");
     passes(&source);
     let model = build_model_from_ioa(&source, 2).unwrap();
     let checked = check_model(&model);

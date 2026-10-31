@@ -13,6 +13,7 @@
 
 pub mod builder;
 mod count_bounds;
+mod counters;
 mod entry;
 mod expansion;
 mod parameters;

@@ -123,7 +123,8 @@ fn effect_input_ranges_reach_compared_parameters() {
                  [[state]]\nname = 'count'\ntype = 'counter'\ninitial = 0";
     let source = source(
         state,
-        "params.p > params.q",
+        // Read count so its effects still determine the compared input range.
+        "params.p > params.q && count >= 0",
         &format!("{P}, {{ name = 'q', type = 'counter' }}"),
     )
     .replace(
