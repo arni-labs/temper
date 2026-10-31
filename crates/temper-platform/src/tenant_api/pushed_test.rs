@@ -117,6 +117,50 @@ async fn send(state: &PlatformState, request: Request<Body>) -> (StatusCode, ser
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
+/// `GET /os-apps/{APP}/install` as `tenant`'s operator: the status and the
+/// body as the bytes a script reads.
+async fn served(state: &PlatformState, tenant: &str) -> (StatusCode, String) {
+    let mut request = Request::get(format!("/os-apps/{APP}/install"))
+        .body(Body::empty())
+        .expect("request should build");
+    request
+        .extensions_mut()
+        .insert(AuthenticatedRequestContext::new(
+            TenantId::new(tenant),
+            SecurityContext::from_resolved_identity("agent-1", "operator", None),
+        ));
+    let response = tenant_api_router()
+        .with_state(state.clone())
+        .oneshot(request)
+        .await
+        .expect("request should run");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .expect("body");
+    (status, String::from_utf8(bytes.to_vec()).expect("utf-8"))
+}
+
+/// The served version's `dir`, read the way Katagami's scripts read it:
+/// `grep -o '"dir":"[^"]*"'` on the raw body, which must be one flat line.
+fn served_dir(body: &str) -> String {
+    assert!(!body.contains('\n'), "one line: {body}");
+    let value: serde_json::Value = serde_json::from_str(body).expect("json");
+    let fields = value.as_object().expect("an object");
+    assert!(
+        fields.values().all(|field| field.is_string()),
+        "flat, every field a string: {body}"
+    );
+    let start = body.find("\"dir\":\"").expect("a dir field") + "\"dir\":\"".len();
+    let dir = &body[start..start + body[start..].find('"').expect("dir ends")];
+    assert_eq!(
+        fields["dir"].as_str(),
+        Some(dir),
+        "dir needs no JSON escaping"
+    );
+    dir.to_string()
+}
+
 async fn record(ps: &SimPlatformStore, tenant: &str) -> Option<InstalledAppRecord> {
     ps.get_installed_app(tenant, APP)
         .await
@@ -180,6 +224,17 @@ async fn a_push_needs_a_credential_and_a_permit_in_its_own_tenant() {
         StatusCode::FORBIDDEN
     );
     assert!(pushed_versions(server.data_dir.path()).is_empty());
+
+    // Reading what is served takes the same permit; with it, nothing is
+    // installed yet.
+    assert_eq!(served(&server.state, &other).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        served(&server.state, &tenant).await,
+        (
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not_installed"}"#.to_string()
+        )
+    );
 }
 
 #[tokio::test]
@@ -260,6 +315,8 @@ async fn a_push_the_installer_refuses_rolls_back_to_the_version_before() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let installed = record(&server.ps, &tenant).await.expect("recorded");
     let spec_before = resolved_spec(&tenant);
+    let (status, served_before) = served(&server.state, &tenant).await;
+    assert_eq!(status, StatusCode::OK, "{served_before}");
 
     // The specs pass their checks; the installer cannot parse the policy.
     let mut files = with_comment("refused by the installer");
@@ -284,6 +341,12 @@ async fn a_push_the_installer_refuses_rolls_back_to_the_version_before() {
     assert_eq!(after.app_ref, installed.app_ref);
     assert_eq!(after.source_kind, "pushed");
     assert_eq!(resolved_spec(&tenant), spec_before);
+
+    // What is served is the version before, still on disk.
+    let (status, served_after) = served(&server.state, &tenant).await;
+    assert_eq!(status, StatusCode::OK, "{served_after}");
+    assert_eq!(served_after, served_before);
+    assert!(Path::new(&served_dir(&served_after)).join(SPEC).is_file());
 }
 
 #[tokio::test]
@@ -314,10 +377,30 @@ async fn a_good_push_is_installed_recorded_and_restored_at_boot() {
     assert_eq!(recorded.source_kind, "pushed");
     assert_eq!(recorded.app_ref, format!("pushed/{APP}@{digest}"));
 
-    // A fresh server over the same files and records finds the version again.
+    // What is served: flat, one line, and a dir a script reads with grep,
+    // which is the version's own app folder.
+    let (status, answer) = served(&server.state, &tenant).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let dir = served_dir(&answer);
+    let fields: serde_json::Value = serde_json::from_str(&answer).expect("json");
+    assert_eq!(fields["app"], APP);
+    assert_eq!(fields["source_kind"], "pushed");
+    assert_eq!(fields["app_ref"], format!("pushed/{APP}@{digest}"));
+    assert_eq!(fields["digest"], digest.as_str());
+    assert_eq!(fields["status"], "installed");
+    assert!(Path::new(&dir).is_absolute(), "{dir}");
+    assert!(
+        std::fs::read_to_string(Path::new(&dir).join(SPEC))
+            .expect("the served spec")
+            .contains("# pushed to its own server")
+    );
+
+    // A fresh server over the same files and records finds the version again,
+    // and answers the same served version from the same folder.
     let restarted = server_on(&tenant, server.data_dir.path(), &server.ps);
     assert!(restore_genesis_registry_cache_roots(&restarted).await >= 1);
     assert!(resolved_spec(&tenant).contains("# pushed to its own server"));
+    assert_eq!(served(&restarted, &tenant).await, (StatusCode::OK, answer));
 
     // The same files again keep the unchanged spec by its hash.
     let mut kept = serde_json::to_value(&files).expect("files");
