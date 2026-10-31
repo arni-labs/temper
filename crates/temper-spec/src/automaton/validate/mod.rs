@@ -271,12 +271,19 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             if !live.relies_on.is_empty() {
                 return Err(invalid(slot, "`relies_on` needs `eventually`".into()));
             }
+            if !live.can_reach.is_empty() {
+                validate_can_reach(automaton, live).map_err(|e| invalid(slot, e))?;
+            }
             continue;
         };
-        if !live.from.is_empty() || !live.reaches.is_empty() || live.has_actions.is_some() {
+        if !live.from.is_empty()
+            || !live.reaches.is_empty()
+            || !live.can_reach.is_empty()
+            || live.has_actions.is_some()
+        {
             return Err(invalid(
                 slot,
-                "`eventually` takes no `from`, `reaches` or `has_actions`".into(),
+                "`eventually` takes no `from`, `reaches`, `can_reach` or `has_actions`".into(),
             ));
         }
         check(eventually, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
@@ -311,6 +318,24 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             return Err(AutomatonParseError::Validation(format!(
                 "terminal references undeclared state '{state}'"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// A `can_reach` rule is its own kind of liveness, and every place it names
+/// is declared: a misspelt `from` would leave it checking nothing, and a
+/// misspelt target would refuse every record.
+fn validate_can_reach(automaton: &Automaton, live: &Liveness) -> Result<(), String> {
+    if !live.reaches.is_empty() || live.has_actions.is_some() {
+        return Err("`can_reach` takes no `reaches` or `has_actions`".into());
+    }
+    for (key, places) in [("from", &live.from), ("can_reach", &live.can_reach)] {
+        if let Some(place) = places
+            .iter()
+            .find(|place| !automaton.automaton.states.contains(place))
+        {
+            return Err(format!("`{key}` names no place '{place}'"));
         }
     }
     Ok(())

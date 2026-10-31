@@ -226,6 +226,13 @@ pub enum LivenessKind {
     /// From any `from` state, there is always at least one enabled action.
     /// This is actually a safety property (always has actions).
     NoDeadlock { from: Vec<String> },
+    /// From every reachable state in one of `from` (any state when it is
+    /// empty), some moves lead to one of `targets`. Checked on the model
+    /// check's whole walk, after a complete exploration.
+    CanReach {
+        from: Vec<String>,
+        targets: Vec<String>,
+    },
 }
 
 /// A resolved liveness property.

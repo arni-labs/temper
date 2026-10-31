@@ -460,6 +460,11 @@ fn resolve_liveness(automaton: &Automaton) -> Vec<ResolvedLiveness> {
                     from: l.from.clone(),
                     targets: l.reaches.clone(),
                 }
+            } else if !l.can_reach.is_empty() {
+                LivenessKind::CanReach {
+                    from: l.from.clone(),
+                    targets: l.can_reach.clone(),
+                }
             } else if l.has_actions == Some(true) {
                 LivenessKind::NoDeadlock {
                     from: l.from.clone(),

@@ -93,11 +93,20 @@ pub fn model_check_diagnostics(result: &VerificationResult) -> Vec<String> {
         } else {
             format!(" ({} false)", counterexample.violated.join(", "))
         };
-        lines.push(format!(
-            "property '{}' violated{broken}; path ({} step(s)):",
-            counterexample.property,
-            counterexample.trace.len().saturating_sub(1),
-        ));
+        let steps = counterexample.trace.len().saturating_sub(1);
+        if counterexample.never_reaches.is_empty() {
+            lines.push(format!(
+                "property '{}' violated{broken}; path ({steps} step(s)):",
+                counterexample.property,
+            ));
+        } else {
+            lines.push(format!(
+                "rule '{}' broken: the record at the end of this path can never reach {} \
+                 ({steps} step(s)):",
+                counterexample.violated.join(", "),
+                crate::lost_places::either(&counterexample.never_reaches),
+            ));
+        }
         lines.extend(render_trace(&counterexample.trace));
     }
 

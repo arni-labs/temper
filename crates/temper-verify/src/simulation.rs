@@ -331,6 +331,9 @@ fn check_liveness_post_simulation(
                         }
                     }
                 }
+                // Whether a record can still get somewhere needs every state
+                // after it, not one run's last: the model check's walk has them.
+                LivenessKind::CanReach { .. } => {}
                 LivenessKind::ReachesState { from, targets } => {
                     if targets.is_empty() {
                         continue;
