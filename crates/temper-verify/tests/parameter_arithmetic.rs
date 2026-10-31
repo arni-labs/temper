@@ -143,7 +143,8 @@ fn a_subtraction_that_cannot_be_worked_back_makes_a_bounded_pass() {
 }
 
 /// `x = a; x -= a` leaves `x` at 0 whatever `a` is, so `a` goes as far as
-/// `y` allows, and 5 takes `y` to 1.
+/// `y` allows, and 5 takes `y` to 1. The rule reads `x`, always true, so the
+/// model keeps it.
 #[test]
 fn a_parameter_that_cancels_itself_in_one_counter_reaches_another() {
     let spec = r#"
@@ -170,7 +171,7 @@ effect = ["x = params.a", "x -= params.a", "y = params.a", "y -= 4"]
 
 [[invariant]]
 name = "Safe"
-assert = "y != 1"
+assert = "y != 1 && x >= 0"
 "#;
     let (a, last) = broken_safe(&model_check(spec));
     assert_eq!(a, ParamValue::Count(5));
