@@ -3,7 +3,7 @@
 //! Each function represents an explicit phase of the startup pipeline.
 //! The `run` coordinator in `mod.rs` calls these in sequence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -626,6 +626,17 @@ enum AppBootstrapSource {
     Cli,
 }
 
+/// What boot prints for an `--app` it has no files for: the specs it stored
+/// for the app still serve, or, with none stored, it serves nothing for the
+/// app and waits for its first install.
+pub(super) fn missing_app_line(app: &str, tenant: &str, stored: bool) -> String {
+    if stored {
+        temper_platform::os_apps::stored_line(app, tenant)
+    } else {
+        temper_platform::os_apps::waiting_line(app, tenant)
+    }
+}
+
 /// Phase 8b: Restore persisted local apps and apply explicit `--app` requests.
 ///
 /// Why this exists:
@@ -657,6 +668,10 @@ pub(super) async fn bootstrap_installed_apps(
             }
         }
     }
+
+    // Apps whose install this server stored: their specs come back from its
+    // database at boot, so it serves them even with no files for them anywhere.
+    let stored: BTreeSet<(String, String)> = requested.keys().cloned().collect();
 
     for app_name in apps {
         requested
@@ -699,7 +714,6 @@ pub(super) async fn bootstrap_installed_apps(
             "  Restored Genesis app cache roots: service={restored_genesis_caches}, registry={restored_genesis_registry_caches}"
         );
     }
-
     for ((tenant, app_name), source) in requested {
         if skip_unavailable_tenant(state, &tenant, &format!("app '{app_name}'")) {
             continue;
@@ -716,15 +730,35 @@ pub(super) async fn bootstrap_installed_apps(
             );
             continue;
         }
+        // An app asked for by `--app` with no files anywhere yet has nothing to
+        // install until its first push (`POST /api/os-apps/{name}/install`);
+        // from that push on, its pushed version is what resolves here.
+        if matches!(source, AppBootstrapSource::Cli)
+            && temper_platform::os_apps::tenant_os_app(&tenant, &app_name).is_none()
+        {
+            let was_stored = stored.contains(&(tenant.clone(), app_name.clone()));
+            println!("{}", missing_app_line(&app_name, &tenant, was_stored));
+            continue;
+        }
 
         // Replay through the real installer every startup. Presence-only checks
         // are not sufficient because an installed app's bundle can drift:
         // updated IOA/Cedar/WASM/ADR assets must refresh even when the tenant
         // already has entity tables from an older install. A replay of a stored
         // install keeps its recorded origin; only an `--app` request is a new
-        // install.
+        // install. An `--app` whose stored install is a pushed version replays
+        // it too: the restore above made that version what the app resolves,
+        // and a new install would record it as the catalog's files.
         let install = match source {
             AppBootstrapSource::Persisted => {
+                temper_platform::restore_os_app(state, &tenant, &app_name).await
+            }
+            AppBootstrapSource::Cli
+                if temper_platform::genesis_install::pushed_install_recorded(
+                    state, &tenant, &app_name,
+                )
+                .await =>
+            {
                 temper_platform::restore_os_app(state, &tenant, &app_name).await
             }
             AppBootstrapSource::Cli => {
@@ -756,17 +790,33 @@ pub(super) async fn bootstrap_installed_apps(
                             }),
                         );
                     }
-                    let all: Vec<String> = result
-                        .added
-                        .iter()
-                        .chain(&result.updated)
-                        .chain(&result.skipped)
-                        .cloned()
-                        .collect();
                     println!(
-                        "  App '{app_name}' installed for '{tenant}': {}",
-                        all.join(", ")
+                        "{}",
+                        temper_platform::os_apps::installed_line(&app_name, &tenant, &result)
                     );
+                    // The version just served from the boot catalog becomes the
+                    // app's first pushed version when it has none, so every
+                    // later boot serves it until the next push, whatever the
+                    // catalog holds then (see `adopt_catalog_app`).
+                    match temper_platform::genesis_install::adopt_catalog_app(
+                        state, &tenant, &app_name,
+                    )
+                    .await
+                    {
+                        Ok(Some(digest)) => tracing::info!(
+                            tenant = %tenant,
+                            app = %app_name,
+                            %digest,
+                            "adopted the boot catalog's version as the first pushed version"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::error!(
+                            tenant = %tenant,
+                            app = %app_name,
+                            %error,
+                            "the served version was not adopted; the next boot serves the catalog's"
+                        ),
+                    }
                 }
             },
             Err(e) => {

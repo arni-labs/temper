@@ -120,6 +120,11 @@ pub fn tenant_os_app(tenant: &str, name: &str) -> Option<AppBundle> {
     load_app_bundle(read_catalog().app_dir(Some(tenant), name)?).ok()
 }
 
+/// The directory `tenant` resolves `name` from, as [`tenant_os_app`] reads it.
+pub(crate) fn tenant_os_app_dir(tenant: &str, name: &str) -> Option<PathBuf> {
+    read_catalog().app_dir(Some(tenant), name).cloned()
+}
+
 /// Get the full app guide markdown `tenant` resolves for `name`.
 pub fn tenant_app_guide(tenant: &str, name: &str) -> Option<String> {
     read_catalog()

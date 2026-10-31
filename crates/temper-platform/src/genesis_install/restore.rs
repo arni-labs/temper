@@ -167,7 +167,10 @@ pub async fn restore_genesis_registry_cache_roots(platform: &PlatformState) -> u
                 continue;
             }
         };
-        if record.source_kind != "genesis" || record.registry_url.trim().is_empty() {
+        // A pushed install's files exist only in its own cache directory; a
+        // Genesis install's can be fetched again from its registry.
+        let pushed = record.source_kind == pushed::SOURCE_KIND;
+        if !pushed && (record.source_kind != "genesis" || record.registry_url.trim().is_empty()) {
             continue;
         }
         let root_ref = match parse_registry_app_ref(&record.app_ref) {
