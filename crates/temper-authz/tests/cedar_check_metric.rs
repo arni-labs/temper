@@ -24,6 +24,7 @@ fn customer(id: &str) -> SecurityContext {
         context_attrs: HashMap::new(),
         correlation_id: "cedar-check-metric".to_string(),
         cause: None,
+        credential: None,
     }
 }
 
