@@ -67,13 +67,19 @@ pub(crate) fn broken_rules(
         .filter(|(_, at)| wanted.contains(at))
         .map(|(state, at)| (*at as usize, state))
         .collect();
+    // The whole walk is complete. Replaying its evidence must neither spend
+    // its remaining search budget nor stop when its deadline passes.
+    let replay = TemperModel {
+        limit: None,
+        ..model.clone()
+    };
     broken
         .into_iter()
         .zip(paths)
         .map(|((name, targets, _), path)| Counterexample {
             property: CAN_REACH.to_string(),
             violated: vec![name],
-            trace: trace(model, &states, &path),
+            trace: trace(&replay, &states, &path),
             never_reaches: targets,
         })
         .collect()

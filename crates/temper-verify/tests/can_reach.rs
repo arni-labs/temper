@@ -6,8 +6,10 @@
 //! Unlike `reaches`, the rule does not ask that every path get there, only
 //! that the way is never closed off.
 
+use std::time::Duration;
+
 use temper_spec::automaton::{LivenessEnforcement, parse_automaton_with_liveness};
-use temper_verify::{CascadeLevel, LevelResult, VerificationCascade};
+use temper_verify::{Budget, CascadeLevel, LevelResult, VerificationCascade};
 
 /// A cup made by one barista. A wrong drink goes back to the line, but
 /// still counts its barista, so no barista may claim it again.
@@ -129,6 +131,65 @@ fn a_cup_sent_back_that_can_never_be_made_again_breaks_the_rule() {
         "{:?}",
         l1.diagnostics
     );
+}
+
+/// The whole walk fits in these allowances, but replaying its refusal path
+/// would spend the remaining expansion work and lose an already walked step.
+#[test]
+fn a_completed_walk_keeps_its_refusal_when_replay_would_spend_the_budget() {
+    let spec = format!("{CUP}{CAN_BE_MADE}");
+    let expected = model_check(&spec);
+    let expected_trace = &expected.verification.as_ref().unwrap().counterexamples[0].trace;
+    for states in [8, 9] {
+        let budget = Budget {
+            time: Duration::from_secs(60),
+            states,
+        };
+        let control = VerificationCascade::from_ioa(CUP).with_budget(budget).run();
+        let control_l1 = control.level_result(CascadeLevel::ModelCheck).unwrap();
+        assert!(control_l1.passed, "{}", control_l1.summary);
+
+        let result = VerificationCascade::from_ioa(&spec)
+            .with_fail_fast()
+            .with_budget(budget)
+            .run();
+        assert!(result.stopped.is_none(), "{:?}", result.stopped);
+        let l1 = result.level_result(CascadeLevel::ModelCheck).unwrap();
+        assert_eq!(l1.summary, expected.summary);
+        let verification = l1.verification.as_ref().unwrap();
+        assert!(verification.is_complete);
+        let (moves, place, makers) = broken(l1, "can_still_be_made");
+        assert_eq!(moves, ["Add", "Claim", "Finish", "WrongDrink"]);
+        assert_eq!((place.as_str(), makers), ("Waiting", 1));
+        assert_eq!(verification.counterexamples[0].never_reaches, ["Made"]);
+        assert_eq!(&verification.counterexamples[0].trace, expected_trace);
+    }
+}
+
+/// Replaying a completed walk without a budget must not let exploration
+/// continue after its budget is spent.
+#[test]
+fn an_incomplete_walk_still_stops_before_checking_can_reach() {
+    let result = VerificationCascade::from_ioa(&format!("{CUP}{CAN_BE_MADE}"))
+        .with_budget(Budget {
+            time: Duration::from_secs(60),
+            states: 7,
+        })
+        .run();
+    let stopped = result.stopped.as_deref().expect("the cascade stopped");
+    assert!(
+        stopped.starts_with("Cup: L1 Model Check STOPPED:"),
+        "{stopped}"
+    );
+    assert_eq!(
+        result.levels.last().unwrap().level,
+        CascadeLevel::ModelCheck
+    );
+    let l1 = result.level_result(CascadeLevel::ModelCheck).unwrap();
+    assert!(!l1.passed, "{}", l1.summary);
+    let verification = l1.verification.as_ref().unwrap();
+    assert!(!verification.is_complete);
+    assert!(verification.counterexamples.is_empty());
 }
 
 /// When L1 fails, its failures are the whole answer: the note that the same
