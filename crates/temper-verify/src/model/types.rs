@@ -28,8 +28,9 @@ pub struct TemperModelState {
     pub counters: BTreeMap<String, usize>,
     /// Named boolean variables (e.g. `has_address`, `payment_captured`).
     pub booleans: BTreeMap<String, bool>,
-    /// Named list variables (e.g. `tags`, `labels`).
-    pub lists: BTreeMap<String, Vec<String>>,
+    /// Named list variables (e.g. `tags`, `labels`), sharing string identities
+    /// with tracked fields.
+    pub lists: BTreeMap<String, Vec<ModelString>>,
     /// The string variables an invariant reads, as symbols: `''`, a literal
     /// the spec compares the variable with, or `#n`, a value that is equal
     /// only to itself. The verifier tracks which strings are equal, not what
@@ -271,7 +272,7 @@ pub struct TemperModel {
     /// Initial boolean values from [[state]] declarations.
     pub(crate) initial_booleans: BTreeMap<String, bool>,
     /// Initial list values from [[state]] declarations.
-    pub(crate) initial_lists: BTreeMap<String, Vec<String>>,
+    pub(crate) initial_lists: BTreeMap<String, Vec<ModelString>>,
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
     /// The string variables the verifier tracks: those an invariant reads,

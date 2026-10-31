@@ -6,13 +6,13 @@ use super::types::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The tracked string values held by `states`, `''` left out.
+/// The tracked field and list string values held by `states`, `''` left out.
 pub fn string_values<'a>(
     states: impl IntoIterator<Item = &'a TemperModelState>,
 ) -> BTreeSet<ModelString> {
     states
         .into_iter()
-        .flat_map(|state| state.strings.values())
+        .flat_map(|state| state.strings.values().chain(state.lists.values().flatten()))
         .filter(|value| !value.is_empty())
         .cloned()
         .collect()
@@ -131,18 +131,34 @@ pub fn apply_string_params(
 pub fn canonical_strings(
     maps: &mut [&mut BTreeMap<String, ModelString>],
 ) -> BTreeMap<ModelString, ModelString> {
+    canonical_values(maps.iter_mut().flat_map(|map| map.values_mut()))
+}
+
+/// Canonicalize a record's strings and list elements in one equality scope.
+pub fn canonical_state(state: &mut TemperModelState) {
+    canonical_values(
+        state
+            .strings
+            .values_mut()
+            .chain(state.lists.values_mut().flatten()),
+    );
+}
+
+/// Renumber symbolic values in first-use order, preserving shared identities.
+/// Returns each value's new name.
+pub fn canonical_values<'a>(
+    values: impl IntoIterator<Item = &'a mut ModelString>,
+) -> BTreeMap<ModelString, ModelString> {
     let mut renamed: BTreeMap<ModelString, ModelString> = BTreeMap::new();
-    for map in maps.iter_mut() {
-        for value in map.values_mut() {
-            let id = renamed.len() + 1;
-            let next = match value {
-                ModelString::Literal(_) => continue,
-                ModelString::Symbol(_) => ModelString::Symbol(id),
-                ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
-            };
-            let name = renamed.entry(value.clone()).or_insert(next).clone();
-            *value = name;
-        }
+    for value in values {
+        let id = renamed.len() + 1;
+        let next = match value {
+            ModelString::Literal(_) => continue,
+            ModelString::Symbol(_) => ModelString::Symbol(id),
+            ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
+        };
+        let name = renamed.entry(value.clone()).or_insert(next).clone();
+        *value = name;
     }
     renamed
 }

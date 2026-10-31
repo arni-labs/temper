@@ -11,10 +11,12 @@ use crate::model::types::StringParam;
 /// a constraint ties to one (`failed_commit` must equal `commit`), with the
 /// action's constraints on each. The model needs the value of the second
 /// kind to decide whether the record takes the action, though it writes
-/// nothing it tracks.
+/// nothing it tracks. Route checks also track inputs appended to lists so
+/// equality with a string field or another list element survives storage.
 pub(super) fn string_params(
     action: &temper_spec::automaton::Action,
     tracked_strings: &BTreeSet<String>,
+    checks_routes: bool,
 ) -> Vec<StringParam> {
     let tied = |name: &str| {
         action.constraints.iter().any(|c| {
@@ -28,11 +30,22 @@ pub(super) fn string_params(
                     .is_some_and(|field| tracked_strings.contains(field))
         })
     };
+    let appended: BTreeSet<&str> = action
+        .effect
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Append {
+                value: Arg::Param(param),
+                ..
+            } if checks_routes => Some(param.as_str()),
+            _ => None,
+        })
+        .collect();
     action
         .params
         .iter()
         .map(|param| param.name())
-        .filter(|name| tracked_strings.contains(*name) || tied(name))
+        .filter(|name| tracked_strings.contains(*name) || tied(name) || appended.contains(*name))
         .map(|name| {
             let mut param = StringParam {
                 name: name.to_string(),
@@ -117,7 +130,8 @@ pub(super) fn tracked_strings(
 
 /// For each tracked string variable, the literals a guard or invariant
 /// compares it with (`v == 'x'`, `v in ['x', 'y']`), also offered to its
-/// constraint sources when checking `can_reach`.
+/// constraint sources when checking `can_reach`. Route inputs share all
+/// literal distinctions, since equality or membership can connect fields.
 pub(super) fn string_literals(
     automaton: &Automaton,
     tracked: &BTreeSet<String>,
@@ -188,26 +202,43 @@ pub(super) fn string_literals(
             }
         }
     }
-    // A literal needed by a tracked parameter must also be offered to any
-    // source it may copy. Otherwise supplying 'ok' to the source, then copying
-    // it into a guard's token, would disappear from the reachability walk.
+    // Equality and membership can carry a literal between fields without an
+    // explicit input constraint. Give every route input the same literal
+    // distinctions, including values initially stored or appended by effects.
     if automaton.liveness.iter().any(|l| !l.can_reach.is_empty()) {
-        loop {
-            let mut changed = false;
-            for constraint in automaton.actions.iter().flat_map(|a| &a.constraints) {
-                if let Some(field) = constraint.field()
-                    && tracked.contains(field)
-                    && let Some(literals) = out.get(constraint.param()).cloned()
-                {
-                    let source = out.entry(field.to_string()).or_default();
-                    let before = source.len();
-                    source.extend(literals);
-                    changed |= source.len() != before;
+        let mut literals: BTreeSet<String> = out.values().flatten().cloned().collect();
+        literals.extend(list_literals.values().flatten().cloned());
+        for effect in automaton.actions.iter().flat_map(|action| &action.effect) {
+            if let Effect::Append {
+                value: Arg::Lit(Literal::Str(text)),
+                ..
+            } = effect
+            {
+                literals.insert(text.clone());
+            }
+        }
+        for state in &automaton.state {
+            match &state.initial {
+                temper_spec::automaton::Initial::String(text) => {
+                    literals.insert(text.clone());
                 }
+                temper_spec::automaton::Initial::List(items) => {
+                    literals.extend(items.iter().cloned());
+                }
+                _ => {}
             }
-            if !changed {
-                break;
-            }
+        }
+        let inputs: BTreeSet<String> = automaton
+            .actions
+            .iter()
+            .flat_map(|action| string_params(action, tracked, true))
+            .map(|param| param.name)
+            .chain(tracked.iter().cloned())
+            .collect();
+        for name in inputs {
+            out.entry(name)
+                .or_default()
+                .extend(literals.iter().cloned());
         }
     }
     out

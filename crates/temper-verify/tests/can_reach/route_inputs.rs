@@ -95,7 +95,10 @@ effect = ["append(tags, params.token)"]
         .into_iter()
         .find(|(params, _)| params["token"] == temper_verify::ParamValue::Str("vip".into()))
         .expect("the actual vip input is explored");
-    assert_eq!(supplied.lists["tags"], ["vip"]);
+    assert_eq!(
+        supplied.lists["tags"],
+        ["vip"].map(temper_verify::model::ModelString::from)
+    );
     assert_eq!(supplied.strings["token"], "vip".into());
     let finish = model
         .transitions
@@ -128,5 +131,168 @@ params = [{ name = "token", type = "string" }]
 "#);
     assert_ne!(constrained, spec);
     let l1 = model_check(&constrained);
+    assert!(l1.passed, "{}", l1.summary);
+}
+
+/// A guard on the chosen input cannot be treated as a free true branch.
+#[test]
+fn an_impossible_parameter_guard_cannot_certify_a_route() {
+    for token in ["", "wrong"] {
+        let spec = TOKEN
+            .replace("initial = \"\"", &format!("initial = {token:?}"))
+            .replace(
+                "guard = \"token == 'ok'\"",
+                r#"
+guard = "params.proof == 'ok'"
+params = [{ name = "proof", type = "string" }]
+[[action.constraints]]
+kind = "param_equals_field"
+param = "proof"
+field = "token"
+"#,
+            );
+        let l1 = model_check(&spec);
+        assert!(!l1.passed, "{}", l1.summary);
+        let result = l1.verification.as_ref().unwrap();
+        assert!(result.is_complete);
+        assert!(result.bounded_by.is_empty());
+        assert!(
+            result
+                .counterexamples
+                .iter()
+                .any(|c| c.property == "CanReach")
+                || result
+                    .unproved_can_reach
+                    .iter()
+                    .any(|r| r.contains("can_finish") && r.contains("params.proof")),
+            "{result:?}"
+        );
+    }
+}
+
+/// No named literal is needed to preserve one input in two kinds of storage.
+#[test]
+fn a_shared_string_and_list_input_keeps_its_identity() {
+    let spec = r#"
+[automaton]
+name = "SharedInput"
+states = ["Waiting", "Ready", "Done"]
+initial = "Waiting"
+[[state]]
+name = "token"
+type = "string"
+initial = ""
+[[state]]
+name = "tags"
+type = "list"
+initial = []
+[[action]]
+name = "Supply"
+from = ["Waiting"]
+to = "Ready"
+params = [{ name = "token", type = "string" }]
+effect = ["append(tags, params.token)"]
+[[action]]
+name = "Finish"
+from = ["Ready"]
+to = "Done"
+guard = "!empty(token) && token in tags"
+[[liveness]]
+name = "can_finish"
+from = ["Waiting"]
+can_reach = ["Done"]
+"#;
+    let l1 = model_check(spec);
+    assert!(l1.passed, "{}", l1.summary);
+    let model = temper_verify::build_model_from_ioa(spec, 2).unwrap();
+    use stateright::Model;
+    use temper_verify::model::semantics::{successors, truth};
+    let initial = model.init_states().remove(0);
+    let supply = model
+        .transitions
+        .iter()
+        .find(|t| t.name == "Supply")
+        .unwrap();
+    let finish = model
+        .transitions
+        .iter()
+        .find(|t| t.name == "Finish")
+        .unwrap();
+    for (_, next) in successors(&model, supply, &initial) {
+        assert_eq!(
+            truth(&finish.guard, &model.var_kinds, &next).must_hold(),
+            !next.strings["token"].is_empty()
+        );
+    }
+    // A list-only input remains available to a later string input even
+    // when no field held it in the intervening state.
+    let list_first = spec
+        .replace(
+            r#"states = ["Waiting", "Ready", "Done"]"#,
+            r#"states = ["Waiting", "Supplied", "Ready", "Done"]"#,
+        )
+        .replace(
+            r#"to = "Ready"
+params = [{ name = "token", type = "string" }]
+effect = ["append(tags, params.token)"]"#,
+            r#"to = "Supplied"
+params = [{ name = "tag", type = "string" }]
+effect = ["append(tags, params.tag)"]
+[[action]]
+name = "SupplyToken"
+from = ["Supplied"]
+to = "Ready"
+params = [{ name = "token", type = "string" }]"#,
+        );
+    assert_ne!(list_first, spec);
+    let l1 = model_check(&list_first);
+    assert!(l1.passed, "{}", l1.summary);
+
+    // A real mismatch must still refuse.
+    let mismatch = spec.replace("append(tags, params.token)", "append(tags, 'other')");
+    let l1 = model_check(&mismatch.replace(
+        "from = [\"Waiting\"]\ncan_reach",
+        "from = [\"Ready\"]\ncan_reach",
+    ));
+    broken(&l1, "can_finish");
+}
+
+/// Compared variables must share literals even before either has been supplied.
+#[test]
+fn compared_strings_share_route_literals() {
+    let spec = r#"
+[automaton]
+name = "ComparedInputs"
+states = ["Start", "Middle", "Waiting", "Done"]
+initial = "Start"
+[[state]]
+name = "a"
+type = "string"
+initial = ""
+[[state]]
+name = "b"
+type = "string"
+initial = ""
+[[action]]
+name = "SupplyA"
+from = ["Start"]
+to = "Middle"
+params = [{ name = "a", type = "string" }]
+[[action]]
+name = "SupplyB"
+from = ["Middle"]
+to = "Waiting"
+params = [{ name = "b", type = "string" }]
+[[action]]
+name = "Finish"
+from = ["Waiting"]
+to = "Done"
+guard = "a == b && b == 'ok'"
+[[liveness]]
+name = "can_finish"
+from = ["Start"]
+can_reach = ["Done"]
+"#;
+    let l1 = model_check(spec);
     assert!(l1.passed, "{}", l1.summary);
 }

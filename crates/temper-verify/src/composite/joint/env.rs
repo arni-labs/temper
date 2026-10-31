@@ -109,7 +109,7 @@ fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> V
         Some(VarKind::List) => state
             .lists
             .get(name)
-            .map_or(Val::Strs(&[]), |items| Val::Strs(items)),
+            .map_or(Val::SymbolicStrs(&[]), |items| Val::SymbolicStrs(items)),
         Some(VarKind::Str) => state
             .strings
             .get(name)

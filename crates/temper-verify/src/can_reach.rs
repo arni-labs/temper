@@ -19,33 +19,39 @@ use crate::reach::{Graph, NO_PLACE, Reach};
 /// name is what is false.
 pub const CAN_REACH: &str = "CanReach";
 
-/// A possible edge through an unmodeled local numeric value cannot prove
-/// that a route exists. Until those values are modeled, conservatively leave
-/// the rules unproved when any guard reads one. This does not suppress a
+/// A possible edge through an unmodeled local numeric value or an unchecked
+/// input guard cannot prove that a route exists. Conservatively leave the
+/// rules unproved when any guard reads one. This does not suppress a
 /// concrete refusal found in the overapproximated graph, nor change how
 /// cross-entity guards are explored.
 pub(crate) fn unproved_rules(model: &TemperModel) -> Vec<String> {
-    let mut numeric = BTreeSet::new();
+    let mut unmodeled = BTreeSet::new();
     for transition in &model.transitions {
         transition.guard.for_each_name(&mut |name| {
-            if let Name::Var(var) = name
-                && model.var_kinds.get(var) == Some(&VarKind::Num)
-            {
-                numeric.insert(var.to_string());
+            match name {
+                Name::Var(var) if model.var_kinds.get(var) == Some(&VarKind::Num) => {
+                    unmodeled.insert(var.to_string());
+                }
+                // Exploration tests the guard before choosing the inputs;
+                // it does not establish that those choices satisfy it.
+                Name::Param(param) => {
+                    unmodeled.insert(format!("params.{param}"));
+                }
+                _ => {}
             }
         });
     }
-    if numeric.is_empty() {
+    if unmodeled.is_empty() {
         return Vec::new();
     }
-    let names = numeric.into_iter().collect::<Vec<_>>().join(", ");
+    let names = unmodeled.into_iter().collect::<Vec<_>>().join(", ");
     model
         .liveness
         .iter()
         .filter(|live| matches!(live.kind, LivenessKind::CanReach { .. }))
         .map(|live| {
             format!(
-                "rule '{}' not proved: guards read unmodeled local numeric variables: {names}",
+                "rule '{}' not proved: guards read unmodeled local values: {names}",
                 live.name
             )
         })

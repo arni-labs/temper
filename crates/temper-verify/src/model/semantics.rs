@@ -13,7 +13,9 @@ use super::types::{
 use super::count_bounds::{CountRange, count_ranges};
 pub(crate) use super::expansion::Expansion;
 use super::strings::string_assignments;
-pub use super::strings::{apply_string_params, canonical_strings, string_values};
+pub use super::strings::{
+    apply_string_params, canonical_state, canonical_strings, canonical_values, string_values,
+};
 
 /// Parameter assignments explored per step for one transition, at most
 /// (numeric/list parameters; joint string products also consume expansion work).
@@ -48,7 +50,7 @@ impl Env for ModelEnv<'_> {
                 .state
                 .lists
                 .get(name)
-                .map_or(Val::Strs(&[]), |items| Val::Strs(items)),
+                .map_or(Val::SymbolicStrs(&[]), |items| Val::SymbolicStrs(items)),
             Some(VarKind::Str) => self
                 .state
                 .strings
@@ -196,7 +198,7 @@ fn successors_with(
             }
             apply_effects(&t.effects, &mut next, &t.name, &params);
             apply_string_params(&t.string_params, &mut next, &params);
-            canonical_strings(&mut [&mut next.strings]);
+            canonical_state(&mut next);
             if within_bounds(model, state, &next) {
                 out.push((params, next));
             } else {
@@ -429,12 +431,12 @@ pub fn apply_effects(
             ModelEffect::ListAppend { var, value } => {
                 let entry = state.lists.entry(var.clone()).or_default();
                 let element = match value {
-                    Arg::Lit(Literal::Str(text)) => text.clone(),
+                    Arg::Lit(Literal::Str(text)) => text.clone().into(),
                     Arg::Param(name) => match params.get(name) {
-                        Some(ParamValue::Str(ModelString::Literal(text))) => text.clone(),
-                        _ => format!("{action_name}#{}", entry.len() + 1),
+                        Some(ParamValue::Str(value)) => value.clone(),
+                        _ => format!("{action_name}#{}", entry.len() + 1).into(),
                     },
-                    _ => format!("{action_name}#{}", entry.len() + 1),
+                    _ => format!("{action_name}#{}", entry.len() + 1).into(),
                 };
                 entry.push(element);
             }

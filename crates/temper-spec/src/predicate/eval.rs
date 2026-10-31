@@ -6,6 +6,8 @@
 //! Kleene logic, so "may hold" is `!= False` and "must hold" is `== True`
 //! under any combination of `!`, `&&`, `||` and `=>`.
 
+use super::string::SymbolicString;
+
 use super::ast::{CmpOp, Expr, Literal, Operand, Set};
 
 /// A three-valued truth value.
@@ -60,6 +62,8 @@ pub enum Val<'a> {
     Symbol(usize),
     /// A list of strings (IOA list/set state variables).
     Strs(&'a [String]),
+    /// A verifier's list of concrete strings and equality symbols.
+    SymbolicStrs(&'a [SymbolicString]),
     /// A JSON array or object from an entity field.
     Json(&'a serde_json::Value),
 }
@@ -79,6 +83,7 @@ impl<'a> Val<'a> {
     fn list_len(self) -> Option<usize> {
         match self {
             Val::Strs(items) => Some(items.len()),
+            Val::SymbolicStrs(items) => Some(items.len()),
             Val::Json(serde_json::Value::Array(items)) => Some(items.len()),
             _ => None,
         }
@@ -258,6 +263,10 @@ fn equal(lhs: Val<'_>, rhs: Val<'_>) -> bool {
         (Val::Str(a), Val::Str(b)) => a == b,
         (Val::Symbol(a), Val::Symbol(b)) => a == b,
         (Val::Strs(a), Val::Strs(b)) => a == b,
+        (Val::SymbolicStrs(a), Val::SymbolicStrs(b)) => a == b,
+        (Val::SymbolicStrs(a), Val::Strs(b)) | (Val::Strs(b), Val::SymbolicStrs(a)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| equal(a.val(), Val::Str(b)))
+        }
         (Val::Json(a), Val::Json(b)) => a == b,
         _ => false,
     }
@@ -273,6 +282,9 @@ fn contains(env: &dyn Env, set: &Set, value: Val<'_>) -> Truth {
             Val::Unknown => Truth::Unknown,
             Val::Strs(items) => {
                 Truth::from_bool(matches!(value, Val::Str(s) if items.iter().any(|item| item == s)))
+            }
+            Val::SymbolicStrs(items) => {
+                Truth::from_bool(items.iter().any(|item| equal(value, item.val())))
             }
             Val::Json(serde_json::Value::Array(items)) => {
                 Truth::from_bool(items.iter().any(|item| equal(value, Val::json(item))))

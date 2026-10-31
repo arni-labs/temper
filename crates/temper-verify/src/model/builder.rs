@@ -64,7 +64,10 @@ pub fn build_model_tracking(
                 initial_booleans.insert(sv.name.clone(), *b);
             }
             Initial::List(items) => {
-                initial_lists.insert(sv.name.clone(), items.clone());
+                initial_lists.insert(
+                    sv.name.clone(),
+                    items.iter().cloned().map(Into::into).collect::<Vec<_>>(),
+                );
             }
             // Strings are initialized below; ints are not modeled.
             Initial::String(_) | Initial::Int(_) => {}
@@ -195,7 +198,11 @@ fn resolve_transitions(
                 guard: a.guard,
                 effects,
                 params,
-                string_params: string_params(action, tracked_strings),
+                string_params: string_params(
+                    action,
+                    tracked_strings,
+                    automaton.liveness.iter().any(|l| !l.can_reach.is_empty()),
+                ),
             }
         })
         .collect()
