@@ -129,13 +129,12 @@ impl TursoEventStore {
         let copy = SyncCopy::open(local_path, sync_url, auth_token)
             .await
             .map_err(storage_error)?;
-        let store = Self::open(Database::synced(copy.clone()), false, Some(copy.clone())).await?;
+        let store = Self::open(Database::synced(copy.clone()), false, Some(copy)).await?;
         store.require_primary_keys().await?;
-        // Schema made by this start goes out now; an answer pushes anything
-        // still left before it confirms a write.
-        if let Err(error) = copy.push_committed().await {
-            tracing::warn!(%error, "turso.sync push after migration failed");
-        }
+        // What this start adds to the schema goes out with the next push, as
+        // anything else it commits does: a start never waits on the remote to
+        // build an index over every record (2.7 s for 1,800 records of
+        // 120 KB on staging, 30 Oct 2026).
         Ok(store)
     }
 

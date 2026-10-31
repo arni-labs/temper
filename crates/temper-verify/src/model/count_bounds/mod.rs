@@ -3,18 +3,21 @@
 //! bound, and every list position it gives no further than one past the end.
 //!
 //! Each counter's value at the end of the move is written as the largest of
-//! a few linear forms over the move's count parameters, each plus a rest
-//! that does not depend on them: a constant, or what the counters held
-//! before the move, known only to lie between 0 and their bounds. A
-//! subtraction stops at 0, which adds the form 0, so a counter ends inside
-//! its bound exactly when each of its forms does. Those limits give each
-//! parameter the largest value it can take.
+//! a few linear forms over the move's count parameters and what the counters
+//! held before the move, each plus a constant part. A subtraction stops at
+//! 0, which adds the form 0, so a counter ends inside its bound exactly when
+//! each of its forms does. What a counter held before the move is known only
+//! to lie between 0 and its bound, so each limit turns those terms into a
+//! range, and the limits give each parameter the largest value it can take.
+
+mod forms;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::predicate::{Arg, Literal, ParamKind};
 
-use super::semantics::{MAX_PARAM_ASSIGNMENTS, counter_bound, list_bound};
+use self::forms::{Coefficients, Rest, Terms, Value, fold_before};
+use super::semantics::{counter_bound, list_bound};
 use super::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// The values one count parameter of a move is explored over: `0..=largest`.
@@ -33,130 +36,13 @@ pub(super) struct CountRange {
     pub(super) widened: bool,
 }
 
-/// The count parameters in a linear form, each with its whole-number
-/// coefficient.
-type Terms<'a> = BTreeMap<&'a str, i64>;
-
-/// The part of a form that is not parameters: the least and the most it can
-/// be, over everything the counters could hold before the move.
-#[derive(Clone, Copy, Debug)]
-struct Rest {
-    least: i64,
-    most: i64,
-}
-
-/// How many forms one value may hold. Forms come from distinct sums of the
-/// move's parameters, and no spec writes as many as a move explores
-/// assignments; a contrived chain of additions could, and would fill memory
-/// before the assignment budget refuses the move. Past it the value is
-/// marked as not worked out, so the move is still explored, widened and
-/// reported as bounded.
-const MAX_FORMS: usize = MAX_PARAM_ASSIGNMENTS;
-
-/// A counter's value partway through the move.
-#[derive(Clone, Debug)]
-enum Value<'a> {
-    /// The largest of these forms, each its terms plus its rest.
-    Largest(BTreeMap<Terms<'a>, Rest>),
-    /// A value that could not be worked out, with the count parameters it
-    /// depends on.
-    Unknown(BTreeSet<&'a str>),
-}
-
-impl<'a> Value<'a> {
-    fn rest(least: i64, most: i64) -> Self {
-        Value::Largest(BTreeMap::from([(Terms::new(), Rest { least, most })]))
-    }
-
-    fn param(p: &'a str) -> Self {
-        Value::Largest(BTreeMap::from([(
-            Terms::from([(p, 1)]),
-            Rest { least: 0, most: 0 },
-        )]))
-    }
-
-    fn params(&self) -> BTreeSet<&'a str> {
-        match self {
-            Value::Largest(forms) => forms
-                .keys()
-                .flat_map(|terms| terms.keys().copied())
-                .collect(),
-            Value::Unknown(params) => params.clone(),
-        }
-    }
-
-    /// `self + sign * other`: each form of one plus `sign` times each form
-    /// of the other, since the larger of sums is the sum of the larger.
-    fn combine(&self, other: &Value<'a>, sign: i64) -> Value<'a> {
-        let (Value::Largest(ours), Value::Largest(theirs)) = (self, other) else {
-            return Value::Unknown(&self.params() | &other.params());
-        };
-        let mut sums = BTreeMap::new();
-        for (our_terms, ours) in ours {
-            for (their_terms, theirs) in theirs {
-                let mut terms = our_terms.clone();
-                for (p, coefficient) in their_terms {
-                    let entry = terms.entry(*p).or_insert(0);
-                    *entry = entry.saturating_add(coefficient.saturating_mul(sign));
-                }
-                terms.retain(|_, coefficient| *coefficient != 0);
-                let rest = if sign > 0 {
-                    Rest {
-                        least: ours.least.saturating_add(theirs.least),
-                        most: ours.most.saturating_add(theirs.most),
-                    }
-                } else {
-                    Rest {
-                        least: ours.least.saturating_sub(theirs.most),
-                        most: ours.most.saturating_sub(theirs.least),
-                    }
-                };
-                keep_largest(&mut sums, terms, rest);
-                if sums.len() > MAX_FORMS {
-                    return Value::Unknown(&self.params() | &other.params());
-                }
-            }
-        }
-        Value::Largest(sums)
-    }
-
-    /// `self - other`, stopping at 0 as L1 and the runtime do.
-    fn take(&self, other: &Value<'a>) -> Value<'a> {
-        match other {
-            Value::Largest(forms) if forms.len() == 1 => match self.combine(other, -1) {
-                Value::Largest(mut left) => {
-                    keep_largest(&mut left, Terms::new(), Rest { least: 0, most: 0 });
-                    Value::Largest(left)
-                }
-                unknown @ Value::Unknown(_) => unknown,
-            },
-            // Taking the larger of several values leaves the smaller of
-            // several, which is not the larger of any forms.
-            _ => Value::Unknown(&self.params() | &other.params()),
-        }
-    }
-}
-
-/// Add a form to `forms`. Two forms with the same terms make one, their
-/// larger, whose rest is at least the larger least and at most the larger
-/// most.
-fn keep_largest<'a>(forms: &mut BTreeMap<Terms<'a>, Rest>, terms: Terms<'a>, rest: Rest) {
-    forms
-        .entry(terms)
-        .and_modify(|kept| {
-            kept.least = kept.least.max(rest.least);
-            kept.most = kept.most.max(rest.most);
-        })
-        .or_insert(rest);
-}
-
 /// One limit on the move's parameters: `terms + rest <= bound`.
 struct Limit<'a> {
     /// The counter whose bound it is, or `None` for a list position, where
     /// `bound` is the first position past the end, which acts as every later
     /// one does.
     counter: Option<&'a str>,
-    terms: Terms<'a>,
+    terms: Coefficients<'a>,
     rest: Rest,
     bound: i64,
 }
@@ -184,16 +70,15 @@ fn walk<'a>(model: &TemperModel, t: &'a ResolvedTransition) -> Walked<'a> {
     for (i, effect) in t.effects.iter().enumerate() {
         match effect {
             ModelEffect::SetCounter { var, value } => {
-                let value = arg_value(model, &values, value);
+                let value = arg_value(&values, value);
                 values.insert(var, value);
             }
             ModelEffect::AddCounter { var, value } => {
-                let sum =
-                    value_of(model, &values, var).combine(&arg_value(model, &values, value), 1);
+                let sum = value_of(&values, var).combine(&arg_value(&values, value), 1, model);
                 values.insert(var, sum);
             }
             ModelEffect::SubCounter { var, value } => {
-                let left = value_of(model, &values, var).take(&arg_value(model, &values, value));
+                let left = value_of(&values, var).take(&arg_value(&values, value), model);
                 values.insert(var, left);
             }
             ModelEffect::ListRemoveAt { var, index } => {
@@ -204,18 +89,10 @@ fn walk<'a>(model: &TemperModel, t: &'a ResolvedTransition) -> Walked<'a> {
                     })
                     .count();
                 let past_end = whole(list_bound(model, var).saturating_add(appended));
-                match arg_value(model, &values, index) {
-                    Value::Largest(forms) => limits.extend(
-                        forms
-                            .into_iter()
-                            .filter(|(terms, _)| !terms.is_empty())
-                            .map(|(terms, rest)| Limit {
-                                counter: None,
-                                terms,
-                                rest,
-                                bound: past_end,
-                            }),
-                    ),
+                match arg_value(&values, index) {
+                    Value::Largest(forms) => {
+                        limits.extend(limits_of(model, &forms, None, past_end))
+                    }
                     Value::Unknown(params) => unsure.extend(params),
                 }
             }
@@ -226,17 +103,7 @@ fn walk<'a>(model: &TemperModel, t: &'a ResolvedTransition) -> Walked<'a> {
         match value {
             Value::Largest(forms) => {
                 let bound = whole(counter_bound(model, counter));
-                limits.extend(
-                    forms
-                        .into_iter()
-                        .filter(|(terms, _)| !terms.is_empty())
-                        .map(|(terms, rest)| Limit {
-                            counter: Some(counter),
-                            terms,
-                            rest,
-                            bound,
-                        }),
-                );
+                limits.extend(limits_of(model, &forms, Some(counter), bound));
             }
             Value::Unknown(params) => unsure.extend(params),
         }
@@ -244,29 +111,40 @@ fn walk<'a>(model: &TemperModel, t: &'a ResolvedTransition) -> Walked<'a> {
     Walked { limits, unsure }
 }
 
+/// The limits `value <= bound` puts on the move's parameters, one for each
+/// sum of parameters in `forms`.
+fn limits_of<'a>(
+    model: &TemperModel,
+    forms: &BTreeMap<Terms<'a>, Rest>,
+    counter: Option<&'a str>,
+    bound: i64,
+) -> impl Iterator<Item = Limit<'a>> {
+    fold_before(model, forms)
+        .into_iter()
+        .filter(|(terms, _)| !terms.params.is_empty())
+        .map(move |(terms, rest)| Limit {
+            counter,
+            terms: terms.params,
+            rest,
+            bound,
+        })
+}
+
 /// `var`'s value at this point of the move: what an earlier effect wrote,
 /// or what it held before the move.
-fn value_of<'a>(
-    model: &TemperModel,
-    values: &BTreeMap<&'a str, Value<'a>>,
-    var: &str,
-) -> Value<'a> {
+fn value_of<'a>(values: &BTreeMap<&'a str, Value<'a>>, var: &'a str) -> Value<'a> {
     values
         .get(var)
         .cloned()
-        .unwrap_or_else(|| Value::rest(0, whole(counter_bound(model, var))))
+        .unwrap_or_else(|| Value::before(var))
 }
 
-fn arg_value<'a>(
-    model: &TemperModel,
-    values: &BTreeMap<&'a str, Value<'a>>,
-    arg: &'a Arg,
-) -> Value<'a> {
+fn arg_value<'a>(values: &BTreeMap<&'a str, Value<'a>>, arg: &'a Arg) -> Value<'a> {
     match arg {
         // A negative amount counts as none, as in L1.
         Arg::Lit(Literal::Int(n)) => Value::rest((*n).max(0), (*n).max(0)),
         Arg::Param(p) => Value::param(p),
-        Arg::Var(source) => value_of(model, values, source),
+        Arg::Var(source) => value_of(values, source),
         Arg::Lit(_) => Value::rest(0, 0),
     }
 }
