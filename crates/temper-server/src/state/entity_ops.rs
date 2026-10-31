@@ -1952,6 +1952,10 @@ impl ServerState {
     /// Update fields only if the actor still matches the state that Cedar
     /// authorized. The comparison and mutation are serialized by the actor
     /// mailbox, closing the read/authorize/write race.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "field update boundary keeps caller and authorization precondition explicit"
+    )]
     pub(crate) async fn update_tenant_entity_fields_if_current(
         &self,
         tenant: &TenantId,
@@ -1974,6 +1978,10 @@ impl ServerState {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "field update boundary keeps caller and authorization precondition explicit"
+    )]
     async fn update_tenant_entity_fields_checked(
         &self,
         tenant: &TenantId,

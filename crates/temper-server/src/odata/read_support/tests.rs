@@ -292,10 +292,15 @@ fn safety_cap_rejects_incomplete_row_authorized_reads() {
 
 #[test]
 fn legacy_catalog_metadata_is_null_and_never_taken_from_app_fields() {
-    let properties: Vec<String> = ["last_event_at", "last_event_via", "last_event_by"]
-        .into_iter()
-        .map(String::from)
-        .collect();
+    let properties: Vec<String> = [
+        "first_event_at",
+        "last_event_at",
+        "last_event_via",
+        "last_event_by",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     let options = QueryOptions {
         select: Some(properties.clone()),
         ..QueryOptions::default()

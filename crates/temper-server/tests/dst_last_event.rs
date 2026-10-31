@@ -66,12 +66,15 @@ const CSDL: &str = r#"<?xml version="1.0"?>
 </Schema></edmx:DataServices></edmx:Edmx>"#;
 
 fn server(store: &SimEventStore) -> ServerState {
+    server_with_spec(store, SPEC)
+}
+fn server_with_spec(store: &SimEventStore, spec: &str) -> ServerState {
     let mut registry = SpecRegistry::new();
     registry.register_tenant(
         "default",
         parse_csdl(CSDL).unwrap(),
         CSDL.into(),
-        &[("Job", SPEC)],
+        &[("Job", spec)],
     );
     registry.set_verification_status(
         &TenantId::default(),
@@ -151,17 +154,22 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
         let store = SimEventStore::no_faults(seed);
         let mut rng = DeterministicRng::new(seed);
         let mut expected = Vec::new();
+        let mut created = std::collections::BTreeMap::new();
         runtime().block_on(async {
             clock.begin();
             let state = server(&store);
             // A direct authenticated request, including forged kernel properties.
-            request(&state, "POST", "/tdata/Jobs", json!({"Id":"timer", "last_event_by":"forged"})).await;
+            created.insert("timer", sim_now());
+            let created_row = request(&state, "POST", "/tdata/Jobs", json!({"Id":"timer", "first_event_at":"1900-01-01T00:00:00Z", "last_event_by":"forged"})).await;
+            let first = created_row["first_event_at"].as_str().expect("creation sets first_event_at");
+            assert_eq!(chrono::DateTime::parse_from_rfc3339(first).unwrap().with_timezone(&chrono::Utc), created["timer"]);
             request(&state, "POST", "/tdata/Jobs('timer')/Jobs.Start", json!({
-                "last_event_at":"1900-01-01T00:00:00Z", "last_event_via":"timer", "last_event_by":"mallory"
+                "first_event_at":"1900-01-01T00:00:00Z", "last_event_at":"1900-01-01T00:00:00Z", "last_event_via":"timer", "last_event_by":"mallory"
             })).await;
             let row = request(&state, "GET", "/tdata/Jobs('timer')", Value::Null).await;
             assert_eq!(metadata(&row), json!([sim_now(), "request", "ann"]), "seed {seed}: request");
             assert!(row["fields"].get("last_event_by").is_none(), "forgery is removed");
+            assert!(row["fields"].get("first_event_at").is_none(), "creation time cannot be a parameter: {row}");
             // The timer must replace the previous sender and timestamp.
             tokio::time::advance(Duration::from_secs(180)).await;
             settle().await;
@@ -175,22 +183,26 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
             assert_eq!(events.last().unwrap()["by"], Value::Null);
             assert_eq!(events[1]["via"], "request");
             assert_eq!(events[1]["by"], "ann");
+            created.insert("request", sim_now());
             request(&state, "POST", "/tdata/Jobs", json!({"Id":"request"})).await;
             request(&state, "POST", "/tdata/Jobs('request')/Jobs.Start", json!({})).await;
             for method in ["PATCH", "PUT"] {
                 request(&state, method, "/tdata/Jobs('request')", json!({
-                    "last_event_at":"1900-01-01T00:00:00Z", "last_event_via":"timer", "last_event_by":"mallory",
+                    "first_event_at":"1900-01-01T00:00:00Z", "last_event_at":"1900-01-01T00:00:00Z", "last_event_via":"timer", "last_event_by":"mallory",
                     "moved_by":"app-owned"
                 })).await;
                 let row = request(&state, "GET", "/tdata/Jobs('request')", Value::Null).await;
                 assert_eq!(metadata(&row), json!([sim_now(), "request", "ann"]), "seed {seed}: {method}");
                 assert_eq!(row["fields"]["moved_by"], "app-owned");
                 assert!(row["fields"].get("last_event_by").is_none());
+                assert!(row["fields"].get("first_event_at").is_none());
             }
             let row = request(&state, "GET", "/tdata/Jobs('request')", Value::Null).await;
             expected.push(("request", metadata(&row)));
             tokio::time::advance(Duration::from_secs(1 + rng.next_bound(60) as u64)).await;
+            created.insert("reaction", sim_now());
             request(&state, "POST", "/tdata/Jobs", json!({"Id":"reaction"})).await;
+            tokio::time::advance(Duration::from_millis(250)).await;
             request(&state, "POST", "/tdata/Jobs('reaction')/Jobs.React", json!({})).await;
             settle().await;
             let row = request(&state, "GET", "/tdata/Jobs('reaction')", Value::Null).await;
@@ -222,12 +234,34 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
                 let expected = expected.iter().find(|(id, _)| row["entity_id"] == *id).unwrap();
                 assert_eq!(metadata(row), expected.1);
             }
+            // Move the oldest record last: creation order must stay stable.
+            tokio::time::advance(Duration::from_millis(137)).await;
+            request(&state, "POST", "/tdata/Jobs('timer')/Jobs.Finish", json!({})).await;
+            let row = request(&state, "GET", "/tdata/Jobs('timer')", Value::Null).await;
+            expected[0].1 = metadata(&row);
+            let rows = request(&state, "GET", "/tdata/Jobs?$orderby=first_event_at%20asc&$select=entity_id,first_event_at", Value::Null).await;
+            let rows = rows["value"].as_array().unwrap();
+            assert_eq!(rows.iter().map(|r| r["entity_id"].as_str().unwrap()).collect::<Vec<_>>(), ["timer", "request", "reaction"]);
+            for row in rows {
+                let id = row["entity_id"].as_str().unwrap();
+                let raw = row["first_event_at"].as_str().expect("creation timestamp");
+                assert!(raw.contains('.') && raw.ends_with('Z'), "fractional UTC: {raw}");
+                assert_eq!(chrono::DateTime::parse_from_rfc3339(raw).unwrap().with_timezone(&chrono::Utc), created[id]);
+            }
+            let rows = request(&state, "GET", "/tdata/Jobs?$filter=first_event_at%20eq%20'2026-01-01T01:00:00.000%2B01:00'", Value::Null).await;
+            assert_eq!(rows["value"].as_array().unwrap().len(), 1);
+            assert_eq!(rows["value"][0]["entity_id"], "timer");
             // Snapshots omit history: all three values, including ann's identity,
             // must live independently. The reaction record replays its journal.
             for id in ["timer", "request"] {
                 let entity = state.get_tenant_entity_state(&TenantId::default(), "Job", id).await.unwrap().state;
                 let mut snapshot = serde_json::to_value(&entity).unwrap();
                 snapshot["events"] = json!([]);
+                if id == "request" {
+                    // A pre-feature snapshot must recover creation from sequence 1,
+                    // independently of its saved tail and the catalog back-fill.
+                    snapshot.as_object_mut().unwrap().remove("first_event_at");
+                }
                 store.save_snapshot(&format!("default:Job:{id}"), entity.sequence_nr, &serde_json::to_vec(&snapshot).unwrap()).await.unwrap();
             }
             clock.end(Duration::from_secs(10));
@@ -247,6 +281,16 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
                     expected,
                     "seed {seed}: recovered state for {id}, independent of the catalog"
                 );
+                let first = serde_json::to_value(&restored).unwrap()["first_event_at"]
+                    .as_str()
+                    .expect("restored creation timestamp")
+                    .to_owned();
+                assert_eq!(
+                    chrono::DateTime::parse_from_rfc3339(&first)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    created[id]
+                );
                 let row =
                     request(&state, "GET", &format!("/tdata/Jobs('{id}')"), Value::Null).await;
                 assert_eq!(metadata(&row), expected, "seed {seed}: restored {id}");
@@ -262,6 +306,81 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
             let event = history["events"].as_array().unwrap().last().unwrap();
             assert_eq!(event["via"], "request");
             assert_eq!(event["by"], "ann");
+            clock.end(Duration::ZERO);
+        });
+    }
+}
+
+#[test]
+fn dst_spawned_creation_and_initial_action_are_reactions() {
+    let spec = SPEC.replace(
+        "to = \"Expired\"",
+        "to = \"Expired\"\neffect = [\"spawn('Job', 'Child', child_id)\"]",
+    ) + r#"
+[[state]]
+name = "child_id"
+type = "string"
+initial = ""
+[[action]]
+name = "Spawn"
+from = ["Idle"]
+to = "Done"
+effect = ["spawn('Job', 'Child', child_id)"]
+[[action]]
+name = "Child"
+from = ["Idle"]
+to = "Done"
+"#;
+    for seed in 0..16 {
+        let clock = Arc::new(process_clock::ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        runtime().block_on(async {
+            clock.begin();
+            let store = SimEventStore::no_faults(seed);
+            let state = server_with_spec(&store, &spec);
+            for (id, action) in [("request-parent", "Spawn"), ("timer-parent", "Start")] {
+                request(&state, "POST", "/tdata/Jobs", json!({"Id":id})).await;
+                request(
+                    &state,
+                    "POST",
+                    &format!("/tdata/Jobs('{id}')/Jobs.{action}"),
+                    json!({}),
+                )
+                .await;
+                if action == "Start" {
+                    tokio::time::advance(Duration::from_secs(180)).await;
+                }
+                settle().await;
+                let parent =
+                    request(&state, "GET", &format!("/tdata/Jobs('{id}')"), Value::Null).await;
+                let child = parent["fields"]["child_id"]
+                    .as_str()
+                    .expect("spawned child");
+                let row = request(
+                    &state,
+                    "GET",
+                    &format!("/tdata/Jobs('{child}')"),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(row["status"], "Done", "seed {seed}: {action}");
+                assert_eq!(row["last_event_via"], "reaction");
+                assert_eq!(row["last_event_by"], Value::Null);
+                assert!(row["first_event_at"].is_string());
+                let history = request(
+                    &state,
+                    "GET",
+                    &format!("/observe/entities/Job/{child}/history"),
+                    Value::Null,
+                )
+                .await;
+                let events = history["events"].as_array().unwrap();
+                assert_eq!(events.len(), 2);
+                for event in events {
+                    assert_eq!(event["via"], "reaction", "seed {seed}: {action}");
+                    assert_eq!(event["by"], Value::Null);
+                }
+            }
             clock.end(Duration::ZERO);
         });
     }

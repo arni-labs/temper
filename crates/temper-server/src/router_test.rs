@@ -1004,7 +1004,12 @@ async fn test_data_only_entity_create_fast_path_persists_projection_without_acto
     assert_eq!(hydrated.state.sequence_nr, 1);
     assert_eq!(hydrated.state.fields["Body"], "created through fast path");
     let restored = serde_json::to_value(&hydrated.state).unwrap();
-    for name in ["last_event_at", "last_event_via", "last_event_by"] {
+    for name in [
+        "first_event_at",
+        "last_event_at",
+        "last_event_via",
+        "last_event_by",
+    ] {
         assert_eq!(restored[name], create_json[name]);
     }
     assert!(state.actor_registry.read().unwrap().contains_key(actor_key));

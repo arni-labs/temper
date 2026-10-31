@@ -40,6 +40,9 @@ impl EventOrigin {
         let Some(caller) = caller else {
             return Self::internal();
         };
+        if let Some(origin) = &caller.event_origin {
+            return origin.clone();
+        }
         let cause = caller
             .security_ctx
             .as_ref()
@@ -80,10 +83,13 @@ impl EventOrigin {
     }
 }
 
-/// The newest applied event, retained even when snapshots omit event history.
+/// Creation time and the newest applied event, retained independently of history.
 /// Flattened into each row using the kernel's top-level snake_case convention.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastEvent {
+    /// Timestamp at journal sequence one; unknown if that event is no longer held.
+    #[serde(default, serialize_with = "serialize_first_event_at")]
+    pub first_event_at: Option<DateTime<Utc>>,
     /// Timestamp of the newest event, null when no event is known.
     pub last_event_at: Option<DateTime<Utc>>,
     /// Immediate source of that same event.
@@ -97,6 +103,17 @@ impl LastEvent {
         self.last_event_at = Some(event.timestamp);
         self.last_event_via = event.origin.via;
         self.last_event_by = event.origin.by.clone();
+    }
+}
+
+fn serialize_first_event_at<S: serde::Serializer>(
+    timestamp: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match timestamp {
+        Some(timestamp) => serializer
+            .serialize_some(&timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+        None => serializer.serialize_none(),
     }
 }
 

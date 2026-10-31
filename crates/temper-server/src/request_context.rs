@@ -57,6 +57,8 @@ pub(crate) enum CallbackBudgetExceeded {
 ///   namespaced observability metadata supplied by clients
 #[derive(Debug, Clone, Default)]
 pub struct AgentContext {
+    /// Kernel-captured immediate origin for a spawned follow-on; never client input.
+    pub event_origin: Option<crate::entity_actor::EventOrigin>,
     /// Runtime-owned steps of the inline execution this context runs inside;
     /// never populated from request headers. See [`InlineChain`].
     pub inline_chain: InlineChain,
@@ -217,6 +219,7 @@ impl AgentContext {
     /// dropping identity via `Default`.
     pub fn system() -> Self {
         Self {
+            event_origin: None,
             inline_chain: InlineChain::default(),
             callback_hops: 0,
             security_ctx: Some(SecurityContext::system()),
@@ -258,6 +261,7 @@ impl AgentContext {
         security_ctx.principal.role = Some("service".to_string());
 
         Self {
+            event_origin: None,
             inline_chain: InlineChain::default(),
             callback_hops: 0,
             security_ctx: Some(security_ctx),
@@ -398,6 +402,7 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
     let workflow_run_id = header_string(headers, "x-temper-workflow-run-id");
 
     AgentContext {
+        event_origin: None,
         inline_chain: InlineChain::default(),
         callback_hops: 0,
         security_ctx: None,

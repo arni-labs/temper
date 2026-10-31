@@ -37,6 +37,7 @@ pub fn is_server_derived_field_name(name: &str) -> bool {
             | "status"
             | "has_spec"
             | "HasSpec"
+            | "first_event_at"
             | "last_event_at"
             | "last_event_via"
             | "last_event_by"

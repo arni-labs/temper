@@ -292,8 +292,14 @@ fn sustained_writes_hold_the_cache_under_budget() {
 #[test]
 fn cached_reply_keeps_event_metadata_without_parameters() {
     let cache = IdempotencyCache::new();
-    cache.put("Feed:f", "k", &req(), &busy_response(1024));
+    let mut response = busy_response(1024);
+    response.state.last_event.first_event_at = Some(temper_runtime::scheduler::sim_now());
+    cache.put("Feed:f", "k", &req(), &response);
     let cached = hit(&cache, "Feed:f", "k").unwrap();
+    assert_eq!(
+        cached.state.last_event.first_event_at,
+        response.state.last_event.first_event_at
+    );
     assert_eq!(cached.state.events.len(), 50);
     let last = cached.state.events.back().unwrap();
     assert_eq!(last.action, "Stepped");

@@ -205,6 +205,7 @@ impl TursoEventStore {
             status: String,
             fields_json: String,
             state_json: String,
+            first_event_at: Option<String>,
             sequence_nr: i64,
             projection_hash: String,
         }
@@ -253,6 +254,11 @@ impl TursoEventStore {
                 status: projection.status.clone(),
                 fields_json,
                 state_json,
+                first_event_at: projection
+                    .state
+                    .get("first_event_at")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
                 sequence_nr,
                 projection_hash: new_projection_hash,
             });
@@ -261,15 +267,15 @@ impl TursoEventStore {
         if !catalog_upserts.is_empty() {
             let mut upsert_sql = String::from(
                 "INSERT INTO entity_catalog \
-                 (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
+                 (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash, first_event_at) \
                  VALUES ",
             );
-            let mut upsert_values = Vec::with_capacity(catalog_upserts.len() * 9);
+            let mut upsert_values = Vec::with_capacity(catalog_upserts.len() * 10);
             for (index, projection) in catalog_upserts.iter().enumerate() {
                 if index > 0 {
                     upsert_sql.push_str(", ");
                 }
-                upsert_sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, 2, ?)");
+                upsert_sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?)");
                 upsert_values.push(Value::from(tenant.to_string()));
                 upsert_values.push(Value::from(projection.entity_type.clone()));
                 upsert_values.push(Value::from(projection.entity_id.clone()));
@@ -279,12 +285,20 @@ impl TursoEventStore {
                 upsert_values.push(Value::from(updated_at.clone()));
                 upsert_values.push(Value::from(projection.sequence_nr));
                 upsert_values.push(Value::from(projection.projection_hash.clone()));
+                upsert_values.push(
+                    projection
+                        .first_event_at
+                        .clone()
+                        .map(Value::Text)
+                        .unwrap_or(Value::Null),
+                );
             }
             upsert_sql.push_str(
                 " ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
                  status = excluded.status, \
                  fields = excluded.fields, \
                  state = excluded.state, \
+                 first_event_at = COALESCE(entity_catalog.first_event_at, excluded.first_event_at), \
                  updated_at = excluded.updated_at, \
                  sequence_nr = excluded.sequence_nr, \
                  projection_version = excluded.projection_version, \
@@ -673,7 +687,7 @@ impl TursoEventStore {
             .join(", ");
         let sql = format!(
             "SELECT c.entity_id, c.status, c.fields, c.state, \
-                    COALESCE(k.sequence_nr, c.sequence_nr), k.counters \
+                    COALESCE(k.sequence_nr, c.sequence_nr), k.counters, c.first_event_at \
              FROM entity_catalog c LEFT JOIN entity_catalog_counters k \
                ON k.tenant = c.tenant AND k.entity_type = c.entity_type \
               AND k.entity_id = c.entity_id \
@@ -702,6 +716,15 @@ impl TursoEventStore {
                 .transpose()
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?
                 .map(|stored| catalog_state_from_storage(&fields, stored));
+            let first_event_at: Option<String> = row.get(6).map_err(storage_error)?;
+            if state.is_none() && first_event_at.is_some() {
+                state = Some(serde_json::json!({}));
+            }
+            if let Some(stored) = state.as_mut().and_then(serde_json::Value::as_object_mut)
+                && (first_event_at.is_some() || stored.contains_key("first_event_at"))
+            {
+                stored.insert("first_event_at".into(), serde_json::json!(first_event_at));
+            }
             // A newer unchanged projection stored only its counters; serve
             // the row as that projection would have written it.
             if let Some(counters) = counters {

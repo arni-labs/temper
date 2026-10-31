@@ -21,6 +21,15 @@ use crate::platform::{PostgresEntityCatalogRow, storage_error};
 /// freed. 32 rows is a quarter of that concurrent payload.
 const CATALOG_READ_BATCH: usize = 32;
 
+type CatalogDocumentRow = (
+    String,
+    String,
+    serde_json::Value,
+    Option<serde_json::Value>,
+    i64,
+    Option<String>,
+);
+
 impl PostgresEventStore {
     /// Batch-load full entity catalog rows for a list of entity IDs.
     ///
@@ -57,15 +66,9 @@ impl PostgresEventStore {
         entity_type: &str,
         entity_ids: &[String],
     ) -> Result<Vec<PostgresEntityCatalogRow>, PersistenceError> {
-        let rows: Vec<(
-            String,
-            String,
-            serde_json::Value,
-            Option<serde_json::Value>,
-            i64,
-        )> = crate::dbm::postgres_query_as!(
+        let rows: Vec<CatalogDocumentRow> = crate::dbm::postgres_query_as!(
             &self.schema,
-            "SELECT entity_id, status, fields, state, sequence_nr \
+            "SELECT entity_id, status, fields, state, sequence_nr, first_event_at \
              FROM {schema}entity_catalog \
              WHERE tenant = $1 AND entity_type = $2 AND entity_id = ANY($3) \
              ORDER BY entity_id",
@@ -78,15 +81,29 @@ impl PostgresEventStore {
         .map_err(storage_error)?;
         Ok(rows
             .into_iter()
-            .map(
-                |(entity_id, status, fields, state, seq)| PostgresEntityCatalogRow {
+            .map(|(entity_id, status, fields, state, seq, first_event_at)| {
+                PostgresEntityCatalogRow {
                     entity_id,
                     status,
-                    state: state.map(|stored| catalog_state_from_storage(&fields, stored)),
+                    state: {
+                        let mut stored =
+                            state.map(|stored| catalog_state_from_storage(&fields, stored));
+                        if stored.is_none() && first_event_at.is_some() {
+                            stored = Some(serde_json::json!({}));
+                        }
+                        if let Some(object) =
+                            stored.as_mut().and_then(serde_json::Value::as_object_mut)
+                            && (first_event_at.is_some() || object.contains_key("first_event_at"))
+                        {
+                            object
+                                .insert("first_event_at".into(), serde_json::json!(first_event_at));
+                        }
+                        stored
+                    },
                     fields,
                     sequence_nr: seq.max(0) as u64,
-                },
-            )
+                }
+            })
             .collect())
     }
 }

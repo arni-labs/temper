@@ -109,7 +109,7 @@ fn evaluate_filter(entity: &serde_json::Value, expr: &FilterExpr) -> Option<bool
                         (Some(left_val), Some(right_val)) => {
                             let is_event_time = |expr: &FilterExpr| {
                                 matches!(expr,
-                                FilterExpr::Property(name) if name == "last_event_at")
+                                FilterExpr::Property(name) if matches!(name.as_str(), "first_event_at" | "last_event_at"))
                             };
                             let (left_val, right_val) =
                                 if is_event_time(left) || is_event_time(right) {
@@ -159,7 +159,10 @@ pub(crate) fn resolve_property(
     entity: &serde_json::Value,
     prop: &str,
 ) -> Option<serde_json::Value> {
-    if matches!(prop, "last_event_at" | "last_event_via" | "last_event_by") {
+    if matches!(
+        prop,
+        "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
         // Old catalog rows have no provenance. App fields can never supply it.
         return Some(entity.get(prop).cloned().unwrap_or(serde_json::Value::Null));
     }
@@ -357,17 +360,18 @@ fn sort_entities(entities: &mut [serde_json::Value], orderby: &[OrderByClause]) 
         for clause in orderby {
             let a_val = resolve_property(a, &clause.property);
             let b_val = resolve_property(b, &clause.property);
-            let (a_val, b_val) = if clause.property == "last_event_at" {
-                (
-                    a_val.map(normalize_event_time),
-                    b_val.map(normalize_event_time),
-                )
-            } else {
-                (a_val, b_val)
-            };
+            let (a_val, b_val) =
+                if matches!(clause.property.as_str(), "first_event_at" | "last_event_at") {
+                    (
+                        a_val.map(normalize_event_time),
+                        b_val.map(normalize_event_time),
+                    )
+                } else {
+                    (a_val, b_val)
+                };
             let kernel_metadata = matches!(
                 clause.property.as_str(),
-                "last_event_at" | "last_event_via" | "last_event_by"
+                "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
             );
             let ordering = match (&a_val, &b_val) {
                 (Some(serde_json::Value::Null), Some(serde_json::Value::Null))

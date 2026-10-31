@@ -157,6 +157,14 @@ impl BoxedEventStore {
             .await
     }
 
+    /// The kernel's saved creation time, or sequence one's time if still held.
+    pub async fn first_event_at(
+        &self,
+        persistence_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, PersistenceError> {
+        self.store.first_event_at(persistence_id).await
+    }
+
     pub async fn append_with_keys(
         &self,
         persistence_id: &str,

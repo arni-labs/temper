@@ -563,6 +563,30 @@ pub trait EventStore: Send + Sync + 'static {
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<PersistenceEnvelope>, PersistenceError>> + Send;
 
+    /// Creation time kept by the kernel, even after journal compaction. Stores
+    /// with a catalog prefer its saved fact; otherwise read exactly sequence 1.
+    fn first_event_at(
+        &self,
+        persistence_id: &str,
+    ) -> impl std::future::Future<
+        Output = Result<Option<chrono::DateTime<chrono::Utc>>, PersistenceError>,
+    > + Send {
+        async move {
+            Ok(self
+                .read_events_page(persistence_id, Some(2), 1)
+                .await?
+                .first()
+                .filter(|event| event.sequence_nr == 1)
+                .map(|event| {
+                    event
+                        .payload
+                        .get("timestamp")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                        .unwrap_or(event.metadata.timestamp)
+                }))
+        }
+    }
+
     /// Save a state snapshot.
     fn save_snapshot(
         &self,

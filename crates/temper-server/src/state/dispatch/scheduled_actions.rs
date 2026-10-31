@@ -284,6 +284,7 @@ impl ServerState {
         // The same action every attempt, so a retry of a fire that landed is
         // answered as it.
         agent.idempotency_key = Some(key.clone());
+        agent.event_origin = None;
         agent.fires_scheduled_action = Some(timer.row());
         super::timer_cause::mark_timer_fire(&mut agent);
         let mut wait = FIRST_RETRY_WAIT;

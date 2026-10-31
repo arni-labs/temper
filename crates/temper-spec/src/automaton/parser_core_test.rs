@@ -187,7 +187,12 @@ params = ["Id", "ctx_owner_status"]
 
 #[test]
 fn last_event_properties_are_reserved_for_the_kernel() {
-    for name in ["last_event_at", "last_event_via", "last_event_by"] {
+    for name in [
+        "first_event_at",
+        "last_event_at",
+        "last_event_via",
+        "last_event_by",
+    ] {
         let source = format!(
             r#"
 [automaton]

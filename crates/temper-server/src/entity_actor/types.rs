@@ -226,6 +226,12 @@ impl EntityState {
 
     /// Append an event to recent history while enforcing bounded memory.
     pub fn push_event_bounded(&mut self, event: EntityEvent) {
+        if self.last_event.first_event_at.is_none()
+            && self.total_event_count == 0
+            && self.sequence_nr <= 1
+        {
+            self.last_event.first_event_at = Some(event.timestamp);
+        }
         self.total_event_count = self.total_event_count.saturating_add(1);
         self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
         if let Some(key) = event.idempotency_key.as_deref() {

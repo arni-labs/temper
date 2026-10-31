@@ -777,6 +777,7 @@ impl ArmedTimer {
         let mut agent = self.agent_ctx.clone();
         agent.idempotency_key = Some(fire_key.clone());
         super::timer_cause::mark_timer_fire(&mut agent);
+        agent.event_origin = None;
         agent.fires_state_timer = Some(StateTimerFire {
             tenant: self.tenant.to_string(),
             entity_type: self.entity_type.clone(),

@@ -107,6 +107,7 @@ impl crate::state::ServerState {
             // The child's initial action carries a key of its own, from the
             // move's key and the child, so every try of it carries the same.
             let mut agent = agent_ctx.clone();
+            agent.event_origin = Some(crate::entity_actor::EventOrigin::internal());
             agent.idempotency_key = agent_ctx.idempotency_key.as_ref().map(|key| {
                 IdempotencyKey::FollowUp(derived_idempotency_key(
                     key.as_str(),

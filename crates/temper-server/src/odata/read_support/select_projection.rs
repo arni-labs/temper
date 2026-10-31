@@ -7,7 +7,7 @@ pub(in crate::odata) fn catalog_select_projection_fields(
     if select.is_empty()
         // Sparse store projections combine app fields and top-level values.
         // Keep kernel provenance in its authoritative full-state namespace.
-        || select.iter().any(|property| matches!(property.as_str(), "last_event_at" | "last_event_via" | "last_event_by"))
+        || select.iter().any(|property| matches!(property.as_str(), "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"))
         || query_options.filter.is_some()
         || query_options.orderby.is_some()
         || query_options.expand.is_some()
@@ -23,7 +23,10 @@ fn selected_catalog_property(
     row: &EntityCatalogRow,
     prop: &str,
 ) -> Option<serde_json::Value> {
-    if matches!(prop, "last_event_at" | "last_event_via" | "last_event_by") {
+    if matches!(
+        prop,
+        "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
         return Some(
             row.state
                 .as_ref()

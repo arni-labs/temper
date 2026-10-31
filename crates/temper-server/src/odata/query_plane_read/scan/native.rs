@@ -37,7 +37,7 @@ fn native_order_property_is_lossless(request: &QueryPlaneReadRequest<'_>, proper
     // Kernel event metadata is in the catalog state, never the app field index.
     if matches!(
         property,
-        "last_event_at" | "last_event_via" | "last_event_by"
+        "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
     ) {
         return false;
     }
@@ -180,7 +180,12 @@ async fn try_uniform_native_page(
     if !matches!(authz, RowAuthz::AllowAll) {
         return None;
     }
-    if request.query_options.filter.is_some() && !plan.filter_pushdown {
+    if request
+        .query_options
+        .filter
+        .as_ref()
+        .is_some_and(|filter| !filter_sql::candidate_filter_is_lossless(filter))
+    {
         return None;
     }
     if requested_top == 0 {
