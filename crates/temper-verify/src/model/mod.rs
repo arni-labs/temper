@@ -12,6 +12,7 @@
 //! and is accessed via the `&TemperModel` reference in property conditions.
 
 pub mod builder;
+mod count_bounds;
 mod expansion;
 pub mod semantics;
 mod stateright_impl;

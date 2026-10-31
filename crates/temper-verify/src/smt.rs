@@ -4,8 +4,8 @@
 //! enumerating states:
 //!
 //! 1. **Guard satisfiability** — Encode each guard as a Z3 formula over
-//!    integer counters (0..max) and boolean variables. Check SAT: if UNSAT,
-//!    the guard is dead code (the action can never fire).
+//!    integer counters (each up to its L1 bound) and boolean variables.
+//!    Check SAT: if UNSAT, the guard is dead code (the action can never fire).
 //!
 //! 2. **Invariant induction** — An invariant is proved inductive when every
 //!    initial state satisfies it and, for every transition, assuming the
@@ -26,7 +26,7 @@ use stateright::Model;
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, Truth, unmodelable};
 
 use crate::model::builder::build_model_from_ioa;
-use crate::model::semantics::{collect_list_contains_pairs, truth};
+use crate::model::semantics::{collect_list_contains_pairs, counter_bound, list_bound, truth};
 use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// Result of symbolic verification.
@@ -88,8 +88,8 @@ pub fn verify_symbolic(ioa_toml: &str, max_counter: usize) -> SmtResult {
     let approximation_notes = approximation_notes(&model);
     let approximate = !approximation_notes.is_empty();
 
-    let guard_sat = check_guard_satisfiability(&model, max_counter);
-    let (inductive, not_proved) = check_invariant_induction(&model, max_counter);
+    let guard_sat = check_guard_satisfiability(&model);
+    let (inductive, not_proved) = check_invariant_induction(&model);
     let unreachable = check_unreachable_states(&model);
 
     // Unreachable states are warnings, not failures — specs may declare states
@@ -135,8 +135,8 @@ fn reads_related_entities(guard: &Expr) -> bool {
 /// For each transition, encode its guard as a Z3 formula and check SAT.
 ///
 /// A guard is satisfiable if there exists an assignment of counter values
-/// (0..max_counter) and boolean values that makes the guard true.
-fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(String, bool)> {
+/// (each up to its bound) and boolean values that makes the guard true.
+fn check_guard_satisfiability(model: &TemperModel) -> Vec<(String, bool)> {
     model
         .transitions
         .iter()
@@ -151,10 +151,10 @@ fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(S
                 }
             }
 
-            // Create Z3 variables for each counter, bounded [0, max_counter]
-            let counter_vars = make_counter_vars(model, &solver, max_counter);
+            // Create Z3 variables for each counter, over the values L1 explores
+            let counter_vars = make_counter_vars(model, &solver);
             let bool_vars = make_bool_vars(model);
-            let list_vars = make_list_vars(model, &solver, max_counter, "");
+            let list_vars = make_list_vars(model, &solver, "");
             let status_var = make_status_var(model, &solver);
 
             if !t.from_states.is_empty() {
@@ -204,10 +204,7 @@ type NotProvedInvariants = Vec<(String, NotProved)>;
 /// not proved. `TypeInvariant` and `Terminal(..)` are
 /// structural: every target is a declared state, and no transition leaves a
 /// terminal state.
-fn check_invariant_induction(
-    model: &TemperModel,
-    max_counter: usize,
-) -> (Vec<(String, bool)>, NotProvedInvariants) {
+fn check_invariant_induction(model: &TemperModel) -> (Vec<(String, bool)>, NotProvedInvariants) {
     let mut not_proved: BTreeMap<usize, NotProved> = BTreeMap::new();
     let inits = model.init_states();
     let mut candidates = Vec::new();
@@ -224,19 +221,10 @@ fn check_invariant_induction(
         }
     }
 
-    // A list longer than L1 explores is reachable only from a longer
-    // initial list.
-    let list_bound = model
-        .initial_lists
-        .values()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-        .max(max_counter);
     loop {
         let mut dropped = BTreeSet::new();
         for t in &model.transitions {
-            for index in broken_by(model, t, &candidates, list_bound) {
+            for index in broken_by(model, t, &candidates) {
                 not_proved
                     .entry(index)
                     .or_insert_with(|| NotProved::BrokenBy(t.name.clone()));
@@ -282,12 +270,7 @@ fn check_invariant_induction(
 /// states and its guard, to a post-state (its effects applied, as L1 applies
 /// them) where the invariant is false. A solver that cannot decide counts as
 /// a break: L0 proves nothing it has not shown.
-fn broken_by(
-    model: &TemperModel,
-    t: &ResolvedTransition,
-    candidates: &[usize],
-    list_bound: usize,
-) -> Vec<usize> {
+fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) -> Vec<usize> {
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -310,7 +293,7 @@ fn broken_by(
             )
         })
         .collect();
-    let pre_lists = make_list_vars(model, &solver, list_bound, "pre:");
+    let pre_lists = make_list_vars(model, &solver, "pre:");
     let pre_status = make_status_var(model, &solver);
 
     // Apply the effects in order, as L1 does; `params.p` is a fresh unknown
@@ -368,13 +351,12 @@ fn broken_by(
             }
         }
     }
-    let changed = make_list_vars(model, &solver, list_bound, "post:");
+    let changed = make_list_vars(model, &solver, "post:");
     let mut post_lists = pre_lists.clone();
     for var in &changed_lists {
-        if let (Some(len), Some(elements)) = (changed.len_vars.get(var), changed.elem_vars.get(var))
-        {
+        if let (Some(len), Some(held)) = (changed.len_vars.get(var), changed.holds.get(var)) {
             post_lists.len_vars.insert(var.clone(), len.clone());
-            post_lists.elem_vars.insert(var.clone(), elements.clone());
+            post_lists.holds.insert(var.clone(), held.clone());
         }
     }
     let post_status = match t
@@ -424,22 +406,18 @@ fn broken_by(
 // Z3 helpers
 // ---------------------------------------------------------------------------
 
-/// Create Z3 integer variables for each counter, bounded [0, max_counter].
-fn make_counter_vars(
-    model: &TemperModel,
-    solver: &Solver,
-    max_counter: usize,
-) -> Vec<(String, Int)> {
+/// Create Z3 integer variables for each counter, each in `[0, bound]` with
+/// the bound L1 explores it to, which covers every literal it is compared with.
+fn make_counter_vars(model: &TemperModel, solver: &Solver) -> Vec<(String, Int)> {
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-
     model
         .initial_counters
         .keys()
         .map(|name| {
             let var = Int::new_const(var_name("", "counter", name));
+            let bound = i64::try_from(counter_bound(model, name)).unwrap_or(i64::MAX);
             solver.assert(var.ge(&zero));
-            solver.assert(var.le(&max_val));
+            solver.assert(var.le(Int::from_i64(bound)));
             (name.clone(), var)
         })
         .collect()
@@ -460,40 +438,25 @@ fn make_bool_vars(model: &TemperModel) -> Vec<(String, Bool)> {
 #[derive(Clone, Default)]
 struct ListSymbolicVars {
     len_vars: BTreeMap<String, Int>,
-    elem_vars: BTreeMap<String, Vec<Int>>,
-    value_atoms: BTreeMap<String, i64>,
+    /// Whether each list holds each value a guard or invariant looks for in
+    /// it.
+    holds: BTreeMap<String, BTreeMap<String, Bool>>,
 }
 
-/// Create exact bounded symbolic list variables, named after `prefix`:
+/// Create exact bounded symbolic list variables, named after `prefix`, for
+/// each list up to the length L1 explores it to (its bound):
 /// - its length, in `[0, bound]`
-/// - one element per position below `bound`
+/// - whether it holds each value a guard or invariant looks for in it, with
+///   no more of those held than its length
 ///
-/// Every string a guard or invariant tests for membership, and every initial
-/// element, gets its own atom, so `'v' in list` is never decided by default.
-fn make_list_vars(
-    model: &TemperModel,
-    solver: &Solver,
-    bound: usize,
-    prefix: &str,
-) -> ListSymbolicVars {
+/// Membership is all a guard or invariant reads of a list's elements, and a
+/// list of length `n` can hold any `n` of the values looked for, so this is
+/// exact. A constant per position would grow with the bound, which comes
+/// from the literals a spec compares the length with and can be any size.
+fn make_list_vars(model: &TemperModel, solver: &Solver, prefix: &str) -> ListSymbolicVars {
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(bound as i64);
-    let mut len_vars = BTreeMap::new();
-    let mut elem_vars = BTreeMap::new();
-
-    for name in model.initial_lists.keys() {
-        let len_var = Int::new_const(var_name(prefix, "len", name));
-        solver.assert(len_var.ge(&zero));
-        solver.assert(len_var.le(&max_val));
-        len_vars.insert(name.clone(), len_var);
-
-        let elements = (0..bound)
-            .map(|idx| Int::new_const(var_name(prefix, &format!("elem{idx}"), name)))
-            .collect::<Vec<_>>();
-        elem_vars.insert(name.clone(), elements);
-    }
-
-    let mut values = BTreeSet::new();
+    let one = Int::from_i64(1);
+    let mut looked_for: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let exprs = model
         .transitions
         .iter()
@@ -502,27 +465,40 @@ fn make_list_vars(
     for expr in exprs {
         let mut pairs = BTreeSet::new();
         collect_list_contains_pairs(expr, &mut pairs);
-        for (_, value) in pairs {
-            values.insert(value);
-        }
-    }
-    for list in model.initial_lists.values() {
-        for value in list {
-            values.insert(value.clone());
+        for (list, value) in pairs {
+            looked_for.entry(list).or_default().insert(value);
         }
     }
 
-    let value_atoms = values
-        .into_iter()
-        .enumerate()
-        .map(|(idx, value)| (value, idx as i64))
-        .collect::<BTreeMap<_, _>>();
+    let mut len_vars = BTreeMap::new();
+    let mut holds = BTreeMap::new();
+    for name in model.initial_lists.keys() {
+        let bound = list_bound(model, name);
+        let max_val = Int::from_i64(i64::try_from(bound).unwrap_or(i64::MAX));
+        let len_var = Int::new_const(var_name(prefix, "len", name));
+        solver.assert(len_var.ge(&zero));
+        solver.assert(len_var.le(&max_val));
 
-    ListSymbolicVars {
-        len_vars,
-        elem_vars,
-        value_atoms,
+        let held: BTreeMap<String, Bool> = looked_for
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                let constant =
+                    Bool::new_const(var_name(prefix, "holds", &format!("{name}|{value}")));
+                (value.clone(), constant)
+            })
+            .collect();
+        if !held.is_empty() {
+            let counted: Vec<Int> = held.values().map(|h| h.ite(&one, &zero)).collect();
+            let count = Int::add(&counted.iter().collect::<Vec<_>>());
+            solver.assert(count.le(&len_var));
+        }
+        len_vars.insert(name.clone(), len_var);
+        holds.insert(name.clone(), held);
     }
+
+    ListSymbolicVars { len_vars, holds }
 }
 
 /// A Z3 constant's name: the state it belongs to (`prefix`), the kind of
@@ -566,32 +542,14 @@ fn encode_state_membership(status_var: &Int, states: &[String], model: &TemperMo
     }
 }
 
-/// Encode exact bounded `contains(list, value)` over symbolic list slots.
+/// Encode exact bounded `contains(list, value)`: whether the list holds it.
 fn encode_list_contains(var: &str, value: &str, lists: &ListSymbolicVars) -> Bool {
-    let Some(len_var) = lists.len_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(elements) = lists.elem_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(atom_id) = lists.value_atoms.get(value) else {
-        return Bool::from_bool(false);
-    };
-
-    if elements.is_empty() {
-        return Bool::from_bool(false);
-    }
-
-    let atom = Int::from_i64(*atom_id);
-    let disjuncts: Vec<Bool> = elements
-        .iter()
-        .enumerate()
-        .map(|(idx, element)| {
-            let idx_int = Int::from_i64(idx as i64);
-            Bool::and(&[&len_var.gt(&idx_int), &element.eq(&atom)])
-        })
-        .collect();
-    Bool::or(&disjuncts)
+    lists
+        .holds
+        .get(var)
+        .and_then(|held| held.get(value))
+        .cloned()
+        .unwrap_or_else(|| Bool::from_bool(false))
 }
 
 /// Symbolic values for one state.

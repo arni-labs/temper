@@ -3,13 +3,13 @@
 //! This module wraps Stateright's BFS model checker and produces a
 //! `VerificationResult` summarizing the outcome.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
 
 use crate::model::ResolvedTransition;
-use crate::model::semantics::{successors, truth};
+use crate::model::semantics::{successors_noting_cuts, truth};
 use crate::model::{TemperModel, TemperModelAction, TemperModelState};
 
 /// A counterexample discovered during model checking.
@@ -40,6 +40,12 @@ pub struct VerificationResult {
     pub dead_transitions: Vec<String>,
     /// Whether the checker completed its exploration (vs. hitting a limit).
     pub is_complete: bool,
+    /// The counters and lists a reachable move takes past the bound they
+    /// are explored to, each with that bound. Those moves are not explored,
+    /// so when this is not empty every property holds only up to these
+    /// bounds: the result is bounded, not proved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounded_by: Vec<(String, usize)>,
 }
 
 /// Run exhaustive BFS model checking on the given `TemperModel`.
@@ -104,13 +110,11 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
 
     // An edge never seen in part of the state space may still be enabled in
     // the rest: dead transitions are named only after a whole exploration.
-    let dead_transitions = if explored_all {
-        find_dead_transitions(model)
-    } else {
-        None
-    };
-    let is_complete = dead_transitions.is_some();
-    let dead_transitions = dead_transitions.unwrap_or_default();
+    let walked = if explored_all { walk(model) } else { None };
+    let is_complete = walked.is_some();
+    let (dead_transitions, bounded_by) = walked
+        .map(|w| (w.dead, w.cut_short.into_iter().collect()))
+        .unwrap_or_default();
     let all_properties_hold =
         is_complete && counterexamples.is_empty() && dead_transitions.is_empty();
 
@@ -120,6 +124,7 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         counterexamples,
         dead_transitions,
         is_complete,
+        bounded_by,
     }
 }
 
@@ -153,9 +158,17 @@ fn first_break(
     steps
 }
 
-/// The transitions no reachable state enables, or `None` when the model's
-/// time limit ran out before every reachable state was walked.
-fn find_dead_transitions(model: &TemperModel) -> Option<Vec<String>> {
+/// What a walk of every reachable state found.
+struct Walked {
+    /// The transitions no reachable state enables.
+    dead: Vec<String>,
+    /// The counters and lists a reachable move takes past their bound, with it.
+    cut_short: BTreeMap<String, usize>,
+}
+
+/// Walk every reachable state, or return `None` when the model's time limit
+/// ran out before every reachable state was walked.
+fn walk(model: &TemperModel) -> Option<Walked> {
     let mut visited_states = HashSet::new();
     let mut queue = VecDeque::new();
     for init in model.init_states() {
@@ -165,13 +178,14 @@ fn find_dead_transitions(model: &TemperModel) -> Option<Vec<String>> {
     }
 
     let mut covered = vec![false; model.transitions.len()];
+    let mut cut = BTreeMap::new();
 
     while let Some(state) = queue.pop_front() {
         if model.out_of_time() {
             return None;
         }
         for (index, transition) in model.transitions.iter().enumerate() {
-            let next_states = step(model, transition, &state);
+            let next_states = step(model, transition, &state, &mut cut);
             if model.out_of_time() {
                 return None;
             }
@@ -199,15 +213,20 @@ fn find_dead_transitions(model: &TemperModel) -> Option<Vec<String>> {
             }
         })
         .collect();
-    Some(dead)
+    Some(Walked {
+        dead,
+        cut_short: cut,
+    })
 }
 
 /// The states `transition` reaches from `state`: none when it is not
-/// enabled, one per explored parameter assignment otherwise.
+/// enabled, one per explored parameter assignment otherwise. Adds to `cut`
+/// what a step it leaves out would take past its bound.
 fn step(
     model: &TemperModel,
     transition: &ResolvedTransition,
     state: &TemperModelState,
+    cut: &mut BTreeMap<String, usize>,
 ) -> Vec<TemperModelState> {
     // `transition_enabled` admits a cross-entity gated edge (its guard is a
     // free boolean), so the gated target state is walked, as it is reachable
@@ -215,7 +234,7 @@ fn step(
     if !model.transition_enabled(transition, state) {
         return Vec::new();
     }
-    successors(model, transition, state)
+    successors_noting_cuts(model, transition, state, cut)
         .into_iter()
         .map(|(_, next)| next)
         .collect()

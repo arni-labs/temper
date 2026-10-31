@@ -448,6 +448,7 @@ mod tests {
             initial_lists: BTreeMap::new(),
             counter_bounds: BTreeMap::new(),
             default_max_counter: 2,
+            list_bounds: BTreeMap::new(),
             list_literals: BTreeMap::new(),
             initial_strings: BTreeMap::new(),
             tracked_strings: Default::default(),

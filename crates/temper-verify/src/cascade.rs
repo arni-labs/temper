@@ -457,10 +457,22 @@ impl VerificationCascade {
     fn run_model_check(&self, model: &TemperModel) -> LevelResult {
         let verification = checker::check_model(model);
         let passed = verification.all_properties_hold;
-        let summary = if passed {
+        let summary = if passed && verification.bounded_by.is_empty() {
             format!(
                 "L1 Model Check PASSED: {} states explored, all properties hold",
                 verification.states_explored,
+            )
+        } else if passed {
+            let bounds: Vec<String> = verification
+                .bounded_by
+                .iter()
+                .map(|(name, bound)| format!("{name} up to {bound}"))
+                .collect();
+            format!(
+                "L1 Model Check PASSED, bounded: {} states explored; every property holds with {}, \
+                 and a move can go past that, which was not explored, so this is not a proof",
+                verification.states_explored,
+                bounds.join(", "),
             )
         } else {
             let mut parts = Vec::new();

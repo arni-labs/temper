@@ -53,6 +53,7 @@ pub(super) fn slice(mut model: TemperModel, read: BTreeSet<String>) -> TemperMod
         model.initial_booleans.remove(name);
         model.initial_lists.remove(name);
         model.counter_bounds.remove(name);
+        model.list_bounds.remove(name);
         model.list_literals.remove(name);
     }
     model.invariants.clear();
