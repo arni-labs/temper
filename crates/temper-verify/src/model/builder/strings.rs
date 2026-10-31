@@ -204,7 +204,7 @@ pub(super) fn string_literals(
     // and effect values: a fresh symbol cannot equal a concrete literal.
     // This stays finite; fresh symbols still cover all other parameter inputs,
     // and effect-only fields still take only their initial and written values.
-    written.extend(out.values().flatten().cloned());
+    // mutant: comparison literals not shared
     for var in tracked {
         out.insert(var.clone(), written.clone());
     }
