@@ -182,3 +182,13 @@ fn a_new_field_no_rule_reads_keeps_the_verdict() {
     assert!(keeps(&kept, TICKET, &tagged));
     assert!(check(&tagged).run().all_passed);
 }
+
+/// `Closed` has no move out and no liveness asks for one, so a silent move
+/// out of it changes nothing a level reads.
+#[test]
+fn a_silent_move_out_of_a_place_no_liveness_watches_keeps_the_verdict() {
+    let kept = check(TICKET).run();
+    let remarked = TICKET.to_string() + &remark("Closed");
+    assert!(check(&remarked).run().all_passed);
+    assert!(keeps(&kept, TICKET, &remarked));
+}

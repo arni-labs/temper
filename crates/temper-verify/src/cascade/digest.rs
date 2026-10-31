@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use temper_spec::predicate::Name;
 
 use super::{CascadeLevel, CascadeResult, VerificationCascade};
-use crate::model::{self, TemperModel};
+use crate::model::{self, LivenessKind, TemperModel};
 
 /// What a kept verdict is found by, and what it is checked against before
 /// it stands for this spec.
@@ -18,6 +18,8 @@ pub struct KeptKey {
     silent: Vec<Vec<String>>,
     /// The terminal places.
     terminal: Vec<String>,
+    /// The places a `NoDeadlock` liveness requires a move out of.
+    watched: Vec<String>,
 }
 
 impl KeptKey {
@@ -26,8 +28,8 @@ impl KeptKey {
     /// moves, which change no state, so it is unless one of this spec's
     /// silent moves leaves no place the kept walk reached (the move is
     /// dead), leaves a reached terminal place (it breaks `Terminal`), or
-    /// the two differ in whether a silent move leaves a reached place no
-    /// other move does (`NoDeadlock` reads that). A verdict kept without
+    /// the two differ in whether a silent move leaves a reached place that
+    /// a `NoDeadlock` liveness watches and no other move leaves. A verdict kept without
     /// its places stands only for a spec with no silent moves: its digest
     /// held every move.
     pub fn fits(&self, kept: &CascadeResult) -> bool {
@@ -49,6 +51,7 @@ impl KeptKey {
         }) && reached
             .stuck
             .iter()
+            .filter(|place| self.watched.contains(place))
             .all(|place| leaves(place) == reached.left_silently.contains(place))
     }
 }
@@ -113,6 +116,15 @@ impl VerificationCascade {
             digest: format!("{:x}", hasher.finalize()),
             silent,
             terminal: built.terminal.clone(),
+            watched: built
+                .liveness
+                .iter()
+                .filter_map(|live| match &live.kind {
+                    LivenessKind::NoDeadlock { from } => Some(from.clone()),
+                    LivenessKind::ReachesState { .. } => None,
+                })
+                .flatten()
+                .collect(),
         })
     }
 }
