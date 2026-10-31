@@ -259,6 +259,11 @@ pub(crate) async fn install_genesis_app(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": error })),
         ),
+        // A spec of the closure failed its check: nothing changed.
+        Err(error) if error.contains("did not pass their checks") => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": error })),
+        ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error })),

@@ -6,18 +6,19 @@
 //! in two processes, would each take the share meant for one. On a 2 GB
 //! sandbox shared with the daemon that holds its data volume, the kernel then
 //! kills whichever crosses the limit, and killing that daemon unmounts the
-//! volume (15 Oct 2026). So each caller that checks or installs specs it was
-//! sent (`POST /api/specs/validate-ioa`, an app's pushed files) takes an
-//! exclusive lock on one fixed file in the system's temporary directory
-//! before it reads free memory, and holds it until its work has ended.
+//! volume (15 Oct 2026). So each caller that checks or installs specs
+//! (`POST /api/specs/validate-ioa`, and every app install from files, pushed
+//! or fetched from a registry) takes an exclusive lock on one fixed file in
+//! the system's temporary directory before it reads free memory, and holds it
+//! until its work has ended.
 //!
 //! A caller takes the turn once: a second lock on a new handle in the same
 //! process waits for the first, so a function that already holds it must not
 //! call one that takes it again.
 //!
-//! Only those two HTTP handlers take it, and no simulation runs either, so the
-//! real file below is never in a simulated run: the lock exists to coordinate
-//! real processes, which a simulation has one of.
+//! No simulation runs either caller (a registry install fetches over the
+//! network), so the real file below is never in a simulated run: the lock
+//! exists to coordinate real processes, which a simulation has one of.
 
 use std::fs::{File, OpenOptions}; // determinism-ok: host-wide lock file, HTTP handlers only
 

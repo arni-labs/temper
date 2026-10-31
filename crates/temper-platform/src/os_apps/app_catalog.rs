@@ -9,10 +9,6 @@ use super::{
     read_app_guide, read_app_manifest,
 };
 
-mod tenant_installs;
-use tenant_installs::TenantInstalls;
-pub use tenant_installs::{add_tenant_os_apps_dir, remove_tenant_os_apps_dir};
-
 pub(crate) struct AppCatalog {
     /// Directory containing app bundles.
     apps_dir: PathBuf,
@@ -58,6 +54,36 @@ impl DirApps {
     }
 }
 
+/// The apps one tenant installed; a later install of a name replaces an earlier one.
+#[derive(Default)]
+struct TenantInstalls {
+    /// Install directories in the order they were added, with the apps taken
+    /// from each.
+    dirs: Vec<(PathBuf, DirApps)>,
+    entries: BTreeMap<String, AppEntry>,
+    paths: BTreeMap<String, PathBuf>,
+}
+
+impl TenantInstalls {
+    /// Add `installed`, taken from its directory as `apps` says. A directory
+    /// added again moves last and takes what it took before as well.
+    fn add(&mut self, installed: AppCatalog, apps: DirApps) {
+        let apps = match self
+            .dirs
+            .iter()
+            .position(|(dir, _)| dir == &installed.apps_dir)
+        {
+            Some(index) => self.dirs.remove(index).1.union(apps),
+            None => apps,
+        };
+        self.dirs.push((installed.apps_dir, apps));
+        self.paths.extend(installed.paths);
+        for entry in installed.entries {
+            self.entries.insert(entry.name.clone(), entry);
+        }
+    }
+}
+
 /// Global catalog, initialized on first access.
 static CATALOG: OnceLock<RwLock<AppCatalog>> = OnceLock::new();
 
@@ -92,6 +118,11 @@ pub fn get_os_app(name: &str) -> Option<AppBundle> {
 /// when it has one, otherwise the shared catalog's.
 pub fn tenant_os_app(tenant: &str, name: &str) -> Option<AppBundle> {
     load_app_bundle(read_catalog().app_dir(Some(tenant), name)?).ok()
+}
+
+/// The directory `tenant` resolves `name` from, as [`tenant_os_app`] reads it.
+pub(crate) fn tenant_os_app_dir(tenant: &str, name: &str) -> Option<PathBuf> {
+    read_catalog().app_dir(Some(tenant), name).cloned()
 }
 
 /// Get the full app guide markdown `tenant` resolves for `name`.
@@ -139,6 +170,20 @@ pub fn add_os_apps_dir_preferred(dir: PathBuf, apps: DirApps) {
     let additional = AppCatalog::from_dir_taking(dir, &apps);
     let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
     lock.merge_catalog_preferred(additional, apps);
+}
+
+/// Make `apps` of `dir` resolve for `tenant` only, ahead of the shared catalog.
+///
+/// Genesis installs into a tenant other than the platform tenant use this: a
+/// pinned closure is what that tenant asked to run, so for that tenant it wins
+/// over a shared app of the same name, and no other tenant sees it.
+pub fn add_tenant_os_apps_dir(tenant: &str, dir: PathBuf, apps: DirApps) {
+    let installed = AppCatalog::from_dir_taking(dir, &apps);
+    let mut lock = catalog().write().unwrap(); // ci-ok: infallible lock
+    lock.tenant_installs
+        .entry(tenant.to_string())
+        .or_default()
+        .add(installed, apps);
 }
 
 /// Re-scan the OS apps directory and refresh the catalog.

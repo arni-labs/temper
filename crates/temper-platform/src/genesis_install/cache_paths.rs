@@ -120,6 +120,8 @@ pub(super) enum InstallSource<'a> {
     Registry(&'a str),
     /// This process's own Genesis rows in this tenant (`App.Install`).
     Local(&'a str),
+    /// Files the caller posted to this server (`POST /api/os-apps/{name}/install`).
+    Pushed,
 }
 
 impl CacheOwner<'_> {
@@ -133,6 +135,10 @@ impl CacheOwner<'_> {
                 tenant,
                 source: InstallSource::Local(source_tenant),
             } => format!("install\n{tenant}\nlocal\n{source_tenant}"),
+            Self::Install {
+                tenant,
+                source: InstallSource::Pushed,
+            } => format!("install\n{tenant}\npushed"),
             Self::Export { registry_tenant } => format!("export\n{registry_tenant}"),
             Self::DependencyRead { tenant } => format!("dependency-read\n{tenant}"),
         }

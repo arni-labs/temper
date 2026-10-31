@@ -714,13 +714,6 @@ pub(super) async fn bootstrap_installed_apps(
             "  Restored Genesis app cache roots: service={restored_genesis_caches}, registry={restored_genesis_registry_caches}"
         );
     }
-    // The version of an app last pushed to this server resolves ahead of its
-    // files in the catalog, so the installs below install that version.
-    let restored_pushed = temper_platform::os_apps::restore_pushed_app_roots(state);
-    if restored_pushed > 0 {
-        tracing::info!(restored_pushed, "restored pushed app versions");
-    }
-
     for ((tenant, app_name), source) in requested {
         if skip_unavailable_tenant(state, &tenant, &format!("app '{app_name}'")) {
             continue;
@@ -753,9 +746,19 @@ pub(super) async fn bootstrap_installed_apps(
         // updated IOA/Cedar/WASM/ADR assets must refresh even when the tenant
         // already has entity tables from an older install. A replay of a stored
         // install keeps its recorded origin; only an `--app` request is a new
-        // install.
+        // install. An `--app` whose stored install is a pushed version replays
+        // it too: the restore above made that version what the app resolves,
+        // and a new install would record it as the catalog's files.
         let install = match source {
             AppBootstrapSource::Persisted => {
+                temper_platform::restore_os_app(state, &tenant, &app_name).await
+            }
+            AppBootstrapSource::Cli
+                if temper_platform::genesis_install::pushed_install_recorded(
+                    state, &tenant, &app_name,
+                )
+                .await =>
+            {
                 temper_platform::restore_os_app(state, &tenant, &app_name).await
             }
             AppBootstrapSource::Cli => {
@@ -795,7 +798,11 @@ pub(super) async fn bootstrap_installed_apps(
                     // app's first pushed version when it has none, so every
                     // later boot serves it until the next push, whatever the
                     // catalog holds then (see `adopt_catalog_app`).
-                    match temper_platform::os_apps::adopt_catalog_app(state, &tenant, &app_name) {
+                    match temper_platform::genesis_install::adopt_catalog_app(
+                        state, &tenant, &app_name,
+                    )
+                    .await
+                    {
                         Ok(Some(digest)) => tracing::info!(
                             tenant = %tenant,
                             app = %app_name,

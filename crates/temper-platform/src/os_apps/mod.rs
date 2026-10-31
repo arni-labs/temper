@@ -25,20 +25,21 @@ mod closure_bootstrap;
 mod entity_aliases;
 mod install_checks;
 mod install_guard;
+mod install_lines;
 mod module_review_step;
 mod policy_rows;
 mod proofs;
-mod pushed;
 mod reconcile;
 mod runtime_heal;
 mod system_files;
 mod types;
 mod wasm_replacement;
 pub(super) use app_catalog::catalog;
+pub(crate) use app_catalog::tenant_os_app_dir;
 pub use app_catalog::{
     DirApps, add_os_apps_dir, add_os_apps_dir_preferred, add_tenant_os_apps_dir, get_os_app,
-    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps,
-    remove_tenant_os_apps_dir, set_os_apps_dir, tenant_app_guide, tenant_os_app,
+    list_os_apps, list_startup_os_apps, list_tenant_os_apps, reload_os_apps, set_os_apps_dir,
+    tenant_app_guide, tenant_os_app,
 };
 pub use closure_bootstrap::{
     ClosureBootstrapResult, OS_APP_CLOSURE_RESOLVER_VERSION, OsAppClosure,
@@ -49,12 +50,9 @@ use entity_aliases::{
     content_sha256, ensure_created_file_initialized, ensure_entity_field_aliases,
     file_already_contains, slug_fragment,
 };
+pub use install_lines::{installed_line, stored_line, waiting_line};
 #[cfg(test)]
 pub(super) use policy_rows::os_app_policy_row_id;
-pub use pushed::{
-    PushRefused, PushedFile, PushedInstall, adopt_catalog_app, install_pushed_app, installed_line,
-    restore_pushed_app_roots, stored_line, waiting_line,
-};
 pub(crate) use reconcile::{
     InstallOrigin, tenant_has_active_policies_for_bundle, tenant_has_registered_wasm_for_bundle,
 };
@@ -68,7 +66,7 @@ pub(crate) use runtime_heal::{
 pub use types::*;
 use wasm_replacement::{UploadedWasmReplacementContext, uploaded_wasm_replacement_context};
 
-fn read_app_manifest(app_dir: &Path) -> Option<AppManifest> {
+pub(crate) fn read_app_manifest(app_dir: &Path) -> Option<AppManifest> {
     let path = app_dir.join("app.toml");
     let content = std::fs::read_to_string(&path).ok()?;
     toml::from_str(&content).ok()
@@ -223,7 +221,7 @@ pub type OsAppBundle = AppBundle;
 ///
 /// Returns `(entity_type_hint, path)` pairs. The entity type is extracted
 /// from the IOA file's `[automaton] name` field, not the filename.
-fn find_ioa_files(app_dir: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn find_ioa_files(app_dir: &Path) -> Vec<(String, PathBuf)> {
     let mut results = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
@@ -868,7 +866,7 @@ fn find_seed_data(app_dir: &Path) -> Vec<SeedInstance> {
 }
 
 /// Read the app guide markdown (APP.md/app.md first, then skill.md/SKILL.md fallback).
-fn read_app_guide(app_dir: &Path) -> Option<String> {
+pub(crate) fn read_app_guide(app_dir: &Path) -> Option<String> {
     for name in &["APP.md", "app.md", "skill.md", "SKILL.md"] {
         let path = app_dir.join(name);
         if let Ok(content) = std::fs::read_to_string(&path) {

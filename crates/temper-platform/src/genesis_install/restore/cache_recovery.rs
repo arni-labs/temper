@@ -15,6 +15,7 @@ pub(super) struct InstallCacheCandidate {
 /// A registry install caches under its registry tenant. An `App.Install` from a Genesis service
 /// on this server caches under the service's tenant, which its record names as the registry
 /// tenant unless the request named another one, so every Genesis source tenant is a candidate too.
+/// A pushed install caches under its tenant alone, after every Genesis source.
 /// A candidate is used only when it holds the recorded versions. Old shared caches
 /// require recorded digests and are copied into the first tenant-owned candidate.
 pub(super) fn install_cache_candidates(
@@ -34,6 +35,7 @@ pub(super) fn install_cache_candidates(
             .filter(|source| source.as_str() != registry_tenant)
             .map(|source| InstallSource::Local(source.as_str())),
     );
+    sources.push(InstallSource::Pushed);
     let mut candidates: Vec<_> = sources
         .into_iter()
         .map(|source| InstallCacheCandidate {

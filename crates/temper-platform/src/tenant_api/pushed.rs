@@ -1,5 +1,6 @@
 //! `POST /api/os-apps/{name}/install`: install an app's files, pushed by the
-//! caller, into this running server ([`crate::os_apps::install_pushed_app`]).
+//! caller, into this running server through the one installer
+//! ([`crate::genesis_install::install_pushed_app`]).
 //!
 //! Body: `{"files": {"<path in the app>": "<text>" | {"base64": "..."} |
 //! {"keep": "<sha256 hex>"}}, "budget_ms": <time each spec's check may
@@ -25,7 +26,7 @@ use super::auth::{
     PlatformResourceAuthorization, require_authenticated, require_requested_resource_authorization,
 };
 use super::authorization_error;
-use crate::os_apps::{PushRefused, PushedFile, install_pushed_app};
+use crate::genesis_install::{PushRefused, PushedFile, install_pushed_app};
 use crate::state::PlatformState;
 
 /// The largest push this server reads. A push is held in memory while it is
