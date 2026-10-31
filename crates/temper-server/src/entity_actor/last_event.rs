@@ -18,12 +18,23 @@ pub enum EventVia {
 }
 
 /// Provenance persisted with an event. Older events have unknown provenance.
+///
+/// `for` and `agent_type` are recorded only with `by`, and only when the
+/// subject carries them: an agent acting for a person names that person and
+/// its type. A person acting in person records `by` alone. They are left out
+/// of the event when absent, so events without them keep their old shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventOrigin {
     /// How the event came about; null for events written before provenance.
     pub via: Option<EventVia>,
     /// The authenticated request subject, never a timer's acting principal.
     pub by: Option<String>,
+    /// The principal `by` acted for, as its authenticated principal names it.
+    #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
+    pub acting_for: Option<String>,
+    /// The agent type of `by`, as its authenticated principal names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 impl EventOrigin {
@@ -31,7 +42,15 @@ impl EventOrigin {
     pub(crate) fn internal() -> Self {
         Self {
             via: Some(EventVia::Reaction),
-            by: None,
+            ..Self::default()
+        }
+    }
+
+    /// A state timeout or scheduled action, which names no request subject.
+    fn timer() -> Self {
+        Self {
+            via: Some(EventVia::Timer),
+            ..Self::default()
         }
     }
 
@@ -53,19 +72,13 @@ impl EventOrigin {
             return Self::internal();
         }
         if caller.fires_state_timer.is_some() || caller.fires_scheduled_action.is_some() {
-            return Self {
-                via: Some(EventVia::Timer),
-                by: None,
-            };
+            return Self::timer();
         }
         if caller.callback_hops > 0 {
             return Self::internal();
         }
         if cause.is_some_and(|cause| cause.timer.is_some()) {
-            return Self {
-                via: Some(EventVia::Timer),
-                by: None,
-            };
+            return Self::timer();
         }
         let Some(ctx) = caller.security_ctx.as_ref() else {
             return Self::internal();
@@ -75,10 +88,19 @@ impl EventOrigin {
         {
             return Self::internal();
         }
+        let principal = &ctx.principal;
+        if principal.id.is_empty() || principal.id == "anonymous" {
+            return Self {
+                via: Some(EventVia::Request),
+                ..Self::default()
+            };
+        }
+        let present = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
         Self {
             via: Some(EventVia::Request),
-            by: (!ctx.principal.id.is_empty() && ctx.principal.id != "anonymous")
-                .then(|| ctx.principal.id.clone()),
+            by: Some(principal.id.clone()),
+            acting_for: present(&principal.acting_for),
+            agent_type: present(&principal.agent_type),
         }
     }
 }
@@ -120,17 +142,59 @@ fn serialize_first_event_at<S: serde::Serializer>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temper_authz::{MoveCause, ReactionHop, SecurityContext, TimerArm};
+    use temper_authz::{MoveCause, PrincipalKind, ReactionHop, SecurityContext, TimerArm};
 
+    /// A person in person, as a verified token with only a `sub` resolves.
     fn caller() -> AgentContext {
         AgentContext {
-            security_ctx: Some(SecurityContext::from_resolved_identity(
-                "ann", "person", None,
+            security_ctx: Some(SecurityContext::from_verified_jwt(
+                "ann",
+                PrincipalKind::Customer,
+                None,
+                None,
+                Some("owner"),
+                None,
             )),
             // An observation field is not the authenticated subject.
             agent_id: Some("forged-observation".into()),
             ..AgentContext::default()
         }
+    }
+
+    /// An agent acting for ann, as a verified token with an `agent_type` resolves.
+    fn agent() -> AgentContext {
+        AgentContext {
+            security_ctx: Some(SecurityContext::from_verified_jwt(
+                "hub-client",
+                PrincipalKind::Agent,
+                Some("claude-code"),
+                Some("ann"),
+                Some("contributor"),
+                None,
+            )),
+            // Observation fields are not the authenticated subject or its type.
+            agent_id: Some("forged-observation".into()),
+            agent_type: Some("forged-type".into()),
+            ..AgentContext::default()
+        }
+    }
+
+    fn timer_cause() -> MoveCause {
+        MoveCause::timer_fire(TimerArm {
+            armed_by: "ann".into(),
+        })
+    }
+
+    fn reaction_cause() -> MoveCause {
+        MoveCause::reaction(
+            ReactionHop {
+                rule: "Job:Expire:finish".into(),
+                action: "Expire".into(),
+                entity_type: "Job".into(),
+                entity_id: "job".into(),
+            },
+            Some(&timer_cause()),
+        )
     }
 
     #[test]
@@ -140,33 +204,96 @@ mod tests {
             EventOrigin::from_caller(Some(&caller)),
             EventOrigin {
                 via: Some(EventVia::Request),
-                by: Some("ann".into())
+                by: Some("ann".into()),
+                ..EventOrigin::default()
             }
         );
-        let timer = MoveCause::timer_fire(TimerArm {
-            armed_by: "ann".into(),
-        });
-        caller.security_ctx.as_mut().unwrap().cause = Some(timer.clone());
+        caller.security_ctx.as_mut().unwrap().cause = Some(timer_cause());
         assert_eq!(
             EventOrigin::from_caller(Some(&caller)),
             EventOrigin {
                 via: Some(EventVia::Timer),
-                by: None
+                ..EventOrigin::default()
             }
         );
-        caller.security_ctx.as_mut().unwrap().cause = Some(MoveCause::reaction(
-            ReactionHop {
-                rule: "Job:Expire:finish".into(),
-                action: "Expire".into(),
-                entity_type: "Job".into(),
-                entity_id: "job".into(),
-            },
-            Some(&timer),
-        ));
+        caller.security_ctx.as_mut().unwrap().cause = Some(reaction_cause());
         assert_eq!(
             EventOrigin::from_caller(Some(&caller)),
             EventOrigin::internal()
         );
+    }
+
+    #[test]
+    fn an_agent_request_records_whom_it_acted_for_and_its_type() {
+        let origin = EventOrigin::from_caller(Some(&agent()));
+        assert_eq!(
+            origin,
+            EventOrigin {
+                via: Some(EventVia::Request),
+                by: Some("hub-client".into()),
+                acting_for: Some("ann".into()),
+                agent_type: Some("claude-code".into()),
+            }
+        );
+        // The journaled event carries them at its top level, as `for` and
+        // `agent_type`, and reads them back.
+        let mut event = super::super::EntityEvent::bootstrap("Idle".into());
+        event.origin = origin;
+        let journaled = serde_json::to_value(&event).unwrap();
+        assert_eq!(journaled["by"], "hub-client");
+        assert_eq!(journaled["for"], "ann");
+        assert_eq!(journaled["agent_type"], "claude-code");
+        assert!(journaled.get("acting_for").is_none(), "{journaled}");
+        let read: super::super::EntityEvent = serde_json::from_value(journaled).unwrap();
+        assert_eq!(read.origin, event.origin);
+    }
+
+    #[test]
+    fn a_person_in_person_records_only_by() {
+        let origin = EventOrigin::from_caller(Some(&caller()));
+        assert_eq!(
+            origin,
+            EventOrigin {
+                via: Some(EventVia::Request),
+                by: Some("ann".into()),
+                acting_for: None,
+                agent_type: None,
+            }
+        );
+        let mut event = super::super::EntityEvent::bootstrap("Idle".into());
+        event.origin = origin;
+        let journaled = serde_json::to_value(&event).unwrap();
+        assert!(journaled.get("for").is_none(), "{journaled}");
+        assert!(journaled.get("agent_type").is_none(), "{journaled}");
+    }
+
+    #[test]
+    fn timer_and_reaction_moves_record_no_agent_or_person() {
+        let timer = EventOrigin {
+            via: Some(EventVia::Timer),
+            ..EventOrigin::default()
+        };
+        let kernel = EventOrigin {
+            via: Some(EventVia::Reaction),
+            ..EventOrigin::default()
+        };
+        let mut fired = agent();
+        fired.security_ctx.as_mut().unwrap().cause = Some(timer_cause());
+        assert_eq!(EventOrigin::from_caller(Some(&fired)), timer);
+        let mut scheduled = agent();
+        scheduled.fires_scheduled_action = Some(crate::request_context::ScheduledFire {
+            tenant: "default".into(),
+            entity_type: "Job".into(),
+            entity_id: "job".into(),
+            arm_id: "arm".into(),
+        });
+        assert_eq!(EventOrigin::from_caller(Some(&scheduled)), timer);
+        let mut reaction = agent();
+        reaction.security_ctx.as_mut().unwrap().cause = Some(reaction_cause());
+        assert_eq!(EventOrigin::from_caller(Some(&reaction)), kernel);
+        let mut callback = agent();
+        callback.callback_hops = 1;
+        assert_eq!(EventOrigin::from_caller(Some(&callback)), kernel);
     }
 
     #[test]
@@ -192,9 +319,7 @@ mod tests {
     fn a_scheduled_fire_inside_a_callback_is_a_timer_and_its_answer_is_a_reaction() {
         let mut caller = caller();
         caller.callback_hops = 3; // Zero-delay schedules retain their callback budget.
-        caller.security_ctx.as_mut().unwrap().cause = Some(MoveCause::timer_fire(TimerArm {
-            armed_by: "ann".into(),
-        }));
+        caller.security_ctx.as_mut().unwrap().cause = Some(timer_cause());
         caller.fires_scheduled_action = Some(crate::request_context::ScheduledFire {
             tenant: "default".into(),
             entity_type: "Job".into(),
@@ -205,7 +330,7 @@ mod tests {
             EventOrigin::from_caller(Some(&caller)),
             EventOrigin {
                 via: Some(EventVia::Timer),
-                by: None
+                ..EventOrigin::default()
             }
         );
         let answer = caller

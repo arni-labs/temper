@@ -23,10 +23,13 @@ use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver};
 
 use stateright::Model;
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, Truth, unmodelable};
+use temper_spec::predicate::{Arg, Expr, Literal, Truth};
+
+mod encoding;
+use encoding::*;
 
 use crate::model::builder::build_model_from_ioa;
-use crate::model::semantics::{collect_list_contains_pairs, counter_bound, list_bound, truth};
+use crate::model::semantics::truth;
 use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// Result of symbolic verification.
@@ -62,7 +65,7 @@ pub enum NotProved {
     /// This action can take a state where every proved invariant holds to
     /// one where this invariant is false. That state may be unreachable.
     BrokenBy(String),
-    /// It reads values L0 does not model (strings, related records).
+    /// It reads values L0 does not model (for example, related records).
     Unmodeled,
 }
 
@@ -166,6 +169,7 @@ fn check_guard_satisfiability(model: &TemperModel) -> Vec<(String, bool)> {
             let symbols = Symbols {
                 counters: counter_vars.into_iter().collect(),
                 bools: bool_vars.into_iter().collect(),
+                strings: make_string_vars(model, ""),
                 lists: &list_vars,
                 status: status_var,
                 prefix: "",
@@ -209,7 +213,7 @@ fn check_invariant_induction(model: &TemperModel) -> (Vec<(String, bool)>, NotPr
     let inits = model.init_states();
     let mut candidates = Vec::new();
     for (index, inv) in model.invariants.iter().enumerate() {
-        if unmodelable(&inv.assert, &model.var_kinds).is_some() {
+        if !models(&inv.assert, model) {
             not_proved.insert(index, NotProved::Unmodeled);
         } else if inits
             .iter()
@@ -302,6 +306,8 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
     let mut post_counters = pre_counters.clone();
     let mut post_bools = pre_bools.clone();
     let mut changed_lists = BTreeSet::new();
+    let pre_strings = make_string_vars(model, "pre:");
+    let mut post_strings = pre_strings.clone();
     let count = |arg: &Arg, counters: &BTreeMap<String, Int>| -> Int {
         match arg {
             Arg::Lit(Literal::Int(n)) => Int::from_i64(*n),
@@ -346,9 +352,36 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
                 };
                 post_bools.insert(var.clone(), value);
             }
+            ModelEffect::SetString { var, value } => {
+                post_strings.insert(
+                    var.clone(),
+                    string_literal(value, model).expect("effect literal is in the model"),
+                );
+            }
             ModelEffect::ListAppend { var, .. } | ModelEffect::ListRemoveAt { var, .. } => {
                 changed_lists.insert(var.clone());
             }
+        }
+    }
+    // Params are written after effects in production. Preserve that order
+    // when a move both assigns a literal and supplies the field as a param.
+    for param in &t.string_params {
+        let value = Int::new_const(var_name("", "string-param", &param.name));
+        if param.nonempty {
+            solver.assert(value.eq(Int::from_i64(0)).not());
+        }
+        for field in &param.equals {
+            if let Some(field) = pre_strings.get(field) {
+                solver.assert(value.eq(field));
+            }
+        }
+        for field in &param.not_equals {
+            if let Some(field) = pre_strings.get(field) {
+                solver.assert(value.eq(field).not());
+            }
+        }
+        if param.writes {
+            post_strings.insert(param.name.clone(), value);
         }
     }
     let changed = make_list_vars(model, &solver, "post:");
@@ -371,6 +404,7 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
     let pre = Symbols {
         counters: pre_counters,
         bools: pre_bools,
+        strings: pre_strings,
         lists: &pre_lists,
         status: pre_status,
         prefix: "pre:",
@@ -378,6 +412,7 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
     let post = Symbols {
         counters: post_counters,
         bools: post_bools,
+        strings: post_strings,
         lists: &post_lists,
         status: post_status,
         prefix: "post:",
@@ -385,6 +420,8 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
     if !t.from_states.is_empty() {
         solver.assert(encode_state_membership(&pre.status, &t.from_states, model));
     }
+    // A literal can establish string equality only when the source guard
+    // holds (for example, reason == 'recovered' before setting error).
     solver.assert(encode(&t.guard, &pre, model));
     for &index in candidates {
         solver.assert(encode(&model.invariants[index].assert, &pre, model));
@@ -400,275 +437,6 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
             broken
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Z3 helpers
-// ---------------------------------------------------------------------------
-
-/// Create Z3 integer variables for each counter, each in `[0, bound]` with
-/// the bound L1 explores it to, which covers every literal it is compared with.
-fn make_counter_vars(model: &TemperModel, solver: &Solver) -> Vec<(String, Int)> {
-    let zero = Int::from_i64(0);
-    model
-        .initial_counters
-        .keys()
-        .map(|name| {
-            let var = Int::new_const(var_name("", "counter", name));
-            let bound = i64::try_from(counter_bound(model, name)).unwrap_or(i64::MAX);
-            solver.assert(var.ge(&zero));
-            solver.assert(var.le(Int::from_i64(bound)));
-            (name.clone(), var)
-        })
-        .collect()
-}
-
-/// Create Z3 boolean variables for each boolean state var.
-fn make_bool_vars(model: &TemperModel) -> Vec<(String, Bool)> {
-    model
-        .initial_booleans
-        .keys()
-        .map(|name| {
-            let var = Bool::new_const(var_name("", "bool", name));
-            (name.clone(), var)
-        })
-        .collect()
-}
-
-#[derive(Clone, Default)]
-struct ListSymbolicVars {
-    len_vars: BTreeMap<String, Int>,
-    /// Whether each list holds each value a guard or invariant looks for in
-    /// it.
-    holds: BTreeMap<String, BTreeMap<String, Bool>>,
-}
-
-/// Create exact bounded symbolic list variables, named after `prefix`, for
-/// each list up to the length L1 explores it to (its bound):
-/// - its length, in `[0, bound]`
-/// - whether it holds each value a guard or invariant looks for in it, with
-///   no more of those held than its length
-///
-/// Membership is all a guard or invariant reads of a list's elements, and a
-/// list of length `n` can hold any `n` of the values looked for, so this is
-/// exact. A constant per position would grow with the bound, which comes
-/// from the literals a spec compares the length with and can be any size.
-fn make_list_vars(model: &TemperModel, solver: &Solver, prefix: &str) -> ListSymbolicVars {
-    let zero = Int::from_i64(0);
-    let one = Int::from_i64(1);
-    let mut looked_for: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let exprs = model
-        .transitions
-        .iter()
-        .map(|t| &t.guard)
-        .chain(model.invariants.iter().map(|inv| &inv.assert));
-    for expr in exprs {
-        let mut pairs = BTreeSet::new();
-        collect_list_contains_pairs(expr, &mut pairs);
-        for (list, value) in pairs {
-            looked_for.entry(list).or_default().insert(value);
-        }
-    }
-
-    let mut len_vars = BTreeMap::new();
-    let mut holds = BTreeMap::new();
-    for name in model.initial_lists.keys() {
-        let bound = list_bound(model, name);
-        let max_val = Int::from_i64(i64::try_from(bound).unwrap_or(i64::MAX));
-        let len_var = Int::new_const(var_name(prefix, "len", name));
-        solver.assert(len_var.ge(&zero));
-        solver.assert(len_var.le(&max_val));
-
-        let held: BTreeMap<String, Bool> = looked_for
-            .get(name)
-            .into_iter()
-            .flatten()
-            .map(|value| {
-                let constant =
-                    Bool::new_const(var_name(prefix, "holds", &format!("{name}|{value}")));
-                (value.clone(), constant)
-            })
-            .collect();
-        if !held.is_empty() {
-            let counted: Vec<Int> = held.values().map(|h| h.ite(&one, &zero)).collect();
-            let count = Int::add(&counted.iter().collect::<Vec<_>>());
-            solver.assert(count.le(&len_var));
-        }
-        len_vars.insert(name.clone(), len_var);
-        holds.insert(name.clone(), held);
-    }
-
-    ListSymbolicVars { len_vars, holds }
-}
-
-/// A Z3 constant's name: the state it belongs to (`prefix`), the kind of
-/// value, and the spec's own name last, so constants of different kinds never
-/// share a name (a counter `tags_len` and list `tags`'s length are two
-/// constants).
-fn var_name(prefix: &str, kind: &str, name: &str) -> String {
-    format!("{prefix}{kind}|{name}")
-}
-
-/// Create a symbolic status variable over `model.states` indices.
-fn make_status_var(model: &TemperModel, solver: &Solver) -> Int {
-    let var = Int::new_const("status");
-    let zero = Int::from_i64(0);
-    if model.states.is_empty() {
-        solver.assert(var.eq(&zero));
-        return var;
-    }
-    let max = Int::from_i64((model.states.len() - 1) as i64);
-    solver.assert(var.ge(&zero));
-    solver.assert(var.le(&max));
-    var
-}
-
-/// Encode `status ∈ states` as a disjunction over symbolic status index.
-fn encode_state_membership(status_var: &Int, states: &[String], model: &TemperModel) -> Bool {
-    let disjuncts: Vec<Bool> = states
-        .iter()
-        .filter_map(|state| {
-            model
-                .states
-                .iter()
-                .position(|s| s == state)
-                .map(|idx| status_var.eq(Int::from_i64(idx as i64)))
-        })
-        .collect();
-    if disjuncts.is_empty() {
-        Bool::from_bool(false)
-    } else {
-        Bool::or(&disjuncts)
-    }
-}
-
-/// Encode exact bounded `contains(list, value)`: whether the list holds it.
-fn encode_list_contains(var: &str, value: &str, lists: &ListSymbolicVars) -> Bool {
-    lists
-        .holds
-        .get(var)
-        .and_then(|held| held.get(value))
-        .cloned()
-        .unwrap_or_else(|| Bool::from_bool(false))
-}
-
-/// Symbolic values for one state.
-struct Symbols<'a> {
-    counters: BTreeMap<String, Int>,
-    bools: BTreeMap<String, Bool>,
-    lists: &'a ListSymbolicVars,
-    status: Int,
-    /// Names this state's free atoms (pre/post) in a solver dump.
-    prefix: &'static str,
-}
-
-/// Encode an expression as a Z3 formula. Each part over values the model
-/// does not track (related-entity statuses, strings, fields, parameters) is a
-/// fresh free atom, even where the same text appears twice: L1 reads every
-/// such part as unknown, so `X && !X` may hold there, and L0 must not rule
-/// out what L1 explores.
-fn encode(expr: &Expr, sym: &Symbols<'_>, model: &TemperModel) -> Bool {
-    let free = || Bool::fresh_const(&format!("{}unknown", sym.prefix));
-    match expr {
-        Expr::Const(value) => Bool::from_bool(*value),
-        Expr::Not(inner) => encode(inner, sym, model).not(),
-        Expr::And(parts) => Bool::and(
-            &parts
-                .iter()
-                .map(|p| encode(p, sym, model))
-                .collect::<Vec<_>>(),
-        ),
-        Expr::Or(parts) => Bool::or(
-            &parts
-                .iter()
-                .map(|p| encode(p, sym, model))
-                .collect::<Vec<_>>(),
-        ),
-        Expr::Implies(lhs, rhs) => encode(lhs, sym, model).implies(encode(rhs, sym, model)),
-        Expr::Var(name) => sym.bools.get(name).cloned().unwrap_or_else(free),
-        Expr::Empty(name) => match sym.lists.len_vars.get(name) {
-            Some(len) => len.eq(Int::from_i64(0)),
-            None => free(),
-        },
-        Expr::Compare { lhs, op, rhs } => {
-            if let (Some(a), Some(b)) = (int_term(lhs, sym), int_term(rhs, sym)) {
-                return match op {
-                    CmpOp::Eq => a.eq(&b),
-                    CmpOp::Ne => a.eq(&b).not(),
-                    CmpOp::Lt => a.lt(&b),
-                    CmpOp::Le => a.le(&b),
-                    CmpOp::Gt => a.gt(&b),
-                    CmpOp::Ge => a.ge(&b),
-                };
-            }
-            let equal = match (lhs, rhs) {
-                (Operand::Status, Operand::Lit(Literal::Str(state)))
-                | (Operand::Lit(Literal::Str(state)), Operand::Status) => Some(
-                    encode_state_membership(&sym.status, std::slice::from_ref(state), model),
-                ),
-                (Operand::Var(name), Operand::Lit(Literal::Bool(value)))
-                | (Operand::Lit(Literal::Bool(value)), Operand::Var(name)) => sym
-                    .bools
-                    .get(name)
-                    .map(|var| var.eq(Bool::from_bool(*value))),
-                _ => None,
-            };
-            match (equal, op) {
-                (Some(equal), CmpOp::Eq) => equal,
-                (Some(equal), CmpOp::Ne) => equal.not(),
-                _ => free(),
-            }
-        }
-        Expr::In {
-            value,
-            set,
-            negated,
-        } => {
-            let member = match (value, set) {
-                (Operand::Status, Set::List(items)) => {
-                    let states: Option<Vec<String>> = items
-                        .iter()
-                        .map(|item| match item {
-                            Literal::Str(state) => Some(state.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    states.map(|states| encode_state_membership(&sym.status, &states, model))
-                }
-                (Operand::Lit(Literal::Str(value)), Set::Var(list))
-                    if sym.lists.len_vars.contains_key(list) =>
-                {
-                    Some(encode_list_contains(list, value, sym.lists))
-                }
-                (value, Set::List(items)) => int_term(value, sym).and_then(|term| {
-                    let options: Option<Vec<Bool>> = items
-                        .iter()
-                        .map(|item| match item {
-                            Literal::Int(n) => Some(term.eq(Int::from_i64(*n))),
-                            _ => None,
-                        })
-                        .collect();
-                    options.map(|options| Bool::or(&options))
-                }),
-                _ => None,
-            };
-            match member {
-                Some(member) if *negated => member.not(),
-                Some(member) => member,
-                None => free(),
-            }
-        }
-    }
-}
-
-/// An integer-valued operand: a counter, a list length, or an integer.
-fn int_term(operand: &Operand, sym: &Symbols<'_>) -> Option<Int> {
-    match operand {
-        Operand::Var(name) => sym.counters.get(name).cloned(),
-        Operand::Len(name) => sym.lists.len_vars.get(name).cloned(),
-        Operand::Lit(Literal::Int(n)) => Some(Int::from_i64(*n)),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------

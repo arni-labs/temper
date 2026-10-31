@@ -260,6 +260,13 @@ impl IdentityResolver {
         )
         .map_err(|_| IdentityError::Invalid)?;
 
+        // "service" is the kernel's own role: the kernel treats a principal
+        // with it as internal (`EventOrigin::from_caller`, `names_a_caller`),
+        // so no token may claim it.
+        if claims.role.as_deref() == Some("service") {
+            return Err(IdentityError::Invalid);
+        }
+
         // Refuse a token whose user signed out everywhere after it was issued
         // (keyed on the human `sub`, so it stops the agents acting for them
         // too) or whose grant was revoked: a revoked grant must stop working

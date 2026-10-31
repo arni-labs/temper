@@ -23,6 +23,7 @@ mod declared_defaults;
 mod dst_projection_lag;
 mod empty_match;
 mod equality_delta;
+mod equality_delta_postgres;
 mod equality_probe;
 mod event_metadata;
 mod keyed_existence;
