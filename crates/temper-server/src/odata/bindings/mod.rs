@@ -128,9 +128,7 @@ pub(super) async fn dispatch_bound_action(
         } = match decide(&request, redecide.is_first()).await {
             Ok(decision) => decision,
             Err(undecided) => {
-                if WriteCaller::of_request(security_ctx) == WriteCaller::Kernel
-                    && redecide.again(undecided.record_changed, "bound_action")
-                {
+                if redecide.again(undecided.record_changed, "bound_action") {
                     continue;
                 }
                 return undecided.response;
@@ -176,10 +174,14 @@ pub(super) async fn dispatch_bound_action(
                 decided_on,
             )
             .await;
-        if let Ok(answer) = &result
-            && WriteCaller::of_request(security_ctx) == WriteCaller::Kernel
-            && redecide.again(answer.is_record_changed(), "bound_action")
-        {
+        // Decided on a record that changed first: an outside caller's write
+        // comes back stale, a kernel write's as the actor's refusal. Either is
+        // decided again on the record as it is now.
+        let decided_on_changed = match &result {
+            Ok(answer) => answer.is_record_changed(),
+            Err(error) => matches!(error, DispatchError::StaleWrite(_)),
+        };
+        if redecide.again(decided_on_changed, "bound_action") {
             continue;
         }
 
