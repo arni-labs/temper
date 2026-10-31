@@ -22,6 +22,7 @@ mod dst_projection_lag;
 mod empty_match;
 mod equality_delta;
 mod equality_probe;
+mod event_metadata;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;

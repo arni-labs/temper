@@ -6,6 +6,7 @@
 //! started again with only [`entry`] selected.
 
 use std::process::Command;
+use std::time::Duration;
 
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -17,6 +18,12 @@ const SCENARIO_ENV: &str = "OTEL_EXPORT_TEST_SCENARIO";
 const WORKLOAD: &str = "workload";
 const LOG_PROBE_THEN_WORKLOAD: &str = "log-probe-then-workload";
 const LOG_AFTER_SHUTDOWN: &str = "log-after-shutdown";
+const WORKLOAD_THEN_WAIT: &str = "workload-then-wait";
+
+/// How long the child keeps running after the workload in
+/// [`run_with_resets`]. The batch processors send every second, and a batch
+/// sent twice more after it failed has arrived 0.75 s after that.
+const WAIT_AFTER_WORKLOAD: Duration = Duration::from_secs(3);
 
 /// The line the child logs once its telemetry has shut down.
 pub const AFTER_SHUTDOWN_LINE: &str = "test log after the telemetry shut down";
@@ -140,8 +147,18 @@ pub fn run_then_log_after_shutdown(env: &[(&str, &str)]) -> Run {
     run_scenario(LOG_AFTER_SHUTDOWN, env)
 }
 
+/// Like [`run`], but the listener closes the first `resets` connections the
+/// child opens, and the child keeps running for [`WAIT_AFTER_WORKLOAD`]
+/// after the workload, as a server does after it boots.
+pub fn run_with_resets(resets: usize, env: &[(&str, &str)]) -> Run {
+    run_scenario_against(Listener::start_resetting(resets), WORKLOAD_THEN_WAIT, env)
+}
+
 fn run_scenario(scenario: &str, env: &[(&str, &str)]) -> Run {
-    let listener = Listener::start();
+    run_scenario_against(Listener::start(), scenario, env)
+}
+
+fn run_scenario_against(listener: Listener, scenario: &str, env: &[(&str, &str)]) -> Run {
     let mut command = Command::new(std::env::current_exe().expect("path of the test binary"));
     command.args(["--exact", "child::entry", "--nocapture"]);
     for (name, _) in std::env::vars_os() {
@@ -193,6 +210,9 @@ fn entry() {
         probe_log_enabled();
     }
     emit_workload();
+    if scenario == WORKLOAD_THEN_WAIT {
+        std::thread::sleep(WAIT_AFTER_WORKLOAD);
+    }
     guard.shutdown();
     if scenario == LOG_AFTER_SHUTDOWN {
         tracing::warn!("{AFTER_SHUTDOWN_LINE}");

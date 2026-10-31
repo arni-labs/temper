@@ -77,6 +77,7 @@ async fn update_query_projection_catalog_row(
              sequence_nr = $6, \
              projection_version = 2, \
              projection_hash = $7, \
+             first_event_at = COALESCE(first_event_at, $8->>'first_event_at'), \
              state = $8, \
              updated_at = now() \
          WHERE tenant = $1 AND entity_type = $2 AND entity_id = $3 \
@@ -711,8 +712,8 @@ impl PostgresEventStore {
         } else {
             let inserted: Option<i32> = crate::dbm::postgres_query_scalar!(&self.schema,
                 "INSERT INTO {schema}entity_catalog \
-                 (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 2, $8, now()) \
+                 (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at, first_event_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 2, $8, now(), $6->>'first_event_at') \
                  ON CONFLICT (tenant, entity_type, entity_id) DO NOTHING \
                  RETURNING 1",
             )

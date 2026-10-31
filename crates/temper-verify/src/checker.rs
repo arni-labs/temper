@@ -3,11 +3,12 @@
 //! This module wraps Stateright's BFS model checker and produces a
 //! `VerificationResult` summarizing the outcome.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
 
+use crate::lost_places::{Graph, LostPlace, lost_places};
 use crate::model::semantics::{successors_noting_cuts, truth};
 use crate::model::{ENTRY_RULES, ResolvedTransition, entry_broken};
 use crate::model::{TemperModel, TemperModelAction, TemperModelState};
@@ -47,6 +48,11 @@ pub struct VerificationResult {
     /// bounds: the result is bounded, not proved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bounded_by: Vec<(String, usize)>,
+    /// Records that can never reach a place another record in the same
+    /// place still can, found only by a whole walk. Worth a look; they
+    /// don't fail the check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lost_places: Vec<LostPlace>,
 }
 
 /// Run exhaustive BFS model checking on the given `TemperModel`.
@@ -124,8 +130,8 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
     // the rest: dead transitions are named only after a whole exploration.
     let walked = if explored_all { walk(model) } else { None };
     let is_complete = walked.is_some();
-    let (dead_transitions, bounded_by) = walked
-        .map(|w| (w.dead, w.cut_short.into_iter().collect()))
+    let (dead_transitions, bounded_by, lost_places) = walked
+        .map(|w| (w.dead, w.cut_short.into_iter().collect(), w.lost_places))
         .unwrap_or_default();
     let all_properties_hold =
         is_complete && counterexamples.is_empty() && dead_transitions.is_empty();
@@ -137,6 +143,7 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         dead_transitions,
         is_complete,
         bounded_by,
+        lost_places,
     }
 }
 
@@ -176,28 +183,35 @@ struct Walked {
     dead: Vec<String>,
     /// The counters and lists a reachable move takes past their bound, with it.
     cut_short: BTreeMap<String, usize>,
+    /// The records that can never reach a place another in theirs can.
+    lost_places: Vec<LostPlace>,
 }
 
 /// Walk every reachable state, or return `None` when the model's time limit
 /// ran out before every reachable state was walked.
 fn walk(model: &TemperModel) -> Option<Walked> {
-    let mut visited_states = HashSet::new();
+    let mut found: HashMap<TemperModelState, u32> = HashMap::new();
+    let mut graph = Graph::default();
     let mut queue = VecDeque::new();
     for init in model.init_states() {
-        if visited_states.insert(init.clone()) {
-            queue.push_back(init);
+        if !found.contains_key(&init) {
+            let at = graph.add(model, &init, None);
+            found.insert(init.clone(), at);
+            queue.push_back((init, at));
         }
     }
 
     let mut covered = vec![false; model.transitions.len()];
     let mut cut = BTreeMap::new();
 
-    while let Some(state) = queue.pop_front() {
+    while let Some((state, at)) = queue.pop_front() {
         if model.out_of_time() {
             return None;
         }
+        let mut cut_here = BTreeMap::new();
+        let mut to = Vec::new();
         for (index, transition) in model.transitions.iter().enumerate() {
-            let next_states = step(model, transition, &state, &mut cut);
+            let next_states = step(model, transition, &state, &mut cut_here);
             if model.out_of_time() {
                 return None;
             }
@@ -206,11 +220,20 @@ fn walk(model: &TemperModel) -> Option<Walked> {
             }
             covered[index] = true;
             for next in next_states {
-                if visited_states.insert(next.clone()) {
-                    queue.push_back(next);
-                }
+                let next_at = match found.get(&next) {
+                    Some(&next_at) => next_at,
+                    None => {
+                        let next_at = graph.add(model, &next, Some((at, index as u32)));
+                        found.insert(next.clone(), next_at);
+                        queue.push_back((next, next_at));
+                        next_at
+                    }
+                };
+                to.push(next_at);
             }
         }
+        graph.steps_from(at, !cut_here.is_empty(), to);
+        cut.extend(cut_here);
     }
 
     let dead = model
@@ -228,6 +251,7 @@ fn walk(model: &TemperModel) -> Option<Walked> {
     Some(Walked {
         dead,
         cut_short: cut,
+        lost_places: lost_places(model, &graph, &found),
     })
 }
 

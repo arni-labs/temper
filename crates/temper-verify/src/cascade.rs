@@ -12,6 +12,7 @@
 use crate::budget::{Budget, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
+use crate::lost_places::LostPlace;
 use crate::model::{self, TemperModel};
 use crate::proptest_gen::{self, PropTestResult};
 use crate::simulation::{self, SimConfig, SimulationResult};
@@ -493,6 +494,19 @@ impl VerificationCascade {
                 "L1 Model Check FAILED: {} states explored, {}",
                 verification.states_explored,
                 parts.join("; "),
+            )
+        };
+        let summary = if verification.lost_places.is_empty() {
+            summary
+        } else {
+            let found: Vec<String> = verification
+                .lost_places
+                .iter()
+                .map(LostPlace::describe)
+                .collect();
+            format!(
+                "{summary}. Not a failure, but worth a look: {}. If that is intended, nothing to do.",
+                found.join("; "),
             )
         };
 
