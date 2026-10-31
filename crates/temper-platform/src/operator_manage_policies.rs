@@ -1,5 +1,5 @@
 //! Narrow operator permits seeded at credential bootstrap: `manage_policies`
-//! (ADR-0172) and `install_app`.
+//! (ADR-0172), `install_app` and `read_app_installs`.
 //!
 //! This is ordinary Cedar — merged into live tenant policy, persisted as a
 //! granular row each, not a code bypass and not permit-all.
@@ -56,6 +56,24 @@ pub fn operator_install_app_cedar() -> String {
     )
 }
 
+/// Stable granular policy id for the operator `read_app_installs` permit.
+pub const OPERATOR_READ_APP_INSTALLS_POLICY_ID: &str = "operator-bootstrap-read-app-installs";
+
+/// Cedar statement granting a verified operator `read_app_installs`: the list
+/// of this tenant's installs, each with the folder it serves from
+/// (`GET /api/genesis/apps/installs`). Whoever installs an app's versions reads
+/// which one is served; the list is of the credential's own tenant only.
+pub fn operator_read_app_installs_cedar() -> String {
+    format!(
+        r#"permit(
+  principal is Agent,
+  action == Action::"read_app_installs",
+  resource is AppInstall
+) when {{ {when} }};"#,
+        when = temper_authz::VERIFIED_OPERATOR_WHEN
+    )
+}
+
 /// Append `statement` to `existing` when it is not already present.
 pub fn merge_cedar_statement(existing: &str, statement: &str) -> String {
     let statement = statement.trim();
@@ -105,6 +123,10 @@ pub async fn seed_operator_permits(state: &PlatformState, tenant: &str) {
             operator_manage_policies_cedar(tenant),
         ),
         (OPERATOR_INSTALL_APP_POLICY_ID, operator_install_app_cedar()),
+        (
+            OPERATOR_READ_APP_INSTALLS_POLICY_ID,
+            operator_read_app_installs_cedar(),
+        ),
     ];
     let mut merged = live_tenant_policy_text(state, tenant);
     for (_, statement) in &permits {
@@ -187,6 +209,11 @@ mod tests {
         let permit = operator_install_app_cedar();
         assert!(permit.contains(r#"action == Action::"install_app""#));
         assert!(permit.contains("resource is App"));
+        assert!(permit.contains(temper_authz::VERIFIED_OPERATOR_WHEN));
+
+        let permit = operator_read_app_installs_cedar();
+        assert!(permit.contains(r#"action == Action::"read_app_installs""#));
+        assert!(permit.contains("resource is AppInstall"));
         assert!(permit.contains(temper_authz::VERIFIED_OPERATOR_WHEN));
     }
 }

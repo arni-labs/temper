@@ -92,10 +92,15 @@ struct InstalledAppView {
     status: String,
     installed_at: Option<String>,
     last_reconciled_at: Option<String>,
+    /// The absolute path of the folder the tenant serves the app from (its
+    /// `specs/`, its `COMMIT`), or `""` when only its stored specs serve.
+    /// Katagami's sandbox scripts read it with `grep -o '"dir":"[^"]*"'`, so
+    /// it is always a path JSON writes without escaping (`plain_dir`).
+    dir: String,
 }
 
-impl From<InstalledAppRecord> for InstalledAppView {
-    fn from(record: InstalledAppRecord) -> Self {
+impl InstalledAppView {
+    fn new(record: InstalledAppRecord, dir: String) -> Self {
         Self {
             app_name: record.app_name,
             source_kind: record.source_kind,
@@ -107,8 +112,30 @@ impl From<InstalledAppRecord> for InstalledAppView {
             status: record.status,
             installed_at: record.installed_at,
             last_reconciled_at: record.last_reconciled_at,
+            dir,
         }
     }
+}
+
+/// The folder `tenant` serves `app` from, as an absolute path JSON writes with
+/// no escaping, or `""` when no folder holds it. Cache folder names are
+/// sanitized and app names are plain identifiers, so only a data directory
+/// whose own path holds such characters is refused, saying so.
+fn plain_dir(tenant: &str, app: &str) -> Result<String, String> {
+    let Some(dir) = crate::os_apps::tenant_os_app_dir(tenant, app) else {
+        return Ok(String::new());
+    };
+    let dir = std::path::absolute(&dir)
+        .map_err(|error| format!("the folder of '{app}' has no absolute path: {error}"))?;
+    let text = dir
+        .to_str()
+        .ok_or_else(|| format!("the folder of '{app}' ({}) is not UTF-8", dir.display()))?;
+    if serde_json::to_string(text).ok().as_deref() != Some(format!("\"{text}\"").as_str()) {
+        return Err(format!(
+            "the folder of '{app}' ({text}) has characters JSON must escape; set TEMPER_DATA_DIR to a plain path"
+        ));
+    }
+    Ok(text.to_string())
 }
 
 /// Authorize a read of the credential tenant's app installs and return that
@@ -182,7 +209,8 @@ async fn installed_apps_in_tenant(
         }
         // None: the row has no metadata, e.g. it was removed between the reads.
         if let Some(record) = platform_store.get_installed_app(tenant, &app_name).await? {
-            apps.push(InstalledAppView::from(record));
+            let dir = plain_dir(tenant, &app_name)?;
+            apps.push(InstalledAppView::new(record, dir));
         }
     }
     apps.sort_by(|left, right| left.app_name.cmp(&right.app_name));
