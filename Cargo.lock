@@ -7115,6 +7115,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+ "tracing-subscriber",
  "url",
  "urlencoding",
  "uuid",
@@ -7199,6 +7200,7 @@ name = "temper-observe"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "log",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -7224,6 +7226,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "percent-encoding",
  "serde",
  "serde_json",
  "temper-runtime",
@@ -7275,7 +7278,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "temper-authz",
- "temper-codegen",
  "temper-jit",
  "temper-observe",
  "temper-optimize",
@@ -7531,7 +7533,9 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "stateright",
+ "temper-authz",
  "temper-runtime",
  "temper-spec",
  "z3",

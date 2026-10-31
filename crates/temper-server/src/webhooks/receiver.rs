@@ -129,19 +129,25 @@ pub async fn handle_webhook(
     };
 
     match state
-        .dispatch_tenant_action(
-            &tenant,
-            &entity_type,
-            &entity_id,
+        .dispatch_outside_action(crate::state::DispatchCommand {
+            tenant: &tenant,
+            entity_type: &entity_type,
+            entity_id: &entity_id,
             action,
-            Value::Object(params),
-            &agent_ctx,
-        )
+            params: Value::Object(params),
+            agent_ctx: &agent_ctx,
+            await_integration: false,
+            await_reactions: true,
+        })
         .await
     {
         Ok(response) => {
             let body = serde_json::to_string(&response).unwrap_or_default();
             (StatusCode::OK, body)
+        }
+        Err(crate::state::DispatchError::StaleWrite(stale)) => {
+            tracing::warn!(error = %stale, webhook = %webhook.name, "webhook action refused as stale");
+            (StatusCode::CONFLICT, stale.body().to_string())
         }
         Err(e) => {
             tracing::error!(error = %e, "webhook action dispatch failed");

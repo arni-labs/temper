@@ -655,18 +655,10 @@ fn upsert_query_projection_diffs_field_index_rows() {
                 (
                     "content_hash".to_string(),
                     Some("sha256:new".to_string()),
-                    Some("Ready".to_string())
+                    None
                 ),
-                (
-                    "owner".to_string(),
-                    Some("alice".to_string()),
-                    Some("Ready".to_string())
-                ),
-                (
-                    "size_bytes".to_string(),
-                    Some("128".to_string()),
-                    Some("Ready".to_string())
-                ),
+                ("owner".to_string(), Some("alice".to_string()), None),
+                ("size_bytes".to_string(), Some("128".to_string()), None),
             ]
         );
 
@@ -762,11 +754,23 @@ fn native_data_only_create_inserts_event_catalog_and_index_atomically() {
         let (status, stored_fields, stored_state, stored_sequence) = catalog.unwrap();
         assert_eq!(status, "Active");
         assert_eq!(stored_fields, fields);
-        let stored_state = stored_state.expect("native create should store full catalog state");
-        assert_eq!(stored_state["fields"], fields);
+        let stored_state = stored_state.expect("native create should store catalog state");
+        assert!(
+            stored_state.get("fields").is_none(),
+            "the stored state leaves out fields the fields column holds"
+        );
         assert_eq!(stored_state["sequence_nr"], 1);
         assert_eq!(stored_state["total_event_count"], 1);
         assert_eq!(stored_sequence, 1);
+        let read = store
+            .load_entity_catalog_rows_pg(&tenant, entity_type, &[entity_id.to_string()])
+            .await
+            .unwrap();
+        let read_state = read[0].state.as_ref().expect("catalog read has a state");
+        assert_eq!(
+            read_state["fields"], fields,
+            "a catalog read puts the fields back"
+        );
 
         let indexed_count: i64 = crate::dbm::postgres_query_scalar!(
             "SELECT COUNT(*)::bigint FROM entity_field_index \
@@ -897,8 +901,10 @@ fn upsert_query_projection_advances_sequence_without_rewriting_unchanged_index()
     });
 }
 
+/// The index holds field values only; the status lives in the catalog row, so
+/// a move that changes only the status leaves the index rows alone.
 #[test]
-fn upsert_query_projection_updates_index_status_when_fields_are_unchanged() {
+fn upsert_query_projection_leaves_index_rows_alone_when_only_status_changes() {
     let Some(database_url) = temper_test_resource::env_var("DATABASE_URL") else {
         return;
     };
@@ -939,9 +945,9 @@ fn upsert_query_projection_updates_index_status_when_fields_are_unchanged() {
         assert_eq!(
             field_rows,
             vec![
-                ("message_count".to_string(), Some("Complete".to_string())),
-                ("owner".to_string(), Some("Complete".to_string())),
-                ("title".to_string(), Some("Complete".to_string())),
+                ("message_count".to_string(), None),
+                ("owner".to_string(), None),
+                ("title".to_string(), None),
             ]
         );
 

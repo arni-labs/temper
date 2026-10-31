@@ -86,10 +86,17 @@ effect = ["message = ''"]
 }
 
 #[test]
-fn smt_observes_the_literal_and_rejects_a_stale_assignment() {
+fn smt_observes_the_literal_and_reports_a_stale_assignment() {
     let broken = SPEC.replace("error = ''", "error = 'stale'");
     let result = temper_verify::smt::verify_symbolic(&broken, 2);
-    assert!(!result.all_passed, "{result:#?}");
+    assert!(
+        result
+            .not_proved
+            .iter()
+            .any(|(name, why)| name == "RecoveredClearsError"
+                && *why == temper_verify::smt::NotProved::BrokenBy("Recover".into())),
+        "{result:#?}"
+    );
     assert!(
         result
             .inductive_invariants

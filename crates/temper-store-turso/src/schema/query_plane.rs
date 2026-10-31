@@ -42,11 +42,25 @@ pub const CREATE_ENTITY_CATALOG_STATUS_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_entity_catalog_status
     ON entity_catalog(tenant, entity_type, status);";
 
+/// Each catalog row's key, sequence and status, for the boot comparison
+/// (`store/projection_repair.rs`). turso_core 0.7.2 reads a whole row, its
+/// `fields` overflow pages included, to give any one of its columns, so a
+/// comparison through the primary key read every record's fields: 1.1 s for
+/// 1,800 records of 120 KB on a cold local disk, 5.3 s on a staging app.
+/// Through this index it reads no row: 5 to 15 ms.
+pub const CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_entity_catalog_checkpoint
+    ON entity_catalog(tenant, entity_type, entity_id, sequence_nr, status);";
+
 /// Entity-Attribute-Value field index for SQL-level OData filter push-down.
 ///
 /// Mirrors top-level scalar fields from entity state so that `$filter`
 /// expressions can be translated to SQL WHERE clauses, avoiding full
 /// materialization of every actor in a collection query.
+///
+/// `status` is no longer written: rows store NULL, and filters read the status
+/// from `entity_catalog` (`store/field_index_rows.rs`). The column and
+/// `idx_efi_status` stay, so an existing database needs no schema change.
 pub const CREATE_ENTITY_FIELD_INDEX_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS entity_field_index (
     tenant       TEXT NOT NULL,

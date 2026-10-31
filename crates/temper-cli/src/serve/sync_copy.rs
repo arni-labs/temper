@@ -9,18 +9,15 @@
 //! be confirmed, requests that can change data are refused before they run
 //! and reads are served as usual.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use temper_store_turso::{CopyState, SyncCopy};
+use temper_server::odata::IDEMPOTENCY_KEY;
+use temper_store_turso::{CopyState, SyncCopy, TursoEventStore};
 
 /// How long a request that can change data may take, its push included,
 /// before its change is reported as not confirmed.
@@ -32,9 +29,9 @@ const MIN_PUSH_BUDGET: Duration = Duration::from_secs(1);
 /// Default period of the background push.
 const DEFAULT_UPKEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The 1 s ceiling lets the background push run once each tick. With a
-/// request in flight the trim stops after its 250 ms floor and current batch;
-/// idle ticks use the whole second to drain the backlog.
+/// The 1 s ceiling lets the background push and the checkpoint run once each
+/// tick. Requests need no share of it: a write that waits goes before the
+/// trim's next batch (`TursoEventStore::trim_change_log`).
 const TRIM_BUDGET: Duration = Duration::from_secs(1);
 
 /// Checkpoint the local log once it passes this size. Turso Sync turns the
@@ -47,15 +44,25 @@ const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
 /// restart starts a fresh one, and the start checks the file again.
 const TIMEOUTS_BEFORE_RESTART: u32 = 6;
 
-/// With a copy, answer changes only after they reach it and keep it current.
-pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Router {
-    let Some(copy) = copy else {
-        return router;
+/// The server's router: `routes` with, when the store's database has a copy,
+/// changes answered only after they reach it, and one span per request
+/// around all of it. The span goes on last, so a request's push, and the
+/// answer it ends in, are part of that request's trace.
+pub(super) fn serve_router(routes: Router, store: Option<TursoEventStore>) -> Router {
+    temper_server::with_request_span(answer_after_copy(routes, store))
+}
+
+/// With a store whose database has a copy, answer changes only after they
+/// reach it and keep it current.
+fn answer_after_copy(routes: Router, store: Option<TursoEventStore>) -> Router {
+    let Some((store, copy)) =
+        store.and_then(|store| store.sync_copy().cloned().map(|copy| (store, copy)))
+    else {
+        return routes;
     };
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    spawn_upkeep(copy.clone(), in_flight.clone());
-    router.layer(axum::middleware::from_fn_with_state(
-        (copy, in_flight),
+    spawn_upkeep(store, copy.clone());
+    routes.layer(axum::middleware::from_fn_with_state(
+        copy,
         push_before_answering,
     ))
 }
@@ -63,16 +70,13 @@ pub(super) fn answer_after_copy(router: Router, copy: Option<SyncCopy>) -> Route
 /// Refuse a request that can change data while writes cannot be confirmed;
 /// otherwise run it and push what it committed before answering.
 async fn push_before_answering(
-    State((copy, in_flight)): State<(SyncCopy, Arc<AtomicUsize>)>,
+    State(copy): State<SyncCopy>,
     request: Request,
     next: Next,
 ) -> Response {
     if reads_only(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
-    // Count through the answer's push, including cancellation and refusals.
-    in_flight.fetch_add(1, Ordering::AcqRel);
-    let _request = InFlight(in_flight);
     if let Some(refusal) = refusal(&copy.state()) {
         return refusal;
     }
@@ -87,22 +91,37 @@ async fn push_before_answering(
         // have been saved here: never answer as if nothing happened.
         Err(error) => {
             tracing::error!(%error, "turso.sync: change not copied off this server; not confirming it");
-            unavailable(
-                "NotConfirmed",
-                "Not confirmed: the change could not be copied to this app's database copy. \
-                 It may still have been saved here; read it back before trying again.",
-            )
+            not_confirmed(response.headers().get(IDEMPOTENCY_KEY))
         }
     }
 }
 
-/// Drop also handles a cancelled request, so upkeep never sees a stale count.
-struct InFlight(Arc<AtomicUsize>);
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+/// The answer to a request that ran but whose change could not be copied
+/// off this server. It names the key the request ran with, when it has one,
+/// so the caller can send it again as the same write.
+fn not_confirmed(key: Option<&HeaderValue>) -> Response {
+    let key = key.and_then(|value| Some((value, value.to_str().ok()?)));
+    let mut error = serde_json::json!({
+        "code": "NotConfirmed",
+        "message": "Not confirmed: the change could not be copied to this app's database copy. \
+                    It may still have been saved here; read it back before trying again.",
+    });
+    if let Some((_, text)) = key {
+        error["message"] = "Not confirmed: the change could not be copied to this app's database \
+                            copy. It may still have been saved here. Send it again with its \
+                            Idempotency-Key (idempotencyKey) and it is applied at most once."
+            .into();
+        error["idempotencyKey"] = text.into();
     }
+    let mut answer = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({ "error": error })),
+    )
+        .into_response();
+    if let Some((value, _)) = key {
+        answer.headers_mut().insert(IDEMPOTENCY_KEY, value.clone());
+    }
+    answer
 }
 
 /// The answer to a request that can change data in `state`, if it is refused.
@@ -138,6 +157,11 @@ fn unavailable(code: &str, message: &str) -> Response {
 /// Requests that cannot change anything: reads of Temper's own routes. A
 /// read of an app's HTTP endpoint or webhook can run actions, so it waits too.
 fn reads_only(method: &Method, path: &str) -> bool {
+    // A question to Cedar is a read sent as a POST: it decides on the snapshot
+    // its caller sends and writes nothing (temper-server's api/authorize.rs).
+    if *method == Method::POST && path == "/api/authorize" {
+        return true;
+    }
     let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     let own_route = ["/tdata", "/observe", "/api", "/genesis"]
         .iter()
@@ -153,8 +177,9 @@ fn reads_only(method: &Method, path: &str) -> bool {
 }
 
 /// Push changes no request waited for, check a file the start could not
-/// check, checkpoint the local log, and restart when only a restart helps.
-fn spawn_upkeep(copy: SyncCopy, in_flight: Arc<AtomicUsize>) {
+/// check, trim the change log, checkpoint the local log, and restart when
+/// only a restart helps.
+fn spawn_upkeep(store: TursoEventStore, copy: SyncCopy) {
     let interval = std::env::var("TEMPER_TURSO_SYNC_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -188,10 +213,7 @@ fn spawn_upkeep(copy: SyncCopy, in_flight: Arc<AtomicUsize>) {
                 );
                 std::process::exit(75);
             }
-            if let Err(error) = copy
-                .trim_pushed(TRIM_BUDGET, || in_flight.load(Ordering::Acquire) > 0)
-                .await
-            {
+            if let Err(error) = store.trim_change_log(TRIM_BUDGET).await {
                 tracing::warn!(%error, "turso.sync could not trim the change log; the next tick will");
             }
             if let Err(error) = copy.checkpoint_if_wal_over(MAX_WAL_BYTES).await {
@@ -202,37 +224,4 @@ fn spawn_upkeep(copy: SyncCopy, in_flight: Arc<AtomicUsize>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_reads_of_temper_routes_skip_the_push() {
-        assert!(reads_only(&Method::GET, "/tdata/Notes('a')"));
-        assert!(reads_only(&Method::GET, "/tdata"));
-        assert!(reads_only(&Method::HEAD, "/healthz"));
-        assert!(reads_only(&Method::GET, "/static/temper-client.js"));
-        assert!(!reads_only(&Method::POST, "/tdata/Notes('a')/Ns.Write"));
-        assert!(!reads_only(&Method::GET, "/webhooks/default/callback"));
-        assert!(!reads_only(&Method::GET, "/oauth/callback"));
-        assert!(!reads_only(&Method::GET, "/static/app-page"));
-        assert!(!reads_only(&Method::GET, "/observer"));
-        assert!(!reads_only(&Method::GET, "/genesisx"));
-    }
-
-    #[test]
-    fn only_a_copying_database_runs_requests_that_can_change_data() {
-        assert!(refusal(&CopyState::Copying).is_none());
-        for state in [
-            CopyState::Unchecked,
-            CopyState::Behind,
-            CopyState::Stopped("refused".to_string()),
-        ] {
-            let refused = refusal(&state).expect("refused");
-            assert_eq!(
-                refused.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{state:?}"
-            );
-        }
-    }
-}
+mod tests;

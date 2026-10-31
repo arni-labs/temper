@@ -377,37 +377,47 @@ async fn restrict_delete_ignores_a_stale_row_that_no_longer_references_it() {
 }
 
 #[tokio::test]
-async fn restrict_delete_sees_a_reference_written_under_a_fields_object() {
+async fn restrict_delete_uses_the_stored_top_level_reference() {
     let store = Store::new("wrapped");
     let writer = indexed_server("delete-reference-wrapped-writer", &store).await;
     create(&writer, "Order", "ord-wrapped", serde_json::json!({})).await;
     create_payments(&writer, "pay", REFERENCING_PAYMENTS, "ord-elsewhere").await;
-    // The create check reads this reference inside the `fields` object, so
-    // the delete must too, though the field index holds top-level fields only.
+    create(&writer, "Order", "ord-top-level", serde_json::json!({})).await;
+    // Relations read the stored record's top-level properties. A nested
+    // `fields` object is arbitrary data, not another record envelope.
     create(
         &writer,
         "Payment",
         "pay-wrapped",
-        serde_json::json!({ "fields": { "OrderId": "ord-wrapped" } }),
+        serde_json::json!({
+            "OrderId": "ord-top-level",
+            "fields": { "OrderId": "ord-wrapped" }
+        }),
     )
     .await;
 
     let state = restarted_server("delete-reference-wrapped-restarted", &store).await;
     let actors_before = state.active_actor_count();
     let (status, body) = delete_order(&state, "ord-wrapped").await;
-    assert_eq!(status, StatusCode::CONFLICT, "wrapped reference: {body}");
+    assert_eq!(status, StatusCode::NO_CONTENT, "nested data: {body}");
+    let (status, body) = delete_order(&state, "ord-top-level").await;
+    assert_eq!(status, StatusCode::CONFLICT, "stored reference: {body}");
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("referenced by Payment('pay-wrapped')"),
-        "refusal names the wrapped Payment: {body}"
+        "refusal names the Payment with the top-level reference: {body}"
     );
     let actors_started = state.active_actor_count().saturating_sub(actors_before);
     assert!(
-        actors_started <= 1,
-        "the delete started {actors_started} actors; the wrapped reference is \
+        actors_started <= 2,
+        "the deletes started {actors_started} actors; the reference is \
          read from its projection, not its actor"
     );
-    assert_eq!(get_order(&state, "ord-wrapped").await, StatusCode::OK);
+    assert_eq!(
+        get_order(&state, "ord-wrapped").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get_order(&state, "ord-top-level").await, StatusCode::OK);
 }

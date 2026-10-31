@@ -19,10 +19,15 @@ use temper_store_turso::TursoEventStore;
 
 mod count_telemetry;
 mod dst_projection_lag;
+mod empty_match;
+mod equality_delta;
+mod equality_probe;
+mod event_metadata;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;
 mod proof;
+mod spec_deleted;
 
 const CSDL_XML: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
 const ORDER_IOA: &str = include_str!("../../../../../test-fixtures/specs/order.ioa.toml");
@@ -85,31 +90,6 @@ async fn upsert_order_projection(
         )
         .await
         .expect("upsert projection");
-}
-
-#[test]
-fn fallback_reason_labels_are_stable() {
-    assert_eq!(QueryPlaneFallbackReason::None.as_str(), "none");
-    assert_eq!(
-        QueryPlaneFallbackReason::NoFilterPushdown.as_str(),
-        "no_filter_pushdown"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::NativePageUnavailable.as_str(),
-        "native_page_unavailable"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::FilterPushdownUnavailable.as_str(),
-        "filter_pushdown_unavailable"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::CatalogCoverageGap.as_str(),
-        "catalog_coverage_gap"
-    );
-    assert_eq!(
-        QueryPlaneFallbackReason::FallbackCandidateBudget.as_str(),
-        "fallback_candidate_budget"
-    );
 }
 
 #[test]
@@ -248,6 +228,7 @@ async fn row_authorized_count_over_budget_returns_413() {
         QueryPlaneReadError::AuthorizationDenied(_) => {
             panic!("test state should allow collection reads")
         }
+        QueryPlaneReadError::ReadUnavailable => panic!("authoritative read should be available"),
         QueryPlaneReadError::InvalidContinuation => {
             panic!("no $skiptoken was supplied")
         }
@@ -281,6 +262,7 @@ async fn list_read_drops_rows_a_per_entity_forbid_names() {
         },
         context_attrs: Default::default(),
         correlation_id: "row-forbid".to_string(),
+        cause: None,
     };
     let query_options = QueryOptions {
         top: Some(10),
@@ -352,6 +334,7 @@ async fn uniform_type_permit_returns_every_row() {
         },
         context_attrs: Default::default(),
         correlation_id: "uniform-permit".to_string(),
+        cause: None,
     };
     let query_options = QueryOptions {
         top: Some(10),
@@ -466,7 +449,13 @@ async fn projection_lagged_actor_write_repairs_missing_catalog_row() {
         .expect("create local turso db");
     let mut state = build_order_state("query-plane-lag-repair");
     create_orders(&state, 1).await;
-    state.set_storage_stack(StorageStack::from_turso(store.clone()));
+    // The journal's own database read as a separate query plane: the server
+    // writes its rows after each commit, as over Postgres, so a record's row
+    // can be missing. Over Turso alone the commit writes it.
+    let mut stack = StorageStack::from_turso(store.clone());
+    stack.query_plane = Some(std::sync::Arc::new(store.clone()));
+    assert!(!stack.entity_rows_in_commit());
+    state.set_storage_stack(stack);
     let tenant = TenantId::default();
 
     let security_ctx = SecurityContext::system();

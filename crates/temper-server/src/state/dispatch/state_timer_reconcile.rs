@@ -15,16 +15,19 @@
 //! - after a dispatch that neither entered nor reset a timed state, after a
 //!   create, and after a delete.
 //!
-//! Only a fresh event arms a record that has no timer, and so no row: a
-//! dispatch, a create, or an install that changed the record's spec. A
-//! rehydration and a boot follow only a timer the record already has, from
-//! its row ([`Arming::FromRow`]); a record in a timed state with no row waits
-//! for its next action, and the boot walk counts it.
+//! A fresh event arms a record that has no timer, and so no row: a dispatch,
+//! a create, or an install that changed the record's spec. So does the boot
+//! walk: a process can stop between an event and its row. A rehydration
+//! follows only a timer the record already has, from its row
+//! ([`Arming::FromRow`]).
 //!
 //! It is idempotent: a record whose armed timer is already the one its state
 //! declares keeps it, so any number of calls leave one timer armed. The timer's
 //! clock starts when the record entered its state, so a timer re-armed after a
 //! restart or a rehydration waits only the rest of its budget, or fires at once.
+//! A timer row that cannot be read leaves the record's timer as it is
+//! ([`TimerFollow::RetryRead`]): it may hold the committed arm. A task that owns
+//! the timer reads it again (`follow_owned_state_timer`).
 //!
 //! A timer fires as someone: the caller of the dispatch that reconciles, else
 //! whoever armed the timer it replaces (its row's `armed_by`), else (a record
@@ -38,11 +41,16 @@
 //! boot, are in `state_timer_follow`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use temper_runtime::scheduler::sim_now;
 use temper_runtime::tenant::TenantId;
 
-use super::state_timeouts::{Reservation, declared_timer, rearm_clock_start, remaining_budget};
+use super::state_timeouts::{
+    Reservation, deadline, declared_timer, rearm_clock_start, remaining_budget,
+};
+use super::state_timer_follow::{FOLLOW_RETRY_FIRST, FOLLOW_RETRY_MAX};
 use crate::entity_actor::{EntityState, RehydrateHook};
 use crate::request_context::AgentContext;
 use crate::state::ServerState;
@@ -56,13 +64,14 @@ const STATE_TIMER_SERVICE: &str = "state-timer";
 pub(crate) enum TimerFollow {
     /// The timer its state declares, or none.
     Settled,
-    /// The record could not be read; the walk must retry it.
+    /// The record or its timer row could not be read, and its timer was left
+    /// as it was: whoever owns the record's timer reads again.
     RetryRead,
     /// Its state declares a timer whose action binds its caller's identity,
     /// and nobody armed it: the record's next action arms it as that caller.
     WaitsForCaller,
     /// Its state declares a timer, but it has no timer and no row, and a
-    /// rehydration or a boot does not arm one: its next action does.
+    /// rehydration does not arm one: its next action or the next boot does.
     WaitsForRow,
 }
 
@@ -71,18 +80,20 @@ pub(crate) enum TimerFollow {
 pub(crate) enum Arming {
     /// A fresh event says the record is in its state now: a dispatch, a
     /// create, a delete, a timer that found its record elsewhere, or an
-    /// install that changed the record's spec. A missing timer is armed.
+    /// install that changed the record's spec. Or the boot walk, which finds
+    /// the records a stopped process left without a row. A missing timer is
+    /// armed.
     #[default]
     Any,
-    /// A rehydration or a boot: only a timer the record has (armed from its
-    /// row, or the row the boot dropped) follows its state. A record with
-    /// neither waits ([`TimerFollow::WaitsForRow`]), so a boot never arms
-    /// records that had no timer, and never fires them all at once.
+    /// A rehydration: only a timer the record has (armed from its row)
+    /// follows its state. A record with neither waits
+    /// ([`TimerFollow::WaitsForRow`]) for its next action or the next boot.
     FromRow,
 }
 
 /// How a reconcile treats the record: who its new timer fires as, the boot
-/// gate it fires through, and whether it may arm a record that has no timer.
+/// gate it fires through, whether it may arm a record that has no timer, and
+/// the deadline of the timer whose task follows the record, if one does.
 #[derive(Clone, Default)]
 pub(crate) struct Follow<'a> {
     /// The caller of the dispatch that reconciles, or whoever armed the row
@@ -91,6 +102,35 @@ pub(crate) struct Follow<'a> {
     /// The boot walk's fire gate.
     pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
     pub(crate) arming: Arming,
+    /// The deadline a timer's task woke for, when that task follows the
+    /// record: it found the record elsewhere, or moved on by an action that
+    /// does not reset the timer. See [`elapsed_bucket`].
+    pub(crate) woke_for: Option<DateTime<Utc>>,
+}
+
+/// How late a timer a follow arms is, as
+/// `temper_state_timeout_armed_on_hydration_total` counts it:
+///
+/// - `budgeted`: its deadline is ahead (`delay` is left);
+/// - `on_time`: it is due, and the timer task that follows the record woke
+///   for a deadline no later than this one, so a timer was waiting for it. A
+///   record that took an action its timer does not reset on keeps the
+///   timer's deadline, and the timer's own task arms it again at that
+///   deadline, to fire at once;
+/// - `overdue`: it is due, and its deadline passed with no timer waiting for
+///   it, as when an actor hydrates or a process boots after it.
+fn elapsed_bucket(
+    delay: Duration,
+    deadline: DateTime<Utc>,
+    woke_for: Option<DateTime<Utc>>,
+) -> &'static str {
+    if !delay.is_zero() {
+        "budgeted"
+    } else if woke_for.is_some_and(|woke_for| woke_for <= deadline) {
+        "on_time"
+    } else {
+        "overdue"
+    }
 }
 
 impl ServerState {
@@ -128,6 +168,7 @@ impl ServerState {
             armed_by,
             gate,
             arming,
+            woke_for,
         } = follow;
         let declared = {
             let Ok(registry) = self.registry.read() else {
@@ -152,12 +193,60 @@ impl ServerState {
             return TimerFollow::Settled;
         };
         let armed = self.armed_state_timer(tenant, entity_type, entity_id);
-        if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() {
+        // Rows that follow commits are the timers the journal armed: one the
+        // record's events left for this state is the timer it has, even when
+        // the process never armed it (the move's answer was lost, or the
+        // actor rebuilt from its journal). Read even with a live arm: a
+        // committed reset can have superseded it without post-dispatch work.
+        // A withheld task releases its live arm but keeps its row. When no
+        // task is live, recover that row even in stores that write it after
+        // commit, so an install never replaces its setter with the service.
+        let row = if armed.is_none() {
+            self.stored_state_timer_row(tenant, entity_type, entity_id)
+                .await
+        } else {
+            self.committed_state_timer_row(tenant, entity_type, entity_id)
+                .await
+        };
+        let Ok(row) = row else {
+            // An unread row may hold the committed arm: a timer built from the
+            // record's fields now would replace its deadline, arguments and
+            // caller. Leave the record's timer as it is.
+            return TimerFollow::RetryRead;
+        };
+        // A row written after commit can lag a reset. Reuse it only for
+        // the current state clock; a committed row is authoritative itself.
+        let row = row.filter(|row| {
+            row.state == st.state
+                && row.sequence_nr <= current.sequence_nr
+                && (self.entity_rows_follow_commits()
+                    || DateTime::parse_from_rfc3339(&row.started_at)
+                        .is_ok_and(|start| start == started_at))
+        });
+        let committed = row.as_ref().and_then(|row| {
+            match super::state_timer_rows::armed_timer(
+                tenant,
+                row,
+                &st.on_timeout,
+                st.after_seconds,
+            ) {
+                Ok(timer) => Some(timer),
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, entity_type, entity_id, %error,
+                        "committed state timer row not decodable");
+                    None
+                }
+            }
+        });
+        if arming == Arming::FromRow && armed.is_none() && armed_by.is_none() && row.is_none() {
             return TimerFollow::WaitsForRow;
         }
-        let known = armed_by
-            .cloned()
-            .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()));
+        let known = committed
+            .as_ref()
+            .map(|timer| timer.agent_ctx.clone())
+            .or_else(|| armed_by.cloned())
+            .or_else(|| armed.as_ref().map(|armed| armed.agent_ctx.clone()))
+            .or_else(|| row.as_ref().and_then(super::state_timer_rows::row_armed_by));
         let identity = match known {
             Some(identity) => identity,
             None if self.action_binds_caller(tenant, entity_type, &st.on_timeout) => {
@@ -174,24 +263,67 @@ impl ServerState {
             &identity,
             started_at,
         );
+        let reservation = if let Some(committed) = committed {
+            timer = committed;
+            // Keep the durable arm's clock, payload, caller and row identity,
+            // but fence its replacement at the record we just reconciled.
+            // Non-resetting actions advance the journal without a new arm.
+            timer.sequence_nr = current.sequence_nr;
+            Reservation::Committed
+        } else {
+            Reservation::Missing
+        };
         timer.boot_gate = gate.or_else(|| armed.and_then(|armed| armed.boot_gate));
-        let delay = remaining_budget(started_at, st.after_seconds, now);
-        if self
-            .start_armed_timer(timer, delay, Reservation::Missing)
-            .await
-        {
+        let delay = remaining_budget(timer.started_at, st.after_seconds, now);
+        let bucket = elapsed_bucket(
+            delay,
+            deadline(timer.started_at, st.after_seconds),
+            woke_for,
+        );
+        if self.start_armed_timer(timer, reservation).await {
             crate::runtime_metrics::record_state_timeout_armed_on_hydration(
                 tenant.as_str(),
                 entity_type,
                 &st.state,
-                if delay.is_zero() {
-                    "overdue"
-                } else {
-                    "budgeted"
-                },
+                bucket,
             );
         }
         TimerFollow::Settled
+    }
+
+    /// [`Self::follow_state_timer`] for a task that owns the record's timer
+    /// (its timer's task, or its rehydration's): a timer row that cannot be
+    /// read is read again, after a wait that doubles from
+    /// [`FOLLOW_RETRY_FIRST`] to [`FOLLOW_RETRY_MAX`] as the walks' does.
+    /// Guessing would replace the committed arm's deadline, arguments and
+    /// caller; giving up would leave the record with no timer. It stops once
+    /// another arm or cancellation in this process takes the record over.
+    pub(super) async fn follow_owned_state_timer(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        current: &EntityState,
+        follow: Follow<'_>,
+    ) -> TimerFollow {
+        let owned = self.state_timer_turn(tenant, entity_type, entity_id);
+        let mut wait = FOLLOW_RETRY_FIRST;
+        loop {
+            let followed = self
+                .follow_state_timer(tenant, entity_type, entity_id, current, follow.clone())
+                .await;
+            if followed != TimerFollow::RetryRead {
+                return followed;
+            }
+            tracing::warn!(tenant = %tenant, entity_type, entity_id,
+                retry_in_secs = wait.as_secs(),
+                "state timer row not readable; the record's timer waits for it");
+            tokio::time::sleep(wait).await; // determinism-ok: retry wait on the runtime clock
+            if self.state_timer_turn(tenant, entity_type, entity_id) != owned {
+                return followed;
+            }
+            wait = (wait * 2).min(FOLLOW_RETRY_MAX);
+        }
     }
 
     /// Whether `action` binds a parameter from its caller's identity, which a
@@ -248,7 +380,13 @@ impl ServerState {
                     ..Follow::default()
                 };
                 server
-                    .follow_state_timer(&tenant, &entity_type, &entity_id, &rehydrated, follow)
+                    .follow_owned_state_timer(
+                        &tenant,
+                        &entity_type,
+                        &entity_id,
+                        &rehydrated,
+                        follow,
+                    )
                     .await;
             });
         }))

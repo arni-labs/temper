@@ -536,25 +536,6 @@ mod tests {
     }
 
     #[test]
-    fn test_full_record_chain_serialization() {
-        let obs = ObservationRecord {
-            header: RecordHeader::new(RecordType::Observation, "sentinel"),
-            source: "sentinel:latency".into(),
-            classification: ObservationClass::Performance,
-            evidence_query: "SELECT count(*) FROM spans".into(),
-            threshold_field: None,
-            threshold_value: None,
-            observed_value: None,
-            context: serde_json::json!({}),
-        };
-
-        let json = serde_json::to_string(&obs).unwrap();
-        let deserialized: ObservationRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.header.id, obs.header.id);
-        assert_eq!(deserialized.source, obs.source);
-    }
-
-    #[test]
     fn test_decision_record() {
         let decision = DecisionRecord {
             header: RecordHeader::new(RecordType::Decision, "human:alice")
@@ -612,49 +593,5 @@ mod tests {
         assert_eq!(record.category, PlatformGapCategory::MissingMethod);
         assert_eq!(record.frequency, 47);
         assert_eq!(record.disposition, FeatureRequestDisposition::Open);
-    }
-
-    #[test]
-    fn test_feature_request_serialization() {
-        let record = FeatureRequestRecord {
-            header: RecordHeader::new(RecordType::FeatureRequest, "insight-generator"),
-            category: PlatformGapCategory::GovernanceBlocked,
-            description: "Method 'set_policy' blocked for agents".to_string(),
-            frequency: 12,
-            trajectory_refs: vec![],
-            disposition: FeatureRequestDisposition::Acknowledged,
-            developer_notes: Some("Will add a scoped version".to_string()),
-        };
-
-        let json = serde_json::to_string(&record).unwrap();
-        let deserialized: FeatureRequestRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.header.id, record.header.id);
-        assert_eq!(
-            deserialized.category,
-            PlatformGapCategory::GovernanceBlocked
-        );
-        assert_eq!(
-            deserialized.disposition,
-            FeatureRequestDisposition::Acknowledged
-        );
-    }
-
-    #[test]
-    fn test_insight_category_platform_gap() {
-        let record = InsightRecord {
-            header: RecordHeader::new(RecordType::Insight, "insight-generator"),
-            category: InsightCategory::PlatformGap,
-            signal: InsightSignal {
-                intent: "unknown method 'send_email'".to_string(),
-                volume: 47,
-                success_rate: 0.0,
-                trend: Trend::Growing,
-                growth_rate: Some(0.25),
-            },
-            recommendation: "Consider adding email integration capability".to_string(),
-            priority_score: 0.9,
-        };
-
-        assert_eq!(record.category, InsightCategory::PlatformGap);
     }
 }

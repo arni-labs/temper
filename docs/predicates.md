@@ -6,7 +6,7 @@ Every condition in an IOA spec is one string in one grammar (ADR-0179):
 |---|---|---|
 | `[[action]]` | `guard` | the entity before the action |
 | `[[action.triggers]]` | `guard` | the entity after the action |
-| `[[invariant]]` | `assert` | every reachable state (proven by the verification cascade) |
+| `[[invariant]]` | `assert` | every reachable state (proven by the verification cascade), and the entity before and after every move ([checked on moves](#invariants-on-every-move)) |
 | `[[field_invariant]]` | `assert` | the entity's fields after a write (checked on writes) |
 
 An action's `effect` is a list of statements over the same literals and names ([Effects](#effects)), and trigger and state-timeout `args` are values in it ([Arguments](#arguments)).
@@ -36,10 +36,10 @@ implies = or [ "=>" implies ]          lowest precedence, right-associative
 or      = and { "||" and }
 and     = unary { "&&" unary }
 unary   = "!" unary | atom
-atom    = "(" expr ")" | "empty" "(" name ")" | name | operand cmp operand
+atom    = "(" expr ")" | "empty" "(" name ")" | name | "params" "." name | operand cmp operand
         | operand [ "not" ] "in" ( "[" literal, ... "]" | name )
 cmp     = "==" | "!=" | "<" | "<=" | ">" | ">="
-operand = "status" | name | "len" "(" name ")" | Type "[" name "]" "." "status" | literal
+operand = "status" | name | "params" "." name | "len" "(" name ")" | Type "[" name "]" "." "status" | literal
 literal = integer | 'string' | true | false | null
 ```
 
@@ -52,6 +52,7 @@ literal = integer | 'string' | true | false | null
   - required: `Workspace[workspace_id].status in ['Active']`
   - optional: `empty(workspace_id) || Workspace[workspace_id].status in ['Active']`
   - only a bad state blocks: `Workspace[workspace_id].status not in ['Frozen', 'Archived']`
+- **`params.p`** is the parameter `p` of the move being taken. Only an action's guard reads one, and only a parameter its action declares. A bare `params.p` is a boolean test, like a bare name, and prints as `params.p == true`. That is how the `on_success` actions a module's answer lists choose between its values (see the agent guide).
 - **`=>`** is implication: `status in ['Done'] => approved`.
 
 ## Effects
@@ -114,9 +115,15 @@ terminal = ["Done", "Cancelled"]
 
 ## What the verifier can prove
 
-`[[invariant]]` asserts are proven over every reachable state, so they may only read what the model tracks: `status`, `counter`, `bool`, `list` and tracked `string` state variables. An assertion over a number variable, an entity field, or a related entity fails to load; state it as a `[[field_invariant]]` instead, which is checked whenever the entity is written.
+`[[invariant]]` asserts are proven over every reachable state. They may read `status`, `counter`, `bool` and `string` state variables, the length and members of `list` variables, and a related entity's status or field. An assertion that reads a number that is not a counter, an undeclared field, or `null` fails to load; state it as a `[[field_invariant]]` instead, which is checked whenever the entity is written.
 
 String fields read by a guard or invariant, or written by an effect, are tracked. An effect-only string ranges over its initial value and the finite set of literals effects write. A field also written by action params keeps the existing equality-symbol abstraction for arbitrary input.
+
+## Invariants on every move
+
+The kernel also checks a type's `[[invariant]]`s on every move, whatever made it: a request, a timer, a reaction or a module's answer. A move that makes an invariant false when it held before the move is refused with `InvariantViolated`, which names the invariant (HTTP 409), and the entity is left as it was. An entity that already breaks an invariant, such as one written before the invariant was added, can still move, and the kernel logs a warning naming the invariant.
+
+A related entity's status (`Type[ref].status`) is read as the move resolved it, and a move that changes `ref` is not checked against that invariant. An invariant that reads a related entity's field (`Type[ref].field`) is not checked on moves; the kernel logs which ones when it loads the spec.
 
 Guards may also read values the model does not track (reference fields, related entities). The verifier treats those as unknown: an action gated on one may fire, but is not guaranteed to.
 

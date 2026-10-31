@@ -237,6 +237,9 @@ pub(in crate::odata) enum QueryPlaneReadError {
     /// The `$skiptoken` continuation could not be decoded for this request —
     /// malformed, or its key count does not match the request's ordering.
     InvalidContinuation,
+    /// A candidate known to be ahead of its projection could not be read
+    /// authoritatively. Never turn this into a stale or incomplete success.
+    ReadUnavailable,
 }
 
 impl QueryPlaneReadError {
@@ -244,7 +247,7 @@ impl QueryPlaneReadError {
         match self {
             Self::AuthorizationDenied(_) => {}
             Self::QueryTooLarge { telemetry, .. } => telemetry.record(span),
-            Self::InvalidContinuation => {}
+            Self::InvalidContinuation | Self::ReadUnavailable => {}
         }
     }
 
@@ -257,6 +260,11 @@ impl QueryPlaneReadError {
                 "This query requires evaluating more candidate entities than the bounded OData read budget permits. Use a narrower filter or a smaller page/count request.",
             )
             .into_response(),
+            Self::ReadUnavailable => odata_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ReadUnavailable",
+                "A committed entity could not be read authoritatively. Retry this request.",
+            ).into_response(),
             Self::InvalidContinuation => odata_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidSkipToken",

@@ -19,7 +19,9 @@ pub(super) fn slice(mut model: TemperModel, read: BTreeSet<String>) -> TemperMod
         let before = keep.len();
         for t in &model.transitions {
             let writes = t.effects.iter().any(|e| keep.contains(effect_var(e)))
-                || t.string_params.iter().any(|p| keep.contains(&p.name));
+                || t.string_params
+                    .iter()
+                    .any(|p| p.writes && keep.contains(&p.name));
             if !writes {
                 continue;
             }
@@ -51,6 +53,7 @@ pub(super) fn slice(mut model: TemperModel, read: BTreeSet<String>) -> TemperMod
         model.initial_booleans.remove(name);
         model.initial_lists.remove(name);
         model.counter_bounds.remove(name);
+        model.list_bounds.remove(name);
         model.list_literals.remove(name);
     }
     model.invariants.clear();
@@ -74,7 +77,8 @@ fn effect_var(effect: &ModelEffect) -> &str {
     }
 }
 
-fn effect_reads(effect: &ModelEffect) -> Option<&str> {
+/// The state variable read by an effect argument, if any.
+pub(super) fn effect_reads(effect: &ModelEffect) -> Option<&str> {
     let arg = match effect {
         ModelEffect::SetCounter { value, .. }
         | ModelEffect::AddCounter { value, .. }

@@ -40,15 +40,77 @@ const DST_SEEDS: u64 = 64;
 /// real planner fall back to the authoritative scan (and 413 at scale).
 #[derive(Default)]
 pub(super) struct SimQueryPlane {
-    // (entity_type, entity_id) -> catalog row
-    catalog: Mutex<BTreeMap<(String, String), EntityCatalogRow>>,
+    // (tenant, entity_type, entity_id) -> catalog row
+    pub(super) catalog: Mutex<BTreeMap<(String, String, String), EntityCatalogRow>>,
+    pub(super) pending: Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
 #[async_trait]
 impl QueryPlaneStore for SimQueryPlane {
+    async fn reconciled_equality_candidates(
+        &self,
+        _journal: &BoxedEventStore,
+        tenant: &str,
+        entity_type: &str,
+        predicates: &[(String, String)],
+        probe_budget: Option<usize>,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
+        let pending = self.pending.lock().unwrap();
+        let Some(pending) = pending.as_ref() else {
+            return Ok(None);
+        };
+        let catalog = self.catalog.lock().unwrap();
+        let mut ids = pending.clone();
+        ids.extend(
+            catalog
+                .iter()
+                .filter(|((t, ty, _), row)| {
+                    t == tenant
+                        && ty == entity_type
+                        && predicates.iter().all(|(field, value)| {
+                            row.fields.get(field).and_then(|v| v.as_str()) == Some(value.as_str())
+                        })
+                })
+                .map(|((_, _, id), _)| id.clone()),
+        );
+        let mut bounded: Vec<_> = ids.into_iter().collect();
+        bounded.sort_by_key(|id| (!pending.contains(id), id.clone()));
+        if let Some(budget) = probe_budget {
+            bounded.truncate(budget.saturating_add(1));
+        }
+        bounded.sort();
+        let dirty = bounded
+            .iter()
+            .filter(|id| pending.contains(*id))
+            .cloned()
+            .collect();
+        Ok(Some((bounded, dirty)))
+    }
+
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        Ok(self
+            .catalog
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((t, _, _), _)| t == tenant)
+            .map(
+                |((_, ty, id), row)| temper_runtime::persistence::ProjectionCheckpoint {
+                    entity_type: ty.clone(),
+                    entity_id: id.clone(),
+                    sequence_nr: row.sequence_nr,
+                    status: row.status.clone(),
+                },
+            )
+            .collect())
+    }
+
     async fn upsert_projection(
         &self,
-        _tenant: &str,
+        tenant: &str,
         entity_type: &str,
         entity_id: &str,
         status: &str,
@@ -57,7 +119,11 @@ impl QueryPlaneStore for SimQueryPlane {
         sequence_nr: u64,
     ) -> Result<(), PersistenceError> {
         self.catalog.lock().unwrap().insert(
-            (entity_type.to_string(), entity_id.to_string()),
+            (
+                tenant.to_string(),
+                entity_type.to_string(),
+                entity_id.to_string(),
+            ),
             EntityCatalogRow {
                 entity_id: entity_id.to_string(),
                 status: status.to_string(),
@@ -71,14 +137,15 @@ impl QueryPlaneStore for SimQueryPlane {
 
     async fn remove_projection(
         &self,
-        _tenant: &str,
+        tenant: &str,
         entity_type: &str,
         entity_id: &str,
     ) -> Result<(), PersistenceError> {
-        self.catalog
-            .lock()
-            .unwrap()
-            .remove(&(entity_type.to_string(), entity_id.to_string()));
+        self.catalog.lock().unwrap().remove(&(
+            tenant.to_string(),
+            entity_type.to_string(),
+            entity_id.to_string(),
+        ));
         Ok(())
     }
 
@@ -121,14 +188,18 @@ impl QueryPlaneStore for SimQueryPlane {
 
     async fn load_entity_catalog_rows(
         &self,
-        _tenant: &str,
+        tenant: &str,
         entity_type: &str,
         entity_ids: &[String],
     ) -> Result<Option<Vec<EntityCatalogRow>>, PersistenceError> {
         let catalog = self.catalog.lock().unwrap();
         let rows = entity_ids
             .iter()
-            .filter_map(|id| catalog.get(&(entity_type.to_string(), id.clone())).cloned())
+            .filter_map(|id| {
+                catalog
+                    .get(&(tenant.to_string(), entity_type.to_string(), id.clone()))
+                    .cloned()
+            })
             .collect();
         Ok(Some(rows))
     }

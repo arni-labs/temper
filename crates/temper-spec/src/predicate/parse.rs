@@ -309,6 +309,14 @@ impl<'a> Parser<'a> {
         }
         match lhs {
             Operand::Var(name) => Ok(Expr::Var(name)),
+            // A bare `params.p` is a boolean test, like a bare name. It reads
+            // as `params.p == true`, which holds for `true` alone, as a bare
+            // name does.
+            Operand::Param(_) => Ok(Expr::Compare {
+                lhs,
+                op: CmpOp::Eq,
+                rhs: Operand::Lit(Literal::Bool(true)),
+            }),
             Operand::Lit(Literal::Bool(value)) => Ok(Expr::Const(value)),
             _ => Err(self.error("expected a comparison or 'in'")),
         }
@@ -352,6 +360,10 @@ impl<'a> Parser<'a> {
                     "false" => Ok(Operand::Lit(Literal::Bool(false))),
                     "null" => Ok(Operand::Lit(Literal::Null)),
                     "len" => Ok(Operand::Len(self.call_arg()?)),
+                    "params" => {
+                        self.expect(&Tok::Dot, "'.' after 'params'")?;
+                        Ok(Operand::Param(self.ident()?))
+                    }
                     _ if is_keyword(&name) => {
                         self.pos -= 1;
                         Err(self.error(&format!("unexpected keyword '{name}'")))

@@ -5,12 +5,32 @@ use temper_store_turso::{TenantStoreRouter, TursoEventStore};
 
 use super::query_plane_impls::{catalog_freshness, storage_order_by, to_turso_projection};
 use super::{
-    CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
+    CatalogGroup, CatalogRowFreshness, EntityCatalogRow, QueryFieldIndexOrder, QueryFieldIndexPage,
     QueryPlaneStore, QueryProjectionFieldsRow, QueryProjectionUpsert,
 };
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for TenantStoreRouter {
+    async fn lagging_projections(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<Vec<temper_runtime::persistence::ProjectionRepairCandidate>>, PersistenceError>
+    {
+        self.store_for_tenant(tenant)
+            .await?
+            .lagging_query_projections(tenant)
+            .await
+            .map(Some)
+    }
+    async fn projection_checkpoints(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<temper_runtime::persistence::ProjectionCheckpoint>, PersistenceError> {
+        self.store_for_tenant(tenant)
+            .await?
+            .query_projection_checkpoints(tenant)
+            .await
+    }
     async fn upsert_projection(
         &self,
         tenant: &str,
@@ -171,6 +191,26 @@ impl QueryPlaneStore for TenantStoreRouter {
         Ok(Some(counts))
     }
 
+    async fn reconciled_equality_candidates(
+        &self,
+        journal: &super::BoxedEventStore,
+        tenant: &str,
+        entity_type: &str,
+        predicates: &[(String, String)],
+        probe_budget: Option<usize>,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
+        // A separately supplied journal can have changes absent from this
+        // store's delta. Its absence is never evidence about that journal.
+        if !std::ptr::addr_eq(self as *const Self, std::sync::Arc::as_ptr(&journal.store)) {
+            return Ok(None);
+        }
+        self.store_for_tenant(tenant)
+            .await?
+            .reconciled_equality_candidates(tenant, entity_type, predicates, probe_budget)
+            .await
+            .map(Some)
+    }
+
     async fn projection_catalog_freshness(
         &self,
         tenant: &str,
@@ -181,5 +221,19 @@ impl QueryPlaneStore for TenantStoreRouter {
             .projection_catalog_freshness(tenant, entity_type)
             .await
             .map(|rows| Some(catalog_freshness(rows)))
+    }
+
+    async fn catalog_groups(
+        &self,
+        tenant: &str,
+        entity_type: &str,
+        fields: &[String],
+        statuses: &[String],
+    ) -> Result<Option<Vec<CatalogGroup>>, PersistenceError> {
+        let store = self.store_for_tenant(tenant).await?;
+        let rows = store
+            .catalog_groups(tenant, entity_type, fields, statuses)
+            .await?;
+        Ok(Some(CatalogGroup::from_rows(rows, fields)))
     }
 }

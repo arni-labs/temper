@@ -12,12 +12,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::{
     ActionConstraint, ActionKind, Automaton, Initial, ResolvedEffect, translate_actions,
 };
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, ParamKind, Set, VarKind};
+use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set};
 
 use super::types::{
     LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
     StringParam, TemperModel,
 };
+
+mod strings;
+use strings::{string_literals, tracked_strings};
 
 /// Build a `TemperModel` from I/O Automaton TOML source.
 ///
@@ -107,7 +110,24 @@ pub fn build_model_tracking(
             *bound = (*bound).max(*initial);
         }
     }
+    // A list is explored at least as long as it starts.
+    let mut list_bounds: BTreeMap<String, usize> = initial_lists
+        .iter()
+        .map(|(name, items)| (name.clone(), max_counter.max(items.len())))
+        .collect();
     let invariants = resolve_invariants(automaton);
+    // A counter, or a list's length, is explored one past every literal a
+    // guard or invariant compares it with, so a rule about a count passing a
+    // threshold is checked at the threshold, not passed because the count
+    // never got there.
+    let guards = transitions.iter().map(|t| &t.guard);
+    let asserts = invariants.iter().map(|inv| &inv.assert);
+    for (name, literal) in compared_literals(guards.chain(asserts)) {
+        let bound = counter_bounds.get_mut(&name).or(list_bounds.get_mut(&name));
+        if let Some(bound) = bound {
+            *bound = (*bound).max(literal.saturating_add(1));
+        }
+    }
     let liveness = resolve_liveness(automaton);
     let var_kinds = automaton
         .state
@@ -131,6 +151,7 @@ pub fn build_model_tracking(
         tracked_strings,
         counter_bounds,
         default_max_counter: max_counter,
+        list_bounds,
         list_literals: list_literals(automaton),
         limit: None,
     }
@@ -182,29 +203,45 @@ fn resolve_transitions(
         .collect()
 }
 
-/// The parameters of `action` that write a tracked string variable, with the
-/// action's constraints on each.
+/// The parameters of `action` that write a tracked string variable, or that
+/// a constraint ties to one (`failed_commit` must equal `commit`), with the
+/// action's constraints on each. The model needs the value of the second
+/// kind to decide whether the record takes the action, though it writes
+/// nothing it tracks.
 fn string_params(
     action: &temper_spec::automaton::Action,
     tracked_strings: &BTreeSet<String>,
 ) -> Vec<StringParam> {
+    let tied = |name: &str| {
+        action.constraints.iter().any(|c| {
+            c.param() == name
+                && matches!(
+                    c,
+                    ActionConstraint::ParamEqualsField { .. }
+                        | ActionConstraint::ParamNotEqualsField { .. }
+                )
+                && c.field()
+                    .is_some_and(|field| tracked_strings.contains(field))
+        })
+    };
     action
         .params
         .iter()
         .map(|param| param.name())
-        .filter(|name| tracked_strings.contains(*name))
+        .filter(|name| tracked_strings.contains(*name) || tied(name))
         .map(|name| {
             let mut param = StringParam {
                 name: name.to_string(),
+                writes: tracked_strings.contains(name),
                 nonempty: false,
-                equals: None,
+                equals: Vec::new(),
                 not_equals: Vec::new(),
             };
             for constraint in action.constraints.iter().filter(|c| c.param() == name) {
                 match constraint {
                     ActionConstraint::ParamNonempty { .. } => param.nonempty = true,
                     ActionConstraint::ParamEqualsField { field, .. } => {
-                        param.equals = Some(field.clone());
+                        param.equals.push(field.clone());
                     }
                     ActionConstraint::ParamNotEqualsField { field, .. } => {
                         param.not_equals.push(field.clone());
@@ -217,151 +254,47 @@ fn string_params(
         .collect()
 }
 
-/// The string variables the verifier tracks: those guards or `[[invariant]]`s read or effects write,
-/// plus `also_tracked`, plus every string variable a constraint ties the
-/// parameter of a tracked one to (its value decides what the tracked one may
-/// become). Other strings stay unmodeled.
-fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BTreeSet<String> {
-    let kinds: BTreeMap<&str, VarKind> = automaton
-        .state
-        .iter()
-        .map(|sv| (sv.name.as_str(), sv.var_type.kind()))
-        .collect();
-    let is_string = |name: &str| kinds.get(name) == Some(&VarKind::Str);
-    let mut tracked: BTreeSet<String> = also_tracked
-        .iter()
-        .filter(|name| is_string(name))
-        .cloned()
-        .collect();
-    for expr in automaton
-        .invariants
-        .iter()
-        .map(|inv| &inv.assert)
-        .chain(automaton.actions.iter().map(|action| &action.guard))
-    {
-        expr.for_each_name(&mut |name| {
-            if let Name::Var(var) = name
-                && is_string(var)
-            {
-                tracked.insert(var.to_string());
-            }
-        });
-    }
-    // An effect-only string has no parameter choices: its reachable values
-    // are exactly its initial value and the finitely many effect literals.
-    // Parameter-written strings keep the existing equality-symbol abstraction
-    // so arbitrary input stays covered without enumerating unbounded strings.
-    for action in &automaton.actions {
-        for effect in &action.effect {
-            if let temper_spec::predicate::Effect::Assign { var, .. } = effect
-                && is_string(var)
-            {
-                tracked.insert(var.clone());
-            }
+/// The largest non-negative integer literal each counter, or each list's
+/// length, is compared with in `exprs` (`v < 4`, `4 <= v`, `v in [1, 4]`,
+/// `len(l) < 4`), by the variable's name.
+fn compared_literals<'a>(exprs: impl Iterator<Item = &'a Expr>) -> BTreeMap<String, usize> {
+    fn note(var: &str, literal: &Literal, out: &mut BTreeMap<String, usize>) {
+        if let Literal::Int(n) = literal
+            && let Ok(n) = usize::try_from(*n)
+        {
+            let largest = out.entry(var.to_string()).or_default();
+            *largest = (*largest).max(n);
         }
     }
-    loop {
-        let before = tracked.len();
-        for action in &automaton.actions {
-            for constraint in &action.constraints {
-                if !tracked.contains(constraint.param()) {
-                    continue;
-                }
-                if let Some(field) = constraint.field()
-                    && is_string(field)
-                {
-                    tracked.insert(field.to_string());
-                }
-            }
-        }
-        if tracked.len() == before {
-            return tracked;
-        }
-    }
-}
-
-/// For every tracked string variable, all initial, effect and comparison
-/// literals any tracked string may hold (`v == 'x'`, `v in ['x', 'y']`).
-fn string_literals(
-    automaton: &Automaton,
-    tracked: &BTreeSet<String>,
-) -> BTreeMap<String, BTreeSet<String>> {
-    fn visit(
-        expr: &Expr,
-        tracked: &BTreeSet<String>,
-        out: &mut BTreeMap<String, BTreeSet<String>>,
-    ) {
+    fn visit(expr: &Expr, out: &mut BTreeMap<String, usize>) {
         match expr {
-            Expr::Not(inner) => visit(inner, tracked, out),
+            Expr::Not(inner) => visit(inner, out),
             Expr::And(parts) | Expr::Or(parts) => {
-                parts.iter().for_each(|part| visit(part, tracked, out));
+                parts.iter().for_each(|part| visit(part, out));
             }
             Expr::Implies(a, b) => {
-                visit(a, tracked, out);
-                visit(b, tracked, out);
+                visit(a, out);
+                visit(b, out);
             }
-            Expr::Compare {
-                lhs,
-                op: CmpOp::Eq | CmpOp::Ne,
-                rhs,
-            } => {
-                for (var, lit) in [(lhs, rhs), (rhs, lhs)] {
-                    if let (Operand::Var(var), Operand::Lit(Literal::Str(text))) = (var, lit)
-                        && tracked.contains(var)
+            Expr::Compare { lhs, rhs, .. } => {
+                for (var, literal) in [(lhs, rhs), (rhs, lhs)] {
+                    if let (Operand::Var(var) | Operand::Len(var), Operand::Lit(literal)) =
+                        (var, literal)
                     {
-                        out.entry(var.clone()).or_default().insert(text.clone());
+                        note(var, literal, out);
                     }
                 }
             }
             Expr::In {
-                value: Operand::Var(var),
+                value: Operand::Var(var) | Operand::Len(var),
                 set: Set::List(items),
                 ..
-            } if tracked.contains(var) => {
-                for item in items {
-                    if let Literal::Str(text) = item {
-                        out.entry(var.clone()).or_default().insert(text.clone());
-                    }
-                }
-            }
+            } => items.iter().for_each(|item| note(var, item, out)),
             _ => {}
         }
     }
     let mut out = BTreeMap::new();
-    let mut written = BTreeSet::new();
-    for sv in &automaton.state {
-        if tracked.contains(&sv.name)
-            && let Initial::String(value) = &sv.initial
-        {
-            written.insert(value.clone());
-        }
-    }
-    for action in &automaton.actions {
-        for effect in &action.effect {
-            if let temper_spec::predicate::Effect::Assign {
-                value: Arg::Lit(Literal::Str(value)),
-                ..
-            } = effect
-            {
-                written.insert(value.clone());
-            }
-        }
-    }
-    for action in &automaton.actions {
-        visit(&action.guard, tracked, &mut out);
-    }
-    for inv in &automaton.invariants {
-        visit(&inv.assert, tracked, &mut out);
-    }
-    // An earlier param may equal a literal compared with another field later
-    // (x == y && y == 'special'). Share comparison literals as well as initial
-    // and effect values: a fresh symbol cannot equal a concrete literal.
-    // This stays finite; fresh symbols still cover all other parameter inputs,
-    // and effect-only fields still take only their initial and written values.
-    written.extend(out.values().flatten().cloned());
-    for var in tracked {
-        out.insert(var.clone(), written.clone());
-    }
+    exprs.for_each(|expr| visit(expr, &mut out));
     out
 }
 
@@ -416,11 +349,13 @@ fn resolve_invariants(automaton: &Automaton) -> Vec<ResolvedInvariant> {
         .collect()
 }
 
-/// Translate IOA liveness properties into resolved liveness.
+/// Translate IOA liveness properties into resolved liveness. An `eventually`
+/// property is checked on the joint model instead.
 fn resolve_liveness(automaton: &Automaton) -> Vec<ResolvedLiveness> {
     automaton
         .liveness
         .iter()
+        .filter(|l| l.eventually.is_none())
         .map(|l| {
             let kind = if !l.reaches.is_empty() {
                 LivenessKind::ReachesState {

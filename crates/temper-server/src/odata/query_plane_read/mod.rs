@@ -1,5 +1,6 @@
 //! OData entity-set reads through the query-plane contract.
 
+mod equality;
 mod pagination;
 mod scan;
 #[cfg(test)]
@@ -113,7 +114,7 @@ fn should_reconcile_empty_exact_match_against_authoritative(
     // only pushdown-able equality conjunctions pay it; ranges/Or/Ne/contains/
     // functions return `None` from `equality_field_predicates` and are
     // unaffected. When the type is too large for that scan, the budget gate
-    // bounds the reconcile to the field-index coverage gap (ARN-68) —
+    // bounds the reconcile to the rows the native page cannot answer for (ARN-68) —
     // see `read_entity_set_from_query_plane`.
     request
         .query_options
@@ -121,6 +122,75 @@ fn should_reconcile_empty_exact_match_against_authoritative(
         .as_ref()
         .and_then(super::filter_sql::equality_field_predicates)
         .is_some()
+}
+
+/// The ids among `all_entity_ids` whose rows the native page cannot answer
+/// for, or `None` when the store cannot say.
+///
+/// A projection writes a row's catalog entry and its field index from the same
+/// fields, so a current catalog row whose fields the index can see holds every
+/// committed value the page filters on (`projection_catalog_freshness`). Only
+/// the other rows can hold a match the page missed: one with no catalog row
+/// yet, one whose journal has a newer event, and one whose fields sit inside a
+/// `fields` object the index does not look into, and one projected before the
+/// field index existed, which has no index row at all until a backfill reaches
+/// it (every projection indexes at least the row's `Id`). A row with no value
+/// for a filtered field has no index row for it and cannot match an equality
+/// on it. A field the spec keeps out of the index (`query_indexed = false`)
+/// has no rows at all, so then no row is answered for.
+async fn unvouched_ids(
+    request: &QueryPlaneReadRequest<'_>,
+    field_names: &std::collections::BTreeSet<String>,
+    all_entity_ids: &[String],
+) -> Option<std::collections::BTreeSet<String>> {
+    let query_plane = request.state.query_plane_store()?;
+    if field_names.iter().any(|field| {
+        !request
+            .state
+            .query_projection_indexes_field(request.tenant, request.entity_type, field)
+    }) {
+        return Some(all_entity_ids.iter().cloned().collect());
+    }
+    let rows = match query_plane
+        .projection_catalog_freshness(request.tenant.as_str(), request.entity_type)
+        .await
+    {
+        Ok(rows) => rows?,
+        Err(error) => {
+            tracing::warn!(
+                tenant = %request.tenant, entity_type = request.entity_type, error = %error,
+                "projection catalog freshness read failed; an empty exact match is not reconciled by gap"
+            );
+            return None;
+        }
+    };
+    let indexed: std::collections::BTreeSet<String> = match query_plane
+        .query_field_index(
+            request.tenant.as_str(),
+            request.entity_type,
+            "entity_id IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2)",
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(Some(ids)) => ids.into_iter().collect(),
+        Ok(None) | Err(_) => return None,
+    };
+    let vouched: std::collections::BTreeSet<String> = rows
+        .into_iter()
+        .filter(|row| {
+            row.current && row.wrapped_fields.is_none() && indexed.contains(&row.entity_id)
+        })
+        .map(|row| row.entity_id)
+        .collect();
+    let gap: std::collections::BTreeSet<String> = all_entity_ids
+        .iter()
+        .filter(|id| !vouched.contains(*id))
+        .cloned()
+        .collect();
+    debug_assert!(gap.len() <= all_entity_ids.len());
+    Some(gap)
 }
 
 fn should_check_source_cursor_catalog_coverage(
@@ -177,6 +247,16 @@ pub(in crate::odata) async fn read_entity_set_page(
     // scan budget can never trip. On a miss we fall back to the full list, which still
     // covers pre-backfill entities: a safe additive fast path until #324 is retired.
     let keyed = keyed_candidate_ids(&request).await;
+    if keyed.is_none()
+        && let Some(result) = equality::try_reconciled_equality_read(&request).await
+    {
+        return result;
+    }
+    // Without an indexed string-equality conjunct (for example a null-only
+    // filter, a non-indexed field, or an OR), or without a durable delta for
+    // this actual journal, retain the general planner below. Its conservative
+    // scan is still needed when no narrower complete candidate proof exists.
+
     // A keyed result of `Some([])` is authoritative absence (the watermark is set):
     // the co-committed `entity_key_index` has no such entity. No native page read
     // runs after that, here or below: the eventually-consistent field index and
@@ -189,7 +269,8 @@ pub(in crate::odata) async fn read_entity_set_page(
     // path below (ARN-89). It suppresses the native retry on that path and
     // selects the `ProjectionLagReconcile` telemetry reason. If the type then
     // turns out to be too large for the reconcile scan, the budget gate bounds
-    // the reconcile to the field-index coverage gap instead of rejecting (ARN-68).
+    // the reconcile to the rows the native page cannot answer for instead of
+    // rejecting (ARN-68).
     let mut reconciling_exact_match_lag = false;
     if !keyed_authoritative_absent
         && let Some(plan) = native_plan.clone()
@@ -278,56 +359,22 @@ pub(in crate::odata) async fn read_entity_set_page(
     // 1275 < 10k) hydrated every id and returned 0.
     if reconciling_exact_match_lag || over_scan_budget {
         // ARN-68 (the SessionEntries-list flavor): the full scan is only needed
-        // for entities the native page cannot see — no `entity_field_index` row
-        // for a filtered field. Reconcile that gap, not the type. A
-        // committed-but-unprojected match is FOUND; a genuine miss returns
-        // bounded empty. If the union exceeds the scan budget, or the backend
-        // has no field-index coverage probe, keep the honest over-budget
-        // rejection. In-budget probe failure still falls through (no second
-        // invented probe).
+        // for entities the native page cannot answer for. Reconcile that gap,
+        // not the type. A committed-but-unprojected match is FOUND; a genuine
+        // miss returns bounded empty. If the union exceeds the scan budget, or
+        // the backend cannot say which catalog rows are current, keep the
+        // honest over-budget rejection. In-budget probe failure still falls
+        // through (no second invented probe).
         if reconciling_exact_match_lag
             && let Some(pairs) = request
                 .query_options
                 .filter
                 .as_ref()
                 .and_then(super::filter_sql::equality_field_predicates)
-            && let Some(query_plane) = request.state.query_plane_store()
         {
             let field_names: std::collections::BTreeSet<String> =
                 pairs.into_iter().map(|(name, _)| name).collect();
-            let mut gap_ids: Option<std::collections::BTreeSet<String>> =
-                Some(std::collections::BTreeSet::new());
-            for field_name in field_names {
-                let covered = query_plane
-                    .query_field_index(
-                        request.tenant.as_str(),
-                        request.entity_type,
-                        "entity_id IN (SELECT entity_id FROM entity_field_index \
-                         WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3)",
-                        vec![field_name],
-                    )
-                    .await;
-                match covered {
-                    Ok(Some(covered_ids)) => {
-                        let covered: std::collections::BTreeSet<&String> =
-                            covered_ids.iter().collect();
-                        if let Some(gap) = gap_ids.as_mut() {
-                            gap.extend(
-                                all_entity_ids
-                                    .iter()
-                                    .filter(|id| !covered.contains(id))
-                                    .cloned(),
-                            );
-                        }
-                    }
-                    // Unsupported backend or probe failure: never trust the empty
-                    // page without coverage proof — fall through to the rejection.
-                    Ok(None) | Err(_) => {
-                        gap_ids = None;
-                        break;
-                    }
-                }
-            }
+            let gap_ids = unvouched_ids(&request, &field_names, &all_entity_ids).await;
             // Re-run the page with `$select` stripped (the union needs `entity_id`,
             // which selection would drop) and `$skip` folded into `$top` (the union
             // must carry the FULL covered prefix; the final cursor pass applies the

@@ -1,39 +1,48 @@
 //! The joint model: the records in scope, their reactions, the dispatches
-//! on their way between them, and the walk.
+//! and module calls on their way, who may send what, and the walk.
 
+mod commit;
 mod drops;
 mod initial;
+mod labels;
+mod order;
+mod react;
 mod read;
 mod step;
+mod walk;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet};
 
+use temper_authz::{May, SendAnalysis};
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Expr, Name, Truth, eval};
+use temper_spec::predicate::{Expr, Name, eval};
 
 use super::env::{Blind, ID, JointEnv, Records};
+use super::senders::{OUTSIDE, Senders};
 use super::slice::slice;
-use super::{JointOutcome, JointState, path_to};
-use crate::Budget;
-use crate::model::semantics::{Expansion, canonical_strings, string_values};
+use super::state::canonical;
+use super::{JointOutcome, JointState};
+use crate::model::semantics::{Expansion, rule_for, string_values};
 use crate::model::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 pub use drops::DroppedReaction;
 pub(crate) use drops::dropped_reactions;
-use read::{Reaction, tracked};
+use order::{Order, Specs};
+pub(super) use read::Timeout;
+use read::{
+    Kernel, Reaction, Unchecked, named_literals, reactions_into, tracked, unchecked_constraints,
+};
 pub(super) use step::Move;
+pub(super) use walk::{Explored, Unwalked, unwalked_reason};
 
 /// Counter ceiling for the joint models, as for the composite plans.
 const JOINT_MAX_COUNTER: usize = 3;
 
-/// Reaction depth followed: the runtime's own bound.
-const MAX_REACTION_DEPTH: u32 = temper_runtime::reaction::MAX_REACTION_DEPTH;
-
-/// Dispatches in flight at once. The runtime has no such bound: each request
-/// and each reaction is its own task. The model needs one to stay finite;
-/// three lets a late dispatch land after two later ones. A walk that held a
-/// move back for it says so, and then proves only up to this many.
+/// Dispatches and module calls in flight at once. The runtime has no such
+/// bound: each request, reaction and module call is its own task. The model
+/// needs one to stay finite; three lets a late dispatch land after two later
+/// ones. A walk that held a move back for it says so, and then proves only
+/// up to this many.
 pub(super) const MAX_IN_FLIGHT: usize = 3;
 
 /// When a dispatch lands, against moves from outside.
@@ -46,8 +55,35 @@ enum Delivery {
     /// Before the next move from outside: the dispatches a move sends all
     /// land, in any order, before anything else is asked. That is what the
     /// drop check claims (ADR-0150); with it, the dispatches in flight are
-    /// bounded by the reactions' fan-out and depth.
+    /// bounded by the reactions' fan-out and distinct steps.
     BeforeNextRequest,
+}
+
+/// Who sends what in the model.
+pub(super) struct Sending<'s> {
+    /// The policies that decide each move as its sender; `None` lets every
+    /// sender send everything.
+    pub(super) policies: Option<&'s SendAnalysis>,
+    /// Whether the model makes the kernel's own moves: state timers, module
+    /// answers and failures, and module calls lost to a restart. Without
+    /// them anyone may send any action, which covers what they do.
+    pub(super) kernel_moves: bool,
+    /// Actions (entity, action) that code outside the specs sends, offered
+    /// and allowed whatever the policies say.
+    pub(super) relies_on: BTreeSet<(String, String)>,
+}
+
+impl Sending<'_> {
+    /// Anyone sends anything, and the kernel makes no moves of its own: what
+    /// the drop check (ADR-0150) assumes, and what a recorded trace replays
+    /// through.
+    pub(super) fn anyone() -> Self {
+        Self {
+            policies: None,
+            kernel_moves: false,
+            relies_on: BTreeSet::new(),
+        }
+    }
 }
 
 /// What a walk found.
@@ -60,7 +96,7 @@ pub(super) struct Walk {
     pub(super) held_back: bool,
 }
 
-/// The joint model of one entity's invariants that read related entities.
+/// The joint model of one entity's properties that read related entities.
 pub(super) struct JointModel {
     expansion: Expansion,
     id_literals: BTreeSet<String>,
@@ -71,19 +107,69 @@ pub(super) struct JointModel {
     /// use: each holds that record's id.
     refs: BTreeMap<String, BTreeSet<String>>,
     delivery: Delivery,
-    /// The types composed: those the invariants name, or a trigger-graph
+    /// The types composed: those the properties name, or a trigger-graph
     /// component for the drop check.
     pub(super) scope: BTreeSet<String>,
+    /// Whether the kernel's own moves are made as the kernel makes them.
+    kernel_moves: bool,
+    kernel: Kernel,
+    relies_on: BTreeSet<(String, String)>,
+    /// The actions with a constraint the model does not decide.
+    unchecked: Unchecked,
+    /// The counts kept as sequence numbers.
+    order: Order,
+    /// Who sends each move, and what Cedar lets them send.
+    senders: Senders,
+    /// The entities whose moves' senders matter: those with a reaction that
+    /// runs as whoever sent its source action, which Cedar decides as them.
+    /// Elsewhere who armed a timer or answers a call changes nothing, so the
+    /// model does not tell them apart.
+    sender_matters: BTreeSet<String>,
+    /// Each entity's transitions (by index) that nothing in the model sends
+    /// and something in the runtime does, with who.
+    unsent: BTreeMap<String, Vec<(usize, Unsent)>>,
+}
+
+/// Who in the runtime sends an action nothing in the model sends.
+#[derive(Debug, Clone)]
+enum Unsent {
+    /// A module whose trigger names no `on_success`, while its call is open:
+    /// the kernel takes whatever action the module's result names, and the
+    /// model answers only with internal actions. Only for an action nothing
+    /// else sends.
+    Answer,
+    /// Reactions from these types, outside the scope.
+    Reactions(BTreeSet<String>),
+}
+
+impl Unsent {
+    fn sender(&self) -> String {
+        match self {
+            Unsent::Answer => "a module whose trigger names no on_success".to_string(),
+            Unsent::Reactions(from) => format!(
+                "a reaction from {}",
+                from.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+        }
+    }
 }
 
 impl JointModel {
+    /// The model of `owner`'s properties `reads` over `scope`. With `cut`,
+    /// each entity is cut down to what `reads` depends on, which only adds
+    /// behaviour.
     pub(super) fn new(
         by_name: &BTreeMap<&str, &Automaton>,
         scope: BTreeSet<String>,
         owner: &str,
-        invariants: &[&temper_spec::automaton::Invariant],
+        reads: &[&Expr],
+        sending: Sending<'_>,
+        cut: bool,
     ) -> Self {
-        // What the invariants read: the owner's variables and the id fields
+        // What the properties read: the owner's variables and the id fields
         // its references use, and the related types' fields.
         let mut read: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut owned = |entity: &str, field: &str| {
@@ -93,8 +179,8 @@ impl JointModel {
                     .insert(field.to_string());
             }
         };
-        for inv in invariants {
-            inv.assert.for_each_name(&mut |n| match n {
+        for expr in reads {
+            expr.for_each_name(&mut |n| match n {
                 Name::Var(var) => owned(owner, var),
                 Name::CrossStatus { id_field, .. } => owned(owner, id_field),
                 Name::CrossField {
@@ -105,14 +191,44 @@ impl JointModel {
                     owned(owner, id_field);
                     owned(entity_type, field);
                 }
-                Name::Status => {}
+                // A move's parameter is no field of a record.
+                Name::Status | Name::Param(_) => {}
             });
         }
+        let (mut models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
+        for ((entity, field), literals) in named_literals(owner, reads, &models, &reactions) {
+            if let Some(model) = models.get_mut(&entity) {
+                model
+                    .string_literals
+                    .entry(field)
+                    .or_default()
+                    .extend(literals);
+            }
+        }
+        Self::compose(by_name, scope, (models, reactions), &read, sending, cut)
+    }
+
+    /// The model of `models` and `reactions` over `scope`, one record per
+    /// id, its dispatches landing whenever. `read` is what its properties
+    /// read; with `cut`, each entity is cut down to that.
+    fn compose(
+        by_name: &BTreeMap<&str, &Automaton>,
+        scope: BTreeSet<String>,
+        (models, reactions): (BTreeMap<String, TemperModel>, Vec<Reaction>),
+        read: &BTreeMap<String, BTreeSet<String>>,
+        sending: Sending<'_>,
+        cut: bool,
+    ) -> Self {
         let mut id_literals = BTreeSet::new();
         for entity in &scope {
             let a = by_name[entity.as_str()];
             for inv in &a.invariants {
                 read::collect_literals(&inv.assert, &mut id_literals);
+            }
+            for live in &a.liveness {
+                if let Some(goal) = &live.eventually {
+                    read::collect_literals(goal, &mut id_literals);
+                }
             }
             for action in &a.actions {
                 read::collect_literals(&action.guard, &mut id_literals);
@@ -131,12 +247,69 @@ impl JointModel {
                 }
             }
         }
-        let (models, reactions) = tracked(by_name, &scope, read.clone(), Records::ById);
-        let models = models
+        let kernel = if sending.kernel_moves {
+            Kernel::read(by_name, &scope)
+        } else {
+            Kernel::default()
+        };
+        let senders = Senders::new(by_name, &scope, sending.policies);
+        let chosen = |entity: &str, action: &str| {
+            sending
+                .relies_on
+                .contains(&(entity.to_string(), action.to_string()))
+                || senders.may(OUTSIDE, entity, action) != May::No
+                || kernel.chooses(entity, action)
+        };
+        let order = Order::read(&Specs {
+            by_name,
+            models: &models,
+            reactions: &reactions,
+            read,
+            chosen: &chosen,
+        });
+        let models: BTreeMap<String, TemperModel> = models
             .into_iter()
             .map(|(entity, model)| {
-                let keep = read.get(&entity).cloned().unwrap_or_default();
-                (entity, slice(model, keep))
+                let mut keep = read.get(&entity).cloned().unwrap_or_default();
+                keep.extend(order.fields(&entity).map(|(field, _)| field.to_string()));
+                keep.extend(deciding(by_name[entity.as_str()], &reactions, &entity));
+                let mut model = if cut { slice(model, keep) } else { model };
+                order.bound(&entity, &mut model);
+                (entity, model)
+            })
+            .collect();
+        let unchecked = unchecked_constraints(by_name, &models, &order);
+        let sender_matters = reactions
+            .iter()
+            .filter(|r| r.principal.is_none())
+            .map(|r| r.from.clone())
+            .collect();
+        let into = reactions_into(by_name, &scope);
+        let open: BTreeSet<&String> = kernel
+            .calls_on
+            .iter()
+            .filter(|(_, specs)| specs.iter().any(|spec| spec.on_success.is_empty()))
+            .map(|((entity, _), _)| entity)
+            .collect();
+        let unsent = models
+            .iter()
+            .filter_map(|(entity, model)| {
+                let ways: Vec<(usize, Unsent)> = model
+                    .transitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        !chosen(entity, &t.name)
+                            && !reactions
+                                .iter()
+                                .any(|r| &r.to == entity && r.target_action == t.name)
+                    })
+                    .filter_map(|(i, t)| match into.get(&(entity.clone(), t.name.clone())) {
+                        Some(from) => Some((i, Unsent::Reactions(from.clone()))),
+                        None => open.contains(entity).then_some((i, Unsent::Answer)),
+                    })
+                    .collect();
+                (!ways.is_empty()).then(|| (entity.clone(), ways))
             })
             .collect();
         Self {
@@ -148,6 +321,37 @@ impl JointModel {
             refs: BTreeMap::new(),
             delivery: Delivery::Any,
             scope,
+            kernel_moves: sending.kernel_moves,
+            kernel,
+            relies_on: sending.relies_on,
+            unchecked,
+            order,
+            senders,
+            sender_matters,
+            unsent,
+        }
+    }
+
+    /// Note each move the runtime could make in `state` that the walk never
+    /// takes.
+    fn note_unwalked(&self, state: &JointState, unwalked: &mut BTreeSet<Unwalked>) {
+        for (entity, ways) in &self.unsent {
+            let open = state
+                .calls
+                .iter()
+                .any(|call| &call.to == entity && call.on_success.is_empty());
+            for (index, sender) in ways {
+                let t = &self.models[entity].transitions[*index];
+                if (open || !matches!(sender, Unsent::Answer))
+                    && self.enabled(entity, t, state, Blind::Nothing)
+                {
+                    unwalked.insert(Unwalked {
+                        action: format!("{entity}.{}", t.name),
+                        sender: sender.sender(),
+                        from: state.records[entity].status.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -186,7 +390,11 @@ impl JointModel {
         let mut state = JointState {
             records,
             inflight: Vec::new(),
+            calls: Vec::new(),
+            armed: BTreeMap::new(),
         };
+        self.arm_at_start(&mut state);
+        self.order.normalize(&mut state);
         let renamed = canonical(&mut state);
         for value in names.values_mut() {
             if let Some(new) = renamed.get(value) {
@@ -194,6 +402,25 @@ impl JointModel {
             }
         }
         (state, names)
+    }
+
+    /// A record that starts in a state with a timer was made by someone
+    /// outside, who armed it.
+    fn arm_at_start(&self, state: &mut JointState) {
+        for (entity, record) in &state.records {
+            if self.timeout(entity, &record.status).is_some() {
+                state.armed.insert(entity.clone(), OUTSIDE);
+            }
+        }
+    }
+
+    /// `entity`'s timer in `status`, when the model makes timers fire.
+    pub(super) fn timeout(&self, entity: &str, status: &str) -> Option<&Timeout> {
+        self.kernel
+            .timers
+            .get(entity)?
+            .iter()
+            .find(|timeout| timeout.state == status)
     }
 
     /// The strings `state` holds, in records and in dispatches.
@@ -207,6 +434,9 @@ impl JointModel {
                     values.insert(text.clone());
                 }
             }
+        }
+        for call in &state.calls {
+            values.extend(call.asked.values().filter(|v| !v.is_empty()).cloned());
         }
         values
     }
@@ -235,10 +465,11 @@ impl JointModel {
         state: &JointState,
         blind: Blind,
     ) -> bool {
-        let local = &state.records[entity];
-        let status_ok =
-            t.from_states.is_empty() || t.from_states.iter().any(|s| s == &local.status);
-        status_ok && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
+        // The rule the runtime takes for this action in the record's status
+        // (`rule_for`); another with the same name never fires from there.
+        let taken = rule_for(&self.models[entity], &t.name, &state.records[entity].status)
+            .is_some_and(|rule| std::ptr::eq(rule, t));
+        taken && eval(&t.guard, &self.env_blind(entity, state, blind)).may_hold()
     }
 
     pub(super) fn env<'a>(&'a self, owner: &'a str, state: &'a JointState) -> JointEnv<'a> {
@@ -260,193 +491,30 @@ impl JointModel {
             blind,
         }
     }
-
-    /// Walk every reachable joint state breadth first, checking `invariants`
-    /// of `owner` in each settled one (nothing in flight).
-    pub(super) fn walk(&self, owner: &str, invariants: &[&Expr], budget: Budget) -> Walk {
-        let mut unsupported = BTreeSet::new();
-        let modeled = |entity: &str, field: &str| {
-            self.models.get(entity).is_some_and(|model| {
-                matches!(field, "Id" | "id")
-                    || match model.var_kinds.get(field) {
-                        Some(temper_spec::predicate::VarKind::Str) => {
-                            model.tracked_strings.contains(field)
-                        }
-                        Some(
-                            temper_spec::predicate::VarKind::Counter
-                            | temper_spec::predicate::VarKind::Bool
-                            | temper_spec::predicate::VarKind::List,
-                        ) => true,
-                        _ => false,
-                    }
-            })
-        };
-        for inv in invariants {
-            inv.for_each_name(&mut |name| {
-                let mut check = |entity: &str, field: &str| {
-                    if !modeled(entity, field) {
-                        unsupported.insert(format!("{entity}.{field}"));
-                    }
-                };
-                match name {
-                    Name::Var(field) => check(owner, field),
-                    Name::CrossStatus { id_field, .. } => check(owner, id_field),
-                    Name::CrossField {
-                        entity_type,
-                        id_field,
-                        field,
-                    } => {
-                        check(owner, id_field);
-                        check(entity_type, field);
-                    }
-                    Name::Status => {}
-                }
-            });
-        }
-        for (entity, model) in &self.models {
-            if let Some((action, _)) = crate::model::semantics::oversized_transition(model) {
-                unsupported.insert(format!("{entity}.{action} parameter expansion"));
-            }
-        }
-        if !unsupported.is_empty() {
-            let reason = format!(
-                "unsupported reads or expansion: {}",
-                unsupported.into_iter().collect::<Vec<_>>().join(", ")
-            );
-            return Walk {
-                states: 0,
-                held_back: false,
-                outcomes: invariants
-                    .iter()
-                    .map(|_| JointOutcome::Incomplete {
-                        reason: reason.clone(),
-                    })
-                    .collect(),
-            };
-        }
-        let started = Instant::now();
-        self.expansion.reset(budget.states, Some(budget.time));
-        let mut nodes: Vec<(JointState, Option<(usize, String)>)> = Vec::new();
-        let mut seen: HashMap<JointState, usize> = HashMap::new();
-        let mut queue = VecDeque::new();
-        for init in self.inits() {
-            if !self.expansion.take() {
-                break;
-            }
-            if !seen.contains_key(&init) {
-                seen.insert(init.clone(), nodes.len());
-                queue.push_back(nodes.len());
-                nodes.push((init, None));
-            }
-        }
-        let mut unknown = vec![false; invariants.len()];
-        let mut broken: Vec<Option<usize>> = vec![None; invariants.len()];
-        let mut stopped = None;
-        let mut held_back = false;
-        while let Some(index) = queue.pop_front() {
-            if self.expansion.exhausted.get() {
-                stopped = Some("the walk exhausted its expansion budget".to_string());
-                break;
-            }
-            let state = nodes[index].0.clone();
-            if state.inflight.is_empty() {
-                let env = self.env(owner, &state);
-                for (i, inv) in invariants.iter().enumerate() {
-                    match eval(inv, &env) {
-                        Truth::False if broken[i].is_none() => broken[i] = Some(index),
-                        Truth::Unknown => unknown[i] = true,
-                        _ => {}
-                    }
-                }
-            }
-            if broken.iter().all(Option::is_some) {
-                break;
-            }
-            if nodes.len() >= budget.states || started.elapsed() >= budget.time {
-                stopped = Some(if nodes.len() >= budget.states {
-                    format!("the walk reached its {} states", budget.states)
-                } else {
-                    format!("the walk ran out of its {} s", budget.time.as_secs())
-                });
-                break;
-            }
-            for mv in self.moves(&state) {
-                if self.expansion.exhausted.get() {
-                    break;
-                }
-                let (nexts, held) = self.next(&state, &mv);
-                held_back |= held;
-                for next in nexts {
-                    if seen.contains_key(&next.state) {
-                        continue;
-                    }
-                    let at = nodes.len();
-                    seen.insert(next.state.clone(), at);
-                    nodes.push((next.state, Some((index, next.label))));
-                    queue.push_back(at);
-                }
-            }
-        }
-        if self.expansion.exhausted.get() {
-            stopped = Some("the walk exhausted its expansion budget".to_string());
-        }
-        let outcomes = broken
-            .iter()
-            .enumerate()
-            .map(|(i, found)| match found {
-                Some(index) => JointOutcome::Broken {
-                    path: path_to(&nodes, *index),
-                },
-                None if unknown[i] => JointOutcome::Incomplete {
-                    reason: "the assertion reads an unsupported or untracked value".to_string(),
-                },
-                None => match &stopped {
-                    Some(reason) => JointOutcome::Incomplete {
-                        reason: reason.clone(),
-                    },
-                    None => JointOutcome::Holds,
-                },
-            })
-            .collect();
-        Walk {
-            states: nodes.len(),
-            outcomes,
-            held_back,
-        }
-    }
 }
 
-/// Renumber new strings over the whole joint state, records first, then
-/// the dispatches in flight; returns each value's new name.
-fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelString> {
-    let mut dispatches = std::mem::take(&mut state.inflight);
-    let mut strings: Vec<BTreeMap<String, ModelString>> = dispatches
+/// The fields of an `entity` record that decide whether a move happens
+/// without being a guard: those a constraint compares a parameter with, and
+/// those the guard of a trigger it fires reads. A cut keeps them, so a
+/// record refusing a dispatch for a stale count, or a reaction it does not
+/// send, stays decided.
+fn deciding(automaton: &Automaton, reactions: &[Reaction], entity: &str) -> BTreeSet<String> {
+    let mut fields: BTreeSet<String> = automaton
+        .actions
         .iter()
-        .map(|d| {
-            d.params
-                .iter()
-                .filter_map(|(name, value)| match value {
-                    ParamValue::Str(text) => Some((name.clone(), text.clone())),
-                    _ => None,
-                })
-                .collect()
-        })
+        .flat_map(|action| &action.constraints)
+        .filter_map(|constraint| constraint.field().map(str::to_string))
         .collect();
-    let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, ModelString>> = state
-            .records
-            .values_mut()
-            .map(|s| &mut s.strings)
-            .chain(strings.iter_mut())
-            .collect();
-        canonical_strings(&mut maps)
-    };
-    for (dispatch, renamed_strings) in dispatches.iter_mut().zip(strings) {
-        for (name, text) in renamed_strings {
-            dispatch.params.insert(name, ParamValue::Str(text));
-        }
+    for guard in reactions
+        .iter()
+        .filter(|r| r.from == entity)
+        .filter_map(|r| r.guard.as_ref())
+    {
+        guard.for_each_name(&mut |name| {
+            if let Name::Var(var) = name {
+                fields.insert(var.to_string());
+            }
+        });
     }
-    dispatches.sort();
-    state.inflight = dispatches;
-    renamed
+    fields
 }
