@@ -114,7 +114,9 @@ impl PostgresEventStore {
     /// This keeps safe OData `$select` list reads from pulling the full
     /// `entity_catalog.state` and `entity_catalog.fields` JSONB payloads over
     /// the database boundary. The selected values are returned in the row's
-    /// `fields` object and `state` is intentionally omitted.
+    /// `fields` object and `state` is intentionally omitted. Selecting `fields`
+    /// restores the complete stored object with the same state-over-column
+    /// precedence as [`catalog_state_from_storage`].
     pub async fn load_selected_entity_catalog_rows_pg(
         &self,
         tenant: &str,
@@ -164,11 +166,16 @@ impl PostgresEventStore {
                             SELECT jsonb_object_agg(k.field_name, selected.value) \
                             FROM unnest($4::text[]) AS k(field_name) \
                             CROSS JOIN LATERAL ( \
-                                SELECT COALESCE( \
+                                SELECT CASE WHEN k.field_name = 'fields' THEN \
+                                    CASE WHEN jsonb_typeof(c.fields) = 'object' \
+                                              AND jsonb_typeof(c.state -> 'fields') = 'object' \
+                                         THEN c.fields || (c.state -> 'fields') \
+                                         ELSE COALESCE(c.state -> 'fields', c.fields) END \
+                                ELSE COALESCE( \
                                     c.state -> k.field_name, \
                                     c.state -> 'fields' -> k.field_name, \
                                     c.fields -> k.field_name \
-                                ) AS value \
+                                ) END AS value \
                             ) selected \
                             WHERE selected.value IS NOT NULL \
                         ), \

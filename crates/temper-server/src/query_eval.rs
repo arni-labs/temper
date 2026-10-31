@@ -551,6 +551,8 @@ async fn expand_entity_recursive(
     for (item, info) in &nav_infos {
         let Some(info) = info else { continue };
         let mut related_entities = Vec::new();
+        let defaults =
+            crate::odata::read_defaults::ReadDefaults::for_entity(state, tenant, &info.target_type);
 
         if info.is_collection
             && let Err(response) = crate::odata::authz::authorize_read(
@@ -580,7 +582,8 @@ async fn expand_entity_recursive(
                             .get_tenant_entity_state(tenant, &info.target_type, fk)
                             .await
                     {
-                        let json = serde_json::to_value(&response.state).unwrap_or_default();
+                        let mut json = serde_json::to_value(&response.state).unwrap_or_default();
+                        defaults.apply(&mut json);
                         related_entities.push(json);
                     }
                 }
@@ -593,7 +596,9 @@ async fn expand_entity_recursive(
                             .get_tenant_entity_state(tenant, &info.target_type, related_id)
                             .await
                         {
-                            let json = serde_json::to_value(&response.state).unwrap_or_default();
+                            let mut json =
+                                serde_json::to_value(&response.state).unwrap_or_default();
+                            defaults.apply(&mut json);
                             let matches = json
                                 .get("fields")
                                 .and_then(|f| f.get(target_fk_field.as_str()))
@@ -613,7 +618,9 @@ async fn expand_entity_recursive(
                             .get_tenant_entity_state(tenant, &info.target_type, related_id)
                             .await
                         {
-                            let json = serde_json::to_value(&response.state).unwrap_or_default();
+                            let mut json =
+                                serde_json::to_value(&response.state).unwrap_or_default();
+                            defaults.apply(&mut json);
                             if matches_parent_reference(&json, entity_type, parent_id) {
                                 related_entities.push(json);
                             }

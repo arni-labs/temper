@@ -242,7 +242,12 @@ pub(super) async fn load_existing_entity_descriptor_body(
     state
         .get_tenant_entity_state(tenant, entity_type, key)
         .await
-        .map(|response| serde_json::to_value(&response.state).unwrap_or_default())
+        .map(|response| {
+            let mut body = serde_json::to_value(&response.state).unwrap_or_default();
+            super::read_defaults::ReadDefaults::for_entity(state, tenant, entity_type)
+                .apply(&mut body);
+            body
+        })
         .map_err(|_| resource_not_found_response(set_name, key))
 }
 
@@ -920,7 +925,7 @@ async fn handle_entity(
             Ok(Some(state_bytes)) => {
                 let actor_state: temper_actor_runtime::spec_actor::SpecActorState =
                     serde_json::from_slice(&state_bytes).unwrap_or_default();
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "entity_type": entity_type,
                     "entity_id": key_str,
                     "status": actor_state.status,
@@ -931,6 +936,8 @@ async fn handle_entity(
                     "@odata.context": format!("$metadata#{set_name}/$entity"),
                     "@odata.id": format!("{set_name}('{key_str}')"),
                 });
+                super::read_defaults::ReadDefaults::for_entity(state, tenant, &entity_type)
+                    .apply(&mut body);
                 if let Err(response) = authorize_read(
                     state,
                     tenant,
