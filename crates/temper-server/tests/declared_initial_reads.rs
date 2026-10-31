@@ -1,4 +1,6 @@
 //! A spec's new declarations must read the same before and during a move.
+#[path = "declared_initial_reads/postgres.rs"]
+mod postgres;
 use axum::{
     body::Body,
     http::{Request, StatusCode},

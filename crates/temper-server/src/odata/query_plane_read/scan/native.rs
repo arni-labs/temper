@@ -94,32 +94,39 @@ pub(in crate::odata::query_plane_read) fn native_candidate_page_plan(
     )
     .field_values(&serde_json::Value::Null);
     let order_by = native_order_by(request)?;
-    let (where_clause, params, filter_pushdown, filter_exact) = match query_options.filter.as_ref()
-    {
-        Some(filter) => {
-            if let Some(translated) =
-                filter_sql::try_translate_candidate_filter_with_defaults(filter, &defaults)
-            {
-                // Missing index entries include omitted/oversized stored fields.
-                // Recheck candidates before counting or applying skip/top.
-                (
-                    translated.where_clause,
-                    translated.params,
-                    true,
-                    !translated.includes_missing_defaults,
-                )
-            } else {
-                ("TRUE".to_string(), Vec::new(), false, false)
+    let (where_clause, params, filter_pushdown, filter_missing_fields) =
+        match query_options.filter.as_ref() {
+            Some(filter) => {
+                if let Some(translated) =
+                    filter_sql::try_translate_candidate_filter_with_defaults(filter, &defaults)
+                {
+                    // Missing index entries include omitted/oversized stored fields.
+                    // Recheck candidates before counting or applying skip/top.
+                    (
+                        translated.where_clause,
+                        translated.params,
+                        true,
+                        translated
+                            .missing_default_fields
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    ("TRUE".to_string(), Vec::new(), false, Vec::new())
+                }
             }
-        }
-        None => ("TRUE".to_string(), Vec::new(), false, false),
-    };
+            None => ("TRUE".to_string(), Vec::new(), false, Vec::new()),
+        };
     Some(NativeCandidatePagePlan {
         where_clause,
         params,
         order_by,
         filter_pushdown,
-        filter_exact,
+        filter_exact: query_options
+            .filter
+            .as_ref()
+            .is_some_and(filter_sql::candidate_filter_is_lossless),
+        filter_missing_fields,
     })
 }
 
@@ -155,29 +162,18 @@ async fn try_query_native_page(
         })
 }
 
-/// Keep indexed sorting when every candidate has its sort values. A missing
-/// index entry needs materialization to distinguish a declared default from
-/// an oversized or otherwise unindexed stored value.
-async fn native_sort_values_present(
+/// A bounded probe distinguishes a complete index from candidates that need
+/// materialization for defaults or oversized stored values. Both filter counts
+/// and sorting may use their native paths only when their values are present.
+async fn native_values_present(
     request: &QueryPlaneReadRequest<'_>,
     plan: &NativeCandidatePagePlan,
+    fields: &[String],
 ) -> Option<bool> {
-    if plan.order_by.is_empty() {
-        return Some(true);
-    }
-    let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
-        request.state,
-        request.tenant,
-        request.entity_type,
-    )
-    .field_values(&serde_json::Value::Null);
-    for clause in &plan.order_by {
-        if defaults.get(&clause.field_name).is_none() {
-            continue;
-        }
+    for field in fields {
         let mut probe = plan.clone();
         let field_param = probe.params.len() + 3;
-        probe.params.push(clause.field_name.clone());
+        probe.params.push(field.clone());
         probe.where_clause = format!(
             "({}) AND entity_id NOT IN (SELECT entity_id FROM entity_field_index \
              WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?{field_param})",
@@ -279,7 +275,7 @@ async fn try_uniform_native_page(
 
 pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     request: &QueryPlaneReadRequest<'_>,
-    plan: NativeCandidatePagePlan,
+    mut plan: NativeCandidatePagePlan,
     coverage: QueryPlaneCoverageReport,
 ) -> Option<Result<CandidateScanResult, QueryPlaneReadError>> {
     let requested_top = request.budget.requested_top(request.query_options);
@@ -307,8 +303,26 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     }
 
     let authz = decide_row_authz(request);
-    if !matches!(authz, RowAuthz::DenyAll) && !native_sort_values_present(request, &plan).await? {
-        return None;
+    if !matches!(authz, RowAuthz::DenyAll) {
+        let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
+            request.state,
+            request.tenant,
+            request.entity_type,
+        )
+        .field_values(&serde_json::Value::Null);
+        let sort_fields = plan
+            .order_by
+            .iter()
+            .filter(|clause| defaults.get(&clause.field_name).is_some())
+            .map(|clause| clause.field_name.clone())
+            .collect::<Vec<_>>();
+        if !native_values_present(request, &plan, &sort_fields).await? {
+            return None;
+        }
+        if plan.filter_exact && !plan.filter_missing_fields.is_empty() {
+            plan.filter_exact =
+                native_values_present(request, &plan, &plan.filter_missing_fields).await?;
+        }
     }
     if let Some(result) = try_uniform_native_page(
         request,

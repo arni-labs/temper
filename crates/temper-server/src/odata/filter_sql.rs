@@ -12,6 +12,8 @@
 //! The translator returns `None` for expressions it cannot handle, signalling
 //! the caller to fall back to the existing in-memory filter path.
 
+use std::collections::BTreeSet;
+
 use temper_odata::query::types::{BinaryOperator, FilterExpr, ODataValue, UnaryOperator};
 
 const MAX_INDEXABLE_FIELD_VALUE_BYTES: usize = 2000;
@@ -23,7 +25,7 @@ pub(super) struct TranslatedFilter {
     /// Ordered parameter values corresponding to `?3`, `?4`, etc.
     pub params: Vec<String>,
     /// Missing index entries may be stored values the index deliberately omitted.
-    pub includes_missing_defaults: bool,
+    pub missing_default_fields: BTreeSet<String>,
 }
 
 /// Try to translate an OData filter expression into a SQL WHERE clause.
@@ -37,13 +39,13 @@ pub(super) fn try_translate_filter(filter: &FilterExpr) -> Option<TranslatedFilt
         params: Vec::new(),
         next_param: 3, // ?1 = tenant, ?2 = entity_type (prepended by query_field_index)
         defaults: serde_json::json!({}),
-        includes_missing_defaults: false,
+        missing_default_fields: BTreeSet::new(),
     };
     let clause = translate_expr(filter, &mut ctx)?;
     Some(TranslatedFilter {
         where_clause: clause,
         params: ctx.params,
-        includes_missing_defaults: ctx.includes_missing_defaults,
+        missing_default_fields: ctx.missing_default_fields,
     })
 }
 
@@ -68,13 +70,13 @@ pub(super) fn try_translate_candidate_filter_with_defaults(
         params: Vec::new(),
         next_param: 3, // ?1 = tenant, ?2 = entity_type (prepended by query_field_index)
         defaults: defaults.clone(),
-        includes_missing_defaults: false,
+        missing_default_fields: BTreeSet::new(),
     };
     let clause = translate_candidate_expr(filter, &mut ctx)?;
     Some(TranslatedFilter {
         where_clause: clause,
         params: ctx.params,
-        includes_missing_defaults: ctx.includes_missing_defaults,
+        missing_default_fields: ctx.missing_default_fields,
     })
 }
 
@@ -149,7 +151,7 @@ fn collect_equality_field_predicates(
 
 struct TranslateCtx {
     defaults: serde_json::Value,
-    includes_missing_defaults: bool,
+    missing_default_fields: BTreeSet<String>,
     params: Vec<String>,
     next_param: usize,
 }
@@ -329,6 +331,9 @@ fn translate_comparison(
                 _ => false,
             });
     let text_value = odata_value_to_text(value)?;
+    if missing_may_match {
+        ctx.missing_default_fields.insert(field_name.clone());
+    }
     let field_param = ctx.add_param(field_name);
     let value_param = ctx.add_param(text_value);
 
@@ -338,7 +343,6 @@ fn translate_comparison(
          AND field_name = {field_param} AND field_value {sql_op} {value_param})"
     );
     if missing_may_match {
-        ctx.includes_missing_defaults = true;
         Some(format!(
             "({predicate} OR entity_id NOT IN (SELECT entity_id FROM entity_field_index \
             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = {field_param}))"
@@ -352,7 +356,8 @@ fn is_status_property(field_name: &str) -> bool {
     field_name == "Status" || field_name == "status"
 }
 
-fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
+/// Whether SQL represents every term of the filter, before resolving index gaps.
+pub(super) fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
     match expr {
         FilterExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
