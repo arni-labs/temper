@@ -131,6 +131,17 @@ fn a_cup_sent_back_that_can_never_be_made_again_breaks_the_rule() {
     );
 }
 
+/// When L1 fails, its failures are the whole answer: the note that the same
+/// cup can never reach what another on the line can is not shown with them.
+#[test]
+fn a_failed_check_shows_only_its_failures() {
+    let l1 = model_check(&format!("{CUP}{CAN_BE_MADE}"));
+    assert_eq!(
+        l1.summary,
+        "L1 Model Check FAILED: 7 states explored, 1 counterexample(s)"
+    );
+}
+
 /// Sent back to be made again, the cup keeps its barista and can always
 /// still be made.
 #[test]
