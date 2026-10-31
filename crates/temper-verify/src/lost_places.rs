@@ -11,8 +11,11 @@
 //!
 //! A state with a step past a counter's bound somewhere ahead is not named:
 //! what lies past the bound was not walked, so what it can reach is not known.
-//! A loss is named in the place where a move made it, not again in each place
-//! the record passes through after it.
+//! A move's loss is named at the first comparable record after it, not again
+//! in each place the record passes through. An intermediate place without a
+//! comparison peer, or a retry cycle, must not hide that move's loss.
+
+mod origins;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -26,7 +29,7 @@ pub struct LostPlace {
     pub place: String,
     /// The places the record can never reach.
     pub lost: Vec<String>,
-    /// The record, at the shortest path to where it lost them.
+    /// The record, at the shortest path to where its loss can be compared.
     pub record: TemperModelState,
     /// The moves to it from the start.
     pub path: Vec<String>,
@@ -107,23 +110,7 @@ pub(crate) fn lost_places(
         }
     }
 
-    // A loss is made by a move from a state that could still reach some of
-    // it, or is there from the start.
-    let mut made_here: BTreeSet<usize> = lost
-        .keys()
-        .copied()
-        .filter(|&at| graph.parent[at].is_none())
-        .collect();
-    for from in 0..n {
-        for &to in graph.steps(from) {
-            let to = to as usize;
-            if let Some(row) = lost.get(&to)
-                && reach_of(from).iter().zip(row).any(|(r, l)| r & l != 0)
-            {
-                made_here.insert(to);
-            }
-        }
-    }
+    let made_here = origins::first_comparable(graph, reach, &lost);
 
     // One finding per place and set of places lost, with its shortest
     // record and the other record in its place that reaches the most of them.

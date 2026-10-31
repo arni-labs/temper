@@ -132,9 +132,11 @@ impl Bits {
 /// them, and whether a step past a bound lies ahead of it.
 pub(crate) struct Reach {
     pub(crate) bits: Bits,
-    component: Vec<u32>,
-    places: Vec<u64>,
+    pub(crate) component: Vec<u32>,
+    pub(crate) places: Vec<u64>,
     past_bound: Vec<bool>,
+    pub(crate) first: Vec<usize>,
+    pub(crate) members: Vec<usize>,
 }
 
 impl Reach {
@@ -192,6 +194,8 @@ impl Reach {
             component,
             places,
             past_bound,
+            first,
+            members,
         })
     }
 

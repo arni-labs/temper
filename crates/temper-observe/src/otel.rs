@@ -51,6 +51,7 @@ use tracing_subscriber::prelude::*;
 mod config;
 mod log_bridge;
 mod log_time;
+mod retry;
 mod sampler;
 mod settings;
 
@@ -60,6 +61,7 @@ use config::{
 };
 use log_bridge::log_bridge;
 use log_time::EventTimeLogProcessor;
+use retry::{Closing, Retrying, build_with_retry};
 use sampler::{
     DISPATCH_BACKGROUND_SAMPLE_RATE_DEFAULT, NameBasedSampler, TraceSamplerConfig,
     WASM_AUXILIARY_SAMPLE_RATE_DEFAULT, record_trace_sampler_config,
@@ -70,8 +72,6 @@ use settings::{ComputedAttributes, ExportSettings};
 /// `opentelemetry-otlp`'s default, which turns to JSON whenever any crate built
 /// alongside this one enables that crate's `http-json` feature.
 const OTEL_EXPORT_PROTOCOL: Protocol = Protocol::HttpBinary;
-const OTEL_EXPORTER_BUILD_RETRY_ATTEMPTS: usize = 3;
-const OTEL_EXPORTER_RETRY_BASE_DELAY_MS: u64 = 250;
 const TRACE_BATCH_MAX_QUEUE_SIZE: usize = 2_048;
 const TRACE_BATCH_MAX_EXPORT_BATCH_SIZE: usize = 512;
 const TRACE_BATCH_SCHEDULE_DELAY_MS: u64 = 1_000;
@@ -103,38 +103,6 @@ pub fn runtime_id() -> &'static str {
         .as_str()
 }
 
-fn build_with_retry<T, E, F>(component: &str, mut build: F) -> Result<T, Box<dyn std::error::Error>>
-where
-    E: std::error::Error + 'static,
-    F: FnMut() -> Result<T, E>,
-{
-    let mut last_err: Option<Box<dyn std::error::Error>> = None;
-
-    for attempt in 1..=OTEL_EXPORTER_BUILD_RETRY_ATTEMPTS {
-        match build() {
-            Ok(exporter) => return Ok(exporter),
-            Err(err) => {
-                eprintln!(
-                    "OTEL {component} init failed (attempt {attempt}/{OTEL_EXPORTER_BUILD_RETRY_ATTEMPTS}): {err}"
-                );
-                last_err = Some(Box::new(err));
-                if attempt < OTEL_EXPORTER_BUILD_RETRY_ATTEMPTS {
-                    let backoff_ms = OTEL_EXPORTER_RETRY_BASE_DELAY_MS * attempt as u64;
-                    // Blocking sleep is intentional: this runs once at startup
-                    // before the async runtime is accepting work.
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                }
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        Box::new(std::io::Error::other(format!(
-            "OTEL {component} init failed without a concrete error",
-        )))
-    }))
-}
-
 /// Guard returned by [`init_tracing`].  Holds provider handles so the
 /// caller can [`shutdown`](OtelGuard::shutdown) cleanly before exit.
 ///
@@ -145,14 +113,17 @@ where
 /// ships inside another embodiment (Tamago, future services), that
 /// binary sets its own `DD_SERVICE`.
 pub struct OtelGuard {
+    closing: Closing,
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
     logger_provider: SdkLoggerProvider,
 }
 
 impl OtelGuard {
-    /// Flush pending telemetry and shut down all providers.
+    /// Flush pending telemetry and shut down all providers. A batch that
+    /// fails from here on is sent once, not again.
     pub fn shutdown(self) {
+        self.closing.close();
         if let Err(e) = self.tracer_provider.shutdown() {
             eprintln!("tracer provider shutdown error: {e}");
         }
@@ -297,6 +268,7 @@ fn init_pipeline(
     // A signal switched off keeps its provider and gets no exporter, so the
     // rest of the process sees the same tracer, meter and logger either way.
     let signals = settings.signals();
+    let closing = Closing::default();
 
     // --- Traces ---
     // ADR-0052 hygiene: drop known-noisy span names at ingestion.
@@ -325,9 +297,10 @@ fn init_pipeline(
             .with_scheduled_delay(Duration::from_millis(TRACE_BATCH_SCHEDULE_DELAY_MS))
             .build();
 
-        let trace_batch_processor = BatchSpanProcessor::builder(span_exporter)
-            .with_batch_config(trace_batch_config)
-            .build();
+        let trace_batch_processor =
+            BatchSpanProcessor::builder(Retrying::new(span_exporter, &closing))
+                .with_batch_config(trace_batch_config)
+                .build();
         tracer_builder = tracer_builder.with_span_processor(trace_batch_processor);
     }
     let tracer_provider = tracer_builder.build();
@@ -374,7 +347,7 @@ fn init_pipeline(
             .with_scheduled_delay(Duration::from_millis(LOG_BATCH_SCHEDULE_DELAY_MS))
             .build();
 
-        let log_batch_processor = BatchLogProcessor::builder(log_exporter)
+        let log_batch_processor = BatchLogProcessor::builder(Retrying::new(log_exporter, &closing))
             .with_batch_config(log_batch_config)
             .build();
         logger_builder = logger_builder
@@ -454,6 +427,7 @@ fn init_pipeline(
     );
 
     Ok(OtelGuard {
+        closing,
         tracer_provider,
         meter_provider,
         logger_provider,
