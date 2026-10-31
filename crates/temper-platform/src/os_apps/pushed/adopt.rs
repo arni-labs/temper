@@ -29,7 +29,13 @@ use crate::os_apps::{DirApps, add_tenant_os_apps_dir, catalog};
 use crate::state::PlatformState;
 
 /// Make the version of `app` that `tenant` resolves now its first pushed
-/// version, when it has none. Returns the adopted digest, or `None` when the
+/// version, when it has none.
+///
+/// Boot calls this only after the version installed: one that did not
+/// install was not served, so it is not adopted. Nothing goes empty that way:
+/// a boot install that fails leaves the specs stored in the database serving,
+/// and Katagami's control plane then sends that commit through the install
+/// route, where a refusal changes nothing. Returns the adopted digest, or `None` when the
 /// app already has a pushed version or no files to adopt.
 ///
 /// Every file under the app's directory is copied, as the installer may read
