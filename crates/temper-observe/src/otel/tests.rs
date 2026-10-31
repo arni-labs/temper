@@ -2,9 +2,13 @@ use super::config::{LOGFIRE_ENDPOINT, resolve_otel_config};
 use super::sampler::{DISPATCH_BACKGROUND_PREFIXES, WASM_AUXILIARY_PREFIXES};
 use super::*;
 
-use opentelemetry::trace::{SamplingDecision, SpanKind, TraceId};
-use opentelemetry_sdk::trace::{Sampler, ShouldSample};
-use std::sync::Mutex;
+use super::retry::{Closing, Retrying};
+use futures::future::BoxFuture;
+use opentelemetry::trace::{SamplingDecision, Span as _, SpanKind, TraceId, Tracer as _};
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+use opentelemetry_sdk::trace::{Sampler, ShouldSample, SpanData};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 const TEST_ENV_VARS: [&str; 5] = [
@@ -285,4 +289,39 @@ fn reduced_sample_prefixes_never_trim_a_span_inside_a_trace() {
             );
         }
     }
+}
+
+/// An exporter whose every send fails, as when the collector's end resets
+/// the connection, counting the sends.
+#[derive(Debug)]
+struct Unreachable(Arc<AtomicUsize>);
+
+impl opentelemetry_sdk::trace::SpanExporter for Unreachable {
+    fn export(&mut self, _batch: Vec<SpanData>) -> BoxFuture<'static, OTelSdkResult> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let reset = OTelSdkError::InternalFailure("Connection reset by peer".to_string());
+        Box::pin(std::future::ready(Err(reset)))
+    }
+}
+
+/// A stopping server sends a batch that fails once: sending it again would
+/// hold up its exit.
+#[test]
+fn a_batch_that_fails_during_shutdown_is_sent_once() {
+    const QUICK: [Duration; 4] = [Duration::from_millis(10); 4];
+    let sends = Arc::new(AtomicUsize::new(0));
+    let closing = Closing::default();
+    let exporter = Retrying::with_delays(Unreachable(Arc::clone(&sends)), &closing, &QUICK);
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_span_processor(BatchSpanProcessor::builder(exporter).build())
+        .build();
+    tracer_provider.tracer("test").start("test.stopping").end();
+    let guard = OtelGuard {
+        closing,
+        tracer_provider,
+        meter_provider: SdkMeterProvider::builder().build(),
+        logger_provider: SdkLoggerProvider::builder().build(),
+    };
+    guard.shutdown();
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
