@@ -18,6 +18,7 @@ mod entry;
 mod expansion;
 mod parameters;
 pub mod semantics;
+mod silent;
 mod stateright_impl;
 mod string;
 mod strings;

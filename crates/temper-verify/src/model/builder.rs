@@ -216,7 +216,7 @@ fn resolve_transitions(
                 .effects
                 .into_iter()
                 .filter_map(convert_effect)
-                .filter(|effect| holds_written(effect, read))
+                .filter(|effect| holds_written(effect, read, tracked_strings))
                 .collect();
             let mut params = effect_params(&effects);
             if !automaton.entry_rules.is_empty() {
@@ -388,11 +388,15 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
     })
 }
 
-/// Whether the model holds the field `effect` writes: a string (tracked or
-/// not, decided by the string rules) or a field in `read`.
-fn holds_written(effect: &ModelEffect, read: &BTreeSet<String>) -> bool {
+/// Whether the model holds the field `effect` writes: a tracked string
+/// (applying a write to any other is a no-op) or a field in `read`.
+fn holds_written(
+    effect: &ModelEffect,
+    read: &BTreeSet<String>,
+    tracked_strings: &BTreeSet<String>,
+) -> bool {
     match effect {
-        ModelEffect::SetString { .. } => true,
+        ModelEffect::SetString { var, .. } => tracked_strings.contains(var),
         ModelEffect::SetCounter { var, .. }
         | ModelEffect::AddCounter { var, .. }
         | ModelEffect::SubCounter { var, .. }

@@ -224,6 +224,34 @@ async fn validate_ioa_keeps_a_passing_verdict_for_a_change_no_level_reads() {
     );
 }
 
+/// A move that stays in place, has no guard and writes a field no rule
+/// reads keeps the note's verdict; one from a place the note never reaches
+/// keeps its digest, but its own check refuses it, so it is checked.
+#[tokio::test]
+async fn validate_ioa_keeps_a_verdict_for_a_silent_move_only_where_it_stands() {
+    let state = test_state_with_registry();
+    let note = NOTE.replace(
+        "states = [\"Open\", \"Closed\"]",
+        "states = [\"Open\", \"Closed\", \"Gone\"]",
+    );
+    assert_ne!(note, NOTE);
+    let remark = |from: &str| {
+        format!(
+            "{note}\n[[state]]\nname = \"memo\"\ntype = \"string\"\ninitial = \"\"\n\n[[action]]\nname = \"Remark\"\nkind = \"input\"\nfrom = [\"{from}\"]\nparams = [{{ name = \"memo\", type = \"string\" }}]\n"
+        )
+    };
+    let checked = validate(&state, &note).await;
+    assert_eq!(checked["all_passed"], true, "{checked}");
+
+    let kept = validate(&state, &remark("Open")).await;
+    assert_eq!(kept["all_passed"], true, "{kept}");
+    assert!(kept["kept"].is_string(), "a silent move keeps it: {kept}");
+
+    let dead = validate(&state, &remark("Gone")).await;
+    assert_eq!(dead["all_passed"], false, "{dead}");
+    assert!(dead.get("kept").is_none(), "{dead}");
+}
+
 #[tokio::test]
 async fn validate_ioa_checks_a_failing_spec_again() {
     let state = test_state_with_registry();

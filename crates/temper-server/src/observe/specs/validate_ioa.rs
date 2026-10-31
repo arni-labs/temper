@@ -104,9 +104,9 @@ pub(crate) async fn handle_validate_ioa(
             .with_prop_test_cases(prop_test_cases)
             .with_budget(budget)
     };
-    let digest = kept::digest(check.clone()).await;
-    let kept_result = match &digest {
-        Some(digest) => kept::kept(&state, digest).await,
+    let key = kept::key(check.clone()).await;
+    let kept_result = match &key {
+        Some(key) => kept::kept(&state, key).await,
         None => None,
     };
     let result = match kept_result {
@@ -120,8 +120,8 @@ pub(crate) async fn handle_validate_ioa(
                         format!("verification worker failed: {error}"),
                     )
                 })?;
-            if let Some(digest) = &digest {
-                kept::keep(&state, digest, &result).await;
+            if let Some(key) = &key {
+                kept::keep(&state, &key.digest, &result).await;
             }
             result
         }
