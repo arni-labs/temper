@@ -36,7 +36,7 @@ impl Expansion {
         use std::sync::atomic::Ordering;
         if let Some(limit) = &self.limit
             && !limit.lifted.load(Ordering::Relaxed)
-            && (limit.past_time()
+            && (limit.elapsed.wall() >= limit.time
                 || limit
                     .work
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))

@@ -53,6 +53,10 @@ impl Elapsed {
         }
     }
 
+    pub(crate) fn wall(&self) -> Duration {
+        self.started.elapsed()
+    }
+
     /// The time since the budget started. Reading a [`Clock::Steps`] moves
     /// it on by one step.
     pub(crate) fn now(&self) -> Duration {

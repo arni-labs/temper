@@ -343,7 +343,7 @@ impl TemperModel {
     pub fn out_of_time(&self) -> bool {
         self.limit.as_ref().is_some_and(|limit| {
             !limit.lifted.load(Ordering::Relaxed)
-                && (limit.past_time() || limit.exhausted.load(Ordering::Relaxed))
+                && (limit.elapsed.wall() >= limit.time || limit.exhausted.load(Ordering::Relaxed))
         })
     }
 }
