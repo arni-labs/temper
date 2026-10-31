@@ -13,7 +13,9 @@
 
 pub mod builder;
 mod count_bounds;
+mod entry;
 mod expansion;
+mod parameters;
 pub mod semantics;
 mod stateright_impl;
 mod string;
@@ -21,9 +23,11 @@ mod strings;
 pub mod types;
 
 pub use builder::{build_model_from_automaton, build_model_from_ioa, build_model_tracking};
-pub(crate) use stateright_impl::REACHES_TERMINAL;
+pub(crate) use entry::{broken_by_action, entry_broken};
+pub(crate) use stateright_impl::{ENTRY_RULES, REACHES_TERMINAL};
 pub(crate) use types::ExploreLimit;
 pub use types::{
-    LivenessKind, ModelEffect, ModelString, ParamValue, ResolvedInvariant, ResolvedLiveness,
-    ResolvedTransition, StringParam, TemperModel, TemperModelAction, TemperModelState,
+    LivenessKind, ModelEffect, ModelString, ParamValue, ResolvedEntryRule, ResolvedInvariant,
+    ResolvedLiveness, ResolvedTransition, StringParam, TemperModel, TemperModelAction,
+    TemperModelState,
 };

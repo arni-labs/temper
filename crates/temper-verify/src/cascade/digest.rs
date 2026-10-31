@@ -59,7 +59,11 @@ impl VerificationCascade {
 /// first-use order.
 fn related_types(model: &TemperModel) -> Vec<String> {
     let guards = model.transitions.iter().map(|t| &t.guard);
-    let rules = model.invariants.iter().map(|i| &i.assert);
+    let rules = model
+        .invariants
+        .iter()
+        .map(|i| &i.assert)
+        .chain(model.entry_rules.iter().map(|rule| &rule.assert));
     let mut types: Vec<String> = Vec::new();
     for (entity_type, _) in guards.chain(rules).flat_map(|expr| expr.related_types()) {
         if !types.contains(&entity_type) {

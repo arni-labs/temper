@@ -9,8 +9,8 @@ use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
 
 use crate::lost_places::{Graph, LostPlace, lost_places};
-use crate::model::ResolvedTransition;
 use crate::model::semantics::{successors_noting_cuts, truth};
+use crate::model::{ENTRY_RULES, ResolvedTransition, entry_broken};
 use crate::model::{TemperModel, TemperModelAction, TemperModelState};
 
 /// A counterexample discovered during model checking.
@@ -19,7 +19,8 @@ pub struct Counterexample {
     /// The property name that was violated.
     pub property: String,
     /// What is false in the trace's last state: for `Invariants`, the names
-    /// of the invariants false there; for any other property, its name.
+    /// of the invariants false there; for `EntryRules`, the rule its last
+    /// move breaks; for any other property, its name.
     #[serde(default)]
     pub violated: Vec<String>,
     /// The sequence of (state, action) pairs leading to the violation: each
@@ -97,7 +98,7 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         if cut_by_time && property_name == crate::model::REACHES_TERMINAL {
             continue;
         }
-        let trace = first_break(&walked, property_name, path.into_vec());
+        let mut trace = first_break(&walked, property_name, path.into_vec());
         let violated = match trace.last() {
             Some((state, _)) if property_name == "Invariants" => walked
                 .invariants
@@ -105,6 +106,17 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
                 .filter(|inv| truth(&inv.assert, &walked.var_kinds, state) == Truth::False)
                 .map(|inv| inv.name.clone())
                 .collect(),
+            Some((state, _)) if property_name == ENTRY_RULES => {
+                match entry_broken(&walked, state) {
+                    Some(broken) => {
+                        trace.last_mut().expect("entry-rule path has a pre-state").1 =
+                            Some(broken.action);
+                        trace.push((broken.after, None));
+                        vec![broken.rule.name.clone()]
+                    }
+                    None => vec![property_name.to_string()],
+                }
+            }
             _ => vec![property_name.to_string()],
         };
         counterexamples.push(Counterexample {
