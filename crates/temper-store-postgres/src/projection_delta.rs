@@ -75,6 +75,32 @@ pub(crate) async fn mark_snapshot(
     .execute(&mut **tx)
     .await
     .map_err(storage_error)?;
+    // READ COMMITTED takes a new snapshot for this statement. The insert can
+    // wait for a projection to retire the old mark, then recreate it using
+    // coverage from before that projection committed. Recheck after owning the
+    // mark, without locking the catalog (writers lock it before the mark).
+    // Preserve newer commits, terminal rows and projections the index cannot
+    // vouch for, just as `applied` and the backfill do.
+    crate::dbm::postgres_query!(
+        schema,
+        "DELETE FROM {schema}entity_projection_delta m \
+         WHERE m.tenant = $1 AND m.entity_type = $2 AND m.entity_id = $3 \
+           AND m.sequence_nr <= $4 AND NOT m.terminal \
+           AND EXISTS (SELECT 1 FROM {schema}entity_catalog c \
+               WHERE c.tenant = m.tenant AND c.entity_type = m.entity_type \
+                 AND c.entity_id = m.entity_id AND c.sequence_nr >= m.sequence_nr \
+                 AND jsonb_typeof(c.fields -> 'fields') IS DISTINCT FROM 'object') \
+           AND EXISTS (SELECT 1 FROM {schema}entity_field_index f \
+               WHERE f.tenant = m.tenant AND f.entity_type = m.entity_type \
+                 AND f.entity_id = m.entity_id)",
+    )
+    .bind(tenant)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(stored_sequence(sequence_nr))
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_error)?;
     Ok(())
 }
 

@@ -397,3 +397,5 @@ fn projection_delta_never_resurrects_a_tombstone_or_scans_deleted_rows() {
         drop_schema(&pool, &schema).await;
     });
 }
+
+mod snapshot;
