@@ -58,12 +58,33 @@ impl ServerState {
         body: &[u8],
         ttl: Option<Duration>,
     ) -> Result<(), String> {
-        if key.starts_with(super::KERNEL_BLOB_PREFIX) {
+        if super::kernel_owns(key) {
             return Err(format!(
-                "'{key}' is under {}, which holds the kernel's own records; nothing was written",
-                super::KERNEL_BLOB_PREFIX
+                "'{key}' is a key the kernel keeps its own records under; nothing was written"
             ));
         }
+        self.write_blob_object(tenant, key, body, ttl).await
+    }
+
+    /// Write one of the kernel's own blobs ([`super::kernel_owns`]), such as
+    /// a module's bytes.
+    pub(crate) async fn put_kernel_blob_object(
+        &self,
+        tenant: &TenantId,
+        key: &str,
+        body: &[u8],
+    ) -> Result<(), String> {
+        assert!(super::kernel_owns(key), "'{key}' is not a kernel key");
+        self.write_blob_object(tenant, key, body, None).await
+    }
+
+    async fn write_blob_object(
+        &self,
+        tenant: &TenantId,
+        key: &str,
+        body: &[u8],
+        ttl: Option<Duration>,
+    ) -> Result<(), String> {
         let store = self.blob_store_for_tenant(tenant)?;
         store.put_if_absent(key, body, ttl).await?;
         self.put_metadata_blob_shadow(tenant, key, body, ttl).await

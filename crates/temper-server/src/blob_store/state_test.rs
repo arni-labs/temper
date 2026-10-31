@@ -50,17 +50,18 @@ async fn a_caller_s_blob_is_never_written_under_the_kernel_s_own_keys() {
     let tenant = TenantId::new("tenant-a");
     let forged = br#"{"all_passed":true}"#;
 
-    let refused = state
-        .put_blob_object(&tenant, "kernel/check-verdict/abc", forged, None)
-        .await;
-    assert!(refused.is_err(), "{refused:?}");
-    assert_eq!(
-        state
-            .get_blob_with_legacy_fallback(&tenant, "kernel/check-verdict/abc")
-            .await
-            .expect("read"),
-        None
-    );
+    for key in ["kernel/check-verdict/abc", "wasm-modules/abc"] {
+        let refused = state.put_blob_object(&tenant, key, forged, None).await;
+        assert!(refused.is_err(), "{key}: {refused:?}");
+        assert_eq!(
+            state
+                .get_blob_with_legacy_fallback(&tenant, key)
+                .await
+                .expect("read"),
+            None,
+            "{key}"
+        );
+    }
     state
         .put_blob_object(&tenant, "check-verdict/abc", forged, None)
         .await
