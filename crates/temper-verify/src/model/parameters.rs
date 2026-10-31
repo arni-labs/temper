@@ -1,12 +1,13 @@
 //! A move's chosen inputs, read in the state before its effects.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::{Action, ActionConstraint};
 use temper_spec::predicate::{CmpOp, Env, Expr, Literal, Operand, Set, Val, eval};
 
-use super::semantics::ModelEnv;
-use super::types::{ParamValue, ResolvedTransition, TemperModel, TemperModelState};
+use super::semantics::{Expansion, ModelEnv, evaluate_guard, param_assignments};
+use super::strings::string_assignments;
+use super::types::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
 
 /// State and parameters shared by guard and entry-rule evaluation.
 pub(super) struct MoveEnv<'a> {
@@ -79,8 +80,8 @@ pub(super) fn guard_with_constraints(action: &Action) -> Expr {
     Expr::And(parts)
 }
 
-/// A guard-only count has no effect bound. Explore through every guard
-/// literal and local count, plus one distinct value per input above them:
+/// Effects can collapse inputs that a guard distinguishes. Explore through
+/// every guard literal and local count, plus one distinct value per input:
 /// comparisons can distinguish those values even when effects cannot.
 pub(super) fn guard_count_bound(model: &TemperModel, t: &ResolvedTransition) -> usize {
     fn literal(value: &Literal) -> usize {
@@ -115,4 +116,65 @@ pub(super) fn guard_count_bound(model: &TemperModel, t: &ResolvedTransition) -> 
         .copied()
         .fold(largest(&t.guard), usize::max)
         .saturating_add(t.params.len())
+}
+
+/// Visit chosen inputs before effects or state bounds are applied, stopping
+/// when `visit` returns true. Exploration and local enablement share choices.
+pub(super) fn any_inputs(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+    values: &BTreeSet<ModelString>,
+    budget: &Expansion,
+    mut visit: impl FnMut(BTreeMap<String, ParamValue>) -> bool,
+) -> bool {
+    let strings = string_assignments(model, t, state, values, budget);
+    for params in param_assignments(model, t) {
+        for chosen in &strings {
+            if !budget.take() {
+                return false;
+            }
+            let mut params = params.clone();
+            params.extend(
+                chosen
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ParamValue::Str(v.clone()))),
+            );
+            if visit(params) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether some allowed input makes the guard definitely true locally.
+/// Related-status gates remain unknown: the record may still need to wait.
+/// Effects going past an exploration bound do not disable a runtime move.
+/// None means the input search exhausted its budget; it proves neither
+/// enablement nor a deadlock.
+pub(super) fn locally_enabled(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    state: &TemperModelState,
+) -> Option<bool> {
+    if model.entry_rules.is_empty() {
+        return Some(evaluate_guard(&t.guard, &model.var_kinds, state));
+    }
+    let values = super::strings::string_values(std::iter::once(state));
+    let budget = Expansion::for_model(model);
+    let enabled = any_inputs(model, t, state, &values, &budget, |params| {
+        eval(
+            &t.guard,
+            &MoveEnv {
+                local: ModelEnv {
+                    kinds: &model.var_kinds,
+                    state,
+                },
+                params: &params,
+            },
+        )
+        .must_hold()
+    });
+    (!budget.exhausted.get()).then_some(enabled)
 }

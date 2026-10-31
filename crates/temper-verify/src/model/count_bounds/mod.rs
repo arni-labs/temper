@@ -212,8 +212,9 @@ pub(super) fn count_ranges<'a>(
                     }
                 }
             };
-            if !model.entry_rules.is_empty()
-                && !super::builder::effect_params(&t.effects).contains_key(*p)
+            // Effects may collapse distinct inputs (saturation or a no-op
+            // index), but a guard can still distinguish those inputs.
+            if !model.entry_rules.is_empty() && t.guard.params_read().iter().any(|name| name == *p)
             {
                 range.largest = range
                     .largest

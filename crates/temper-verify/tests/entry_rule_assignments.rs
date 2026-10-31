@@ -277,3 +277,152 @@ field = "expected"
     );
     passes(&source);
 }
+
+fn effect_input(effect: &str, state: &str) -> String {
+    spec(
+        &(string("topping", "one") + state),
+        &format!(
+            r#"params = [{{ name = "p", type = "counter" }}]
+guard = "(params.p == 0 && Topping[topping].status == 'Stocked') || (params.p == 50 && Topping[topping].status == 'Empty')"
+effect = ["{effect}"]"#
+        ),
+        "Topping[topping].status == 'Stocked'",
+    )
+}
+
+fn count_witness(source: &str) {
+    refuses(source);
+    let model = build_model_from_ioa(source, 2).unwrap();
+    let checked = check_model(&model);
+    let found = checked
+        .counterexamples
+        .iter()
+        .find(|c| c.property == "EntryRules")
+        .unwrap();
+    let (_, Some(action)) = &found.trace[found.trace.len() - 2] else {
+        panic!("missing breaking move")
+    };
+    assert_eq!(action.name, "Enter");
+    assert_eq!(action.params["p"], ParamValue::Count(50));
+}
+
+#[test]
+fn saturated_subtraction_preserves_guard_distinguishable_inputs() {
+    count_witness(&effect_input(
+        "count -= params.p",
+        "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n",
+    ));
+}
+
+#[test]
+fn no_op_list_indexes_preserve_guard_distinguishable_inputs() {
+    count_witness(&effect_input(
+        "remove_at(items, params.p)",
+        "\n[[state]]\nname = \"items\"\ntype = \"list\"\ninitial = ['one']\n",
+    ));
+}
+
+#[test]
+fn widened_guard_inputs_still_respect_effect_bounds() {
+    let source = effect_input(
+        "count += params.p",
+        "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n",
+    );
+    passes(&source);
+    let model = build_model_from_ioa(&source, 2).unwrap();
+    let checked = check_model(&model);
+    assert!(
+        checked.bounded_by.iter().any(|(var, _)| var == "count"),
+        "{checked:?}"
+    );
+}
+
+#[test]
+fn string_inputs_can_equal_the_current_place_without_a_redundant_literal() {
+    for guard in [
+        "params.p == status",
+        "params.p == status && status == 'Waiting'",
+    ] {
+        let source = spec(
+            "",
+            &format!("params = [{{ name = \"p\", type = \"string\" }}]\nguard = \"{guard}\""),
+            "true",
+        );
+        passes(&source);
+        let model = build_model_from_ioa(&source, 2).unwrap();
+        let mut actions = Vec::new();
+        model.actions(&model.init_states()[0], &mut actions);
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.params["p"] == ParamValue::Str("Waiting".into())),
+            "{actions:?}"
+        );
+        refuses(&source.replace("assert = \"true\"", "assert = \"false\""));
+    }
+}
+
+fn constrained_entry() -> String {
+    spec(
+        &string("expected", "Stocked"),
+        r#"params = [{ name = "p", type = "string" }]
+[[action.constraints]]
+kind = "param_equals_field"
+param = "p"
+field = "expected""#,
+        "true",
+    )
+}
+
+#[test]
+fn constrained_inputs_do_not_fabricate_a_deadlock() {
+    let source = format!(
+        r#"{}
+[[liveness]]
+name = "can_enter"
+from = ["Waiting"]
+has_actions = true
+"#,
+        constrained_entry()
+    );
+    passes(&source);
+}
+
+#[test]
+fn constrained_inputs_do_not_hide_a_terminal_exit() {
+    let source = constrained_entry().replace(
+        "initial = \"Waiting\"",
+        "initial = \"Waiting\"\nterminal = ['Waiting']",
+    );
+    let checked = check_model(&build_model_from_ioa(&source, 2).unwrap());
+    assert!(
+        checked
+            .counterexamples
+            .iter()
+            .any(|c| c.property == "Terminal"),
+        "{checked:?}"
+    );
+}
+
+#[test]
+fn local_enablement_requires_satisfied_inputs_and_a_local_guard() {
+    for guard in [
+        "params.p != expected",
+        "Topping[topping].status == 'Stocked'",
+    ] {
+        let source =
+            constrained_entry().replace("params =", &format!("guard = \"{guard}\"\nparams ="));
+        let model = build_model_from_ioa(&source, 2).unwrap();
+        let mut model = model;
+        model.terminal = vec!["Waiting".into()];
+        let property = model
+            .properties()
+            .into_iter()
+            .find(|p| p.name == "Terminal")
+            .unwrap();
+        assert!(
+            (property.condition)(&model, &model.init_states()[0]),
+            "{guard}"
+        );
+    }
+}

@@ -12,7 +12,7 @@ use super::types::{
 
 use super::count_bounds::{CountRange, count_ranges};
 pub(crate) use super::expansion::Expansion;
-use super::strings::string_assignments;
+use super::parameters::any_inputs;
 pub use super::strings::{
     apply_string_params, canonical_state, canonical_strings, canonical_values, string_values,
 };
@@ -179,37 +179,26 @@ fn successors_with(
     mut left_out: impl FnMut(&TemperModelState),
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
-    let strings = string_assignments(model, t, state, values, budget);
-    for params in param_assignments(model, t) {
-        for chosen in &strings {
-            if !budget.take() {
-                return out;
-            }
-            let mut params = params.clone();
-            params.extend(
-                chosen
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ParamValue::Str(v.clone()))),
-            );
-            if !model.entry_rules.is_empty()
-                && !super::parameters::inputs_allow(model, t, state, &params)
-            {
-                continue;
-            }
-            let mut next = state.clone();
-            if let Some(to) = &t.to_state {
-                next.status = to.clone();
-            }
-            apply_effects(&t.effects, &mut next, &t.name, &params);
-            apply_string_params(&t.string_params, &mut next, &params);
-            canonical_state(&mut next);
-            if within_bounds(model, state, &next) {
-                out.push((params, next));
-            } else {
-                left_out(&next);
-            }
+    any_inputs(model, t, state, values, budget, |params| {
+        if !model.entry_rules.is_empty()
+            && !super::parameters::inputs_allow(model, t, state, &params)
+        {
+            return false;
         }
-    }
+        let mut next = state.clone();
+        if let Some(to) = &t.to_state {
+            next.status = to.clone();
+        }
+        apply_effects(&t.effects, &mut next, &t.name, &params);
+        apply_string_params(&t.string_params, &mut next, &params);
+        canonical_state(&mut next);
+        if within_bounds(model, state, &next) {
+            out.push((params, next));
+        } else {
+            left_out(&next);
+        }
+        false
+    });
     out
 }
 
@@ -302,7 +291,7 @@ fn string_literals(model: &TemperModel, t: &ResolvedTransition, name: &str) -> B
 }
 
 /// The cartesian product of each parameter's candidate values.
-fn param_assignments(
+pub(super) fn param_assignments(
     model: &TemperModel,
     t: &ResolvedTransition,
 ) -> Vec<BTreeMap<String, ParamValue>> {

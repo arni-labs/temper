@@ -68,3 +68,27 @@ fn a_move_from_only_the_destination_does_not_cover_a_default_entry_rule() {
         "{error}"
     );
 }
+
+#[test]
+fn entry_assertions_cannot_silently_read_unmodeled_numbers() {
+    for assertion in [
+        "amount > 0",
+        "!(amount == 0)",
+        "amount in [0, 1]",
+        "true && amount != null",
+    ] {
+        let source = spec("['Inside', 'Outside']", "", "")
+            .replace(
+                "[[action]]",
+                "[[state]]\nname = 'amount'\ntype = 'int'\ninitial = 0\n\n[[action]]",
+            )
+            .replace("assert = \"false\"", &format!("assert = \"{assertion}\""));
+        let error = parse_automaton_with_liveness(&source, LivenessEnforcement::WarnOnly)
+            .expect_err("the verifier cannot evaluate an int read")
+            .to_string();
+        assert!(
+            error.contains("entry rule 'entry'") && error.contains("cannot model"),
+            "{error}"
+        );
+    }
+}

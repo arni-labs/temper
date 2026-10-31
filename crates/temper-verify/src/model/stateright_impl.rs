@@ -6,10 +6,10 @@
 
 use stateright::{Model, Property};
 
-use super::semantics::{
-    canonical_state, evaluate_guard, guard_may_hold, rule_for, step, successors, truth,
-};
+use super::semantics::{canonical_state, guard_may_hold, rule_for, step, successors, truth};
 use temper_spec::predicate::Truth;
+
+use super::parameters::locally_enabled;
 
 use super::types::{
     LivenessKind, ResolvedTransition, TemperModel, TemperModelAction, TemperModelState,
@@ -52,7 +52,7 @@ fn check_terminal(model: &TemperModel, state: &TemperModelState) -> bool {
     !model.transitions.iter().any(|t| {
         let status_ok =
             t.from_states.is_empty() || t.from_states.iter().any(|s| s == &state.status);
-        status_ok && evaluate_guard(&t.guard, &model.var_kinds, state)
+        status_ok && locally_enabled(model, t, state) == Some(true)
     })
 }
 
@@ -70,7 +70,7 @@ fn check_no_deadlock(model: &TemperModel, state: &TemperModelState) -> bool {
             for t in &model.transitions {
                 let status_ok =
                     t.from_states.is_empty() || t.from_states.iter().any(|s| s == &state.status);
-                if status_ok && evaluate_guard(&t.guard, &model.var_kinds, state) {
+                if status_ok && locally_enabled(model, t, state) != Some(false) {
                     has_action = true;
                     break;
                 }

@@ -412,3 +412,38 @@ fn string_products_spend_the_per_record_budget() {
         assert!(result.dead_transitions.is_empty());
     }
 }
+
+#[test]
+fn exhausted_input_search_does_not_fabricate_a_deadlock() {
+    use crate::budget::{Budget, Spending};
+    use std::time::Duration;
+
+    let source = r#"
+[automaton]
+name = "Entry"
+states = ["Waiting", "Inside"]
+initial = "Waiting"
+[[action]]
+name = "Enter"
+from = ["Waiting"]
+to = "Inside"
+params = [{ name = "p", type = "string" }]
+guard = "params.p == 'Stocked'"
+[[entry_rule]]
+name = "entry"
+place = "Inside"
+assert = "true"
+[[liveness]]
+name = "can_enter"
+from = ["Waiting"]
+has_actions = true
+"#;
+    let model = Spending::start(Budget {
+        states: 1,
+        time: Duration::from_secs(5),
+    })
+    .limit(build_model_from_ioa(source, 2).unwrap());
+    let result = check_model(&model);
+    assert!(!result.is_complete, "{result:?}");
+    assert!(result.counterexamples.is_empty(), "{result:?}");
+}

@@ -45,6 +45,7 @@ fn string_candidates(
             Some(value) => BTreeSet::from([value]),
             None => {
                 let mut all: BTreeSet<ModelString> = values.clone();
+                all.insert(state.status.clone().into());
                 all.insert("".into());
                 all.insert(fresh_string(values, false));
                 all.insert(fresh_string(values, true));
