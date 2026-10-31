@@ -20,9 +20,19 @@ impl TursoEventStore {
         let conn = self
             .write_connection("first_event_backfill_start", WritePriority::Low)
             .await?;
-        conn.execute("INSERT INTO first_event_backfill (id, complete) SELECT 1, NOT EXISTS (SELECT 1 FROM entity_catalog LIMIT 1) ON CONFLICT(id) DO NOTHING", ()).await.map_err(storage_error)?;
-        drop(conn);
-        let conn = self.configured_connection().await?;
+        // Even a conflicting INSERT appends a Turso Sync transaction marker.
+        // Hold the write gate across the probe and initialization, and close
+        // the read cursor before writing on this connection.
+        let cursor_exists = {
+            let mut rows = conn
+                .query("SELECT 1 FROM first_event_backfill WHERE id=1", ())
+                .await
+                .map_err(storage_error)?;
+            rows.next().await.map_err(storage_error)?.is_some()
+        };
+        if !cursor_exists {
+            conn.execute("INSERT INTO first_event_backfill (id, complete) SELECT 1, NOT EXISTS (SELECT 1 FROM entity_catalog LIMIT 1) ON CONFLICT(id) DO NOTHING", ()).await.map_err(storage_error)?;
+        }
         let mut rows = conn
             .query("SELECT complete FROM first_event_backfill WHERE id=1", ())
             .await
