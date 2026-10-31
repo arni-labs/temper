@@ -70,9 +70,16 @@ pub(super) fn current(home: &Path) -> Option<String> {
     (is_digest && home.join(digest).is_dir()).then(|| digest.to_string())
 }
 
-/// Name `digest` as the version installed last. The new name is written
-/// beside the old one and renamed over it, so a crash leaves one or the other.
-pub(super) fn set_current(home: &Path, digest: &str) -> std::io::Result<()> {
+/// Name `digest` as the version installed last, or name none. The new name is
+/// written beside the old one and renamed over it, so a crash leaves one or
+/// the other.
+pub(super) fn set_current(home: &Path, digest: Option<&str>) -> std::io::Result<()> {
+    let Some(digest) = digest else {
+        return match std::fs::remove_file(home.join(CURRENT)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    };
     let mut file = tempfile::NamedTempFile::new_in(home)?;
     std::io::Write::write_all(&mut file, digest.as_bytes())?;
     file.as_file().sync_all()?;

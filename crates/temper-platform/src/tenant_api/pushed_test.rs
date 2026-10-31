@@ -188,6 +188,49 @@ async fn a_push_whose_spec_fails_its_check_changes_nothing() {
     assert_eq!(versions, vec![installed], "the refused version is not kept");
 }
 
+/// A version whose checks pass is recorded as current before it is installed;
+/// when the installer then refuses it, the previous version is current again.
+#[tokio::test]
+async fn a_push_the_installer_refuses_after_its_checks_leaves_the_previous_version_current() {
+    let tenant = unique_tenant("install-refused");
+    let (state, _data_dir) = server(&tenant);
+    let (status, body) = send(
+        &state,
+        push(&tenant, serde_json::json!({ "files": app_files() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let installed = current(&state, &tenant).expect("a good push is recorded");
+    let spec_before = resolved_spec(&tenant);
+
+    // The specs pass their checks; the installer cannot parse the policy.
+    let mut files = app_files();
+    files.insert(
+        "policies/evolution.cedar".to_string(),
+        "permit(principal, action, resource) when { this is not cedar };".to_string(),
+    );
+    files
+        .get_mut(SPEC)
+        .expect("sentinel spec")
+        .push_str("\n# refused by the installer\n");
+    let (status, body) = send(&state, push(&tenant, serde_json::json!({ "files": files }))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|e| e.contains("Cedar")),
+        "{body}"
+    );
+
+    assert_eq!(current(&state, &tenant), Some(installed.clone()));
+    assert_eq!(resolved_spec(&tenant), spec_before);
+    let versions: Vec<_> = std::fs::read_dir(home(&state, &tenant))
+        .expect("home")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "current")
+        .collect();
+    assert_eq!(versions, vec![installed], "the refused version is not kept");
+}
+
 #[tokio::test]
 async fn a_good_push_is_installed_and_comes_back_after_a_restart() {
     let tenant = unique_tenant("installed");

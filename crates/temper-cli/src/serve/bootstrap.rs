@@ -722,6 +722,15 @@ pub(super) async fn bootstrap_installed_apps(
             );
             continue;
         }
+        // An app asked for by `--app` with no files anywhere yet is a server
+        // waiting for its first push (`POST /api/os-apps/{name}/install`); from
+        // that push on, its pushed version is what resolves here.
+        if matches!(source, AppBootstrapSource::Cli)
+            && temper_platform::os_apps::tenant_os_app(&tenant, &app_name).is_none()
+        {
+            println!("  App '{app_name}' waits for its first install for '{tenant}'");
+            continue;
+        }
 
         // Replay through the real installer every startup. Presence-only checks
         // are not sufficient because an installed app's bundle can drift:

@@ -135,7 +135,9 @@ async fn install_in_turn(
     let push = Push {
         tenant,
         app,
+        home,
         root: &root,
+        prior: prior.as_deref(),
         created,
         registered: prior.as_deref() == Some(digest.as_str()),
     };
@@ -164,6 +166,22 @@ async fn install_in_turn(
         return Err(PushRefused::Checks(checks));
     }
 
+    // Order: record the checked version as current, then make it resolve and
+    // install it, and name the previous version again if the install fails.
+    // A crash after the record restarts on this version, which passed its
+    // checks; the caller never got an answer, pushes again, and the same push
+    // installs nothing new. Recording after the install would instead let a
+    // crash between the two restart on the previous version while this one
+    // had already gone live.
+    if !push.registered
+        && let Err(error) = files::set_current(home, Some(&digest))
+    {
+        push.undo(false);
+        return Err(PushRefused::Server(format!(
+            "the pushed version of '{app}' could not be recorded, so it was not installed: {error}"
+        )));
+    }
+
     add_tenant_os_apps_dir(
         tenant,
         root.clone(),
@@ -188,14 +206,21 @@ async fn install_in_turn(
             return Err(PushRefused::Install(error));
         }
     };
+    // The same line a boot install prints (temper-cli `bootstrap_installed_apps`):
+    // whoever reads this server's output reads a pushed install the same way.
+    let types: Vec<&str> = result
+        .added
+        .iter()
+        .chain(&result.updated)
+        .chain(&result.skipped)
+        .map(String::as_str)
+        .collect();
+    println!(
+        "  App '{app}' installed for '{tenant}': {}",
+        types.join(", ")
+    );
 
     if !push.registered {
-        files::set_current(home, &digest).map_err(|error| {
-            PushRefused::Server(format!(
-                "'{app}' is installed, but a restart would not keep it: the version could not \
-                 be recorded ({error}); push it again"
-            ))
-        })?;
         let keep: Vec<&str> = [Some(digest.as_str()), prior.as_deref()]
             .into_iter()
             .flatten()
@@ -228,7 +253,11 @@ pub fn restore_pushed_app_roots(state: &PlatformState) -> usize {
 struct Push<'a> {
     tenant: &'a str,
     app: &'a str,
+    /// The directory of the app's pushed versions.
+    home: &'a Path,
     root: &'a Path,
+    /// The version current before this push, if any.
+    prior: Option<&'a str>,
     /// This push wrote the version's directory.
     created: bool,
     /// The version is the one installed now, so the tenant resolved it before.
@@ -236,10 +265,22 @@ struct Push<'a> {
 }
 
 impl Push<'_> {
-    /// Leave things as they were before this push: the tenant resolves the
-    /// app as it did, and a directory this push wrote is gone.
-    fn undo(&self, added: bool) {
-        if added && !self.registered {
+    /// Leave things as they were before this push: the previous version is
+    /// current again, the tenant resolves the app as it did, and a directory
+    /// this push wrote is gone. `recorded` says this push named its version
+    /// current and added it to the tenant's installs.
+    fn undo(&self, recorded: bool) {
+        if recorded && !self.registered {
+            if let Err(error) = files::set_current(self.home, self.prior) {
+                tracing::error!(
+                    app = self.app,
+                    tenant = self.tenant,
+                    prior = ?self.prior,
+                    %error,
+                    "a refused pushed version is still recorded as current; a restart would \
+                     install it"
+                );
+            }
             remove_tenant_os_apps_dir(self.tenant, self.root);
         }
         if self.created
