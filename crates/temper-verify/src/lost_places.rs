@@ -231,7 +231,7 @@ pub(crate) fn lost_places(
     let mut lost: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
     for at in 0..n {
         let place = graph.place[at];
-        if place == NO_PLACE || past_bound[component[at] as usize] {
+        if place == NO_PLACE {
             continue;
         }
         let row: Vec<u64> = bits
