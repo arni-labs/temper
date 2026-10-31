@@ -209,3 +209,77 @@ async fn indexed_sort_with_declared_defaults_stays_bounded_when_values_are_prese
     assert_eq!(result.count, Some(12));
     assert_eq!(result.entities[0]["entity_id"], "ord-01");
 }
+
+#[tokio::test]
+async fn declared_default_equality_keeps_other_indexed_conjuncts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TursoEventStore::new(
+        &format!("file:{}", dir.path().join("default-conjunct.db").display()),
+        None,
+    )
+    .await
+    .unwrap();
+    let mut state = build_order_state("default-conjunct");
+    state.set_storage_stack(StorageStack::from_turso(store.clone()));
+    let spec = format!(
+        "{ORDER_IOA}\n[[state]]\nname = \"Currency\"\ntype = \"string\"\ninitial = \"USD\"\n"
+    );
+    state.registry.write().unwrap().register_tenant(
+        "default",
+        parse_csdl(CSDL_XML).unwrap(),
+        CSDL_XML.to_string(),
+        &[("Order", &spec)],
+    );
+    state
+        .authz
+        .reload_tenant_policies("default", "permit(principal, action, resource);")
+        .unwrap();
+    let tenant = TenantId::default();
+    for (id, fields) in [
+        ("ord-00-old", serde_json::json!({"Notes": "keep"})),
+        (
+            "ord-01-stored",
+            serde_json::json!({"Notes": "keep", "Currency": "USD"}),
+        ),
+        (
+            "ord-02-other-value",
+            serde_json::json!({"Notes": "keep", "Currency": "EUR"}),
+        ),
+        ("ord-03-other-note", serde_json::json!({"Notes": "drop"})),
+    ] {
+        upsert_order_projection(&store, &tenant, id, fields, 1).await;
+    }
+    let security = SecurityContext::system();
+    for (currency, count, first) in [("USD", 2, "ord-00-old"), ("EUR", 1, "ord-02-other-value")] {
+        let options = QueryOptions {
+            filter: Some(
+                temper_odata::query::parse_filter(&format!(
+                    "Currency eq '{currency}' and Notes eq 'keep'"
+                ))
+                .unwrap(),
+            ),
+            count: Some(true),
+            top: Some(1),
+            ..QueryOptions::default()
+        };
+        let result = read_entity_set_page(QueryPlaneReadRequest {
+            state: &state,
+            tenant: &tenant,
+            security_ctx: &security,
+            entity_type: "Order",
+            entity_set_name: "Orders",
+            query_options: &options,
+            budget: QueryPlaneReadBudget {
+                default_page_size: 1,
+                max_entities: 10,
+            },
+        })
+        .await
+        .unwrap_or_else(|_| panic!("declared-default conjunction must be readable"));
+        assert_eq!(result.count, Some(count));
+        assert_eq!(result.entities.len(), 1);
+        assert_eq!(result.entities[0]["entity_id"], first);
+        assert_eq!(result.entities[0]["fields"]["Currency"], currency);
+        assert!(result.telemetry.filter_pushdown);
+    }
+}
