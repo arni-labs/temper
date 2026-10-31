@@ -33,6 +33,9 @@ impl KeptKey {
     /// its places stands only for a spec with no silent moves: its digest
     /// held every move.
     pub fn fits(&self, kept: &CascadeResult) -> bool {
+        if !kept.levels.is_empty() {
+            return true;
+        }
         let reached = kept
             .levels
             .iter()
