@@ -25,6 +25,7 @@ mod s3_buffered_get;
 mod state;
 mod streaming;
 pub(crate) use endpoint::{LocalInternalBlobEndpoint, is_local_internal_blob_endpoint};
+pub use keys::KERNEL_BLOB_PREFIX;
 pub(crate) use keys::{DEFAULT_BLOB_BUCKET, hex_lower, wasm_artifact_key};
 use limits::{BLOB_BUFFERED_OPERATION_TIMEOUT, BLOB_IO_QUEUE_TIMEOUT, blob_io_semaphore};
 use local::{get_local_blob_observed, local_blob_path, put_local_blob_observed};

@@ -13,11 +13,11 @@ use super::{
     ActionDetail, ActionParamDetail, InvariantDetail, SpecDetail, SpecSummary, StateVarDetail,
 };
 
+mod kept;
 mod load_dir;
 mod load_inline;
 mod types;
 mod validate_ioa;
-mod verification_cached;
 mod verification_stream;
 
 pub(crate) use load_dir::handle_load_dir;
@@ -139,6 +139,7 @@ pub(crate) async fn handle_get_spec_detail(
                             })
                             .collect(),
                         hint: a.hint.clone().unwrap_or_default(),
+                        says: a.says.clone(),
                     })
                     .collect(),
                 invariants: automaton
@@ -162,6 +163,7 @@ pub(crate) async fn handle_get_spec_detail(
                         query_indexed: sv.query_indexed,
                     })
                     .collect(),
+                groups: automaton.groups.clone(),
             };
             return Ok(Json(detail));
         }

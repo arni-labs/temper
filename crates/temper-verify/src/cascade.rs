@@ -12,12 +12,15 @@
 use crate::budget::{Budget, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
+use crate::lost_places::LostPlace;
 use crate::model::{self, TemperModel};
 use crate::proptest_gen::{self, PropTestResult};
 use crate::simulation::{self, SimConfig, SimulationResult};
 use crate::smt::{self, SmtResult};
 
 use temper_runtime::scheduler::FaultConfig;
+
+mod digest;
 
 /// Result of an actor simulation level (Level 2b).
 ///
@@ -116,6 +119,11 @@ pub struct CascadeResult {
     /// after it did not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
+    /// Set when this verdict was not run again but kept: an earlier check
+    /// passed a spec whose levels read the same models with the same
+    /// settings. The digest of what they read ([`VerificationCascade::digest`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
 }
 
 /// Serializable summary of a [`crate::composite::CompositeVerificationPlan`].
@@ -133,8 +141,8 @@ pub struct CompositeCascadeReport {
     /// Number of trigger edges within the scope.
     pub edge_count: usize,
     /// Whether the trigger graph contains a cycle reachable from the
-    /// seed. Legal (cascade depth bounds cycles at runtime) but surfaced
-    /// for visibility.
+    /// seed. Legal (at runtime a chain round a cycle stops at its first
+    /// repeated step) but surfaced for visibility.
     pub has_cycle: bool,
     /// Conservative upper bound on joint state-space size — product of
     /// per-entity reachable-status counts. Useful for budgeting whether
@@ -398,44 +406,44 @@ impl VerificationCascade {
             .filter(|(_, sat)| !sat)
             .map(|(name, _)| name.as_str())
             .collect();
-        let non_inductive: Vec<&str> = result
+        let proved = result
+            .inductive_invariants
+            .iter()
+            .filter(|(_, ind)| *ind)
+            .count();
+        let not_proved: Vec<String> = result
             .inductive_invariants
             .iter()
             .filter(|(_, ind)| !ind)
-            .map(|(name, _)| name.as_str())
+            .map(
+                |(name, _)| match result.not_proved.iter().find(|(n, _)| n == name) {
+                    Some((_, why)) => format!("{name} ({why})"),
+                    None => name.clone(),
+                },
+            )
             .collect();
 
-        let summary = if passed {
-            let mut base = format!(
-                "L0 Symbolic PASSED: {} guards satisfiable, {} invariants inductive, {} unreachable",
+        let mut summary = if passed {
+            format!(
+                "L0 Symbolic PASSED: {} guards satisfiable, {proved} of {} invariants proved inductive, {} unreachable",
                 result.guard_satisfiability.len(),
                 result.inductive_invariants.len(),
                 result.unreachable_states.len(),
-            );
-            if result.approximate {
-                base.push_str("; approximate model: ");
-                base.push_str(&result.approximation_notes.join(" | "));
-            }
-            base
+            )
         } else {
-            let mut issues = Vec::new();
-            if !dead_guards.is_empty() {
-                issues.push(format!("dead guards: {}", dead_guards.join(", ")));
-            }
-            if !non_inductive.is_empty() {
-                issues.push(format!(
-                    "non-inductive invariants: {}",
-                    non_inductive.join(", ")
-                ));
-            }
-            if result.approximate {
-                issues.push(format!(
-                    "approximate model: {}",
-                    result.approximation_notes.join(" | ")
-                ));
-            }
-            format!("L0 Symbolic WARNINGS: {}", issues.join("; "))
+            format!(
+                "L0 Symbolic FAILED: dead guards: {}",
+                dead_guards.join(", ")
+            )
         };
+        if !not_proved.is_empty() {
+            summary.push_str("; not proved, left to the model check: ");
+            summary.push_str(&not_proved.join(", "));
+        }
+        if result.approximate {
+            summary.push_str("; approximate model: ");
+            summary.push_str(&result.approximation_notes.join(" | "));
+        }
 
         LevelResult {
             level: CascadeLevel::SymbolicVerification,
@@ -457,10 +465,22 @@ impl VerificationCascade {
     fn run_model_check(&self, model: &TemperModel) -> LevelResult {
         let verification = checker::check_model(model);
         let passed = verification.all_properties_hold;
-        let summary = if passed {
+        let summary = if passed && verification.bounded_by.is_empty() {
             format!(
                 "L1 Model Check PASSED: {} states explored, all properties hold",
                 verification.states_explored,
+            )
+        } else if passed {
+            let bounds: Vec<String> = verification
+                .bounded_by
+                .iter()
+                .map(|(name, bound)| format!("{name} up to {bound}"))
+                .collect();
+            format!(
+                "L1 Model Check PASSED, bounded: {} states explored; every property holds with {}, \
+                 and a move can go past that, which was not explored, so this is not a proof",
+                verification.states_explored,
+                bounds.join(", "),
             )
         } else {
             let mut parts = Vec::new();
@@ -481,6 +501,19 @@ impl VerificationCascade {
                 "L1 Model Check FAILED: {} states explored, {}",
                 verification.states_explored,
                 parts.join("; "),
+            )
+        };
+        let summary = if verification.lost_places.is_empty() {
+            summary
+        } else {
+            let found: Vec<String> = verification
+                .lost_places
+                .iter()
+                .map(LostPlace::describe)
+                .collect();
+            format!(
+                "{summary}. Not a failure, but worth a look: {}. If that is intended, nothing to do.",
+                found.join("; "),
             )
         };
 
@@ -677,6 +710,7 @@ fn finish(
         reachable_paths,
         composite_report,
         stopped: None,
+        kept: None,
     }
 }
 

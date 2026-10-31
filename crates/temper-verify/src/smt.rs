@@ -4,13 +4,15 @@
 //! enumerating states:
 //!
 //! 1. **Guard satisfiability** — Encode each guard as a Z3 formula over
-//!    integer counters (0..max) and boolean variables. Check SAT: if UNSAT,
-//!    the guard is dead code (the action can never fire).
+//!    integer counters (each up to its L1 bound) and boolean variables.
+//!    Check SAT: if UNSAT, the guard is dead code (the action can never fire).
 //!
-//! 2. **Invariant induction** — For each (invariant, transition) pair:
-//!    assume `invariant(S) ∧ guard(S) ∧ status ∈ from_states`, apply
-//!    effects to get S', prove `invariant(S')` by checking that its
-//!    negation is UNSAT.
+//! 2. **Invariant induction** — An invariant is proved inductive when every
+//!    initial state satisfies it and, for every transition, assuming the
+//!    proved invariants and the transition's source states and guard in S and
+//!    applying its effects to get S', the invariant's negation in S' is UNSAT.
+//!    A proved invariant holds in every state the model check (L1) reaches;
+//!    one L0 cannot prove is reported as not proved, with why, and L1 decides.
 //!
 //! 3. **Unreachable state detection** — BFS from initial state through
 //!    transition targets to find states that can never be reached.
@@ -20,10 +22,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use z3::ast::{Bool, Int};
 use z3::{SatResult, Solver};
 
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, unmodelable};
+use stateright::Model;
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Operand, Set, Truth, unmodelable};
 
 use crate::model::builder::build_model_from_ioa;
-use crate::model::semantics::collect_list_contains_pairs;
+use crate::model::semantics::{collect_list_contains_pairs, counter_bound, list_bound, truth};
 use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 
 /// Result of symbolic verification.
@@ -31,16 +34,46 @@ use crate::model::types::{ModelEffect, ResolvedTransition, TemperModel};
 pub struct SmtResult {
     /// For each action, whether its guard is satisfiable (can ever fire).
     pub guard_satisfiability: Vec<(String, bool)>,
-    /// For each invariant, whether it is inductively maintained by all transitions.
+    /// For each invariant, whether L0 proved it inductive: true in every
+    /// initial state and kept by every transition. `false` means not proved,
+    /// not broken: [`SmtResult::not_proved`] says why, and the model check
+    /// (L1) decides whether a reachable state breaks it.
     pub inductive_invariants: Vec<(String, bool)>,
+    /// Why each invariant L0 did not prove inductive was not proved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_proved: Vec<(String, NotProved)>,
     /// States that cannot be reached from the initial state.
     pub unreachable_states: Vec<String>,
     /// Whether symbolic checks rely on bounded/abstract encodings.
     pub approximate: bool,
     /// Human-readable approximation notes for downstream reporting.
     pub approximation_notes: Vec<String>,
-    /// Whether all checks passed (no dead guards, all invariants inductive).
+    /// Whether L0 found no problem: every guard can fire. An invariant L0
+    /// cannot prove inductive is not a problem by itself; L1 decides it.
     pub all_passed: bool,
+}
+
+/// Why L0 did not prove an invariant inductive.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotProved {
+    /// An initial state does not satisfy it.
+    Initial,
+    /// This action can take a state where every proved invariant holds to
+    /// one where this invariant is false. That state may be unreachable.
+    BrokenBy(String),
+    /// It reads values L0 does not model (strings, related records).
+    Unmodeled,
+}
+
+impl std::fmt::Display for NotProved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotProved::Initial => f.write_str("an initial state breaks it"),
+            NotProved::BrokenBy(action) => write!(f, "{action} can break it"),
+            NotProved::Unmodeled => f.write_str("reads values L0 does not model"),
+        }
+    }
 }
 
 /// Run symbolic verification on an IOA spec using the Z3 SMT solver.
@@ -55,17 +88,19 @@ pub fn verify_symbolic(ioa_toml: &str, max_counter: usize) -> SmtResult {
     let approximation_notes = approximation_notes(&model);
     let approximate = !approximation_notes.is_empty();
 
-    let guard_sat = check_guard_satisfiability(&model, max_counter);
-    let inductive = check_invariant_induction(&model, max_counter);
+    let guard_sat = check_guard_satisfiability(&model);
+    let (inductive, not_proved) = check_invariant_induction(&model);
     let unreachable = check_unreachable_states(&model);
 
     // Unreachable states are warnings, not failures — specs may declare states
-    // that are only reachable through composition or external actions.
-    let all_passed = guard_sat.iter().all(|(_, sat)| *sat) && inductive.iter().all(|(_, ind)| *ind);
+    // that are only reachable through composition or external actions. An
+    // invariant L0 cannot prove is not a failure either: L1 decides it.
+    let all_passed = guard_sat.iter().all(|(_, sat)| *sat);
 
     SmtResult {
         guard_satisfiability: guard_sat,
         inductive_invariants: inductive,
+        not_proved,
         unreachable_states: unreachable,
         approximate,
         approximation_notes,
@@ -84,20 +119,13 @@ fn approximation_notes(model: &TemperModel) -> Vec<String> {
     }
 
     vec![format!(
-        "{cross_entity_guard_count} transition(s) use abstract cross-entity guards; single-entity SMT excludes them from local induction and reachability"
+        "{cross_entity_guard_count} transition(s) use abstract cross-entity guards; single-entity SMT reads their cross-entity parts as unknowns and leaves them out of reachability"
     )]
 }
 
 /// Whether a guard reads a related entity's status (not modeled here).
 fn reads_related_entities(guard: &Expr) -> bool {
     !guard.cross_refs().is_empty()
-}
-
-fn concrete_transitions(model: &TemperModel) -> impl Iterator<Item = &ResolvedTransition> {
-    model
-        .transitions
-        .iter()
-        .filter(|transition| !reads_related_entities(&transition.guard))
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +135,8 @@ fn concrete_transitions(model: &TemperModel) -> impl Iterator<Item = &ResolvedTr
 /// For each transition, encode its guard as a Z3 formula and check SAT.
 ///
 /// A guard is satisfiable if there exists an assignment of counter values
-/// (0..max_counter) and boolean values that makes the guard true.
-fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(String, bool)> {
+/// (each up to its bound) and boolean values that makes the guard true.
+fn check_guard_satisfiability(model: &TemperModel) -> Vec<(String, bool)> {
     model
         .transitions
         .iter()
@@ -123,10 +151,10 @@ fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(S
                 }
             }
 
-            // Create Z3 variables for each counter, bounded [0, max_counter]
-            let counter_vars = make_counter_vars(model, &solver, max_counter);
+            // Create Z3 variables for each counter, over the values L1 explores
+            let counter_vars = make_counter_vars(model, &solver);
             let bool_vars = make_bool_vars(model);
-            let list_vars = make_list_vars(model, &solver, max_counter);
+            let list_vars = make_list_vars(model, &solver, "");
             let status_var = make_status_var(model, &solver);
 
             if !t.from_states.is_empty() {
@@ -154,103 +182,132 @@ fn check_guard_satisfiability(model: &TemperModel, max_counter: usize) -> Vec<(S
 // Invariant induction
 // ---------------------------------------------------------------------------
 
-/// For each invariant, check that the transitions entering its states
-/// preserve it.
+/// Each invariant L0 did not prove, with why.
+type NotProvedInvariants = Vec<(String, NotProved)>;
+
+/// Which invariants are inductive, and why each of the others is not proved.
 ///
-/// L0 scope (unchanged by the unified grammar): an invariant written as
-/// `status in [W...] => P` is checked on every concrete transition whose
-/// target is in `W`: assume `P` in the pre-state, apply the effects, prove
-/// `P` in the post-state. Guards and other variables are not constrained, so
-/// this is a fast early filter; the model checker (L1) is the full proof.
-/// Invariants without a `status in [...] =>` prefix, and invariants over
-/// values the model does not track, are left to L1. Status membership and
-/// `terminal` states are checked structurally.
-fn check_invariant_induction(model: &TemperModel, max_counter: usize) -> Vec<(String, bool)> {
+/// An invariant is proved when every initial state satisfies it and no
+/// transition can break it from a state where every proved invariant holds,
+/// within the transition's source states and guard. Candidates start as the
+/// invariants the initial states satisfy; a transition that can break one
+/// drops it, and the rest are checked again without it, until a pass drops
+/// none (Houdini). The proved set is then inductive as a whole, so each holds
+/// in every reachable state, and the model check (L1) cannot break it.
+///
+/// Every transition is checked, those that stay in their state and those
+/// whose guards read related entities (the unknown parts of a guard are free,
+/// so the guard may hold). Counters are only non-negative, so a proof about
+/// counters holds at every count, not just up to L1's bound; lists are as
+/// long as L1 explores them, so a proof about a list's length holds up to that
+/// bound, as L1's check does. An invariant over values L0 does not model is
+/// not proved. `TypeInvariant` and `Terminal(..)` are
+/// structural: every target is a declared state, and no transition leaves a
+/// terminal state.
+fn check_invariant_induction(model: &TemperModel) -> (Vec<(String, bool)>, NotProvedInvariants) {
+    let mut not_proved: BTreeMap<usize, NotProved> = BTreeMap::new();
+    let inits = model.init_states();
+    let mut candidates = Vec::new();
+    for (index, inv) in model.invariants.iter().enumerate() {
+        if unmodelable(&inv.assert, &model.var_kinds).is_some() {
+            not_proved.insert(index, NotProved::Unmodeled);
+        } else if inits
+            .iter()
+            .any(|init| truth(&inv.assert, &model.var_kinds, init) != Truth::True)
+        {
+            not_proved.insert(index, NotProved::Initial);
+        } else {
+            candidates.push(index);
+        }
+    }
+
+    loop {
+        let mut dropped = BTreeSet::new();
+        for t in &model.transitions {
+            for index in broken_by(model, t, &candidates) {
+                not_proved
+                    .entry(index)
+                    .or_insert_with(|| NotProved::BrokenBy(t.name.clone()));
+                dropped.insert(index);
+            }
+        }
+        if dropped.is_empty() {
+            break;
+        }
+        candidates.retain(|index| !dropped.contains(index));
+    }
+
     let mut results = vec![(
         "TypeInvariant".to_string(),
-        concrete_transitions(model).all(|t| {
-            t.to_state
-                .as_ref()
-                .map(|s| model.states.contains(s))
-                .unwrap_or(true)
-        }),
+        model
+            .transitions
+            .iter()
+            .all(|t| t.to_state.as_ref().is_none_or(|s| model.states.contains(s))),
     )];
-    for inv in &model.invariants {
-        let inductive = match split_trigger(&inv.assert) {
-            Some((trigger, body)) if unmodelable(body, &model.var_kinds).is_none() => {
-                concrete_transitions(model)
-                    .filter(|t| t.to_state.as_ref().is_some_and(|to| trigger.contains(to)))
-                    .all(|t| preserved_by(model, body, t, max_counter))
-            }
-            _ => true,
-        };
-        results.push((inv.name.clone(), inductive));
-    }
+    results.extend(
+        model
+            .invariants
+            .iter()
+            .enumerate()
+            .map(|(index, inv)| (inv.name.clone(), !not_proved.contains_key(&index))),
+    );
     for state in &model.terminal {
-        let closed = !concrete_transitions(model)
+        let closed = !model
+            .transitions
+            .iter()
             .any(|t| t.from_states.contains(state) || t.from_states.is_empty());
         results.push((format!("Terminal({state})"), closed));
     }
-    results
+    let not_proved = not_proved
+        .into_iter()
+        .map(|(index, why)| (model.invariants[index].name.clone(), why))
+        .collect();
+    (results, not_proved)
 }
 
-/// `status in [W...] => P` as `(W, P)`.
-fn split_trigger(assert: &Expr) -> Option<(Vec<String>, &Expr)> {
-    let Expr::Implies(lhs, body) = assert else {
-        return None;
-    };
-    let Expr::In {
-        value: Operand::Status,
-        set: Set::List(items),
-        negated: false,
-    } = lhs.as_ref()
-    else {
-        return None;
-    };
-    let states = items
-        .iter()
-        .map(|item| match item {
-            Literal::Str(state) => Some(state.clone()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some((states, body))
-}
-
-/// Whether transition `t` preserves `body`: `body(pre) ∧ post = effects(pre)
-/// ∧ ¬body(post)` is unsatisfiable.
-fn preserved_by(
-    model: &TemperModel,
-    body: &Expr,
-    t: &ResolvedTransition,
-    max_counter: usize,
-) -> bool {
+/// The invariants among `candidates` (indices into `model.invariants`) that
+/// `t` can break: from a state where every candidate holds, `t`'s source
+/// states and its guard, to a post-state (its effects applied, as L1 applies
+/// them) where the invariant is false. A solver that cannot decide counts as
+/// a break: L0 proves nothing it has not shown.
+fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) -> Vec<usize> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     let solver = Solver::new();
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-    let lists = ListSymbolicVars::default();
 
     let mut pre_counters = BTreeMap::new();
     for name in model.initial_counters.keys() {
-        let pre = Int::new_const(format!("{name}_pre"));
+        let pre = Int::new_const(var_name("pre:", "counter", name));
         solver.assert(pre.ge(&zero));
-        solver.assert(pre.le(&max_val));
         pre_counters.insert(name.clone(), pre);
     }
-    let mut pre_bools = BTreeMap::new();
-    for name in model.initial_booleans.keys() {
-        pre_bools.insert(name.clone(), Bool::new_const(format!("{name}_pre")));
-    }
-    // Apply the effects in order, as the runtime does; `params.p` is a fresh
-    // unknown (a non-negative integer or a boolean).
+    let pre_bools: BTreeMap<String, Bool> = model
+        .initial_booleans
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                Bool::new_const(var_name("pre:", "bool", name)),
+            )
+        })
+        .collect();
+    let pre_lists = make_list_vars(model, &solver, "pre:");
+    let pre_status = make_status_var(model, &solver);
+
+    // Apply the effects in order, as L1 does; `params.p` is a fresh unknown
+    // (a non-negative integer or a boolean). A list an effect changes may be
+    // any list afterwards.
     let mut post_counters = pre_counters.clone();
     let mut post_bools = pre_bools.clone();
+    let mut changed_lists = BTreeSet::new();
     let count = |arg: &Arg, counters: &BTreeMap<String, Int>| -> Int {
         match arg {
             Arg::Lit(Literal::Int(n)) => Int::from_i64(*n),
             Arg::Var(name) => counters.get(name).cloned().unwrap_or_else(|| zero.clone()),
             Arg::Param(name) => {
-                let param = Int::new_const(format!("param:{name}"));
+                let param = Int::new_const(var_name("", "param", name));
                 solver.assert(param.ge(&zero));
                 param
             }
@@ -270,7 +327,7 @@ fn preserved_by(
                 }
             }
             ModelEffect::SubCounter { var, value } => {
-                // Runtime semantics are saturating: max(counter - delta, 0).
+                // L1 and the runtime stop at 0: max(counter - delta, 0).
                 let delta = count(value, &post_counters);
                 if let Some(post) = post_counters.get_mut(var) {
                     let dec = Int::sub(&[&*post, &delta]);
@@ -284,15 +341,24 @@ fn preserved_by(
                         .get(name)
                         .cloned()
                         .unwrap_or_else(|| Bool::from_bool(false)),
-                    Arg::Param(name) => Bool::new_const(format!("param:{name}")),
+                    Arg::Param(name) => Bool::new_const(var_name("", "param", name)),
                     Arg::Lit(_) => Bool::from_bool(false),
                 };
                 post_bools.insert(var.clone(), value);
             }
-            ModelEffect::ListAppend { .. } | ModelEffect::ListRemoveAt { .. } => {}
+            ModelEffect::ListAppend { var, .. } | ModelEffect::ListRemoveAt { var, .. } => {
+                changed_lists.insert(var.clone());
+            }
         }
     }
-    let pre_status = make_status_var(model, &solver);
+    let changed = make_list_vars(model, &solver, "post:");
+    let mut post_lists = pre_lists.clone();
+    for var in &changed_lists {
+        if let (Some(len), Some(held)) = (changed.len_vars.get(var), changed.holds.get(var)) {
+            post_lists.len_vars.insert(var.clone(), len.clone());
+            post_lists.holds.insert(var.clone(), held.clone());
+        }
+    }
     let post_status = match t
         .to_state
         .as_ref()
@@ -305,42 +371,53 @@ fn preserved_by(
     let pre = Symbols {
         counters: pre_counters,
         bools: pre_bools,
-        lists: &lists,
+        lists: &pre_lists,
         status: pre_status,
         prefix: "pre:",
     };
     let post = Symbols {
         counters: post_counters,
         bools: post_bools,
-        lists: &lists,
+        lists: &post_lists,
         status: post_status,
         prefix: "post:",
     };
-    solver.assert(encode(body, &pre, model));
-    solver.assert(encode(body, &post, model).not());
-    !matches!(solver.check(), SatResult::Sat)
+    if !t.from_states.is_empty() {
+        solver.assert(encode_state_membership(&pre.status, &t.from_states, model));
+    }
+    solver.assert(encode(&t.guard, &pre, model));
+    for &index in candidates {
+        solver.assert(encode(&model.invariants[index].assert, &pre, model));
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|&index| {
+            solver.push();
+            solver.assert(encode(&model.invariants[index].assert, &post, model).not());
+            let broken = !matches!(solver.check(), SatResult::Unsat);
+            solver.pop(1);
+            broken
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // Z3 helpers
 // ---------------------------------------------------------------------------
 
-/// Create Z3 integer variables for each counter, bounded [0, max_counter].
-fn make_counter_vars(
-    model: &TemperModel,
-    solver: &Solver,
-    max_counter: usize,
-) -> Vec<(String, Int)> {
+/// Create Z3 integer variables for each counter, each in `[0, bound]` with
+/// the bound L1 explores it to, which covers every literal it is compared with.
+fn make_counter_vars(model: &TemperModel, solver: &Solver) -> Vec<(String, Int)> {
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-
     model
         .initial_counters
         .keys()
         .map(|name| {
-            let var = Int::new_const(name.as_str());
+            let var = Int::new_const(var_name("", "counter", name));
+            let bound = i64::try_from(counter_bound(model, name)).unwrap_or(i64::MAX);
             solver.assert(var.ge(&zero));
-            solver.assert(var.le(&max_val));
+            solver.assert(var.le(Int::from_i64(bound)));
             (name.clone(), var)
         })
         .collect()
@@ -352,70 +429,89 @@ fn make_bool_vars(model: &TemperModel) -> Vec<(String, Bool)> {
         .initial_booleans
         .keys()
         .map(|name| {
-            let var = Bool::new_const(name.as_str());
+            let var = Bool::new_const(var_name("", "bool", name));
             (name.clone(), var)
         })
         .collect()
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ListSymbolicVars {
     len_vars: BTreeMap<String, Int>,
-    elem_vars: BTreeMap<String, Vec<Int>>,
-    value_atoms: BTreeMap<String, i64>,
+    /// Whether each list holds each value a guard or invariant looks for in
+    /// it.
+    holds: BTreeMap<String, BTreeMap<String, Bool>>,
 }
 
-/// Create exact bounded symbolic list variables:
-/// - `len` in `[0, max_counter]`
-/// - `elem_0..elem_{max_counter-1}` for position values
-fn make_list_vars(model: &TemperModel, solver: &Solver, max_counter: usize) -> ListSymbolicVars {
+/// Create exact bounded symbolic list variables, named after `prefix`, for
+/// each list up to the length L1 explores it to (its bound):
+/// - its length, in `[0, bound]`
+/// - whether it holds each value a guard or invariant looks for in it, with
+///   no more of those held than its length
+///
+/// Membership is all a guard or invariant reads of a list's elements, and a
+/// list of length `n` can hold any `n` of the values looked for, so this is
+/// exact. A constant per position would grow with the bound, which comes
+/// from the literals a spec compares the length with and can be any size.
+fn make_list_vars(model: &TemperModel, solver: &Solver, prefix: &str) -> ListSymbolicVars {
     let zero = Int::from_i64(0);
-    let max_val = Int::from_i64(max_counter as i64);
-    let mut len_vars = BTreeMap::new();
-    let mut elem_vars = BTreeMap::new();
+    let one = Int::from_i64(1);
+    let mut looked_for: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let exprs = model
+        .transitions
+        .iter()
+        .map(|t| &t.guard)
+        .chain(model.invariants.iter().map(|inv| &inv.assert));
+    for expr in exprs {
+        let mut pairs = BTreeSet::new();
+        collect_list_contains_pairs(expr, &mut pairs);
+        for (list, value) in pairs {
+            looked_for.entry(list).or_default().insert(value);
+        }
+    }
 
+    let mut len_vars = BTreeMap::new();
+    let mut holds = BTreeMap::new();
     for name in model.initial_lists.keys() {
-        let len_var = Int::new_const(format!("{name}_len"));
+        let bound = list_bound(model, name);
+        let max_val = Int::from_i64(i64::try_from(bound).unwrap_or(i64::MAX));
+        let len_var = Int::new_const(var_name(prefix, "len", name));
         solver.assert(len_var.ge(&zero));
         solver.assert(len_var.le(&max_val));
+
+        let held: BTreeMap<String, Bool> = looked_for
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                let constant =
+                    Bool::new_const(var_name(prefix, "holds", &format!("{name}|{value}")));
+                (value.clone(), constant)
+            })
+            .collect();
+        if !held.is_empty() {
+            let counted: Vec<Int> = held.values().map(|h| h.ite(&one, &zero)).collect();
+            let count = Int::add(&counted.iter().collect::<Vec<_>>());
+            solver.assert(count.le(&len_var));
+        }
         len_vars.insert(name.clone(), len_var);
-
-        let elements = (0..max_counter)
-            .map(|idx| Int::new_const(format!("{name}_elem_{idx}")))
-            .collect::<Vec<_>>();
-        elem_vars.insert(name.clone(), elements);
+        holds.insert(name.clone(), held);
     }
 
-    let mut values = BTreeSet::new();
-    for t in &model.transitions {
-        let mut pairs = BTreeSet::new();
-        collect_list_contains_pairs(&t.guard, &mut pairs);
-        for (_, value) in pairs {
-            values.insert(value);
-        }
-    }
-    for list in model.initial_lists.values() {
-        for value in list {
-            values.insert(value.clone());
-        }
-    }
+    ListSymbolicVars { len_vars, holds }
+}
 
-    let value_atoms = values
-        .into_iter()
-        .enumerate()
-        .map(|(idx, value)| (value, idx as i64))
-        .collect::<BTreeMap<_, _>>();
-
-    ListSymbolicVars {
-        len_vars,
-        elem_vars,
-        value_atoms,
-    }
+/// A Z3 constant's name: the state it belongs to (`prefix`), the kind of
+/// value, and the spec's own name last, so constants of different kinds never
+/// share a name (a counter `tags_len` and list `tags`'s length are two
+/// constants).
+fn var_name(prefix: &str, kind: &str, name: &str) -> String {
+    format!("{prefix}{kind}|{name}")
 }
 
 /// Create a symbolic status variable over `model.states` indices.
 fn make_status_var(model: &TemperModel, solver: &Solver) -> Int {
-    let var = Int::new_const("status_idx");
+    let var = Int::new_const("status");
     let zero = Int::from_i64(0);
     if model.states.is_empty() {
         solver.assert(var.eq(&zero));
@@ -446,32 +542,14 @@ fn encode_state_membership(status_var: &Int, states: &[String], model: &TemperMo
     }
 }
 
-/// Encode exact bounded `contains(list, value)` over symbolic list slots.
+/// Encode exact bounded `contains(list, value)`: whether the list holds it.
 fn encode_list_contains(var: &str, value: &str, lists: &ListSymbolicVars) -> Bool {
-    let Some(len_var) = lists.len_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(elements) = lists.elem_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(atom_id) = lists.value_atoms.get(value) else {
-        return Bool::from_bool(false);
-    };
-
-    if elements.is_empty() {
-        return Bool::from_bool(false);
-    }
-
-    let atom = Int::from_i64(*atom_id);
-    let disjuncts: Vec<Bool> = elements
-        .iter()
-        .enumerate()
-        .map(|(idx, element)| {
-            let idx_int = Int::from_i64(idx as i64);
-            Bool::and(&[&len_var.gt(&idx_int), &element.eq(&atom)])
-        })
-        .collect();
-    Bool::or(&disjuncts)
+    lists
+        .holds
+        .get(var)
+        .and_then(|held| held.get(value))
+        .cloned()
+        .unwrap_or_else(|| Bool::from_bool(false))
 }
 
 /// Symbolic values for one state.
@@ -480,15 +558,17 @@ struct Symbols<'a> {
     bools: BTreeMap<String, Bool>,
     lists: &'a ListSymbolicVars,
     status: Int,
-    /// Distinguishes free atoms of different states (pre/post).
+    /// Names this state's free atoms (pre/post) in a solver dump.
     prefix: &'static str,
 }
 
-/// Encode an expression as a Z3 formula. Parts over values the model does
-/// not track (related-entity statuses, strings, fields) become free boolean
-/// atoms, named by their source text so repeated occurrences agree.
+/// Encode an expression as a Z3 formula. Each part over values the model
+/// does not track (related-entity statuses, strings, fields, parameters) is a
+/// fresh free atom, even where the same text appears twice: L1 reads every
+/// such part as unknown, so `X && !X` may hold there, and L0 must not rule
+/// out what L1 explores.
 fn encode(expr: &Expr, sym: &Symbols<'_>, model: &TemperModel) -> Bool {
-    let free = || Bool::new_const(format!("{}atom:{expr}", sym.prefix));
+    let free = || Bool::fresh_const(&format!("{}unknown", sym.prefix));
     match expr {
         Expr::Const(value) => Bool::from_bool(*value),
         Expr::Not(inner) => encode(inner, sym, model).not(),
@@ -628,213 +708,5 @@ fn check_unreachable_states(model: &TemperModel) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ORDER_IOA: &str = include_str!("../../../test-fixtures/specs/order.ioa.toml");
-
-    #[test]
-    fn test_all_guards_satisfiable() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        for (action, sat) in &result.guard_satisfiability {
-            assert!(sat, "Guard for '{action}' should be satisfiable");
-        }
-    }
-
-    #[test]
-    fn test_no_unreachable_states() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        assert!(
-            result.unreachable_states.is_empty(),
-            "All states should be reachable, but got unreachable: {:?}",
-            result.unreachable_states
-        );
-    }
-
-    #[test]
-    fn test_type_invariant_is_inductive() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        let type_inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "TypeInvariant");
-        assert!(type_inv.is_some());
-        assert!(type_inv.unwrap().1, "TypeInvariant should be inductive");
-    }
-
-    #[test]
-    fn test_counter_positive_invariant_is_inductive() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        let inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "SubmitRequiresItems");
-        assert!(inv.is_some(), "Should have SubmitRequiresItems");
-        assert!(inv.unwrap().1, "SubmitRequiresItems should be inductive");
-    }
-
-    #[test]
-    fn test_symbolic_result_structure() {
-        let result = verify_symbolic(ORDER_IOA, 2);
-        assert!(!result.guard_satisfiability.is_empty());
-        assert!(!result.inductive_invariants.is_empty());
-        assert!(!result.approximate);
-        assert!(result.approximation_notes.is_empty());
-    }
-
-    #[test]
-    fn test_list_contains_exact_at_bound() {
-        let spec = r#"
-[automaton]
-name = "ListExact"
-states = ["S"]
-initial = "S"
-
-[[state]]
-name = "labels"
-type = "list"
-initial = []
-
-[[action]]
-name = "ConflictingContains"
-from = ["S"]
-to = "S"
-guard = "'urgent' in labels && 'normal' in labels"
-"#;
-
-        // With max_counter=1, a single-slot list cannot contain two distinct
-        // values simultaneously.
-        let result = verify_symbolic(spec, 1);
-        let guard = result
-            .guard_satisfiability
-            .iter()
-            .find(|(name, _)| name == "ConflictingContains");
-        assert!(guard.is_some());
-        assert!(
-            !guard.unwrap().1,
-            "single-slot exact list encoding should reject conflicting contains guards"
-        );
-    }
-
-    #[test]
-    fn test_dead_guard_detected() {
-        // Guard requires counter >= 10 but max is 2 → Z3 returns UNSAT
-        let spec = r#"
-[automaton]
-name = "DeadGuard"
-states = ["A", "B"]
-initial = "A"
-
-[[state]]
-name = "items"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "Go"
-from = ["A"]
-to = "B"
-guard = "items > 9"
-"#;
-        let result = verify_symbolic(spec, 2);
-        let go_guard = result
-            .guard_satisfiability
-            .iter()
-            .find(|(name, _)| name == "Go");
-        assert!(go_guard.is_some());
-        assert!(
-            !go_guard.unwrap().1,
-            "Guard requiring items >= 10 with max_counter=2 should be unsatisfiable"
-        );
-    }
-
-    #[test]
-    fn test_non_inductive_invariant_detected() {
-        // GoB reaches trigger state B but doesn't increment count →
-        // Z3 finds pre-state where count=1, effect none → post count=0 possible?
-        // Actually: no effects, so counter_post = counter_pre. If pre > 0
-        // then post > 0. This IS inductive because no decrement.
-        // Let's test with a decrement instead.
-        let spec = r#"
-[automaton]
-name = "NonInductive"
-states = ["A", "B"]
-initial = "A"
-
-[[state]]
-name = "count"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "GoB"
-from = ["A"]
-to = "B"
-
-[[invariant]]
-name = "BRequiresCount"
-assert = "status in ['B'] => count > 0"
-"#;
-        // GoB reaches B, no effects on count. The invariant says count > 0
-        // when in B. Since GoB doesn't set count, if count was 0 in A,
-        // count will be 0 in B. But in the Z3 induction check, we assume
-        // count > 0 in pre-state (induction hypothesis). Since no decrement,
-        // count stays > 0. So this IS inductive from the Z3 perspective.
-        //
-        // The issue is reachability: GoB can fire from A when count=0 (no guard),
-        // reaching B with count=0. But that's a BASE CASE violation, not an
-        // induction failure. Induction only checks: if invariant holds before
-        // transition, does it hold after?
-        let result = verify_symbolic(spec, 2);
-        let inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "BRequiresCount");
-        assert!(inv.is_some());
-        // This is inductive (no counter modification), even though the
-        // invariant doesn't hold from initial state — that's a BFS check.
-        assert!(
-            inv.unwrap().1,
-            "BRequiresCount is inductive (no counter change)"
-        );
-    }
-
-    #[test]
-    fn test_decrement_breaks_induction() {
-        // Transition decrements counter when reaching trigger state →
-        // Z3 finds counterexample: count_pre=1, count_post=0
-        let spec = r#"
-[automaton]
-name = "DecrBreaks"
-states = ["A", "B"]
-initial = "A"
-
-[[state]]
-name = "count"
-type = "counter"
-initial = 0
-
-[[action]]
-name = "GoB"
-from = ["A"]
-to = "B"
-effect = ["count -= 1"]
-
-[[invariant]]
-name = "BNeedsCount"
-assert = "status in ['B'] => count > 0"
-"#;
-        let result = verify_symbolic(spec, 2);
-        let inv = result
-            .inductive_invariants
-            .iter()
-            .find(|(name, _)| name == "BNeedsCount");
-        assert!(inv.is_some());
-        // GoB decrements count. Z3 finds: count_pre=1, count_post=0 ≤ 0 → SAT
-        // So induction fails.
-        assert!(
-            !inv.unwrap().1,
-            "BNeedsCount should NOT be inductive (decrement can reach 0)"
-        );
-    }
-}
+#[path = "smt_test.rs"]
+mod tests;

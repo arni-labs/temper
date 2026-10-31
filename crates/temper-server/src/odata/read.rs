@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use temper_authz::{AuthenticatedRequestContext, SecurityContext};
 use temper_odata::path::{KeyValue, ODataPath, parse_path};
-use temper_odata::query::parse_query_options;
+use temper_odata::query::parse_query_options_from_pairs;
 use temper_odata::query::types::{
     BinaryOperator, ExpandItem, ExpandOptions, FilterExpr, ODataValue, QueryOptions,
 };
@@ -546,7 +546,9 @@ fn enrich_entity_response(
     {
         let table = spec.table();
         for rule in &table.rules {
-            if rule.from_states.iter().any(|s| s == current_status) {
+            if !temper_spec::automaton::is_carry_move(&rule.name)
+                && rule.from_states.iter().any(|s| s == current_status)
+            {
                 // Look up hint from automaton actions
                 let hint = spec
                     .automaton
@@ -615,12 +617,12 @@ pub(super) async fn handle_odata_get_for_tenant(
         }
     };
 
-    let query_string: String = query_params
+    // The extractor already split and decoded the query string; parse those
+    // pairs as they are so `&`, `=` and parentheses inside a value stay data.
+    let pairs = query_params
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    let query_options = match parse_query_options(&query_string) {
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    let query_options = match parse_query_options_from_pairs(pairs) {
         Ok(q) => q,
         Err(e) => {
             return odata_error(StatusCode::BAD_REQUEST, "InvalidQuery", &e.to_string())

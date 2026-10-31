@@ -176,7 +176,8 @@ fn push_unique_cedar_text(
 ///
 /// Reads the durable `tenant_installed_apps` table and reinstalls any
 /// apps whose specs are not already present in the SpecRegistry.
-/// Uses the production [`os_apps::install_os_app`] code path — no shortcuts.
+/// Uses the production installer through [`os_apps::restore_os_app`], which
+/// keeps each stored record's origin. It takes no shortcuts.
 ///
 /// This is the **production code path** — identical logic runs at CLI boot
 /// (Phase 8b) and during DST restart simulation.
@@ -216,7 +217,7 @@ pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStor
             continue;
         }
 
-        match os_apps::install_os_app(state, &tenant, &app_name).await {
+        match os_apps::restore_os_app(state, &tenant, &app_name).await {
             Ok(result) => {
                 let all: Vec<String> = result
                     .added
@@ -231,7 +232,7 @@ pub async fn restore_installed_apps(state: &PlatformState, ps: &dyn PlatformStor
                 );
             }
             Err(e) => {
-                tracing::warn!("Failed to restore app '{app_name}' for '{tenant}': {e}");
+                tracing::error!("Stored app '{app_name}' for '{tenant}' was not restored: {e}");
             }
         }
     }
@@ -250,7 +251,7 @@ pub async fn recover_installed_app_runtime_state(
     tenant: &str,
     app_name: &str,
 ) -> InstalledAppRuntimeRecoveryOutcome {
-    let Some(bundle) = os_apps::get_os_app(app_name) else {
+    let Some(bundle) = os_apps::tenant_os_app(tenant, app_name) else {
         tracing::warn!(
             tenant,
             app = %app_name,
@@ -267,7 +268,7 @@ pub async fn recover_installed_app_runtime_state(
         return InstalledAppRuntimeRecoveryOutcome::Ready;
     }
 
-    let Some(digest) = os_apps::os_app_bundle_digest(app_name) else {
+    let Some(digest) = os_apps::tenant_os_app_bundle_digest(tenant, app_name) else {
         return InstalledAppRuntimeRecoveryOutcome::MissingBundle;
     };
 
@@ -329,7 +330,7 @@ pub async fn recover_installed_apps_runtime_state(
 
 /// Check if all entity types for an app are already registered.
 fn tenant_has_ready_app_specs(state: &PlatformState, tenant: &str, app_name: &str) -> bool {
-    let Some(bundle) = os_apps::get_os_app(app_name) else {
+    let Some(bundle) = os_apps::tenant_os_app(tenant, app_name) else {
         return false;
     };
     let tenant_id = TenantId::new(tenant);
@@ -391,14 +392,17 @@ permit(
             "id".to_string(),
             serde_json::json!("__trigger__:Submit:build_session_message"),
         );
-        resource_attrs.insert(
-            "module".to_string(),
+        // The WASM gate sets the calling module on the context.
+        let mut module_ctx =
+            SecurityContext::from_resolved_identity("wasm-module", "wasm_module", None);
+        module_ctx.context_attrs.insert(
+            temper_authz::platform_keys::MODULE.to_string(),
             serde_json::json!("build_session_message"),
         );
 
         let decision = state.server.authz.authorize_for_tenant(
             "default",
-            &SecurityContext::from_resolved_identity("wasm-module", "wasm_module", None),
+            &module_ctx,
             "http_call",
             "HttpEndpoint",
             &resource_attrs,

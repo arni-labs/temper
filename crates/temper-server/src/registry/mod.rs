@@ -241,7 +241,7 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
-                let table = TransitionTable::from_automaton(&automaton);
+                let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
 
                 if let Some(existing_spec) = existing_config.entities.get_mut(*entity_type) {
@@ -314,7 +314,7 @@ impl SpecRegistry {
                         source: e.to_string(),
                     }
                 })?;
-                let table = TransitionTable::from_automaton(&automaton);
+                let table = transition_table(&tenant_name, entity_type, &automaton);
                 let integrations = automaton.integrations.clone();
                 entities.insert(
                     entity_type.to_string(),
@@ -463,6 +463,21 @@ impl SpecRegistry {
         self.tenants.keys().collect()
     }
 
+    /// The tenant's types marked `principal_record`: a record of one, keyed by
+    /// a user's `sub`, describes that user to Cedar.
+    pub fn principal_record_types(&self, tenant: &TenantId) -> Vec<String> {
+        self.tenants
+            .get(tenant)
+            .map(|tc| {
+                tc.entities
+                    .iter()
+                    .filter(|(_, spec)| spec.automaton.automaton.principal_record)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// List all entity types for a tenant.
     pub fn entity_types(&self, tenant: &TenantId) -> Vec<&str> {
         self.tenants
@@ -502,6 +517,28 @@ impl SpecRegistry {
     ) -> Option<&BTreeMap<String, VerificationStatus>> {
         self.tenants.get(tenant).map(|tc| &tc.verification)
     }
+}
+
+/// Build a type's transition table, and say which of its invariants moves
+/// are not checked against: a move reads the statuses of the records it
+/// points at, never their fields (`temper_jit::table::invariant`).
+fn transition_table(
+    tenant: &str,
+    entity_type: &str,
+    automaton: &automaton::Automaton,
+) -> TransitionTable {
+    for invariant in &automaton.invariants {
+        if !temper_jit::table::MoveInvariant::checked(invariant) {
+            tracing::warn!(
+                tenant,
+                entity_type,
+                invariant = %invariant.name,
+                "invariant reads another record's field, which moves do not read; \
+                 moves are not checked against it"
+            );
+        }
+    }
+    TransitionTable::from_automaton(automaton)
 }
 
 #[cfg(test)]

@@ -178,7 +178,8 @@ async fn assert_projection(store: &TursoEventStore, tenant: &str, expected: &Ent
             .query_field_index(
                 tenant,
                 "Order",
-                "field_name = ?3 AND field_value = ?4",
+                "entity_id IN (SELECT entity_id FROM entity_field_index \
+                 WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
                 vec![field.to_string(), text],
             )
             .await
@@ -195,7 +196,8 @@ async fn assert_projection(store: &TursoEventStore, tenant: &str, expected: &Ent
                 .query_field_index(
                     tenant,
                     "Order",
-                    "field_name = ?3 AND field_value = ?4",
+                    "entity_id IN (SELECT entity_id FROM entity_field_index \
+                     WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?3 AND field_value = ?4)",
                     vec!["ProductId".into(), "snapshot-product".into()],
                 )
                 .await

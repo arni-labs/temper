@@ -266,6 +266,12 @@ fn translate_comparison(
         _ => return None, // cross-field or complex expressions
     };
 
+    if matches!(
+        field_name.as_str(),
+        "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
+        return None;
+    }
     let sql_op = match op {
         BinaryOperator::Eq => "=",
         BinaryOperator::Ne => "!=",
@@ -313,7 +319,7 @@ fn is_status_property(field_name: &str) -> bool {
     field_name == "Status" || field_name == "status"
 }
 
-fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
+pub(super) fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
     match expr {
         FilterExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
@@ -334,6 +340,12 @@ fn lossless_eq_comparison(left: &FilterExpr, right: &FilterExpr) -> bool {
     let Some((field_name, value)) = property_literal_pair(left, right) else {
         return false;
     };
+    if matches!(
+        field_name,
+        "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
+        return false;
+    }
     if is_status_property(field_name) {
         return matches!(value, ODataValue::Null | ODataValue::String(_));
     }
@@ -400,6 +412,12 @@ fn translate_function(name: &str, args: &[FilterExpr], ctx: &mut TranslateCtx) -
                 FilterExpr::Property(name) => name.clone(),
                 _ => return None,
             };
+            if matches!(
+                field_name.as_str(),
+                "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+            ) {
+                return None;
+            }
             let search_value = match &args[1] {
                 FilterExpr::Literal(ODataValue::String(s)) => s.clone(),
                 _ => return None,

@@ -107,6 +107,19 @@ fn evaluate_filter(entity: &serde_json::Value, expr: &FilterExpr) -> Option<bool
                         comparison_operand(entity, right),
                     ) {
                         (Some(left_val), Some(right_val)) => {
+                            let is_event_time = |expr: &FilterExpr| {
+                                matches!(expr,
+                                FilterExpr::Property(name) if matches!(name.as_str(), "first_event_at" | "last_event_at"))
+                            };
+                            let (left_val, right_val) =
+                                if is_event_time(left) || is_event_time(right) {
+                                    (
+                                        left_val.map(normalize_event_time),
+                                        right_val.map(normalize_event_time),
+                                    )
+                                } else {
+                                    (left_val, right_val)
+                                };
                             Some(compare_nullable(left_val.as_ref(), right_val.as_ref(), op))
                         }
                         _ => Some(false),
@@ -146,6 +159,13 @@ pub(crate) fn resolve_property(
     entity: &serde_json::Value,
     prop: &str,
 ) -> Option<serde_json::Value> {
+    if matches!(
+        prop,
+        "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+    ) {
+        // Old catalog rows have no provenance. App fields can never supply it.
+        return Some(entity.get(prop).cloned().unwrap_or(serde_json::Value::Null));
+    }
     if prop == "Status" {
         return entity
             .get("Status")
@@ -319,13 +339,50 @@ fn evaluate_function(entity: &serde_json::Value, name: &str, args: &[FilterExpr]
     }
 }
 
+// Fixed UTC precision orders instants correctly, including a whole second
+// before a fractional second. This applies only to the kernel's typed clock.
+fn normalize_event_time(value: serde_json::Value) -> serde_json::Value {
+    value
+        .as_str()
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|time| {
+            serde_json::Value::String(
+                time.with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            )
+        })
+        .unwrap_or(value)
+}
+
 /// Sort entities in place by the given orderby clauses.
 fn sort_entities(entities: &mut [serde_json::Value], orderby: &[OrderByClause]) {
     entities.sort_by(|a, b| {
         for clause in orderby {
             let a_val = resolve_property(a, &clause.property);
             let b_val = resolve_property(b, &clause.property);
+            let (a_val, b_val) =
+                if matches!(clause.property.as_str(), "first_event_at" | "last_event_at") {
+                    (
+                        a_val.map(normalize_event_time),
+                        b_val.map(normalize_event_time),
+                    )
+                } else {
+                    (a_val, b_val)
+                };
+            let kernel_metadata = matches!(
+                clause.property.as_str(),
+                "first_event_at" | "last_event_at" | "last_event_via" | "last_event_by"
+            );
             let ordering = match (&a_val, &b_val) {
+                (Some(serde_json::Value::Null), Some(serde_json::Value::Null))
+                    if kernel_metadata =>
+                {
+                    std::cmp::Ordering::Equal
+                }
+                (Some(serde_json::Value::Null), _) if kernel_metadata => {
+                    std::cmp::Ordering::Greater
+                }
+                (_, Some(serde_json::Value::Null)) if kernel_metadata => std::cmp::Ordering::Less,
                 (Some(av), Some(bv)) => json_cmp(av, bv).unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,

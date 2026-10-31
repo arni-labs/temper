@@ -1,6 +1,9 @@
 //! Checks a parsed spec must pass before it is installed: declared states,
-//! predicates and effects, state timeouts, triggers, webhooks and vectors.
+//! predicates and effects, state timeouts, triggers, webhooks, vectors and
+//! the statechart labels.
 
+mod carries;
+mod groups;
 mod triggers;
 mod webhooks;
 
@@ -17,6 +20,19 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
         return Err(AutomatonParseError::Validation(format!(
             "initial state '{}' is not in states list",
             automaton.automaton.initial
+        )));
+    }
+
+    // A principal record's status reaches Cedar as `principal.<name>`. Every
+    // attribute the kernel puts on a principal starts lowercase (`id`, `role`,
+    // `agentTypeVerified`, `actingFor<Type>`), so a name that starts uppercase
+    // can never stand in for one of them.
+    let name = &automaton.automaton.name;
+    if automaton.automaton.principal_record && !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return Err(AutomatonParseError::Validation(format!(
+            "principal_record type '{name}' must start with an uppercase letter: Cedar reads it \
+             as principal.{name}, and every attribute the kernel sets on a principal starts \
+             lowercase, so only such a name cannot stand in for one"
         )));
     }
 
@@ -140,6 +156,11 @@ pub(super) fn validate(automaton: &Automaton) -> Result<(), AutomatonParseError>
     //    - `metric` must be one of cosine | dot | l2.
     //    - names must be unique (each identifies one index partition + `decl=`).
     validate_vector_decls(automaton)?;
+    carries::validate_carries(automaton)?;
+
+    // 8. Statechart labels: `says` is one line; `[[group]]` boxes form a tree.
+    groups::validate_says(automaton)?;
+    groups::validate_groups(automaton)?;
 
     Ok(())
 }
@@ -155,9 +176,53 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
         .collect();
     let invalid =
         |slot: String, error: String| AutomatonParseError::Validation(format!("{slot}: {error}"));
+    // A related entity's field is read only by the joint check of several
+    // entity types; the runtime resolves related statuses, not fields. Do not
+    // let a guard or a parameter constraint read one without a commit that
+    // spans both records: the dispatch path would read the field before the
+    // actor writes, and the related record can change in between, so the
+    // write would rest on a stale read (an install pin set from a commit the
+    // install later rolled back is that bug).
+    let no_related_field = |expr: &crate::predicate::Expr, slot: String| {
+        if expr.reads_related_field() {
+            Err(invalid(
+                slot,
+                format!(
+                    "`{expr}` reads a related entity's field, which only an \
+                     [[invariant]] may do"
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    // `params.p` is a parameter of the move being taken, so only an
+    // action's guard reads one, and only a parameter its action declares.
+    let no_params = |expr: &crate::predicate::Expr, slot: String| match expr.params_read().first() {
+        Some(param) => Err(invalid(
+            slot,
+            format!("`params.{param}` is a parameter of a move; only an action's guard reads one"),
+        )),
+        None => Ok(()),
+    };
     for action in &automaton.actions {
         check(&action.guard, Scope::State(&vars))
             .map_err(|e| invalid(format!("action '{}' guard", action.name), e))?;
+        no_related_field(&action.guard, format!("action '{}' guard", action.name))?;
+        if let Some(param) = action
+            .guard
+            .params_read()
+            .into_iter()
+            .find(|param| !action.params.iter().any(|p| p.name() == param))
+        {
+            return Err(invalid(
+                format!("action '{}' guard", action.name),
+                format!(
+                    "`params.{param}` is not a parameter of '{}'; declare it in its params",
+                    action.name
+                ),
+            ));
+        }
         check_effects(&action.effect, &vars)
             .map_err(|e| invalid(format!("action '{}' effect", action.name), e))?;
         for effect in &action.effect {
@@ -175,35 +240,71 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
         }
         for trigger in &action.triggers {
             if let Some(guard) = &trigger.guard {
-                check(guard, Scope::Fields).map_err(|e| {
-                    invalid(
-                        format!(
-                            "trigger '{}' on action '{}' guard",
-                            trigger.name, action.name
-                        ),
-                        e,
-                    )
-                })?;
+                let slot = format!(
+                    "trigger '{}' on action '{}' guard",
+                    trigger.name, action.name
+                );
+                check(guard, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;
+                no_params(guard, slot.clone())?;
+                no_related_field(guard, slot)?;
             }
         }
     }
     for inv in &automaton.invariants {
         let slot = format!("invariant '{}'", inv.name);
         check(&inv.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
-        if let Some(culprit) = crate::predicate::unmodelable(&inv.assert, &vars) {
+        no_params(&inv.assert, slot.clone())?;
+        if let Some(culprit) = crate::predicate::unverifiable(&inv.assert, &vars) {
             return Err(invalid(
                 slot,
                 format!(
                     "`{culprit}` reads a value the verification cascade cannot model \
-                     (a string, number, field or related entity); state it as a \
-                     [[field_invariant]], which is checked on writes"
+                     (a number that is not a counter, an undeclared field, or null); \
+                     state it as a [[field_invariant]], which is checked on writes"
                 ),
             ));
         }
     }
+    for live in &automaton.liveness {
+        let slot = format!("liveness '{}'", live.name);
+        let Some(eventually) = &live.eventually else {
+            if !live.relies_on.is_empty() {
+                return Err(invalid(slot, "`relies_on` needs `eventually`".into()));
+            }
+            continue;
+        };
+        if !live.from.is_empty() || !live.reaches.is_empty() || live.has_actions.is_some() {
+            return Err(invalid(
+                slot,
+                "`eventually` takes no `from`, `reaches` or `has_actions`".into(),
+            ));
+        }
+        check(eventually, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
+        if let Some(culprit) = crate::predicate::unverifiable(eventually, &vars) {
+            return Err(invalid(
+                slot,
+                format!(
+                    "`{culprit}` reads a value the verification cascade cannot model \
+                     (a number that is not a counter, an undeclared field, or null)"
+                ),
+            ));
+        }
+        if let Some(unknown) = live
+            .relies_on
+            .iter()
+            .find(|name| !automaton.actions.iter().any(|a| &a.name == *name))
+        {
+            return Err(invalid(
+                slot,
+                format!("`relies_on` names no action '{unknown}'"),
+            ));
+        }
+    }
     for inv in &automaton.field_invariants {
-        check(&inv.assert, Scope::Fields)
-            .map_err(|e| invalid(format!("field_invariant '{}'", inv.name), e))?;
+        let slot = format!("field_invariant '{}'", inv.name);
+        check(&inv.assert, Scope::Fields).map_err(|e| invalid(slot.clone(), e))?;
+        no_params(&inv.assert, slot.clone())?;
+        no_related_field(&inv.assert, slot)?;
     }
     for state in &automaton.automaton.terminal {
         if !automaton.automaton.states.contains(state) {

@@ -8,8 +8,9 @@ use temper_store_turso::TursoEventStore;
 
 const ORDER_IOA: &str = include_str!("../../../../../test-fixtures/specs/order.ioa.toml");
 const ORDER_CSDL: &str = include_str!("../../../../../test-fixtures/specs/model.csdl.xml");
-/// Well-formed TOML the cross-invariant parser does not accept.
-const UNSUPPORTED_CROSS_INVARIANTS: &str = "default_delete_policy = \"cascade\"\n";
+/// Well-formed TOML the cross-invariant parser does not accept: the server
+/// does not carry out `setnull`.
+const UNSUPPORTED_CROSS_INVARIANTS: &str = "default_delete_policy = \"setnull\"\n";
 
 struct Fixture {
     state: PlatformState,

@@ -234,7 +234,7 @@ on_timeout = "Expire"
     add_os_apps_dir(root.clone());
     let install = INSTALLER.scope(
         true,
-        install_os_app_with_plan(&state, tenant.as_str(), app, plan),
+        install_os_app_with_plan(&state, tenant.as_str(), app, plan, InstallOrigin::Request),
     );
     tokio::pin!(install);
     tokio::select! {
@@ -243,7 +243,7 @@ on_timeout = "Expire"
     }
     if let Some(other) = &other {
         // B's install ends with a walk of its own while A's still waits.
-        install_os_app_with_plan(&state, other.as_str(), app, plan)
+        install_os_app_with_plan(&state, other.as_str(), app, plan, InstallOrigin::Request)
             .await
             .expect("tenant B installs while tenant A waits for module storage");
     }

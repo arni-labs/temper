@@ -31,6 +31,8 @@
 //! with the journal in the simulated store, state timer rows in
 //! [`SimTimerRows`]; both outlive a restart.
 
+#[path = "dst_state_timers_follow_state/process_clock.rs"]
+mod process_clock;
 #[path = "dst_state_timers_follow_state/world.rs"]
 mod world;
 
@@ -39,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use process_clock::ProcessClock;
 use serde_json::json;
 use temper_runtime::persistence::EventStore;
 use temper_runtime::scheduler::{
@@ -47,7 +50,7 @@ use temper_runtime::scheduler::{
 use temper_runtime::tenant::TenantId;
 use temper_server::request_context::ScheduledFire;
 use temper_store_sim::SimEventStore;
-use world::{ProcessClock, SimTimerRows};
+use world::SimTimerRows;
 
 #[path = "dst_scheduled_actions_durable/process.rs"]
 mod process;
@@ -85,7 +88,7 @@ fn run_seed(seed: u64) -> Result<usize, String> {
             state
                 .get_or_create_tenant_entity(&TenantId::new(TENANT), "Job", &id, json!({}))
                 .await
-                .map_err(|error| run.fail("records are created", error))?;
+                .map_err(|error| run.fail("records are created", error.to_string()))?;
             let now = sim_now();
             let in_a_period = now + chrono::Duration::seconds(PERIOD);
             let (action, params, kind, due) = match rng.next_bound(4) {
@@ -329,3 +332,6 @@ fn dst_scheduled_actions_outlive_a_restart() {
         "no stop over {SEEDS} seeds came right after a written fire"
     );
 }
+
+#[path = "dst_scheduled_actions_durable/fractional.rs"]
+mod fractional;

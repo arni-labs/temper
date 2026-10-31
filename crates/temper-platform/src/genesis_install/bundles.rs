@@ -10,6 +10,7 @@ use super::bundle_transport::decode_bundle_response;
 use super::cache_paths::{
     app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
 };
+use super::registry::{RegistryUrl, registry_client};
 use super::{
     GenesisRegistryBundleApp, GenesisRegistryBundleFile, GenesisRegistryBundleResponse,
     RegistryAppRef, parse_registry_app_ref,
@@ -32,7 +33,7 @@ const MAX_GENESIS_TREE_DEPTH: usize = 128;
 const MAX_GENESIS_TREE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) async fn materialize_registry_app_closure_via_bundle(
-    registry_url: &str,
+    registry: &RegistryUrl,
     registry_tenant: &str,
     root_ref: RegistryAppRef,
     cache_root: &Path,
@@ -43,12 +44,12 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
     let version_hash = validate_git_object_id(version_hash)?;
     let bundle_url = format!(
         "{}/api/genesis/apps/{}/{}/versions/{}/bundle",
-        registry_url.trim_end_matches('/'),
+        registry.as_str(),
         root_ref.owner,
         root_ref.name,
         version_hash
     );
-    let response = reqwest::Client::new()
+    let response = registry_client()?
         .get(&bundle_url)
         .header("X-Tenant-Id", registry_tenant)
         .send()
