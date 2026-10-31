@@ -249,3 +249,210 @@ fn a_shared_record_cannot_satisfy_contradictory_guards_through_overlapping_lists
         "{result:?}"
     );
 }
+
+/// Check each backend directly: the cascade stops at the first refusal.
+fn refuses(source: &str, writes_first: bool) {
+    use temper_verify::proptest_gen::run_prop_tests_on_model;
+    use temper_verify::simulation::{SimConfig, run_multi_seed_simulation};
+
+    let model = build_model_from_ioa(source, 2).unwrap();
+    let result = check_model(&model);
+    let found = result
+        .counterexamples
+        .iter()
+        .find(|c| c.property == "EntryRules")
+        .unwrap_or_else(|| panic!("missed breaking Enter: {result:?}"));
+    assert_eq!(found.violated, ["entry"]);
+    assert_eq!(
+        found.trace[found.trace.len() - 2].1.as_ref().unwrap().name,
+        "Enter"
+    );
+    assert_eq!(found.trace.last().unwrap().0.status, "BeingMade");
+    if writes_first {
+        assert_eq!(found.trace[0].1.as_ref().unwrap().name, "Write");
+    }
+    let simulated = run_multi_seed_simulation(&model, &SimConfig::default(), 20);
+    assert!(
+        simulated
+            .iter()
+            .any(|s| s.violations.iter().any(|v| v.invariant == "entry")),
+        "{simulated:?}"
+    );
+    let tested = run_prop_tests_on_model(&model, 1000, 10);
+    assert_eq!(
+        tested.failure.as_ref().map(|f| f.invariant.as_str()),
+        Some("entry"),
+        "{tested:?}"
+    );
+}
+
+#[test]
+fn equality_through_related_statuses_explores_the_literal_input() {
+    let source = spec(
+        &(string("expected", "Other") + &string("topping", "one")),
+        "guard = \"Topping[topping].status == expected && Topping[topping].status == 'Stocked'\"",
+        "false",
+    );
+    refuses(
+        &format!(
+            r#"{source}
+[[action]]
+name = "Write"
+from = ["Waiting"]
+params = [{{ name = "expected", type = "string" }}]
+"#
+        ),
+        true,
+    );
+}
+
+#[test]
+fn missing_related_records_can_enable_a_breaking_move() {
+    for state in [
+        string("topping", "one"),
+        string("topping", ""),
+        list("topping", "[]"),
+        list("topping", "['one', 'two']"),
+    ] {
+        refuses(
+            &spec(
+                &state,
+                "guard = \"Topping[topping].status == null\"",
+                "false",
+            ),
+            false,
+        );
+        passes(&spec(
+            &state,
+            "guard = \"Topping[topping].status == null\"",
+            "Topping[topping].status != 'Stocked'",
+        ));
+    }
+}
+
+#[test]
+fn independent_list_inputs_can_name_distinct_records() {
+    let source = spec(
+        &(list("left", "[]") + &list("right", "[]")),
+        "guard = \"len(left) == 1 && len(right) == 1 && Topping[left].status == 'Stocked'\"",
+        "Topping[right].status == 'Stocked'",
+    );
+    refuses(
+        &format!(
+            r#"{source}
+[[action]]
+name = "Write"
+from = ["Waiting"]
+guard = "len(left) == 0 && len(right) == 0"
+params = [{{ name = "a", type = "string" }}, {{ name = "b", type = "string" }}]
+effect = ["append(left, params.a)", "append(right, params.b)"]
+"#
+        ),
+        true,
+    );
+}
+
+#[test]
+fn list_members_are_choices_for_guard_string_inputs() {
+    let source = spec(
+        &(string("expected", "Other")
+            + &list("allowed", "['Other', 'Stocked']")
+            + &string("topping", "one")),
+        "guard = \"expected in allowed && Topping[topping].status == expected\"",
+        "Topping[topping].status != 'Stocked'",
+    );
+    let source = format!(
+        r#"{source}
+[[action]]
+name = "Write"
+from = ["Waiting"]
+params = [{{ name = "expected", type = "string" }}]
+"#
+    );
+    refuses(&source, true);
+    // Here Stocked appears only in the list, so predicate literals alone
+    // cannot expose the breaking input.
+    let list_only = source
+        .replace(
+            "expected in allowed && Topping[topping].status == expected",
+            "expected in allowed && expected != 'Other' && Topping[topping].status == expected",
+        )
+        .replace("Topping[topping].status != 'Stocked'", "false");
+    refuses(&list_only, true);
+}
+
+#[test]
+fn reused_list_inputs_and_scalar_list_aliases_share_statuses() {
+    for (state, params, effects) in [
+        (
+            list("left", "[]") + &list("right", "[]"),
+            r#"[{ name = "a", type = "string" }]"#,
+            r#"["append(left, params.a)", "append(right, params.a)"]"#,
+        ),
+        (
+            string("left", "initial") + &list("right", "[]"),
+            r#"[{ name = "left", type = "string" }]"#,
+            r#"["append(right, params.left)"]"#,
+        ),
+    ] {
+        let source = spec(
+            &state,
+            "guard = \"len(right) == 1 && Topping[left].status == 'Stocked'\"",
+            "Topping[right].status == 'Stocked'",
+        );
+        passes(&format!(
+            r#"{source}
+[[action]]
+name = "Write"
+from = ["Waiting"]
+guard = "len(right) == 0"
+params = {params}
+effect = {effects}
+"#
+        ));
+    }
+}
+
+#[test]
+fn list_choices_preserve_equal_distinct_and_literal_identities() {
+    use temper_verify::model::{ModelString, semantics::successors};
+
+    let source = spec(
+        &(list("left", "[]") + &list("right", "['#1']")),
+        "guard = \"len(left) == 1 && Topping[left].status == 'Stocked'\"",
+        "Topping[right].status == 'Stocked'",
+    );
+    let source = format!(
+        r#"{source}
+[[action]]
+name = "Write"
+from = ["Waiting"]
+guard = "len(left) == 0"
+params = [{{ name = "a", type = "string" }}, {{ name = "b", type = "string" }}]
+effect = ["append(left, params.a)", "append(right, params.b)"]
+"#
+    );
+    let model = build_model_from_ioa(&source, 2).unwrap();
+    let before = model.init_states().remove(0);
+    let write = model
+        .transitions
+        .iter()
+        .find(|t| t.name == "Write")
+        .unwrap();
+    let choices = successors(&model, write, &before);
+    assert!(
+        choices
+            .iter()
+            .any(|(_, s)| s.lists["left"][0] == ModelString::from("#1"))
+    );
+    assert!(choices.iter().any(|(_, s)| {
+        matches!(s.lists["left"][0], ModelString::Symbol(_))
+            && s.lists["left"][0] == s.lists["right"][1]
+    }));
+    assert!(choices.iter().any(|(_, s)| {
+        matches!(s.lists["left"][0], ModelString::Symbol(_))
+            && matches!(s.lists["right"][1], ModelString::Symbol(_))
+            && s.lists["left"][0] != s.lists["right"][1]
+            && s.lists["left"][0] != s.lists["right"][0]
+    }));
+}

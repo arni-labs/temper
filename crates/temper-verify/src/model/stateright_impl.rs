@@ -7,7 +7,7 @@
 use stateright::{Model, Property};
 
 use super::semantics::{
-    canonical_strings, evaluate_guard, guard_may_hold, rule_for, step, successors, truth,
+    canonical_state, evaluate_guard, guard_may_hold, rule_for, step, successors, truth,
 };
 use temper_spec::predicate::Truth;
 
@@ -193,7 +193,7 @@ impl Model for TemperModel {
         // another (the simulator's late delivery) takes that state's rule.
         let resolved = rule_for(self, &action.name, &state.status)?;
         let mut next = step(resolved, state, &action.params);
-        canonical_strings(&mut [&mut next.strings]);
+        canonical_state(&mut next);
         Some(next)
     }
 

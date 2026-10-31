@@ -20,8 +20,8 @@ use strings::{string_literals, tracked_strings};
 
 use super::entry::resolve_entry_rules;
 use super::types::{
-    LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition,
-    StringParam, TemperModel,
+    LivenessKind, ModelEffect, ModelString, ResolvedInvariant, ResolvedLiveness,
+    ResolvedTransition, StringParam, TemperModel,
 };
 
 /// Build a `TemperModel` from I/O Automaton TOML source.
@@ -55,7 +55,7 @@ pub fn build_model_tracking(
     // Extract initial values from [[state]] declarations.
     let mut initial_counters = BTreeMap::new();
     let mut initial_booleans = BTreeMap::new();
-    let mut initial_lists = BTreeMap::new();
+    let mut initial_lists: BTreeMap<String, Vec<ModelString>> = BTreeMap::new();
     let mut counter_bounds = BTreeMap::new();
 
     for sv in &automaton.state {
@@ -68,7 +68,10 @@ pub fn build_model_tracking(
                 initial_booleans.insert(sv.name.clone(), *b);
             }
             Initial::List(items) => {
-                initial_lists.insert(sv.name.clone(), items.clone());
+                initial_lists.insert(
+                    sv.name.clone(),
+                    items.iter().cloned().map(Into::into).collect(),
+                );
             }
             // Strings and ints are not modeled.
             Initial::String(_) | Initial::Int(_) => {}
@@ -137,6 +140,10 @@ pub fn build_model_tracking(
         .map(|sv| (sv.name.clone(), sv.var_type.kind()))
         .collect();
 
+    let mut string_inputs = tracked_strings.clone();
+    for t in &transitions {
+        string_inputs.extend(t.string_params.iter().map(|p| p.name.clone()));
+    }
     TemperModel {
         states,
         transitions,
@@ -149,7 +156,7 @@ pub fn build_model_tracking(
         initial_counters,
         initial_booleans,
         initial_lists,
-        string_literals: string_literals(automaton, &tracked_strings),
+        string_literals: string_literals(automaton, &string_inputs),
         initial_strings,
         tracked_strings,
         counter_bounds,
@@ -200,6 +207,12 @@ fn resolve_transitions(
             let effects: Vec<ModelEffect> =
                 a.effects.into_iter().filter_map(convert_effect).collect();
             let params = effect_params(&effects);
+            let string_params = string_params(
+                action,
+                tracked_strings,
+                &params,
+                !automaton.entry_rules.is_empty(),
+            );
             ResolvedTransition {
                 name: a.name,
                 from_states: a.from_states,
@@ -207,7 +220,7 @@ fn resolve_transitions(
                 guard: a.guard,
                 effects,
                 params,
-                string_params: string_params(action, tracked_strings),
+                string_params,
             }
         })
         .collect()
@@ -217,10 +230,13 @@ fn resolve_transitions(
 /// a constraint ties to one (`failed_commit` must equal `commit`), with the
 /// action's constraints on each. The model needs the value of the second
 /// kind to decide whether the record takes the action, though it writes
-/// nothing it tracks.
+/// nothing it tracks. With entry rules, list inputs also use equality classes
+/// so independent inputs can name equal or distinct related records.
 fn string_params(
     action: &temper_spec::automaton::Action,
     tracked_strings: &BTreeSet<String>,
+    effect_params: &BTreeMap<String, ParamKind>,
+    entry_rules: bool,
 ) -> Vec<StringParam> {
     let tied = |name: &str| {
         action.constraints.iter().any(|c| {
@@ -238,7 +254,11 @@ fn string_params(
         .params
         .iter()
         .map(|param| param.name())
-        .filter(|name| tracked_strings.contains(*name) || tied(name))
+        .filter(|name| {
+            tracked_strings.contains(*name)
+                || tied(name)
+                || (entry_rules && effect_params.get(*name) == Some(&ParamKind::Str))
+        })
         .map(|name| {
             let mut param = StringParam {
                 name: name.to_string(),

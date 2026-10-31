@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Env, Expr, Literal, Operand, Set, Truth, Val, VarKind, eval};
 
-use super::semantics::{Expansion, ModelEnv, canonical_strings, rule_for, successors};
+use super::semantics::{Expansion, ModelEnv, rule_for, successors};
 use super::types::{
     ModelString, ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelAction,
     TemperModelState,
@@ -64,8 +64,7 @@ pub(crate) fn entry_broken<'m>(
         .filter(|t| model.transition_enabled(t, state))
         .find_map(|t| {
             let rule = broken_by(model, t, state)?;
-            let (params, mut after) = successors(model, t, state).into_iter().next()?;
-            canonical_strings(&mut [&mut after.strings]);
+            let (params, after) = successors(model, t, state).into_iter().next()?;
             Some(EntryViolation {
                 rule,
                 action: TemperModelAction {
@@ -113,17 +112,15 @@ fn breaks(
     let mut places = BTreeSet::from([ModelString::from(state.status.clone())]);
     // Nonliteral operands can name a concrete local string or an equality
     // symbol. Include both, so equality with either is a possible assignment.
-    places.extend(state.strings.values().map(|value| match value {
-        ModelString::BlankSymbol(n) => ModelString::Symbol(*n),
-        other => other.clone(),
-    }));
     places.extend(
         state
-            .lists
+            .strings
             .values()
-            .flatten()
-            .cloned()
-            .map(ModelString::from),
+            .chain(state.lists.values().flatten())
+            .map(|value| match value {
+                ModelString::BlankSymbol(n) => ModelString::Symbol(*n),
+                other => other.clone(),
+            }),
     );
     let mut comparisons = 0;
     for expr in exprs {
@@ -146,6 +143,11 @@ fn breaks(
         .unwrap_or(0)
         + 1;
     places.extend((first..first + fresh).map(ModelString::Symbol));
+    // A referenced record can be missing. Null participates in the same
+    // assignment as strings, including when several fields alias that ID.
+    let places: Vec<_> = std::iter::once(None)
+        .chain(places.into_iter().map(Some))
+        .collect();
     let mut references = BTreeMap::new();
     let mut related = BTreeMap::new();
     for key in refs {
@@ -157,7 +159,6 @@ fn breaks(
                 .into_iter()
                 .flatten()
                 .cloned()
-                .map(ModelString::from)
                 .collect(),
             _ => BTreeSet::new(),
         };
@@ -192,7 +193,7 @@ fn breaks(
         assertion: &rule.assert,
         references,
         related: related.into_iter().collect(),
-        places: places.into_iter().collect(),
+        places,
         budget: Expansion::for_model(model),
     }
     .any_assignment(0, &mut BTreeMap::new())
@@ -213,7 +214,7 @@ struct StatusSearch<'a> {
     assertion: &'a Expr,
     references: BTreeMap<Related, Vec<StatusKey>>,
     related: Vec<(StatusKey, usize)>,
-    places: Vec<ModelString>,
+    places: Vec<Option<ModelString>>,
     budget: Expansion,
 }
 
@@ -221,7 +222,7 @@ impl StatusSearch<'_> {
     fn any_assignment(
         &self,
         index: usize,
-        assigned: &mut BTreeMap<StatusKey, Vec<ModelString>>,
+        assigned: &mut BTreeMap<StatusKey, Vec<Option<ModelString>>>,
     ) -> bool {
         if !self.budget.take() {
             return false;
@@ -241,8 +242,8 @@ impl StatusSearch<'_> {
         &self,
         index: usize,
         start: usize,
-        chosen: &mut Vec<ModelString>,
-        assigned: &mut BTreeMap<StatusKey, Vec<ModelString>>,
+        chosen: &mut Vec<Option<ModelString>>,
+        assigned: &mut BTreeMap<StatusKey, Vec<Option<ModelString>>>,
     ) -> bool {
         let (key, size) = &self.related[index];
         if !chosen.is_empty() {
@@ -314,7 +315,7 @@ fn compared_values(expr: &Expr, out: &mut BTreeSet<ModelString>, comparisons: &m
 struct Assumed<'a> {
     local: &'a ModelEnv<'a>,
     references: &'a BTreeMap<Related, Vec<StatusKey>>,
-    statuses: &'a BTreeMap<StatusKey, Vec<ModelString>>,
+    statuses: &'a BTreeMap<StatusKey, Vec<Option<ModelString>>>,
 }
 
 impl Env for Assumed<'_> {
@@ -331,7 +332,11 @@ impl Env for Assumed<'_> {
         self.references.get(&key).map(|records| {
             records
                 .iter()
-                .flat_map(|record| self.statuses[record].iter().map(ModelString::val))
+                .flat_map(|record| {
+                    self.statuses[record]
+                        .iter()
+                        .map(|s| s.as_ref().map_or(Val::Null, ModelString::val))
+                })
                 .collect()
         })
     }

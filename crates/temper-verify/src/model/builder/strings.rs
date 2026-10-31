@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::{ActionKind, Automaton};
-use temper_spec::predicate::{CmpOp, Expr, Literal, Name, Operand, Set, VarKind};
+use temper_spec::predicate::{Expr, Literal, Name, Operand, Set, VarKind};
 
 use super::rule_asserts;
 
@@ -79,59 +79,56 @@ pub(super) fn tracked_strings(
     }
 }
 
-/// For each tracked string variable, the literals a guard or rule compares
-/// it with (`v == 'x'`, `v in ['x', 'y']`).
+/// Concrete equality classes from every predicate. A local input may be tied
+/// to a literal indirectly through related statuses, another variable or a
+/// list, so sampling only literals directly compared to that variable loses
+/// transitive equalities. Sharing the finite literal vocabulary is safe;
+/// guards still decide which choices are executable.
 pub(super) fn string_literals(
     automaton: &Automaton,
     tracked: &BTreeSet<String>,
 ) -> BTreeMap<String, BTreeSet<String>> {
-    fn visit(
-        expr: &Expr,
-        tracked: &BTreeSet<String>,
-        out: &mut BTreeMap<String, BTreeSet<String>>,
-    ) {
+    fn note(operand: &Operand, out: &mut BTreeSet<String>) {
+        if let Operand::Lit(Literal::Str(text)) = operand {
+            out.insert(text.clone());
+        }
+    }
+    fn visit(expr: &Expr, out: &mut BTreeSet<String>) {
         match expr {
-            Expr::Not(inner) => visit(inner, tracked, out),
+            Expr::Not(inner) => visit(inner, out),
             Expr::And(parts) | Expr::Or(parts) => {
-                parts.iter().for_each(|part| visit(part, tracked, out));
+                parts.iter().for_each(|part| visit(part, out));
             }
             Expr::Implies(a, b) => {
-                visit(a, tracked, out);
-                visit(b, tracked, out);
+                visit(a, out);
+                visit(b, out);
             }
-            Expr::Compare {
-                lhs,
-                op: CmpOp::Eq | CmpOp::Ne,
-                rhs,
-            } => {
-                for (var, lit) in [(lhs, rhs), (rhs, lhs)] {
-                    if let (Operand::Var(var), Operand::Lit(Literal::Str(text))) = (var, lit)
-                        && tracked.contains(var)
-                    {
-                        out.entry(var.clone()).or_default().insert(text.clone());
-                    }
-                }
+            Expr::Compare { lhs, rhs, .. } => {
+                note(lhs, out);
+                note(rhs, out);
             }
-            Expr::In {
-                value: Operand::Var(var),
-                set: Set::List(items),
-                ..
-            } if tracked.contains(var) => {
-                for item in items {
-                    if let Literal::Str(text) = item {
-                        out.entry(var.clone()).or_default().insert(text.clone());
+            Expr::In { value, set, .. } => {
+                note(value, out);
+                if let Set::List(items) = set {
+                    for item in items {
+                        if let Literal::Str(text) = item {
+                            out.insert(text.clone());
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
-    let mut out = BTreeMap::new();
+    let mut literals = BTreeSet::new();
     for action in &automaton.actions {
-        visit(&action.guard, tracked, &mut out);
+        visit(&action.guard, &mut literals);
     }
     for assert in rule_asserts(automaton) {
-        visit(assert, tracked, &mut out);
+        visit(assert, &mut literals);
     }
-    out
+    tracked
+        .iter()
+        .map(|var| (var.clone(), literals.clone()))
+        .collect()
 }
