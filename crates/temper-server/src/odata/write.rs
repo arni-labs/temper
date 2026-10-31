@@ -820,11 +820,12 @@ pub async fn handle_odata_post(
             }
 
             match state
-                .try_create_data_only_tenant_entity(
+                .try_create_data_only_tenant_entity_by(
                     &tenant,
                     &entity_type,
                     &entity_id,
                     initial_fields.clone(),
+                    Some(&agent_ctx),
                 )
                 .await
             {
@@ -1305,6 +1306,7 @@ pub async fn handle_odata_patch(
                         body_json,
                         false,
                         existing.precondition,
+                        &agent_ctx,
                     )
                     .await;
                 if let Ok(response) = &answer
@@ -1565,6 +1567,7 @@ pub async fn handle_odata_put(
                         body_json,
                         true,
                         existing.precondition,
+                        &agent_ctx,
                     )
                     .await;
                 if let Ok(response) = &answer
@@ -1789,6 +1792,7 @@ pub async fn handle_odata_delete(
                         &entity_type,
                         &key_str,
                         existing.precondition,
+                        &agent_ctx,
                     )
                     .await;
                 if let Ok(response) = &answer

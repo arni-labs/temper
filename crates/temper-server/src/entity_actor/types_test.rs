@@ -52,6 +52,7 @@ fn event_budget_is_based_on_snapshot_tail_not_lifetime_total() {
         last_snapshot_sequence_nr: MAX_EVENTS_SINCE_SNAPSHOT as u64 + 48,
         sequence_nr: MAX_EVENTS_SINCE_SNAPSHOT as u64 + 50,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        last_event: Default::default(),
         status_clock: Default::default(),
         spawn_reservations: Default::default(),
     };
@@ -76,6 +77,7 @@ fn event_budget_rejects_when_snapshot_tail_reaches_cap() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: MAX_EVENTS_SINCE_SNAPSHOT as u64,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        last_event: Default::default(),
         status_clock: Default::default(),
         spawn_reservations: Default::default(),
     };
@@ -100,6 +102,7 @@ fn entity_response_spec_governed_skipped_when_true() {
         last_snapshot_sequence_nr: 0,
         sequence_nr: 0,
         processed_idempotency_keys: std::collections::BTreeMap::new(),
+        last_event: Default::default(),
         status_clock: Default::default(),
         spawn_reservations: Default::default(),
     };

@@ -14,6 +14,7 @@ impl EntityEvent {
             params: serde_json::json!({}),
             idempotency_key: None,
             outcome: None,
+            origin: crate::entity_actor::EventOrigin::internal(),
             kind: temper_runtime::persistence::EventKind::Tombstone,
         }
     }

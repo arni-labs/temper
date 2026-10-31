@@ -131,7 +131,7 @@ impl ServerState {
         let mut events = Vec::with_capacity(3);
 
         let created = EntityEvent::bootstrap(state.status.clone());
-        push_synthetic_event(&mut state, &mut events, created);
+        push_synthetic_event(&mut state, &mut events, created, agent_ctx);
 
         let no_xref = std::collections::BTreeMap::new();
         if create_params
@@ -140,7 +140,7 @@ impl ServerState {
         {
             let create_event =
                 apply_synthetic_file_action(&mut state, &table, "Create", create_params, &no_xref)?;
-            push_synthetic_event(&mut state, &mut events, create_event);
+            push_synthetic_event(&mut state, &mut events, create_event, agent_ctx);
         }
 
         let version_number = state.counters.get("version_count").copied().unwrap_or(0) + 1;
@@ -178,7 +178,7 @@ impl ServerState {
             stream_params,
             &stream_xref,
         )?;
-        push_synthetic_event(&mut state, &mut events, stream_event);
+        push_synthetic_event(&mut state, &mut events, stream_event, agent_ctx);
 
         let envelopes = events
             .iter()
@@ -434,8 +434,10 @@ fn apply_synthetic_file_action(
 fn push_synthetic_event(
     state: &mut EntityState,
     events: &mut Vec<EntityEvent>,
-    event: EntityEvent,
+    mut event: EntityEvent,
+    caller: &crate::request_context::AgentContext,
 ) {
+    event.origin = crate::entity_actor::EventOrigin::from_caller(Some(caller));
     state.sequence_nr = state.sequence_nr.saturating_add(1);
     state.push_event_bounded(event.clone());
     events.push(event);

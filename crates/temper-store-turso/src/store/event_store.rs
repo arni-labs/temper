@@ -395,6 +395,38 @@ impl EventStore for TursoEventStore {
         Ok(page)
     }
 
+    async fn first_event_at(
+        &self,
+        persistence_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let conn = self.configured_connection().await?;
+        // One read keeps the saved fact and the journal fallback consistent
+        // with compaction. Both probes use the full record key.
+        let mut rows = conn.query(
+            "SELECT COALESCE(
+                (SELECT first_event_at FROM entity_catalog INDEXED BY sqlite_autoindex_entity_catalog_1
+                 WHERE tenant=?1 AND entity_type=?2 AND entity_id=?3),
+                (SELECT COALESCE(json_extract(payload, '$.timestamp'), json_extract(metadata, '$.timestamp'))
+                 FROM events INDEXED BY idx_events_entity
+                 WHERE tenant=?1 AND entity_type=?2 AND entity_id=?3 AND sequence_nr=1))",
+            params![tenant, entity_type, entity_id]).await.map_err(storage_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| PersistenceError::Storage("missing creation lookup row".into()))?;
+        let saved: Option<String> = row.get(0).map_err(storage_error)?;
+        saved
+            .map(|saved| {
+                chrono::DateTime::parse_from_rfc3339(&saved)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|error| PersistenceError::Serialization(error.to_string()))
+            })
+            .transpose()
+    }
+
     #[instrument(skip_all, fields(persistence_id, otel.name = "turso.save_snapshot"))]
     async fn save_snapshot(
         &self,
