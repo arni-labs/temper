@@ -6,7 +6,7 @@ use axum::{body::Body, http::Request};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use temper_authz::{AuthenticatedRequestContext, SecurityContext};
+use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
 use temper_runtime::scheduler::{
     DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
 };
@@ -111,6 +111,16 @@ async fn settle() {
     }
 }
 async fn request(state: &ServerState, method: &str, uri: &str, body: Value) -> Value {
+    let ann = SecurityContext::from_resolved_identity("ann", "person", None);
+    request_as(state, ann, method, uri, body).await
+}
+async fn request_as(
+    state: &ServerState,
+    caller: SecurityContext,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> Value {
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
@@ -120,7 +130,7 @@ async fn request(state: &ServerState, method: &str, uri: &str, body: Value) -> V
     req.extensions_mut()
         .insert(AuthenticatedRequestContext::new(
             TenantId::default(),
-            SecurityContext::from_resolved_identity("ann", "person", None),
+            caller,
         ));
     let app = if uri.starts_with("/observe") {
         axum::Router::new()
@@ -324,6 +334,75 @@ fn dst_latest_event_survives_timers_reactions_and_snapshot_restore() {
             let event = history["events"].as_array().unwrap().last().unwrap();
             assert_eq!(event["via"], "request");
             assert_eq!(event["by"], "ann");
+            clock.end(Duration::ZERO);
+        });
+    }
+}
+
+#[test]
+fn dst_history_names_whom_an_agent_acted_for() {
+    // The contexts the bearer layer builds from verified tokens: an agent's
+    // token (`client_id`, `agent_type`, `sub`) and a person's (`sub` only).
+    let agent = || {
+        SecurityContext::from_verified_jwt(
+            "hub-client",
+            PrincipalKind::Agent,
+            Some("claude-code"),
+            Some("ann"),
+            Some("contributor"),
+            None,
+        )
+    };
+    let ann = || {
+        SecurityContext::from_verified_jwt("ann", PrincipalKind::Customer, None, None, None, None)
+    };
+    for seed in 0..16 {
+        let clock = Arc::new(process_clock::ProcessClock::new());
+        let _sim = install_sim_context(clock.clone(), Arc::new(DeterministicIdGen::new(seed)));
+        runtime().block_on(async {
+            clock.begin();
+            let store = SimEventStore::no_faults(seed);
+            let state = server(&store);
+            request_as(&state, agent(), "POST", "/tdata/Jobs", json!({"Id":"job"})).await;
+            let start = "/tdata/Jobs('job')/Jobs.Start";
+            // Forged origin parameters stay parameters.
+            let forged = json!({"for":"mallory", "agent_type":"forged"});
+            request_as(&state, agent(), "POST", start, forged).await;
+            let poke = "/tdata/Jobs('job')/Jobs.Poke";
+            request_as(&state, ann(), "POST", poke, json!({})).await;
+            tokio::time::advance(Duration::from_secs(180)).await;
+            settle().await;
+            let history = request(
+                &state,
+                "GET",
+                "/observe/entities/Job/job/history",
+                Value::Null,
+            )
+            .await;
+            let rows: Vec<Value> = history["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    json!([
+                        event["action"],
+                        event["via"],
+                        event["by"],
+                        event["for"],
+                        event["agent_type"]
+                    ])
+                })
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    json!(["Created", "request", "hub-client", "ann", "claude-code"]),
+                    json!(["Start", "request", "hub-client", "ann", "claude-code"]),
+                    json!(["Poke", "request", "ann", null, null]),
+                    json!(["Expire", "timer", null, null, null]),
+                ],
+                "seed {seed}: {history}"
+            );
             clock.end(Duration::ZERO);
         });
     }
