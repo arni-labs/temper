@@ -80,15 +80,17 @@ pub(crate) fn apply_field_update(
 pub struct ScheduledAction {
     /// The action name to dispatch.
     pub action: String,
-    /// Delay in seconds before dispatching the action.
-    pub delay_seconds: u64,
+    /// Delay in milliseconds before dispatching the action.
+    pub delay_millis: u64,
     /// The arming event's journal sequence and this action's place among the
     /// event's schedules, `<seq>.<index>`. The actor sets it when it writes
     /// that event; empty until then.
     #[serde(default)]
     pub arm_id: String,
-    /// When it is due: the arming event's time plus the delay, as its row
-    /// says. The actor sets it with `arm_id`; None until then.
+    /// The absolute `schedule_at` target (clamped to now if past), or the
+    /// arming event's time plus the delay for `schedule`. Kept exactly in
+    /// the durable row; `schedule_at` sets it when resolved, `schedule`
+    /// when the actor arms it.
     #[serde(default)]
     pub due_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -768,7 +770,7 @@ pub fn apply_effects(
             } => {
                 scheduled_actions.push(ScheduledAction {
                     action: action.clone(),
-                    delay_seconds: *delay_seconds,
+                    delay_millis: delay_seconds.saturating_mul(1000),
                     arm_id: String::new(),
                     due_at: None,
                 });
@@ -1075,21 +1077,21 @@ pub fn resolve_schedule_at_requests(
                         .ok()
                         .map(|ndt| ndt.and_utc())
                 })?;
-            let delay_seconds = (target - now).num_seconds().max(0) as u64;
+            let delay_millis = (target - now).num_milliseconds().max(0) as u64;
             tracing::info!(
                 entity_type = %state.entity_type,
                 entity_id = %state.entity_id,
                 action = %req.action,
                 field = %req.field,
                 target = %target,
-                delay_seconds,
+                delay_millis,
                 "schedule_at resolved"
             );
             Some(ScheduledAction {
                 action: req.action.clone(),
-                delay_seconds,
+                delay_millis,
                 arm_id: String::new(),
-                due_at: None,
+                due_at: Some(target.max(now)),
             })
         })
         .collect()
@@ -1371,7 +1373,7 @@ to = "Refreshing"
         assert_eq!(state.status, "Active");
         assert_eq!(result.scheduled_actions.len(), 1);
         assert_eq!(result.scheduled_actions[0].action, "Refresh");
-        assert_eq!(result.scheduled_actions[0].delay_seconds, 2700);
+        assert_eq!(result.scheduled_actions[0].delay_millis, 2_700_000);
     }
 
     /// Build a minimal `EntityState` for guard-error rendering tests.
@@ -1502,7 +1504,7 @@ to = "Closed"
         assert!(custom.is_empty());
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].action, "Refresh");
-        assert_eq!(scheduled[0].delay_seconds, 3600);
+        assert_eq!(scheduled[0].delay_millis, 3_600_000);
         assert_eq!(state.status, "Active");
     }
 
@@ -1795,7 +1797,7 @@ from = ["Active"]
         );
         assert_eq!(result.scheduled_actions[0].action, "Trigger");
         // Delay should be ~300 seconds (sim_now is deterministic)
-        assert_eq!(result.scheduled_actions[0].delay_seconds, 300);
+        assert_eq!(result.scheduled_actions[0].delay_millis, 300_000);
     }
 
     #[test]
@@ -1854,7 +1856,7 @@ from = ["Active"]
         assert!(result.success);
         assert_eq!(result.scheduled_actions.len(), 1);
         assert_eq!(
-            result.scheduled_actions[0].delay_seconds, 0,
+            result.scheduled_actions[0].delay_millis, 0,
             "past timestamp should fire immediately"
         );
     }

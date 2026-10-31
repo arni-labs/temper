@@ -177,7 +177,11 @@ fn immediate_scheduled_follow_ons_keep_the_parent_lineage_and_clocked_ones_start
     assert!(immediate.inline_chain.is_empty());
     assert_eq!(immediate.callback_hops, context.callback_hops);
 
-    let clocked = context.for_scheduled_follow_on("Ring", 0, 1);
+    for delay_millis in [1, 999] {
+        let fractional = context.for_scheduled_follow_on("Ring", 0, delay_millis);
+        assert_eq!(fractional.callback_hops, context.callback_hops);
+    }
+    let clocked = context.for_scheduled_follow_on("Ring", 0, 1000);
     assert!(clocked.inline_chain.is_empty());
     assert_eq!(clocked.callback_hops, 0);
     assert_eq!(clocked.agent_id, context.agent_id);
@@ -193,7 +197,7 @@ fn a_scheduled_follow_on_has_a_key_of_its_own_that_a_retry_derives_again() {
         ..AgentContext::default()
     };
     let first = context
-        .for_scheduled_follow_on("Ring", 0, 1)
+        .for_scheduled_follow_on("Ring", 0, 1000)
         .idempotency_key;
     // The parent's key is the scheduling transition's; reusing it would
     // answer the follow-on with that transition's reply.
@@ -201,18 +205,18 @@ fn a_scheduled_follow_on_has_a_key_of_its_own_that_a_retry_derives_again() {
     assert_eq!(
         first,
         context
-            .for_scheduled_follow_on("Ring", 0, 1)
+            .for_scheduled_follow_on("Ring", 0, 1000)
             .idempotency_key
     );
     assert_ne!(
         first,
         context
-            .for_scheduled_follow_on("Ring", 1, 1)
+            .for_scheduled_follow_on("Ring", 1, 1000)
             .idempotency_key
     );
     assert_eq!(
         AgentContext::default()
-            .for_scheduled_follow_on("Ring", 0, 1)
+            .for_scheduled_follow_on("Ring", 0, 1000)
             .idempotency_key,
         None
     );
@@ -228,7 +232,7 @@ fn a_scheduled_rows_context_keeps_its_lineage_and_key_after_recovery() {
         idempotency_key: Some(IdempotencyKey::Request("press-once".into())),
         ..AgentContext::for_service("invoker")
     };
-    for delay in [0, 1] {
+    for delay in [0, 1, 999, 1000] {
         let child = parent.for_scheduled_follow_on("Ring", 0, delay);
         let recovered = decode_armed_by(&encode_scheduled_armed_by(&child).unwrap()).unwrap();
         assert_eq!(recovered.callback_hops, child.callback_hops);

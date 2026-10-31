@@ -385,7 +385,7 @@ fn estimate_counts_every_collection_a_reply_keeps() {
             .scheduled_actions
             .push(crate::entity_actor::ScheduledAction {
                 action: format!("Timer{index:03}"),
-                delay_seconds: 5,
+                delay_millis: 5000,
                 arm_id: String::new(),
                 due_at: None,
             });

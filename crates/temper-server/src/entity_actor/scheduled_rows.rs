@@ -46,10 +46,14 @@ impl EntityActor {
         };
         for (index, action) in scheduled.iter_mut().enumerate() {
             action.arm_id = format!("{sequence}.{index}");
-            action.due_at = i64::try_from(action.delay_seconds)
-                .ok()
-                .and_then(chrono::Duration::try_seconds)
-                .and_then(|delay| event.timestamp.checked_add_signed(delay));
+            // An absolute schedule keeps its target, even if processing the
+            // arming event took time. A relative schedule starts at the event.
+            action.due_at = action.due_at.or_else(|| {
+                i64::try_from(action.delay_millis)
+                    .ok()
+                    .and_then(chrono::Duration::try_milliseconds)
+                    .and_then(|delay| event.timestamp.checked_add_signed(delay))
+            });
         }
         if !journaled {
             return ScheduledRows::default();
@@ -74,7 +78,7 @@ impl EntityActor {
             .map(|(index, action)| {
                 let follow_on = caller
                     .unwrap_or(&AgentContext::default())
-                    .for_scheduled_follow_on(&action.action, index, action.delay_seconds);
+                    .for_scheduled_follow_on(&action.action, index, action.delay_millis);
                 let armed_by = encode_scheduled_armed_by(&follow_on).unwrap_or_else(|error| {
                     tracing::error!(entity_type = %state.entity_type, entity_id = %state.entity_id,
                         %error, "scheduled action caller not encodable; it fires with no identity");
