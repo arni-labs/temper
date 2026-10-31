@@ -31,9 +31,14 @@ mod world;
 
 use world::*;
 
-/// A move its guard refused on the record as it is: not stale.
+/// A move its guard refused on the record as it is, by a guard expression or
+/// by the states it may start from: not stale.
 fn refused_by_guard(status: StatusCode, body: &Value) -> bool {
-    status == StatusCode::CONFLICT && body["error"]["code"] == "ActionFailed"
+    status == StatusCode::CONFLICT
+        && matches!(
+            body["error"]["code"].as_str(),
+            Some("GuardFailed" | "InvalidState")
+        )
 }
 
 /// N allowed moves race on one record: each lands on its first attempt.
