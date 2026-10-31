@@ -178,9 +178,10 @@ pub fn invariant_proofs(
                 kernel_moves: true,
                 relies_on,
             };
-            Ok(JointModel::new(
-                &by_name, &scope, name, &exprs, sending, true,
-            ))
+            Ok(
+                JointModel::new(&by_name, &scope, name, &exprs, sending, true)
+                    .without_silent(&by_name),
+            )
         } else {
             Err(format!(
                 "it reads {}, which this app does not declare",
@@ -311,14 +312,10 @@ pub fn liveness_proofs(
                         .map(|action| (name.to_string(), action.clone()))
                         .collect(),
                 };
-                Ok(JointModel::new(
-                    &by_name,
-                    &scope,
-                    name,
-                    &[goal],
-                    sending,
-                    true,
-                ))
+                Ok(
+                    JointModel::new(&by_name, &scope, name, &[goal], sending, true)
+                        .without_silent(&by_name),
+                )
             } else {
                 Err(format!(
                     "it reads {}, which this app does not declare",
