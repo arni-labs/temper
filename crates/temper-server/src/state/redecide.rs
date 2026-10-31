@@ -11,8 +11,11 @@
 //! and run every check again on it, instead of answering 409 for a write its
 //! policy allows. Nothing is decided on old state, and a check added to a route
 //! later is decided again with the rest, without a list to keep in sync.
-//! Outside bound actions instead answer `StaleWrite`; their caller re-reads
-//! and retries (see `dispatch::outside_write`).
+//! Writes from outside are decided again the same way: a bound action, an
+//! HttpEndpoint's action bridge or admission, and a webhook. Their dispatch
+//! answers `StaleWrite` (see `dispatch::outside_write`) where a kernel write's
+//! answers the actor's refusal, and only a write still decided on a changed
+//! record at the deadline answers it to the caller.
 
 use std::time::Duration;
 
