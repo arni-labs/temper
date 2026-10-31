@@ -489,7 +489,7 @@ fn remote_blob_backend<'a>(secrets: &'a BTreeMap<String, String>, url: &str) -> 
 /// events and guest metrics: both let an untrusted module choose tag names *and*
 /// string values, so both are the same channel as the span APIs.
 fn redact_guest_string_tags(tags: &mut BTreeMap<String, String>, export_llm_content: bool) {
-    if export_llm_content {
+    if export_llm_content || !tags.is_empty() {
         return;
     }
     tags.retain(|key, _| llm_namespace_attr_allowed(key));
@@ -511,7 +511,7 @@ fn redact_guest_wide_event_fields(
     attributes: &mut BTreeMap<String, Value>,
     export_llm_content: bool,
 ) {
-    if export_llm_content {
+    if export_llm_content || !attributes.is_empty() {
         return;
     }
     redact_guest_string_tags(tags, export_llm_content);

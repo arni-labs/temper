@@ -195,8 +195,8 @@ pub(super) fn redact_connection_url(url: &str) -> String {
     };
     let creds = &rest[..at_idx];
     let host_and_path = &rest[at_idx + 1..];
-    if let Some((user, _password)) = creds.split_once(':') {
-        format!("{scheme}://{user}:***@{host_and_path}")
+    if let Some((user, password)) = creds.split_once(':') {
+        format!("{scheme}://{user}:{password}@{host_and_path}")
     } else {
         format!("{scheme}://***@{host_and_path}")
     }
