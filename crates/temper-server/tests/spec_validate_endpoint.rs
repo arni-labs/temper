@@ -175,3 +175,61 @@ async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
         "{stopped}"
     );
 }
+
+/// A note that says why it closed, in words no rule reads.
+const NOTE: &str = include_str!("../../../test-fixtures/kept/note.ioa.toml");
+
+/// The answer `state`'s validate-ioa gives `ioa`.
+async fn validate(state: &ServerState, ioa: &str) -> serde_json::Value {
+    let response = build_router(state.clone())
+        .oneshot(authenticated_post(
+            "/api/specs/validate-ioa",
+            &serde_json::json!({ "ioa_source": ioa }).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn validate_ioa_keeps_a_passing_verdict_for_a_change_no_level_reads() {
+    let state = test_state_with_registry();
+
+    let checked = validate(&state, NOTE).await;
+    assert_eq!(checked["all_passed"], true, "{checked}");
+    assert!(
+        checked.get("kept").is_none(),
+        "the first check runs: {checked}"
+    );
+
+    let reworded = NOTE.replace("Closed by its owner", "Closed by whoever owns it");
+    let kept = validate(&state, &reworded).await;
+    assert_eq!(kept["all_passed"], true);
+    let digest = kept["kept"].as_str().expect("the answer says it was kept");
+    assert_eq!(digest.len(), 64, "{digest}");
+    assert_eq!(kept["levels"], checked["levels"]);
+
+    let guarded = NOTE.replace("guard = \"count < 2\"", "guard = \"count < 1\"");
+    let rechecked = validate(&state, &guarded).await;
+    assert_eq!(rechecked["all_passed"], true, "{rechecked}");
+    assert!(
+        rechecked.get("kept").is_none(),
+        "a guard is read, so its change is checked: {rechecked}"
+    );
+}
+
+#[tokio::test]
+async fn validate_ioa_checks_a_failing_spec_again() {
+    let state = test_state_with_registry();
+    let broken = NOTE.replace("assert = \"count <= 2\"", "assert = \"count <= 1\"");
+    assert_ne!(broken, NOTE);
+    for attempt in 0..2 {
+        let answer = validate(&state, &broken).await;
+        assert_eq!(answer["all_passed"], false, "attempt {attempt}: {answer}");
+        assert!(answer.get("kept").is_none(), "attempt {attempt}: {answer}");
+    }
+}
