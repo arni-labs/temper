@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::{Action, ActionConstraint};
 use temper_spec::predicate::{CmpOp, Env, Expr, Literal, Operand, Set, Val, eval};
 
+use super::count_bounds::CountRange;
 use super::semantics::{Expansion, ModelEnv, evaluate_guard, param_assignments};
 use super::strings::string_assignments;
 use super::types::{ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState};
@@ -80,42 +81,80 @@ pub(super) fn guard_with_constraints(action: &Action) -> Expr {
     Expr::And(parts)
 }
 
-/// Effects can collapse inputs that a guard distinguishes. Explore through
-/// every guard literal and local count, plus one distinct value per input:
-/// comparisons can distinguish those values even when effects cannot.
-pub(super) fn guard_count_bound(model: &TemperModel, t: &ResolvedTransition) -> usize {
+/// Effects can collapse inputs that a guard distinguishes. Follow comparisons
+/// from this input (including other inputs it is compared with), and explore
+/// through their literals, local bounds and other inputs' effect ranges,
+/// plus one distinct value per input.
+/// Unrelated state and independent comparisons cannot widen this range.
+pub(super) fn guard_count_bound(
+    model: &TemperModel,
+    t: &ResolvedTransition,
+    param: &str,
+    effect_ranges: &BTreeMap<&str, CountRange>,
+) -> usize {
     fn literal(value: &Literal) -> usize {
         match value {
             Literal::Int(n) => usize::try_from(*n).unwrap_or(0),
             _ => 0,
         }
     }
-    fn operand(value: &Operand) -> usize {
+    fn operand(model: &TemperModel, value: &Operand) -> usize {
         match value {
             Operand::Lit(value) => literal(value),
+            Operand::Var(name) => model.counter_bounds.get(name).copied().unwrap_or(0),
+            Operand::Len(name) => model.list_bounds.get(name).copied().unwrap_or(0),
             _ => 0,
         }
     }
-    fn largest(expr: &Expr) -> usize {
+    fn connected(value: &Operand, params: &BTreeSet<String>) -> bool {
+        matches!(value, Operand::Param(name) if params.contains(name))
+    }
+    fn inspect(expr: &Expr, model: &TemperModel, params: &mut BTreeSet<String>, bound: &mut usize) {
         match expr {
-            Expr::Compare { lhs, rhs, .. } => operand(lhs).max(operand(rhs)),
-            Expr::In { value, set, .. } => operand(value).max(match set {
-                Set::List(items) => items.iter().map(literal).max().unwrap_or(0),
-                Set::Var(_) => 0,
-            }),
-            Expr::And(parts) | Expr::Or(parts) => parts.iter().map(largest).max().unwrap_or(0),
-            Expr::Implies(a, b) => largest(a).max(largest(b)),
-            Expr::Not(inner) => largest(inner),
-            _ => 0,
+            Expr::Compare { lhs, rhs, .. } if connected(lhs, params) || connected(rhs, params) => {
+                *bound = (*bound).max(operand(model, lhs)).max(operand(model, rhs));
+                for value in [lhs, rhs] {
+                    if let Operand::Param(name) = value {
+                        params.insert(name.clone());
+                    }
+                }
+            }
+            Expr::In {
+                value,
+                set: Set::List(items),
+                ..
+            } if connected(value, params) => {
+                *bound = (*bound).max(items.iter().map(literal).max().unwrap_or(0));
+            }
+            Expr::And(parts) | Expr::Or(parts) => {
+                for part in parts {
+                    inspect(part, model, params, bound);
+                }
+            }
+            Expr::Implies(a, b) => {
+                inspect(a, model, params, bound);
+                inspect(b, model, params, bound);
+            }
+            Expr::Not(inner) => inspect(inner, model, params, bound),
+            _ => {}
         }
     }
-    model
-        .counter_bounds
-        .values()
-        .chain(model.list_bounds.values())
-        .copied()
-        .fold(largest(&t.guard), usize::max)
-        .saturating_add(t.params.len())
+    let mut params = BTreeSet::from([param.to_string()]);
+    let mut bound = 0;
+    loop {
+        let previous = params.len();
+        inspect(&t.guard, model, &mut params, &mut bound);
+        if params.len() == previous {
+            let effects = params
+                .iter()
+                .filter(|p| p.as_str() != param)
+                .filter_map(|p| effect_ranges.get(p.as_str()))
+                .map(|range| range.largest)
+                .max()
+                .unwrap_or(0);
+            return bound.max(effects).saturating_add(params.len());
+        }
+    }
 }
 
 /// Visit chosen inputs before effects or state bounds are applied, stopping
