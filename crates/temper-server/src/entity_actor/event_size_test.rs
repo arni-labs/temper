@@ -97,6 +97,7 @@ async fn a_change_over_the_limit_is_refused_and_never_written() {
     let patched: EntityResponse = actor
         .ask(
             EntityMsg::UpdateFields {
+                caller: None,
                 fields: serde_json::json!({ "Notes": "y".repeat(5_000) }),
                 replace: false,
                 expected_precondition: None,

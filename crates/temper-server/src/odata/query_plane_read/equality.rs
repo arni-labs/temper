@@ -66,6 +66,10 @@ pub(super) async fn try_reconciled_equality_read(
                     | "events"
                     | "sequence_nr"
                     | "total_event_count"
+                    | "first_event_at"
+                    | "last_event_at"
+                    | "last_event_via"
+                    | "last_event_by"
             ) || !request.state.query_projection_indexes_field(
                 request.tenant,
                 request.entity_type,

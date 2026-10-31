@@ -29,6 +29,7 @@ pub(super) fn replay_copy(response: &EntityResponse) -> EntityResponse {
             timestamp: event.timestamp,
             params: serde_json::Value::Null,
             idempotency_key: event.idempotency_key.clone(),
+            origin: event.origin.clone(),
             kind: temper_runtime::persistence::EventKind::Transition,
             outcome: None,
         })
@@ -51,6 +52,7 @@ pub(super) fn replay_copy(response: &EntityResponse) -> EntityResponse {
             last_snapshot_sequence_nr: state.last_snapshot_sequence_nr,
             sequence_nr: state.sequence_nr,
             processed_idempotency_keys: BTreeMap::new(),
+            last_event: state.last_event.clone(),
             status_clock: state.status_clock.clone(),
             spawn_reservations: state.spawn_reservations.clone(),
         },
@@ -83,6 +85,7 @@ pub(super) fn estimated_entry_bytes(
                 + event.from_status.len()
                 + event.to_status.len()
                 + event.idempotency_key.as_ref().map_or(0, String::len)
+                + event.origin.by.as_ref().map_or(0, String::len)
         })
         .sum();
     let spawns: usize = response
@@ -118,6 +121,11 @@ pub(super) fn estimated_entry_bytes(
         + state.entity_type.len()
         + state.entity_id.len()
         + state.status.len()
+        + state
+            .last_event
+            .last_event_by
+            .as_ref()
+            .map_or(0, String::len)
         + response.error.as_ref().map_or(0, String::len)
         + json_bytes(&state.fields)
         + state

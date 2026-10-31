@@ -47,6 +47,7 @@ pub(super) async fn commit_field_update(
     fields: Value,
     replace: bool,
     has_precondition: bool,
+    caller: Option<&crate::request_context::AgentContext>,
 ) -> Result<(), NotUpdated> {
     if actor
         .table
@@ -108,9 +109,11 @@ pub(super) async fn commit_field_update(
         "object-ness was checked above; the apply cannot decline"
     );
     let mut event = field_event(action, state, &fields);
+    event.origin = super::EventOrigin::from_caller(caller);
 
     let (Some(store), Some(backend)) = (actor.event_journal.as_ref(), actor.event_backend) else {
-        // No configured persistence: memory-only, as in every other handler.
+        // The same event metadata is visible without a journal.
+        state.push_event_bounded(event);
         return Ok(());
     };
 
@@ -164,6 +167,7 @@ pub(super) async fn commit_field_update(
                     "object-ness was checked above; the apply cannot decline"
                 );
                 event = field_event(action, state, &fields);
+                event.origin = super::EventOrigin::from_caller(caller);
             }
             Err(e) => {
                 state.fields = previous_fields;
@@ -208,6 +212,7 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         timestamp: sim_now(),
         params: fields.clone(),
         idempotency_key: None,
+        origin: crate::entity_actor::EventOrigin::internal(),
         kind: temper_runtime::persistence::EventKind::Transition,
         outcome: None,
     }

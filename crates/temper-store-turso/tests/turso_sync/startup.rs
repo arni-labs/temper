@@ -356,3 +356,83 @@ async fn reopening_versioned_secrets_adds_no_change_log_rows() {
         }
     }
 }
+
+#[tokio::test]
+async fn reopening_completed_creation_backfill_adds_no_change_log_rows() {
+    use temper_runtime::persistence::EventStore;
+
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_dir, path) = machine();
+    let store = server.open(&path).await;
+    let created = event(1);
+    let expected = created
+        .metadata
+        .timestamp
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .append("default:Note:legacy", 0, &[created])
+        .await
+        .unwrap();
+    store
+        .upsert_query_projection(
+            "default",
+            "Note",
+            "legacy",
+            "Created",
+            &serde_json::json!({}),
+            1,
+        )
+        .await
+        .unwrap();
+    // Model a pre-migration catalog with a pending durable cursor.
+    store
+        .sync_copy()
+        .unwrap()
+        .execute_local("UPDATE first_event_backfill SET complete = 0 WHERE id = 1")
+        .await
+        .unwrap();
+    push(&store).await;
+    drop(store);
+
+    let store = server.open(&path).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows = store
+                .load_entity_catalog_rows("default", "Note", &["legacy".into()])
+                .await
+                .unwrap();
+            if rows[0].state.as_ref().unwrap()["first_event_at"] == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("creation backfill completes");
+    push(&store).await;
+    let copy = store.sync_copy().unwrap();
+    let rows = copy.change_log_rows().await.unwrap();
+    let newest = copy.last_change().await.unwrap();
+    drop(store);
+
+    for _ in 0..2 {
+        let store = server.open(&path).await;
+        let copy = store.sync_copy().unwrap();
+        assert_eq!(
+            copy.change_log_rows().await.unwrap(),
+            rows,
+            "a completed creation backfill must not write to the change log"
+        );
+        assert_eq!(copy.last_change().await.unwrap(), newest);
+        let catalog = store
+            .load_entity_catalog_rows("default", "Note", &["legacy".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog[0].state.as_ref().unwrap()["first_event_at"],
+            expected
+        );
+    }
+}
