@@ -119,7 +119,10 @@ fn a_parameter_reaches_a_counter_through_a_chain() {
 /// pass says it is bounded and names `x`.
 #[test]
 fn a_parameter_that_can_take_a_counter_past_its_bound_makes_a_bounded_pass() {
-    let spec = arithmetic(&["y = params.a", "y -= 3", "x = y", "y = 0"], "y == 0");
+    let spec = arithmetic(
+        &["y = params.a", "y -= 3", "x = y", "y = 0"],
+        "y == 0 && x >= 0",
+    );
     let l1 = model_check(&spec);
     assert!(l1.passed, "{}", l1.summary);
     assert!(l1.summary.contains("bounded"), "{}", l1.summary);
@@ -132,7 +135,7 @@ fn a_parameter_that_can_take_a_counter_past_its_bound_makes_a_bounded_pass() {
 /// the pass says so.
 #[test]
 fn a_subtraction_that_cannot_be_worked_back_makes_a_bounded_pass() {
-    let spec = arithmetic(&["x = params.a", "x -= params.b"], "y == 0");
+    let spec = arithmetic(&["x = params.a", "x -= params.b"], "x >= 0");
     let l1 = model_check(&spec);
     assert!(l1.passed, "{}", l1.summary);
     let cut = &l1.verification.as_ref().unwrap().bounded_by;
@@ -140,7 +143,8 @@ fn a_subtraction_that_cannot_be_worked_back_makes_a_bounded_pass() {
 }
 
 /// `x = a; x -= a` leaves `x` at 0 whatever `a` is, so `a` goes as far as
-/// `y` allows, and 5 takes `y` to 1.
+/// `y` allows, and 5 takes `y` to 1. The rule reads `x`, always true, so the
+/// model keeps it.
 #[test]
 fn a_parameter_that_cancels_itself_in_one_counter_reaches_another() {
     let spec = r#"
@@ -167,7 +171,7 @@ effect = ["x = params.a", "x -= params.a", "y = params.a", "y -= 4"]
 
 [[invariant]]
 name = "Safe"
-assert = "y != 1"
+assert = "y != 1 && x >= 0"
 "#;
     let (a, last) = broken_safe(&model_check(spec));
     assert_eq!(a, ParamValue::Count(5));
@@ -179,7 +183,7 @@ assert = "y != 1"
 /// the pass names both.
 #[test]
 fn a_bounded_pass_names_every_counter_a_parameter_can_take_past_its_bound() {
-    let spec = arithmetic(&["x = params.a", "y = params.a"], "w == 0");
+    let spec = arithmetic(&["x = params.a", "y = params.a"], "x >= 0 && y >= 0");
     let l1 = model_check(&spec);
     assert!(l1.passed, "{}", l1.summary);
     let cut = &l1.verification.as_ref().unwrap().bounded_by;
@@ -238,6 +242,10 @@ name = "Sum"
 from = ["On"]
 to = "Done"
 effect = [{}]
+
+[[invariant]]
+name = "Read"
+assert = "x >= 0"
 "#,
         effects.join(", ")
     );
