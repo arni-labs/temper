@@ -10,7 +10,7 @@ use super::types::{
     ModelEffect, ModelString, ParamValue, ResolvedTransition, TemperModel, TemperModelState,
 };
 
-use super::count_bounds::count_range;
+use super::count_bounds::{CountRange, count_ranges};
 pub(crate) use super::expansion::Expansion;
 use super::strings::string_assignments;
 pub use super::strings::{apply_string_params, canonical_strings, string_values};
@@ -147,17 +147,12 @@ pub(crate) fn successors_noting_cuts(
     state: &TemperModelState,
     cut: &mut BTreeMap<String, usize>,
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
-    for (name, kind) in &t.params {
-        if matches!(kind, ParamKind::Count) {
-            let range = count_range(model, t, name);
-            // A value one past the range takes this counter past its bound:
-            // that step is left out, as any other step that goes past is.
-            if let Some((counter, bound)) = range.past {
-                cut.insert(counter, bound);
-            }
-            if range.widened {
-                cut.insert(format!("params.{name}"), range.largest);
-            }
+    for (name, range) in count_ranges(model, t) {
+        // A value past the range takes these counters past their bounds:
+        // that step is left out, as any other step that goes past is.
+        cut.extend(range.past);
+        if range.widened {
+            cut.insert(format!("params.{name}"), range.largest);
         }
     }
     let values = string_values(std::iter::once(state));
@@ -249,9 +244,10 @@ pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
     model.transitions.iter().find_map(|t| {
         // Counted, not built: a parameter can write a counter with a large
         // bound, and building its candidates would allocate that many.
+        let ranges = count_ranges(model, t);
         let assignments = t.params.iter().fold(1usize, |n, (name, kind)| {
             let choices = match kind {
-                ParamKind::Count => count_range(model, t, name).largest.saturating_add(1),
+                ParamKind::Count => ranges[name.as_str()].largest.saturating_add(1),
                 ParamKind::Bool => 2,
                 ParamKind::Str => string_literals(model, t, name).len() + 1,
             };
@@ -267,11 +263,10 @@ fn param_candidates(
     t: &ResolvedTransition,
     name: &str,
     kind: &ParamKind,
+    ranges: &BTreeMap<&str, CountRange>,
 ) -> Vec<ParamValue> {
     match kind {
-        ParamKind::Count => (0..=count_range(model, t, name).largest)
-            .map(ParamValue::Count)
-            .collect(),
+        ParamKind::Count => (0..=ranges[name].largest).map(ParamValue::Count).collect(),
         ParamKind::Bool => vec![ParamValue::Bool(false), ParamValue::Bool(true)],
         ParamKind::Str => string_literals(model, t, name)
             .into_iter()
@@ -304,9 +299,10 @@ fn param_assignments(
     model: &TemperModel,
     t: &ResolvedTransition,
 ) -> Vec<BTreeMap<String, ParamValue>> {
+    let ranges = count_ranges(model, t);
     let mut assignments = vec![BTreeMap::new()];
     for (name, kind) in &t.params {
-        let candidates = param_candidates(model, t, name, kind);
+        let candidates = param_candidates(model, t, name, kind, &ranges);
         assert!(
             assignments.len() * candidates.len() <= MAX_PARAM_ASSIGNMENTS,
             "transition '{}' has more than {MAX_PARAM_ASSIGNMENTS} parameter assignments",

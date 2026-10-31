@@ -354,10 +354,9 @@ fn broken_by(model: &TemperModel, t: &ResolvedTransition, candidates: &[usize]) 
     let changed = make_list_vars(model, &solver, "post:");
     let mut post_lists = pre_lists.clone();
     for var in &changed_lists {
-        if let (Some(len), Some(elements)) = (changed.len_vars.get(var), changed.elem_vars.get(var))
-        {
+        if let (Some(len), Some(held)) = (changed.len_vars.get(var), changed.holds.get(var)) {
             post_lists.len_vars.insert(var.clone(), len.clone());
-            post_lists.elem_vars.insert(var.clone(), elements.clone());
+            post_lists.holds.insert(var.clone(), held.clone());
         }
     }
     let post_status = match t
@@ -439,37 +438,25 @@ fn make_bool_vars(model: &TemperModel) -> Vec<(String, Bool)> {
 #[derive(Clone, Default)]
 struct ListSymbolicVars {
     len_vars: BTreeMap<String, Int>,
-    elem_vars: BTreeMap<String, Vec<Int>>,
-    value_atoms: BTreeMap<String, i64>,
+    /// Whether each list holds each value a guard or invariant looks for in
+    /// it.
+    holds: BTreeMap<String, BTreeMap<String, Bool>>,
 }
 
 /// Create exact bounded symbolic list variables, named after `prefix`, for
 /// each list up to the length L1 explores it to (its bound):
 /// - its length, in `[0, bound]`
-/// - one element per position below `bound`
+/// - whether it holds each value a guard or invariant looks for in it, with
+///   no more of those held than its length
 ///
-/// Every string a guard or invariant tests for membership, and every initial
-/// element, gets its own atom, so `'v' in list` is never decided by default.
+/// Membership is all a guard or invariant reads of a list's elements, and a
+/// list of length `n` can hold any `n` of the values looked for, so this is
+/// exact. A constant per position would grow with the bound, which comes
+/// from the literals a spec compares the length with and can be any size.
 fn make_list_vars(model: &TemperModel, solver: &Solver, prefix: &str) -> ListSymbolicVars {
     let zero = Int::from_i64(0);
-    let mut len_vars = BTreeMap::new();
-    let mut elem_vars = BTreeMap::new();
-
-    for name in model.initial_lists.keys() {
-        let bound = list_bound(model, name);
-        let max_val = Int::from_i64(i64::try_from(bound).unwrap_or(i64::MAX));
-        let len_var = Int::new_const(var_name(prefix, "len", name));
-        solver.assert(len_var.ge(&zero));
-        solver.assert(len_var.le(&max_val));
-        len_vars.insert(name.clone(), len_var);
-
-        let elements = (0..bound)
-            .map(|idx| Int::new_const(var_name(prefix, &format!("elem{idx}"), name)))
-            .collect::<Vec<_>>();
-        elem_vars.insert(name.clone(), elements);
-    }
-
-    let mut values = BTreeSet::new();
+    let one = Int::from_i64(1);
+    let mut looked_for: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let exprs = model
         .transitions
         .iter()
@@ -478,27 +465,40 @@ fn make_list_vars(model: &TemperModel, solver: &Solver, prefix: &str) -> ListSym
     for expr in exprs {
         let mut pairs = BTreeSet::new();
         collect_list_contains_pairs(expr, &mut pairs);
-        for (_, value) in pairs {
-            values.insert(value);
-        }
-    }
-    for list in model.initial_lists.values() {
-        for value in list {
-            values.insert(value.clone());
+        for (list, value) in pairs {
+            looked_for.entry(list).or_default().insert(value);
         }
     }
 
-    let value_atoms = values
-        .into_iter()
-        .enumerate()
-        .map(|(idx, value)| (value, idx as i64))
-        .collect::<BTreeMap<_, _>>();
+    let mut len_vars = BTreeMap::new();
+    let mut holds = BTreeMap::new();
+    for name in model.initial_lists.keys() {
+        let bound = list_bound(model, name);
+        let max_val = Int::from_i64(i64::try_from(bound).unwrap_or(i64::MAX));
+        let len_var = Int::new_const(var_name(prefix, "len", name));
+        solver.assert(len_var.ge(&zero));
+        solver.assert(len_var.le(&max_val));
 
-    ListSymbolicVars {
-        len_vars,
-        elem_vars,
-        value_atoms,
+        let held: BTreeMap<String, Bool> = looked_for
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                let constant =
+                    Bool::new_const(var_name(prefix, "holds", &format!("{name}|{value}")));
+                (value.clone(), constant)
+            })
+            .collect();
+        if !held.is_empty() {
+            let counted: Vec<Int> = held.values().map(|h| h.ite(&one, &zero)).collect();
+            let count = Int::add(&counted.iter().collect::<Vec<_>>());
+            solver.assert(count.le(&len_var));
+        }
+        len_vars.insert(name.clone(), len_var);
+        holds.insert(name.clone(), held);
     }
+
+    ListSymbolicVars { len_vars, holds }
 }
 
 /// A Z3 constant's name: the state it belongs to (`prefix`), the kind of
@@ -542,32 +542,14 @@ fn encode_state_membership(status_var: &Int, states: &[String], model: &TemperMo
     }
 }
 
-/// Encode exact bounded `contains(list, value)` over symbolic list slots.
+/// Encode exact bounded `contains(list, value)`: whether the list holds it.
 fn encode_list_contains(var: &str, value: &str, lists: &ListSymbolicVars) -> Bool {
-    let Some(len_var) = lists.len_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(elements) = lists.elem_vars.get(var) else {
-        return Bool::from_bool(false);
-    };
-    let Some(atom_id) = lists.value_atoms.get(value) else {
-        return Bool::from_bool(false);
-    };
-
-    if elements.is_empty() {
-        return Bool::from_bool(false);
-    }
-
-    let atom = Int::from_i64(*atom_id);
-    let disjuncts: Vec<Bool> = elements
-        .iter()
-        .enumerate()
-        .map(|(idx, element)| {
-            let idx_int = Int::from_i64(idx as i64);
-            Bool::and(&[&len_var.gt(&idx_int), &element.eq(&atom)])
-        })
-        .collect();
-    Bool::or(&disjuncts)
+    lists
+        .holds
+        .get(var)
+        .and_then(|held| held.get(value))
+        .cloned()
+        .unwrap_or_else(|| Bool::from_bool(false))
 }
 
 /// Symbolic values for one state.
