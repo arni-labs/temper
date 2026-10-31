@@ -180,8 +180,9 @@ impl AgentContext {
     /// state timer has (`state_timeout` requires `after_seconds > 0`). That
     /// wait is what bounds a periodic schedule, so it starts a fresh callback
     /// lineage and a recurring schedule keeps running however many cycles it
-    /// has completed. A follow-on with no delay, including a `schedule_at`
-    /// whose time has already passed, keeps the parent's callback lineage.
+    /// has completed. A follow-on waiting less than one second, including a
+    /// `schedule_at` whose time has already passed, keeps the parent's
+    /// callback lineage.
     ///
     /// Either way the follow-on is a new request on the record: it gets an
     /// idempotency key of its own, derived from this context's key, the
@@ -194,7 +195,7 @@ impl AgentContext {
         &self,
         action: &str,
         index: usize,
-        delay_seconds: u64,
+        delay_millis: u64,
     ) -> Self {
         let mut next = self.for_background_task();
         next.idempotency_key = self.idempotency_key.as_ref().map(|key| {
@@ -204,7 +205,7 @@ impl AgentContext {
                 &index.to_string(),
             ))
         });
-        if delay_seconds > 0 {
+        if delay_millis >= 1000 {
             next.callback_hops = 0;
         }
         next

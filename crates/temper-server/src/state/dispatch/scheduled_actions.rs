@@ -95,9 +95,9 @@ impl ServerState {
             // A record with no journal keeps no row: its action is due its
             // delay from now. One past the end of the calendar never is.
             let due_at = scheduled.due_at.unwrap_or_else(|| {
-                i64::try_from(scheduled.delay_seconds)
+                i64::try_from(scheduled.delay_millis)
                     .ok()
-                    .and_then(chrono::Duration::try_seconds)
+                    .and_then(chrono::Duration::try_milliseconds)
                     .and_then(|delay| sim_now().checked_add_signed(delay))
                     .unwrap_or(DateTime::<Utc>::MAX_UTC)
             });
@@ -111,7 +111,7 @@ impl ServerState {
                 agent_ctx: ctx.agent_ctx.for_scheduled_follow_on(
                     &scheduled.action,
                     index,
-                    scheduled.delay_seconds,
+                    scheduled.delay_millis,
                 ),
             };
             self.spawn_scheduled_action(timer, None);
