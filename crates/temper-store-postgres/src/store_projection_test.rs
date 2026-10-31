@@ -340,7 +340,14 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
             "entity_id": entity_id,
             "status": "Published",
             "Title": "State title",
-            "fields": fields,
+            "fields": {
+                "Id": entity_id,
+                "Name": "State name wins",
+                "Status": "Published",
+                "JsonField": { "kind": "nested", "score": 9 },
+                "Large": "x".repeat(4096),
+                "Private": "state only",
+            },
             "events": [{ "type": "ShouldNotLoad" }],
             "sequence_nr": 7,
             "total_event_count": 7,
@@ -352,7 +359,7 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
                 entity_type,
                 entity_id,
                 "Published",
-                state.get("fields").unwrap(),
+                &fields,
                 &state,
                 7,
             )
@@ -386,6 +393,18 @@ fn load_selected_entity_catalog_rows_pg_returns_sparse_json_values() {
         assert_eq!(rows[0].fields["Status"], "Published");
         assert!(rows[0].fields.get("Large").is_none());
         assert!(rows[0].fields.get("Missing").is_none());
+
+        let selected_fields = store
+            .load_selected_entity_catalog_rows_pg(
+                &tenant,
+                entity_type,
+                &[entity_id.to_string()],
+                &["fields".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected_fields[0].fields["fields"], state["fields"]);
+        assert!(selected_fields[0].state.is_none());
 
         crate::dbm::postgres_query!("DELETE FROM entity_field_index WHERE tenant = $1")
             .bind(&tenant)

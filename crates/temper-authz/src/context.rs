@@ -35,7 +35,10 @@ pub struct Principal {
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
+mod credential;
 pub mod platform_keys;
+
+pub use credential::IssuedCredential;
 
 /// Whether `name` is a Cedar context key only the platform sets
 /// ([`platform_keys`]), which a record's field never fills.
@@ -61,6 +64,13 @@ pub struct SecurityContext {
     /// sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<crate::MoveCause>,
+    /// What the verified token behind an agent's identity was issued under,
+    /// so a move made later in the agent's name (a timer it set) can ask
+    /// whether that token would still be accepted. None for every other
+    /// identity, and in a context saved before contexts kept it. Cedar never
+    /// sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<IssuedCredential>,
 }
 
 /// Credential-authenticated authority bound to one tenant.
@@ -164,6 +174,7 @@ impl SecurityContext {
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
             cause: None,
+            credential: None,
         }
     }
 
@@ -194,6 +205,7 @@ impl SecurityContext {
             context_attrs: HashMap::new(),
             correlation_id,
             cause: None,
+            credential: None,
         }
     }
 
@@ -214,6 +226,7 @@ impl SecurityContext {
             context_attrs: HashMap::new(),
             correlation_id: uuid::Uuid::now_v7().to_string(),
             cause: None,
+            credential: None,
         }
     }
 
@@ -266,6 +279,7 @@ impl SecurityContext {
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
             cause: None,
+            credential: None,
         }
     }
 
@@ -332,6 +346,7 @@ impl SecurityContext {
             context_attrs,
             correlation_id: uuid::Uuid::now_v7().to_string(),
             cause: None,
+            credential: None,
         }
     }
 
@@ -413,6 +428,15 @@ impl SecurityContext {
                 .attributes
                 .insert(name.clone(), serde_json::Value::String(status.clone()));
         }
+        self
+    }
+
+    /// Keep what the verified token behind this identity was issued under
+    /// ([`Self::credential`]). Only the identity boundary calls this, for an
+    /// agent resolved from a trusted-issuer token.
+    #[must_use]
+    pub fn with_credential(mut self, credential: Option<IssuedCredential>) -> Self {
+        self.credential = credential;
         self
     }
 

@@ -195,6 +195,24 @@ fn a_bounded_pass_names_every_counter_a_parameter_can_take_past_its_bound() {
     }
 }
 
+/// `x += z; x -= z` leaves `x` at `a` whatever `z` holds, so `a` goes only
+/// as far as `x`'s bound, here one past the 2 its rule compares it with,
+/// even with `z` at 5000.
+#[test]
+fn adding_and_taking_away_the_same_counter_cancels() {
+    let spec = arithmetic(&["x = params.a", "x += z", "x -= z"], "x != 2")
+        .replace("initial = 5\n", "initial = 5000\n");
+    let model = build_model_from_ioa(&spec, 2).unwrap();
+    let initial = model.init_states().remove(0);
+    let choices = successors(&model, &model.transitions[0], &initial);
+    assert_eq!(choices.len(), 4, "a from 0 to 3");
+
+    let (a, last) = broken_safe(&model_check(&spec));
+    assert_eq!(a, ParamValue::Count(2));
+    assert_eq!(last.counters["x"], 2);
+    assert_eq!(last.counters["z"], 5000);
+}
+
 /// Each `cN -= 1` leaves the larger of `cN - 1` and 0, and adding twenty of
 /// them to `x` does not make a range out of every way of choosing between
 /// them.

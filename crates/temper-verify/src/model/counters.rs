@@ -10,8 +10,8 @@ use super::builder::effect_params;
 use super::types::{ModelEffect, TemperModel};
 use temper_spec::automaton::Automaton;
 
-/// Drop from `model` every counter no guard or invariant reads, unless an
-/// effect copies it into a variable the model keeps, with the effects that
+/// Drop from `model` every counter no guard, invariant or entry rule reads,
+/// unless an effect copies it into a variable the model keeps, with the effects that
 /// write it and the parameters only they used. Such a counter cannot change
 /// whether a move may fire or a rule holds, so leaving it out only merges
 /// states that differ in it: a pass is no longer bounded by a count no rule
@@ -26,7 +26,9 @@ pub(super) fn leave_out_unread_counters(automaton: &Automaton, model: &mut Tempe
         .collect();
     let mut read = BTreeSet::new();
     let guards = model.transitions.iter().map(|t| &t.guard);
-    for expr in guards.chain(model.invariants.iter().map(|inv| &inv.assert)) {
+    let invariants = model.invariants.iter().map(|inv| &inv.assert);
+    let entry_rules = model.entry_rules.iter().map(|rule| &rule.assert);
+    for expr in guards.chain(invariants).chain(entry_rules) {
         expr.for_each_name(&mut |name| {
             if let Name::Var(var) = name {
                 read.insert(var.to_string());
@@ -45,6 +47,7 @@ pub(super) fn leave_out_unread_counters(automaton: &Automaton, model: &mut Tempe
                 | ModelEffect::SetBool { var, value }
                 | ModelEffect::ListAppend { var, value } => (var, value),
                 ModelEffect::ListRemoveAt { var, index } => (var, index),
+                ModelEffect::SetString { .. } => continue,
             };
             if (read.contains(var) || !counters.contains(var.as_str()))
                 && let Arg::Var(source) = value
@@ -65,9 +68,19 @@ pub(super) fn leave_out_unread_counters(automaton: &Automaton, model: &mut Tempe
             | ModelEffect::AddCounter { var, .. }
             | ModelEffect::SubCounter { var, .. } => !unread(var),
             ModelEffect::SetBool { .. }
+            | ModelEffect::SetString { .. }
             | ModelEffect::ListAppend { .. }
             | ModelEffect::ListRemoveAt { .. } => true,
         });
-        t.params = effect_params(&t.effects);
+        let effect_params = effect_params(&t.effects);
+        // Entry rules choose guard and constraint inputs too, even when
+        // their only effect writes a counter that was left out.
+        let guard_params = t.guard.params_read();
+        t.params.retain(|name, _| {
+            effect_params.contains_key(name)
+                || (!model.entry_rules.is_empty()
+                    && (guard_params.contains(name)
+                        || t.string_params.iter().any(|param| &param.name == name)))
+        });
     }
 }

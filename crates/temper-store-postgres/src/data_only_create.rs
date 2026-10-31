@@ -153,8 +153,8 @@ impl PostgresEventStore {
 
         if let Err(e) = crate::dbm::postgres_query!(&self.schema,
             "INSERT INTO {schema}entity_catalog \
-             (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, 1, 2, $7, now())",
+             (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at, first_event_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 1, 2, $7, now(), $6->>'first_event_at')",
         )
         .bind(tenant)
         .bind(entity_type)
@@ -194,6 +194,16 @@ impl PostgresEventStore {
             .await
             .map_err(storage_error)?;
         }
+        // The event and its projection commit together, so the entity enters
+        // the gap only when its fields are wrapped where the index cannot see.
+        crate::projection_delta::applied(
+            &self.schema,
+            &mut tx,
+            [tenant, entity_type, entity_id],
+            1,
+            fields,
+        )
+        .await?;
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {

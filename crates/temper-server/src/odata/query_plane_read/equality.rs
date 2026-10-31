@@ -43,6 +43,12 @@ fn required_equalities(
 pub(super) async fn try_reconciled_equality_read(
     request: &QueryPlaneReadRequest<'_>,
 ) -> Option<Result<QueryPlaneReadResult, QueryPlaneReadError>> {
+    let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
+        request.state,
+        request.tenant,
+        request.entity_type,
+    );
+    let default_fields = defaults.field_values(&serde_json::Value::Null);
     let mut pairs = Vec::new();
     required_equalities(request.query_options.filter.as_ref()?, &mut pairs);
     let predicates: Vec<_> = pairs
@@ -66,6 +72,10 @@ pub(super) async fn try_reconciled_equality_read(
                     | "events"
                     | "sequence_nr"
                     | "total_event_count"
+                    | "first_event_at"
+                    | "last_event_at"
+                    | "last_event_via"
+                    | "last_event_by"
             ) || !request.state.query_projection_indexes_field(
                 request.tenant,
                 request.entity_type,
@@ -74,6 +84,16 @@ pub(super) async fn try_reconciled_equality_read(
                 return None;
             }
             let value = value.as_str()?;
+            // A current projection can still predate this declaration. Its
+            // missing field is not a journal delta, so this equality cannot
+            // narrow the union. Other required conjuncts remain usable.
+            if default_fields
+                .get(&field)
+                .and_then(serde_json::Value::as_str)
+                == Some(value)
+            {
+                return None;
+            }
             (value.len() <= 2000).then(|| (field, value.to_string()))
         })
         .collect();
@@ -212,6 +232,7 @@ pub(super) async fn try_reconciled_equality_read(
         }
         counters.materialized_count += 1;
         let mut entity = serde_json::to_value(&response.state).expect("entity state serializes");
+        defaults.apply(&mut entity);
         entity["@odata.id"] = serde_json::json!(format!("{}('{}')", request.entity_set_name, id));
         if entity_read_allowed(request, &entity) {
             entities.push(entity);

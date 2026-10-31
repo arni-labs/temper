@@ -25,6 +25,7 @@ fn user(id: &str, status: &str) -> SecurityContext {
         context_attrs: HashMap::new(),
         correlation_id: "principal-record".to_string(),
         cause: None,
+        credential: None,
     }
 }
 

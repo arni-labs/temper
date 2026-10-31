@@ -333,6 +333,18 @@ impl EventStore for PostgresEventStore {
             self.delete_scheduled_action_row(&mut tx, tenant, entity_type, entity_id, arm_id)
                 .await?;
         }
+        // The projection follows this commit, so the commit enters the gap
+        // with it. The concurrency check above has already passed.
+        if new_seq > expected_sequence {
+            crate::projection_delta::mark_pending(
+                &self.schema,
+                &mut tx,
+                [tenant, entity_type, entity_id],
+                new_seq,
+                events.iter().any(PersistenceEnvelope::is_tombstone),
+            )
+            .await?;
+        }
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
@@ -855,6 +867,22 @@ impl EventStore for PostgresEventStore {
                 sequence_nr: new_seq,
             });
         }
+        // Every stream's events are in, so each mark follows its stream's
+        // concurrency check and unique key, as in a single append.
+        for ((append, (tenant, entity_type, entity_id, _)), result) in
+            appends.iter().zip(&parsed).zip(&results)
+        {
+            if !append.events.is_empty() {
+                crate::projection_delta::mark_pending(
+                    &self.schema,
+                    &mut tx,
+                    [tenant.as_str(), entity_type.as_str(), entity_id.as_str()],
+                    result.sequence_nr,
+                    append.events.iter().any(PersistenceEnvelope::is_tombstone),
+                )
+                .await?;
+            }
+        }
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {
@@ -948,6 +976,27 @@ impl EventStore for PostgresEventStore {
         Ok(page)
     }
 
+    async fn first_event_at(
+        &self,
+        persistence_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let saved: Option<String> = crate::dbm::postgres_query_scalar!(&self.schema,
+            "SELECT COALESCE(
+                (SELECT first_event_at FROM {schema}entity_catalog WHERE tenant=$1 AND entity_type=$2 AND entity_id=$3),
+                (SELECT COALESCE(payload->>'timestamp', metadata->>'timestamp') FROM {schema}events
+                 WHERE tenant=$1 AND entity_type=$2 AND entity_id=$3 AND sequence_nr=1))")
+            .bind(tenant).bind(entity_type).bind(entity_id).fetch_one(self.pool()).await.map_err(|error| PersistenceError::Storage(error.to_string()))?;
+        saved
+            .map(|saved| {
+                chrono::DateTime::parse_from_rfc3339(&saved)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|error| PersistenceError::Serialization(error.to_string()))
+            })
+            .transpose()
+    }
+
     /// Save (upsert) a snapshot for the given entity.
     ///
     /// Uses `ON CONFLICT … DO UPDATE` so that only the latest snapshot is
@@ -989,6 +1038,13 @@ impl EventStore for PostgresEventStore {
             tenant,
             entity_type,
             entity_id,
+            sequence_nr,
+        )
+        .await?;
+        crate::projection_delta::mark_snapshot(
+            &self.schema,
+            &mut tx,
+            [tenant, entity_type, entity_id],
             sequence_nr,
         )
         .await?;

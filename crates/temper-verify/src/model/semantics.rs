@@ -12,8 +12,10 @@ use super::types::{
 
 use super::count_bounds::{CountRange, count_ranges};
 pub(crate) use super::expansion::Expansion;
-use super::strings::string_assignments;
-pub use super::strings::{apply_string_params, canonical_strings, string_values};
+use super::parameters::any_inputs;
+pub use super::strings::{
+    apply_string_params, canonical_state, canonical_strings, canonical_values, string_values,
+};
 
 /// Parameter assignments explored per step for one transition, at most
 /// (numeric/list parameters; joint string products also consume expansion work).
@@ -44,11 +46,10 @@ impl Env for ModelEnv<'_> {
             Some(VarKind::Bool) => {
                 Val::Bool(self.state.booleans.get(name).copied().unwrap_or(false))
             }
-            Some(VarKind::List) => self
-                .state
-                .lists
-                .get(name)
-                .map_or(Val::Strs(&[]), |items| Val::Strs(items)),
+            Some(VarKind::List) => self.state.lists.get(name).map_or_else(
+                || Val::Values(Vec::new()),
+                |items| Val::Values(items.iter().map(|s| s.val()).collect()),
+            ),
             Some(VarKind::Str) => self
                 .state
                 .strings
@@ -178,32 +179,26 @@ fn successors_with(
     mut left_out: impl FnMut(&TemperModelState),
 ) -> Vec<(BTreeMap<String, ParamValue>, TemperModelState)> {
     let mut out = Vec::new();
-    let strings = string_assignments(model, t, state, values, budget);
-    for params in param_assignments(model, t) {
-        for chosen in &strings {
-            if !budget.take() {
-                return out;
-            }
-            let mut params = params.clone();
-            params.extend(
-                chosen
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ParamValue::Str(v.clone()))),
-            );
-            let mut next = state.clone();
-            if let Some(to) = &t.to_state {
-                next.status = to.clone();
-            }
-            apply_effects(&t.effects, &mut next, &t.name, &params);
-            apply_string_params(&t.string_params, &mut next, &params);
-            canonical_strings(&mut [&mut next.strings]);
-            if within_bounds(model, state, &next) {
-                out.push((params, next));
-            } else {
-                left_out(&next);
-            }
+    any_inputs(model, t, state, values, budget, |params| {
+        if !model.entry_rules.is_empty()
+            && !super::parameters::inputs_allow(model, t, state, &params)
+        {
+            return false;
         }
-    }
+        let mut next = state.clone();
+        if let Some(to) = &t.to_state {
+            next.status = to.clone();
+        }
+        apply_effects(&t.effects, &mut next, &t.name, &params);
+        apply_string_params(&t.string_params, &mut next, &params);
+        canonical_state(&mut next);
+        if within_bounds(model, state, &next) {
+            out.push((params, next));
+        } else {
+            left_out(&next);
+        }
+        false
+    });
     out
 }
 
@@ -249,6 +244,7 @@ pub fn oversized_transition(model: &TemperModel) -> Option<(&str, usize)> {
             let choices = match kind {
                 ParamKind::Count => ranges[name.as_str()].largest.saturating_add(1),
                 ParamKind::Bool => 2,
+                ParamKind::Str if t.string_params.iter().any(|p| p.name == *name) => 1,
                 ParamKind::Str => string_literals(model, t, name).len() + 1,
             };
             n.saturating_mul(choices)
@@ -295,13 +291,16 @@ fn string_literals(model: &TemperModel, t: &ResolvedTransition, name: &str) -> B
 }
 
 /// The cartesian product of each parameter's candidate values.
-fn param_assignments(
+pub(super) fn param_assignments(
     model: &TemperModel,
     t: &ResolvedTransition,
 ) -> Vec<BTreeMap<String, ParamValue>> {
     let ranges = count_ranges(model, t);
     let mut assignments = vec![BTreeMap::new()];
     for (name, kind) in &t.params {
+        if *kind == ParamKind::Str && t.string_params.iter().any(|p| p.name == *name) {
+            continue; // String products, including list inputs, use equality classes.
+        }
         let candidates = param_candidates(model, t, name, kind, &ranges);
         assert!(
             assignments.len() * candidates.len() <= MAX_PARAM_ASSIGNMENTS,
@@ -426,17 +425,28 @@ pub fn apply_effects(
                 };
                 state.booleans.insert(var.clone(), value);
             }
+            ModelEffect::SetString { var, value } => {
+                if let Some(current) = state.strings.get_mut(var) {
+                    *current = ModelString::from(value.clone());
+                }
+            }
             ModelEffect::ListAppend { var, value } => {
-                let entry = state.lists.entry(var.clone()).or_default();
-                let element = match value {
-                    Arg::Lit(Literal::Str(text)) => text.clone(),
-                    Arg::Param(name) => match params.get(name) {
-                        Some(ParamValue::Str(ModelString::Literal(text))) => text.clone(),
-                        _ => format!("{action_name}#{}", entry.len() + 1),
-                    },
-                    _ => format!("{action_name}#{}", entry.len() + 1),
+                let placeholder = || {
+                    format!(
+                        "{action_name}#{}",
+                        state.lists.get(var).map_or(1, |v| v.len() + 1)
+                    )
+                    .into()
                 };
-                entry.push(element);
+                let element = match value {
+                    Arg::Lit(Literal::Str(text)) => text.clone().into(),
+                    Arg::Param(name) => match params.get(name) {
+                        Some(ParamValue::Str(value)) => value.clone(),
+                        _ => placeholder(),
+                    },
+                    _ => placeholder(),
+                };
+                state.lists.entry(var.clone()).or_default().push(element);
             }
             ModelEffect::ListRemoveAt { var, index } => {
                 let index = count(index, state);

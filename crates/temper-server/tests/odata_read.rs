@@ -12,6 +12,8 @@ mod list_context_owner;
 mod page_rows;
 #[path = "odata_read/pagination_count.rs"]
 mod pagination_count;
+#[path = "odata_read/pagination_metadata.rs"]
+mod pagination_metadata;
 #[path = "odata_read/platform_context_keys.rs"]
 mod platform_context_keys;
 
@@ -66,6 +68,7 @@ fn authenticate(mut request: Request<Body>, principal_id: &str) -> Request<Body>
         context_attrs: Default::default(),
         correlation_id: "odata-read-test".to_string(),
         cause: None,
+        credential: None,
     };
     request
         .extensions_mut()

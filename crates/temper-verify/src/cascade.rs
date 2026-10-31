@@ -12,12 +12,15 @@
 use crate::budget::{Budget, Clock, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
+use crate::lost_places::LostPlace;
 use crate::model::{self, TemperModel};
 use crate::proptest_gen::{self, PropTestResult};
 use crate::simulation::{self, SimConfig, SimulationResult};
 use crate::smt::{self, SmtResult};
 
 use temper_runtime::scheduler::FaultConfig;
+
+mod digest;
 
 /// Result of an actor simulation level (Level 2b).
 ///
@@ -116,6 +119,11 @@ pub struct CascadeResult {
     /// after it did not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<String>,
+    /// Set when this verdict was not run again but kept: an earlier check
+    /// passed a spec whose levels read the same models with the same
+    /// settings. The digest of what they read ([`VerificationCascade::digest`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
 }
 
 /// Serializable summary of a [`crate::composite::CompositeVerificationPlan`].
@@ -506,6 +514,19 @@ impl VerificationCascade {
                 parts.join("; "),
             )
         };
+        let summary = if verification.lost_places.is_empty() {
+            summary
+        } else {
+            let found: Vec<String> = verification
+                .lost_places
+                .iter()
+                .map(LostPlace::describe)
+                .collect();
+            format!(
+                "{summary}. Not a failure, but worth a look: {}. If that is intended, nothing to do.",
+                found.join("; "),
+            )
+        };
 
         LevelResult {
             level: CascadeLevel::ModelCheck,
@@ -700,6 +721,7 @@ fn finish(
         reachable_paths,
         composite_report,
         stopped: None,
+        kept: None,
     }
 }
 

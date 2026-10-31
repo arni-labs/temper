@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::model::semantics::canonical_strings;
+use crate::model::semantics::canonical_values;
 use crate::model::{ModelString, ParamValue, TemperModelAction, TemperModelState};
 
 /// The records in scope, one per type, and the dispatches and module calls
@@ -137,14 +137,13 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelSt
         })
         .collect();
     let renamed = {
-        let mut maps: Vec<&mut BTreeMap<String, ModelString>> = state
+        let values = state
             .records
             .values_mut()
-            .map(|s| &mut s.strings)
-            .chain(strings.iter_mut())
-            .chain(state.calls.iter_mut().map(|c| &mut c.asked))
-            .collect();
-        canonical_strings(&mut maps)
+            .flat_map(|s| s.strings.values_mut().chain(s.lists.values_mut().flatten()))
+            .chain(strings.iter_mut().flat_map(|s| s.values_mut()))
+            .chain(state.calls.iter_mut().flat_map(|c| c.asked.values_mut()));
+        canonical_values(values)
     };
     for (dispatch, renamed_strings) in dispatches.iter_mut().zip(strings) {
         for (name, text) in renamed_strings {

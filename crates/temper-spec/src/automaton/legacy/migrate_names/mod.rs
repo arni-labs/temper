@@ -40,6 +40,7 @@ pub(super) fn migrate_names(
     pass.entries(doc, "state_timeout", Pass::state_timeout)?;
     for (section, keys) in [
         ("invariant", &["name", "assert"][..]),
+        ("entry_rule", &["name", "place", "from", "assert"][..]),
         ("field_invariant", &["name", "assert", "message"][..]),
         ("context_entity", &["name", "entity_type", "id_field"][..]),
         ("key", &["name", "properties"][..]),

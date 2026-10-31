@@ -114,6 +114,7 @@ fn refusal_event(state: &EntityState, params: Value) -> EntityEvent {
         params,
         idempotency_key: None,
         outcome: None,
+        origin: crate::entity_actor::EventOrigin::internal(),
         kind: temper_runtime::persistence::EventKind::Transition,
     }
 }

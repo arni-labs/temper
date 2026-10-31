@@ -127,3 +127,58 @@ assert = "shown < 2"
     let (last, _) = found.trace.last().unwrap();
     assert_eq!(last.counters["shown"], 2);
 }
+
+/// An entry rule reads `count` even though no guard or invariant does.
+/// Entering after Tick must still produce the path that breaks the rule.
+#[test]
+fn a_counter_read_only_by_an_entry_rule_is_kept() {
+    let spec = r#"
+[automaton]
+name = "EntryCount"
+states = ["Outside", "Inside"]
+initial = "Outside"
+terminal = ["Inside"]
+
+[[state]]
+name = "count"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Tick"
+from = ["Outside"]
+effect = ["count += 1"]
+
+[[action]]
+name = "Enter"
+from = ["Outside"]
+to = "Inside"
+
+[[entry_rule]]
+name = "enter_before_counting"
+place = "Inside"
+assert = "count == 0"
+"#;
+    let result = VerificationCascade::from_ioa(spec)
+        .with_sim_seeds(2)
+        .with_prop_test_cases(20)
+        .run();
+    assert!(!result.all_passed, "{result:?}");
+    let l1 = result.level_result(CascadeLevel::ModelCheck).unwrap();
+    assert!(!l1.passed, "{}", l1.summary);
+    let found = l1
+        .verification
+        .as_ref()
+        .unwrap()
+        .counterexamples
+        .iter()
+        .find(|c| c.property == "EntryRules" && c.violated == ["enter_before_counting"])
+        .unwrap_or_else(|| panic!("no path breaking the entry rule: {}", l1.summary));
+    let [.., (before, Some(action)), (after, None)] = found.trace.as_slice() else {
+        panic!("the path ends without its move: {:?}", found.trace);
+    };
+    assert_eq!(before.status, "Outside");
+    assert_eq!(before.counters["count"], 1);
+    assert_eq!(action.name, "Enter");
+    assert_eq!(after.status, "Inside");
+}

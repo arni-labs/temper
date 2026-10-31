@@ -8,6 +8,13 @@ pub(crate) struct Expansion {
     until: std::cell::Cell<Option<std::time::Instant>>,
     pub(crate) exhausted: std::cell::Cell<bool>,
 }
+/// Only the name: the allowance is a walk's own accounting, not part of the
+/// model, so a model's digest (`JointProof::digest`) leaves it out.
+impl std::fmt::Debug for Expansion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Expansion")
+    }
+}
 impl Default for Expansion {
     fn default() -> Self {
         Self {

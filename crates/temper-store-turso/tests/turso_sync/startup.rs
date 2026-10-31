@@ -44,6 +44,41 @@ async fn a_start_without_the_remote_serves_reads_and_confirms_writes_once_it_ans
 }
 
 #[tokio::test]
+async fn a_start_that_adds_an_index_serves_before_the_remote_builds_it() {
+    // A start that adds to the schema, as an upgrade adds an index over
+    // every record, asks the remote only whether the file is behind. The
+    // remote builds the index, which takes as long as the app is big, with
+    // the next push, while the server serves.
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (url, requests) = counting(&server.url).await;
+    let (_a_dir, a_path) = machine();
+    let open = || TursoEventStore::new_synced(a_path.to_str().expect("utf-8"), &url, TOKEN);
+    let a = open().await.expect("open");
+    write(&a, "i", 0).await;
+    a.sync_copy()
+        .expect("copy")
+        .execute_local("DROP INDEX idx_snapshots_checkpoint")
+        .await
+        .expect("drop the index");
+    push(&a).await;
+    drop(a);
+
+    let before = requests.load(std::sync::atomic::Ordering::Acquire);
+    let a = open().await.expect("restart");
+    assert_eq!(a.sync_copy().expect("copy").state(), CopyState::Copying);
+    let asked = requests.load(std::sync::atomic::Ordering::Acquire) - before;
+    assert_eq!(
+        asked, 1,
+        "a start that adds an index sent {asked} requests to the remote before serving"
+    );
+    push(&a).await;
+    // The index is on the remote again: dropping it there succeeds.
+    server.remote_sql("DROP INDEX idx_snapshots_checkpoint");
+}
+
+#[tokio::test]
 async fn an_older_copy_opened_without_the_remote_is_restored_once_it_answers() {
     let Some(server) = SyncServer::start() else {
         return;
@@ -319,5 +354,85 @@ async fn reopening_versioned_secrets_adds_no_change_log_rows() {
                 versions
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn reopening_completed_creation_backfill_adds_no_change_log_rows() {
+    use temper_runtime::persistence::EventStore;
+
+    let Some(server) = SyncServer::start() else {
+        return;
+    };
+    let (_dir, path) = machine();
+    let store = server.open(&path).await;
+    let created = event(1);
+    let expected = created
+        .metadata
+        .timestamp
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .append("default:Note:legacy", 0, &[created])
+        .await
+        .unwrap();
+    store
+        .upsert_query_projection(
+            "default",
+            "Note",
+            "legacy",
+            "Created",
+            &serde_json::json!({}),
+            1,
+        )
+        .await
+        .unwrap();
+    // Model a pre-migration catalog with a pending durable cursor.
+    store
+        .sync_copy()
+        .unwrap()
+        .execute_local("UPDATE first_event_backfill SET complete = 0 WHERE id = 1")
+        .await
+        .unwrap();
+    push(&store).await;
+    drop(store);
+
+    let store = server.open(&path).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows = store
+                .load_entity_catalog_rows("default", "Note", &["legacy".into()])
+                .await
+                .unwrap();
+            if rows[0].state.as_ref().unwrap()["first_event_at"] == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("creation backfill completes");
+    push(&store).await;
+    let copy = store.sync_copy().unwrap();
+    let rows = copy.change_log_rows().await.unwrap();
+    let newest = copy.last_change().await.unwrap();
+    drop(store);
+
+    for _ in 0..2 {
+        let store = server.open(&path).await;
+        let copy = store.sync_copy().unwrap();
+        assert_eq!(
+            copy.change_log_rows().await.unwrap(),
+            rows,
+            "a completed creation backfill must not write to the change log"
+        );
+        assert_eq!(copy.last_change().await.unwrap(), newest);
+        let catalog = store
+            .load_entity_catalog_rows("default", "Note", &["legacy".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog[0].state.as_ref().unwrap()["first_event_at"],
+            expected
+        );
     }
 }

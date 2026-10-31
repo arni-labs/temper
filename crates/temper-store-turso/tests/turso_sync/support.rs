@@ -317,6 +317,58 @@ pub async fn switch(upstream: &str) -> (String, std::sync::Arc<std::sync::atomic
     (url, on)
 }
 
+/// Forwards to the sync server, counting the HTTP requests sent through it.
+pub async fn counting(upstream: &str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let upstream = upstream.trim_start_matches("http://").to_string();
+    let counted = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut server_read, mut server_write) = server.into_split();
+            let counted = counted.clone();
+            tokio::spawn(async move {
+                // Each request line ends with its version; the last bytes of
+                // one read are kept so a line split across two reads counts.
+                const START: &[u8] = b" HTTP/1.1\r\n";
+                let mut seen: Vec<u8> = Vec::new();
+                let mut buf = vec![0; 64 * 1024];
+                while let Ok(n) = client_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    let found = seen.windows(START.len()).filter(|w| *w == START).count();
+                    counted.fetch_add(found, Ordering::AcqRel);
+                    let keep = seen.len().min(START.len() - 1);
+                    seen.drain(..seen.len() - keep);
+                    if server_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let mut buf = vec![0; 64 * 1024];
+                while let Ok(n) = server_read.read(&mut buf).await {
+                    if n == 0 || client_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (url, requests)
+}
+
 /// One logged line: the span it was logged in, its message and its fields.
 #[derive(Clone, Debug)]
 pub struct Line {

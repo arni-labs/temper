@@ -36,12 +36,16 @@
 
 mod data_only_create;
 pub mod dbm;
+mod first_event;
 mod metrics;
 mod namespace;
 pub use namespace::PostgresSchema;
 mod catalog_groups;
 pub mod migration;
 pub mod platform;
+mod projection_delta;
+#[cfg(test)]
+mod projection_delta_test;
 mod projection_freshness;
 mod projection_repair;
 #[cfg(test)]

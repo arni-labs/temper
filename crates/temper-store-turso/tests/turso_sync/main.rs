@@ -84,7 +84,9 @@ async fn a_restart_keeps_local_writes_and_sends_them() {
         "the restart did not replace the local file"
     );
 
-    // Opening pushes what the last run left behind.
+    // The next push sends what the last run left behind; a server makes one
+    // as soon as it serves.
+    push(&a).await;
     let (_b_dir, b_path) = machine();
     let b = server.open(&b_path).await;
     assert_eq!(count(&b, "r1").await, 1);

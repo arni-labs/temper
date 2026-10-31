@@ -13,6 +13,7 @@ use super::effects::PostDispatchContext;
 use super::retry;
 use super::{DispatchCommand, DispatchError, DispatchExtOptions, record_workflow_span_attrs};
 use crate::state::admission::AdmissionOutcome;
+use crate::state::write_record::WriteCaller;
 
 const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
 
@@ -198,9 +199,21 @@ impl crate::state::ServerState {
     pub(crate) async fn dispatch_tenant_action_ext_typed_if_current(
         &self,
         cmd: DispatchCommand<'_>,
+        caller: WriteCaller,
         expected_authorization_precondition: String,
     ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, Some(expected_authorization_precondition))
+        self.dispatch_typed_checked(cmd, caller, Some(expected_authorization_precondition))
+            .await
+    }
+
+    /// Dispatch an action a caller outside the kernel sent, such as an
+    /// HttpEndpoint route or an inbound webhook, with no Cedar precondition
+    /// to hold the actor to.
+    pub(crate) async fn dispatch_outside_action(
+        &self,
+        cmd: DispatchCommand<'_>,
+    ) -> Result<EntityResponse, DispatchError> {
+        self.dispatch_typed_checked(cmd, WriteCaller::Outside, None)
             .await
     }
 
@@ -208,13 +221,15 @@ impl crate::state::ServerState {
         &self,
         cmd: DispatchCommand<'_>,
     ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, None).await
+        self.dispatch_typed_checked(cmd, WriteCaller::Kernel, None)
+            .await
     }
 
     /// The dispatch, on the task [`Self::dispatch_typed_checked`] gives it.
     pub(super) async fn dispatch_typed_attached(
         &self,
         cmd: DispatchCommand<'_>,
+        caller: WriteCaller,
         expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
         let DispatchCommand {
@@ -263,6 +278,7 @@ impl crate::state::ServerState {
                 params,
                 agent_ctx,
                 await_integration,
+                caller,
                 expected_authorization_precondition,
             )
             .await?;
@@ -433,7 +449,8 @@ impl crate::state::ServerState {
         params: serde_json::Value,
         agent_ctx: &AgentContext,
         await_integration: bool,
-        expected_authorization_precondition: Option<String>,
+        caller: WriteCaller,
+        mut expected_authorization_precondition: Option<String>,
     ) -> Result<EntityResponse, DispatchError> {
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
@@ -497,7 +514,7 @@ impl crate::state::ServerState {
                 .load_authz_resource_snapshot(tenant, entity_type, entity_id)
                 .await?;
             if !snapshot.exists {
-                let mut response = snapshot.current_state;
+                let response = snapshot.current_state;
                 if let Err(error) = table.validate_action_params(
                     action,
                     &params,
@@ -505,8 +522,7 @@ impl crate::state::ServerState {
                     &response.state.counters,
                     &response.state.booleans,
                 ) {
-                    response.success = false;
-                    response.error = Some(error.message);
+                    let mut response = response;
                     response.refusal = error.refusal;
                     response.refused = true;
                     let ctx = PostDispatchContext {
@@ -522,12 +538,9 @@ impl crate::state::ServerState {
                         action_params: &params,
                         await_integration,
                     };
-                    let response = self.run_post_dispatch_effects(&ctx, response).await;
-                    tracing::Span::current().record("success", false);
-                    if let Some(error) = &response.error {
-                        tracing::Span::current().record("error_msg", error.as_str());
-                    }
-                    return Ok(response);
+                    return Ok(self
+                        .refuse_before_actor(&ctx, response, error.message)
+                        .await);
                 }
             }
         }
@@ -572,6 +585,35 @@ impl crate::state::ServerState {
         let related = self
             .resolve_related_statuses(tenant, entity_type, entity_id, action)
             .await;
+
+        // Relation integrity, field invariants and cross-invariants hold for the
+        // record an outside call's action stores, and the actor is held to the
+        // state that record was built from.
+        let ctx = PostDispatchContext {
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            agent_ctx,
+            dispatch_idempotency_key: agent_ctx
+                .idempotency_key
+                .as_ref()
+                .map(crate::idempotency::IdempotencyKey::as_str),
+            action_params: &params,
+            await_integration,
+        };
+        // Boxed so the preview's future does not deepen every caller's.
+        if let Some(refused) = Box::pin(self.check_outside_action(
+            &ctx,
+            caller,
+            &table,
+            &related,
+            &mut expected_authorization_precondition,
+        ))
+        .await?
+        {
+            return Ok(refused);
+        }
 
         let action_params = params.clone();
         // ADR-0051: acquire an admission permit before spending retry budget.
@@ -645,7 +687,7 @@ impl crate::state::ServerState {
         let authorization_precondition_for_retry = expected_authorization_precondition;
         // The actor keeps the caller's identity on any scheduled action the
         // transition arms, so the action fires as them after a restart too.
-        let caller = Arc::new(agent_ctx.clone());
+        let actor_caller = Arc::new(agent_ctx.clone());
         let idempotency_key = agent_ctx.idempotency_key.clone();
         // W2 phase: ask_reply — round-trip through the retry layer to the
         // actor and back. Aggregates with other phase spans by prefix.
@@ -658,7 +700,7 @@ impl crate::state::ServerState {
         let outcome = {
             use tracing::Instrument;
             let make_msg = || EntityMsg::Action {
-                caller: Some(caller.clone()),
+                caller: Some(actor_caller.clone()),
                 name: action_name.clone(),
                 params: params_for_retry.clone(),
                 related: cross_for_retry.clone(),
@@ -829,6 +871,13 @@ impl crate::state::ServerState {
         let answered_action = response.answered_action.clone();
         let action = answered_action.as_deref().unwrap_or(action);
 
+        let stale = super::outside_write::stale_refusal(
+            caller,
+            authorization_precondition_for_retry.as_deref(),
+            entity_type,
+            entity_id,
+            &response,
+        );
         // Run all post-dispatch effects through the dedicated pipeline.
         let ctx = PostDispatchContext {
             tenant,
@@ -871,6 +920,10 @@ impl crate::state::ServerState {
         };
         // The reply the effects claim hands back may be another dispatcher's.
         response.answered_action = answered_action;
+        if let Some(stale) = stale {
+            tracing::Span::current().record("success", false);
+            return Err(stale);
+        }
         if response.success {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }
@@ -882,36 +935,28 @@ impl crate::state::ServerState {
 
         Ok(response)
     }
+
+    /// Answer a dispatch refused before it reached the actor. The refusal runs
+    /// the post-dispatch pipeline like a refusal from the actor, so it is
+    /// recorded the same way.
+    pub(super) async fn refuse_before_actor(
+        &self,
+        ctx: &PostDispatchContext<'_>,
+        mut response: EntityResponse,
+        error: String,
+    ) -> EntityResponse {
+        response.success = false;
+        response.refused = true;
+        response.error = Some(error);
+        let response = self.run_post_dispatch_effects(ctx, response).await;
+        tracing::Span::current().record("success", false);
+        if let Some(error) = &response.error {
+            tracing::Span::current().record("error_msg", error.as_str());
+        }
+        response
+    }
 }
 
 #[cfg(test)]
-mod log_truncation_tests {
-    use super::{LOG_REQUEST_BODY_MAX_BYTES, truncate_request_body_for_log};
-
-    #[test]
-    fn short_body_is_logged_verbatim() {
-        let body = r#"{"ProductId":"p-1"}"#;
-        assert_eq!(truncate_request_body_for_log(body), body);
-    }
-
-    #[test]
-    fn oversized_ascii_body_is_marked_truncated() {
-        let body = "a".repeat(LOG_REQUEST_BODY_MAX_BYTES + 100);
-        let truncated = truncate_request_body_for_log(&body);
-        assert!(truncated.ends_with("[truncated]"));
-        assert_eq!(
-            truncated.len(),
-            LOG_REQUEST_BODY_MAX_BYTES + "[truncated]".len()
-        );
-    }
-
-    #[test]
-    fn oversized_multibyte_body_does_not_panic_at_the_cap() {
-        // 3-byte characters: the cap at 4096 falls mid-character (4096 % 3 != 0),
-        // which a raw byte slice would panic on.
-        let body = "\u{4e16}".repeat(LOG_REQUEST_BODY_MAX_BYTES);
-        let truncated = truncate_request_body_for_log(&body);
-        assert!(truncated.ends_with("[truncated]"));
-        assert!(truncated.len() <= LOG_REQUEST_BODY_MAX_BYTES + "[truncated]".len());
-    }
-}
+#[path = "actions_log_test.rs"]
+mod log_truncation_tests;

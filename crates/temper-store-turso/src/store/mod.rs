@@ -43,6 +43,7 @@ mod event_store;
 mod evolution;
 pub mod field_index;
 mod field_index_rows;
+mod first_event;
 mod instrumentation;
 mod migration_support;
 pub mod ots;
@@ -129,13 +130,12 @@ impl TursoEventStore {
         let copy = SyncCopy::open(local_path, sync_url, auth_token)
             .await
             .map_err(storage_error)?;
-        let store = Self::open(Database::synced(copy.clone()), false, Some(copy.clone())).await?;
+        let store = Self::open(Database::synced(copy.clone()), false, Some(copy)).await?;
         store.require_primary_keys().await?;
-        // Schema made by this start goes out now; an answer pushes anything
-        // still left before it confirms a write.
-        if let Err(error) = copy.push_committed().await {
-            tracing::warn!(%error, "turso.sync push after migration failed");
-        }
+        // What this start adds to the schema goes out with the next push, as
+        // anything else it commits does: a start never waits on the remote to
+        // build an index over every record (2.7 s for 1,800 records of
+        // 120 KB on staging, 30 Oct 2026).
         Ok(store)
     }
 
@@ -154,6 +154,7 @@ impl TursoEventStore {
             commit_probe: None,
         };
         store.migrate().await?;
+        store.start_first_event_backfill().await?;
         Ok(store)
     }
 
@@ -537,6 +538,14 @@ impl TursoEventStore {
         let _ = conn
             .execute(schema::ALTER_ENTITY_CATALOG_ADD_STATE, ())
             .await;
+        migration_support::add_column_if_missing(
+            &conn,
+            "ALTER TABLE entity_catalog ADD COLUMN first_event_at TEXT",
+        )
+        .await?;
+        conn.execute(first_event::CREATE_BACKFILL_TABLE, ())
+            .await
+            .map_err(storage_error)?;
         conn.execute(schema::CREATE_ENTITY_CATALOG_CHECKPOINT_INDEX, ())
             .await
             .map_err(storage_error)?;

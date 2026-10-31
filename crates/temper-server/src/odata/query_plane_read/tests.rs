@@ -18,10 +18,14 @@ use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 
 mod count_telemetry;
+mod declared_default_count;
+mod declared_defaults;
 mod dst_projection_lag;
 mod empty_match;
 mod equality_delta;
+mod equality_delta_postgres;
 mod equality_probe;
+mod event_metadata;
 mod keyed_existence;
 mod paging;
 mod point_read_freshness;
@@ -262,6 +266,7 @@ async fn list_read_drops_rows_a_per_entity_forbid_names() {
         context_attrs: Default::default(),
         correlation_id: "row-forbid".to_string(),
         cause: None,
+        credential: None,
     };
     let query_options = QueryOptions {
         top: Some(10),
@@ -334,6 +339,7 @@ async fn uniform_type_permit_returns_every_row() {
         context_attrs: Default::default(),
         correlation_id: "uniform-permit".to_string(),
         cause: None,
+        credential: None,
     };
     let query_options = QueryOptions {
         top: Some(10),
