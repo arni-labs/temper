@@ -4,9 +4,12 @@
 //! The check builds the record from the state it reads and the dispatch then
 //! holds the actor to that state (or to the state Cedar authorized, when the
 //! caller brings one). When the record moved on first, the actor applies
-//! nothing and answers with the record as it now is; the write is refused as
-//! stale with that record's version, and the caller re-reads and retries.
-//! Nothing re-checks and resends the write on the caller's behalf.
+//! nothing and answers with the record as it now is, and the dispatch answers
+//! the write as stale with that record's version. The route that took the
+//! write decides it again on that record, checks and all (`state::redecide`),
+//! so a write is never applied to a record its checks did not read, and one
+//! its rules allow lands. Only a write still stale at the route's deadline
+//! reaches its caller as `StaleWrite`.
 
 use serde_json::{Value, json};
 

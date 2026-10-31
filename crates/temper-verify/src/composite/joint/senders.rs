@@ -25,6 +25,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 
 use serde_json::Value;
 use temper_authz::{Asker, Attr, May, SendAnalysis};
@@ -50,6 +51,25 @@ pub(super) struct Senders {
     /// The answers decided again so far: a walk asks the same few questions
     /// over and over, and reading the policies takes far longer than a step.
     decided: RefCell<HashMap<Question, May>>,
+    /// The policies that may apply to a move whose answer depends on the
+    /// request ([`SendAnalysis::applicable`]): all a walk reads of `policies`
+    /// when it decides one again.
+    reread: BTreeSet<String>,
+}
+
+/// What a walk reads of its senders, which a model's digest
+/// ([`JointProof::digest`](super::JointProof::digest)) is of: who sends,
+/// what Cedar lets each send, and the policies it may read again. Policies
+/// no walk can read, and the answers decided so far, are left out.
+impl fmt::Debug for Senders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Senders")
+            .field("askers", &self.askers)
+            .field("detached", &self.detached)
+            .field("may", &self.may)
+            .field("reread", &self.reread)
+            .finish()
+    }
 }
 
 /// A move decided again: its sender, record type and action, its source's
@@ -102,7 +122,7 @@ impl Senders {
             detached.push(at as u32);
         }
         detached.extend((detached.len()..askers.len()).map(|at| at as u32));
-        let may = policies.map(|policies| {
+        let may: Option<BTreeMap<String, BTreeMap<String, Vec<May>>>> = policies.map(|policies| {
             entities
                 .into_iter()
                 .map(|entity| {
@@ -123,12 +143,25 @@ impl Senders {
                 })
                 .collect()
         });
+        let mut reread = BTreeSet::new();
+        if let (Some(policies), Some(may)) = (policies, &may) {
+            for (entity, actions) in may {
+                for (action, answers) in actions {
+                    for (by, answer) in answers.iter().enumerate() {
+                        if *answer == May::Maybe {
+                            reread.extend(policies.applicable(&askers[by], action, entity));
+                        }
+                    }
+                }
+            }
+        }
         Self {
             askers,
             detached,
             may,
             policies: policies.cloned(),
             decided: RefCell::default(),
+            reread,
         }
     }
 

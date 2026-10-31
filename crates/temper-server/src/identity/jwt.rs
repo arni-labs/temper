@@ -130,8 +130,13 @@ pub struct Claims {
     pub client_id: Option<String>,
     #[serde(default)]
     pub agent_type: Option<String>,
-    /// The owning human's role (owner/curator/contributor), set by the AS from
-    /// the Member record. Carried onto the principal for Cedar evaluation.
+    /// The caller's role at this token's audience: on a person's token, the
+    /// person's role; on an agent's token, the agent's own role (for example,
+    /// its role in one app). Carried onto the principal for Cedar evaluation.
+    ///
+    /// `service` is reserved. The kernel treats a principal whose role is
+    /// `service` as one of its own internal identities: it names no caller and
+    /// its moves record no request subject. An issuer must never grant it.
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
