@@ -25,6 +25,9 @@ Writes key=value lines to $GITHUB_OUTPUT (stdout when unset):
             before) or the SDK itself did; packages/ is in DOCS for Rust's sake
   shards    JSON matrix of Tests shards for the pr lane
   specs     true when Spec Verification runs: the full lane, or a changed spec file
+  tests     false on a pull request: it only compiles and lints, and its merge group
+            runs every test once, before main takes it (Rita, 31 Oct 2026: "CI 2
+            times is insane"); true for every other event
 """
 
 import fnmatch
@@ -156,7 +159,7 @@ def main():
     lane = "pr" if queued or verified or os.environ.get("CHANGED_PATHS", "").strip() else "full"
     dirs, names, dependents, libraries = workspace()
     out = {"lane": lane, "mode": "full", "packages": " ".join(sorted(names)), "test_args": "--workspace", "rust": "true",
-           "specs": "true"}
+           "specs": "true", "tests": "false" if os.environ.get("EVENT") == "pull_request" else "true"}
     if lane == "pr":
         if verified:
             print(f"This tree already passed in its merge group: {verified}", file=sys.stderr)
