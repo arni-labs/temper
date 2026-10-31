@@ -72,6 +72,40 @@ where
     }
 }
 
+/// Longest error phrase an outbound-failure log line carries.
+const OUTBOUND_ERROR_KIND_MAX_CHARS: usize = 120;
+
+/// Log an outbound host call that failed before the guest got a response.
+///
+/// The guest sees only `-1`, so this line is the one record of why. It names
+/// the method, host and path, and the error's leading phrase (the text before
+/// its first `": "`), which says what kind of failure it was. It never logs the
+/// query, headers, body or the rest of the error, which can quote a response
+/// body.
+fn log_outbound_call_failure(host_fn: &'static str, method: &str, url: &str, error: &str) {
+    let (host, path) = match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            let host = match (parsed.host_str(), parsed.port()) {
+                (Some(host), Some(port)) => format!("{host}:{port}"),
+                (Some(host), None) => host.to_string(),
+                (None, _) => String::new(),
+            };
+            (host, parsed.path().to_string())
+        }
+        Err(_) => ("<unparsed url>".to_string(), String::new()),
+    };
+    let phrase = error.split(": ").next().unwrap_or(error).trim();
+    let error_kind: String = phrase.chars().take(OUTBOUND_ERROR_KIND_MAX_CHARS).collect();
+    tracing::warn!(
+        host_fn,
+        http.method = %method.to_ascii_uppercase(),
+        url.host = %host,
+        url.path = %path,
+        error_kind = %error_kind,
+        "WASM host outbound call failed; returning error to guest"
+    );
+}
+
 fn redact_url_for_log(url: &str) -> String {
     let without_fragment = url.split('#').next().unwrap_or(url);
     without_fragment
@@ -757,6 +791,7 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                 let _guest_span = caller.data().guest_spans.enter_active();
                 let host = caller.data().host.clone();
                 let deadline = caller.data().remaining_host_call_timeout();
+                let target = (method.clone(), url.clone());
                 let Ok(result) =
                     run_host_call_with_timeout("host_http_call", deadline, async move {
                         host.http_call(&method, &url, &headers, &body).await
@@ -786,7 +821,10 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                         }
                         resp_bytes.len() as i32
                     }
-                    Err(_) => -1,
+                    Err(error) => {
+                        log_outbound_call_failure("host_http_call", &target.0, &target.1, &error);
+                        -1
+                    }
                 }
             },
         )
@@ -832,6 +870,11 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                 let _guest_span = caller.data().guest_spans.enter_active();
                 let host = caller.data().host.clone();
                 let deadline = caller.data().remaining_host_call_timeout();
+                // A batch fails as one call; its first request names where it went.
+                let target = requests
+                    .first()
+                    .map(|request| (request.method.clone(), request.url.clone()))
+                    .unwrap_or_default();
                 let Ok(result) =
                     run_host_call_with_timeout("host_http_call_batch", deadline, async move {
                         host.http_call_batch(
@@ -881,7 +924,15 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                         }
                         response_bytes.len() as i32
                     }
-                    Err(_) => -1,
+                    Err(error) => {
+                        log_outbound_call_failure(
+                            "host_http_call_batch",
+                            &target.0,
+                            &target.1,
+                            &error,
+                        );
+                        -1
+                    }
                 }
             },
         )
@@ -965,6 +1016,7 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                 let _guest_span = caller.data().guest_spans.enter_active();
                 let host = caller.data().host.clone();
                 let deadline = caller.data().remaining_host_call_timeout();
+                let target_url = url.clone();
                 let Ok(result) =
                     run_host_call_with_timeout("host_connect_call", deadline, async move {
                         host.connect_call(&url, &headers, &body).await
@@ -994,7 +1046,11 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                         }
                         json_bytes.len() as i32
                     }
-                    Err(_) => -1,
+                    Err(error) => {
+                        // A Connect call is always a POST.
+                        log_outbound_call_failure("host_connect_call", "POST", &target_url, &error);
+                        -1
+                    }
                 }
             },
         )
@@ -1122,6 +1178,7 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                 let _guest_span = caller.data().guest_spans.enter_active();
                 let host = caller.data().host.clone();
                 let deadline = caller.data().remaining_host_call_timeout();
+                let target = (method.clone(), url.clone());
                 let Ok(result) =
                     run_host_call_with_timeout("host_http_call_stream", deadline, async move {
                         host.http_call_binary(&method, &url, &headers, &body_bytes)
@@ -1144,7 +1201,15 @@ pub(super) fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), 
                         }
                         status as i32
                     }
-                    Err(_) => -1,
+                    Err(error) => {
+                        log_outbound_call_failure(
+                            "host_http_call_stream",
+                            &target.0,
+                            &target.1,
+                            &error,
+                        );
+                        -1
+                    }
                 }
             },
         )
