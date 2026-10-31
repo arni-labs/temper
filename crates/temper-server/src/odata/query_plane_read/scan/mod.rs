@@ -26,6 +26,8 @@ pub(super) struct NativeCandidatePagePlan {
     pub(super) params: Vec<String>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
     pub(super) filter_pushdown: bool,
+    /// The SQL predicate needs no recheck before pagination/counting.
+    pub(super) filter_exact: bool,
 }
 
 pub(super) struct CandidateScanResult {

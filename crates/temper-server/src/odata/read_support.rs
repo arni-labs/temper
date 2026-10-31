@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use futures_util::stream::{self, StreamExt};
 use temper_runtime::tenant::TenantId;
 
+use super::read_defaults::ReadDefaults;
 use crate::state::ServerState;
 use crate::storage::{
     CatalogRowsLoad, EntityCatalogRow, load_catalog_rows_by_id, load_selected_catalog_rows_by_id,
@@ -267,11 +268,9 @@ pub(super) async fn try_load_entity_body_from_catalog(
         }
     }
     maybe_spawn_catalog_shadow_check(state, tenant, entity_type, &row);
-    Some(catalog_row_to_entity_body(
-        entity_type,
-        entity_set_name,
-        row,
-    ))
+    let mut body = catalog_row_to_entity_body(entity_type, entity_set_name, row);
+    ReadDefaults::for_entity(state, tenant, entity_type).apply(&mut body);
+    Some(body)
 }
 
 pub(super) async fn materialize_entity_set_entities(
@@ -283,11 +282,13 @@ pub(super) async fn materialize_entity_set_entities(
     prefer_catalog: bool,
     selected_catalog_fields: Option<&[String]>,
 ) -> MaterializedEntitySet {
+    let defaults = ReadDefaults::for_entity(state, tenant, entity_type);
+    let projection_fields = selected_catalog_fields.map(|select| defaults.catalog_fields(select));
     let selected_catalog_fields_owned = selected_catalog_fields.map(Vec::from);
     let mut catalog_select_projection = false;
     let mut catalog_hits: BTreeMap<String, EntityCatalogRow> =
         if should_read_catalog_for_materialization(prefer_catalog) {
-            match selected_catalog_fields {
+            match projection_fields.as_deref() {
                 Some(select) => {
                     let (rows, sparse) = try_load_selected_catalog_rows(
                         state,
@@ -327,16 +328,23 @@ pub(super) async fn materialize_entity_set_entities(
             let entity_type = entity_type.to_string();
             let entity_set_name = entity_set_name.to_string();
             let selected_catalog_fields = selected_catalog_fields_owned.clone();
+            let defaults = &defaults;
             async move {
                 if let Some(row) = catalog_row {
                     let entity = match selected_catalog_fields.as_deref() {
-                        Some(select) => catalog_row_to_selected_entity_body(
-                            &entity_type,
-                            &entity_set_name,
-                            row,
-                            select,
-                        ),
-                        None => catalog_row_to_entity_body(&entity_type, &entity_set_name, row),
+                        Some(select) => {
+                            let fields = defaults.field_values(row.state.as_ref().unwrap_or(&row.fields));
+                            let mut entity = catalog_row_to_selected_entity_body(
+                                &entity_type, &entity_set_name, row, select,
+                            );
+                            defaults.apply_selected(&mut entity, select, &fields);
+                            entity
+                        }
+                        None => {
+                            let mut entity = catalog_row_to_entity_body(&entity_type, &entity_set_name, row);
+                            defaults.apply(&mut entity);
+                            entity
+                        }
                     };
                     return Some(entity);
                 }
@@ -376,6 +384,7 @@ pub(super) async fn materialize_entity_set_entities(
                             }
                         }
                         let mut entity = serde_json::to_value(&response.state).unwrap_or_default();
+                        defaults.apply(&mut entity);
                         if let Some(obj) = entity.as_object_mut() {
                             obj.insert(
                                 "@odata.id".into(),

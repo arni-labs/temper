@@ -87,22 +87,39 @@ pub(in crate::odata::query_plane_read) fn native_candidate_page_plan(
     request: &QueryPlaneReadRequest<'_>,
 ) -> Option<NativeCandidatePagePlan> {
     let query_options = request.query_options;
+    let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
+        request.state,
+        request.tenant,
+        request.entity_type,
+    )
+    .field_values(&serde_json::Value::Null);
     let order_by = native_order_by(request)?;
-    let (where_clause, params, filter_pushdown) = match query_options.filter.as_ref() {
+    let (where_clause, params, filter_pushdown, filter_exact) = match query_options.filter.as_ref()
+    {
         Some(filter) => {
-            if let Some(translated) = filter_sql::try_translate_candidate_filter(filter) {
-                (translated.where_clause, translated.params, true)
+            if let Some(translated) =
+                filter_sql::try_translate_candidate_filter_with_defaults(filter, &defaults)
+            {
+                // Missing index entries include omitted/oversized stored fields.
+                // Recheck candidates before counting or applying skip/top.
+                (
+                    translated.where_clause,
+                    translated.params,
+                    true,
+                    !translated.includes_missing_defaults,
+                )
             } else {
-                ("TRUE".to_string(), Vec::new(), false)
+                ("TRUE".to_string(), Vec::new(), false, false)
             }
         }
-        None => ("TRUE".to_string(), Vec::new(), false),
+        None => ("TRUE".to_string(), Vec::new(), false, false),
     };
     Some(NativeCandidatePagePlan {
         where_clause,
         params,
         order_by,
         filter_pushdown,
+        filter_exact,
     })
 }
 
@@ -136,6 +153,45 @@ async fn try_query_native_page(
                 "native OData query-plane page failed; falling back"
             );
         })
+}
+
+/// Keep indexed sorting when every candidate has its sort values. A missing
+/// index entry needs materialization to distinguish a declared default from
+/// an oversized or otherwise unindexed stored value.
+async fn native_sort_values_present(
+    request: &QueryPlaneReadRequest<'_>,
+    plan: &NativeCandidatePagePlan,
+) -> Option<bool> {
+    if plan.order_by.is_empty() {
+        return Some(true);
+    }
+    let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
+        request.state,
+        request.tenant,
+        request.entity_type,
+    )
+    .field_values(&serde_json::Value::Null);
+    for clause in &plan.order_by {
+        if defaults.get(&clause.field_name).is_none() {
+            continue;
+        }
+        let mut probe = plan.clone();
+        let field_param = probe.params.len() + 3;
+        probe.params.push(clause.field_name.clone());
+        probe.where_clause = format!(
+            "({}) AND entity_id NOT IN (SELECT entity_id FROM entity_field_index \
+             WHERE tenant = ?1 AND entity_type = ?2 AND field_name = ?{field_param})",
+            probe.where_clause,
+        );
+        probe.order_by.clear();
+        let page = try_query_native_page(request, &probe, 0, 1, false)
+            .await
+            .ok()??;
+        if !page.entity_ids.is_empty() {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// One SQL page when every row is allowed and the filter, if any, is already
@@ -173,7 +229,7 @@ async fn try_uniform_native_page(
     if !matches!(authz, RowAuthz::AllowAll) {
         return None;
     }
-    if request.query_options.filter.is_some() && !plan.filter_pushdown {
+    if request.query_options.filter.is_some() && !plan.filter_exact {
         return None;
     }
     if requested_top == 0 {
@@ -251,6 +307,9 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     }
 
     let authz = decide_row_authz(request);
+    if !matches!(authz, RowAuthz::DenyAll) && !native_sort_values_present(request, &plan).await? {
+        return None;
+    }
     if let Some(result) = try_uniform_native_page(
         request,
         &plan,

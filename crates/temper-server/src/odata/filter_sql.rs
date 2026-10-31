@@ -22,6 +22,8 @@ pub(super) struct TranslatedFilter {
     pub where_clause: String,
     /// Ordered parameter values corresponding to `?3`, `?4`, etc.
     pub params: Vec<String>,
+    /// Missing index entries may be stored values the index deliberately omitted.
+    pub includes_missing_defaults: bool,
 }
 
 /// Try to translate an OData filter expression into a SQL WHERE clause.
@@ -34,11 +36,14 @@ pub(super) fn try_translate_filter(filter: &FilterExpr) -> Option<TranslatedFilt
     let mut ctx = TranslateCtx {
         params: Vec::new(),
         next_param: 3, // ?1 = tenant, ?2 = entity_type (prepended by query_field_index)
+        defaults: serde_json::json!({}),
+        includes_missing_defaults: false,
     };
     let clause = translate_expr(filter, &mut ctx)?;
     Some(TranslatedFilter {
         where_clause: clause,
         params: ctx.params,
+        includes_missing_defaults: ctx.includes_missing_defaults,
     })
 }
 
@@ -50,14 +55,26 @@ pub(super) fn try_translate_filter(filter: &FilterExpr) -> Option<TranslatedFilt
 /// this predicate as a candidate narrowing step and still re-evaluate the
 /// original filter after materialization.
 pub(super) fn try_translate_candidate_filter(filter: &FilterExpr) -> Option<TranslatedFilter> {
+    try_translate_candidate_filter_with_defaults(filter, &serde_json::json!({}))
+}
+
+/// Include rows without an indexed value when the declaration matches the filter.
+/// The original predicate is checked again after read defaults are materialized.
+pub(super) fn try_translate_candidate_filter_with_defaults(
+    filter: &FilterExpr,
+    defaults: &serde_json::Value,
+) -> Option<TranslatedFilter> {
     let mut ctx = TranslateCtx {
         params: Vec::new(),
         next_param: 3, // ?1 = tenant, ?2 = entity_type (prepended by query_field_index)
+        defaults: defaults.clone(),
+        includes_missing_defaults: false,
     };
     let clause = translate_candidate_expr(filter, &mut ctx)?;
     Some(TranslatedFilter {
         where_clause: clause,
         params: ctx.params,
+        includes_missing_defaults: ctx.includes_missing_defaults,
     })
 }
 
@@ -131,6 +148,8 @@ fn collect_equality_field_predicates(
 }
 
 struct TranslateCtx {
+    defaults: serde_json::Value,
+    includes_missing_defaults: bool,
     params: Vec<String>,
     next_param: usize,
 }
@@ -298,15 +317,35 @@ fn translate_comparison(
         };
     }
 
+    let missing_may_match = op == BinaryOperator::Eq
+        && ctx
+            .defaults
+            .get(&field_name)
+            .is_some_and(|initial| match value {
+                ODataValue::String(value) => initial.as_str() == Some(value.as_str()),
+                // A stored boolean may predate its fields mirror and differ
+                // from the active declaration (for example after a spec edit).
+                ODataValue::Boolean(_) => initial.as_bool().is_some(),
+                _ => false,
+            });
     let text_value = odata_value_to_text(value)?;
     let field_param = ctx.add_param(field_name);
     let value_param = ctx.add_param(text_value);
 
-    Some(format!(
+    let predicate = format!(
         "entity_id IN (SELECT entity_id FROM entity_field_index \
          WHERE tenant = ?1 AND entity_type = ?2 \
          AND field_name = {field_param} AND field_value {sql_op} {value_param})"
-    ))
+    );
+    if missing_may_match {
+        ctx.includes_missing_defaults = true;
+        Some(format!(
+            "({predicate} OR entity_id NOT IN (SELECT entity_id FROM entity_field_index \
+            WHERE tenant = ?1 AND entity_type = ?2 AND field_name = {field_param}))"
+        ))
+    } else {
+        Some(predicate)
+    }
 }
 
 fn is_status_property(field_name: &str) -> bool {

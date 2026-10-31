@@ -14,6 +14,7 @@ mod nearest;
 mod query_plane_read;
 mod rate_limit;
 mod read;
+pub(crate) mod read_defaults;
 mod read_support;
 mod response;
 mod storage_guardrails;
