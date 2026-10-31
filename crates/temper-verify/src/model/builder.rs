@@ -14,8 +14,10 @@ use temper_spec::automaton::{
 };
 use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set, VarKind};
 
+mod fields;
 mod strings;
 
+use fields::read_fields;
 use strings::{string_literals, tracked_strings};
 
 use super::counters::leave_out_unread_counters;
@@ -61,8 +63,9 @@ pub fn build_model_tracking(
     let mut initial_booleans = BTreeMap::new();
     let mut initial_lists: BTreeMap<String, Vec<ModelString>> = BTreeMap::new();
     let mut counter_bounds = BTreeMap::new();
+    let read = read_fields(automaton, also_tracked);
 
-    for sv in &automaton.state {
+    for sv in automaton.state.iter().filter(|sv| read.contains(&sv.name)) {
         match &sv.initial {
             Initial::Counter(n) => {
                 initial_counters.insert(sv.name.clone(), *n);
@@ -95,7 +98,7 @@ pub fn build_model_tracking(
             (sv.name.clone(), value.into())
         })
         .collect();
-    let transitions = resolve_transitions(automaton, &tracked_strings);
+    let transitions = resolve_transitions(automaton, &tracked_strings, &read);
     // A counter written with a literal larger than the exploration bound is
     // explored up to that literal, so the write is not pruned away.
     for t in &transitions {
@@ -198,6 +201,7 @@ fn list_literals(automaton: &Automaton) -> BTreeMap<String, BTreeSet<String>> {
 fn resolve_transitions(
     automaton: &Automaton,
     tracked_strings: &BTreeSet<String>,
+    read: &BTreeSet<String>,
 ) -> Vec<ResolvedTransition> {
     // `translate_actions` keeps every action but outputs, in order.
     let declared = automaton
@@ -208,8 +212,12 @@ fn resolve_transitions(
         .into_iter()
         .zip(declared)
         .map(|(a, action)| {
-            let effects: Vec<ModelEffect> =
-                a.effects.into_iter().filter_map(convert_effect).collect();
+            let effects: Vec<ModelEffect> = a
+                .effects
+                .into_iter()
+                .filter_map(convert_effect)
+                .filter(|effect| holds_written(effect, read))
+                .collect();
             let mut params = effect_params(&effects);
             if !automaton.entry_rules.is_empty() {
                 // A guard-only input still determines whether entry is legal.
@@ -378,6 +386,20 @@ fn convert_effect(effect: ResolvedEffect) -> Option<ModelEffect> {
         | ResolvedEffect::ScheduleAt { .. }
         | ResolvedEffect::Spawn { .. } => return None,
     })
+}
+
+/// Whether the model holds the field `effect` writes: a string (tracked or
+/// not, decided by the string rules) or a field in `read`.
+fn holds_written(effect: &ModelEffect, read: &BTreeSet<String>) -> bool {
+    match effect {
+        ModelEffect::SetString { .. } => true,
+        ModelEffect::SetCounter { var, .. }
+        | ModelEffect::AddCounter { var, .. }
+        | ModelEffect::SubCounter { var, .. }
+        | ModelEffect::SetBool { var, .. }
+        | ModelEffect::ListAppend { var, .. }
+        | ModelEffect::ListRemoveAt { var, .. } => read.contains(var),
+    }
 }
 
 /// The kind of every `params.p` the effects read (checked consistent at load).

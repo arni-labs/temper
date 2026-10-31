@@ -128,7 +128,7 @@ async fn validate_ioa_rejects_a_budget_out_of_range() {
 async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
     let flags: Vec<String> = (0..13).map(|i| format!("f{i}")).collect();
     let ioa = format!(
-        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n",
+        "[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n{}\n[[action]]\nname = \"Set\"\nkind = \"input\"\nfrom = [\"On\"]\nparams = [{}]\neffect = [{}]\n\n[[invariant]]\nname = \"Held\"\nassert = \"{}\"\n",
         flags
             .iter()
             .map(|f| format!("[[state]]\nname = \"{f}\"\ntype = \"bool\"\ninitial = false\n"))
@@ -144,6 +144,12 @@ async fn validate_ioa_answers_a_move_with_too_many_parameter_choices() {
             .map(|f| format!("\"{f} = params.{f}\""))
             .collect::<Vec<_>>()
             .join(", "),
+        // The model holds only the fields some rule reads.
+        flags
+            .iter()
+            .map(|f| format!("({f} || !{f})"))
+            .collect::<Vec<_>>()
+            .join(" && "),
     );
     let app = build_router(test_state_with_registry());
     let response = app

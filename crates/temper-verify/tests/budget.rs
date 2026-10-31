@@ -74,15 +74,16 @@ action = [
   { name = "E", kind = "input", from = ["On"], effect = ["e += 1"] },
   { name = "F", kind = "input", from = ["On"], effect = ["f += 1"] },
 ]
-# Read every counter, so each one multiplies the states to check.
-invariant = [
-  { name = "Counted", assert = "a >= 0 && b >= 0 && c >= 0 && d >= 0 && e >= 0 && f >= 0" },
-]
 
 [automaton]
 name = "Wide"
 states = ["On"]
 initial = "On"
+
+# The model holds only the fields some rule reads.
+[[invariant]]
+name = "Held"
+assert = "a >= 0 && b >= 0 && c >= 0 && d >= 0 && e >= 0 && f >= 0"
 "#;
 
 #[test]
@@ -171,15 +172,18 @@ fn thirteen_flags() -> String {
         .map(|f| format!("  {{ name = \"{f}\", type = \"bool\", initial = false }},"))
         .collect();
     let params: Vec<String> = flags.iter().map(|f| format!("\"{f}\"")).collect();
+    // The model holds only the fields some rule reads.
+    let read: Vec<String> = flags.iter().map(|f| format!("({f} || !{f})")).collect();
     let effects: Vec<String> = flags
         .iter()
         .map(|f| format!("\"{f} = params.{f}\""))
         .collect();
     format!(
-        "state = [\n{}\n]\naction = [\n  {{ name = \"Set\", kind = \"input\", from = [\"On\"], params = [{}], effect = [{}] }},\n]\n\n[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n",
+        "state = [\n{}\n]\naction = [\n  {{ name = \"Set\", kind = \"input\", from = [\"On\"], params = [{}], effect = [{}] }},\n]\n\n[automaton]\nname = \"Flags\"\nstates = [\"On\"]\ninitial = \"On\"\n\n[[invariant]]\nname = \"Held\"\nassert = \"{}\"\n",
         states.join("\n"),
         params.join(", "),
         effects.join(", "),
+        read.join(" && "),
     )
 }
 
@@ -226,8 +230,9 @@ from = ["On"]
 params = ["n"]
 effect = ["x += params.n"]
 
+# The model holds only the fields some rule reads.
 [[invariant]]
-name = "Counted"
+name = "Held"
 assert = "x >= 0"
 "#;
     let started = Instant::now();

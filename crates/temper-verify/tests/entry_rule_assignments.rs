@@ -278,6 +278,9 @@ field = "expected"
     passes(&source);
 }
 
+/// `state` declares the field the effect writes and a rule that reads it:
+/// the model holds only fields some rule reads, and an unread one bounds
+/// nothing.
 fn effect_input(effect: &str, state: &str) -> String {
     spec(
         &(string("topping", "one") + state),
@@ -310,7 +313,7 @@ fn count_witness(source: &str) {
 fn saturated_subtraction_preserves_guard_distinguishable_inputs() {
     count_witness(&effect_input(
         "count -= params.p",
-        "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n",
+        "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n\n[[invariant]]\nname = \"held\"\nassert = \"count >= 0\"\n",
     ));
 }
 
@@ -318,7 +321,7 @@ fn saturated_subtraction_preserves_guard_distinguishable_inputs() {
 fn no_op_list_indexes_preserve_guard_distinguishable_inputs() {
     count_witness(&effect_input(
         "remove_at(items, params.p)",
-        "\n[[state]]\nname = \"items\"\ntype = \"list\"\ninitial = ['one']\n",
+        "\n[[state]]\nname = \"items\"\ntype = \"list\"\ninitial = ['one']\n\n[[invariant]]\nname = \"held\"\nassert = \"len(items) >= 0\"\n",
     ));
 }
 
@@ -326,10 +329,8 @@ fn no_op_list_indexes_preserve_guard_distinguishable_inputs() {
 fn widened_guard_inputs_still_respect_effect_bounds() {
     let source = effect_input(
         "count += params.p",
-        "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n",
+        "\n[[state]]\nname = \"count\"\ntype = \"counter\"\ninitial = 0\n\n[[invariant]]\nname = \"held\"\nassert = \"count >= 0\"\n",
     );
-    // Keep the count whose effect bound this test exercises.
-    let source = format!("{source}\n[[invariant]]\nname = 'Counted'\nassert = 'count >= 0'\n");
     passes(&source);
     let model = build_model_from_ioa(&source, 2).unwrap();
     let checked = check_model(&model);
