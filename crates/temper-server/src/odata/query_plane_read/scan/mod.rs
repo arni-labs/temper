@@ -26,8 +26,6 @@ pub(super) struct NativeCandidatePagePlan {
     pub(super) params: Vec<String>,
     pub(super) order_by: Vec<QueryFieldIndexOrder>,
     pub(super) filter_pushdown: bool,
-    /// The complete filter is translated; index gaps are probed before use.
-    pub(super) filter_exact: bool,
     /// Fields whose absent index entries require candidate rechecking.
     pub(super) filter_missing_fields: Vec<String>,
 }

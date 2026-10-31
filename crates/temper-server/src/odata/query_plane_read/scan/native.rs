@@ -122,10 +122,6 @@ pub(in crate::odata::query_plane_read) fn native_candidate_page_plan(
         params,
         order_by,
         filter_pushdown,
-        filter_exact: query_options
-            .filter
-            .as_ref()
-            .is_some_and(filter_sql::candidate_filter_is_lossless),
         filter_missing_fields,
     })
 }
@@ -225,7 +221,12 @@ async fn try_uniform_native_page(
     if !matches!(authz, RowAuthz::AllowAll) {
         return None;
     }
-    if request.query_options.filter.is_some() && !plan.filter_exact {
+    if request
+        .query_options
+        .filter
+        .as_ref()
+        .is_some_and(|filter| !filter_sql::candidate_filter_is_lossless(filter))
+    {
         return None;
     }
     if requested_top == 0 {
@@ -275,7 +276,7 @@ async fn try_uniform_native_page(
 
 pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     request: &QueryPlaneReadRequest<'_>,
-    mut plan: NativeCandidatePagePlan,
+    plan: NativeCandidatePagePlan,
     coverage: QueryPlaneCoverageReport,
 ) -> Option<Result<CandidateScanResult, QueryPlaneReadError>> {
     let requested_top = request.budget.requested_top(request.query_options);
@@ -303,6 +304,9 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
     }
 
     let authz = decide_row_authz(request);
+    // Index completeness and whole-filter translation are separate proofs.
+    // The uniform page checks translation; this probe checks only index gaps.
+    let mut filter_values_present = true;
     if !matches!(authz, RowAuthz::DenyAll) {
         let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
             request.state,
@@ -319,21 +323,22 @@ pub(in crate::odata::query_plane_read) async fn try_native_page_read(
         if !native_values_present(request, &plan, &sort_fields).await? {
             return None;
         }
-        if plan.filter_exact && !plan.filter_missing_fields.is_empty() {
-            plan.filter_exact =
+        if !plan.filter_missing_fields.is_empty() {
+            filter_values_present =
                 native_values_present(request, &plan, &plan.filter_missing_fields).await?;
         }
     }
-    if let Some(result) = try_uniform_native_page(
-        request,
-        &plan,
-        coverage,
-        &authz,
-        requested_top,
-        skip,
-        include_count,
-    )
-    .await
+    if filter_values_present
+        && let Some(result) = try_uniform_native_page(
+            request,
+            &plan,
+            coverage,
+            &authz,
+            requested_top,
+            skip,
+            include_count,
+        )
+        .await
     {
         return Some(result);
     }

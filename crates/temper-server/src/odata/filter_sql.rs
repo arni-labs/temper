@@ -356,7 +356,6 @@ fn is_status_property(field_name: &str) -> bool {
     field_name == "Status" || field_name == "status"
 }
 
-/// Whether SQL represents every term of the filter, before resolving index gaps.
 pub(super) fn candidate_filter_is_lossless(expr: &FilterExpr) -> bool {
     match expr {
         FilterExpr::BinaryOp { left, op, right } => match op {
