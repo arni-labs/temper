@@ -290,7 +290,9 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             }
         };
         if !automaton.actions.iter().any(|a| {
-            a.to.as_ref() == Some(&rule.place) && (a.from.is_empty() || a.from.iter().any(covered))
+            a.kind != ActionKind::Output
+                && a.to.as_ref() == Some(&rule.place)
+                && (a.from.is_empty() || a.from.iter().any(covered))
         }) {
             return Err(invalid(
                 slot,

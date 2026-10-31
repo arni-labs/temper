@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
 
-use crate::model::semantics::{successors, successors_noting_cuts, truth};
+use crate::model::semantics::{successors_noting_cuts, truth};
 use crate::model::{ENTRY_RULES, ResolvedTransition, entry_broken};
 use crate::model::{TemperModel, TemperModelAction, TemperModelState};
 
@@ -102,9 +102,11 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
                 .collect(),
             Some((state, _)) if property_name == ENTRY_RULES => {
                 match entry_broken(&walked, state) {
-                    Some((rule, t)) => {
-                        take_the_move(&walked, t, &mut trace);
-                        vec![rule.name.clone()]
+                    Some(broken) => {
+                        trace.last_mut().expect("entry-rule path has a pre-state").1 =
+                            Some(broken.action);
+                        trace.push((broken.after, None));
+                        vec![broken.rule.name.clone()]
                     }
                     None => vec![property_name.to_string()],
                 }
@@ -166,27 +168,6 @@ fn first_break(
         steps[first].1 = None;
     }
     steps
-}
-
-/// End `trace`, which stops at the state an entry rule is read in, with the
-/// move `t` that breaks it and the state it leads to.
-fn take_the_move(
-    model: &TemperModel,
-    t: &ResolvedTransition,
-    trace: &mut Vec<(TemperModelState, Option<TemperModelAction>)>,
-) {
-    let Some((before, action)) = trace.last_mut() else {
-        return;
-    };
-    let Some((params, after)) = successors(model, t, before).into_iter().next() else {
-        return;
-    };
-    *action = Some(TemperModelAction {
-        name: t.name.clone(),
-        target_state: t.to_state.clone(),
-        params,
-    });
-    trace.push((after, None));
 }
 
 /// What a walk of every reachable state found.

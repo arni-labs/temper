@@ -12,7 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::{
     ActionConstraint, ActionKind, Automaton, Initial, ResolvedEffect, translate_actions,
 };
-use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, ParamKind, Set, VarKind};
+use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set};
+
+mod strings;
+
+use strings::{string_literals, tracked_strings};
 
 use super::entry::resolve_entry_rules;
 use super::types::{
@@ -258,109 +262,6 @@ fn string_params(
             param
         })
         .collect()
-}
-
-/// The string variables the verifier tracks: those `[[invariant]]`s and
-/// `[[entry_rule]]`s read, plus `also_tracked`, plus every string variable a
-/// constraint ties the parameter of a tracked one to (its value decides what
-/// the tracked one may become). Strings no rule can see stay unmodeled, so a
-/// spec whose rules read none explores exactly as before.
-fn tracked_strings(automaton: &Automaton, also_tracked: &BTreeSet<String>) -> BTreeSet<String> {
-    let kinds: BTreeMap<&str, VarKind> = automaton
-        .state
-        .iter()
-        .map(|sv| (sv.name.as_str(), sv.var_type.kind()))
-        .collect();
-    let is_string = |name: &str| kinds.get(name) == Some(&VarKind::Str);
-    let mut tracked: BTreeSet<String> = also_tracked
-        .iter()
-        .filter(|name| is_string(name))
-        .cloned()
-        .collect();
-    for assert in rule_asserts(automaton) {
-        assert.for_each_name(&mut |name| {
-            if let Name::Var(var) = name
-                && is_string(var)
-            {
-                tracked.insert(var.to_string());
-            }
-        });
-    }
-    loop {
-        let before = tracked.len();
-        for action in &automaton.actions {
-            for constraint in &action.constraints {
-                if !tracked.contains(constraint.param()) {
-                    continue;
-                }
-                if let Some(field) = constraint.field()
-                    && is_string(field)
-                {
-                    tracked.insert(field.to_string());
-                }
-            }
-        }
-        if tracked.len() == before {
-            return tracked;
-        }
-    }
-}
-
-/// For each tracked string variable, the literals a guard or rule compares
-/// it with (`v == 'x'`, `v in ['x', 'y']`).
-fn string_literals(
-    automaton: &Automaton,
-    tracked: &BTreeSet<String>,
-) -> BTreeMap<String, BTreeSet<String>> {
-    fn visit(
-        expr: &Expr,
-        tracked: &BTreeSet<String>,
-        out: &mut BTreeMap<String, BTreeSet<String>>,
-    ) {
-        match expr {
-            Expr::Not(inner) => visit(inner, tracked, out),
-            Expr::And(parts) | Expr::Or(parts) => {
-                parts.iter().for_each(|part| visit(part, tracked, out));
-            }
-            Expr::Implies(a, b) => {
-                visit(a, tracked, out);
-                visit(b, tracked, out);
-            }
-            Expr::Compare {
-                lhs,
-                op: CmpOp::Eq | CmpOp::Ne,
-                rhs,
-            } => {
-                for (var, lit) in [(lhs, rhs), (rhs, lhs)] {
-                    if let (Operand::Var(var), Operand::Lit(Literal::Str(text))) = (var, lit)
-                        && tracked.contains(var)
-                    {
-                        out.entry(var.clone()).or_default().insert(text.clone());
-                    }
-                }
-            }
-            Expr::In {
-                value: Operand::Var(var),
-                set: Set::List(items),
-                ..
-            } if tracked.contains(var) => {
-                for item in items {
-                    if let Literal::Str(text) = item {
-                        out.entry(var.clone()).or_default().insert(text.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = BTreeMap::new();
-    for action in &automaton.actions {
-        visit(&action.guard, tracked, &mut out);
-    }
-    for assert in rule_asserts(automaton) {
-        visit(assert, tracked, &mut out);
-    }
-    out
 }
 
 /// The largest non-negative integer literal each counter, or each list's

@@ -18,9 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Env, Expr, Literal, Operand, Set, Truth, Val, VarKind, eval};
 
-use super::semantics::{Expansion, ModelEnv, rule_for};
+use super::semantics::{Expansion, ModelEnv, canonical_strings, rule_for, successors};
 use super::types::{
-    ModelString, ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelState,
+    ModelString, ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelAction,
+    TemperModelState,
 };
 
 /// A related status: `(entity_type, id_field)`.
@@ -45,17 +46,36 @@ pub(super) fn resolve_entry_rules(automaton: &Automaton) -> Vec<ResolvedEntryRul
         .collect()
 }
 
-/// The first move `state` enables that may break an entry rule, with the
-/// rule.
+/// A broken rule together with an executable move and its resulting state.
+pub(crate) struct EntryViolation<'m> {
+    pub(crate) rule: &'m ResolvedEntryRule,
+    pub(crate) action: TemperModelAction,
+    pub(crate) after: TemperModelState,
+}
+
+/// The first executable move from `state` that may break an entry rule.
 pub(crate) fn entry_broken<'m>(
     model: &'m TemperModel,
     state: &TemperModelState,
-) -> Option<(&'m ResolvedEntryRule, &'m ResolvedTransition)> {
+) -> Option<EntryViolation<'m>> {
     model
         .transitions
         .iter()
         .filter(|t| model.transition_enabled(t, state))
-        .find_map(|t| broken_by(model, t, state).map(|rule| (rule, t)))
+        .find_map(|t| {
+            let rule = broken_by(model, t, state)?;
+            let (params, mut after) = successors(model, t, state).into_iter().next()?;
+            canonical_strings(&mut [&mut after.strings]);
+            Some(EntryViolation {
+                rule,
+                action: TemperModelAction {
+                    name: t.name.clone(),
+                    target_state: t.to_state.clone(),
+                    params,
+                },
+                after,
+            })
+        })
 }
 
 /// The first entry rule that taking `action` from `state` may break.
@@ -126,21 +146,43 @@ fn breaks(
         .unwrap_or(0)
         + 1;
     places.extend((first..first + fresh).map(ModelString::Symbol));
-    let related = refs
-        .into_iter()
-        .map(|key| {
-            let size = match model.var_kinds.get(&key.1) {
-                Some(VarKind::Str) => 1,
-                Some(VarKind::List) => state
-                    .lists
-                    .get(&key.1)
-                    .map_or(1, |ids| ids.iter().collect::<BTreeSet<_>>().len().max(1)),
-                // A reference outside the modeled state may be a list of any size.
-                _ => places.len(),
+    let mut references = BTreeMap::new();
+    let mut related = BTreeMap::new();
+    for key in refs {
+        let ids: BTreeSet<ModelString> = match model.var_kinds.get(&key.1) {
+            Some(VarKind::Str) => state.strings.get(&key.1).cloned().into_iter().collect(),
+            Some(VarKind::List) => state
+                .lists
+                .get(&key.1)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(ModelString::from)
+                .collect(),
+            _ => BTreeSet::new(),
+        };
+        let records = if ids.is_empty() {
+            // An absent/unmodeled reference has unknown statuses (as in
+            // guard evaluation), never an empty universal comparison.
+            let record = StatusKey::Unknown(key.clone());
+            let size = if model.var_kinds.get(&key.1) == Some(&VarKind::List) {
+                1
+            } else {
+                places.len()
             };
-            (key, size)
-        })
-        .collect();
+            related.insert(record.clone(), size);
+            vec![record]
+        } else {
+            ids.into_iter()
+                .map(|id| {
+                    let record = StatusKey::Record(key.0.clone(), id);
+                    related.insert(record.clone(), 1);
+                    record
+                })
+                .collect()
+        };
+        references.insert(key, records);
+    }
     StatusSearch {
         local: ModelEnv {
             kinds: &model.var_kinds,
@@ -148,21 +190,29 @@ fn breaks(
         },
         guard: &t.guard,
         assertion: &rule.assert,
-        related,
+        references,
+        related: related.into_iter().collect(),
         places: places.into_iter().collect(),
         budget: Expansion::for_model(model),
     }
     .any_assignment(0, &mut BTreeMap::new())
 }
 
-/// A reference has one status per distinct record, shared by every read in
-/// both predicates. Multiplicity and order do not affect universal predicates,
-/// so enumerate nonempty subsets rather than permutations of the same values.
+/// Known references share statuses by entity type and record identity,
+/// including aliases and partially overlapping lists. An unmodeled reference
+/// ranges over nonempty status subsets, as its IDs are unknown.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum StatusKey {
+    Record(String, ModelString),
+    Unknown(Related),
+}
+
 struct StatusSearch<'a> {
     local: ModelEnv<'a>,
     guard: &'a Expr,
     assertion: &'a Expr,
-    related: Vec<(Related, usize)>,
+    references: BTreeMap<Related, Vec<StatusKey>>,
+    related: Vec<(StatusKey, usize)>,
     places: Vec<ModelString>,
     budget: Expansion,
 }
@@ -171,7 +221,7 @@ impl StatusSearch<'_> {
     fn any_assignment(
         &self,
         index: usize,
-        assigned: &mut BTreeMap<Related, Vec<ModelString>>,
+        assigned: &mut BTreeMap<StatusKey, Vec<ModelString>>,
     ) -> bool {
         if !self.budget.take() {
             return false;
@@ -179,6 +229,7 @@ impl StatusSearch<'_> {
         if index == self.related.len() {
             let env = Assumed {
                 local: &self.local,
+                references: &self.references,
                 statuses: assigned,
             };
             return eval(self.guard, &env).may_hold() && eval(self.assertion, &env) == Truth::False;
@@ -191,7 +242,7 @@ impl StatusSearch<'_> {
         index: usize,
         start: usize,
         chosen: &mut Vec<ModelString>,
-        assigned: &mut BTreeMap<Related, Vec<ModelString>>,
+        assigned: &mut BTreeMap<StatusKey, Vec<ModelString>>,
     ) -> bool {
         let (key, size) = &self.related[index];
         if !chosen.is_empty() {
@@ -262,7 +313,8 @@ fn compared_values(expr: &Expr, out: &mut BTreeSet<ModelString>, comparisons: &m
 /// The record as the model knows it, with the related statuses assumed.
 struct Assumed<'a> {
     local: &'a ModelEnv<'a>,
-    statuses: &'a BTreeMap<Related, Vec<ModelString>>,
+    references: &'a BTreeMap<Related, Vec<StatusKey>>,
+    statuses: &'a BTreeMap<StatusKey, Vec<ModelString>>,
 }
 
 impl Env for Assumed<'_> {
@@ -276,8 +328,11 @@ impl Env for Assumed<'_> {
 
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {
         let key = (entity_type.to_string(), id_field.to_string());
-        self.statuses
-            .get(&key)
-            .map(|places| places.iter().map(ModelString::val).collect())
+        self.references.get(&key).map(|records| {
+            records
+                .iter()
+                .flat_map(|record| self.statuses[record].iter().map(ModelString::val))
+                .collect()
+        })
     }
 }
