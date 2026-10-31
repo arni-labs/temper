@@ -20,6 +20,9 @@ async fn a_hung_push_shows_where_it_waited() {
     let store = TursoEventStore::new_synced(path.to_str().expect("utf-8"), &url, TOKEN)
         .await
         .expect("open through the valve");
+    // A copy's first push asks the remote what it holds before it sends;
+    // pushing once while the valve is open leaves the hung push to the engine.
+    push(&store).await;
     let lines = Lines::default();
     // This thread's own listener: the test runtime runs every task here.
     let _listening = tracing::subscriber::set_default(
