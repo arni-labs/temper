@@ -439,3 +439,6 @@ fn a_can_reach_rule_naming_an_undeclared_place_fails_to_load() {
 
 #[path = "can_reach/route_inputs.rs"]
 mod route_inputs;
+
+#[path = "can_reach/review_constraints.rs"]
+mod review_constraints;

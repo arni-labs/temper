@@ -207,6 +207,9 @@ pub(super) fn string_literals(
     // distinctions, including values initially stored or appended by effects.
     if automaton.liveness.iter().any(|l| !l.can_reach.is_empty()) {
         let mut literals: BTreeSet<String> = out.values().flatten().cloned().collect();
+        // A field can be compared with status after its input is stored.
+        // Every declared status is concrete, even without a quoted guard literal.
+        literals.extend(automaton.automaton.states.iter().cloned());
         literals.extend(list_literals.values().flatten().cloned());
         for effect in automaton.actions.iter().flat_map(|action| &action.effect) {
             if let Effect::Append {

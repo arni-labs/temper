@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use temper_spec::automaton::ActionConstraint;
 use temper_spec::predicate::{Name, VarKind};
 
 use crate::checker::Counterexample;
@@ -20,12 +21,13 @@ use crate::reach::{Graph, NO_PLACE, Reach};
 pub const CAN_REACH: &str = "CanReach";
 
 /// A possible edge through an unmodeled local numeric value or an unchecked
-/// input guard cannot prove that a route exists. Conservatively leave the
-/// rules unproved when any guard reads one. This does not suppress a
-/// concrete refusal found in the overapproximated graph, nor change how
-/// cross-entity guards are explored.
+/// input guard or constraint cannot prove that a route exists. Conservatively
+/// leave the rules unproved when exploration does not enforce one. This does
+/// not suppress a concrete refusal found in the overapproximated graph, nor
+/// change how cross-entity guards are explored.
 pub(crate) fn unproved_rules(model: &TemperModel) -> Vec<String> {
     let mut unmodeled = BTreeSet::new();
+    let mut unchecked = BTreeSet::new();
     for transition in &model.transitions {
         transition.guard.for_each_name(&mut |name| {
             match name {
@@ -40,21 +42,44 @@ pub(crate) fn unproved_rules(model: &TemperModel) -> Vec<String> {
                 _ => {}
             }
         });
+        for constraint in &transition.constraints {
+            let enforced = transition.string_params.iter().any(|param| {
+                param.name == constraint.param()
+                    && match constraint {
+                        ActionConstraint::ParamNonempty { .. } => param.nonempty,
+                        ActionConstraint::ParamEqualsField { field, .. } => {
+                            model.tracked_strings.contains(field) && param.equals.contains(field)
+                        }
+                        ActionConstraint::ParamNotEqualsField { field, .. } => {
+                            model.tracked_strings.contains(field)
+                                && param.not_equals.contains(field)
+                        }
+                        ActionConstraint::ParamGreaterThanField { .. } => false,
+                    }
+            });
+            if !enforced {
+                unchecked.insert(format!("{}: {constraint:?}", transition.name));
+            }
+        }
     }
-    if unmodeled.is_empty() {
+    let mut reasons = Vec::new();
+    if !unmodeled.is_empty() {
+        let names = unmodeled.into_iter().collect::<Vec<_>>().join(", ");
+        reasons.push(format!("guards read unmodeled local values: {names}"));
+    }
+    if !unchecked.is_empty() {
+        let constraints = unchecked.into_iter().collect::<Vec<_>>().join(", ");
+        reasons.push(format!("input constraints not modeled: {constraints}"));
+    }
+    if reasons.is_empty() {
         return Vec::new();
     }
-    let names = unmodeled.into_iter().collect::<Vec<_>>().join(", ");
+    let reasons = reasons.join("; ");
     model
         .liveness
         .iter()
         .filter(|live| matches!(live.kind, LivenessKind::CanReach { .. }))
-        .map(|live| {
-            format!(
-                "rule '{}' not proved: guards read unmodeled local values: {names}",
-                live.name
-            )
-        })
+        .map(|live| format!("rule '{}' not proved: {reasons}", live.name))
         .collect()
 }
 

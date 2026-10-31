@@ -7535,6 +7535,7 @@ dependencies = [
  "serde_json",
  "stateright",
  "temper-authz",
+ "temper-jit",
  "temper-runtime",
  "temper-spec",
  "z3",

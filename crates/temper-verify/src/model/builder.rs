@@ -203,6 +203,7 @@ fn resolve_transitions(
                     tracked_strings,
                     automaton.liveness.iter().any(|l| !l.can_reach.is_empty()),
                 ),
+                constraints: action.constraints.clone(),
             }
         })
         .collect()

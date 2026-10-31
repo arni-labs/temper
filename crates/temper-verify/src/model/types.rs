@@ -182,6 +182,9 @@ pub struct ResolvedTransition {
     /// parameter into its field), and those a constraint ties to a tracked
     /// one.
     pub string_params: Vec<StringParam>,
+    /// Original input constraints. Route proofs must identify any that
+    /// string parameter exploration does not enforce.
+    pub constraints: Vec<temper_spec::automaton::ActionConstraint>,
 }
 
 /// A string parameter of an action, with what the action's constraints allow

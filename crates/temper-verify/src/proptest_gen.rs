@@ -434,6 +434,7 @@ mod tests {
                 effects: vec![],
                 params: BTreeMap::new(),
                 string_params: vec![],
+                constraints: vec![],
             }],
             invariants: vec![ResolvedInvariant {
                 name: "OnlyA".to_string(),
