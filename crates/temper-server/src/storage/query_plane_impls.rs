@@ -20,6 +20,13 @@ pub(super) fn catalog_freshness(
         .collect()
 }
 
+/// Whether `journal` is `store` itself. A separately supplied journal can have
+/// changes absent from this store's projection delta, so the delta's absence
+/// is evidence only about the store's own journal.
+fn journal_is<T>(store: &T, journal: &super::BoxedEventStore) -> bool {
+    std::ptr::addr_eq(store as *const T, std::sync::Arc::as_ptr(&journal.store))
+}
+
 pub(super) fn storage_order_by(order_by: &[QueryFieldIndexOrder]) -> Vec<(String, bool)> {
     order_by
         .iter()
@@ -34,6 +41,22 @@ pub(super) fn storage_order_by(order_by: &[QueryFieldIndexOrder]) -> Vec<(String
 
 #[async_trait::async_trait]
 impl QueryPlaneStore for PostgresEventStore {
+    async fn reconciled_equality_candidates(
+        &self,
+        journal: &super::BoxedEventStore,
+        tenant: &str,
+        entity_type: &str,
+        predicates: &[(String, String)],
+        probe_budget: Option<usize>,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
+        if !journal_is(self, journal) {
+            return Ok(None);
+        }
+        self.reconciled_equality_candidates_pg(tenant, entity_type, predicates, probe_budget)
+            .await
+            .map(Some)
+    }
+
     async fn lagging_projections(
         &self,
         tenant: &str,
@@ -385,9 +408,7 @@ impl QueryPlaneStore for TursoEventStore {
         predicates: &[(String, String)],
         probe_budget: Option<usize>,
     ) -> Result<Option<(Vec<String>, Vec<String>)>, PersistenceError> {
-        // A separately supplied journal can have changes absent from this
-        // store's delta. Its absence is never evidence about that journal.
-        if !std::ptr::addr_eq(self as *const Self, std::sync::Arc::as_ptr(&journal.store)) {
+        if !journal_is(self, journal) {
             return Ok(None);
         }
         TursoEventStore::reconciled_equality_candidates(
