@@ -10,7 +10,10 @@ use super::rule_asserts;
 /// The string variables the verifier tracks:
 /// - those `[[invariant]]`s and `[[entry_rule]]`s read, constraint fields when
 ///   the type has entry rules, and `also_tracked`;
-/// - those guards read or effects write that no action's parameter writes;
+/// - those guards read or effects write that no action's parameter writes,
+///   and every string a move into a place with an `[[entry_rule]]` reads in
+///   its guard: the rule claims what that guard guarantees, so the guard is
+///   modeled exactly;
 /// - and every string variable a constraint ties the parameter of a tracked
 ///   one to (its value decides what the tracked one may become), or a guard
 ///   or rule compares with a tracked one (`x == y`).
@@ -64,10 +67,14 @@ pub(super) fn tracked_strings(
         });
     }
     for action in &automaton.actions {
+        let enters_a_rule = automaton
+            .entry_rules
+            .iter()
+            .any(|rule| action.to.as_deref() == Some(rule.place.as_str()));
         action.guard.for_each_name(&mut |name| {
             if let Name::Var(var) = name
                 && is_string(var)
-                && !param_written.contains(var)
+                && (enters_a_rule || !param_written.contains(var))
             {
                 tracked.insert(var.to_string());
             }
