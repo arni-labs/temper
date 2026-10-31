@@ -143,18 +143,7 @@ impl Senders {
                 })
                 .collect()
         });
-        let mut reread = BTreeSet::new();
-        if let (Some(policies), Some(may)) = (policies, &may) {
-            for (entity, actions) in may {
-                for (action, answers) in actions {
-                    for (by, answer) in answers.iter().enumerate() {
-                        if *answer == May::Maybe {
-                            reread.extend(policies.applicable(&askers[by], action, entity));
-                        }
-                    }
-                }
-            }
-        }
+        let reread = reread(policies, &askers, may.as_ref());
         Self {
             askers,
             detached,
@@ -163,6 +152,21 @@ impl Senders {
             decided: RefCell::default(),
             reread,
         }
+    }
+
+    /// Forget what Cedar lets each sender send of `moves` (entity, action),
+    /// which the model no longer makes: neither a walk nor its digest reads
+    /// them.
+    pub(super) fn forget(&mut self, moves: &BTreeSet<(String, String)>) {
+        let Some(may) = &mut self.may else {
+            return;
+        };
+        for (entity, action) in moves {
+            if let Some(actions) = may.get_mut(entity) {
+                actions.remove(action);
+            }
+        }
+        self.reread = reread(self.policies.as_ref(), &self.askers, self.may.as_ref());
     }
 
     /// Whether Cedar lets sender `by` send `action` to an `entity` record.
@@ -270,6 +274,28 @@ impl Senders {
             None => format!("sender {by}"),
         }
     }
+}
+
+/// The policies that may apply to a move whose answer `may` leaves to the
+/// request: all a walk reads of `policies` when it decides one again.
+fn reread(
+    policies: Option<&SendAnalysis>,
+    askers: &[Asker],
+    may: Option<&BTreeMap<String, BTreeMap<String, Vec<May>>>>,
+) -> BTreeSet<String> {
+    let mut reread = BTreeSet::new();
+    if let (Some(policies), Some(may)) = (policies, may) {
+        for (entity, actions) in may {
+            for (action, answers) in actions {
+                for (by, answer) in answers.iter().enumerate() {
+                    if *answer == May::Maybe {
+                        reread.extend(policies.applicable(&askers[by], action, entity));
+                    }
+                }
+            }
+        }
+    }
+    reread
 }
 
 /// The sender a reaction declares, as the trigger dispatcher builds it.

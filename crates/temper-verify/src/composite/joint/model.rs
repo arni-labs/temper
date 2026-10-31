@@ -8,6 +8,7 @@ mod labels;
 mod order;
 mod react;
 mod read;
+mod silent;
 mod step;
 mod walk;
 
