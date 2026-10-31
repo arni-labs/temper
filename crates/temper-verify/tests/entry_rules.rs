@@ -186,3 +186,202 @@ fn a_rule_may_not_read_a_move_s_parameters() {
         .to_string();
     assert!(error.contains("params.topping"), "{error}");
 }
+
+/// A minimal entry with two independently addressable related records.
+fn related_entry(guard: &str, assertion: &str) -> String {
+    format!(
+        r#"
+[automaton]
+name = "Entry"
+states = ["Waiting", "BeingMade"]
+initial = "Waiting"
+
+[[state]]
+name = "toppings"
+type = "list"
+initial = ["one", "two"]
+
+[[state]]
+name = "expected"
+type = "string"
+initial = "Waiting"
+
+[[action]]
+name = "Enter"
+from = ["Waiting"]
+to = "BeingMade"
+guard = "{guard}"
+
+[[entry_rule]]
+name = "entry"
+place = "BeingMade"
+assert = "{assertion}"
+"#
+    )
+}
+
+fn refuses_entry(spec: &str) {
+    let result = check(spec);
+    assert_eq!(
+        breaking_move(&result, "entry"),
+        ("Enter".to_string(), "BeingMade".to_string())
+    );
+    for level in [CascadeLevel::Simulation, CascadeLevel::PropertyTest] {
+        let checked = result.level_result(level).unwrap();
+        assert!(
+            !checked.passed && checked.summary.contains("entry"),
+            "{checked:?}"
+        );
+    }
+}
+
+#[test]
+fn a_related_status_can_equal_the_local_status_or_a_string_variable() {
+    for operand in ["status", "expected"] {
+        refuses_entry(&related_entry(
+            "true",
+            &format!("Topping[toppings].status != {operand}"),
+        ));
+        refuses_entry(&related_entry(
+            &format!("{operand} == Topping[toppings].status"),
+            "Topping[toppings].status == 'Stocked'",
+        ));
+    }
+}
+
+#[test]
+fn mixed_statuses_distinguish_not_all_equal_from_all_unequal() {
+    refuses_entry(&related_entry(
+        "!(Topping[toppings].status == 'Stocked')",
+        "Topping[toppings].status != 'Stocked'",
+    ));
+    refuses_entry(&related_entry(
+        "Topping[toppings].status in ['Stocked', 'Empty'] && !(Topping[toppings].status == 'Stocked')",
+        "Topping[toppings].status == 'Empty'",
+    ));
+}
+
+#[test]
+fn mixed_statuses_keep_the_same_values_in_the_guard_and_rule() {
+    for predicate in [
+        "Topping[toppings].status != status",
+        "!(Topping[toppings].status == 'Stocked')",
+        "Topping[toppings].status in ['Stocked', 'Empty']",
+        "Topping[toppings].status == Other[other].status",
+    ] {
+        let result = check(&related_entry(predicate, predicate));
+        assert!(result.all_passed, "{predicate}: {result:?}");
+    }
+}
+
+#[test]
+fn a_single_record_cannot_have_mixed_statuses() {
+    for declaration in [
+        "type = \"string\"\ninitial = \"one\"",
+        "type = \"list\"\ninitial = [\"one\"]",
+        "type = \"list\"\ninitial = [\"one\", \"one\"]",
+    ] {
+        let spec = related_entry(
+            "!(Topping[toppings].status == 'Stocked')",
+            "Topping[toppings].status != 'Stocked'",
+        )
+        .replace("type = \"list\"\ninitial = [\"one\", \"two\"]", declaration);
+        let result = check(&spec);
+        assert!(result.all_passed, "{declaration}: {result:?}");
+    }
+}
+
+#[test]
+fn an_unmodeled_reference_can_hold_a_mixed_list() {
+    let spec = related_entry(
+        "!(Topping[references].status == 'Stocked')",
+        "Topping[references].status != 'Stocked'",
+    );
+    refuses_entry(&spec);
+}
+
+#[test]
+fn an_explicit_source_can_cover_a_self_transition() {
+    let spec = related_entry("true", "false")
+        .replace("to = \"BeingMade\"", "to = \"Waiting\"")
+        .replace(
+            "place = \"BeingMade\"",
+            "place = \"Waiting\"\nfrom = [\"Waiting\"]",
+        );
+    let result = check(&spec);
+    assert_eq!(
+        breaking_move(&result, "entry"),
+        ("Enter".into(), "Waiting".into())
+    );
+    // The default still excludes self-transitions and therefore covers no move.
+    let error = temper_spec::automaton::parse_automaton(&spec.replace(
+        "place = \"Waiting\"\nfrom = [\"Waiting\"]",
+        "place = \"Waiting\"",
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("no action moves"), "{error}");
+}
+
+#[test]
+fn related_statuses_cover_equal_and_distinct_unnamed_values() {
+    refuses_entry(&related_entry(
+        "Topping[toppings].status == Other[other].status",
+        "Topping[toppings].status != 'Stocked'",
+    ));
+    refuses_entry(&related_entry(
+        "Topping[toppings].status != status && Other[other].status != status && Topping[toppings].status != Other[other].status",
+        "false",
+    ).replace("type = \"list\"\ninitial = [\"one\", \"two\"]", "type = \"string\"\ninitial = \"one\""));
+}
+
+#[test]
+fn a_related_status_can_equal_a_symbolic_local_string() {
+    let spec = related_entry(
+        "expected != 'Waiting' && expected != ''",
+        "Topping[toppings].status != expected",
+    );
+    // Only a newly chosen symbolic value enables Enter after this write.
+    let spec = format!(
+        r#"{spec}
+[[action]]
+name = "Write"
+from = ["Waiting"]
+to = "Waiting"
+params = [{{ name = "expected", type = "string" }}]
+"#
+    );
+    let result = check(&spec);
+    assert_eq!(
+        breaking_move(&result, "entry"),
+        ("Enter".into(), "BeingMade".into())
+    );
+}
+
+#[test]
+fn related_status_search_spends_the_existing_expansion_budget() {
+    use std::time::Duration;
+    use temper_verify::Budget;
+
+    let predicate = (0..8)
+        .map(|n| format!("Related[ref{n}].status == 'Stocked'"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let result = VerificationCascade::from_ioa(&related_entry(&predicate, &predicate))
+        .with_budget(Budget {
+            time: Duration::from_secs(2),
+            states: 50,
+        })
+        .run();
+    assert!(!result.all_passed, "{result:?}");
+    let last = result.levels.last().unwrap();
+    assert_eq!(last.level, CascadeLevel::ModelCheck);
+    assert!(
+        !last.verification.as_ref().unwrap().is_complete,
+        "{result:?}"
+    );
+    assert!(
+        result.stopped.as_ref().unwrap().contains("expansion steps"),
+        "{result:?}"
+    );
+}

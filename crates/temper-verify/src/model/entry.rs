@@ -9,24 +9,22 @@
 //! the rule is false. A guard that requires what the rule requires never
 //! does.
 //!
-//! A related status is tried as each place the guard and the rule compare
-//! it with, and as one place they name none of. A reference that lists
-//! several records takes one status for all of them.
+//! Related statuses cover concrete and symbolic equality classes from both
+//! predicates and the local state. A reference list may contain different
+//! statuses; the same assignment is used by the guard and the rule.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Env, Expr, Literal, Operand, Set, Truth, Val, eval};
+use temper_spec::predicate::{Env, Expr, Literal, Operand, Set, Truth, Val, VarKind, eval};
 
-use super::semantics::{ModelEnv, rule_for};
-use super::types::{ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelState};
+use super::semantics::{Expansion, ModelEnv, rule_for};
+use super::types::{
+    ModelString, ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelState,
+};
 
 /// A related status: `(entity_type, id_field)`.
 type Related = (String, String);
-
-/// The status of a related record that is in none of the places the guard
-/// and the rule name. A place's name has no spaces, so none equals it.
-const ANOTHER_PLACE: &str = " another place ";
 
 /// The spec's entry rules, spelling out the places each one covers.
 pub(super) fn resolve_entry_rules(automaton: &Automaton) -> Vec<ResolvedEntryRule> {
@@ -90,102 +88,181 @@ fn breaks(
     t: &ResolvedTransition,
     state: &TemperModelState,
 ) -> bool {
-    let related = related_statuses([&t.guard, &rule.assert]);
-    any_assignment(&related, &mut BTreeMap::new(), &mut |statuses| {
-        let env = Assumed {
-            local: ModelEnv {
-                kinds: &model.var_kinds,
-                state,
-            },
-            statuses,
-        };
-        eval(&t.guard, &env).may_hold() && eval(&rule.assert, &env) == Truth::False
-    })
-}
-
-/// Whether `test` passes for some status of each of `related`, after those
-/// already in `assigned`.
-fn any_assignment(
-    related: &[(Related, Vec<String>)],
-    assigned: &mut BTreeMap<Related, String>,
-    test: &mut dyn FnMut(&BTreeMap<Related, String>) -> bool,
-) -> bool {
-    let Some(((key, places), rest)) = related.split_first() else {
-        return test(assigned);
-    };
-    for place in places {
-        assigned.insert(key.clone(), place.clone());
-        if any_assignment(rest, assigned, test) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Each related status `exprs` read, with every place they compare it with
-/// and [`ANOTHER_PLACE`].
-fn related_statuses(exprs: [&Expr; 2]) -> Vec<(Related, Vec<String>)> {
-    let mut found: BTreeMap<Related, BTreeSet<String>> = BTreeMap::new();
+    let exprs = [&t.guard, &rule.assert];
+    let refs: BTreeSet<Related> = exprs.iter().flat_map(|expr| expr.cross_refs()).collect();
+    let mut places = BTreeSet::from([ModelString::from(state.status.clone())]);
+    // Nonliteral operands can name a concrete local string or an equality
+    // symbol. Include both, so equality with either is a possible assignment.
+    places.extend(state.strings.values().map(|value| match value {
+        ModelString::BlankSymbol(n) => ModelString::Symbol(*n),
+        other => other.clone(),
+    }));
+    places.extend(
+        state
+            .lists
+            .values()
+            .flatten()
+            .cloned()
+            .map(ModelString::from),
+    );
+    let mut comparisons = 0;
     for expr in exprs {
-        for related in expr.cross_refs() {
-            found.entry(related).or_default();
-        }
-        compared_places(expr, &mut found);
+        compared_values(expr, &mut places, &mut comparisons);
     }
-    found
+    // With no status-to-status comparison, all unnamed places are equivalent.
+    // Otherwise each false universal comparison needs at most two witnesses;
+    // keep one more per reference to keep every reference nonempty. Deleting
+    // other records preserves all true universal comparisons. Fresh symbols
+    // cover every equality relationship among those witnesses.
+    let fresh = if comparisons == 0 {
+        1
+    } else {
+        2 * comparisons + refs.len()
+    };
+    let first = places
+        .iter()
+        .filter_map(ModelString::symbol_id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    places.extend((first..first + fresh).map(ModelString::Symbol));
+    let related = refs
         .into_iter()
-        .map(|(related, places)| {
-            let places = places.into_iter().chain([ANOTHER_PLACE.to_string()]);
-            (related, places.collect())
+        .map(|key| {
+            let size = match model.var_kinds.get(&key.1) {
+                Some(VarKind::Str) => 1,
+                Some(VarKind::List) => state
+                    .lists
+                    .get(&key.1)
+                    .map_or(1, |ids| ids.iter().collect::<BTreeSet<_>>().len().max(1)),
+                // A reference outside the modeled state may be a list of any size.
+                _ => places.len(),
+            };
+            (key, size)
         })
-        .collect()
+        .collect();
+    StatusSearch {
+        local: ModelEnv {
+            kinds: &model.var_kinds,
+            state,
+        },
+        guard: &t.guard,
+        assertion: &rule.assert,
+        related,
+        places: places.into_iter().collect(),
+        budget: Expansion::for_model(model),
+    }
+    .any_assignment(0, &mut BTreeMap::new())
 }
 
-/// The places `expr` compares each related status with
-/// (`T[id].status == 'x'`, `T[id].status in ['x', 'y']`).
-fn compared_places(expr: &Expr, out: &mut BTreeMap<Related, BTreeSet<String>>) {
-    fn note(operand: &Operand, place: &Literal, out: &mut BTreeMap<Related, BTreeSet<String>>) {
-        if let (
-            Operand::CrossStatus {
-                entity_type,
-                id_field,
-            },
-            Literal::Str(place),
-        ) = (operand, place)
-        {
-            let related = (entity_type.clone(), id_field.clone());
-            out.entry(related).or_default().insert(place.clone());
+/// A reference has one status per distinct record, shared by every read in
+/// both predicates. Multiplicity and order do not affect universal predicates,
+/// so enumerate nonempty subsets rather than permutations of the same values.
+struct StatusSearch<'a> {
+    local: ModelEnv<'a>,
+    guard: &'a Expr,
+    assertion: &'a Expr,
+    related: Vec<(Related, usize)>,
+    places: Vec<ModelString>,
+    budget: Expansion,
+}
+
+impl StatusSearch<'_> {
+    fn any_assignment(
+        &self,
+        index: usize,
+        assigned: &mut BTreeMap<Related, Vec<ModelString>>,
+    ) -> bool {
+        if !self.budget.take() {
+            return false;
+        }
+        if index == self.related.len() {
+            let env = Assumed {
+                local: &self.local,
+                statuses: assigned,
+            };
+            return eval(self.guard, &env).may_hold() && eval(self.assertion, &env) == Truth::False;
+        }
+        self.choose(index, 0, &mut Vec::new(), assigned)
+    }
+
+    fn choose(
+        &self,
+        index: usize,
+        start: usize,
+        chosen: &mut Vec<ModelString>,
+        assigned: &mut BTreeMap<Related, Vec<ModelString>>,
+    ) -> bool {
+        let (key, size) = &self.related[index];
+        if !chosen.is_empty() {
+            assigned.insert(key.clone(), chosen.clone());
+            if self.any_assignment(index + 1, assigned) {
+                return true;
+            }
+        }
+        if chosen.len() < *size {
+            for next in start..self.places.len() {
+                if !self.budget.take() {
+                    return false;
+                }
+                chosen.push(self.places[next].clone());
+                if self.choose(index, next + 1, chosen, assigned) {
+                    return true;
+                }
+                chosen.pop();
+            }
+        }
+        false
+    }
+}
+
+/// Concrete strings from either predicate, including literals on the other
+/// side of a related-status comparison, and the comparisons that distinguish
+/// different unnamed places from each other.
+fn compared_values(expr: &Expr, out: &mut BTreeSet<ModelString>, comparisons: &mut usize) {
+    fn note(operand: &Operand, out: &mut BTreeSet<ModelString>) {
+        if let Operand::Lit(Literal::Str(value)) = operand {
+            out.insert(value.clone().into());
         }
     }
     match expr {
-        Expr::Not(inner) => compared_places(inner, out),
+        Expr::Not(inner) => compared_values(inner, out, comparisons),
         Expr::And(parts) | Expr::Or(parts) => {
-            parts.iter().for_each(|part| compared_places(part, out));
+            parts
+                .iter()
+                .for_each(|part| compared_values(part, out, comparisons));
         }
         Expr::Implies(a, b) => {
-            compared_places(a, out);
-            compared_places(b, out);
+            compared_values(a, out, comparisons);
+            compared_values(b, out, comparisons);
         }
         Expr::Compare { lhs, rhs, .. } => {
-            for (side, other) in [(lhs, rhs), (rhs, lhs)] {
-                if let Operand::Lit(place) = other {
-                    note(side, place, out);
+            note(lhs, out);
+            note(rhs, out);
+            if matches!(lhs, Operand::CrossStatus { .. })
+                && matches!(rhs, Operand::CrossStatus { .. })
+            {
+                *comparisons += 1;
+            }
+        }
+        Expr::In { value, set, .. } => {
+            note(value, out);
+            if let Set::List(items) = set {
+                for item in items {
+                    if let Literal::Str(value) = item {
+                        out.insert(value.clone().into());
+                    }
                 }
             }
         }
-        Expr::In {
-            value,
-            set: Set::List(items),
-            ..
-        } => items.iter().for_each(|place| note(value, place, out)),
         _ => {}
     }
 }
 
 /// The record as the model knows it, with the related statuses assumed.
 struct Assumed<'a> {
-    local: ModelEnv<'a>,
-    statuses: &'a BTreeMap<Related, String>,
+    local: &'a ModelEnv<'a>,
+    statuses: &'a BTreeMap<Related, Vec<ModelString>>,
 }
 
 impl Env for Assumed<'_> {
@@ -199,6 +276,8 @@ impl Env for Assumed<'_> {
 
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {
         let key = (entity_type.to_string(), id_field.to_string());
-        self.statuses.get(&key).map(|place| vec![Val::Str(place)])
+        self.statuses
+            .get(&key)
+            .map(|places| places.iter().map(ModelString::val).collect())
     }
 }

@@ -283,7 +283,11 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
         }
         // A rule no move is checked against proves nothing.
         let covered = |from: &String| {
-            from != &rule.place && (rule.from.is_empty() || rule.from.contains(from))
+            if rule.from.is_empty() {
+                from != &rule.place
+            } else {
+                rule.from.contains(from)
+            }
         };
         if !automaton.actions.iter().any(|a| {
             a.to.as_ref() == Some(&rule.place) && (a.from.is_empty() || a.from.iter().any(covered))
