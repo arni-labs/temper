@@ -18,9 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Env, Expr, Literal, Operand, Set, Truth, Val, VarKind, eval};
 
+use super::parameters::MoveEnv;
 use super::semantics::{Expansion, ModelEnv, rule_for, successors};
 use super::types::{
-    ModelString, ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelAction,
+    ModelString, ParamValue, ResolvedEntryRule, ResolvedTransition, TemperModel, TemperModelAction,
     TemperModelState,
 };
 
@@ -61,29 +62,40 @@ pub(crate) fn entry_broken<'m>(
     model
         .transitions
         .iter()
-        .filter(|t| model.transition_enabled(t, state))
+        .filter(|t| {
+            model.transition_enabled(t, state)
+                && model.entry_rules.iter().any(|rule| covers(rule, t, state))
+        })
         .find_map(|t| {
-            let rule = broken_by(model, t, state)?;
-            let (params, after) = successors(model, t, state).into_iter().next()?;
-            Some(EntryViolation {
-                rule,
-                action: TemperModelAction {
-                    name: t.name.clone(),
-                    target_state: t.to_state.clone(),
-                    params,
-                },
-                after,
-            })
+            successors(model, t, state)
+                .into_iter()
+                .find_map(|(params, after)| {
+                    let rule = broken_by(model, t, state, &params)?;
+                    Some(EntryViolation {
+                        rule,
+                        action: TemperModelAction {
+                            name: t.name.clone(),
+                            target_state: t.to_state.clone(),
+                            params,
+                        },
+                        after,
+                    })
+                })
         })
 }
 
 /// The first entry rule that taking `action` from `state` may break.
 pub(crate) fn broken_by_action<'m>(
     model: &'m TemperModel,
-    action: &str,
+    action: &TemperModelAction,
     state: &TemperModelState,
 ) -> Option<&'m ResolvedEntryRule> {
-    broken_by(model, rule_for(model, action, &state.status)?, state)
+    broken_by(
+        model,
+        rule_for(model, &action.name, &state.status)?,
+        state,
+        &action.params,
+    )
 }
 
 /// The first entry rule that taking `t` from `state` may break.
@@ -91,12 +103,16 @@ fn broken_by<'m>(
     model: &'m TemperModel,
     t: &ResolvedTransition,
     state: &TemperModelState,
+    params: &BTreeMap<String, ParamValue>,
 ) -> Option<&'m ResolvedEntryRule> {
-    model.entry_rules.iter().find(|rule| {
-        t.to_state.as_ref() == Some(&rule.place)
-            && rule.from.contains(&state.status)
-            && breaks(model, rule, t, state)
-    })
+    model
+        .entry_rules
+        .iter()
+        .find(|rule| covers(rule, t, state) && breaks(model, rule, t, state, params))
+}
+
+fn covers(rule: &ResolvedEntryRule, t: &ResolvedTransition, state: &TemperModelState) -> bool {
+    t.to_state.as_ref() == Some(&rule.place) && rule.from.contains(&state.status)
 }
 
 /// Whether some statuses of the related records that `t`'s guard and
@@ -106,6 +122,7 @@ fn breaks(
     rule: &ResolvedEntryRule,
     t: &ResolvedTransition,
     state: &TemperModelState,
+    params: &BTreeMap<String, ParamValue>,
 ) -> bool {
     let exprs = [&t.guard, &rule.assert];
     let refs: BTreeSet<Related> = exprs.iter().flat_map(|expr| expr.cross_refs()).collect();
@@ -117,6 +134,10 @@ fn breaks(
             .strings
             .values()
             .chain(state.lists.values().flatten())
+            .chain(params.values().filter_map(|p| match p {
+                ParamValue::Str(value) => Some(value),
+                _ => None,
+            }))
             .map(|value| match value {
                 ModelString::BlankSymbol(n) => ModelString::Symbol(*n),
                 other => other.clone(),
@@ -185,9 +206,12 @@ fn breaks(
         references.insert(key, records);
     }
     StatusSearch {
-        local: ModelEnv {
-            kinds: &model.var_kinds,
-            state,
+        local: MoveEnv {
+            local: ModelEnv {
+                kinds: &model.var_kinds,
+                state,
+            },
+            params,
         },
         guard: &t.guard,
         assertion: &rule.assert,
@@ -209,7 +233,7 @@ enum StatusKey {
 }
 
 struct StatusSearch<'a> {
-    local: ModelEnv<'a>,
+    local: MoveEnv<'a>,
     guard: &'a Expr,
     assertion: &'a Expr,
     references: BTreeMap<Related, Vec<StatusKey>>,
@@ -313,7 +337,7 @@ fn compared_values(expr: &Expr, out: &mut BTreeSet<ModelString>, comparisons: &m
 
 /// The record as the model knows it, with the related statuses assumed.
 struct Assumed<'a> {
-    local: &'a ModelEnv<'a>,
+    local: &'a MoveEnv<'a>,
     references: &'a BTreeMap<Related, Vec<StatusKey>>,
     statuses: &'a BTreeMap<StatusKey, Vec<Option<ModelString>>>,
 }
@@ -325,6 +349,10 @@ impl Env for Assumed<'_> {
 
     fn var(&self, name: &str) -> Val<'_> {
         self.local.var(name)
+    }
+
+    fn param(&self, name: &str) -> Val<'_> {
+        self.local.param(name)
     }
 
     fn cross_statuses(&self, entity_type: &str, id_field: &str) -> Option<Vec<Val<'_>>> {

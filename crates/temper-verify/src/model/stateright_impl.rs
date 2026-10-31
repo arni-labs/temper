@@ -143,8 +143,11 @@ impl TemperModel {
     ///
     /// An unknown action name is not enabled; there is no transition to fire.
     pub fn action_enabled(&self, state: &TemperModelState, action: &TemperModelAction) -> bool {
-        rule_for(self, &action.name, &state.status)
-            .is_some_and(|t| self.transition_enabled(t, state))
+        rule_for(self, &action.name, &state.status).is_some_and(|t| {
+            self.transition_enabled(t, state)
+                && (self.entry_rules.is_empty()
+                    || super::parameters::inputs_allow(self, t, state, &action.params))
+        })
     }
 }
 

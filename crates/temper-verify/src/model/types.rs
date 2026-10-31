@@ -175,12 +175,14 @@ pub struct ResolvedTransition {
     pub guard: Expr,
     /// Effects applied when the transition fires.
     pub effects: Vec<ModelEffect>,
-    /// The action parameters the effects read, by kind.
+    /// The action parameters the effects read, by kind. Entry-rule models
+    /// also choose parameters read only by guards or constraints.
     pub params: BTreeMap<String, ParamKind>,
     /// The string parameters the model gives a value: those that write a
     /// tracked string variable of the same name (the runtime writes every
     /// parameter into its field), and those a constraint ties to a tracked
-    /// one. Entry-rule models also choose list inputs here to retain identity.
+    /// one. Entry-rule models also choose guard inputs and list inputs here
+    /// to retain identity and evaluate the guard with the chosen assignment.
     pub string_params: Vec<StringParam>,
 }
 

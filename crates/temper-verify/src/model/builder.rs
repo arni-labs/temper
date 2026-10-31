@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use temper_spec::automaton::{
     ActionConstraint, ActionKind, Automaton, Initial, ResolvedEffect, translate_actions,
 };
-use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set};
+use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set, VarKind};
 
 mod strings;
 
@@ -206,7 +206,33 @@ fn resolve_transitions(
         .map(|(a, action)| {
             let effects: Vec<ModelEffect> =
                 a.effects.into_iter().filter_map(convert_effect).collect();
-            let params = effect_params(&effects);
+            let mut params = effect_params(&effects);
+            if !automaton.entry_rules.is_empty() {
+                // A guard-only input still determines whether entry is legal.
+                let reads = action.guard.params_read();
+                for param in &action.params {
+                    let constraints: Vec<_> = action
+                        .constraints
+                        .iter()
+                        .filter(|c| c.param() == param.name())
+                        .collect();
+                    if !reads.iter().any(|name| name == param.name()) && constraints.is_empty() {
+                        continue;
+                    }
+                    let kind = constraints
+                        .iter()
+                        .filter_map(|c| c.field())
+                        .find_map(|field| automaton.state.iter().find(|s| s.name == field))
+                        .map_or(param.param_type().kind(), |s| s.var_type.kind());
+                    let kind = match kind {
+                        VarKind::Str => ParamKind::Str,
+                        VarKind::Bool => ParamKind::Bool,
+                        VarKind::Counter => ParamKind::Count,
+                        VarKind::Num | VarKind::List => continue,
+                    };
+                    params.entry(param.name().to_string()).or_insert(kind);
+                }
+            }
             let string_params = string_params(
                 action,
                 tracked_strings,
@@ -217,7 +243,11 @@ fn resolve_transitions(
                 name: a.name,
                 from_states: a.from_states,
                 to_state: a.to_state,
-                guard: a.guard,
+                guard: if automaton.entry_rules.is_empty() {
+                    a.guard
+                } else {
+                    super::parameters::guard_with_constraints(action)
+                },
                 effects,
                 params,
                 string_params,

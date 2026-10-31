@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{ActionKind, Automaton};
+use temper_spec::automaton::Automaton;
 use temper_spec::predicate::{Expr, Literal, Name, Operand, Set, VarKind};
 
 use super::rule_asserts;
 
 /// The string variables the verifier tracks: those `[[invariant]]`s and
-/// `[[entry_rule]]`s read, their covered guards and constraint fields, plus
+/// `[[entry_rule]]`s read, their guards and constraint fields, plus
 /// `also_tracked`, plus the string fields constraints tie to tracked parameters.
 /// Specs without entry rules or string invariants explore as before.
 pub(super) fn tracked_strings(
@@ -26,30 +26,26 @@ pub(super) fn tracked_strings(
         .filter(|name| is_string(name))
         .cloned()
         .collect();
-    let covered_actions = automaton.actions.iter().filter(|action| {
-        action.kind != ActionKind::Output
-            && automaton.entry_rules.iter().any(|rule| {
-                action.to.as_ref() == Some(&rule.place)
-                    && automaton.automaton.states.iter().any(|from| {
-                        (action.from.is_empty() || action.from.contains(from))
-                            && if rule.from.is_empty() {
-                                from != &rule.place
-                            } else {
-                                rule.from.contains(from)
-                            }
-                    })
-            })
-    });
-    for action in covered_actions.clone() {
-        // Even a rule with no local reads must not report a move whose
-        // parameter constraints have no solution in the pre-state.
+    for action in automaton
+        .actions
+        .iter()
+        .filter(|_| !automaton.entry_rules.is_empty())
+    {
+        // Both the entry and its prefix moves need executable inputs, even
+        // when the assertion has no local reads.
         for field in action.constraints.iter().filter_map(|c| c.field()) {
             if is_string(field) {
                 tracked.insert(field.to_string());
             }
         }
     }
-    let predicates = rule_asserts(automaton).chain(covered_actions.map(|action| &action.guard));
+    let predicates = rule_asserts(automaton).chain(
+        automaton
+            .actions
+            .iter()
+            .filter(|_| !automaton.entry_rules.is_empty())
+            .map(|action| &action.guard),
+    );
     for assert in predicates {
         assert.for_each_name(&mut |name| {
             if let Name::Var(var) = name

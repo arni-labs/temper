@@ -189,7 +189,7 @@ pub(super) fn count_ranges<'a>(
     counts
         .iter()
         .map(|p| {
-            let range = match most[p] {
+            let mut range = match most[p] {
                 Some(limit) => CountRange {
                     largest: usize::try_from(limit).unwrap_or(0),
                     past: bounds
@@ -212,6 +212,13 @@ pub(super) fn count_ranges<'a>(
                     }
                 }
             };
+            if !model.entry_rules.is_empty()
+                && !super::builder::effect_params(&t.effects).contains_key(*p)
+            {
+                range.largest = range
+                    .largest
+                    .max(super::parameters::guard_count_bound(model, t));
+            }
             (*p, range)
         })
         .collect()

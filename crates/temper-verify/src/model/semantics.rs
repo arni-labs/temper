@@ -191,6 +191,11 @@ fn successors_with(
                     .iter()
                     .map(|(k, v)| (k.clone(), ParamValue::Str(v.clone()))),
             );
+            if !model.entry_rules.is_empty()
+                && !super::parameters::inputs_allow(model, t, state, &params)
+            {
+                continue;
+            }
             let mut next = state.clone();
             if let Some(to) = &t.to_state {
                 next.status = to.clone();

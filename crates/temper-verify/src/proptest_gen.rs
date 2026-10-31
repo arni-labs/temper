@@ -82,7 +82,7 @@ fn check_invariants(model: &TemperModel, state: &TemperModelState) -> Result<(),
 fn check_step(
     model: &TemperModel,
     before: &TemperModelState,
-    action: &str,
+    action: &TemperModelAction,
     after: &TemperModelState,
 ) -> Result<(), String> {
     if let Some(rule) = broken_by_action(model, action, before) {
@@ -156,7 +156,7 @@ pub fn run_prop_tests_on_model(
             let Some(next) = model.next_state(&state, action.clone()) else {
                 break;
             };
-            let checked = check_step(model, &state, &action.name, &next);
+            let checked = check_step(model, &state, &action, &next);
             state = next;
 
             if let Err(inv) = checked {
@@ -234,7 +234,7 @@ pub fn run_prop_tests_with_shrinking_on_model(
             let Some(next) = model.next_state(&state, action.clone()) else {
                 break;
             };
-            let checked = check_step(model, &state, &action.name, &next);
+            let checked = check_step(model, &state, &action, &next);
             state = next;
 
             checked.map_err(|inv| {
@@ -319,7 +319,7 @@ fn replay_failure(
         let Some(next) = model.next_state(&state, action.clone()) else {
             break;
         };
-        let checked = check_step(model, &state, &action.name, &next);
+        let checked = check_step(model, &state, &action, &next);
         state = next;
 
         if let Err(inv) = checked {
