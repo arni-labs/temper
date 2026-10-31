@@ -728,7 +728,10 @@ pub(super) async fn bootstrap_installed_apps(
         if matches!(source, AppBootstrapSource::Cli)
             && temper_platform::os_apps::tenant_os_app(&tenant, &app_name).is_none()
         {
-            println!("  App '{app_name}' waits for its first install for '{tenant}'");
+            println!(
+                "{}",
+                temper_platform::os_apps::waiting_line(&app_name, &tenant)
+            );
             continue;
         }
 
@@ -771,17 +774,29 @@ pub(super) async fn bootstrap_installed_apps(
                             }),
                         );
                     }
-                    let all: Vec<String> = result
-                        .added
-                        .iter()
-                        .chain(&result.updated)
-                        .chain(&result.skipped)
-                        .cloned()
-                        .collect();
                     println!(
-                        "  App '{app_name}' installed for '{tenant}': {}",
-                        all.join(", ")
+                        "{}",
+                        temper_platform::os_apps::installed_line(&app_name, &tenant, &result)
                     );
+                    // The version just served from the boot catalog becomes the
+                    // app's first pushed version when it has none, so every
+                    // later boot serves it until the next push, whatever the
+                    // catalog holds then (see `adopt_catalog_app`).
+                    match temper_platform::os_apps::adopt_catalog_app(state, &tenant, &app_name) {
+                        Ok(Some(digest)) => tracing::info!(
+                            tenant = %tenant,
+                            app = %app_name,
+                            %digest,
+                            "adopted the boot catalog's version as the first pushed version"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::error!(
+                            tenant = %tenant,
+                            app = %app_name,
+                            %error,
+                            "the served version was not adopted; the next boot serves the catalog's"
+                        ),
+                    }
                 }
             },
             Err(e) => {

@@ -13,6 +13,8 @@ mod loader;
 mod local_sandbox;
 mod observe_ui;
 pub(crate) mod options;
+#[cfg(test)]
+mod pushed_boot_tests;
 mod storage;
 mod sync_copy;
 #[cfg(test)]

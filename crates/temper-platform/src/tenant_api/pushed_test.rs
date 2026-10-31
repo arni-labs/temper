@@ -312,3 +312,59 @@ async fn a_push_waits_for_the_host_install_turn() {
         "the push ran while the turn was held: {body}"
     );
 }
+
+/// Katagami's control plane reads these lines to know an app is served or
+/// waiting; their words are fixed.
+#[test]
+fn the_install_and_waiting_lines_read_as_the_control_plane_reads_them() {
+    let result = crate::os_apps::InstallResult {
+        added: vec!["Order".to_string()],
+        updated: vec!["Invoice".to_string()],
+        skipped: vec!["Customer".to_string()],
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::os_apps::installed_line("shop", "default", &result),
+        "  App 'shop' installed for 'default': Order, Invoice, Customer"
+    );
+    assert_eq!(
+        crate::os_apps::waiting_line("shop", "default"),
+        "  App 'shop' waits for its first install for 'default'"
+    );
+}
+
+/// An app served from the boot catalog is adopted as its first pushed
+/// version; pushing the same files again is that version, and a changed push
+/// replaces it.
+#[tokio::test]
+async fn an_adopted_catalog_version_is_the_current_one_a_push_builds_on() {
+    let tenant = unique_tenant("adopted");
+    let (state, _data_dir) = server(&tenant);
+    let digest = crate::os_apps::adopt_catalog_app(&state, &tenant, APP)
+        .expect("adopt")
+        .expect("the catalog holds the app");
+    assert_eq!(current(&state, &tenant), Some(digest.clone()));
+    assert_eq!(
+        crate::os_apps::adopt_catalog_app(&state, &tenant, APP).expect("adopt again"),
+        None,
+        "an app with a pushed version is not adopted again"
+    );
+
+    let (status, body) = send(
+        &state,
+        push(&tenant, serde_json::json!({ "files": app_files() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["digest"], digest.as_str());
+
+    let mut files = app_files();
+    files
+        .get_mut(SPEC)
+        .expect("sentinel spec")
+        .push_str("\n# pushed after adoption\n");
+    let (status, body) = send(&state, push(&tenant, serde_json::json!({ "files": files }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["digest"], digest.as_str());
+    assert!(resolved_spec(&tenant).contains("# pushed after adoption"));
+}

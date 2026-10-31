@@ -23,7 +23,10 @@ use super::{
 };
 use crate::state::PlatformState;
 
+mod adopt;
 mod files;
+
+pub use adopt::adopt_catalog_app;
 
 /// One pushed file: its text, its bytes in base64, or the same bytes as the
 /// file at its path in the version installed now, named by their SHA-256.
@@ -206,19 +209,9 @@ async fn install_in_turn(
             return Err(PushRefused::Install(error));
         }
     };
-    // The same line a boot install prints (temper-cli `bootstrap_installed_apps`):
-    // whoever reads this server's output reads a pushed install the same way.
-    let types: Vec<&str> = result
-        .added
-        .iter()
-        .chain(&result.updated)
-        .chain(&result.skipped)
-        .map(String::as_str)
-        .collect();
-    println!(
-        "  App '{app}' installed for '{tenant}': {}",
-        types.join(", ")
-    );
+    // The same line a boot install prints: whoever reads this server's
+    // output reads a pushed install the same way.
+    println!("{}", installed_line(app, tenant, &result));
 
     if !push.registered {
         let keep: Vec<&str> = [Some(digest.as_str()), prior.as_deref()]
@@ -232,6 +225,31 @@ async fn install_in_turn(
         result,
         checks,
     })
+}
+
+/// The line this server prints when it installs `app` for `tenant`, at boot
+/// or by push: `  App '<app>' installed for '<tenant>': <types>`. Katagami's
+/// control plane judges an app served by finding `App '<app>' installed for
+/// '<tenant>'` in this server's output, so those words do not change.
+pub fn installed_line(app: &str, tenant: &str, result: &InstallResult) -> String {
+    let types: Vec<&str> = result
+        .added
+        .iter()
+        .chain(&result.updated)
+        .chain(&result.skipped)
+        .map(String::as_str)
+        .collect();
+    format!(
+        "  App '{app}' installed for '{tenant}': {}",
+        types.join(", ")
+    )
+}
+
+/// The line this server prints at boot for an `--app` it has no files for
+/// anywhere: it serves without the app until the app's first install. Read by
+/// Katagami's control plane, like [`installed_line`].
+pub fn waiting_line(app: &str, tenant: &str) -> String {
+    format!("  App '{app}' waits for its first install for '{tenant}'")
 }
 
 /// Make the version each app installed last by push resolve for its tenant
