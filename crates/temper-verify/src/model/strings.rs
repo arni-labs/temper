@@ -91,8 +91,9 @@ pub(super) fn string_assignments(
             scope.extend(assignment.values().cloned());
             let mut candidates = string_candidates(model, param, state, &scope);
             // A parameter that writes nothing leads to the same state with any
-            // value its constraints allow: one is enough.
-            if !param.writes {
+            // value its constraints allow: one is enough, unless an effect
+            // also reads it (for example, appending it to a list).
+            if !param.writes && !t.params.contains_key(&param.name) {
                 candidates.truncate(1);
             }
             for value in candidates {

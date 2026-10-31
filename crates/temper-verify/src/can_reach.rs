@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use temper_spec::predicate::{Name, VarKind};
+
 use crate::checker::Counterexample;
 use crate::model::semantics::successors;
 use crate::model::{LivenessKind, TemperModel, TemperModelAction, TemperModelState};
@@ -16,6 +18,39 @@ use crate::reach::{Graph, NO_PLACE, Reach};
 /// The property a broken `can_reach` rule is reported under; the rule's
 /// name is what is false.
 pub const CAN_REACH: &str = "CanReach";
+
+/// A possible edge through an unmodeled local numeric value cannot prove
+/// that a route exists. Until those values are modeled, conservatively leave
+/// the rules unproved when any guard reads one. This does not suppress a
+/// concrete refusal found in the overapproximated graph, nor change how
+/// cross-entity guards are explored.
+pub(crate) fn unproved_rules(model: &TemperModel) -> Vec<String> {
+    let mut numeric = BTreeSet::new();
+    for transition in &model.transitions {
+        transition.guard.for_each_name(&mut |name| {
+            if let Name::Var(var) = name
+                && model.var_kinds.get(var) == Some(&VarKind::Num)
+            {
+                numeric.insert(var.to_string());
+            }
+        });
+    }
+    if numeric.is_empty() {
+        return Vec::new();
+    }
+    let names = numeric.into_iter().collect::<Vec<_>>().join(", ");
+    model
+        .liveness
+        .iter()
+        .filter(|live| matches!(live.kind, LivenessKind::CanReach { .. }))
+        .map(|live| {
+            format!(
+                "rule '{}' not proved: guards read unmodeled local numeric variables: {names}",
+                live.name
+            )
+        })
+        .collect()
+}
 
 /// One counterexample for each `can_reach` rule a state in `graph` breaks,
 /// whose path leads to the nearest such state. `found` maps each state to

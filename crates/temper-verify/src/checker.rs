@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
 
-use crate::can_reach::broken_rules;
+use crate::can_reach::{broken_rules, unproved_rules};
 use crate::lost_places::{LostPlace, lost_places};
 use crate::model::ResolvedTransition;
 use crate::model::semantics::{successors_noting_cuts, truth};
@@ -58,6 +58,11 @@ pub struct VerificationResult {
     /// don't fail the check.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lost_places: Vec<LostPlace>,
+    /// `can_reach` rules the completed walk cannot prove because local
+    /// numeric guards are abstract. These prevent a pass, without asserting
+    /// that a concrete record breaks the rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproved_can_reach: Vec<String>,
 }
 
 /// Run exhaustive BFS model checking on the given `TemperModel`.
@@ -132,8 +137,15 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         }
         None => Default::default(),
     };
-    let all_properties_hold =
-        is_complete && counterexamples.is_empty() && dead_transitions.is_empty();
+    let unproved_can_reach = if is_complete {
+        unproved_rules(model)
+    } else {
+        Vec::new()
+    };
+    let all_properties_hold = is_complete
+        && counterexamples.is_empty()
+        && dead_transitions.is_empty()
+        && unproved_can_reach.is_empty();
 
     VerificationResult {
         states_explored,
@@ -143,6 +155,7 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         is_complete,
         bounded_by,
         lost_places,
+        unproved_can_reach,
     }
 }
 

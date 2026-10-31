@@ -436,3 +436,6 @@ fn a_can_reach_rule_naming_an_undeclared_place_fails_to_load() {
     );
     assert_eq!(load("from = [\"Waiting\"]\ncan_reach = [\"Made\"]"), "");
 }
+
+#[path = "can_reach/route_inputs.rs"]
+mod route_inputs;

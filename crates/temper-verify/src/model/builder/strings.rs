@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{ActionConstraint, ActionKind, Automaton};
-use temper_spec::predicate::{CmpOp, Expr, Literal, Name, Operand, Set, VarKind};
+use temper_spec::automaton::{ActionConstraint, ActionKind, Automaton, Effect};
+use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, Set, VarKind};
 
 use crate::model::types::StringParam;
 
@@ -61,7 +61,7 @@ pub(super) fn string_params(
 /// The string variables the verifier tracks: those invariants read, and,
 /// when proving `can_reach`, those guards read. A possible edge through an
 /// untracked local value cannot establish a route. Also include `also_tracked`
-/// and every string variable a constraint ties a tracked parameter to: its
+/// and every string variable a route action constrains an input against: its
 /// value decides what the tracked one may become. Specs without `can_reach`
 /// keep their existing invariant-driven tracking.
 pub(super) fn tracked_strings(
@@ -99,7 +99,7 @@ pub(super) fn tracked_strings(
         let before = tracked.len();
         for action in &automaton.actions {
             for constraint in &action.constraints {
-                if !tracked.contains(constraint.param()) {
+                if !checks_routes && !tracked.contains(constraint.param()) {
                     continue;
                 }
                 if let Some(field) = constraint.field()
@@ -169,6 +169,24 @@ pub(super) fn string_literals(
     }
     for inv in &automaton.invariants {
         visit(&inv.assert, tracked, &mut out);
+    }
+    // A parameter can supply a tracked string and append to a list on the
+    // same step. Its string choices must preserve the list's distinctions
+    // too, before constraints propagate those choices to source fields.
+    let list_literals = super::list_literals(automaton);
+    for action in &automaton.actions {
+        for effect in &action.effect {
+            if let Effect::Append {
+                list,
+                value: Arg::Param(param),
+            } = effect
+                && let Some(literals) = list_literals.get(list)
+            {
+                out.entry(param.clone())
+                    .or_default()
+                    .extend(literals.iter().cloned());
+            }
+        }
     }
     // A literal needed by a tracked parameter must also be offered to any
     // source it may copy. Otherwise supplying 'ok' to the source, then copying

@@ -490,6 +490,7 @@ impl VerificationCascade {
                     verification.dead_transitions.join(", ")
                 ));
             }
+            parts.extend(verification.unproved_can_reach.iter().cloned());
             format!(
                 "L1 Model Check FAILED: {} states explored, {}",
                 verification.states_explored,
