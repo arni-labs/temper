@@ -325,3 +325,127 @@ fn a_batch_that_fails_during_shutdown_is_sent_once() {
     guard.shutdown();
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
+
+/// Reports each failed send so shutdown can overlap the final production
+/// backoff rather than the initial flush.
+#[derive(Debug)]
+struct FailingDuringBackoff {
+    sends: Arc<AtomicUsize>,
+    failed: std::sync::mpsc::Sender<()>,
+}
+
+impl FailingDuringBackoff {
+    fn fail(&self) -> OTelSdkResult {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        self.failed.send(()).expect("test is waiting for sends");
+        Err(OTelSdkError::InternalFailure(
+            "Connection reset by peer".to_string(),
+        ))
+    }
+}
+
+impl opentelemetry_sdk::trace::SpanExporter for FailingDuringBackoff {
+    fn export(&mut self, _batch: Vec<SpanData>) -> BoxFuture<'static, OTelSdkResult> {
+        Box::pin(std::future::ready(self.fail()))
+    }
+}
+
+impl opentelemetry_sdk::logs::LogExporter for FailingDuringBackoff {
+    async fn export(&self, _batch: opentelemetry_sdk::logs::LogBatch<'_>) -> OTelSdkResult {
+        self.fail()
+    }
+}
+
+fn assert_shutdown_interrupts_backoff(
+    guard: OtelGuard,
+    sends: Arc<AtomicUsize>,
+    failed: std::sync::mpsc::Receiver<()>,
+) {
+    // The fourth failure precedes the 2 s backoff. Let the processor enter
+    // that wait before shutting down, as a handoff can do during export.
+    for _ in 0..4 {
+        failed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("processor must reach its final retry delay");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    guard.shutdown();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        4,
+        "send after closing (shutdown took {elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "shutdown waited for the retry delay: {elapsed:?}"
+    );
+}
+
+#[test]
+fn span_shutdown_interrupts_backoff_without_another_send() {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (failed, failures) = std::sync::mpsc::channel();
+    let closing = Closing::default();
+    let exporter = Retrying::new(
+        FailingDuringBackoff {
+            sends: Arc::clone(&sends),
+            failed,
+        },
+        &closing,
+    );
+    let processor = BatchSpanProcessor::builder(exporter)
+        .with_batch_config(
+            opentelemetry_sdk::trace::BatchConfigBuilder::default()
+                .with_max_export_batch_size(1)
+                .build(),
+        )
+        .build();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
+        .build();
+    tracer_provider.tracer("test").start("test.backoff").end();
+    let guard = OtelGuard {
+        closing,
+        tracer_provider,
+        meter_provider: SdkMeterProvider::builder().build(),
+        logger_provider: SdkLoggerProvider::builder().build(),
+    };
+    assert_shutdown_interrupts_backoff(guard, sends, failures);
+}
+
+#[test]
+fn log_shutdown_interrupts_backoff_without_another_send() {
+    use opentelemetry::logs::{Logger, LoggerProvider};
+
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (failed, failures) = std::sync::mpsc::channel();
+    let closing = Closing::default();
+    let exporter = Retrying::new(
+        FailingDuringBackoff {
+            sends: Arc::clone(&sends),
+            failed,
+        },
+        &closing,
+    );
+    let processor = BatchLogProcessor::builder(exporter)
+        .with_batch_config(
+            opentelemetry_sdk::logs::BatchConfigBuilder::default()
+                .with_max_export_batch_size(1)
+                .build(),
+        )
+        .build();
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_log_processor(processor)
+        .build();
+    let logger = logger_provider.logger("test");
+    logger.emit(logger.create_log_record());
+    let guard = OtelGuard {
+        closing,
+        tracer_provider: SdkTracerProvider::builder().build(),
+        meter_provider: SdkMeterProvider::builder().build(),
+        logger_provider,
+    };
+    assert_shutdown_interrupts_backoff(guard, sends, failures);
+}

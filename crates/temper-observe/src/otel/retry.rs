@@ -9,8 +9,7 @@
 //! outlast that window, and drops it as before only after the last.
 
 use std::future::ready;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -71,15 +70,25 @@ pub(super) const RETRY_DELAYS: [Duration; 4] = [
 /// fails after that is not tried again, so a stopping server's last flush
 /// never holds up its exit.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Closing(Arc<AtomicBool>);
+pub(super) struct Closing(Arc<(Mutex<bool>, Condvar)>);
 
 impl Closing {
     pub(super) fn close(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        let (closed, wake) = &*self.0;
+        *closed.lock().expect("closing mutex must lock") = true;
+        wake.notify_all();
     }
 
-    fn is_closed(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+    /// Wait before retrying, waking immediately if shutdown starts. The
+    /// predicate handles closing before the wait and spurious wakeups; the
+    /// final check prevents a resend when closing interrupted the wait.
+    fn wait_before_retry(&self, delay: Duration) -> bool {
+        let (closed, wake) = &*self.0;
+        let closed = closed.lock().expect("closing mutex must lock");
+        let (closed, _) = wake
+            .wait_timeout_while(closed, delay, |closed| !*closed)
+            .expect("closing mutex must lock after waiting");
+        !*closed
     }
 }
 
@@ -107,13 +116,9 @@ impl<E> Retrying<E> {
 
     /// Whether to send again after `result`, waiting `delay` first.
     fn again(&self, result: &OTelSdkResult, delay: Duration) -> bool {
-        if result.is_ok() || self.closing.is_closed() {
-            return false;
-        }
         // The processors export on a thread of their own, never the async
         // runtime's, so waiting here holds up only that thread.
-        std::thread::sleep(delay);
-        true
+        result.is_err() && self.closing.wait_before_retry(delay)
     }
 }
 
