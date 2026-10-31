@@ -45,9 +45,6 @@ fn string_candidates(
             Some(value) => BTreeSet::from([value]),
             None => {
                 let mut all: BTreeSet<ModelString> = values.clone();
-                // An input can be saved now and compared with status after
-                // a later move, so every declared place is a concrete class.
-                all.extend(model.states.iter().cloned().map(ModelString::from));
                 all.insert("".into());
                 all.insert(fresh_string(values, false));
                 all.insert(fresh_string(values, true));
