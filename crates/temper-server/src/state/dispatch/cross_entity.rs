@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use super::DispatchExtOptions;
 use super::owed_writes::{Attempt, OwedKind, OwedTry, OwedWrite};
-use crate::idempotency::{IdempotencyKey, derived_idempotency_key};
 use crate::request_context::AgentContext;
 use crate::state::CreateError;
 use temper_jit::table::{Related, RelatedMap, TransitionTable};
@@ -106,14 +105,7 @@ impl crate::state::ServerState {
             let request = req.clone();
             // The child's initial action carries a key of its own, from the
             // move's key and the child, so every try of it carries the same.
-            let mut agent = agent_ctx.clone();
-            agent.idempotency_key = agent_ctx.idempotency_key.as_ref().map(|key| {
-                IdempotencyKey::FollowUp(derived_idempotency_key(
-                    key.as_str(),
-                    "spawn",
-                    &format!("{child_type}:{child_id}"),
-                ))
-            });
+            let agent = agent_ctx.for_spawned_child(&child_type, &child_id);
             let workflow_root_entity_type = agent
                 .workflow_root_entity_type
                 .clone()

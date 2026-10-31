@@ -28,6 +28,7 @@ mod projection_barrier;
 pub(crate) mod retry;
 mod scheduled_actions;
 pub(crate) mod state_timeouts;
+pub(crate) use state_timeouts::timer_agent;
 mod state_timer_fire;
 mod state_timer_follow;
 mod state_timer_reconcile;
@@ -36,6 +37,7 @@ mod state_timer_rows;
 #[path = "strict_support_test.rs"]
 mod strict_test_support;
 mod timer_cause;
+pub(crate) use timer_cause::mark_timer_fire;
 mod timer_standing;
 mod wasm;
 pub(crate) use wasm::authorized_http_endpoint_host;

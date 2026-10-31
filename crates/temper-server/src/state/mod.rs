@@ -39,6 +39,7 @@ pub use dispatch::{
     BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
     StateTimeoutTracker, TimerFollowHold,
 };
+pub(crate) use dispatch::{mark_timer_fire, timer_agent};
 pub use entity_ops::{
     CreateError, FailedLevelInfo, PASSIVATE_IDLE_ACTORS_PER_TICK, VerificationGateError,
 };

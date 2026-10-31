@@ -54,7 +54,12 @@ fn reaction_cause(
 /// deeper. The cause is returned too: a context without a security context is
 /// checked with one approximated from it, which must carry the same cause
 /// ([`effective_trigger_security_context`]).
-pub(super) fn resolve_trigger_principal(
+///
+/// The install-time permit check calls this function for every entity
+/// trigger. A second copy of the principal rule would drift, which is how a
+/// callback's follow-up was still described as `service:wasm-runtime` after
+/// this dispatcher stopped sending it that way.
+pub(crate) fn resolve_trigger_principal(
     declared_principal: Option<&str>,
     invoking_ctx: &AgentContext,
     rule_name: &str,
@@ -147,7 +152,7 @@ fn reaction_idempotency_key(
 /// The security context a reaction is checked with: its dispatch context's
 /// own, which carries `cause`, or one approximated from the dispatch
 /// context's agent fields when it has none, with `cause` set on it.
-pub(super) fn effective_trigger_security_context(
+pub(crate) fn effective_trigger_security_context(
     agent_ctx: &AgentContext,
     cause: &MoveCause,
 ) -> SecurityContext {

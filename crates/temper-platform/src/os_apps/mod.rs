@@ -1253,16 +1253,30 @@ async fn install_once(
         combined_policy.as_deref(),
     )?;
     let policies = combined_policy.as_deref();
-    // A carry's then move is asked of the policies the install serves with.
-    let mut warnings = install_checks::check_spec_changes(
+    // FOLLOW-UP(kernel-upgrade-recheck): ADR-0184. This runs when an app is
+    // installed or its specs or Cedar change. Apps already installed when the
+    // kernel binary changes are not rechecked; that pass must report them and
+    // keep serving them.
+    let mut warnings = install_checks::automatic_move_permits(
         state,
-        &tenant_id,
+        tenant,
         app_name,
         &bundle.specs,
-        plan.specs,
+        new_specs,
         policies,
-    )
-    .await?;
+    )?;
+    // A carry's then move is asked of the policies the install serves with.
+    warnings.extend(
+        install_checks::check_spec_changes(
+            state,
+            &tenant_id,
+            app_name,
+            &bundle.specs,
+            plan.specs,
+            policies,
+        )
+        .await?,
+    );
     let specs = &bundle.specs;
     let checked = install_checks::model_warnings(
         state, tenant, app_name, specs, new_specs, policies, attempt,

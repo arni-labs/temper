@@ -11,6 +11,7 @@ mod admin;
 #[cfg(feature = "observe")]
 mod api;
 pub mod authz;
+pub mod automatic_moves;
 mod aws_sigv4;
 pub mod blob_store;
 pub mod blob_sweeper;

@@ -93,7 +93,7 @@ impl MoveCause {
 /// always, the reaction's hop on a reaction, the timer's arm in a timer's
 /// chain. A check with no cause is a direct request: `via == "request"`,
 /// `depth == 0`, so a path the kernel does not mark gets the strict case.
-pub(crate) fn cause_context(cause: Option<&MoveCause>) -> Vec<(&'static str, Value)> {
+pub fn cause_context(cause: Option<&MoveCause>) -> Vec<(&'static str, Value)> {
     let string = |value: &str| Value::String(value.to_string());
     let Some(cause) = cause else {
         return vec![

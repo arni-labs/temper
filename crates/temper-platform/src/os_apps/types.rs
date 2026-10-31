@@ -97,6 +97,17 @@ impl InstallWarning {
             detail: Some(detail),
         }
     }
+
+    /// An automatic move Cedar might allow once the record or the particular
+    /// principal is known (`automatic_moves`). A move Cedar refuses is not a
+    /// warning: it refuses the install.
+    pub fn automatic_move(message: String, detail: serde_json::Value) -> Self {
+        Self {
+            check: "automatic_moves".to_string(),
+            message,
+            detail: Some(detail),
+        }
+    }
 }
 
 /// Component phases an OS-app install/reconcile should execute.

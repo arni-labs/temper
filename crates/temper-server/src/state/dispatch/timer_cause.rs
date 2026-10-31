@@ -17,7 +17,7 @@ use crate::request_context::AgentContext;
 /// by its own principal. It replaces any cause the arming move carried: a
 /// timer's chain starts at its fire. A context with no security context (an
 /// internal caller) carries no cause.
-pub(super) fn mark_timer_fire(agent: &mut AgentContext) {
+pub(crate) fn mark_timer_fire(agent: &mut AgentContext) {
     if let Some(security_ctx) = agent.security_ctx.as_mut() {
         security_ctx.cause = Some(MoveCause::timer_fire(TimerArm {
             armed_by: security_ctx.principal.id.clone(),
