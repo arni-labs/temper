@@ -587,6 +587,10 @@ pub struct ServerState {
     /// Pending owner-byte reservations held by admitted raw Blob uploads.
     commons_storage_reservations:
         Arc<Mutex<BTreeMap<String, storage_caps::CommonsStorageReservationEntry>>>,
+    /// Passing checks this process reached or read from the blob table, by
+    /// the digest of what their levels read (`observe::specs::kept`).
+    #[cfg(feature = "observe")]
+    pub(crate) check_verdicts: Arc<Mutex<BTreeMap<String, temper_verify::CascadeResult>>>,
     /// Coarse commons-mode write guardrail lock.
     ///
     /// Held from preflight through persistence for commons writes so exact
@@ -870,6 +874,8 @@ impl ServerState {
             commons_rate_limit_buckets: Arc::new(Mutex::new(BTreeMap::new())),
             commons_storage_projection_cache: Arc::new(Mutex::new(BTreeMap::new())),
             commons_storage_reservations: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(feature = "observe")]
+            check_verdicts: Arc::new(Mutex::new(BTreeMap::new())),
             commons_write_guardrail_lock: Arc::new(tokio::sync::Mutex::new(())),
             raw_blob_ingest_budget: crate::blob_store::BlobIngestBudget::runtime(),
             file_ingest_budget: crate::blob_store::BlobIngestBudget::files(),
@@ -1153,6 +1159,8 @@ impl ServerState {
             commons_rate_limit_buckets: Arc::new(Mutex::new(BTreeMap::new())),
             commons_storage_projection_cache: Arc::new(Mutex::new(BTreeMap::new())),
             commons_storage_reservations: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(feature = "observe")]
+            check_verdicts: Arc::new(Mutex::new(BTreeMap::new())),
             commons_write_guardrail_lock: Arc::new(tokio::sync::Mutex::new(())),
             raw_blob_ingest_budget: crate::blob_store::BlobIngestBudget::runtime(),
             file_ingest_budget: crate::blob_store::BlobIngestBudget::files(),

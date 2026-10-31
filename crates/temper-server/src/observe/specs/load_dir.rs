@@ -16,7 +16,7 @@ use tracing::instrument;
 
 use super::super::specs_helpers::{
     build_ndjson_response, cross_lint_ndjson_line, lint_loaded_specs, lint_ndjson_line,
-    to_pascal_case, unchanged_passed_verification,
+    to_pascal_case,
 };
 use super::types::LoadDirRequest;
 use super::verification_stream::{PendingInstall, build_verification_stream_response};
@@ -423,25 +423,18 @@ pub(super) async fn load_specs_from_directory(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    // Snapshot before register: merge/replace resets verification to Pending.
     // A replace-mode load drops the tenant's other types; their rows are
     // removed when this install commits.
-    let (cached_verification, removed_types) = {
+    let removed_types: Vec<String> = if body.merge {
+        Vec::new()
+    } else {
         let registry = state.registry.read().unwrap(); // ci-ok: infallible lock
-        let removed: Vec<String> = if body.merge {
-            Vec::new()
-        } else {
-            registry
-                .entity_types(&body.tenant.as_str().into())
-                .into_iter()
-                .map(str::to_string)
-                .filter(|entity_type| !ioa_sources.contains_key(entity_type))
-                .collect()
-        };
-        (
-            unchanged_passed_verification(&registry, &body.tenant, &ioa_sources),
-            removed,
-        )
+        registry
+            .entity_types(&body.tenant.as_str().into())
+            .into_iter()
+            .map(str::to_string)
+            .filter(|entity_type| !ioa_sources.contains_key(entity_type))
+            .collect()
     };
 
     {
@@ -526,7 +519,6 @@ pub(super) async fn load_specs_from_directory(
             csdl_xml: csdl_xml_for_db,
             removed_types,
         },
-        cached_verification,
         lint_warning_lines,
         cross_lint_warning_lines,
     ))
