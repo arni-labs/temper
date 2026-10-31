@@ -15,7 +15,9 @@ use temper_spec::predicate::Truth;
 
 use crate::model::semantics::truth;
 
-use crate::model::{TemperModel, TemperModelAction, TemperModelState, build_model_from_ioa};
+use crate::model::{
+    TemperModel, TemperModelAction, TemperModelState, broken_by_action, build_model_from_ioa,
+};
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -73,6 +75,20 @@ fn check_invariants(model: &TemperModel, state: &TemperModelState) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// Check the move `action` from `before` to `after`: the entry rules it
+/// must meet as it fires, then every invariant in `after`.
+fn check_step(
+    model: &TemperModel,
+    before: &TemperModelState,
+    action: &TemperModelAction,
+    after: &TemperModelState,
+) -> Result<(), String> {
+    if let Some(rule) = broken_by_action(model, action, before) {
+        return Err(rule.name.clone());
+    }
+    check_invariants(model, after)
 }
 
 /// Collect enabled actions for a state.
@@ -137,13 +153,13 @@ pub fn run_prop_tests_on_model(
             action_seq.push(action.name.clone());
             trace.push((state.clone(), Some(action.clone())));
 
-            if let Some(next) = model.next_state(&state, action) {
-                state = next;
-            } else {
+            let Some(next) = model.next_state(&state, action.clone()) else {
                 break;
-            }
+            };
+            let checked = check_step(model, &state, &action, &next);
+            state = next;
 
-            if let Err(inv) = check_invariants(model, &state) {
+            if let Err(inv) = checked {
                 let final_state = format!("{state}");
                 trace.push((state, None));
                 return PropTestResult {
@@ -215,13 +231,13 @@ pub fn run_prop_tests_with_shrinking_on_model(
             }
             let action = actions[idx % actions.len()].clone();
 
-            if let Some(next) = model.next_state(&state, action) {
-                state = next;
-            } else {
+            let Some(next) = model.next_state(&state, action.clone()) else {
                 break;
-            }
+            };
+            let checked = check_step(model, &state, &action, &next);
+            state = next;
 
-            check_invariants(model, &state).map_err(|inv| {
+            checked.map_err(|inv| {
                 proptest::test_runner::TestCaseError::Fail(
                     format!("invariant {inv} violated at state {state}").into(),
                 )
@@ -300,13 +316,13 @@ fn replay_failure(
         action_seq.push(action.name.clone());
         trace.push((state.clone(), Some(action.clone())));
 
-        if let Some(next) = model.next_state(&state, action) {
-            state = next;
-        } else {
+        let Some(next) = model.next_state(&state, action.clone()) else {
             break;
-        }
+        };
+        let checked = check_step(model, &state, &action, &next);
+        state = next;
 
-        if let Err(inv) = check_invariants(model, &state) {
+        if let Err(inv) = checked {
             let final_state = format!("{state}");
             trace.push((state, None));
             return (inv, action_seq, final_state, trace);
@@ -440,6 +456,7 @@ mod tests {
                 name: "OnlyA".to_string(),
                 assert: parse("status == 'A'").unwrap(),
             }],
+            entry_rules: vec![],
             liveness: vec![],
             terminal: vec![],
             var_kinds: BTreeMap::new(),

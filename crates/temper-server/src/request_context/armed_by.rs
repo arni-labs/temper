@@ -102,3 +102,60 @@ pub(crate) fn decode_armed_by(armed_by: &str) -> Result<AgentContext, serde_json
         ..AgentContext::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use temper_authz::{IssuedCredential, PrincipalKind, SecurityContext};
+
+    use super::*;
+
+    fn agent() -> SecurityContext {
+        SecurityContext::from_verified_jwt(
+            "agent-1",
+            PrincipalKind::Agent,
+            Some("contributor"),
+            Some("user-1"),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_row_keeps_what_the_setters_token_was_issued_under() {
+        let credential = IssuedCredential {
+            subject: Some("user-1".to_string()),
+            auth_generation: 2,
+            grant_id: Some("grant-1".to_string()),
+        };
+        let setter = AgentContext {
+            security_ctx: Some(agent().with_credential(Some(credential.clone()))),
+            ..AgentContext::default()
+        };
+        for row in [
+            encode_armed_by(&setter).unwrap(),
+            encode_scheduled_armed_by(&setter).unwrap(),
+        ] {
+            let fired_as = decode_armed_by(&row).unwrap();
+            assert_eq!(
+                fired_as.security_ctx.and_then(|ctx| ctx.credential),
+                Some(credential.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_written_before_rows_kept_a_credential_fires_without_one() {
+        let setter = AgentContext {
+            security_ctx: Some(agent()),
+            ..AgentContext::default()
+        };
+        let row = encode_armed_by(&setter).unwrap();
+        assert!(
+            !row.contains("credential"),
+            "an identity without a credential writes the row it always did: {row}"
+        );
+        let fired_as = decode_armed_by(&row).unwrap().security_ctx.unwrap();
+        assert_eq!(fired_as.principal.id, "agent-1");
+        assert!(fired_as.credential.is_none());
+    }
+}

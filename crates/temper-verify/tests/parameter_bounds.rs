@@ -1,7 +1,7 @@
 //! Numeric parameter domains follow the fields their effects use.
 
 use stateright::Model;
-use temper_verify::model::{ParamValue, build_model_from_ioa, semantics::successors};
+use temper_verify::model::{ModelString, ParamValue, build_model_from_ioa, semantics::successors};
 use temper_verify::{CascadeLevel, VerificationCascade, check_model};
 
 const COUNTERS: &str = r#"
@@ -116,15 +116,15 @@ fn an_unrelated_threshold_does_not_expand_list_indexes() {
     assert_eq!(choices.len(), 3, "two indexes and one out-of-range no-op");
     assert_eq!(
         choices[0].1.lists["items"],
-        ["second"].map(temper_verify::model::ModelString::from)
+        ["second"].map(ModelString::from)
     );
     assert_eq!(
         choices[1].1.lists["items"],
-        ["first"].map(temper_verify::model::ModelString::from)
+        ["first"].map(ModelString::from)
     );
     assert_eq!(
         choices[2].1.lists["items"],
-        ["first", "second"].map(temper_verify::model::ModelString::from)
+        ["first", "second"].map(ModelString::from)
     );
 
     let result = VerificationCascade::from_ioa(LIST)
@@ -177,7 +177,7 @@ fn list_indexes_cover_an_initial_list_longer_than_the_default_bound() {
     assert_eq!(choices.len(), 5, "four indexes and one out-of-range no-op");
     assert_eq!(
         choices[3].1.lists["items"],
-        ["first", "second", "third"].map(temper_verify::model::ModelString::from)
+        ["first", "second", "third"].map(ModelString::from)
     );
     assert_eq!(choices[4].1.lists["items"], initial.lists["items"]);
 }
@@ -305,8 +305,7 @@ fn list_indexes_cover_appends_earlier_in_the_same_action() {
     assert!(
         choices.iter().any(|(params, next)| {
             params["index"] == ParamValue::Count(3)
-                && next.lists["items"]
-                    == ["second", "new"].map(temper_verify::model::ModelString::from)
+                && next.lists["items"] == ["second", "new"].map(ModelString::from)
         }),
         "{choices:?}"
     );

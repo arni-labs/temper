@@ -106,10 +106,10 @@ fn var_of<'a>(model: &TemperModel, state: &'a TemperModelState, name: &str) -> V
     match model.var_kinds.get(name) {
         Some(VarKind::Counter) => Val::Num(state.counters.get(name).copied().unwrap_or(0) as f64),
         Some(VarKind::Bool) => Val::Bool(state.booleans.get(name).copied().unwrap_or(false)),
-        Some(VarKind::List) => state
-            .lists
-            .get(name)
-            .map_or(Val::SymbolicStrs(&[]), |items| Val::SymbolicStrs(items)),
+        Some(VarKind::List) => state.lists.get(name).map_or_else(
+            || Val::Values(Vec::new()),
+            |items| Val::Values(items.iter().map(|s| s.val()).collect()),
+        ),
         Some(VarKind::Str) => state
             .strings
             .get(name)

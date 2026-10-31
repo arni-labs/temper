@@ -6,7 +6,7 @@ use super::types::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The tracked field and list string values held by `states`, `''` left out.
+/// The scalar strings and list members held by `states`, `''` left out.
 pub fn string_values<'a>(
     states: impl IntoIterator<Item = &'a TemperModelState>,
 ) -> BTreeSet<ModelString> {
@@ -90,10 +90,12 @@ pub(super) fn string_assignments(
             let mut scope = values.clone();
             scope.extend(assignment.values().cloned());
             let mut candidates = string_candidates(model, param, state, &scope);
-            // A parameter that writes nothing leads to the same state with any
-            // value its constraints allow: one is enough, unless an effect
-            // also reads it (for example, appending it to a list).
-            if !param.writes && !t.params.contains_key(&param.name) {
+            // A parameter neither effects nor guard reads leads to the same
+            // move with any value its constraints allow: one is enough.
+            if !param.writes
+                && !t.params.contains_key(&param.name)
+                && !t.guard.params_read().contains(&param.name)
+            {
                 candidates.truncate(1);
             }
             for value in candidates {
@@ -134,7 +136,7 @@ pub fn canonical_strings(
     canonical_values(maps.iter_mut().flat_map(|map| map.values_mut()))
 }
 
-/// Canonicalize a record's strings and list elements in one equality scope.
+/// Renumber equality symbols across scalar strings and list elements together.
 pub fn canonical_state(state: &mut TemperModelState) {
     canonical_values(
         state
@@ -144,12 +146,11 @@ pub fn canonical_state(state: &mut TemperModelState) {
     );
 }
 
-/// Renumber symbolic values in first-use order, preserving shared identities.
-/// Returns each value's new name.
+/// Renumber a sequence of values, retaining each equality class.
 pub fn canonical_values<'a>(
     values: impl IntoIterator<Item = &'a mut ModelString>,
 ) -> BTreeMap<ModelString, ModelString> {
-    let mut renamed: BTreeMap<ModelString, ModelString> = BTreeMap::new();
+    let mut renamed = BTreeMap::new();
     for value in values {
         let id = renamed.len() + 1;
         let next = match value {
@@ -157,8 +158,7 @@ pub fn canonical_values<'a>(
             ModelString::Symbol(_) => ModelString::Symbol(id),
             ModelString::BlankSymbol(_) => ModelString::BlankSymbol(id),
         };
-        let name = renamed.entry(value.clone()).or_insert(next).clone();
-        *value = name;
+        *value = renamed.entry(value.clone()).or_insert(next).clone();
     }
     renamed
 }

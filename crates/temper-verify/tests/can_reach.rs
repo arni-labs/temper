@@ -442,3 +442,6 @@ mod route_inputs;
 
 #[path = "can_reach/review_constraints.rs"]
 mod review_constraints;
+
+#[path = "can_reach/entry_rules.rs"]
+mod entry_rules;

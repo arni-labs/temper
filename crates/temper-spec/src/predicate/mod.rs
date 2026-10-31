@@ -14,6 +14,7 @@ mod print;
 mod string;
 
 pub use ast::{CmpOp, Expr, Literal, Name, Operand, Set};
+pub(crate) use check::unverifiable_entry;
 pub use check::{Scope, VarKind, check, unmodelable, unverifiable};
 pub use effect::{
     Arg, AssignOp, Effect, ParamKind, check_effect, check_effects, parse_arg, parse_effect,

@@ -141,7 +141,7 @@ pub(super) fn canonical(state: &mut JointState) -> BTreeMap<ModelString, ModelSt
             .records
             .values_mut()
             .flat_map(|s| s.strings.values_mut().chain(s.lists.values_mut().flatten()))
-            .chain(strings.iter_mut().flat_map(|map| map.values_mut()))
+            .chain(strings.iter_mut().flat_map(|s| s.values_mut()))
             .chain(state.calls.iter_mut().flat_map(|c| c.asked.values_mut()));
         canonical_values(values)
     };

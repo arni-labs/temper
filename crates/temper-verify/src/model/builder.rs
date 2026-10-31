@@ -10,15 +10,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::{ActionKind, Automaton, Initial, ResolvedEffect, translate_actions};
-use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set};
-
-use super::types::{
-    LivenessKind, ModelEffect, ResolvedInvariant, ResolvedLiveness, ResolvedTransition, TemperModel,
-};
+use temper_spec::predicate::{Arg, Expr, Literal, Operand, ParamKind, Set, VarKind};
 
 mod strings;
 
 use strings::{string_literals, string_params, tracked_strings};
+
+use super::entry::resolve_entry_rules;
+use super::types::{
+    LivenessKind, ModelEffect, ModelString, ResolvedInvariant, ResolvedLiveness,
+    ResolvedTransition, TemperModel,
+};
 
 /// Build a `TemperModel` from I/O Automaton TOML source.
 ///
@@ -51,7 +53,7 @@ pub fn build_model_tracking(
     // Extract initial values from [[state]] declarations.
     let mut initial_counters = BTreeMap::new();
     let mut initial_booleans = BTreeMap::new();
-    let mut initial_lists = BTreeMap::new();
+    let mut initial_lists: BTreeMap<String, Vec<ModelString>> = BTreeMap::new();
     let mut counter_bounds = BTreeMap::new();
 
     for sv in &automaton.state {
@@ -66,7 +68,7 @@ pub fn build_model_tracking(
             Initial::List(items) => {
                 initial_lists.insert(
                     sv.name.clone(),
-                    items.iter().cloned().map(Into::into).collect::<Vec<_>>(),
+                    items.iter().cloned().map(Into::into).collect(),
                 );
             }
             // Strings are initialized below; ints are not modeled.
@@ -117,13 +119,13 @@ pub fn build_model_tracking(
         .map(|(name, items)| (name.clone(), max_counter.max(items.len())))
         .collect();
     let invariants = resolve_invariants(automaton);
+    let entry_rules = resolve_entry_rules(automaton);
     // A counter, or a list's length, is explored one past every literal a
-    // guard or invariant compares it with, so a rule about a count passing a
+    // guard or rule compares it with, so a rule about a count passing a
     // threshold is checked at the threshold, not passed because the count
     // never got there.
     let guards = transitions.iter().map(|t| &t.guard);
-    let asserts = invariants.iter().map(|inv| &inv.assert);
-    for (name, literal) in compared_literals(guards.chain(asserts)) {
+    for (name, literal) in compared_literals(guards.chain(rule_asserts(automaton))) {
         let bound = counter_bounds.get_mut(&name).or(list_bounds.get_mut(&name));
         if let Some(bound) = bound {
             *bound = (*bound).max(literal.saturating_add(1));
@@ -136,10 +138,15 @@ pub fn build_model_tracking(
         .map(|sv| (sv.name.clone(), sv.var_type.kind()))
         .collect();
 
+    let mut string_inputs = tracked_strings.clone();
+    for t in &transitions {
+        string_inputs.extend(t.string_params.iter().map(|p| p.name.clone()));
+    }
     TemperModel {
         states,
         transitions,
         invariants,
+        entry_rules,
         liveness,
         terminal: automaton.automaton.terminal.clone(),
         var_kinds,
@@ -147,7 +154,7 @@ pub fn build_model_tracking(
         initial_counters,
         initial_booleans,
         initial_lists,
-        string_literals: string_literals(automaton, &tracked_strings),
+        string_literals: string_literals(automaton, &string_inputs),
         initial_strings,
         tracked_strings,
         counter_bounds,
@@ -158,14 +165,21 @@ pub fn build_model_tracking(
     }
 }
 
-/// `'x' in list` literals per list, across every guard and invariant.
+/// The asserts of the spec's invariants and entry rules: what the model
+/// checks beyond the guards.
+fn rule_asserts(automaton: &Automaton) -> impl Iterator<Item = &Expr> {
+    let invariants = automaton.invariants.iter().map(|inv| &inv.assert);
+    invariants.chain(automaton.entry_rules.iter().map(|rule| &rule.assert))
+}
+
+/// `'x' in list` literals per list, across every guard and rule.
 fn list_literals(automaton: &Automaton) -> BTreeMap<String, BTreeSet<String>> {
     let mut pairs = BTreeSet::new();
     for action in &automaton.actions {
         super::semantics::collect_list_contains_pairs(&action.guard, &mut pairs);
     }
-    for inv in &automaton.invariants {
-        super::semantics::collect_list_contains_pairs(&inv.assert, &mut pairs);
+    for assert in rule_asserts(automaton) {
+        super::semantics::collect_list_contains_pairs(assert, &mut pairs);
     }
     let mut literals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (list, value) in pairs {
@@ -190,19 +204,52 @@ fn resolve_transitions(
         .map(|(a, action)| {
             let effects: Vec<ModelEffect> =
                 a.effects.into_iter().filter_map(convert_effect).collect();
-            let params = effect_params(&effects);
+            let mut params = effect_params(&effects);
+            if !automaton.entry_rules.is_empty() {
+                // A guard-only input still determines whether entry is legal.
+                let reads = action.guard.params_read();
+                for param in &action.params {
+                    let constraints: Vec<_> = action
+                        .constraints
+                        .iter()
+                        .filter(|c| c.param() == param.name())
+                        .collect();
+                    if !reads.iter().any(|name| name == param.name()) && constraints.is_empty() {
+                        continue;
+                    }
+                    let kind = constraints
+                        .iter()
+                        .filter_map(|c| c.field())
+                        .find_map(|field| automaton.state.iter().find(|s| s.name == field))
+                        .map_or(param.param_type().kind(), |s| s.var_type.kind());
+                    let kind = match kind {
+                        VarKind::Str => ParamKind::Str,
+                        VarKind::Bool => ParamKind::Bool,
+                        VarKind::Counter => ParamKind::Count,
+                        VarKind::Num | VarKind::List => continue,
+                    };
+                    params.entry(param.name().to_string()).or_insert(kind);
+                }
+            }
+            let string_params = string_params(
+                action,
+                tracked_strings,
+                &params,
+                !automaton.entry_rules.is_empty()
+                    || automaton.liveness.iter().any(|l| !l.can_reach.is_empty()),
+            );
             ResolvedTransition {
                 name: a.name,
                 from_states: a.from_states,
                 to_state: a.to_state,
-                guard: a.guard,
+                guard: if automaton.entry_rules.is_empty() {
+                    a.guard
+                } else {
+                    super::parameters::guard_with_constraints(action)
+                },
                 effects,
                 params,
-                string_params: string_params(
-                    action,
-                    tracked_strings,
-                    automaton.liveness.iter().any(|l| !l.can_reach.is_empty()),
-                ),
+                string_params,
                 constraints: action.constraints.clone(),
             }
         })

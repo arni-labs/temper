@@ -6,10 +6,10 @@
 
 use stateright::{Model, Property};
 
-use super::semantics::{
-    canonical_state, evaluate_guard, guard_may_hold, rule_for, step, successors, truth,
-};
+use super::semantics::{canonical_state, guard_may_hold, rule_for, step, successors, truth};
 use temper_spec::predicate::Truth;
+
+use super::parameters::locally_enabled;
 
 use super::types::{
     LivenessKind, ResolvedTransition, TemperModel, TemperModelAction, TemperModelState,
@@ -19,7 +19,16 @@ use super::types::{
 /// a walk, so a walk cut short can report it falsely.
 pub(crate) const REACHES_TERMINAL: &str = "ReachesTerminal";
 
+/// The property that no move breaks an entry rule. It is read in the state
+/// before the move, so its path ends with that move.
+pub(crate) const ENTRY_RULES: &str = "EntryRules";
+
 // -- Property condition functions (bare fn pointers) -------------------------
+
+/// Check that no move enabled here enters a place with its entry rule false.
+fn check_entry_rules(model: &TemperModel, state: &TemperModelState) -> bool {
+    super::entry::entry_broken(model, state).is_none()
+}
 
 /// Check that the current status is a declared state.
 fn check_status_in_set(model: &TemperModel, state: &TemperModelState) -> bool {
@@ -43,7 +52,7 @@ fn check_terminal(model: &TemperModel, state: &TemperModelState) -> bool {
     !model.transitions.iter().any(|t| {
         let status_ok =
             t.from_states.is_empty() || t.from_states.iter().any(|s| s == &state.status);
-        status_ok && evaluate_guard(&t.guard, &model.var_kinds, state)
+        status_ok && locally_enabled(model, t, state) == Some(true)
     })
 }
 
@@ -61,7 +70,7 @@ fn check_no_deadlock(model: &TemperModel, state: &TemperModelState) -> bool {
             for t in &model.transitions {
                 let status_ok =
                     t.from_states.is_empty() || t.from_states.iter().any(|s| s == &state.status);
-                if status_ok && evaluate_guard(&t.guard, &model.var_kinds, state) {
+                if status_ok && locally_enabled(model, t, state) != Some(false) {
                     has_action = true;
                     break;
                 }
@@ -134,8 +143,11 @@ impl TemperModel {
     ///
     /// An unknown action name is not enabled; there is no transition to fire.
     pub fn action_enabled(&self, state: &TemperModelState, action: &TemperModelAction) -> bool {
-        rule_for(self, &action.name, &state.status)
-            .is_some_and(|t| self.transition_enabled(t, state))
+        rule_for(self, &action.name, &state.status).is_some_and(|t| {
+            self.transition_enabled(t, state)
+                && (self.entry_rules.is_empty()
+                    || super::parameters::inputs_allow(self, t, state, &action.params))
+        })
     }
 }
 
@@ -194,6 +206,9 @@ impl Model for TemperModel {
         props.push(Property::always("TypeInvariant", check_status_in_set));
         if !self.invariants.is_empty() {
             props.push(Property::always("Invariants", check_invariants));
+        }
+        if !self.entry_rules.is_empty() {
+            props.push(Property::always(ENTRY_RULES, check_entry_rules));
         }
         if !self.terminal.is_empty() {
             props.push(Property::always("Terminal", check_terminal));

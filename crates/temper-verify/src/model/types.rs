@@ -28,15 +28,15 @@ pub struct TemperModelState {
     pub counters: BTreeMap<String, usize>,
     /// Named boolean variables (e.g. `has_address`, `payment_captured`).
     pub booleans: BTreeMap<String, bool>,
-    /// Named list variables (e.g. `tags`, `labels`), sharing string identities
-    /// with tracked fields.
+    /// Named list variables (e.g. `tags`, `labels`). Elements retain equality
+    /// symbols, so reused inputs alias and independent inputs can differ.
     pub lists: BTreeMap<String, Vec<ModelString>>,
-    /// The string variables guards/invariants read or effects write, as symbols: `''`, a literal
+    /// The string variables guards or rules read or effects write, as symbols: `''`, a literal
     /// the spec compares the variable with, or `#n`, a value that is equal
     /// only to itself. The verifier tracks which strings are equal, not what
     /// they say, so `#n` are renumbered in order of first use after every
     /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
-    /// guards, invariants and effects use no string.
+    /// guards, rules and effects use no string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub strings: BTreeMap<String, ModelString>,
 }
@@ -177,12 +177,14 @@ pub struct ResolvedTransition {
     pub guard: Expr,
     /// Effects applied when the transition fires.
     pub effects: Vec<ModelEffect>,
-    /// The action parameters the effects read, by kind.
+    /// The action parameters the effects read, by kind. Entry-rule models
+    /// also choose parameters read only by guards or constraints.
     pub params: BTreeMap<String, ParamKind>,
     /// The string parameters the model gives a value: those that write a
     /// tracked string variable of the same name (the runtime writes every
     /// parameter into its field), and those a constraint ties to a tracked
-    /// one.
+    /// one. Entry-rule models also choose guard inputs and list inputs here
+    /// to retain identity and evaluate the guard with the chosen assignment.
     pub string_params: Vec<StringParam>,
     /// Original input constraints. Route proofs must identify any that
     /// string parameter exploration does not enforce.
@@ -213,6 +215,21 @@ pub struct ResolvedInvariant {
     pub name: String,
     /// The assertion. Values the model does not track read as unknown, and
     /// an unknown result is not a violation.
+    pub assert: Expr,
+}
+
+/// A rule on entering a place: every move into `place` from one of `from`
+/// must have `assert` true just before it fires (`model/entry.rs`).
+#[derive(Clone, Debug)]
+pub struct ResolvedEntryRule {
+    /// The rule name.
+    pub name: String,
+    /// The place it guards.
+    pub place: String,
+    /// The places whose moves into `place` it covers, never `place` itself
+    /// unless the spec names it.
+    pub from: Vec<String>,
+    /// The assertion, read in the state before the move.
     pub assert: Expr,
 }
 
@@ -264,6 +281,8 @@ pub struct TemperModel {
     pub transitions: Vec<ResolvedTransition>,
     /// Pre-resolved safety invariants (accessible to property fn pointers via &self).
     pub invariants: Vec<ResolvedInvariant>,
+    /// Rules every move into a place must meet as it fires.
+    pub entry_rules: Vec<ResolvedEntryRule>,
     /// Pre-resolved liveness properties.
     pub liveness: Vec<ResolvedLiveness>,
     /// States from which no transition may be enabled.
@@ -284,8 +303,8 @@ pub struct TemperModel {
     /// or effects write, and those whose value reaches one through a
     /// constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
-    /// String literals written by effects or compared with a tracked variable in a guard or
-    /// invariant: the values worth choosing for it besides `''` and others'.
+    /// Concrete initial, predicate and effect literals for tracked string inputs,
+    /// including literals tied to them indirectly through related statuses.
     pub(crate) string_literals: BTreeMap<String, BTreeSet<String>>,
     /// Per-counter upper bounds for bounded exploration.
     pub(crate) counter_bounds: BTreeMap<String, usize>,
@@ -348,6 +367,7 @@ impl fmt::Debug for TemperModel {
             states,
             transitions,
             invariants,
+            entry_rules,
             liveness,
             terminal,
             var_kinds,
@@ -368,6 +388,7 @@ impl fmt::Debug for TemperModel {
             .field("states", states)
             .field("transitions", transitions)
             .field("invariants", invariants)
+            .field("entry_rules", entry_rules)
             .field("liveness", liveness)
             .field("terminal", terminal)
             .field("var_kinds", var_kinds)

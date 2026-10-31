@@ -18,6 +18,7 @@ fn admin_context() -> SecurityContext {
         context_attrs: HashMap::new(),
         correlation_id: "test-admin".to_string(),
         cause: None,
+        credential: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn customer_context(id: &str) -> SecurityContext {
         context_attrs: HashMap::new(),
         correlation_id: "test-customer".to_string(),
         cause: None,
+        credential: None,
     }
 }
 

@@ -188,7 +188,7 @@ pub(super) fn count_ranges<'a>(
     tighten(&bounds, &mut most, Some(&guessed));
 
     let widest = widest(model);
-    counts
+    let mut ranges: BTreeMap<_, _> = counts
         .iter()
         .map(|p| {
             let range = match most[p] {
@@ -216,7 +216,27 @@ pub(super) fn count_ranges<'a>(
             };
             (*p, range)
         })
-        .collect()
+        .collect();
+    if !model.entry_rules.is_empty() {
+        // Freeze effect ranges before widening: a compared input's effects
+        // can require values this input must reach too. Updating in place
+        // while calculating bounds would make the result depend on order.
+        let guard_bounds: Vec<_> = t
+            .guard
+            .params_read()
+            .into_iter()
+            .filter(|p| ranges.contains_key(p.as_str()))
+            .map(|p| {
+                let bound = super::parameters::guard_count_bound(model, t, &p, &ranges);
+                (p, bound)
+            })
+            .collect();
+        for (p, bound) in guard_bounds {
+            let range = ranges.get_mut(p.as_str()).expect("count input range");
+            range.largest = range.largest.max(bound);
+        }
+    }
+    ranges
 }
 
 /// Lower each parameter's largest value to what every bound allows, given

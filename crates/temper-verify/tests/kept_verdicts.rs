@@ -121,3 +121,38 @@ fn a_kept_check_does_not_keep_a_change_that_breaks_a_rule_over_two_types() {
         "{after}"
     );
 }
+
+#[test]
+fn entry_rule_changes_invalidate_a_kept_verdict() {
+    let source = r#"
+[automaton]
+name = "Entry"
+states = ["Outside", "Inside"]
+initial = "Outside"
+terminal = ["Inside"]
+[[state]]
+name = "ready"
+type = "bool"
+initial = true
+[[action]]
+name = "Enter"
+from = ["Outside"]
+to = "Inside"
+[[entry_rule]]
+name = "entry"
+place = "Inside"
+assert = "ready"
+"#;
+    let broken = source.replace("assert = \"ready\"", "assert = \"!ready\"");
+    assert!(check(source).run().all_passed);
+    assert!(!check(&broken).run().all_passed);
+    assert_ne!(digest(source), digest(&broken));
+    let related = source.replace(
+        "assert = \"ready\"",
+        "assert = \"Topping[id].status == 'Stocked'\"",
+    );
+    assert_eq!(
+        digest(&related),
+        digest(&related.replace("Topping[id]", "OtherTopping[id]"))
+    );
+}

@@ -7,6 +7,10 @@ mod groups;
 mod triggers;
 mod webhooks;
 
+#[cfg(test)]
+#[path = "entry_rules_test.rs"]
+mod entry_rules_test;
+
 use super::parser::AutomatonParseError;
 use super::types::*;
 
@@ -261,6 +265,51 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
                     "`{culprit}` reads a value the verification cascade cannot model \
                      (a number that is not a counter, an undeclared field, or null); \
                      state it as a [[field_invariant]], which is checked on writes"
+                ),
+            ));
+        }
+    }
+    for rule in &automaton.entry_rules {
+        let slot = format!("entry rule '{}'", rule.name);
+        for place in std::iter::once(&rule.place).chain(&rule.from) {
+            if !automaton.automaton.states.contains(place) {
+                return Err(invalid(slot, format!("'{place}' is not a declared state")));
+            }
+        }
+        check(&rule.assert, Scope::State(&vars)).map_err(|e| invalid(slot.clone(), e))?;
+        no_params(&rule.assert, slot.clone())?;
+        no_related_field(&rule.assert, slot.clone())?;
+        // Entry checks share the assertion read contract, with nullable
+        // statuses and local membership modeled by the shared move environment.
+        if let Some(culprit) = crate::predicate::unverifiable_entry(&rule.assert, &vars) {
+            return Err(invalid(
+                slot,
+                format!("`{culprit}` reads a value the verification cascade cannot model"),
+            ));
+        }
+        // A rule no move is checked against proves nothing.
+        let covered = |from: &String| {
+            if rule.from.is_empty() {
+                from != &rule.place
+            } else {
+                rule.from.contains(from)
+            }
+        };
+        if !automaton.actions.iter().any(|a| {
+            let sources = if a.from.is_empty() {
+                &automaton.automaton.states
+            } else {
+                &a.from
+            };
+            a.kind != ActionKind::Output
+                && a.to.as_ref() == Some(&rule.place)
+                && sources.iter().any(covered)
+        }) {
+            return Err(invalid(
+                slot,
+                format!(
+                    "no action moves into '{}' from a place it covers",
+                    rule.place
                 ),
             ));
         }

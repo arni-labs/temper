@@ -37,6 +37,7 @@ fn request(path: &str, body: serde_json::Value) -> Request<Body> {
                 context_attrs: Default::default(),
                 correlation_id: "factory-sized-offers".to_string(),
                 cause: None,
+                credential: None,
             },
         )
         .with_session_id(Some("session-1".to_string())),
