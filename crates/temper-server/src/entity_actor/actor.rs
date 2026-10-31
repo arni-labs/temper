@@ -2312,14 +2312,6 @@ impl EntityActor {
                     store_unavailable: false,
                 });
             }
-            EntityMsg::GetField { field } => {
-                let value = state
-                    .fields
-                    .get(&field)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                ctx.reply(value);
-            }
             EntityMsg::UpdateFields {
                 caller,
                 fields,

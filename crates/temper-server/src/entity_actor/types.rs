@@ -58,8 +58,6 @@ pub enum EntityMsg {
     },
     /// Get the current entity state.
     GetState,
-    /// Get a specific field value.
-    GetField { field: String },
     /// Update entity fields (PATCH: merge, PUT: replace).
     UpdateFields {
         /// Kernel dispatch context; never populated from field values.
