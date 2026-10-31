@@ -86,6 +86,8 @@ pub(super) fn estimated_entry_bytes(
                 + event.to_status.len()
                 + event.idempotency_key.as_ref().map_or(0, String::len)
                 + event.origin.by.as_ref().map_or(0, String::len)
+                + event.origin.acting_for.as_ref().map_or(0, String::len)
+                + event.origin.agent_type.as_ref().map_or(0, String::len)
         })
         .sum();
     let spawns: usize = response

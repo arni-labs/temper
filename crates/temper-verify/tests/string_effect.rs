@@ -238,11 +238,13 @@ fn sequential_string_parameters_share_comparison_literals() {
             "{comparison}: {result:#?}"
         );
 
+        // An invariant that reads x keeps x, and the y it is compared with,
+        // tracked: Equal is reachable only with both 'special'.
         let unsafe_source = source
             + r#"
 [[invariant]]
-name = "NeverEqual"
-assert = "status != 'Equal'"
+name = "EqualOnlyEmpty"
+assert = "status != 'Equal' || empty(x)"
 "#;
         assert_sequential_special_counterexample(&unsafe_source);
     }
@@ -257,6 +259,53 @@ name = "NeverEqualSpecial"
 assert = "status != 'Equal' || y != 'special'"
 "#;
     assert_sequential_special_counterexample(&source);
+}
+
+/// A guard that reads only strings parameters write leaves them unmodeled, as
+/// before string effects, so it adds no states to check.
+#[test]
+fn a_guard_on_parameter_written_strings_adds_no_states() {
+    let spec = |guard: &str| {
+        format!(
+            r#"
+[automaton]
+name = "Asked"
+states = ["Draft", "Ready", "Done"]
+initial = "Draft"
+terminal = ["Done"]
+[[state]]
+name = "source"
+type = "string"
+initial = ""
+[[state]]
+name = "asked"
+type = "string"
+initial = ""
+[[state]]
+name = "tries"
+type = "counter"
+initial = 0
+[[action]]
+name = "Describe"
+from = ["Draft", "Ready"]
+to = "Ready"
+params = ["source", "asked"]
+guard = "tries < 3"
+effect = ["tries += 1"]
+[[action]]
+name = "Finish"
+from = ["Ready"]
+to = "Done"
+{guard}
+"#
+        )
+    };
+    let explored =
+        |source: &str| check_model(&build_model_from_ioa(source, 2).unwrap()).states_explored;
+    assert_eq!(
+        explored(&spec("guard = \"source != 'asked' || asked != ''\"")),
+        explored(&spec(""))
+    );
 }
 
 fn assert_sequential_special_counterexample(source: &str) {

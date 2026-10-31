@@ -194,6 +194,16 @@ impl PostgresEventStore {
             .await
             .map_err(storage_error)?;
         }
+        // The event and its projection commit together, so the entity enters
+        // the gap only when its fields are wrapped where the index cannot see.
+        crate::projection_delta::applied(
+            &self.schema,
+            &mut tx,
+            [tenant, entity_type, entity_id],
+            1,
+            fields,
+        )
+        .await?;
 
         let commit_started = Instant::now();
         tx.commit().await.map_err(|e| {

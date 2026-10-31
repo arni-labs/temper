@@ -71,10 +71,22 @@ pub(super) fn string_params(
         .collect()
 }
 
-/// The string variables the verifier tracks: those guards/invariants read or
-/// effects write, plus `also_tracked` and their constraint dependencies.
-/// Route checks also track every string field an input is constrained against:
-/// its value decides whether the route is enabled.
+/// The string variables the verifier tracks:
+/// - those `[[invariant]]`s read, and `also_tracked`;
+/// - those guards read or effects write that no action's parameter writes;
+/// - and every string variable a constraint ties the parameter of a tracked
+///   one to (its value decides what the tracked one may become), or a guard
+///   or invariant compares with a tracked one (`x == y`).
+///
+/// `can_reach` rules also need every guard/effect string and constraint source:
+/// an unmodeled value must not certify an impossible route.
+///
+/// Other strings stay unmodeled, and a guard that reads one may go either
+/// way. A string no parameter writes holds only its initial value and the
+/// effects' literals, so tracking it adds few states. A string a parameter
+/// writes takes a fresh symbol at each write, and tracking one only guards
+/// read multiplies the states to check: four such strings took a spec from
+/// 137,137 states to past 10 million generated.
 pub(super) fn tracked_strings(
     automaton: &Automaton,
     also_tracked: &BTreeSet<String>,
@@ -85,19 +97,19 @@ pub(super) fn tracked_strings(
         .map(|sv| (sv.name.as_str(), sv.var_type.kind()))
         .collect();
     let is_string = |name: &str| kinds.get(name) == Some(&VarKind::Str);
+    let param_written: BTreeSet<&str> = automaton
+        .actions
+        .iter()
+        .flat_map(|action| action.params.iter().map(|param| param.name()))
+        .collect();
     let mut tracked: BTreeSet<String> = also_tracked
         .iter()
         .filter(|name| is_string(name))
         .cloned()
         .collect();
     let checks_routes = automaton.liveness.iter().any(|l| !l.can_reach.is_empty());
-    for expr in automaton
-        .invariants
-        .iter()
-        .map(|inv| &inv.assert)
-        .chain(automaton.actions.iter().map(|action| &action.guard))
-    {
-        expr.for_each_name(&mut |name| {
+    for inv in &automaton.invariants {
+        inv.assert.for_each_name(&mut |name| {
             if let Name::Var(var) = name
                 && is_string(var)
             {
@@ -105,14 +117,32 @@ pub(super) fn tracked_strings(
             }
         });
     }
-    // Effect-only strings take only initial and literal values; tracking them
-    // does not add arbitrary parameter choices.
-    for effect in automaton.actions.iter().flat_map(|action| &action.effect) {
-        if let Effect::Assign { var, .. } = effect
-            && is_string(var)
-        {
-            tracked.insert(var.clone());
+    for action in &automaton.actions {
+        action.guard.for_each_name(&mut |name| {
+            if let Name::Var(var) = name
+                && is_string(var)
+                && (checks_routes || !param_written.contains(var))
+            {
+                tracked.insert(var.to_string());
+            }
+        });
+        for effect in &action.effect {
+            if let temper_spec::predicate::Effect::Assign { var, .. } = effect
+                && is_string(var)
+                && (checks_routes || !param_written.contains(var.as_str()))
+            {
+                tracked.insert(var.clone());
+            }
         }
+    }
+    let mut compared = Vec::new();
+    for expr in automaton
+        .invariants
+        .iter()
+        .map(|inv| &inv.assert)
+        .chain(automaton.actions.iter().map(|action| &action.guard))
+    {
+        compared_strings(expr, &is_string, &mut compared);
     }
     loop {
         let before = tracked.len();
@@ -128,16 +158,47 @@ pub(super) fn tracked_strings(
                 }
             }
         }
+        for (a, b) in &compared {
+            if tracked.contains(a) || tracked.contains(b) {
+                tracked.insert(a.clone());
+                tracked.insert(b.clone());
+            }
+        }
         if tracked.len() == before {
             return tracked;
         }
     }
 }
 
-/// For each tracked string variable, the literals a guard or invariant
-/// compares it with (`v == 'x'`, `v in ['x', 'y']`), also offered to its
-/// constraint sources when checking `can_reach`. Route inputs share all
-/// literal distinctions, since equality or membership can connect fields.
+/// The pairs of string variables `expr` compares with each other (`x == y`,
+/// `x != y`).
+fn compared_strings(
+    expr: &Expr,
+    is_string: &impl Fn(&str) -> bool,
+    out: &mut Vec<(String, String)>,
+) {
+    match expr {
+        Expr::Not(inner) => compared_strings(inner, is_string, out),
+        Expr::And(parts) | Expr::Or(parts) => {
+            parts
+                .iter()
+                .for_each(|part| compared_strings(part, is_string, out));
+        }
+        Expr::Implies(a, b) => {
+            compared_strings(a, is_string, out);
+            compared_strings(b, is_string, out);
+        }
+        Expr::Compare {
+            lhs: Operand::Var(a),
+            op: CmpOp::Eq | CmpOp::Ne,
+            rhs: Operand::Var(b),
+        } if is_string(a) && is_string(b) => out.push((a.clone(), b.clone())),
+        _ => {}
+    }
+}
+
+/// For every tracked string variable, all initial, effect and comparison
+/// literals any tracked string may hold (`v == 'x'`, `v in ['x', 'y']`).
 pub(super) fn string_literals(
     automaton: &Automaton,
     tracked: &BTreeSet<String>,
