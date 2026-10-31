@@ -7,6 +7,13 @@ const WASM_ARTIFACT_PREFIX: &str = "wasm-modules/";
 /// could write `kernel/check-verdict/<digest>` would pass a spec no check
 /// passed.
 pub const KERNEL_BLOB_PREFIX: &str = "kernel/";
+
+/// Whether the kernel owns `key`: its own records, and modules' bytes, which
+/// it kept under wasm-modules/ before kernel/ existed. Only the kernel writes
+/// a key it owns, so what it reads there is what it wrote.
+pub(crate) fn kernel_owns(key: &str) -> bool {
+    key.starts_with(KERNEL_BLOB_PREFIX) || key.starts_with(WASM_ARTIFACT_PREFIX)
+}
 pub(crate) const DEFAULT_BLOB_BUCKET: &str = "temper-fs";
 
 pub(crate) fn wasm_artifact_key(sha256_hash: &str) -> String {
