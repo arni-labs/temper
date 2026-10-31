@@ -88,6 +88,13 @@ pub(super) async fn write_projection(
         if sequence_nr > existing.sequence_nr() {
             store_event_counters(tx, [tenant, entity_type, entity_id], sequence_nr, state).await?;
         }
+        super::projection_delta::applied(
+            tx,
+            [tenant, entity_type, entity_id],
+            row.sequence_nr,
+            fields,
+        )
+        .await?;
         return Ok(());
     }
     if existing
@@ -125,7 +132,14 @@ pub(super) async fn write_projection(
     .map_err(storage_error)?;
 
     let indexed = indexed_projection_fields(status, fields);
-    sync_field_index(tx, [tenant, entity_type, entity_id], &indexed).await
+    sync_field_index(tx, [tenant, entity_type, entity_id], &indexed).await?;
+    super::projection_delta::applied(
+        tx,
+        [tenant, entity_type, entity_id],
+        row.sequence_nr,
+        fields,
+    )
+    .await
 }
 
 /// Remove an entity's query-plane rows in `tx`.
@@ -146,5 +160,6 @@ pub(super) async fn remove_projection(
     .await
     .map_err(storage_error)?;
     drop_event_counters(tx, [tenant, entity_type, entity_id]).await?;
+    super::projection_delta::mark_removed(tx, [tenant, entity_type, entity_id]).await?;
     Ok(())
 }
