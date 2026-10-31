@@ -496,7 +496,9 @@ impl VerificationCascade {
                 parts.join("; "),
             )
         };
-        let summary = if verification.lost_places.is_empty() {
+        // A failed check's failures are the whole answer: a note would often
+        // name the record a failure already names.
+        let summary = if !passed || verification.lost_places.is_empty() {
             summary
         } else {
             let found: Vec<String> = verification
