@@ -13,6 +13,14 @@
 # `after-restart`, run once the server has restarted, the same tenants get the
 # same ref once more.
 #
+# With TENANT set, every run installs into that one tenant instead, e.g.
+# TENANT=default on a throwaway Temper whose own TEMPER_API_KEY is an operator
+# only in "default". Only the first install of a round meets an empty tenant,
+# so it alone is `first-install`; every later install is `same-ref-again`.
+# Empty the server's data dir between rounds to get a first install again.
+# A key answers only in its own tenant (401 elsewhere), so this cannot reach
+# a tenant the key does not belong to.
+#
 # Environment (the key is read from the environment and never printed):
 #   TEMPER_URL     base URL of the Temper, e.g. https://<staging main Temper>
 #   TEMPER_API_KEY a key that may install into the test tenants
@@ -24,6 +32,7 @@
 #                  Genesis (29, 57 with its closure); pass the same app's ref in
 #                  the registry the Temper uses if that registry names it otherwise
 #   TENANT_PREFIX  default kgtiming; never a person's tenant
+#   TENANT         unset by default; one tenant for every run (see above)
 #   RUNS           default 3
 #
 # Kept check verdicts are shared by the whole server, keyed by what a spec's
@@ -55,6 +64,7 @@ esac
 : "${REGISTRY_URL:?set REGISTRY_URL}"
 APP_REF="${APP_REF:-temperpaw/paw-patrol@e3cca7fccf9f6e2dee982f6d97ebc94101535257}"
 TENANT_PREFIX="${TENANT_PREFIX:-kgtiming}"
+TENANT="${TENANT:-}"
 RUNS="${RUNS:-3}"
 base="${TEMPER_URL%/}"
 
@@ -63,6 +73,15 @@ trap 'rm -rf "$out"' EXIT
 # The key goes to curl through a file only this user can read, never argv.
 umask 077
 printf 'Authorization: Bearer %s\n' "$TEMPER_API_KEY" > "$out/auth"
+
+# The tenant run $1 installs into.
+tenant_for() {
+    if [ -n "$TENANT" ]; then
+        echo "$TENANT"
+    else
+        echo "$TENANT_PREFIX-$label-$1"
+    fi
+}
 
 # One install of APP_REF into $1. Prints "<http code> <time_total>".
 install() {
@@ -80,9 +99,11 @@ started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "# $label $phase $APP_REF on $base, started $started"
 printf 'label\tcase\trun\ttenant\thttp\ttime_total_s\n'
 for run in $(seq 1 "$RUNS"); do
-    tenant="$TENANT_PREFIX-$label-$run"
-    if [ "$phase" = first ]; then
+    tenant="$(tenant_for "$run")"
+    if [ "$phase" = first ] && { [ -z "$TENANT" ] || [ "$run" = 1 ]; }; then
         cases="first-install same-ref-again"
+    elif [ "$phase" = first ]; then
+        cases="same-ref-again same-ref-again"
     else
         cases="after-restart"
     fi
@@ -98,8 +119,9 @@ ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "# ended $ended; the server's install_reconcile and total phase lines for $APP_REF are in its logs between $started and $ended"
 
 echo "# what each test tenant has installed now (no uninstall route exists):"
-for run in $(seq 1 "$RUNS"); do
-    tenant="$TENANT_PREFIX-$label-$run"
+if [ -n "$TENANT" ]; then listed_runs=1; else listed_runs="$RUNS"; fi
+for run in $(seq 1 "$listed_runs"); do
+    tenant="$(tenant_for "$run")"
     curl -sS -H @"$out/auth" -H "X-Tenant-Id: $tenant" "$base/api/genesis/apps/installs" \
         | tr '}' '\n' | grep -o '"app_name":"[^"]*"\|"app_ref":"[^"]*"' | paste -sd' ' - \
         | sed "s/^/#   $tenant: /" || echo "#   $tenant: could not be listed"
