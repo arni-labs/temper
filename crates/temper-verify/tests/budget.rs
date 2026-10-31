@@ -74,6 +74,10 @@ action = [
   { name = "E", kind = "input", from = ["On"], effect = ["e += 1"] },
   { name = "F", kind = "input", from = ["On"], effect = ["f += 1"] },
 ]
+# Read every counter, so each one multiplies the states to check.
+invariant = [
+  { name = "Counted", assert = "a >= 0 && b >= 0 && c >= 0 && d >= 0 && e >= 0 && f >= 0" },
+]
 
 [automaton]
 name = "Wide"
