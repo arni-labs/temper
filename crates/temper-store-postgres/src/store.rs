@@ -948,6 +948,27 @@ impl EventStore for PostgresEventStore {
         Ok(page)
     }
 
+    async fn first_event_at(
+        &self,
+        persistence_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, PersistenceError> {
+        let (tenant, entity_type, entity_id) =
+            parse_persistence_id_parts(persistence_id).map_err(PersistenceError::Storage)?;
+        let saved: Option<String> = crate::dbm::postgres_query_scalar!(&self.schema,
+            "SELECT COALESCE(
+                (SELECT first_event_at FROM {schema}entity_catalog WHERE tenant=$1 AND entity_type=$2 AND entity_id=$3),
+                (SELECT COALESCE(payload->>'timestamp', metadata->>'timestamp') FROM {schema}events
+                 WHERE tenant=$1 AND entity_type=$2 AND entity_id=$3 AND sequence_nr=1))")
+            .bind(tenant).bind(entity_type).bind(entity_id).fetch_one(self.pool()).await.map_err(|error| PersistenceError::Storage(error.to_string()))?;
+        saved
+            .map(|saved| {
+                chrono::DateTime::parse_from_rfc3339(&saved)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|error| PersistenceError::Serialization(error.to_string()))
+            })
+            .transpose()
+    }
+
     /// Save (upsert) a snapshot for the given entity.
     ///
     /// Uses `ON CONFLICT … DO UPDATE` so that only the latest snapshot is

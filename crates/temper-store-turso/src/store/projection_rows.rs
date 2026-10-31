@@ -106,12 +106,13 @@ pub(super) async fn write_projection(
 
     tx.execute(
         "INSERT INTO entity_catalog \
-         (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2, ?9) \
+         (tenant, entity_type, entity_id, status, fields, state, updated_at, sequence_nr, projection_version, projection_hash, first_event_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2, ?9, json_extract(?6, '$.first_event_at')) \
          ON CONFLICT(tenant, entity_type, entity_id) DO UPDATE SET \
              status = excluded.status, \
              fields = excluded.fields, \
              state = excluded.state, \
+             first_event_at = COALESCE(entity_catalog.first_event_at, excluded.first_event_at), \
              updated_at = excluded.updated_at, \
              sequence_nr = excluded.sequence_nr, \
              projection_version = excluded.projection_version, \

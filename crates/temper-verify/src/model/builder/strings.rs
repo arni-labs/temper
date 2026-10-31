@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use temper_spec::automaton::{ActionConstraint, ActionKind, Automaton, Effect};
+use temper_spec::automaton::{ActionConstraint, Automaton, Effect, Initial};
 use temper_spec::predicate::{Arg, CmpOp, Expr, Literal, Name, Operand, Set, VarKind};
 
 use crate::model::types::StringParam;
@@ -71,12 +71,10 @@ pub(super) fn string_params(
         .collect()
 }
 
-/// The string variables the verifier tracks: those invariants read, and,
-/// when proving `can_reach`, those guards read. A possible edge through an
-/// untracked local value cannot establish a route. Also include `also_tracked`
-/// and every string variable a route action constrains an input against: its
-/// value decides what the tracked one may become. Specs without `can_reach`
-/// keep their existing invariant-driven tracking.
+/// The string variables the verifier tracks: those guards/invariants read or
+/// effects write, plus `also_tracked` and their constraint dependencies.
+/// Route checks also track every string field an input is constrained against:
+/// its value decides whether the route is enabled.
 pub(super) fn tracked_strings(
     automaton: &Automaton,
     also_tracked: &BTreeSet<String>,
@@ -93,13 +91,12 @@ pub(super) fn tracked_strings(
         .cloned()
         .collect();
     let checks_routes = automaton.liveness.iter().any(|l| !l.can_reach.is_empty());
-    let guards = automaton
-        .actions
+    for expr in automaton
+        .invariants
         .iter()
-        .filter(|a| checks_routes && a.kind != ActionKind::Output)
-        .map(|a| &a.guard);
-    let assertions = automaton.invariants.iter().map(|inv| &inv.assert);
-    for expr in assertions.chain(guards) {
+        .map(|inv| &inv.assert)
+        .chain(automaton.actions.iter().map(|action| &action.guard))
+    {
         expr.for_each_name(&mut |name| {
             if let Name::Var(var) = name
                 && is_string(var)
@@ -107,6 +104,15 @@ pub(super) fn tracked_strings(
                 tracked.insert(var.to_string());
             }
         });
+    }
+    // Effect-only strings take only initial and literal values; tracking them
+    // does not add arbitrary parameter choices.
+    for effect in automaton.actions.iter().flat_map(|action| &action.effect) {
+        if let Effect::Assign { var, .. } = effect
+            && is_string(var)
+        {
+            tracked.insert(var.clone());
+        }
     }
     loop {
         let before = tracked.len();
@@ -184,6 +190,28 @@ pub(super) fn string_literals(
     for inv in &automaton.invariants {
         visit(&inv.assert, tracked, &mut out);
     }
+    // Share initial, effect and comparison literals: an earlier input can
+    // equal a value another field receives from a later effect.
+    let mut written: BTreeSet<String> = out.values().flatten().cloned().collect();
+    for state in &automaton.state {
+        if tracked.contains(&state.name)
+            && let Initial::String(value) = &state.initial
+        {
+            written.insert(value.clone());
+        }
+    }
+    for effect in automaton.actions.iter().flat_map(|action| &action.effect) {
+        if let Effect::Assign {
+            value: Arg::Lit(Literal::Str(value)),
+            ..
+        } = effect
+        {
+            written.insert(value.clone());
+        }
+    }
+    for var in tracked {
+        out.insert(var.clone(), written.clone());
+    }
     // A parameter can supply a tracked string and append to a list on the
     // same step. Its string choices must preserve the list's distinctions
     // too, before constraints propagate those choices to source fields.
@@ -222,10 +250,10 @@ pub(super) fn string_literals(
         }
         for state in &automaton.state {
             match &state.initial {
-                temper_spec::automaton::Initial::String(text) => {
+                Initial::String(text) => {
                     literals.insert(text.clone());
                 }
-                temper_spec::automaton::Initial::List(items) => {
+                Initial::List(items) => {
                     literals.extend(items.iter().cloned());
                 }
                 _ => {}

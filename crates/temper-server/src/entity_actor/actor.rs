@@ -312,6 +312,7 @@ impl EntityActor {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
+            last_event: Default::default(),
             status_clock: Default::default(),
             spawn_reservations: Default::default(),
         }
@@ -530,7 +531,8 @@ impl EntityActor {
         format!("{}:{}:{}", self.tenant, self.entity_type, self.entity_id)
     }
 
-    fn field_sync_mode_for_backend(
+    /// Storage transformation shared by execution and outside-write previews.
+    pub(crate) fn field_sync_mode_for_backend(
         backend: Option<BackendLabel>,
         blob_store: Option<&crate::blob_store::BlobStore>,
     ) -> FieldSyncMode {
@@ -911,6 +913,30 @@ impl EntityActor {
                 if !loaded_snapshot && from_sequence == 0 && !envelopes.is_empty() {
                     super::bootstrap::clear_for_replay(state, &table.initial_state);
                 }
+                // An old snapshot may lack creation metadata. Read exactly sequence
+                // one through the journal index, never the oldest retained event.
+                let event_time = |event: &PersistenceEnvelope| {
+                    event
+                        .payload
+                        .get("timestamp")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                        .unwrap_or(event.metadata.timestamp)
+                };
+                let first_event_at = if state.last_event.first_event_at.is_some() {
+                    state.last_event.first_event_at
+                } else if let Some(event) = envelopes.first().filter(|event| event.sequence_nr == 1)
+                {
+                    Some(event_time(event))
+                } else if loaded_snapshot {
+                    store
+                        .first_event_at(persistence_id)
+                        .await
+                        .map_err(|error| {
+                            ActorError::custom(format!("creation time lookup failed: {error}"))
+                        })?
+                } else {
+                    None
+                };
                 let mut expected_sequence = from_sequence.saturating_add(1);
                 for (index, env) in envelopes.iter().enumerate() {
                     if replay_policy.strict_event_validation() {
@@ -982,6 +1008,7 @@ impl EntityActor {
                                 timestamp: env.metadata.timestamp,
                                 params: serde_json::json!({}),
                                 idempotency_key: None,
+                                origin: Default::default(),
                                 kind: temper_runtime::persistence::EventKind::Tombstone,
                                 outcome: None,
                             },
@@ -1204,6 +1231,7 @@ impl EntityActor {
                     }
                     state.sequence_nr = env.sequence_nr;
                 }
+                state.last_event.first_event_at = first_event_at;
                 if !envelopes.is_empty() {
                     let replayed_tail = state
                         .sequence_nr
@@ -1398,6 +1426,7 @@ impl Actor for EntityActor {
                 timestamp: sim_now(),
                 params: initial_params,
                 idempotency_key: None,
+                origin: super::EventOrigin::from_caller(self.created_by.as_ref()),
                 kind: temper_runtime::persistence::EventKind::Transition,
                 outcome: None,
             };
@@ -1724,6 +1753,7 @@ impl EntityActor {
                         .clone()
                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                     event.idempotency_key = idempotency_key.clone();
+                    event.origin = super::EventOrigin::from_caller(caller.as_deref());
 
                     // An event too large to be written stores no overflow blobs first.
                     if !result.overflow_blobs.is_empty()
@@ -1978,6 +2008,8 @@ impl EntityActor {
                                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                                     let mut retry_event = retry_event;
                                     retry_event.idempotency_key = idempotency_key.clone();
+                                    retry_event.origin =
+                                        super::EventOrigin::from_caller(caller.as_deref());
 
                                     // Overflow blobs for the re-evaluated result.
                                     if !retry_result.overflow_blobs.is_empty()
@@ -2289,6 +2321,7 @@ impl EntityActor {
                 ctx.reply(value);
             }
             EntityMsg::UpdateFields {
+                caller,
                 fields,
                 replace,
                 expected_precondition,
@@ -2313,6 +2346,7 @@ impl EntityActor {
                     fields,
                     replace,
                     expected_precondition.is_some(),
+                    caller.as_deref(),
                 )
                 .await;
                 ctx.reply(match outcome {
@@ -2360,6 +2394,7 @@ impl EntityActor {
             }
 
             EntityMsg::Delete {
+                caller,
                 expected_authorization_precondition,
             } => {
                 if self
@@ -2407,7 +2442,8 @@ impl EntityActor {
                     });
                     return Ok(());
                 }
-                let deleted = EntityEvent::tombstone(state.status.clone());
+                let mut deleted = EntityEvent::tombstone(state.status.clone());
+                deleted.origin = super::EventOrigin::from_caller(caller.as_deref());
 
                 if let (Some(store), Some(backend)) =
                     (self.event_journal.as_ref(), self.event_backend)
@@ -2481,6 +2517,10 @@ mod event_size_tests;
 #[cfg(test)]
 #[path = "contract_state_test.rs"]
 pub(super) mod contract_state_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "held_action_test.rs"]
+mod held_action_tests;
 
 #[cfg(all(test, feature = "sim"))]
 #[path = "hydration_test.rs"]

@@ -31,12 +31,12 @@ pub struct TemperModelState {
     /// Named list variables (e.g. `tags`, `labels`), sharing string identities
     /// with tracked fields.
     pub lists: BTreeMap<String, Vec<ModelString>>,
-    /// The string variables an invariant reads, as symbols: `''`, a literal
+    /// The string variables guards/invariants read or effects write, as symbols: `''`, a literal
     /// the spec compares the variable with, or `#n`, a value that is equal
     /// only to itself. The verifier tracks which strings are equal, not what
     /// they say, so `#n` are renumbered in order of first use after every
     /// step ([`super::semantics::canonical_strings`]). Empty for a spec whose
-    /// invariants read no string.
+    /// guards, invariants and effects use no string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub strings: BTreeMap<String, ModelString>,
 }
@@ -155,6 +155,8 @@ pub enum ModelEffect {
     SubCounter { var: String, value: Arg },
     /// `var = value` on a bool.
     SetBool { var: String, value: Arg },
+    /// `var = 'literal'` on a string, including the empty string.
+    SetString { var: String, value: String },
     /// `append(var, value)`.
     ListAppend { var: String, value: Arg },
     /// `remove_at(var, index)`; out of range is a no-op.
@@ -278,11 +280,11 @@ pub struct TemperModel {
     pub(crate) initial_lists: BTreeMap<String, Vec<ModelString>>,
     /// Initial values of the tracked string variables.
     pub(crate) initial_strings: BTreeMap<String, ModelString>,
-    /// The string variables the verifier tracks: those an invariant reads,
-    /// those a guard reads when checking `can_reach`, and those whose value
-    /// reaches one through a constraint or a reaction.
+    /// The string variables the verifier tracks: those guards/invariants read
+    /// or effects write, and those whose value reaches one through a
+    /// constraint or a reaction.
     pub tracked_strings: BTreeSet<String>,
-    /// String literals each tracked variable is compared with in a guard or
+    /// String literals written by effects or compared with a tracked variable in a guard or
     /// invariant: the values worth choosing for it besides `''` and others'.
     pub(crate) string_literals: BTreeMap<String, BTreeSet<String>>,
     /// Per-counter upper bounds for bounded exploration.
@@ -332,6 +334,55 @@ impl ExploreLimit {
 
     pub(crate) fn lift(&self) {
         self.lifted.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Every field a walk reads, in order. `limit` is left out: it is the budget a
+/// walk runs under, not part of the model, so a model prints the same however
+/// it is budgeted. The checks are kept by a digest of this text
+/// ([`crate::VerificationCascade::digest`]); the destructuring makes a new
+/// field a compile error here until it is printed or left out on purpose.
+impl fmt::Debug for TemperModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let TemperModel {
+            states,
+            transitions,
+            invariants,
+            liveness,
+            terminal,
+            var_kinds,
+            initial_status,
+            initial_counters,
+            initial_booleans,
+            initial_lists,
+            initial_strings,
+            tracked_strings,
+            string_literals,
+            counter_bounds,
+            default_max_counter,
+            list_bounds,
+            list_literals,
+            limit: _,
+        } = self;
+        f.debug_struct("TemperModel")
+            .field("states", states)
+            .field("transitions", transitions)
+            .field("invariants", invariants)
+            .field("liveness", liveness)
+            .field("terminal", terminal)
+            .field("var_kinds", var_kinds)
+            .field("initial_status", initial_status)
+            .field("initial_counters", initial_counters)
+            .field("initial_booleans", initial_booleans)
+            .field("initial_lists", initial_lists)
+            .field("initial_strings", initial_strings)
+            .field("tracked_strings", tracked_strings)
+            .field("string_literals", string_literals)
+            .field("counter_bounds", counter_bounds)
+            .field("default_max_counter", default_max_counter)
+            .field("list_bounds", list_bounds)
+            .field("list_literals", list_literals)
+            .finish_non_exhaustive()
     }
 }
 

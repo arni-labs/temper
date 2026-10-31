@@ -428,6 +428,11 @@ pub fn apply_effects(
                 };
                 state.booleans.insert(var.clone(), value);
             }
+            ModelEffect::SetString { var, value } => {
+                if let Some(current) = state.strings.get_mut(var) {
+                    *current = ModelString::from(value.clone());
+                }
+            }
             ModelEffect::ListAppend { var, value } => {
                 let entry = state.lists.entry(var.clone()).or_default();
                 let element = match value {

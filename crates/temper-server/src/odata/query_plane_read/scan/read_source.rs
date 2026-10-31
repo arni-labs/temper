@@ -275,6 +275,12 @@ async fn sparse_allowed_ids<'a>(
     // whole id list (up to the scan budget) is what made a per-entity list
     // the size of the catalog. One batch matches the SQL read size, and the
     // allowed result is only ids, in the same order as `all_entity_ids`.
+    let defaults = crate::odata::read_defaults::ReadDefaults::for_entity(
+        request.state,
+        request.tenant,
+        request.entity_type,
+    );
+    let catalog_fields = defaults.catalog_fields(&fields);
     let mut allowed = Vec::new();
     for chunk in all_entity_ids.chunks(SPARSE_DECISION_BATCH) {
         let loaded = crate::storage::load_selected_catalog_rows_by_id(
@@ -282,7 +288,7 @@ async fn sparse_allowed_ids<'a>(
             request.tenant.as_str(),
             request.entity_type,
             chunk,
-            &fields,
+            &catalog_fields,
         )
         .await
         .ok()?;
@@ -293,12 +299,14 @@ async fn sparse_allowed_ids<'a>(
             let Some(row) = rows.get(entity_id) else {
                 continue;
             };
-            let body = super::super::super::read_support::catalog_row_to_selected_entity_body(
+            let mut body = super::super::super::read_support::catalog_row_to_selected_entity_body(
                 request.entity_type,
                 request.entity_set_name,
                 row.clone(),
                 &fields,
             );
+            let values = defaults.field_values(row.state.as_ref().unwrap_or(&row.fields));
+            defaults.apply_selected(&mut body, &fields, &values);
             if super::entity_read_allowed(request, &body) {
                 allowed.push(entity_id);
             }

@@ -36,6 +36,7 @@
 
 mod data_only_create;
 pub mod dbm;
+mod first_event;
 mod metrics;
 mod namespace;
 pub use namespace::PostgresSchema;

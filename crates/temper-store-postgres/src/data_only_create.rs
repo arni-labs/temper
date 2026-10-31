@@ -153,8 +153,8 @@ impl PostgresEventStore {
 
         if let Err(e) = crate::dbm::postgres_query!(&self.schema,
             "INSERT INTO {schema}entity_catalog \
-             (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, 1, 2, $7, now())",
+             (tenant, entity_type, entity_id, status, fields, state, sequence_nr, projection_version, projection_hash, updated_at, first_event_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 1, 2, $7, now(), $6->>'first_event_at')",
         )
         .bind(tenant)
         .bind(entity_type)

@@ -11,6 +11,8 @@ mod effect_outcome;
 pub mod effects;
 pub(crate) mod entity_rows;
 mod field_updates;
+mod last_event;
+pub use last_event::{EventOrigin, EventVia, LastEvent};
 mod move_invariants;
 pub(crate) mod related;
 mod replay_validation;

@@ -4,7 +4,10 @@
 //! (mailbox depth and utilization) and the whole entity index. On 27 Oct 2026
 //! that walk was 87% of a create's handling at 6,000 records, and a create's
 //! p50 rose from 1.58 ms to 2.44 ms between 360 and 6,060 records. The gauges
-//! are now sampled by the runtime metrics loop.
+//! are now sampled by the runtime metrics loop. The shared idempotency cache
+//! must not walk all actors on each insertion either: a debug assertion that
+//! recounted its replies made creates grow again. Its indexes are checked in
+//! deterministic cache tests instead.
 //!
 //! This creates records one at a time on an in-memory server and compares the
 //! median create time of the first records with that of the last. Medians of
@@ -118,10 +121,55 @@ async fn create_time_stays_flat_as_records_grow() {
 
     let first = median(times[..WINDOW].to_vec());
     let last = median(times[RECORDS - WINDOW..].to_vec());
+    eprintln!("median create: first {first:?}, last {last:?}");
     assert!(
         last.as_secs_f64() <= first.as_secs_f64() * GROWTH_ALLOWED,
         "a create took {last:?} (median) with {} records live, against {first:?} with \
          none: something each create does grows with the records",
+        RECORDS - WINDOW
+    );
+}
+
+/// Measure the shared reply cache directly, so the rest of dispatch cannot
+/// mask work proportional to the number of actors with cached replies.
+#[tokio::test]
+async fn cache_insert_time_stays_flat_as_records_grow() {
+    use temper_server::idempotency::{CachedReply, IdempotencyCache, RequestFingerprint};
+
+    let state = build_state("items");
+    let response = state
+        .dispatch_tenant_action(
+            &TenantId::new("items"),
+            "Item",
+            "fixture",
+            "Touch",
+            serde_json::json!({}),
+            &AgentContext::for_service(SERVICE),
+        )
+        .await
+        .expect("fixture dispatches");
+    assert!(response.success);
+    let cache = IdempotencyCache::new();
+    let request = RequestFingerprint::new("Touch", &serde_json::json!({}));
+    let mut times = Vec::with_capacity(RECORDS);
+    for n in 0..RECORDS {
+        let actor = format!("items:Item:item-{n:05}");
+        let started = Instant::now(); // determinism-ok: the test measures wall time
+        // A dispatch caches its actor reply, then completes its effects.
+        cache.put(&actor, "create", &request, &response);
+        cache.put_effects_applied(&actor, "create", &request, &response);
+        times.push(started.elapsed());
+    }
+    assert!(matches!(
+        cache.get("items:Item:item-00000", "create", &request),
+        CachedReply::Replay(_)
+    ));
+    let first = median(times[..WINDOW].to_vec());
+    let last = median(times[RECORDS - WINDOW..].to_vec());
+    eprintln!("median cache insert: first {first:?}, last {last:?}");
+    assert!(
+        last.as_secs_f64() <= first.as_secs_f64() * GROWTH_ALLOWED,
+        "cache insertion grew from {first:?} to {last:?} with {} records live",
         RECORDS - WINDOW
     );
 }
