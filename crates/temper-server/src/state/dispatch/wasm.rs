@@ -30,6 +30,7 @@ mod boxed;
 mod invocation_artifacts;
 mod local_tdata_host;
 mod replay_inputs;
+mod trigger_principal;
 
 pub(super) use boxed::{
     dispatch_callback_action_boxed, dispatch_wasm_callback_boxed, dispatch_wasm_integrations_boxed,
@@ -667,7 +668,7 @@ impl crate::state::ServerState {
                     workflow_root_entity_id: ctx.agent_ctx.workflow_root_entity_id.clone(),
                     workflow_run_id: ctx.agent_ctx.workflow_run_id.clone(),
                     http_request: None,
-                    trigger_principal: None,
+                    trigger_principal: trigger_principal::trigger_principal(ctx.agent_ctx),
                 };
                 (authz_ctx, inv_ctx)
             },
