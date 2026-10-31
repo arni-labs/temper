@@ -38,8 +38,8 @@ use cache_paths::{
     sanitize_fragment, validate_git_object_id, validate_identity_component,
 };
 use object_lookup::load_genesis_object;
+use registry::Registry;
 pub(crate) use registry::configured_registry;
-use registry::{RegistryUrl, registry_client};
 use restore::rollback_to_prior;
 pub use restore::{restore_genesis_app_cache_roots, restore_genesis_registry_cache_roots};
 
@@ -651,7 +651,7 @@ fn follow_latest_error_update(
 }
 
 async fn fetch_registry_latest_version_hash(
-    registry: &RegistryUrl,
+    registry: &Registry,
     registry_tenant: &str,
     owner: &str,
     name: &str,
@@ -661,14 +661,10 @@ async fn fetch_registry_latest_version_hash(
         sanitize_registry_id_component(owner),
         sanitize_registry_id_component(name)
     );
-    let url = format!(
-        "{}/tdata/Apps('{}')",
-        registry.as_str(),
-        app_id.replace('\'', "''")
-    );
-    let response = registry_client()?
-        .get(&url)
-        .header("X-Tenant-Id", registry_tenant)
+    let app_path = format!("/tdata/Apps('{}')", app_id.replace('\'', "''"));
+    let url = registry.url(&app_path);
+    let response = registry
+        .get(&app_path, registry_tenant)?
         .send()
         .await
         .map_err(|error| format!("request Genesis App row {url}: {error}"))?;
@@ -740,7 +736,7 @@ fn parse_registry_app_ref(app_ref: &str) -> Result<RegistryAppRef, String> {
 }
 
 async fn materialize_git_registry_app(
-    registry: &RegistryUrl,
+    registry: &Registry,
     owner: &str,
     name: &str,
     version_hash: Option<&str>,
@@ -798,7 +794,7 @@ async fn materialize_git_registry_app(
 }
 
 async fn materialize_registry_app_closure(
-    registry: &RegistryUrl,
+    registry: &Registry,
     root_ref: RegistryAppRef,
     cache_root: &Path,
 ) -> Result<Vec<RegistryAppRef>, String> {
@@ -840,8 +836,14 @@ async fn materialize_registry_app_closure(
     Ok(materialized_refs)
 }
 
-fn registry_git_url(registry: &RegistryUrl, owner: &str, name: &str) -> String {
-    format!("{}/{}/{}.git", registry.as_str(), owner, name)
+/// The git remote of one registry app.
+///
+/// Clones carry no registry credential: Genesis authenticates git with its own
+/// git tokens and withholds a kernel credential from its git routes, so the
+/// registry token cannot open a private repository there. A private app
+/// installs through the bundle route, which takes the credential.
+fn registry_git_url(registry: &Registry, owner: &str, name: &str) -> String {
+    registry.url(&format!("/{owner}/{name}.git"))
 }
 
 /// Git options for registry clones and fetches: do not follow HTTP redirects.

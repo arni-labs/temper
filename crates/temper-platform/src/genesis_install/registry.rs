@@ -1,11 +1,19 @@
 //! The Genesis registry this process installs apps from.
 
+use std::fmt;
+
 use reqwest::Url;
 
 /// The setting that names this process's Genesis registry.
 const REGISTRY_SETTING: &str = "TEMPER_GENESIS_REGISTRY_URL";
 
-/// The Genesis registry this process fetches app bundles and App rows from.
+/// The setting that holds this process's credential for that registry: a
+/// bearer token the registry resolves to a read-only identity. Unset, every
+/// registry read is anonymous and only public apps can be fetched.
+const TOKEN_SETTING: &str = "TEMPER_GENESIS_REGISTRY_TOKEN";
+
+/// The Genesis registry this process fetches app bundles and App rows from,
+/// and the credential it presents there.
 ///
 /// A new install takes its registry from [`configured_registry`], from
 /// `TEMPER_GENESIS_REGISTRY_URL`: which host a server takes new app code from
@@ -13,13 +21,62 @@ const REGISTRY_SETTING: &str = "TEMPER_GENESIS_REGISTRY_URL";
 /// say which one it means, and any other value is refused before a request is
 /// made. Restoring an install this server already made uses
 /// [`recorded_registry`], the registry that install came from.
+///
+/// Every request to the registry is built by [`Registry::get`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RegistryUrl(String);
+pub(crate) struct Registry {
+    base: String,
+    credential: Option<Credential>,
+}
 
-impl RegistryUrl {
+/// The `TEMPER_GENESIS_REGISTRY_TOKEN` secret. Its `Debug` form never shows it.
+#[derive(Clone, PartialEq, Eq)]
+struct Credential(String);
+
+impl Credential {
+    fn from_setting(raw: &str) -> Option<Self> {
+        let token = raw.trim();
+        (!token.is_empty()).then(|| Self(token.to_string()))
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Credential(redacted)")
+    }
+}
+
+impl Registry {
     /// The registry's base URL, without a trailing slash.
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.base
+    }
+
+    /// The full URL of `path` on this registry.
+    pub(crate) fn url(&self, path: &str) -> String {
+        // A path that did not start at the root would extend the host name
+        // and send the request, and its credential, somewhere else.
+        assert!(
+            path.starts_with('/'),
+            "registry path must start with '/': {path}"
+        );
+        format!("{}{path}", self.base)
+    }
+
+    /// A GET of `path` on this registry, in `registry_tenant`, carrying this
+    /// process's registry credential when one is configured.
+    pub(crate) fn get(
+        &self,
+        path: &str,
+        registry_tenant: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let request = registry_client()?
+            .get(self.url(path))
+            .header("X-Tenant-Id", registry_tenant);
+        Ok(match &self.credential {
+            Some(Credential(token)) => request.bearer_auth(token),
+            None => request,
+        })
     }
 }
 
@@ -27,9 +84,10 @@ impl RegistryUrl {
 ///
 /// An empty `requested` means the configured registry. With no registry
 /// configured, nothing is fetched.
-pub(crate) fn configured_registry(requested: &str) -> Result<RegistryUrl, String> {
+pub(crate) fn configured_registry(requested: &str) -> Result<Registry, String> {
     let configured = std::env::var(REGISTRY_SETTING).unwrap_or_default();
-    registry_for(&configured, requested)
+    let token = std::env::var(TOKEN_SETTING).unwrap_or_default();
+    registry_for(&configured, requested, &token)
 }
 
 /// The registry a stored install record was made from, to fetch that same
@@ -38,20 +96,19 @@ pub(crate) fn configured_registry(requested: &str) -> Result<RegistryUrl, String
 /// Restoring reproduces what this server already installed, so it does not
 /// depend on the current setting: a restart with the setting unset or changed
 /// keeps every installed app.
-pub(crate) fn recorded_registry(recorded: &str) -> Result<RegistryUrl, String> {
-    comparable_form(recorded).map_err(|error| format!("recorded registry_url {error}"))?;
-    Ok(RegistryUrl(
-        recorded.trim().trim_end_matches('/').to_string(),
-    ))
+pub(crate) fn recorded_registry(recorded: &str) -> Result<Registry, String> {
+    let configured = std::env::var(REGISTRY_SETTING).unwrap_or_default();
+    let token = std::env::var(TOKEN_SETTING).unwrap_or_default();
+    recorded_registry_for(recorded, &configured, &token)
 }
 
 /// The registry `configured` names, as if it were this server's setting.
 #[cfg(test)]
-pub(crate) fn registry_for_test(configured: &str) -> RegistryUrl {
-    registry_for(configured, "").expect("test registry URL")
+pub(crate) fn registry_for_test(configured: &str) -> Registry {
+    registry_for(configured, "", "").expect("test registry URL")
 }
 
-fn registry_for(configured: &str, requested: &str) -> Result<RegistryUrl, String> {
+fn registry_for(configured: &str, requested: &str, token: &str) -> Result<Registry, String> {
     if configured.trim().is_empty() {
         return Err(format!(
             "no Genesis registry is configured on this server; set {REGISTRY_SETTING} to install apps from one"
@@ -68,9 +125,30 @@ fn registry_for(configured: &str, requested: &str) -> Result<RegistryUrl, String
             ));
         }
     }
-    Ok(RegistryUrl(
-        configured.trim().trim_end_matches('/').to_string(),
-    ))
+    Ok(Registry {
+        base: configured.trim().trim_end_matches('/').to_string(),
+        credential: Credential::from_setting(token),
+    })
+}
+
+fn recorded_registry_for(
+    recorded: &str,
+    configured: &str,
+    token: &str,
+) -> Result<Registry, String> {
+    let recorded_form =
+        comparable_form(recorded).map_err(|error| format!("recorded registry_url {error}"))?;
+    // The credential was issued by the configured registry. A record made from
+    // any other registry is fetched without it, so it never reaches a host
+    // that could replay it against the registry that issued it.
+    let credential = comparable_form(configured)
+        .is_ok_and(|configured_form| configured_form == recorded_form)
+        .then(|| Credential::from_setting(token))
+        .flatten();
+    Ok(Registry {
+        base: recorded.trim().trim_end_matches('/').to_string(),
+        credential,
+    })
 }
 
 /// A registry base URL in the form two spellings of one registry share:
@@ -91,8 +169,8 @@ fn comparable_form(raw: &str) -> Result<String, String> {
 /// HTTP client for registry requests.
 ///
 /// It does not follow redirects, so every response comes from the configured
-/// registry itself.
-pub(crate) fn registry_client() -> Result<reqwest::Client, String> {
+/// registry itself and the credential is sent nowhere else.
+fn registry_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -101,16 +179,43 @@ pub(crate) fn registry_client() -> Result<reqwest::Client, String> {
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
     const CONFIGURED: &str = "https://genesis.example.test";
+    const TOKEN: &str = "registry-test-token";
+    const APP_ROW: &str = "/tdata/Apps('app-acme-notes')";
+
+    /// The `Authorization` header of each request `server` received.
+    async fn authorization_headers(server: &MockServer) -> Vec<Option<String>> {
+        server
+            .received_requests()
+            .await
+            .expect("request recording")
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().expect("header text").to_string())
+            })
+            .collect()
+    }
+
+    async fn ok_registry() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    }
 
     #[test]
     fn an_empty_request_uses_the_configured_registry() {
-        let registry = registry_for(" https://genesis.example.test/ ", "").expect("configured");
+        let registry = registry_for(" https://genesis.example.test/ ", "", "").expect("configured");
         assert_eq!(registry.as_str(), CONFIGURED);
     }
 
@@ -122,7 +227,7 @@ mod tests {
             "HTTPS://Genesis.Example.Test",
             "https://genesis.example.test:443",
         ] {
-            let registry = registry_for(CONFIGURED, requested).expect(requested);
+            let registry = registry_for(CONFIGURED, requested, "").expect(requested);
             assert_eq!(registry.as_str(), CONFIGURED, "{requested}");
         }
     }
@@ -140,30 +245,121 @@ mod tests {
             "file:///etc",
             "not a url",
         ] {
-            let error = registry_for(CONFIGURED, requested).expect_err(requested);
+            let error = registry_for(CONFIGURED, requested, TOKEN).expect_err(requested);
             assert!(error.contains("registry_url"), "{requested}: {error}");
         }
     }
 
     #[test]
     fn a_stored_install_is_fetched_again_from_the_registry_it_came_from() {
-        let registry = recorded_registry(" http://127.0.0.1:18081/ ").expect("recorded");
+        let registry =
+            recorded_registry_for(" http://127.0.0.1:18081/ ", "", "").expect("recorded");
         assert_eq!(registry.as_str(), "http://127.0.0.1:18081");
         for recorded in ["", "file:///etc", "https://genesis.example.test/?x=1"] {
-            assert!(recorded_registry(recorded).is_err(), "{recorded}");
+            assert!(
+                recorded_registry_for(recorded, CONFIGURED, TOKEN).is_err(),
+                "{recorded}"
+            );
         }
     }
 
     #[test]
     fn without_a_configured_registry_nothing_is_fetched() {
         for requested in ["", CONFIGURED] {
-            let error = registry_for("", requested).expect_err("unset");
+            let error = registry_for("", requested, TOKEN).expect_err("unset");
             assert!(error.contains(REGISTRY_SETTING), "{error}");
         }
     }
 
     #[tokio::test]
-    async fn the_registry_client_does_not_follow_redirects() {
+    async fn registry_reads_carry_the_configured_credential() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(APP_ROW))
+            .and(header("X-Tenant-Id", "default"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = registry_for(&server.uri(), "", &format!(" {TOKEN} ")).expect("registry");
+
+        let response = registry
+            .get(APP_ROW, "default")
+            .expect("request")
+            .send()
+            .await
+            .expect("response");
+
+        assert_eq!(response.status().as_u16(), 200);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn without_a_credential_registry_reads_are_anonymous() {
+        let server = ok_registry().await;
+        for token in ["", "   "] {
+            registry_for(&server.uri(), "", token)
+                .expect("registry")
+                .get(APP_ROW, "default")
+                .expect("request")
+                .send()
+                .await
+                .expect("response");
+        }
+        assert_eq!(authorization_headers(&server).await, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_stored_install_from_the_configured_registry_is_fetched_with_its_credential() {
+        let server = ok_registry().await;
+        let configured = format!("{}/", server.uri().to_uppercase());
+        recorded_registry_for(&server.uri(), &configured, TOKEN)
+            .expect("recorded")
+            .get(APP_ROW, "default")
+            .expect("request")
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(
+            authorization_headers(&server).await,
+            vec![Some(format!("Bearer {TOKEN}"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_credential_is_never_sent_to_another_registry() {
+        let server = ok_registry().await;
+        for configured in [CONFIGURED, "", "not a url"] {
+            recorded_registry_for(&server.uri(), configured, TOKEN)
+                .expect("recorded")
+                .get(APP_ROW, "default")
+                .expect("request")
+                .send()
+                .await
+                .expect("response");
+        }
+        assert_eq!(authorization_headers(&server).await, vec![None, None, None]);
+    }
+
+    #[test]
+    fn the_credential_never_appears_in_debug_output() {
+        let registry = registry_for(CONFIGURED, "", TOKEN).expect("registry");
+        let shown = format!("{registry:?}");
+        assert!(!shown.contains(TOKEN), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    #[should_panic(expected = "registry path must start with '/'")]
+    fn a_path_that_would_change_the_host_is_refused() {
+        registry_for(CONFIGURED, "", TOKEN)
+            .expect("registry")
+            .url(".attacker.test/x");
+    }
+
+    #[tokio::test]
+    async fn registry_reads_do_not_follow_redirects() {
         let registry = MockServer::start().await;
         let elsewhere = MockServer::start().await;
         Mock::given(method("GET"))
@@ -180,12 +376,10 @@ mod tests {
             .mount(&elsewhere)
             .await;
 
-        let response = registry_client()
-            .expect("client")
-            .get(format!(
-                "{}/api/genesis/apps/acme/notes/versions/x/bundle",
-                registry.uri()
-            ))
+        let response = registry_for(&registry.uri(), "", TOKEN)
+            .expect("registry")
+            .get("/api/genesis/apps/acme/notes/versions/x/bundle", "default")
+            .expect("request")
             .send()
             .await
             .expect("response");

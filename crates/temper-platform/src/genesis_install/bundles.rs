@@ -10,7 +10,7 @@ use super::bundle_transport::decode_bundle_response;
 use super::cache_paths::{
     app_cache_dir, replace_directory, validate_git_object_id, validate_identity_component,
 };
-use super::registry::{RegistryUrl, registry_client};
+use super::registry::Registry;
 use super::{
     GenesisRegistryBundleApp, GenesisRegistryBundleFile, GenesisRegistryBundleResponse,
     RegistryAppRef, parse_registry_app_ref,
@@ -33,7 +33,7 @@ const MAX_GENESIS_TREE_DEPTH: usize = 128;
 const MAX_GENESIS_TREE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) async fn materialize_registry_app_closure_via_bundle(
-    registry: &RegistryUrl,
+    registry: &Registry,
     registry_tenant: &str,
     root_ref: RegistryAppRef,
     cache_root: &Path,
@@ -42,16 +42,13 @@ pub(super) async fn materialize_registry_app_closure_via_bundle(
         return Err("bundle fetch requires a pinned root app ref".to_string());
     };
     let version_hash = validate_git_object_id(version_hash)?;
-    let bundle_url = format!(
-        "{}/api/genesis/apps/{}/{}/versions/{}/bundle",
-        registry.as_str(),
-        root_ref.owner,
-        root_ref.name,
-        version_hash
+    let bundle_path = format!(
+        "/api/genesis/apps/{}/{}/versions/{}/bundle",
+        root_ref.owner, root_ref.name, version_hash
     );
-    let response = registry_client()?
-        .get(&bundle_url)
-        .header("X-Tenant-Id", registry_tenant)
+    let bundle_url = registry.url(&bundle_path);
+    let response = registry
+        .get(&bundle_path, registry_tenant)?
         .send()
         .await
         .map_err(|error| format!("request Genesis bundle {bundle_url}: {error}"))?;
