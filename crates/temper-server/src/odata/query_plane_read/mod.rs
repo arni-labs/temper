@@ -1,5 +1,6 @@
 //! OData entity-set reads through the query-plane contract.
 
+mod equality;
 mod pagination;
 mod scan;
 #[cfg(test)]
@@ -246,6 +247,16 @@ pub(in crate::odata) async fn read_entity_set_page(
     // scan budget can never trip. On a miss we fall back to the full list, which still
     // covers pre-backfill entities: a safe additive fast path until #324 is retired.
     let keyed = keyed_candidate_ids(&request).await;
+    if keyed.is_none()
+        && let Some(result) = equality::try_reconciled_equality_read(&request).await
+    {
+        return result;
+    }
+    // Without an indexed string-equality conjunct (for example a null-only
+    // filter, a non-indexed field, or an OR), or without a durable delta for
+    // this actual journal, retain the general planner below. Its conservative
+    // scan is still needed when no narrower complete candidate proof exists.
+
     // A keyed result of `Some([])` is authoritative absence (the watermark is set):
     // the co-committed `entity_key_index` has no such entity. No native page read
     // runs after that, here or below: the eventually-consistent field index and

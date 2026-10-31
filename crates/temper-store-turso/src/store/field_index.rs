@@ -212,6 +212,7 @@ impl TursoEventStore {
 
         let mut catalog_upserts = Vec::new();
         let mut changed_indexes = Vec::new();
+        let mut applied_projections = Vec::new();
         for projection in &projections {
             let fields_json = serde_json::to_string(&projection.fields)
                 .map_err(|error| PersistenceError::Serialization(error.to_string()))?;
@@ -226,6 +227,7 @@ impl TursoEventStore {
             if existing_row.is_some_and(|existing| existing.sequence_nr() > sequence_nr) {
                 continue;
             }
+            applied_projections.push(*projection);
             let entity = [
                 tenant,
                 projection.entity_type.as_str(),
@@ -362,6 +364,15 @@ impl TursoEventStore {
             }
         }
 
+        for projection in applied_projections {
+            super::projection_delta::applied(
+                &tx,
+                [tenant, &projection.entity_type, &projection.entity_id],
+                projection.sequence_nr,
+                &projection.fields,
+            )
+            .await?;
+        }
         tx.commit().await.map_err(storage_error)?;
         Ok(())
     }
