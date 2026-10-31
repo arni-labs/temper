@@ -1,9 +1,9 @@
-//! String state and equality literals needed by the model's predicates.
+//! String state and equality literals needed by the model's predicates and effects.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use temper_spec::automaton::Automaton;
-use temper_spec::predicate::{Expr, Literal, Name, Operand, Set, VarKind};
+use temper_spec::predicate::{Arg, Effect, Expr, Literal, Name, Operand, Set, VarKind};
 
 use super::rule_asserts;
 
@@ -75,11 +75,12 @@ pub(super) fn tracked_strings(
     }
 }
 
-/// Concrete equality classes from every predicate. A local input may be tied
-/// to a literal indirectly through related statuses, another variable or a
-/// list, so sampling only literals directly compared to that variable loses
-/// transitive equalities. Sharing the finite literal vocabulary is safe;
-/// guards still decide which choices are executable.
+/// Concrete equality classes from every predicate and string-writing effect.
+/// A local input may be tied to a literal indirectly through related statuses,
+/// another variable or a list, including a value appended by the same move, so
+/// sampling only predicate literals loses transitive equalities. Sharing the
+/// finite literal vocabulary is safe; guards still decide which choices are
+/// executable.
 pub(super) fn string_literals(
     automaton: &Automaton,
     tracked: &BTreeSet<String>,
@@ -119,6 +120,15 @@ pub(super) fn string_literals(
     let mut literals = BTreeSet::new();
     for action in &automaton.actions {
         visit(&action.guard, &mut literals);
+        for effect in &action.effect {
+            if let Effect::Append {
+                value: Arg::Lit(Literal::Str(text)),
+                ..
+            } = effect
+            {
+                literals.insert(text.clone());
+            }
+        }
     }
     for assert in rule_asserts(automaton) {
         visit(assert, &mut literals);
