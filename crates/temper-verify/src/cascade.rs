@@ -9,7 +9,7 @@
 //!
 //! Each level produces a pass/fail result. All levels run independently.
 
-use crate::budget::{Budget, Spending, ran_out, too_many_choices};
+use crate::budget::{Budget, Clock, Spending, ran_out, too_many_choices};
 use crate::checker::{self, VerificationResult};
 use crate::diagnostics;
 use crate::model::{self, TemperModel};
@@ -177,6 +177,8 @@ pub struct VerificationCascade {
     composite_scope: Option<CompositeScopeConfig>,
     /// Optional budget: what the cascade may spend before it stops.
     budget: Option<Budget>,
+    /// Where the budget reads the time.
+    clock: Clock,
 }
 
 struct CompositeScopeConfig {
@@ -199,6 +201,7 @@ impl VerificationCascade {
             path_extraction_config: None,
             composite_scope: None,
             budget: None,
+            clock: Clock::Wall,
         }
     }
 
@@ -206,6 +209,12 @@ impl VerificationCascade {
     /// and the levels after it do not run.
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Read the budget's time from `clock` instead of the wall clock.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -269,7 +278,9 @@ impl VerificationCascade {
 
     /// Run the full verification cascade.
     pub fn run(&self) -> CascadeResult {
-        let spending = self.budget.map(Spending::start);
+        let spending = self
+            .budget
+            .map(|budget| Spending::start(budget, self.clock));
         let spending = spending.as_ref();
         let mut levels = Vec::new();
         let model = self.build_temper_model(self.max_counter, spending);
