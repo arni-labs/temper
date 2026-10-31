@@ -100,3 +100,34 @@ async fn a_rule_that_checks_nothing_as_written_is_a_warning() {
         "{unproved:?}"
     );
 }
+
+/// A start installs again the specs and Cedar the tenant already runs: they
+/// were proven when they were installed, so nothing is walked. The same
+/// specs under Cedar the tenant does not run yet are walked.
+#[tokio::test]
+async fn an_install_that_changes_neither_specs_nor_cedar_proves_nothing() {
+    let parent = format!(
+        "{}\n[[action]]\nname = 'Close'\nkind = 'input'\nfrom = ['Open']\nto = 'Closed'\n",
+        spec("Parent", None)
+    );
+    let child = spec("Child", Some("Parent[Id].status != 'Closed'"));
+    let state = state("alice", &[("Parent", &parent), ("Child", &child)]);
+    let running = "permit(principal, action, resource);";
+    state
+        .server
+        .authz
+        .reload_tenant_policies("alice", running)
+        .expect("load policies");
+    let specs = [("Parent".to_string(), parent), ("Child".to_string(), child)];
+
+    let unproved = prove_to_the_end(&state, "alice", "app", &specs, false, Some(running))
+        .await
+        .expect("nothing changed, so nothing is walked");
+    assert!(unproved.is_empty(), "{unproved:?}");
+
+    let changed = format!("{running}\n// one more line");
+    let err = prove_to_the_end(&state, "alice", "app", &specs, false, Some(&changed))
+        .await
+        .unwrap_err();
+    assert!(err.contains("Child.rule BROKEN"), "{err}");
+}

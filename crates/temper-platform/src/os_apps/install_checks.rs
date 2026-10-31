@@ -57,7 +57,9 @@ pub(super) fn parse_cross_invariants(source: Option<&str>, app_name: &str) -> Re
 /// send each move decides whether a rule holds and whether a record gets
 /// where it should. A named type the bundle does not carry is taken from what
 /// the tenant already runs. Policy and spec changes check every active tenant
-/// spec, overlaid with the incoming specs.
+/// spec, overlaid with the incoming specs. Policies whose text is the tenant's
+/// Cedar now are no change: a start installs again the specs and Cedar the
+/// tenant runs, proven when they were installed, so it walks nothing.
 ///
 /// Only a rule the check finds broken refuses the install: an invariant with
 /// a path of moves that breaks it, or a liveness rule with a path to a state
@@ -79,6 +81,8 @@ pub(super) async fn prove(
     policies: Option<&str>,
     attempt: &Attempt,
 ) -> Result<ControlFlow<Vec<String>, Wait>, String> {
+    let policies =
+        policies.filter(|text| *text != super::cached_or_active_tenant_policy_text(state, tenant));
     if !new_specs && policies.is_none() {
         return Ok(ControlFlow::Break(Vec::new()));
     }
