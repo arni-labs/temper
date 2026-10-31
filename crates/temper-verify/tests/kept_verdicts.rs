@@ -64,6 +64,25 @@ fn a_change_a_level_reads_changes_the_digest() {
 }
 
 #[test]
+fn a_rule_reading_a_related_record_keeps_the_digest_whatever_its_type_is_called() {
+    let renamed = CHILD.replace("Parent[Id]", "AppTwoParent[Id]");
+    assert_ne!(renamed, CHILD);
+    assert_eq!(digest(&renamed), digest(CHILD), "the related type's name");
+
+    let either = |other: &str| {
+        CHILD.replace(
+            "Parent[Id].status == 'Open'",
+            &format!("Parent[Id].status == 'Open' || {other}[Id].status == 'Open'"),
+        )
+    };
+    assert_ne!(
+        digest(&either("Mother")),
+        digest(&either("Parent")),
+        "two related types are two"
+    );
+}
+
+#[test]
 fn a_check_that_reads_more_than_its_models_has_no_digest() {
     let scoped = check(NOTE)
         .with_composite_scope(vec![parse_automaton(NOTE).expect("fixture parses")], "Note");
