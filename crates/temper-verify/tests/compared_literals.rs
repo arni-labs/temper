@@ -5,9 +5,13 @@
 //! whose threshold sits above that bound was never reached: a count that
 //! passes it was reported as holding, and a move that waits for it as dead.
 
+use std::time::{Duration, Instant};
+
 use proptest::prelude::*;
 use temper_verify::model::build_model_from_ioa;
-use temper_verify::{CascadeLevel, TemperModelState, VerificationCascade, check_model};
+use temper_verify::{
+    CascadeLevel, TemperModelState, VerificationCascade, check_model, verify_symbolic,
+};
 
 /// A batch's age counts up by the hour and must stay under 4.
 const COUNT_UP: &str = r#"
@@ -188,6 +192,23 @@ fn a_move_that_waits_for_a_list_longer_than_the_old_bound_can_fire() {
         .expect("L1 ran");
     assert!(l1.passed, "{}", l1.summary);
     assert!(l1.summary.contains("bounded"), "{}", l1.summary);
+}
+
+/// L0 reads a list only through its length and what it holds, so a length
+/// compared with a large literal costs it no more than a small one.
+#[test]
+fn a_large_length_threshold_is_quick_for_the_symbolic_check() {
+    let spec = BATCH.replace("len(cups) >= 5", "len(cups) >= 10000000");
+    let started = Instant::now();
+    let result = verify_symbolic(&spec, 2);
+    let took = started.elapsed();
+    let ship = result
+        .guard_satisfiability
+        .iter()
+        .find(|(name, _)| name == "Ship")
+        .map(|(_, sat)| *sat);
+    assert_eq!(ship, Some(true), "{:?}", result.guard_satisfiability);
+    assert!(took < Duration::from_secs(2), "L0 took {took:?}");
 }
 
 /// What a rule counts: a counter `x` that one move adds 1 to, or the

@@ -417,13 +417,66 @@ fn a_parameter_that_can_take_a_counter_past_its_bound_makes_a_bounded_pass() {
     assert!(cut.iter().any(|(name, _)| name == "x"), "{cut:?}");
 }
 
-/// What `params.b` can usefully be depends on `params.a`, which `x` took
-/// earlier in the move, so its range is widened and the pass says so.
+/// How far `params.a` can go with `x` inside its bound depends on
+/// `params.b`, which nothing limits, so `a` is tried with `b` taken as 0 and
+/// the pass says so.
 #[test]
 fn a_subtraction_that_cannot_be_worked_back_makes_a_bounded_pass() {
     let spec = arithmetic(&["x = params.a", "x -= params.b"], "y == 0");
     let l1 = model_check(&spec);
     assert!(l1.passed, "{}", l1.summary);
     let cut = &l1.verification.as_ref().unwrap().bounded_by;
-    assert!(cut.iter().any(|(name, _)| name == "params.b"), "{cut:?}");
+    assert!(cut.iter().any(|(name, _)| name == "params.a"), "{cut:?}");
+}
+
+/// `x = a; x -= a` leaves `x` at 0 whatever `a` is, so `a` goes as far as
+/// `y` allows, and 5 takes `y` to 1.
+#[test]
+fn a_parameter_that_cancels_itself_in_one_counter_reaches_another() {
+    let spec = r#"
+[automaton]
+name = "Cancel"
+states = ["On", "Done"]
+initial = "On"
+
+[[state]]
+name = "x"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "y"
+type = "counter"
+initial = 0
+
+[[action]]
+name = "Write"
+from = ["On"]
+to = "Done"
+effect = ["x = params.a", "x -= params.a", "y = params.a", "y -= 4"]
+
+[[invariant]]
+name = "Safe"
+assert = "y != 1"
+"#;
+    let (a, last) = broken_safe(&model_check(spec));
+    assert_eq!(a, ParamValue::Count(5));
+    assert_eq!(last.counters["x"], 0);
+    assert_eq!(last.counters["y"], 1);
+}
+
+/// A value past `a`'s range takes both `x` and `y` past their bounds, and
+/// the pass names both.
+#[test]
+fn a_bounded_pass_names_every_counter_a_parameter_can_take_past_its_bound() {
+    let spec = arithmetic(&["x = params.a", "y = params.a"], "w == 0");
+    let l1 = model_check(&spec);
+    assert!(l1.passed, "{}", l1.summary);
+    let cut = &l1.verification.as_ref().unwrap().bounded_by;
+    for counter in ["x", "y"] {
+        assert!(
+            cut.iter().any(|(name, _)| name == counter),
+            "{counter}: {cut:?}"
+        );
+    }
 }
