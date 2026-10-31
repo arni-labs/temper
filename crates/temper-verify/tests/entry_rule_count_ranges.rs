@@ -119,8 +119,6 @@ fn count_comparisons_keep_transitive_parameter_and_state_values() {
 
 /// The model holds only fields some rule reads, so `count` has one: its
 /// bound is what limits `q`.
-/// The model holds only fields some rule reads, so `count` has one: its
-/// bound is what limits `q`.
 #[test]
 fn effect_input_ranges_reach_compared_parameters() {
     let state = "[[state]]\nname = 'other'\ntype = 'counter'\ninitial = 50\n\

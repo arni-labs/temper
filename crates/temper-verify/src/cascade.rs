@@ -21,6 +21,7 @@ use crate::smt::{self, SmtResult};
 use temper_runtime::scheduler::FaultConfig;
 
 mod digest;
+pub use digest::KeptKey;
 
 /// Result of an actor simulation level (Level 2b).
 ///

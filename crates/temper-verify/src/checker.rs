@@ -3,7 +3,7 @@
 //! This module wraps Stateright's BFS model checker and produces a
 //! `VerificationResult` summarizing the outcome.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use stateright::{Checker, Expectation, Model};
 use temper_spec::predicate::Truth;
@@ -64,6 +64,22 @@ pub struct VerificationResult {
     /// that a concrete record breaks the rule.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unproved_can_reach: Vec<String>,
+    /// The places a whole walk reached, with what a kept verdict needs to
+    /// stand for a spec that differs only in its silent moves
+    /// ([`TemperModel::is_silent`]). `None` when the walk did not finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<Reached>,
+}
+
+/// The places a whole walk of a model reached.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Reached {
+    /// Every place a reachable state is in.
+    pub places: Vec<String>,
+    /// The places of reachable states no move but a silent one leaves.
+    pub stuck: Vec<String>,
+    /// The places in `stuck` a silent move leaves.
+    pub left_silently: Vec<String>,
 }
 
 /// Run exhaustive BFS model checking on the given `TemperModel`.
@@ -142,10 +158,15 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
     // the rest: dead transitions are named only after a whole exploration.
     let walked = if explored_all { walk(model) } else { None };
     let is_complete = walked.is_some();
-    let (dead_transitions, bounded_by, lost_places) = match walked {
+    let (dead_transitions, bounded_by, lost_places, reached) = match walked {
         Some(w) => {
             counterexamples.extend(w.broken);
-            (w.dead, w.cut_short.into_iter().collect(), w.lost_places)
+            (
+                w.dead,
+                w.cut_short.into_iter().collect(),
+                w.lost_places,
+                Some(w.reached),
+            )
         }
         None => Default::default(),
     };
@@ -168,6 +189,7 @@ pub fn check_model(model: &TemperModel) -> VerificationResult {
         bounded_by,
         lost_places,
         unproved_can_reach,
+        reached,
     }
 }
 
@@ -211,6 +233,8 @@ struct Walked {
     lost_places: Vec<LostPlace>,
     /// A path for each `can_reach` rule a record breaks.
     broken: Vec<Counterexample>,
+    /// The places reached, and those only a silent move leaves.
+    reached: Reached,
 }
 
 /// Walk every reachable state, or return `None` when the model's time limit
@@ -229,6 +253,11 @@ fn walk(model: &TemperModel) -> Option<Walked> {
 
     let mut covered = vec![false; model.transitions.len()];
     let mut cut = BTreeMap::new();
+    let silent: Vec<bool> = (0..model.transitions.len())
+        .map(|index| model.is_silent(index))
+        .collect();
+    let mut places = BTreeSet::new();
+    let mut stuck = BTreeSet::new();
 
     while let Some((state, at)) = queue.pop_front() {
         if model.out_of_time() {
@@ -236,6 +265,7 @@ fn walk(model: &TemperModel) -> Option<Walked> {
         }
         let mut cut_here = BTreeMap::new();
         let mut to = Vec::new();
+        let mut moves = false;
         for (index, transition) in model.transitions.iter().enumerate() {
             let next_states = step(model, transition, &state, &mut cut_here);
             if model.out_of_time() {
@@ -245,6 +275,7 @@ fn walk(model: &TemperModel) -> Option<Walked> {
                 continue;
             }
             covered[index] = true;
+            moves |= !silent[index];
             for next in next_states {
                 let next_at = match found.get(&next) {
                     Some(&next_at) => next_at,
@@ -260,6 +291,10 @@ fn walk(model: &TemperModel) -> Option<Walked> {
         }
         graph.steps_from(at, !cut_here.is_empty(), to);
         cut.extend(cut_here);
+        if !moves {
+            stuck.insert(state.status.clone());
+        }
+        places.insert(state.status);
     }
 
     let dead = model
@@ -281,11 +316,27 @@ fn walk(model: &TemperModel) -> Option<Walked> {
         ),
         None => Default::default(),
     };
+    let left_silently = stuck
+        .iter()
+        .filter(|place| {
+            model
+                .transitions
+                .iter()
+                .enumerate()
+                .any(|(index, t)| silent[index] && t.from_states.contains(place))
+        })
+        .cloned()
+        .collect();
     Some(Walked {
         dead,
         cut_short: cut,
         lost_places,
         broken,
+        reached: Reached {
+            places: places.into_iter().collect(),
+            stuck: stuck.into_iter().collect(),
+            left_silently,
+        },
     })
 }
 

@@ -25,8 +25,10 @@ pub mod smt;
 
 // Re-export key types.
 pub use budget::Budget;
-pub use cascade::{ActorSimResult, CascadeLevel, CascadeResult, LevelResult, VerificationCascade};
-pub use checker::{VerificationResult, check_model};
+pub use cascade::{
+    ActorSimResult, CascadeLevel, CascadeResult, KeptKey, LevelResult, VerificationCascade,
+};
+pub use checker::{Reached, VerificationResult, check_model};
 pub use composite::{CompositePlanError, CompositeVerificationPlan};
 pub use lost_places::LostPlace;
 pub use model::{
