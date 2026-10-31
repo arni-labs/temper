@@ -531,7 +531,8 @@ impl EntityActor {
         format!("{}:{}:{}", self.tenant, self.entity_type, self.entity_id)
     }
 
-    fn field_sync_mode_for_backend(
+    /// Storage transformation shared by execution and outside-write previews.
+    pub(crate) fn field_sync_mode_for_backend(
         backend: Option<BackendLabel>,
         blob_store: Option<&crate::blob_store::BlobStore>,
     ) -> FieldSyncMode {
@@ -2516,6 +2517,10 @@ mod event_size_tests;
 #[cfg(test)]
 #[path = "contract_state_test.rs"]
 pub(super) mod contract_state_tests;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "held_action_test.rs"]
+mod held_action_tests;
 
 #[cfg(all(test, feature = "sim"))]
 #[path = "hydration_test.rs"]

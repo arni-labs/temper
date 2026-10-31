@@ -230,6 +230,10 @@ pub enum FieldSyncMode {
     /// Values exceeding `default_inline_max` are written to the Turso blob store
     /// and replaced with a content-addressed reference object.
     BlobRefs { default_inline_max: usize },
+    /// Every value stays in the record as it is, whatever its size. For a
+    /// blob-backed preview that stores nothing itself, so checks read domain
+    /// values rather than references to blobs that have not been stored yet.
+    Inline,
 }
 
 impl FieldSyncMode {
@@ -245,6 +249,7 @@ impl FieldSyncMode {
         match self {
             FieldSyncMode::InlineTruncate => DEFAULT_FIELD_INLINE_MAX,
             FieldSyncMode::BlobRefs { default_inline_max } => default_inline_max,
+            FieldSyncMode::Inline => usize::MAX,
         }
     }
 }
@@ -1279,6 +1284,9 @@ fn project_field_value(
     field_meta: Option<&temper_jit::table::StateVarMetadata>,
     overflow_blobs: &mut Vec<OverflowBlobWrite>,
 ) -> serde_json::Value {
+    if mode == FieldSyncMode::Inline {
+        return value.clone();
+    }
     let serialized = serde_json::to_vec(value).unwrap_or_else(|_| value.to_string().into_bytes());
     let serialized_len = serialized.len();
     // Per-field override wins over the mode default; mode default wins over
@@ -1291,6 +1299,7 @@ fn project_field_value(
     }
 
     match mode {
+        FieldSyncMode::Inline => value.clone(),
         FieldSyncMode::InlineTruncate => {
             tracing::warn!(
                 entity_type,

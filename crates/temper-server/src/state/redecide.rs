@@ -7,10 +7,12 @@
 //! refuses without writing, with `Refusal::RecordChanged`
 //! (`EntityResponse::is_record_changed`). Only the actor's own checks give
 //! that reason, so an answer from after a commit (an integration callback's,
-//! say) is never mistaken for it. Every write route then reads the record again and
-//! runs every check again on it, instead of answering 409 for a write its
+//! say) is never mistaken for it. Routes using this helper read the record again
+//! and run every check again on it, instead of answering 409 for a write its
 //! policy allows. Nothing is decided on old state, and a check added to a route
 //! later is decided again with the rest, without a list to keep in sync.
+//! Outside bound actions instead answer `StaleWrite`; their caller re-reads
+//! and retries (see `dispatch::outside_write`).
 
 use std::time::Duration;
 

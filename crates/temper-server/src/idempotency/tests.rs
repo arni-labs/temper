@@ -454,3 +454,6 @@ fn live_state_answers_a_retry_only_while_it_is_the_reply() {
     recounted.total_event_count += 1;
     assert!(!live_state_is_the_reply(&recounted, &cached, "k3"));
 }
+
+#[path = "index_test.rs"]
+mod indexes;

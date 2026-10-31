@@ -16,6 +16,7 @@ use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::AgentContext;
 use crate::response::{ODataResponse, odata_error, odata_refusal};
 use crate::state::redecide::Redecide;
+use crate::state::write_record::WriteCaller;
 use crate::state::{BoundActionHookContext, DispatchCommand, DispatchError, ServerState};
 use decide::{BoundAction, Decision, decide};
 
@@ -127,7 +128,9 @@ pub(super) async fn dispatch_bound_action(
         } = match decide(&request, redecide.is_first()).await {
             Ok(decision) => decision,
             Err(undecided) => {
-                if redecide.again(undecided.record_changed, "bound_action") {
+                if WriteCaller::of_request(security_ctx) == WriteCaller::Kernel
+                    && redecide.again(undecided.record_changed, "bound_action")
+                {
                     continue;
                 }
                 return undecided.response;
@@ -169,10 +172,12 @@ pub(super) async fn dispatch_bound_action(
                     await_integration,
                     await_reactions: true,
                 },
+                WriteCaller::of_request(security_ctx),
                 decided_on,
             )
             .await;
         if let Ok(answer) = &result
+            && WriteCaller::of_request(security_ctx) == WriteCaller::Kernel
             && redecide.again(answer.is_record_changed(), "bound_action")
         {
             continue;
@@ -259,6 +264,10 @@ pub(super) async fn dispatch_bound_action(
                 action_span.set_status(Status::error(reason.clone()));
                 odata_error(StatusCode::PAYLOAD_TOO_LARGE, "StorageCapExceeded", &reason)
                     .into_response()
+            }
+            Err(DispatchError::StaleWrite(stale)) => {
+                action_span.set_status(Status::error(stale.to_string()));
+                (StatusCode::CONFLICT, axum::Json(stale.body())).into_response()
             }
             Err(DispatchError::Conflict(reason)) => {
                 action_span.set_status(Status::error(reason.clone()));

@@ -102,6 +102,7 @@ async fn try_reaction(state: &ServerState, reaction: &Reaction) -> ReactionTry {
             sent.params.clone(),
             &sent.agent_ctx,
             false,
+            crate::state::write_record::WriteCaller::Kernel,
             None,
         )
         .await;

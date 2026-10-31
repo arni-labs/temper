@@ -29,6 +29,7 @@ pub mod status_cache;
 pub(crate) mod storage_caps;
 pub mod trajectory;
 pub mod wasm_invocation_log;
+pub(crate) mod write_record;
 
 pub use admission::{AdmissionController, AdmissionOutcome, AdmissionPermit};
 pub(crate) use dispatch::authorized_http_endpoint_host;
@@ -36,7 +37,7 @@ pub(crate) use dispatch::authorized_http_endpoint_host;
 pub(crate) use dispatch::internal_http_capability_issuer;
 pub(crate) use dispatch::owed_writes;
 pub use dispatch::{
-    BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions,
+    BootTimerCounts, BootTimers, DispatchCommand, DispatchError, DispatchExtOptions, StaleWrite,
     StateTimeoutTracker, TimerFollowHold,
 };
 pub use entity_ops::{
