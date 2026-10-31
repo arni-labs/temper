@@ -2,7 +2,9 @@
 //!
 //! A timer fires as whoever set it. Its move is the app's own, so Cedar is
 //! not asked about the move: it is asked whether the setter may read the
-//! record, when they set the timer and when it fires. The tenant's Cedar here
+//! record, when they set the timer and when it fires. A timer an agent set
+//! also stops when the token the agent's identity came from would be refused
+//! now: its grant was revoked, or the user it acts for signed out everywhere. The tenant's Cedar here
 //! names its people, as an app's does: they may read its records, `Start` a
 //! `Job` and `Hold` it. It also names outsiders, who may `Start` and `Hold` a
 //! `Job` but never read one. Nobody is permitted the timers' own moves,
@@ -19,6 +21,12 @@
 //!   themselves or through an agent;
 //! - an outsider, by themselves or through an agent, who could never read the
 //!   record;
+//! - an agent whose grant is revoked after it set the timer and before it
+//!   fires;
+//! - a user who signs out everywhere after setting the timer and before it
+//!   fires, by themselves or through an agent;
+//! - an agent whose identity kept no credential (a context saved before
+//!   contexts kept one), whose user signs out and whose grant is revoked;
 //! - the app's own service, which Cedar names nowhere;
 //! - an internal caller with no security context.
 //!
@@ -29,9 +37,12 @@
 //! Invariants, long after every timer was due, and again after the last
 //! restart:
 //! - a timer whose setter may still read the record, could not read it when
-//!   they set it, or acts for no one, makes its move exactly once;
+//!   they set it, or acts for no one, makes its move exactly once, and so
+//!   does a person's after they sign out everywhere and an agent's that kept
+//!   no credential;
 //! - a timer whose setter could read the record when they set it and can no
-//!   longer never makes its move, and says so in a log line naming the setter;
+//!   longer, or an agent's whose token would now be refused, never makes its
+//!   move, and says so in a log line naming the setter;
 //! - such a state timer keeps its row, armed as its setter, so no later
 //!   arming fires it as anyone else; such a scheduled action leaves no row
 //!   and no live timer.
@@ -49,6 +60,8 @@ mod logged;
 mod process_clock;
 #[path = "dst_timer_setter_standing/recovery.rs"]
 mod recovery;
+#[path = "dst_timer_setter_standing/revocation.rs"]
+mod revocation;
 #[path = "dst_timer_setter_standing/server.rs"]
 mod server;
 #[path = "dst_timer_setter_standing/specs.rs"]
@@ -65,9 +78,10 @@ use axum::http::{Request, StatusCode};
 use invariants::{check, check_logged};
 use logged::Withheld;
 use process_clock::ProcessClock;
+use revocation::{bump_generation, grant};
 use serde_json::json;
 use server::{Process, World, pass, settle};
-use temper_authz::{AuthenticatedRequestContext, PrincipalKind, SecurityContext};
+use temper_authz::{AuthenticatedRequestContext, IssuedCredential, PrincipalKind, SecurityContext};
 use temper_runtime::scheduler::{
     DeterministicIdGen, DeterministicRng, install_sim_context, sim_now,
 };
@@ -137,6 +151,16 @@ enum Setter {
     Leaves(By),
     /// A user the tenant's Cedar lets set a `Job`'s timers but never read it.
     Outsider(By),
+    /// An agent acting for a user who stays in the tenant's Cedar, whose
+    /// grant is revoked before the timer fires.
+    Revoked,
+    /// A user who stays in the tenant's Cedar and signs out everywhere before
+    /// the timer fires.
+    SignsOut(By),
+    /// An agent whose identity kept no credential, as one saved before
+    /// identities kept it, whose user signs out everywhere and whose grant is
+    /// revoked before the timer fires.
+    NoCredential,
     /// The app's own service, which the Cedar names nowhere.
     App,
     /// An internal caller with no security context.
@@ -144,38 +168,73 @@ enum Setter {
 }
 
 impl Setter {
-    /// The identity the record's user `user` sets the timer as.
+    /// The identity the record's user `user` sets the timer as. An agent's
+    /// keeps what its token was issued under, as the identity boundary keeps
+    /// it: the user, their sign-out generation then (0) and its grant.
     fn caller(self, user: &str) -> AgentContext {
-        let verified = |id: &str, kind, agent_type, acting_for| AgentContext {
-            security_ctx: Some(SecurityContext::from_verified_jwt(
-                id, kind, agent_type, acting_for, None, None,
-            )),
-            ..Default::default()
+        let verified = |id: &str, kind, agent_type, acting_for| {
+            SecurityContext::from_verified_jwt(id, kind, agent_type, acting_for, None, None)
         };
-        match self {
+        let agent = verified(AGENT, PrincipalKind::Agent, Some("contributor"), Some(user));
+        let security_ctx = match self {
             Self::Stays(By::Themselves)
             | Self::Leaves(By::Themselves)
-            | Self::Outsider(By::Themselves) => verified(user, PrincipalKind::Customer, None, None),
-            Self::Stays(By::Agent) | Self::Leaves(By::Agent) | Self::Outsider(By::Agent) => {
-                verified(AGENT, PrincipalKind::Agent, Some("contributor"), Some(user))
-            }
-            Self::App => AgentContext::for_service("app"),
-            Self::Internal => AgentContext::default(),
+            | Self::Outsider(By::Themselves)
+            | Self::SignsOut(By::Themselves) => verified(user, PrincipalKind::Customer, None, None),
+            Self::NoCredential => agent,
+            Self::Stays(By::Agent)
+            | Self::Leaves(By::Agent)
+            | Self::Outsider(By::Agent)
+            | Self::Revoked
+            | Self::SignsOut(By::Agent) => agent.with_credential(Some(IssuedCredential {
+                subject: Some(user.to_string()),
+                auth_generation: 0,
+                grant_id: Some(grant(user)),
+            })),
+            Self::App => return AgentContext::for_service("app"),
+            Self::Internal => return AgentContext::default(),
+        };
+        AgentContext {
+            security_ctx: Some(security_ctx),
+            ..Default::default()
         }
     }
 
     /// The principal a withheld fire names as its setter.
     fn principal(self, user: &str) -> String {
         match self {
-            Self::Stays(By::Agent) | Self::Leaves(By::Agent) | Self::Outsider(By::Agent) => {
-                AGENT.to_string()
-            }
+            Self::Stays(By::Agent)
+            | Self::Leaves(By::Agent)
+            | Self::Outsider(By::Agent)
+            | Self::Revoked
+            | Self::SignsOut(By::Agent)
+            | Self::NoCredential => AGENT.to_string(),
             _ => user.to_string(),
         }
     }
 
     fn leaves(self) -> bool {
         matches!(self, Self::Leaves(_))
+    }
+
+    /// The sign-out generations bumped before the timer fires: the user's
+    /// own (signing out everywhere) and their agent's grant (revoking it).
+    fn bumps(self, user: &str) -> Vec<String> {
+        match self {
+            Self::Revoked => vec![grant(user)],
+            Self::SignsOut(_) => vec![user.to_string()],
+            Self::NoCredential => vec![user.to_string(), grant(user)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the setter's timer must not make its move: they left the
+    /// tenant's Cedar, or they are an agent whose token would be refused now.
+    fn loses_standing(self) -> bool {
+        matches!(
+            self,
+            Self::Leaves(_) | Self::Revoked | Self::SignsOut(By::Agent)
+        )
     }
 }
 
@@ -212,6 +271,10 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
             Setter::Leaves(By::Agent),
             Setter::Outsider(By::Themselves),
             Setter::Outsider(By::Agent),
+            Setter::Revoked,
+            Setter::SignsOut(By::Themselves),
+            Setter::SignsOut(By::Agent),
+            Setter::NoCredential,
             Setter::App,
             Setter::Internal,
         ] {
@@ -329,6 +392,28 @@ fn run_seed(seed: u64, withheld: &Withheld) -> Result<(), String> {
         .reload_tenant_policies(TENANT, &world.cedar())
         .expect("the tenant's Cedar parses");
     trace.push(format!("leavers left at {}", sim_now()));
+
+    // Grants are revoked and users sign out everywhere, as the platform does:
+    // by bumping the generation keyed by the grant or the user.
+    let revoked = process.runtime.block_on(async {
+        for record in &records {
+            for key in record.setter.bumps(&record.user) {
+                bump_generation(&process.state, &tenant, &key)
+                    .await
+                    .map_err(|error| fail(seed, &trace, "generations are bumped", error))?;
+            }
+        }
+        settle().await;
+        Ok(())
+    });
+    if let Err(report) = revoked {
+        process.kill(&world, Duration::ZERO);
+        return Err(report);
+    }
+    trace.push(format!(
+        "grants revoked and users signed out at {}",
+        sim_now()
+    ));
 
     // Restart before the timers fire, or while they fall due, or not at all.
     let process = match seed % 3 {

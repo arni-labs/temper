@@ -74,6 +74,7 @@ fn admin_context() -> SecurityContext {
         context_attrs: Default::default(),
         correlation_id: "policy-admin-test".to_string(),
         cause: None,
+        credential: None,
     }
 }
 

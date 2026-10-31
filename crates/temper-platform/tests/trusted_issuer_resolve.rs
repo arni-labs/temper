@@ -111,6 +111,16 @@ async fn valid_token_resolves_to_verified_agent_acting_for_human() {
     assert_eq!(id.agent_instance_id, "kc_agent_e2e");
     assert_eq!(id.agent_type_name, "contributor");
     assert_eq!(id.acting_for.as_deref(), Some("human-e2e"));
+    // What the token was issued under rides on the agent's identity, so a
+    // timer it sets can ask whether the token would still be accepted.
+    assert_eq!(
+        id.credential,
+        Some(temper_authz::IssuedCredential {
+            subject: Some("human-e2e".to_string()),
+            auth_generation: 3,
+            grant_id: Some("grant-e2e".to_string()),
+        })
+    );
 }
 
 #[tokio::test]
@@ -250,6 +260,8 @@ async fn human_token_resolves_to_customer_with_role() {
     assert_eq!(id.agent_instance_id, "human-owner");
     assert_eq!(id.role.as_deref(), Some("owner"));
     assert!(id.acting_for.is_none());
+    // A person's timers outlive their sign-out, so nothing is kept to ask.
+    assert!(id.credential.is_none());
 }
 
 #[tokio::test]
