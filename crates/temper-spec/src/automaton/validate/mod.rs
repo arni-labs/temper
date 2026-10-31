@@ -7,6 +7,10 @@ mod groups;
 mod triggers;
 mod webhooks;
 
+#[cfg(test)]
+#[path = "entry_rules_test.rs"]
+mod entry_rules_test;
+
 use super::parser::AutomatonParseError;
 use super::types::*;
 
@@ -290,9 +294,14 @@ fn validate_predicates(automaton: &Automaton) -> Result<(), AutomatonParseError>
             }
         };
         if !automaton.actions.iter().any(|a| {
+            let sources = if a.from.is_empty() {
+                &automaton.automaton.states
+            } else {
+                &a.from
+            };
             a.kind != ActionKind::Output
                 && a.to.as_ref() == Some(&rule.place)
-                && (a.from.is_empty() || a.from.iter().any(covered))
+                && sources.iter().any(covered)
         }) {
             return Err(invalid(
                 slot,
